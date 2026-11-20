@@ -52,6 +52,14 @@ updates:
     labels: [dependencies]
     commit-message:
       prefix: "chore(docker)"
+    # The runtime stays on Node 22 and MySQL 8.4 LTS; only refreshes within those release lines are wanted.
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "mysql"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "caddy"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: docker-compose
     directory: /deploy/docker
@@ -63,3 +71,11 @@ updates:
     labels: [dependencies]
     commit-message:
       prefix: "chore(docker)"
+    # The runtime stays on Node 22 and MySQL 8.4 LTS; only refreshes within those release lines are wanted.
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "mysql"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "caddy"
+        update-types: ["version-update:semver-major"]
