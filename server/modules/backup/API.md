@@ -16,7 +16,7 @@ Backup, cryptographic/semantic verification, and isolated disaster-recovery rest
 | Restore to isolated target | `backup.restore` | **Yes** | Admin + fresh step-up + exact typed confirmation (`RESTORE <backupPublicId> TO <targetDatabaseName>`). Restores **only** to an isolated empty `targetDatabaseName` and isolated empty `targetStorageDir` — **refuses** live database/storage, overlapping paths, or populated targets. Runs §7.3 security-state continuity reconciliation and post-restore integrity checks. |
 | Retention & legal holds | `backup.retention.manage` | **Yes** | Admin + fresh step-up. Manages retention policy, dry-run/apply pruning, and legal holds. Never deletes a held archive or the last-known-good verified archive. |
 
-## 2. Service Interface — `deps.services.backup: BackupModule` **[sig]**
+## 2. Service Interface — `deps.services.backup: BackupModule` **[impl]**
 
 Exported from `server/modules/backup/index.ts`:
 
