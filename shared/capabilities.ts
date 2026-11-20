@@ -20,6 +20,7 @@ export const CAPABILITIES = [
   "orders.transition",
   "orders.reassign",
   "orders.identifiers.change",
+  "orders.production.trigger",
   "catalog.manage",
   "workflows.manage",
   // files
@@ -71,6 +72,7 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "orders.read_all",
   "orders.manage",
   "orders.transition",
+  "orders.production.trigger",
   "files.read_all",
   "files.manage",
   "files.visibility.change",
