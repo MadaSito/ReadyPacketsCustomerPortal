@@ -191,6 +191,7 @@ describe("MySQL durable job leases", () => {
     const jobs = createJobQueue({ ...h.deps, audit: createAuditEmitter(h.deps) });
     const engine = engineFor(jobs)!;
     jobs.register("test.audit", done);
+    jobs.registerSchedule({ name: "test.tick", type: "test.audit", everyMs: 60_000 });
     await expect(t.db.transaction(async (tx) => {
       await jobs.enqueue("test.audit", null, { correlationId: "rollback_workflow" }, tx);
       throw new Error("caller refused");
@@ -205,6 +206,64 @@ describe("MySQL durable job leases", () => {
       expect.objectContaining({ eventName: "job.completed", jobId, actorRole: "system", origin: "worker" }),
     ]));
     expect(events).toHaveLength(3);
+  });
+
+  it("records a routine scheduled success in the ledger and operational log without any audit events", async () => {
+    const h = createTestDeps({ db: t.db });
+    const info = vi.fn();
+    const jobs = createJobQueue({ ...h.deps, logger: { ...h.deps.logger, info }, audit: createAuditEmitter(h.deps) });
+    const engine = engineFor(jobs)!;
+    jobs.register("test.scheduled", async () => ({
+      outcome: "completed", safeCounts: { checked: 2, negative: -1, "unsafe.label": 9 },
+    }));
+    jobs.registerSchedule({ name: "test.tick", type: "test.scheduled", everyMs: 60_000 });
+    await engine.scheduleTick();
+    const claim = (await engine.claim())!;
+    expect(await t.db.select().from(auditEvents)).toHaveLength(0);
+    expect(info).not.toHaveBeenCalled();
+    await engine.execute(claim);
+    expect(await t.db.select().from(auditEvents)).toHaveLength(0);
+    const [row] = await t.db.select().from(jobRuns);
+    expect(row).toMatchObject({ publicId: claim.job.jobId, state: "completed", attempt: 1, scheduleName: "test.tick" });
+    expect(await t.db.select().from(jobAttempts)).toMatchObject([{ state: "completed", safeCounts: { checked: 2 } }]);
+    expect(info).toHaveBeenCalledExactlyOnceWith("scheduled job completed", {
+      component: "jobs.queue", jobId: claim.job.jobId, jobType: "test.scheduled",
+      scheduleName: "test.tick", scheduleSlot: row!.scheduleSlot!.toISOString(),
+      correlationId: claim.job.correlationId, durationMs: expect.any(Number), safeCounts: { checked: 2 },
+    });
+  });
+
+  it("writes a standalone, durable failure for a scheduled tick without enqueue or claim audit", async () => {
+    const h = createTestDeps({ db: t.db });
+    const jobs = createJobQueue({ ...h.deps, audit: createAuditEmitter(h.deps) });
+    const engine = engineFor(jobs)!;
+    jobs.register("test.scheduled", async () => ({ outcome: "failed", reasonCode: "TICK_FAILED", retryable: false }));
+    jobs.registerSchedule({ name: "test.tick", type: "test.scheduled", everyMs: 60_000 });
+    await engine.scheduleTick();
+    const claim = (await engine.claim())!;
+    await engine.execute(claim);
+    const [row] = await t.db.select().from(jobRuns);
+    expect(row).toMatchObject({ state: "failed", allowRetry: false });
+    expect(await t.db.select().from(auditEvents)).toMatchObject([{
+      eventName: "job.failed", outcome: "failed", reasonCode: "TICK_FAILED", actorRole: "system",
+      jobId: claim.job.jobId, correlationId: claim.job.correlationId, durability: "durable",
+      attributes: { job_type: "test.scheduled", schedule_key: "test.tick", schedule_slot: row!.scheduleSlot!.toISOString(), attempt: 1 },
+    }]);
+  });
+
+  it("keeps automatic retry, subsequent claim and completion audited for a scheduled job", async () => {
+    const f = fixture();
+    f.jobs.register("test.scheduled", async ({ attempt }) => attempt === 1
+      ? { outcome: "failed", reasonCode: "TICK_RETRY", retryable: true } : { outcome: "completed" });
+    f.jobs.registerSchedule({ name: "test.tick", type: "test.scheduled", everyMs: 60_000 });
+    await f.engine.scheduleTick();
+    await f.engine.execute((await f.engine.claim())!);
+    f.h.clock.advance(2_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(f.h.audit.events.map(({ eventName, attributes }) => [eventName, attributes?.attempt])).toEqual([
+      ["job.failed", 1], ["job.retry.queued", 1], ["job.claimed", 2], ["job.completed", 2],
+    ]);
+    expect(f.h.audit.recordedInTx).toEqual([true, true, true, true]);
   });
 
   it("rejects wrong roles, remediation sessions, missing or future step-up, and bad pagination", async () => {

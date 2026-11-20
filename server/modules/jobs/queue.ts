@@ -26,7 +26,7 @@ type JobRow = typeof jobRuns.$inferSelect;
 type Handler = { run: (job: ClaimedJob<unknown>) => Promise<JobResult>; retrySafe: boolean };
 type Schedule = Parameters<JobQueue["registerSchedule"]>[0];
 type Slot = { name: string; start: Date };
-export type ActiveClaim = { job: ClaimedJob; controller: AbortController };
+export type ActiveClaim = { job: ClaimedJob; controller: AbortController; startedAtMs: number };
 
 export const JOB_TYPE = /^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$/;
 const CORRELATION = /^[A-Za-z0-9_.:-]{1,64}$/;
@@ -71,14 +71,22 @@ export async function gateDraining(tx: Tx, mode: "share" | "update" = "share"): 
   return gate.active;
 }
 
+type ScheduleAttempt = Pick<JobRow, "scheduleName" | "scheduleSlot" | "type" | "attempt">;
+const isRoutineScheduledAttempt = (row: Pick<ScheduleAttempt, "scheduleName" | "attempt">) =>
+  row.scheduleName !== null && row.attempt === 1;
+
 export function jobAudit(
-  deps: QueueDeps, tx: Tx, job: Pick<JobRow, "publicId" | "correlationId">,
+  deps: QueueDeps, tx: Tx, job: Pick<JobRow, "publicId" | "correlationId"> & Partial<ScheduleAttempt>,
   eventName: string, outcome: AuditOutcome, reasonCode?: string, system = false, counts?: Record<string, number>,
 ): Promise<void> {
   return deps.audit.record({
     category: "job", eventName, outcome, reasonCode, action: "transition",
     resource: { type: "job", publicId: job.publicId }, jobId: job.publicId, correlationId: job.correlationId,
     safeCounts: counts,
+    ...(job.scheduleName ? { attributes: {
+      job_type: job.type ?? null, schedule_key: job.scheduleName,
+      schedule_slot: job.scheduleSlot?.toISOString() ?? null, attempt: job.attempt ?? null,
+    } } : {}),
     ...(system ? { actor: { role: "system" } } : {}),
   }, tx);
 }
@@ -168,7 +176,9 @@ export class JobEngine implements JobQueue {
         : eq(jobRuns.publicId, publicId),
     ).limit(1).for("update");
     if (!stored) throw new Error("JOB_ENQUEUE_INVARIANT");
-    if (stored.publicId === publicId) await jobAudit(deps, tx, { publicId, correlationId }, "job.enqueued", "completed");
+    if (!slot && stored.publicId === publicId) {
+      await jobAudit(deps, tx, { publicId, correlationId }, "job.enqueued", "completed");
+    }
     return { jobId: stored.publicId };
   }
 
@@ -207,8 +217,11 @@ export class JobEngine implements JobQueue {
       await tx.update(jobRuns).set({ state: "running", leaseUntil: newLease, attempt, fencingToken, updatedAt: now })
         .where(eq(jobRuns.id, candidate.id));
       await tx.insert(jobAttempts).values({ jobId: candidate.id, fencingToken, attempt, state: "running", startedAt: now });
-      await workerContext(deps, candidate, () => jobAudit(deps, tx, candidate, "job.claimed", "attempted", undefined, true));
-      return { ...candidate, attempt, fencingToken };
+      const claimed = { ...candidate, attempt, fencingToken };
+      if (!isRoutineScheduledAttempt(claimed)) {
+        await workerContext(deps, claimed, () => jobAudit(deps, tx, claimed, "job.claimed", "attempted", undefined, true));
+      }
+      return claimed;
     }, { isolationLevel: "read committed" });
     if (!row) return null;
     const controller = new AbortController();
@@ -235,7 +248,7 @@ export class JobEngine implements JobQueue {
         }
       },
     };
-    return { job, controller };
+    return { job, controller, startedAtMs: performance.now() };
   }
 
   async #owned(tx: Tx, job: ClaimedJob): Promise<JobRow | undefined> {
@@ -302,19 +315,33 @@ export class JobEngine implements JobQueue {
   }
 
   async finish(claim: ActiveClaim, result: JobResult): Promise<boolean> {
-    return this.deps.db.transaction(async (tx) => {
+    const settled = await this.deps.db.transaction(async (tx) => {
       const row = await this.#owned(tx, claim.job);
       if (!row) {
         claim.controller.abort();
-        return false;
+        return null;
       }
       const reason = result.outcome === "completed" ? undefined
         : SAFE_REASON.test(result.reasonCode) ? result.reasonCode : "JOB_RESULT_UNAVAILABLE";
       const retry = result.outcome === "failed" && result.retryable;
-      await this.#settle(tx, row, result.outcome, reason, retry,
-        result.outcome === "completed" ? safeCounts(result.safeCounts) : undefined);
-      return true;
+      const counts = result.outcome === "completed" ? safeCounts(result.safeCounts) : undefined;
+      await this.#settle(tx, row, result.outcome, reason, retry, counts);
+      return { row, counts };
     }, { isolationLevel: "read committed" });
+    if (!settled) return false;
+    const { row, counts } = settled;
+    if (result.outcome === "completed" && isRoutineScheduledAttempt(row)) {
+      // The run and attempt are committed; operational logging must not affect disposition.
+      try {
+        this.deps.logger.info("scheduled job completed", {
+          component: "jobs.queue", jobId: row.publicId, jobType: row.type,
+          scheduleName: row.scheduleName, scheduleSlot: row.scheduleSlot?.toISOString() ?? null,
+          correlationId: row.correlationId, durationMs: Math.round(performance.now() - claim.startedAtMs),
+          safeCounts: counts ?? {},
+        });
+      } catch { /* the job ledger remains authoritative */ }
+    }
+    return true;
   }
 
   async interrupt(claim: ActiveClaim, reason = "JOB_WORKER_STOPPED"): Promise<boolean> {
@@ -367,13 +394,13 @@ export class JobEngine implements JobQueue {
     await tx.update(jobAttempts).set({ state: outcome, reasonCode, safeCounts: counts, finishedAt: now })
       .where(and(eq(jobAttempts.jobId, row.id), eq(jobAttempts.fencingToken, row.fencingToken)));
     if (row.type === "jobs.mail.deliver" && !queued) await this.#settleInterruptedMail(tx, row, now);
-    if (outcome !== "interrupted") {
+    if (outcome === "interrupted") {
+      await jobAudit(deps, tx, row, state === "unknown" ? "job.unknown" : "job.failed",
+        state === "unknown" ? "unknown" : "failed", reasonCode, true);
+    } else if (outcome !== "completed" || !isRoutineScheduledAttempt(row)) {
       const event = ({ completed: "job.completed", failed: "job.failed", canceled: "job.canceled", unknown: "job.unknown" })[outcome];
       await jobAudit(deps, tx, row, event, outcome, reasonCode, true, counts);
       if (inheritedUnknown) await jobAudit(deps, tx, row, "job.unknown", "unknown", "JOB_PRIOR_ATTEMPT_UNKNOWN", true);
-    } else {
-      await jobAudit(deps, tx, row, state === "unknown" ? "job.unknown" : "job.failed",
-        state === "unknown" ? "unknown" : "failed", reasonCode, true);
     }
     if (queued) await jobAudit(deps, tx, row, "job.retry.queued", "completed", reasonCode, true);
   }
