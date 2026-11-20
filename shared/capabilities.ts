@@ -12,6 +12,7 @@ export const CAPABILITIES = [
   "customers.credentials.administer",
   "sessions.revoke_any",
   "staff.manage",
+  "customers.reference.change",
   // orders / catalog
   "orders.create",
   "orders.read_all",
@@ -42,6 +43,7 @@ export const CAPABILITIES = [
   "audit.export",
   "audit.cases.manage",
   "audit.retention.manage",
+  "siem.read",
   "siem.manage",
   // platform / integrations / jobs
   "platform.settings.manage",
@@ -97,6 +99,7 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "customers.credentials.administer",
   "sessions.revoke_any",
   "staff.manage",
+  "customers.reference.change",
   "orders.reassign",
   "orders.identifiers.change",
   "audit.export",
