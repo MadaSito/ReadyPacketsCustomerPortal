@@ -14,6 +14,7 @@ import { createTRPCContext } from "@trpc/tanstack-react-query";
 import superjson from "superjson";
 import type { AppRouter } from "@server/trpc/root";
 import type { SafeErrorData } from "@server/trpc/trpc";
+import { TRPC_CLIENT_MAX_URL_LENGTH, TRPC_MAX_BATCH_SIZE } from "@shared/apiLimits";
 import { apiUrl } from "./runtime";
 import { sessionFetch } from "./sessionTransport";
 
@@ -52,7 +53,7 @@ export const dropInfiniteDirectionLink: TRPCLink<AppRouter> = () => ({ op, next 
 
 export function createApiClient() {
   return createTRPCClient<AppRouter>({
-    links: [dropInfiniteDirectionLink, httpBatchLink({ url: apiUrl("/api/trpc"), transformer: superjson, maxItems: 10, fetch: sessionFetch })],
+    links: [dropInfiniteDirectionLink, httpBatchLink({ url: apiUrl("/api/trpc"), transformer: superjson, maxItems: TRPC_MAX_BATCH_SIZE, maxURLLength: TRPC_CLIENT_MAX_URL_LENGTH, fetch: sessionFetch })],
   });
 }
 

@@ -18,6 +18,7 @@ import express, { type ErrorRequestHandler, type Express, type Request, type Req
 import type { AnyTRPCProcedure, AnyTRPCRouter } from "@trpc/server";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { HEADER_CSRF } from "../../shared/sessionTransportHeaders.js";
+import { MAX_REQUEST_TARGET_LENGTH, TRPC_MAX_BATCH_SIZE } from "../../shared/apiLimits.js";
 import type { Services } from "../container.js";
 import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
@@ -52,8 +53,8 @@ export interface AppOptions {
 }
 
 const JSON_LIMIT_BYTES = 256 * 1024;
-const MAX_BATCH_SIZE = 8;
-const MAX_REQUEST_TARGET = 8_192;
+const MAX_BATCH_SIZE = TRPC_MAX_BATCH_SIZE;
+const MAX_REQUEST_TARGET = MAX_REQUEST_TARGET_LENGTH;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const PROBE_PATHS = new Set(["/healthz", "/readyz"]);
 const CATEGORY_PRIORITY: Record<RateLimitCategory, number> = {
