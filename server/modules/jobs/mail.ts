@@ -61,10 +61,10 @@ export function createMailer(deps: MailDeps): Mailer {
 
 export async function mailAudit(
   deps: QueueDeps, tx: Tx, mail: Pick<MailRow, "publicId" | "correlationId" | "jobPublicId">, name: string,
-  outcome: AuditOutcome, reasonCode?: string, system = false,
+  outcome: AuditOutcome, reasonCode?: string, system = false, action: "transition" | "read" = "transition",
 ): Promise<void> {
   await deps.audit.record({
-    category: "job", eventName: name, action: "transition", outcome, reasonCode,
+    category: "job", eventName: name, action, outcome, reasonCode,
     resource: { type: "mail", publicId: mail.publicId }, correlationId: mail.correlationId, jobId: mail.jobPublicId ?? undefined,
     ...(system ? { actor: { role: "system" } } : {}),
   }, tx);
@@ -166,7 +166,7 @@ export class MailEngine implements Mailer {
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
     if (!row || row.state !== "captured" || row.captureEnc === null || row.expiresAt <= this.deps.clock.now()) throw notFound();
     const value = captureSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.captureEnc, `mail_outbox.capture_enc:${row.publicId}`)));
-    await mailAudit(this.deps, tx, row, "job.mail.capture.viewed", "completed");
+    await mailAudit(this.deps, tx, row, "job.mail.capture.viewed", "completed", undefined, false, "read");
     return value;
   }
 

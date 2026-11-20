@@ -421,6 +421,9 @@ describe("MySQL transactional mail outbox", () => {
     expect(row).toMatchObject({ state: "captured", payloadEnc: null });
     expect(row?.captureEnc).not.toContain(input.vars.link);
     expect(await f.admin.capture(f.operator, row!.publicId)).toMatchObject({ text: expect.stringContaining(input.vars.link) });
+    expect(f.h.audit.named("job.mail.capture.viewed")).toMatchObject([{
+      action: "read", outcome: "completed", resource: { type: "mail", publicId: row!.publicId },
+    }]);
     expect(ports.send).not.toHaveBeenCalled();
     f.h.clock.advance(16 * 60_000);
     const renewed = fakePrincipal({ role: "admin", stepUpAt: f.h.clock.now() });
