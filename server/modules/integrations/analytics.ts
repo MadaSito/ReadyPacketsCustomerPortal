@@ -13,7 +13,7 @@
 import type { ModuleDeps } from "../../container.js";
 import { validation } from "../../core/errors.js";
 import type { SessionPrincipal } from "../../core/types.js";
-import { isFlagEnabled, readSetting, writeSetting } from "../platform/index.js";
+import { readSetting, writeSetting } from "../platform/index.js";
 import { flagKey } from "../platform/settingsRegistry.js";
 import { assertIntegrationsManageInTx, assertIntegrationsManagePreflight } from "./authz.js";
 import {
@@ -32,6 +32,7 @@ import {
   isValidPostHogProjectKey,
   PERMANENTLY_EXCLUDED_ANALYTICS_PREFIXES,
   POSTHOG_CLOUD_ORIGINS,
+  readIntegrationFlag,
 } from "./settings.js";
 
 export interface AnalyticsCspPolicy {
@@ -92,9 +93,9 @@ const ANALYTICS_VERIFICATION_NOTE =
 export function createAnalyticsService(deps: ModuleDeps): AnalyticsService {
   async function loadEffectiveState() {
     const [clarityFlag, clarityId, posthogFlag, posthogKey, posthogHost, selfHostedOrigins] = await Promise.all([
-      isFlagEnabled(deps.settings, INTEGRATIONS_CLARITY_FLAG),
+      readIntegrationFlag(deps.settings, INTEGRATIONS_CLARITY_FLAG),
       readSetting(deps.settings, INTEGRATIONS_CLARITY_PROJECT_ID),
-      isFlagEnabled(deps.settings, INTEGRATIONS_POSTHOG_FLAG),
+      readIntegrationFlag(deps.settings, INTEGRATIONS_POSTHOG_FLAG),
       readSetting(deps.settings, INTEGRATIONS_POSTHOG_PROJECT_KEY),
       readSetting(deps.settings, INTEGRATIONS_POSTHOG_HOST),
       readSetting(deps.settings, INTEGRATIONS_POSTHOG_ALLOWED_ORIGINS),

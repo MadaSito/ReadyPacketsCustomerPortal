@@ -1,25 +1,28 @@
 /**
- * Optional Stripe Adapter Scaffold & Signature-Verified Webhook (`services.integrations.stripe`).
+ * Disabled Stripe Scaffold & Inert Signature-Verified Webhook (`services.integrations.stripe`).
  *
- * Security & honesty invariants:
- *  - Off by default (`isOnlinePaymentConfigured()` returns `false`).
+ * Release posture & security invariants (binding architecture & integrator decision):
+ *  - Stripe is a DISABLED SCAFFOLD ONLY in this release (`STRIPE_LEDGER_MUTATION_ENABLED === false`).
+ *  - Cannot be enabled by any runtime setting or feature flag: `isOnlinePaymentConfigured()` always
+ *    returns `false`, `updateConfig({ enabled: true, ... })` is refused with `STRIPE_NOT_AVAILABLE_IN_RELEASE`,
+ *    and the admin surface reports `"Not available in this release"`.
+ *  - No provider event can ever book, complete, or refund a payment in the compliance ledger; payments
+ *    are recorded manually by authorized staff with `invoices.manage` + fresh step-up.
  *  - Keys (`secretKey`, `webhookSecret`) are stored exclusively via `defineSecret` (`FieldCrypto`
- *    AES-256-GCM at rest) and are write-only in administrative APIs.
- *  - Webhook endpoint (`/api/integrations/webhooks/stripe`) is inert when unconfigured/disabled,
- *    verifies `Stripe-Signature` (`t=...,v1=...` HMAC-SHA256 + timestamp replay window) over the raw
- *    `Buffer` BEFORE JSON parsing, reserves `(provider, external_event_id)` durably in
- *    `integration_webhook_events` to guarantee idempotent processing, and delegates ledger updates
- *    to `services.compliance.recordProviderPayment(..., tx)` inside the same transaction.
- *  - Honestly reported as "Implemented webhook adapter, not exercised against live Stripe."
+ *    AES-256-GCM at rest, non-exportable) and are write-only in administrative APIs.
+ *  - `/api/integrations/webhooks/stripe` remains inert (`503`) when no signing secret is configured;
+ *    when a signing secret is configured for integration testing, it verifies `Stripe-Signature`
+ *    (`t=...,v1=...` HMAC-SHA256 + replay window) over the raw `Buffer`, durably records the received
+ *    event row (`status: "ignored"`) + audit note, and acknowledges with zero ledger effect.
  */
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
-import { validation } from "../../core/errors.js";
+import { DomainError, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { SessionPrincipal, Tx } from "../../core/types.js";
-import { isFlagEnabled, isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
+import type { SessionPrincipal } from "../../core/types.js";
+import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { flagKey } from "../platform/settingsRegistry.js";
 import { assertIntegrationsManageInTx, assertIntegrationsManagePreflight } from "./authz.js";
 import type { ProviderChecksStore } from "./providerChecks.js";
@@ -32,8 +35,19 @@ import {
 } from "./settings.js";
 import type { ProviderState } from "./smtp.js";
 
+/** Compile-time constant: automatic provider ledger mutations are hard-disabled in this release. */
+export const STRIPE_LEDGER_MUTATION_ENABLED = false as const;
+
+export const STRIPE_RELEASE_BANNER =
+  "Not available in this release — online checkout and automatic ledger booking are disabled; staff record payments manually.";
+
+const STRIPE_VERIFICATION_NOTE =
+  "Disabled scaffold in this release (implemented signature-verified inert webhook receiver only; never mutates the compliance ledger and not exercised against live Stripe APIs).";
+
 export interface StripeConfigView {
-  enabled: boolean;
+  enabled: false;
+  availableInRelease: false;
+  releaseBanner: string;
   configured: boolean;
   verified: boolean;
   state: ProviderState;
@@ -48,6 +62,7 @@ export interface StripeConfigView {
 }
 
 export interface UpdateStripeConfigInput {
+  /** Must not be `true`; attempting to enable Stripe throws `NOT_CONFIGURED / STRIPE_NOT_AVAILABLE_IN_RELEASE`. */
   enabled: boolean;
   publishableKey: string;
   webhookToleranceSeconds?: number;
@@ -61,6 +76,7 @@ export interface StripeWebhookResult {
   httpStatus: 200 | 400 | 409 | 503;
   accepted: boolean;
   duplicate: boolean;
+  ledgerMutated: false;
   reasonCode: string;
 }
 
@@ -70,9 +86,6 @@ export interface StripeService {
   updateConfig(principal: SessionPrincipal, input: UpdateStripeConfigInput): Promise<StripeConfigView>;
   handleSignedWebhook(input: { rawBody: Buffer; signatureHeader: string | undefined }): Promise<StripeWebhookResult>;
 }
-
-const STRIPE_VERIFICATION_NOTE =
-  "Implemented signature-verified webhook adapter and idempotent compliance ledger hook; not exercised against live Stripe APIs in this environment.";
 
 const stripeEventEnvelopeSchema = z.object({
   id: z.string().regex(/^evt_[A-Za-z0-9_]{6,96}$/),
@@ -91,44 +104,48 @@ export function verifyStripeWebhookSignature(
   toleranceSeconds: number,
 ): { ok: true; timestampSeconds: number } | { ok: false; reasonCode: string } {
   if (!signatureHeader || signatureHeader.length > 1024) {
-    return { ok: false, reasonCode: "MISSING_SIGNATURE" };
+    return { ok: false, reasonCode: "MISSING_OR_OVERSIZED_SIGNATURE" };
   }
 
-  let timestampStr: string | null = null;
-  const v1Signatures: string[] = [];
+  let timestampRaw: string | null = null;
+  const v1HexCandidates: string[] = [];
 
   for (const part of signatureHeader.split(",")) {
     const eqIdx = part.indexOf("=");
     if (eqIdx <= 0) continue;
     const key = part.slice(0, eqIdx).trim();
     const val = part.slice(eqIdx + 1).trim();
-    if (key === "t" && /^\d{1,12}$/.test(val)) {
-      timestampStr = val;
-    } else if (key === "v1" && /^[0-9a-fA-F]{64}$/.test(val)) {
-      v1Signatures.push(val.toLowerCase());
+    if (key === "t" && timestampRaw === null) {
+      timestampRaw = val;
+    } else if (key === "v1" && /^[0-9a-f]{64}$/i.test(val)) {
+      v1HexCandidates.push(val.toLowerCase());
     }
   }
 
-  if (!timestampStr || v1Signatures.length === 0) {
-    return { ok: false, reasonCode: "MALFORMED_SIGNATURE" };
+  if (!timestampRaw || !/^\d{9,12}$/.test(timestampRaw) || v1HexCandidates.length === 0) {
+    return { ok: false, reasonCode: "MALFORMED_SIGNATURE_HEADER" };
   }
 
-  const timestampSeconds = Number(timestampStr);
+  const timestampSeconds = Number.parseInt(timestampRaw, 10);
+  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds <= 0) {
+    return { ok: false, reasonCode: "INVALID_SIGNATURE_TIMESTAMP" };
+  }
+
   const nowSeconds = Math.floor(now.getTime() / 1000);
-  if (Math.abs(nowSeconds - timestampSeconds) > toleranceSeconds) {
+  const skewSeconds = Math.abs(nowSeconds - timestampSeconds);
+  if (skewSeconds > toleranceSeconds) {
     return { ok: false, reasonCode: "STALE_WEBHOOK_TIMESTAMP" };
   }
 
-  const hmac = createHmac("sha256", webhookSecret);
-  hmac.update(timestampStr, "utf8");
-  hmac.update(".", "utf8");
-  hmac.update(rawBody);
-  const expectedBuf = hmac.digest();
+  const expectedMac = createHmac("sha256", webhookSecret)
+    .update(`${timestampSeconds}.`, "utf8")
+    .update(rawBody)
+    .digest();
 
   let matched = false;
-  for (const candidateHex of v1Signatures) {
+  for (const candidateHex of v1HexCandidates.slice(0, 8)) {
     const candidateBuf = Buffer.from(candidateHex, "hex");
-    if (candidateBuf.byteLength === expectedBuf.byteLength && timingSafeEqual(candidateBuf, expectedBuf)) {
+    if (candidateBuf.byteLength === expectedMac.byteLength && timingSafeEqual(candidateBuf, expectedMac)) {
       matched = true;
     }
   }
@@ -136,96 +153,13 @@ export function verifyStripeWebhookSignature(
   if (!matched) {
     return { ok: false, reasonCode: "INVALID_SIGNATURE" };
   }
+
   return { ok: true, timestampSeconds };
-}
-
-interface ExtractedPaymentMutation {
-  providerPaymentId: string;
-  invoicePublicId?: string;
-  orderPublicId?: string;
-  kind: "succeeded" | "failed" | "refunded";
-  amountMinor: number;
-  currency: string;
-}
-
-function extractPaymentMutation(
-  eventType: string,
-  obj: Record<string, unknown>,
-): ExtractedPaymentMutation | null {
-  const metadata =
-    typeof obj.metadata === "object" && obj.metadata !== null
-      ? (obj.metadata as Record<string, unknown>)
-      : {};
-  const invoicePublicId =
-    typeof metadata.invoicePublicId === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(metadata.invoicePublicId)
-      ? metadata.invoicePublicId
-      : undefined;
-  const orderPublicId =
-    typeof metadata.orderPublicId === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(metadata.orderPublicId)
-      ? metadata.orderPublicId
-      : undefined;
-
-  const rawId = typeof obj.id === "string" && /^[A-Za-z0-9_]{4,128}$/.test(obj.id) ? obj.id : null;
-  if (!rawId) return null;
-
-  const currencyRaw = typeof obj.currency === "string" ? obj.currency.trim().toUpperCase() : "";
-  if (!/^[A-Z]{3}$/.test(currencyRaw)) return null;
-
-  if (eventType === "payment_intent.succeeded" || eventType === "checkout.session.completed") {
-    const amount =
-      typeof obj.amount_received === "number"
-        ? obj.amount_received
-        : typeof obj.amount_total === "number"
-          ? obj.amount_total
-          : typeof obj.amount === "number"
-            ? obj.amount
-            : null;
-    if (amount === null || !Number.isInteger(amount) || amount < 0) return null;
-    return {
-      providerPaymentId: rawId,
-      invoicePublicId,
-      orderPublicId,
-      kind: "succeeded",
-      amountMinor: amount,
-      currency: currencyRaw,
-    };
-  }
-
-  if (eventType === "payment_intent.payment_failed") {
-    const amount = typeof obj.amount === "number" && Number.isInteger(obj.amount) && obj.amount >= 0 ? obj.amount : 0;
-    return {
-      providerPaymentId: rawId,
-      invoicePublicId,
-      orderPublicId,
-      kind: "failed",
-      amountMinor: amount,
-      currency: currencyRaw,
-    };
-  }
-
-  if (eventType === "charge.refunded") {
-    const amountRefunded =
-      typeof obj.amount_refunded === "number" && Number.isInteger(obj.amount_refunded) && obj.amount_refunded > 0
-        ? obj.amount_refunded
-        : null;
-    if (amountRefunded === null) return null;
-    return {
-      providerPaymentId: rawId,
-      invoicePublicId,
-      orderPublicId,
-      kind: "refunded",
-      amountMinor: amountRefunded,
-      currency: currencyRaw,
-    };
-  }
-
-  return null;
 }
 
 export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStore): StripeService {
   async function loadView(): Promise<StripeConfigView> {
-    const [enabled, cfg, hasSecretKey, hasWebhookSecret, check] = await Promise.all([
-      isFlagEnabled(deps.settings, INTEGRATIONS_STRIPE_FLAG),
+    const [cfg, hasSecretKey, hasWebhookSecret, check] = await Promise.all([
       readSetting(deps.settings, INTEGRATIONS_STRIPE_CONFIG),
       isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_SECRET_KEY),
       isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_WEBHOOK_SECRET),
@@ -233,33 +167,16 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
     ]);
 
     const configured = hasSecretKey && hasWebhookSecret;
-    let state: ProviderState;
-    let summary: string;
     const verified = Boolean(check?.verifiedAt && check.lastOutcome === "succeeded");
 
-    if (!configured) {
-      state = "not_configured";
-      summary = "Stripe adapter is not configured — off by default.";
-    } else if (!enabled) {
-      state = "disabled";
-      summary = "Stripe credentials are saved, but online payment/webhook processing is disabled.";
-    } else if (check?.lastOutcome === "failed") {
-      state = "failing";
-      summary = "Last Stripe webhook processing attempt failed.";
-    } else if (verified) {
-      state = "configured";
-      summary = "Stripe webhook adapter enabled; signed webhook verified at last check.";
-    } else {
-      state = "configured";
-      summary = "Stripe webhook adapter configured (not exercised against live Stripe).";
-    }
-
     return {
-      enabled,
+      enabled: false,
+      availableInRelease: false,
+      releaseBanner: STRIPE_RELEASE_BANNER,
       configured,
       verified,
-      state,
-      summary,
+      state: "disabled",
+      summary: STRIPE_RELEASE_BANNER,
       publishableKey: cfg.publishableKey,
       secretKeyConfigured: hasSecretKey,
       webhookSecretConfigured: hasWebhookSecret,
@@ -272,12 +189,8 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
 
   return {
     async isOnlinePaymentConfigured(): Promise<boolean> {
-      const [enabled, hasSecretKey, hasWebhookSecret] = await Promise.all([
-        isFlagEnabled(deps.settings, INTEGRATIONS_STRIPE_FLAG),
-        isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_SECRET_KEY),
-        isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_WEBHOOK_SECRET),
-      ]);
-      return enabled && hasSecretKey && hasWebhookSecret;
+      // Compile-time disabled in this release regardless of stored settings or flags.
+      return STRIPE_LEDGER_MUTATION_ENABLED;
     },
 
     getConfig(): Promise<StripeConfigView> {
@@ -288,28 +201,40 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
       const now = deps.clock.now();
       assertIntegrationsManagePreflight(principal, now);
 
-      const publishableKey = input.publishableKey.trim();
-      if (publishableKey !== "" && !/^pk_(?:test|live)_[A-Za-z0-9]{12,180}$/.test(publishableKey)) {
-        throw validation(
-          "INVALID_STRIPE_PUBLISHABLE_KEY",
-          "Stripe publishable key must start with pk_test_ or pk_live_.",
+      if (input.enabled) {
+        throw new DomainError(
+          "NOT_CONFIGURED",
+          "STRIPE_NOT_AVAILABLE_IN_RELEASE",
+          STRIPE_RELEASE_BANNER,
         );
       }
-      if (input.secretKey !== undefined && input.secretKey !== null) {
-        if (!/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{10,220}$/.test(input.secretKey)) {
-          throw validation(
-            "INVALID_STRIPE_SECRET_KEY",
-            "Stripe secret key must start with sk_test_, sk_live_, rk_test_ or rk_live_.",
-          );
-        }
+
+      const publishableKey = input.publishableKey.trim();
+      if (publishableKey !== "" && !/^pk_(?:test|live)_[A-Za-z0-9]{10,200}$/.test(publishableKey)) {
+        throw validation(
+          "INVALID_STRIPE_PUBLISHABLE_KEY",
+          "Publishable key must start with pk_test_ or pk_live_.",
+        );
       }
-      if (input.webhookSecret !== undefined && input.webhookSecret !== null) {
-        if (!/^whsec_[A-Za-z0-9_]{10,220}$/.test(input.webhookSecret)) {
-          throw validation(
-            "INVALID_STRIPE_WEBHOOK_SECRET",
-            "Stripe webhook signing secret must start with whsec_.",
-          );
-        }
+
+      if (
+        typeof input.secretKey === "string" &&
+        !/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{10,220}$/.test(input.secretKey.trim())
+      ) {
+        throw validation(
+          "INVALID_STRIPE_SECRET_KEY",
+          "Stripe secret key must start with sk_test_, sk_live_, rk_test_, or rk_live_.",
+        );
+      }
+
+      if (
+        typeof input.webhookSecret === "string" &&
+        !/^whsec_[A-Za-z0-9_]{10,220}$/.test(input.webhookSecret.trim())
+      ) {
+        throw validation(
+          "INVALID_STRIPE_WEBHOOK_SECRET",
+          "Stripe webhook signing secret must start with whsec_.",
+        );
       }
 
       const tolerance = input.webhookToleranceSeconds ?? 300;
@@ -323,25 +248,6 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
       await deps.db.transaction(async (tx) => {
         await assertIntegrationsManageInTx(deps, principal, tx);
 
-        const prevSecretSet = await isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_SECRET_KEY, tx);
-        const prevWebhookSet = await isSecretConfigured(deps.settings, INTEGRATIONS_STRIPE_WEBHOOK_SECRET, tx);
-
-        const nextSecretSet =
-          input.secretKey === null ? false : typeof input.secretKey === "string" ? true : prevSecretSet;
-        const nextWebhookSet =
-          input.webhookSecret === null
-            ? false
-            : typeof input.webhookSecret === "string"
-              ? true
-              : prevWebhookSet;
-
-        if (input.enabled && (!nextSecretSet || !nextWebhookSet)) {
-          throw validation(
-            "STRIPE_SECRETS_REQUIRED",
-            "Save both the Stripe secret key and webhook signing secret before enabling Stripe.",
-          );
-        }
-
         await writeSetting(
           deps.settings,
           INTEGRATIONS_STRIPE_CONFIG,
@@ -349,28 +255,35 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
           tx,
         );
         if (input.secretKey !== undefined) {
-          await deps.settings.setSecret(INTEGRATIONS_STRIPE_SECRET_KEY.key, input.secretKey, tx);
+          await deps.settings.setSecret(
+            INTEGRATIONS_STRIPE_SECRET_KEY.key,
+            input.secretKey === null ? null : input.secretKey.trim(),
+            tx,
+          );
         }
         if (input.webhookSecret !== undefined) {
-          await deps.settings.setSecret(INTEGRATIONS_STRIPE_WEBHOOK_SECRET.key, input.webhookSecret, tx);
-        }
-        await deps.settings.set(flagKey(INTEGRATIONS_STRIPE_FLAG.flag), input.enabled, tx);
-
-        if (input.secretKey !== undefined || input.webhookSecret !== undefined) {
+          await deps.settings.setSecret(
+            INTEGRATIONS_STRIPE_WEBHOOK_SECRET.key,
+            input.webhookSecret === null ? null : input.webhookSecret.trim(),
+            tx,
+          );
           await checks.clearVerification("stripe", tx);
         }
+        // Always force the runtime flag off so no setting export/import can ever mark Stripe active.
+        await deps.settings.set(flagKey(INTEGRATIONS_STRIPE_FLAG.flag), false, tx);
 
         await deps.audit.record(
           {
             category: "integration",
-            eventName: "integration.stripe.updated",
+            eventName: "integration.stripe.scaffold_updated",
             action: "update",
             outcome: "completed",
             severity: "INFO",
             provider: "stripe",
             resource: { type: "integration_provider", publicId: "stripe" },
             attributes: {
-              enabled: input.enabled,
+              enabled: false,
+              available_in_release: false,
               secret_key_updated: input.secretKey !== undefined,
               webhook_secret_updated: input.webhookSecret !== undefined,
               tolerance_seconds: tolerance,
@@ -385,18 +298,18 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
 
     async handleSignedWebhook(input): Promise<StripeWebhookResult> {
       const now = deps.clock.now();
-      const [enabled, cfg, webhookSecret] = await Promise.all([
-        isFlagEnabled(deps.settings, INTEGRATIONS_STRIPE_FLAG),
+      const [cfg, webhookSecret] = await Promise.all([
         readSetting(deps.settings, INTEGRATIONS_STRIPE_CONFIG),
         readSecret(deps.settings, INTEGRATIONS_STRIPE_WEBHOOK_SECRET),
       ]);
 
-      // Inert unless explicitly enabled and signing secret configured
-      if (!enabled || !webhookSecret) {
+      // Inert (`503`) unless an administrator stored a signing secret for webhook verification testing.
+      if (!webhookSecret) {
         return {
           httpStatus: 503,
           accepted: false,
           duplicate: false,
+          ledgerMutated: false,
           reasonCode: "STRIPE_NOT_CONFIGURED",
         };
       }
@@ -406,34 +319,37 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
           httpStatus: 400,
           accepted: false,
           duplicate: false,
+          ledgerMutated: false,
           reasonCode: "INVALID_WEBHOOK_BODY",
         };
       }
 
-      const verification = verifyStripeWebhookSignature(
+      const sigVerdict = verifyStripeWebhookSignature(
         input.rawBody,
         input.signatureHeader,
         webhookSecret,
         now,
         cfg.webhookToleranceSeconds,
       );
-      if (!verification.ok) {
-        await deps.audit.record({
-          category: "security",
-          eventName: "integration.stripe.webhook.rejected",
-          action: "verify_webhook",
+      if (!sigVerdict.ok) {
+        await checks.recordOutcome("stripe", "failed", sigVerdict.reasonCode);
+        deps.audit.note({
+          category: "integration",
+          eventName: "integration.stripe.webhook_rejected",
+          action: "verify",
           outcome: "denied",
           severity: "WARN",
-          reasonCode: verification.reasonCode,
-          actor: { role: "anonymous" },
+          reasonCode: sigVerdict.reasonCode,
           provider: "stripe",
-          resource: { type: "webhook_endpoint", publicId: "stripe" },
+          actor: { role: "system" },
+          resource: { type: "integration_webhook" },
         });
         return {
           httpStatus: 400,
           accepted: false,
           duplicate: false,
-          reasonCode: verification.reasonCode,
+          ledgerMutated: false,
+          reasonCode: sigVerdict.reasonCode,
         };
       }
 
@@ -441,29 +357,34 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
       try {
         rawJson = JSON.parse(input.rawBody.toString("utf8"));
       } catch {
+        await checks.recordOutcome("stripe", "failed", "MALFORMED_WEBHOOK_JSON");
         return {
           httpStatus: 400,
           accepted: false,
           duplicate: false,
-          reasonCode: "INVALID_WEBHOOK_JSON",
+          ledgerMutated: false,
+          reasonCode: "MALFORMED_WEBHOOK_JSON",
         };
       }
 
-      const parsedEvent = stripeEventEnvelopeSchema.safeParse(rawJson);
-      if (!parsedEvent.success) {
+      const parsedEnvelope = stripeEventEnvelopeSchema.safeParse(rawJson);
+      if (!parsedEnvelope.success) {
+        await checks.recordOutcome("stripe", "failed", "INVALID_WEBHOOK_ENVELOPE");
         return {
           httpStatus: 400,
           accepted: false,
           duplicate: false,
-          reasonCode: "INVALID_STRIPE_EVENT_SCHEMA",
+          ledgerMutated: false,
+          reasonCode: "INVALID_WEBHOOK_ENVELOPE",
         };
       }
 
-      const event = parsedEvent.data;
+      const event = parsedEnvelope.data;
       const payloadSha256 = createHash("sha256").update(input.rawBody).digest("hex");
       const providerTimestamp = new Date(event.created * 1000);
-      const mutation = extractPaymentMutation(event.type, event.data.object);
+      const eventPublicId = ulid();
 
+      // Durable idempotency + audit only — ZERO compliance ledger mutations (`STRIPE_LEDGER_MUTATION_ENABLED === false`).
       return deps.db.transaction(async (tx) => {
         const [existing] = await tx
           .select()
@@ -479,149 +400,99 @@ export function createStripeService(deps: ModuleDeps, checks: ProviderChecksStor
 
         if (existing) {
           if (existing.payloadSha256 !== payloadSha256) {
-            await deps.audit.record(
-              {
-                category: "security",
-                eventName: "integration.stripe.webhook.rejected",
-                action: "verify_webhook",
-                outcome: "denied",
-                severity: "WARN",
-                reasonCode: "WEBHOOK_PAYLOAD_MISMATCH",
-                actor: { role: "anonymous" },
-                provider: "stripe",
-                deliveryId: event.id,
-                resource: { type: "webhook_event", publicId: existing.publicId },
-              },
-              tx,
-            );
+            deps.audit.note({
+              category: "security",
+              eventName: "integration.stripe.webhook_payload_mismatch",
+              action: "verify",
+              outcome: "denied",
+              severity: "ERROR",
+              reasonCode: "EVENT_PAYLOAD_MISMATCH",
+              provider: "stripe",
+              actor: { role: "system" },
+              resource: { type: "integration_webhook", publicId: existing.publicId },
+            });
             return {
               httpStatus: 409 as const,
               accepted: false,
               duplicate: false,
-              reasonCode: "WEBHOOK_PAYLOAD_MISMATCH",
+              ledgerMutated: false as const,
+              reasonCode: "EVENT_PAYLOAD_MISMATCH",
             };
           }
-          if (existing.status === "processed" || existing.status === "ignored") {
+          return {
+            httpStatus: 200 as const,
+            accepted: true,
+            duplicate: true,
+            ledgerMutated: false as const,
+            reasonCode: "DUPLICATE_EVENT",
+          };
+        }
+
+        try {
+          await tx.insert(integrationWebhookEvents).values({
+            publicId: eventPublicId,
+            provider: "stripe",
+            externalEventId: event.id,
+            eventType: event.type,
+            payloadSha256,
+            status: "ignored",
+            reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+            providerTimestamp,
+            processedAt: now,
+            createdAt: now,
+            updatedAt: now,
+          });
+        } catch (err) {
+          if ((err as { code?: string } | null)?.code === "ER_DUP_ENTRY") {
             return {
               httpStatus: 200 as const,
               accepted: true,
               duplicate: true,
+              ledgerMutated: false as const,
               reasonCode: "DUPLICATE_EVENT",
             };
           }
+          throw err;
         }
 
-        const eventPublicId = existing?.publicId ?? ulid();
-        if (!existing) {
-          try {
-            await tx.insert(integrationWebhookEvents).values({
-              publicId: eventPublicId,
-              provider: "stripe",
-              externalEventId: event.id,
-              eventType: event.type,
-              payloadSha256,
-              status: "processing",
-              providerTimestamp,
-              createdAt: now,
-              updatedAt: now,
-            });
-          } catch (err) {
-            if ((err as { code?: string } | null)?.code === "ER_DUP_ENTRY") {
-              return {
-                httpStatus: 200 as const,
-                accepted: true,
-                duplicate: true,
-                reasonCode: "DUPLICATE_EVENT",
-              };
-            }
-            throw err;
-          }
-        }
-
-        let status: "processed" | "ignored" = "ignored";
-        let reasonCode = "UNHANDLED_EVENT_TYPE";
-
-        if (mutation) {
-          const complianceWithHook = deps.services.compliance as
-            | {
-                recordProviderPayment?: (input: {
-                  provider: "stripe";
-                  providerEventId: string;
-                  providerPaymentId: string;
-                  invoicePublicId?: string;
-                  orderPublicId?: string;
-                  kind: "succeeded" | "failed" | "refunded";
-                  amountMinor: number;
-                  currency: string;
-                  occurredAt: Date;
-                  tx?: Tx;
-                }) => Promise<{ applied: boolean; reasonCode?: string }>;
-              }
-            | undefined;
-          const recordPayment = complianceWithHook?.recordProviderPayment;
-          if (typeof recordPayment === "function") {
-            const result = await recordPayment.call(complianceWithHook, {
-              provider: "stripe",
-              providerEventId: event.id,
-              providerPaymentId: mutation.providerPaymentId,
-              invoicePublicId: mutation.invoicePublicId,
-              orderPublicId: mutation.orderPublicId,
-              kind: mutation.kind,
-              amountMinor: mutation.amountMinor,
-              currency: mutation.currency,
-              occurredAt: providerTimestamp,
-              tx,
-            });
-            status = "processed";
-            reasonCode = result.reasonCode ?? (result.applied ? "PAYMENT_RECORDED" : "PAYMENT_NOOP");
-          } else {
-            status = "processed";
-            reasonCode = "COMPLIANCE_HOOK_UNAVAILABLE";
-          }
-        }
-
-        await tx
-          .update(integrationWebhookEvents)
-          .set({
-            status,
-            reasonCode,
-            processedAt: now,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(integrationWebhookEvents.provider, "stripe"),
-              eq(integrationWebhookEvents.externalEventId, event.id),
-            ),
-          );
-
-        await checks.recordOutcome("stripe", "succeeded", reasonCode, tx);
+        await checks.recordOutcome("stripe", "succeeded", "STRIPE_DISABLED_IN_RELEASE", tx);
 
         await deps.audit.record(
           {
             category: "integration",
-            eventName: "integration.stripe.webhook.processed",
-            action: "process",
+            eventName: "integration.stripe.webhook_received_inert",
+            action: "receive",
             outcome: "completed",
             severity: "INFO",
-            reasonCode,
-            actor: { role: "system" },
+            reasonCode: "STRIPE_DISABLED_IN_RELEASE",
             provider: "stripe",
-            deliveryId: event.id,
-            resource: { type: "webhook_event", publicId: eventPublicId },
+            actor: { role: "system" },
+            resource: { type: "integration_webhook", publicId: eventPublicId },
             attributes: {
               event_type: event.type,
-              status,
+              ledger_mutated: false,
             },
           },
           tx,
         );
+        deps.audit.note({
+          category: "integration",
+          eventName: "integration.stripe.webhook_acknowledged_no_ledger_effect",
+          action: "receive",
+          outcome: "completed",
+          severity: "INFO",
+          reasonCode: "STRIPE_DISABLED_IN_RELEASE",
+          provider: "stripe",
+          actor: { role: "system" },
+          resource: { type: "integration_webhook", publicId: eventPublicId },
+        });
 
         return {
           httpStatus: 200 as const,
           accepted: true,
           duplicate: false,
-          reasonCode,
+          ledgerMutated: false as const,
+          reasonCode: "STRIPE_DISABLED_IN_RELEASE",
         };
       });
     },

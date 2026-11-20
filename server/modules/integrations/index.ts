@@ -14,6 +14,7 @@ import {
 } from "./analytics.js";
 import {
   createEgressPolicy,
+  createPinnedLookup,
   EGRESS_PROTOCOLS,
   EGRESS_PURPOSES,
   type CreateEgressRuleInput,
@@ -53,6 +54,8 @@ import {
 } from "./smtp.js";
 import {
   createStripeService,
+  STRIPE_LEDGER_MUTATION_ENABLED,
+  STRIPE_RELEASE_BANNER,
   type StripeConfigView,
   type StripeService,
   type StripeWebhookResult,
@@ -63,9 +66,12 @@ import {
 import "./settings.js";
 
 export {
+  createPinnedLookup,
   EGRESS_PROTOCOLS,
   EGRESS_PURPOSES,
   SAML_RELEASE_BANNER,
+  STRIPE_LEDGER_MUTATION_ENABLED,
+  STRIPE_RELEASE_BANNER,
   type AdminAnalyticsConfig,
   type AnalyticsCspPolicy,
   type AnalyticsService,
@@ -126,7 +132,8 @@ export interface IntegrationsModuleOptions {
   smtpTransportFactory?: SmtpTransportFactory;
 }
 
-export interface IntegrationsModule extends ModuleLifecycle {
+export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
+  health(): Promise<ModuleHealth[]>;
   egress: EgressPolicy;
   providers: ProviderRegistry;
   smtp: SmtpService;
@@ -212,7 +219,7 @@ export function createIntegrationsModule(
         name: "Stripe Payment Webhooks",
         state: stripeView.state,
         verified: stripeView.verified,
-        scaffoldOnly: false,
+        scaffoldOnly: true,
         lastCheckedAt: stripeView.lastCheckedAt,
         summary: stripeView.summary,
       },

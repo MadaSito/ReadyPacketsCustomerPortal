@@ -132,7 +132,40 @@ export type HttpsPinnedRequester = (
 
 export interface EgressPolicyOptions {
   dnsLookup?: DnsLookupFn;
+  dnsTimeoutMs?: number;
   httpsRequester?: HttpsPinnedRequester;
+}
+
+/**
+ * Node `net`/`https` custom `lookup` implementation that pins socket resolution to the verified
+ * `(address, family)` tuple while honoring both scalar callbacks and Node >=20 `autoSelectFamily`
+ * `{ all: true }` array callbacks (`LookupAddress[]`).
+ */
+export function createPinnedLookup(pinned: Pick<PinnedEgressTarget, "address" | "family">) {
+  return (
+    _hostname: string,
+    optionsOrCallback:
+      | number
+      | { family?: number; hints?: number; all?: boolean; verbatim?: boolean }
+      | ((err: NodeJS.ErrnoException | null, address: string | Array<{ address: string; family: number }>, family?: number) => void),
+    maybeCallback?: (
+      err: NodeJS.ErrnoException | null,
+      address: string | Array<{ address: string; family: number }>,
+      family?: number,
+    ) => void,
+  ): void => {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    if (!cb) return;
+    const wantsAll =
+      typeof optionsOrCallback === "object" &&
+      optionsOrCallback !== null &&
+      optionsOrCallback.all === true;
+    if (wantsAll) {
+      cb(null, [{ address: pinned.address, family: pinned.family }]);
+    } else {
+      cb(null, pinned.address, pinned.family);
+    }
+  };
 }
 
 export interface EgressPolicy {
@@ -236,29 +269,36 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
     }
 
     let settled = false;
+    let totalDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearDeadline = () => {
+      if (totalDeadlineTimer !== undefined) {
+        clearTimeout(totalDeadlineTimer);
+        totalDeadlineTimer = undefined;
+      }
+    };
     const finishError = (err: Error) => {
       if (settled) return;
       settled = true;
+      clearDeadline();
       reject(err);
     };
 
-    const req = https.request(
-      {
-        protocol: "https:",
-        hostname: pinned.hostname,
-        port: pinned.port,
-        path: `${url.pathname}${url.search}`,
-        method: options.method,
-        headers: reqHeaders,
-        servername: pinned.servername,
-        minVersion: "TLSv1.2",
-        rejectUnauthorized: true,
-        agent: false,
-        lookup: (_host, _opts, cb) => {
-          cb(null, pinned.address, pinned.family);
-        },
-      },
-      (res) => {
+    const reqOptions: https.RequestOptions & { autoSelectFamily?: boolean } = {
+      protocol: "https:",
+      hostname: pinned.hostname,
+      port: pinned.port,
+      family: pinned.family,
+      autoSelectFamily: false,
+      path: `${url.pathname}${url.search}`,
+      method: options.method,
+      headers: reqHeaders,
+      servername: pinned.servername,
+      minVersion: "TLSv1.2",
+      rejectUnauthorized: true,
+      agent: false,
+      lookup: createPinnedLookup(pinned) as never,
+    };
+    const req = https.request(reqOptions, (res) => {
         const status = res.statusCode ?? 0;
         // Refuse all HTTP redirects rather than following across hosts or leaking payloads.
         if (status >= 300 && status < 400) {
@@ -295,6 +335,7 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
         res.on("end", () => {
           if (settled) return;
           settled = true;
+          clearDeadline();
           const headersOut: Record<string, string> = {};
           for (const [k, v] of Object.entries(res.headers)) {
             if (typeof v === "string") headersOut[k.toLowerCase()] = v;
@@ -317,6 +358,14 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
         });
       },
     );
+
+    // Hard wall-clock deadline across connect + TLS + headers + full body streaming (not just socket idle).
+    totalDeadlineTimer = setTimeout(() => {
+      req.destroy();
+      finishError(
+        new DomainError("UNAVAILABLE", "EGRESS_TIMEOUT", "The outbound provider request timed out."),
+      );
+    }, options.timeoutMs);
 
     req.setTimeout(options.timeoutMs, () => {
       req.destroy();
@@ -342,6 +391,7 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
     });
 
     req.on("close", () => {
+      clearDeadline();
       options.signal?.removeEventListener("abort", onAbort);
     });
 
@@ -409,9 +459,32 @@ function toRuleView(row: typeof integrationEgressAllowlist.$inferSelect): Egress
 
 export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOptions = {}): EgressPolicy {
   const lookup = options.dnsLookup ?? defaultDnsLookup;
+  const dnsTimeoutMs = Math.min(Math.max(options.dnsTimeoutMs ?? 5_000, 100), 30_000);
   const requester = options.httpsRequester ?? defaultHttpsRequester;
   const isProd = deps.config.nodeEnv === "production";
   const isTest = deps.config.nodeEnv === "test";
+
+  async function lookupWithDeadline(hostname: string): Promise<readonly DnsResolvedAddress[]> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        lookup(hostname),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(
+              new DomainError(
+                "UNAVAILABLE",
+                "EGRESS_DNS_TIMEOUT",
+                "Resolving the outbound destination hostname timed out.",
+              ),
+            );
+          }, dnsTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
 
   async function loadEnabledRulesForPurpose(purpose: EgressPurpose): Promise<EgressAllowlistRuleView[]> {
     try {
@@ -593,8 +666,9 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     } else {
       let rawRecords: readonly DnsResolvedAddress[];
       try {
-        rawRecords = await lookup(hostCheck.normalizedHost);
-      } catch {
+        rawRecords = await lookupWithDeadline(hostCheck.normalizedHost);
+      } catch (err) {
+        if (err instanceof DomainError) throw err;
         throw new DomainError(
           "UNAVAILABLE",
           "EGRESS_DNS_RESOLUTION_FAILED",
@@ -725,14 +799,22 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     async fetchPinned(url, purpose, fetchOptions = {}) {
       const pinned = await evaluateTarget(url, purpose, { allowedSchemes: ["https:"] });
       const parsedUrl = new URL(pinned.normalizedUrl ?? String(url));
-      return requester(pinned, parsedUrl, {
+      const resp = await requester(pinned, parsedUrl, {
         method: fetchOptions.method ?? "GET",
         headers: fetchOptions.headers,
         body: fetchOptions.body,
-        timeoutMs: Math.min(Math.max(fetchOptions.timeoutMs ?? 10_000, 500), 30_000),
+        timeoutMs: Math.min(Math.max(fetchOptions.timeoutMs ?? 10_000, 100), 30_000),
         maxResponseBytes: Math.min(Math.max(fetchOptions.maxResponseBytes ?? 262_144, 1024), 2 * 1024 * 1024),
         signal: fetchOptions.signal,
       });
+      if (resp.status >= 300 && resp.status < 400) {
+        throw new DomainError(
+          "FORBIDDEN",
+          "EGRESS_REDIRECT_REFUSED",
+          "Outbound destination attempted an HTTP redirect, which is refused by egress policy.",
+        );
+      }
+      return resp;
     },
 
     async listAllowlist() {

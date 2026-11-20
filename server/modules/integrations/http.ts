@@ -9,6 +9,7 @@
  */
 import type { Request, Response, Router } from "express";
 import type { Services } from "../../container.js";
+import { rateLimitAddress } from "../../security/rateLimitAddress.js";
 
 export function registerIntegrationsHttpRoutes(_router: Router, _services: Services): void {
   // All administrative operations use tRPC (`trpc.integrations.*`) with session + CSRF + step-up.
@@ -19,7 +20,7 @@ export function registerSignedIntegrationWebhooks(router: Router, services: Serv
     try {
       const verdict = await services.rateLimiter.consume(
         "api",
-        `webhook:stripe:${req.ip ?? "unknown"}`,
+        `webhook:stripe:${rateLimitAddress(req.ip)}`,
       );
       if (!verdict.allowed) {
         res

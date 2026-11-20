@@ -5,7 +5,8 @@
  * AES-256-GCM at rest) and are write-only in administrative APIs.
  */
 import { z } from "zod";
-import { defineFeatureFlag, defineSecret, defineSetting } from "../platform/index.js";
+import type { SettingsStore, Tx } from "../../core/types.js";
+import { defineFeatureFlag, defineSecret, defineSetting, type FeatureFlagDefinition } from "../platform/index.js";
 
 /* ----------------------------------------------------- analytics constants & validators */
 
@@ -331,3 +332,26 @@ export const INTEGRATIONS_SAML_SCAFFOLD = defineSetting({
   default: DEFAULT_SAML_SCAFFOLD,
   sensitivity: "internal",
 });
+
+/**
+ * Reads a declared feature flag consistently across both `PlatformSettingsStore` (which stores
+ * `feature.<flag>` in `platform_settings`) and `MemorySettings` test doubles (which may populate
+ * either `values.set("feature.<flag>", bool)` or `flags.add("<flag>")`).
+ */
+export async function readIntegrationFlag(
+  settings: SettingsStore,
+  def: FeatureFlagDefinition,
+  tx?: Tx,
+): Promise<boolean> {
+  const storedViaKey = await settings.get<boolean | undefined>(
+    def.key,
+    (raw) => (typeof raw === "boolean" ? raw : undefined),
+    undefined,
+    tx,
+  );
+  if (typeof storedViaKey === "boolean") {
+    return storedViaKey;
+  }
+  return settings.isFeatureEnabled(def.flag, tx);
+}
+

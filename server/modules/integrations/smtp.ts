@@ -14,11 +14,12 @@ import nodemailer from "nodemailer";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
 import type { SessionPrincipal } from "../../core/types.js";
-import { isFlagEnabled, isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
+import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { flagKey } from "../platform/settingsRegistry.js";
 import { assertIntegrationsManageInTx, assertIntegrationsManagePreflight } from "./authz.js";
 import type { EgressPolicy, PinnedEgressTarget } from "./egress.js";
 import type { ProviderChecksStore } from "./providerChecks.js";
+import { readIntegrationFlag } from "./settings.js";
 import {
   hasNoHeaderInjection,
   INTEGRATIONS_SMTP_CONFIG,
@@ -282,7 +283,7 @@ export function createSmtpService(
 
   async function loadConfigView(): Promise<SmtpConfigView> {
     const [enabled, cfg, passwordConfigured, check] = await Promise.all([
-      isFlagEnabled(deps.settings, INTEGRATIONS_SMTP_FLAG),
+      readIntegrationFlag(deps.settings, INTEGRATIONS_SMTP_FLAG),
       readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG),
       isSecretConfigured(deps.settings, INTEGRATIONS_SMTP_PASSWORD),
       checks.get("smtp"),
@@ -451,17 +452,37 @@ export function createSmtpService(
         throw validation("INVALID_RECIPIENT", "Enter a valid recipient email address for the test message.");
       }
 
-      const [cfg, password] = await Promise.all([
-        readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG),
-        readSecret(deps.settings, INTEGRATIONS_SMTP_PASSWORD),
-      ]);
-      if (!password || !isCompleteSmtpConfig(cfg, true)) {
-        throw new DomainError(
-          "NOT_CONFIGURED",
-          "SMTP_NOT_CONFIGURED",
-          "Save complete SMTP settings and credentials before sending a test message.",
+      // Phase 1: Short authoritative DB transaction BEFORE revealing secrets or opening network sockets.
+      // Re-validates the actor + session + fresh step-up under lock and persists a durable `attempted` audit row.
+      const { cfg, password } = await deps.db.transaction(async (tx) => {
+        await assertIntegrationsManageInTx(deps, principal, tx);
+        const storedCfg = await readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG, tx);
+        const storedPassword = await readSecret(deps.settings, INTEGRATIONS_SMTP_PASSWORD, tx);
+        if (!storedPassword || !isCompleteSmtpConfig(storedCfg, true)) {
+          throw new DomainError(
+            "NOT_CONFIGURED",
+            "SMTP_NOT_CONFIGURED",
+            "Save complete SMTP settings and credentials before sending a test message.",
+          );
+        }
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.smtp.test_attempted",
+            action: "test",
+            outcome: "attempted",
+            severity: "INFO",
+            provider: "smtp",
+            resource: { type: "integration_provider", publicId: "smtp" },
+            attributes: {
+              port: storedCfg.port,
+              tls_mode: storedCfg.tlsMode,
+            },
+          },
+          tx,
         );
-      }
+        return { cfg: storedCfg, password: storedPassword };
+      });
 
       let outcome: "accepted" | "rejected" | "unknown";
       let reasonCode: string;
@@ -512,8 +533,8 @@ export function createSmtpService(
       const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
       const checkOutcome = outcome === "accepted" ? "succeeded" : outcome === "rejected" ? "failed" : "unknown";
 
+      // Phase 3: Persist truthful check outcome and completion audit row (authorization already committed in Phase 1).
       await deps.db.transaction(async (tx) => {
-        await assertIntegrationsManageInTx(deps, principal, tx);
         await checks.recordOutcome("smtp", checkOutcome, reasonCode, tx);
         await deps.audit.record(
           {
@@ -551,7 +572,7 @@ export function createSmtpService(
       }
 
       const [enabled, cfg, password] = await Promise.all([
-        isFlagEnabled(deps.settings, INTEGRATIONS_SMTP_FLAG),
+        readIntegrationFlag(deps.settings, INTEGRATIONS_SMTP_FLAG),
         readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG),
         readSecret(deps.settings, INTEGRATIONS_SMTP_PASSWORD),
       ]);

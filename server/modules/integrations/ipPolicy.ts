@@ -269,8 +269,8 @@ export function classifyIpv6(u128: bigint): IpAddressClass {
     return v4Class === "CLOUD_METADATA" ? "CLOUD_METADATA" : "IPV4_TRANSITION_ADDRESS";
   }
 
-  // IPv4-translated `::ffff:0:0:0/96` (`0:0:0:0:ffff:0:w.x.y.z`)
-  if ((u128 >> 32n) === 0xffff00000000n) {
+  // IPv4-translated SIIT `::ffff:0:0/96` (`0:0:0:0:ffff:0:w.x.y.z` -> bits 48..63 = 0xffff, bits 32..47 = 0x0000)
+  if ((u128 >> 32n) === 0xffff0000n) {
     const embeddedV4 = Number(u128 & 0xffffffffn) >>> 0;
     const v4Class = classifyIpv4(embeddedV4);
     return v4Class === "CLOUD_METADATA" ? "CLOUD_METADATA" : "IPV4_TRANSITION_ADDRESS";
