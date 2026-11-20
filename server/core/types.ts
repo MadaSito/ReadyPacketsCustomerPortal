@@ -227,6 +227,11 @@ export interface OutboundMail {
   vars: Record<string, string | number | boolean>;
   /** Stable key so retries never double-send. */
   idempotencyKey: string;
+  /**
+   * Authoritative expiry of the single-use secret carried in `vars` (if any). The mail module purges the
+   * sensitive payload at this time (bounded by its own maximum) and never delivers after it.
+   */
+  expiresAt?: Date;
 }
 
 export interface MailTemplate {
