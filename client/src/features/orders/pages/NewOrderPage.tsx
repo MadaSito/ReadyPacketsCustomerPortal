@@ -22,6 +22,8 @@ export default function NewOrderPage() {
   const [projectName, setProjectName] = useState("");
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Server-side race: a required policy was published (or not yet accepted) after this page loaded.
+  const [policyBlocked, setPolicyBlocked] = useState(false);
   const [nameError, setNameError] = useState<string | undefined>();
   // One key per wizard visit: a double submit or retry resolves to the same order on the server.
   const [idempotencyKey] = useState(newIdempotencyKey);
@@ -112,6 +114,7 @@ export default function NewOrderPage() {
 
   const submit = async () => {
     setError(null);
+    setPolicyBlocked(false);
     try {
       const result = await create.mutateAsync({
         projectName: projectName.trim(),
@@ -124,6 +127,12 @@ export default function NewOrderPage() {
       navigate(`/orders/${result.publicId}`);
     } catch (err) {
       const safe = safeError(err);
+      if (safe?.reasonCode === "POLICY_ACCEPTANCE_REQUIRED") {
+        setPolicyBlocked(true);
+        // Refresh the customer policy status so the policy gate and /policies show what is pending.
+        await queryClient.invalidateQueries({ queryKey: trpc.compliance.policies.myStatus.queryKey() });
+        return;
+      }
       setError(safe?.reasonCode === "PRODUCT_UNAVAILABLE" ? "An item is no longer available. Go back and review your choices." : errorMessage(err));
     }
   };
@@ -143,6 +152,17 @@ export default function NewOrderPage() {
           </li>
         ))}
       </ol>
+      {policyBlocked ? (
+        <Callout tone="warning" live="assertive" title="Please review our policies first" className="mb-4">
+          <p>
+            A policy you need to accept has been published or updated. Your order has not been placed yet.{" "}
+            <Link href="/policies" className="font-medium text-action underline underline-offset-2">
+              Review and accept policies
+            </Link>
+            , then come back and submit again. Your choices on this page are kept.
+          </p>
+        </Callout>
+      ) : null}
       {error ? (
         <div ref={errorRef} tabIndex={-1} className="mb-4 outline-none">
           <Callout tone="danger" live="assertive" title="Please check your order">

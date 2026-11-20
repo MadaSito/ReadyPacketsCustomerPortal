@@ -168,6 +168,35 @@ describe("new order wizard", () => {
     expect((create[0]!.input as { idempotencyKey: string }).idempotencyKey).toMatch(/^[A-Za-z0-9_-]{16,80}$/);
   });
 
+  it("handles a policy published mid-wizard: keeps the choices, links to /policies and refreshes policy status", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    let attempts = 0;
+    handlers.set("orders.create", () => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error("policy"), { data: { safe: { domainCode: "CONFLICT", reasonCode: "POLICY_ACCEPTANCE_REQUIRED", safeMessage: "Please accept.", requestId: "r1" } } });
+      return { publicId: ORDER_ID, reference: "RP-2026-000001", created: true };
+    });
+    const user = userEvent.setup();
+    const { container, location, queryClient } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    await screen.findByText("Synthetic A");
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "1");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Policy race");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(await screen.findByRole("button", { name: "Submit order" }));
+    expect(await screen.findByText("Please review our policies first")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review and accept policies" })).toHaveAttribute("href", "/policies");
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["compliance.policies.myStatus", undefined] });
+    expect(location.history?.at(-1)).toBe("/orders/new");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const keys = calls.filter((c) => c.path === "orders.create").map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
+    expect(keys).toHaveLength(2);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
   it("explains an empty catalog instead of showing a broken form", async () => {
     handlers.set("orders.catalog.list", () => []);
     const { container } = renderUi(<NewOrderPage />, { path: "/orders/new" });
