@@ -32,7 +32,7 @@ usage() {
 domain="" email="" tls_internal="" docker_only=""
 while (( $# )); do
     case $1 in
-        --domain) [[ $# -ge 2 ]] || die "--domain needs a value"; domain=$2; shift 2 ;;
+        --domain) [[ $# -ge 2 ]] || die "--domain needs a value"; domain=${2,,}; shift 2 ;;
         --acme-email) [[ $# -ge 2 ]] || die "--acme-email needs a value"; email=$2; shift 2 ;;
         --tls-internal) tls_internal=1; shift ;;
         --docker-only) docker_only=1; shift ;;
@@ -65,8 +65,13 @@ work=""
 cleanup() { [[ -z $work ]] || rm -rf "$work"; }
 trap cleanup EXIT
 
+# Docker Engine 23 or newer with the Compose and Buildx plugins.
 docker_ready() {
-    command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
+    local version
+    command -v docker >/dev/null 2>&1 || return 1
+    version=$(docker version --format '{{.Client.Version}}' 2>/dev/null || true)
+    [[ ${version%%.*} =~ ^[0-9]+$ ]] && (( ${version%%.*} >= 23 )) || return 1
+    docker compose version >/dev/null 2>&1 && docker buildx version >/dev/null 2>&1
 }
 
 install_docker() {
@@ -86,6 +91,8 @@ install_docker() {
     [[ $fingerprints == "$docker_key_fingerprint" ]] \
         || die "the Docker package signing key did not match the expected fingerprint; nothing was installed"
 
+    [[ ! -e /etc/apt/sources.list.d/docker.sources ]] \
+        || die "/etc/apt/sources.list.d/docker.sources already exists. Finish or remove that Docker repository setup, then run this script again."
     install -d -m 0755 /etc/apt/keyrings
     install -m 0644 "$key" /etc/apt/keyrings/docker.asc
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
@@ -93,12 +100,15 @@ install_docker() {
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends \
         docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
-    docker_ready || die "Docker was installed but the 'docker compose' command is not available"
+    docker_ready || die "Docker was installed but 'docker compose' or 'docker buildx' is not available"
     say "installed $(docker --version)"
 }
 
 if docker_ready; then
     say "Docker is already installed ($(docker --version)); leaving it as it is"
+elif command -v docker >/dev/null 2>&1; then
+    # Never replace or upgrade a Docker installation somebody else set up.
+    die "Docker is installed ($(docker --version 2>/dev/null || echo 'unknown version')) but this stack needs Docker Engine 23 or newer with the Compose and Buildx plugins (packages docker-compose-plugin and docker-buildx-plugin). Upgrade it, then run this script again."
 else
     install_docker
 fi
@@ -130,7 +140,7 @@ if command -v ss >/dev/null 2>&1; then
         fi
     done
 fi
-if [[ -z $tls_internal && $domain != localhost ]]; then
+if [[ -z $tls_internal && $domain != localhost && $domain != *.localhost ]]; then
     if ! getent ahosts "$domain" >/dev/null 2>&1; then
         warn "$domain does not resolve yet. A public certificate can only be issued once its DNS record points at this server."
     fi

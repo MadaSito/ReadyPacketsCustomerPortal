@@ -24,7 +24,9 @@ RUN pnpm build \
     && rm -f dist/ops/seed-demo.js dist/ops/seed-demo.js.map \
     && test -f dist/server/main.js -a -f dist/public/index.html -a -f dist/ops/migrate.js \
          -a -f dist/ops/create-admin.js -a -f dist/ops/catalog-import.js -a -f dist/ops/generate-keys.js \
-         -a -f migrations/meta/_journal.json -a -f data/catalog/readypackets-offerings-v3.0.json
+         -a -f dist/ops/keys-doctor.js -a -f migrations/meta/_journal.json \
+         -a -f data/catalog/readypackets-offerings-v3.0.json -a -f data/catalog/offerings.schema.json \
+    && chmod -R go-w package.json node_modules dist migrations data/catalog
 
 FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS runtime
 # openssl is used once by init-secrets.sh. The package managers are removed: nothing is installed at run time.
@@ -46,6 +48,7 @@ COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
 COPY --from=build /src/migrations ./migrations
 COPY --from=build /src/data/catalog ./data/catalog
+COPY --chmod=0444 deploy/docker/healthcheck.mjs ./healthcheck.mjs
 COPY --chmod=0555 deploy/docker/init-secrets.sh /usr/local/bin/rp-init-secrets
 ENV NODE_ENV=production \
     RP_MIGRATIONS_DIR=/opt/readypackets/migrations

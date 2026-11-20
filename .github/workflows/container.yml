@@ -47,9 +47,13 @@ jobs:
             for tool in npm npx pnpm corepack yarn; do
               if command -v "$tool" >/dev/null 2>&1; then echo "unexpected tool: $tool"; exit 1; fi
             done
-            for path in dist/ops/seed-demo.js node_modules/vite node_modules/typescript node_modules/.bin server client tests; do
+            for path in dist/ops/seed-demo.js node_modules/vite node_modules/vitest node_modules/.bin server client tests deploy; do
               if [ -e "/opt/readypackets/$path" ]; then echo "unexpected path: $path"; exit 1; fi
             done
+            test -f /opt/readypackets/healthcheck.mjs
+            # Nothing in the program directory is writable by group or others.
+            loose=$(find /opt/readypackets -perm /022 ! -type l | head -5)
+            if [ -n "$loose" ]; then echo "group/other-writable files:"; echo "$loose"; exit 1; fi
             node --version'
       - name: Container logs (on failure)
         if: failure()

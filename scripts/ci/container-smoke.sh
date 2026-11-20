@@ -55,6 +55,34 @@ head -c 400000 /dev/zero | tr '\0' 'a' > "$work/large"
 expect "large body" "$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     --data-binary "@$work/large" "$origin/api/trpc/identity.signIn")" 413
 
+step "proxy rules: other ports in Host, upload allowances only on the exact routes"
+docker exec readypackets-caddy-1 caddy version
+expect "Host with another port" "$(web -o /dev/null -w '%{http_code}' -H 'Host: localhost:8443' "$origin/readyz")" 421
+expect "mixed-case upload path keeps the default limit" "$(web -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/probe")" 413
+upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/octet-stream' \
+    --data-binary "@$work/large" "$origin/api/files/upload/probe")
+# The proxy lets the larger body through on the real upload route; the application then refuses the
+# unauthenticated request itself.
+[[ $upload_status =~ ^40[13]$ ]] || fail "upload route: expected the application to refuse (401/403), got $upload_status"
+
+step "the application answers only the proxy"
+expect "web networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-web-1)" "readypackets_data readypackets_edge "
+expect "worker networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-worker-1)" "readypackets_data readypackets_egress "
+expect "proxy networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-caddy-1)" "readypackets_edge "
+expect "database networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-db-1)" "readypackets_data "
+# The worker shares only the database network with web, and web does not listen there.
+probe='const s = require("node:net").connect({ host: process.argv[1], port: 5000, timeout: 3000 }); s.on("connect", () => process.exit(0)); s.on("error", () => process.exit(7)); s.on("timeout", () => process.exit(7));'
+status=0
+docker exec readypackets-worker-1 node -e "$probe" web || status=$?
+expect "worker cannot connect to web" "$status" 7
+status=0
+docker exec readypackets-web-1 node -e "$probe" 127.0.0.1 || status=$?
+expect "web does not listen on loopback" "$status" 7
+status=0
+docker exec readypackets-web-1 node -e "$probe" 172.30.250.20 || status=$?
+expect "web listens on its proxy-network address" "$status" 0
+
 step "container hardening"
 for service in web worker; do
     container=readypackets-$service-1
@@ -113,6 +141,21 @@ sign_in() {
 
 step "sign-in through the proxy (password accepted, authenticator enrolment required next)"
 sign_in
+
+step "proxy error log holds no request target, query string or header value"
+docker stop readypackets-web-1 >/dev/null
+expect "upstream down" "$(web -o /dev/null -w '%{http_code}' -H 'X-Probe: header-canary-7f3a' \
+    "$origin/path-canary-91c2?token=query-canary-55d1")" 502
+sleep 1
+docker logs readypackets-caddy-1 > "$work/caddy.log" 2>&1
+grep -q '"status":502' "$work/caddy.log" || fail "the proxy did not record the upstream failure"
+! grep -q 'canary' "$work/caddy.log" || fail "the proxy log contains request data"
+
+step "update in place: the portal is stopped, migrated and started again"
+"$rp" up
+wait_for_proxy
+expect "readyz after update" "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
+expect "web restarted cleanly" "$(docker inspect -f '{{.State.Status}}' readypackets-web-1)" running
 
 step "restart keeps data, keys and settings"
 "$rp" down

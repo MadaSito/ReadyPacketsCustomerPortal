@@ -10,6 +10,11 @@
 # stores or passes a secret: secrets are created inside the stack and stay in its volumes.
 set -euo pipefail
 
+if [[ $(uname -s) != Linux ]] || (( BASH_VERSINFO[0] < 4 )); then
+    printf 'ReadyPackets: this script needs Linux and Bash 4 or newer.\n' >&2
+    exit 1
+fi
+
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(cd "$here/../.." && pwd -P)
 readonly here repo
@@ -70,6 +75,7 @@ setting() {
     while IFS= read -r line; do
         if [[ $line == "$key="* ]]; then
             value=${line#"$key="}
+            value=${value%$'\r'}
             value=${value#\"}; value=${value%\"}
         fi
     done < "$env_file"
@@ -100,8 +106,7 @@ release_ref() {
 }
 
 web_ready() {
-    compose exec -T web node -e \
-        'fetch("http://127.0.0.1:5000/readyz").then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
+    compose exec -T web node /opt/readypackets/healthcheck.mjs \
         >/dev/null 2>&1
 }
 
@@ -165,7 +170,7 @@ cmd_up() {
         printf 'RP_INSTALLATION_ID=%s\n' "$installation_id"
         printf 'RP_RELEASE_REF=%s\n' "$(release_ref)"
         local key value
-        for key in RP_PROXY_IP RP_EDGE_SUBNET RP_DATA_SUBNET; do
+        for key in RP_PROXY_IP RP_WEB_IP RP_EDGE_SUBNET RP_EGRESS_SUBNET RP_DATA_SUBNET; do
             value=$(setting "$key")
             [[ -z $value ]] || printf '%s=%s\n' "$key" "$value"
         done
@@ -173,8 +178,19 @@ cmd_up() {
     chmod 0644 "$tmp"
     mv -f "$tmp" "$env_file"
 
-    say "building the image and starting the stack for https://$domain (the first build takes a few minutes)"
-    compose up --detach --build --remove-orphans
+    say "building the image for https://$domain (the first build takes a few minutes)"
+    compose build
+
+    # Database migrations must never run underneath a serving portal: stop the proxy and both
+    # application processes first (they finish in-flight work), then migrate, then start again. If a
+    # migration fails the portal stays down instead of serving from a half-changed database.
+    if [[ -n $(compose ps --quiet caddy web worker 2>/dev/null || true) ]]; then
+        say "stopping the running portal before the update (it is unavailable until the new version is ready)"
+        compose stop caddy web worker
+    fi
+
+    say "starting the stack"
+    compose up --detach --no-build --remove-orphans
 
     local attempt
     for attempt in $(seq 1 60); do
@@ -227,6 +243,7 @@ cmd_admin() {
         compose run --rm --no-deps -T ops sh -c '
             umask 077
             file="$TMPDIR/rp-bootstrap-password.$$"
+            trap "rm -f \"$file\"" EXIT INT TERM
             cat > "$file" || exit 1
             RP_BOOTSTRAP_ADMIN_PASSWORD_FILE="$file" node dist/ops/create-admin.js "$@"
             status=$?

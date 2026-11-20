@@ -10,10 +10,27 @@
 	admin off
 	persist_config off
 	skip_install_trust
+	# The proxy writes no access log. Its error log (for example "upstream unreachable") would otherwise
+	# include the request target and headers, so both are removed before anything is written.
+	log {
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers delete
+			}
+		}
+	}
 	servers {
 		protocols h1 h2
+		# The Host header must match the name in the TLS handshake.
+		strict_sni_host on
 		timeouts {
 			read_header 20s
+			# Whole-request budgets (Caddy has no per-read idle timer for clients). The application
+			# closes any request it has not fully received within 120 seconds.
+			read_body 130s
+			write 30m
 			idle 30s
 		}
 	}
@@ -22,14 +39,18 @@
 (rp_upstream) {
 	reverse_proxy web:5000 {
 		header_up Host {$RP_DOMAIN}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
 		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Host {$RP_DOMAIN}
 		header_up X-Forwarded-Port 443
 		header_up -Forwarded
 		header_up -traceparent
 		header_up -tracestate
-		flush_interval -1
 		transport http {
 			dial_timeout 5s
+			# Starts once the request has been sent in full. Per-read upstream timers are not used:
+			# they also count the time a client spends uploading and would cut long uploads short.
 			response_header_timeout 120s
 		}
 	}
@@ -38,14 +59,23 @@
 {$RP_DOMAIN} {
 	{$RP_TLS_DIRECTIVE}
 
-	# No access log: request paths and query strings are never written by the proxy. The application
-	# logs safe route templates with a request id.
+	# No access log here. The application logs safe route templates with a request id.
 	header {
 		-Server
 		-Via
 	}
 
-	@portable_import path /api/portable/imports
+	# A Host header carrying any port other than 443 is refused, as the Nginx profile does.
+	@other_port {
+		header_regexp Host :[0-9]*$
+		not header_regexp Host :443$
+	}
+	handle @other_port {
+		respond 421
+	}
+
+	# Case-sensitive, anchored matches: only the exact upload routes get a larger body allowance.
+	@portable_import path_regexp ^/api/portable/imports$
 	handle @portable_import {
 		request_body {
 			max_size 192MiB
@@ -53,7 +83,7 @@
 		import rp_upstream
 	}
 
-	@file_upload path /api/files/upload/*
+	@file_upload path_regexp ^/api/files/upload/
 	handle @file_upload {
 		request_body {
 			max_size 256MiB
@@ -61,7 +91,7 @@
 		import rp_upstream
 	}
 
-	@presentation_image path /api/platform/presentation/images
+	@presentation_image path_regexp ^/api/platform/presentation/images$
 	handle @presentation_image {
 		request_body {
 			max_size 2MiB

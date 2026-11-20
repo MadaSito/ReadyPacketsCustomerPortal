@@ -41,6 +41,20 @@ for dir in "$app_dir" "$migrator_dir" "$db_dir"; do
 done
 
 if [[ -e $marker ]]; then
+    # The marker lives in one volume only. Make sure the other two were not lost or replaced, and say
+    # so plainly instead of letting the database or the migration fail later with a confusing error.
+    check() {
+        local label=$1 dir=$2 name
+        shift 2
+        for name in "$@"; do
+            [[ -s $dir/$name ]] || die "the $label volume is incomplete ($name is missing or empty) although this installation was initialised. Restore that volume from your copy; do not start again unless the installation holds no data you need."
+        done
+    }
+    check "application secrets" "$app_dir" database_url db-ca.pem rp_data_keyring rp_index_key \
+        rp_pseudonym_key rp_token_hash_key rp_audit_chain_key
+    check "migration secrets" "$migrator_dir" database_url db-ca.pem
+    check "database secrets" "$db_dir" root_password app_password migrator_password ca.pem \
+        server-cert.pem server-key.pem
     say "secrets already initialised; nothing to do"
     exit 0
 fi

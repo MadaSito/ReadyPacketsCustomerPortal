@@ -37,8 +37,6 @@ x-logging: &logging
 x-app-environment: &app-environment
   NODE_ENV: production
   RP_DEPLOYMENT_PROFILE: production
-  # The process listens on the container interface; only Caddy can reach it (no published port).
-  HOST: 0.0.0.0
   PORT: "5000"
   RP_CANONICAL_ORIGIN: https://${RP_DOMAIN:?Run rp-docker.sh up --domain <host> first}
   RP_TRUSTED_PROXIES: ${RP_PROXY_IP:-172.30.250.10}
@@ -155,24 +153,26 @@ services:
     environment:
       <<: *app-environment
       RP_ROLE: web
+      # Listens only on its address on the proxy network, which it shares with Caddy alone. Nothing is
+      # published to the host, and the worker and the database cannot connect to it.
+      HOST: ${RP_WEB_IP:-172.30.250.20}
     tmpfs:
       - /tmp:mode=1777,size=64m
     volumes:
       - app-secrets:/run/readypackets/secrets:ro
       - storage:/var/lib/readypackets/storage
       - web-tmp:/var/lib/readypackets/tmp
-    networks: [edge, data]
+    networks:
+      edge:
+        ipv4_address: ${RP_WEB_IP:-172.30.250.20}
+      data: {}
     depends_on:
       db:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - 'fetch("http://127.0.0.1:5000/readyz").then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))'
+      test: ["CMD", "node", "/opt/readypackets/healthcheck.mjs"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -193,7 +193,7 @@ services:
       - app-secrets:/run/readypackets/secrets:ro
       - storage:/var/lib/readypackets/storage
       - worker-tmp:/var/lib/readypackets/tmp
-    networks: [edge, data]
+    networks: [egress, data]
     depends_on:
       db:
         condition: service_healthy
@@ -248,12 +248,18 @@ services:
     restart: "no"
 
 networks:
-  # Caddy, web and worker. Outbound connections (mail, SIEM, webhooks, certificates) leave from here.
+  # Caddy and web only. Certificates are requested from here.
   edge:
     driver: bridge
     ipam:
       config:
         - subnet: ${RP_EDGE_SUBNET:-172.30.250.0/24}
+  # Worker only: outbound connections for background jobs (mail, SIEM, webhooks).
+  egress:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RP_EGRESS_SUBNET:-172.30.252.0/24}
   # Database traffic only. "internal" means no route to or from the outside world.
   data:
     driver: bridge
