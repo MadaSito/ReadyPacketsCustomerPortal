@@ -111,8 +111,94 @@ export const EXTERNAL_NUMERIC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "workflow_version",
 ]);
 
-/** Safe fixed-vocabulary token format for allowlisted external string attributes (no spaces, quotes, `@`, or prose). */
-const SAFE_EXTERNAL_TOKEN_RE = /^[A-Za-z0-9_.:/-]{1,64}$/;
+/** Explicit allowlist of boolean/null flag keys permitted in external audit projections. */
+export const EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "active",
+  "allow_private_address",
+  "allow_private_network",
+  "email_verified",
+  "enabled",
+  "endpoint_changed",
+  "expired",
+  "has_auth_secret",
+  "has_client_cert",
+  "has_client_key",
+  "has_custom_ca",
+  "has_mtls",
+  "include_bom",
+  "locked",
+  "mfa_enrolled",
+  "mfa_required",
+  "mfa_verified",
+  "migrate_backlog",
+  "must_change_password",
+  "password_updated",
+  "probe",
+  "recovery_used",
+  "remember_device",
+  "revoked",
+  "secrets_included",
+  "secrets_modified",
+  "step_up",
+  "step_up_verified",
+  "synthetic",
+  "totp_enrolled",
+  "truncated",
+  "uncertain_delivery",
+  "was_enabled",
+]);
+
+/** Explicit allowlist of `safe_counts` metric keys permitted in external audit projections. */
+export const EXTERNAL_SAFE_COUNT_KEYS: ReadonlySet<string> = new Set([
+  "active_spool",
+  "attempts",
+  "backlog_migrated",
+  "backlog_quarantined",
+  "bytes",
+  "categories",
+  "count",
+  "delivered",
+  "dropped",
+  "events",
+  "failed",
+  "files",
+  "filtered_queued",
+  "items",
+  "matched",
+  "migrated_queued",
+  "missing",
+  "pruned",
+  "purged",
+  "quarantined_queued",
+  "recipients",
+  "records",
+  "removed_outbox_items",
+  "replayed",
+  "returned",
+  "sessions_revoked",
+  "spool_max",
+  "succeeded",
+  "total",
+  "uncertain_events",
+]);
+
+/** Closed value vocabularies for discrete enum attributes; remaining allowlisted string keys require strict lowercase identifier syntax. */
+const EXTERNAL_ENUM_VOCABULARIES: Readonly<Record<string, ReadonlySet<string>>> = {
+  category: VALID_CATEGORIES,
+  min_severity: VALID_SEVERITIES,
+  role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
+  from_role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
+  to_role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
+  format: new Set(["syslog_rfc5425", "jsonl_tls", "cef_tls", "otlp_https", "json", "ndjson", "csv", "pdf", "zip"]),
+  receipt_confirmation: new Set(["none", "transport_accepted", "collector_2xx"]),
+  tls_mode: new Set(["strict", "mtls", "starttls", "tls"]),
+  auth_method: new Set(["password", "totp", "passkey", "webauthn", "recovery_code", "session", "token"]),
+  mfa_method: new Set(["totp", "passkey", "webauthn", "recovery_code"]),
+  decision: new Set(["allow", "deny", "challenge", "step_up", "quarantine"]),
+};
+
+/** Strict lowercase identifier syntax for open-enum technical vocabulary keys (never mixed-case tokens, base64, or prose). */
+const SAFE_VOCAB_IDENTIFIER_RE = /^[a-z0-9][a-z0-9_.:/-]{0,47}$/;
 const SAFE_SHA256_HEX_RE = /^[a-f0-9]{64}$/;
 const SAFE_ID_RE = /^[A-Za-z0-9_.:/-]{1,80}$/;
 
@@ -120,7 +206,6 @@ const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 const URL_CRED_RE = /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i;
 const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 const IPV6_LIKE_RE = /^(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
-const LONG_SECRET_LIKE_RE = /^[A-Za-z0-9+/_=-]{40,}$/;
 
 function cleanSafeId(value: string | null | undefined, maxLen = 80): string | null {
   if (!value || typeof value !== "string") return null;
@@ -138,15 +223,18 @@ function cleanIsoUtc(value: string | null | undefined, fallbackIso: string): str
   return parsed.toISOString();
 }
 
-function isSafeAllowlistedToken(value: string): boolean {
-  if (!SAFE_EXTERNAL_TOKEN_RE.test(value)) return false;
+function isSafeAllowlistedStringValue(key: string, value: string): boolean {
+  const closedVocab = EXTERNAL_ENUM_VOCABULARIES[key];
+  if (closedVocab) {
+    return closedVocab.has(value);
+  }
+  if (!SAFE_VOCAB_IDENTIFIER_RE.test(value)) return false;
   if (
     EMAIL_RE.test(value) ||
     URL_CRED_RE.test(value) ||
     IPV4_RE.test(value) ||
     IPV6_LIKE_RE.test(value) ||
-    value.startsWith("rpenc:") ||
-    LONG_SECRET_LIKE_RE.test(value)
+    value.startsWith("rpenc:")
   ) {
     return false;
   }
@@ -175,7 +263,13 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
         dropped += 1;
         continue;
       }
-      if (SAFE_ATTR_KEY.test(key) && typeof val === "number" && Number.isSafeInteger(val) && val >= 0) {
+      if (
+        SAFE_ATTR_KEY.test(key) &&
+        EXTERNAL_SAFE_COUNT_KEYS.has(key) &&
+        typeof val === "number" &&
+        Number.isSafeInteger(val) &&
+        val >= 0
+      ) {
         cleanCounts[key] = val;
         countKeys += 1;
       } else {
@@ -197,8 +291,16 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
         continue;
       }
       if (val === null || typeof val === "boolean") {
-        cleanAttributes[key] = val;
-        attrKeys += 1;
+        if (
+          EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS.has(key) ||
+          EXTERNAL_STRING_ATTRIBUTE_KEYS.has(key) ||
+          EXTERNAL_NUMERIC_ATTRIBUTE_KEYS.has(key)
+        ) {
+          cleanAttributes[key] = val;
+          attrKeys += 1;
+        } else {
+          dropped += 1;
+        }
       } else if (typeof val === "number") {
         if (
           EXTERNAL_NUMERIC_ATTRIBUTE_KEYS.has(key) &&
@@ -214,7 +316,7 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
         if (EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS.has(key) && SAFE_SHA256_HEX_RE.test(val)) {
           cleanAttributes[key] = val;
           attrKeys += 1;
-        } else if (EXTERNAL_STRING_ATTRIBUTE_KEYS.has(key) && isSafeAllowlistedToken(val)) {
+        } else if (EXTERNAL_STRING_ATTRIBUTE_KEYS.has(key) && isSafeAllowlistedStringValue(key, val)) {
           cleanAttributes[key] = val;
           attrKeys += 1;
         } else {

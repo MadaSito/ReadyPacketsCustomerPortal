@@ -104,7 +104,7 @@ export {
 } from "./projection.js";
 
 const CERT_EXPIRY_WARN_MS = 14 * 24 * 60 * 60 * 1_000;
-const LEASE_DURATION_MS = 60_000;
+const LEASE_DURATION_SECONDS = 60;
 
 interface IdentityAssertPort {
   sessions?: {
@@ -857,27 +857,23 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
       let migratedBacklogCount = 0;
       let quarantinedBacklogCount = 0;
+      let filteredQueuedCount = 0;
 
-      if (endpointChanged) {
+      const scopeChanged =
+        nextMinSeverity !== locked.minSeverity ||
+        nextCategories.length !== locked.categoriesJson.length ||
+        nextCategories.some((c, idx) => c !== locked.categoriesJson[idx]);
+
+      if (endpointChanged || scopeChanged) {
         const queuedItems = await tx
-          .select({ id: siemOutbox.id })
+          .select({ id: siemOutbox.id, projectedJson: siemOutbox.projectedJson })
           .from(siemOutbox)
           .where(and(eq(siemOutbox.destinationId, locked.id), eq(siemOutbox.state, "queued")))
           .for("update");
 
         if (queuedItems.length > 0) {
-          const ids = queuedItems.map((q) => q.id);
-          if (input.migrateBacklog === true) {
-            migratedBacklogCount = ids.length;
-            await tx
-              .update(siemOutbox)
-              .set({
-                destinationVersion: nextVersion,
-                endpointGeneration: nextEndpointGen,
-                updatedAt: now,
-              })
-              .where(inArray(siemOutbox.id, ids));
-          } else {
+          if (endpointChanged && input.migrateBacklog !== true) {
+            const ids = queuedItems.map((q) => q.id);
             quarantinedBacklogCount = ids.length;
             await tx
               .update(siemOutbox)
@@ -888,6 +884,37 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
                 updatedAt: now,
               })
               .where(inArray(siemOutbox.id, ids));
+          } else {
+            const matchingIds: number[] = [];
+            const filteredOutIds: number[] = [];
+            for (const q of queuedItems) {
+              if (
+                matchesDestinationFilter(q.projectedJson, {
+                  minSeverity: nextMinSeverity as Severity,
+                  categories: nextCategories,
+                })
+              ) {
+                matchingIds.push(q.id);
+              } else {
+                filteredOutIds.push(q.id);
+              }
+            }
+
+            if (filteredOutIds.length > 0) {
+              filteredQueuedCount = filteredOutIds.length;
+              await tx.delete(siemOutbox).where(inArray(siemOutbox.id, filteredOutIds));
+            }
+            if (matchingIds.length > 0) {
+              if (endpointChanged) migratedBacklogCount = matchingIds.length;
+              await tx
+                .update(siemOutbox)
+                .set({
+                  destinationVersion: nextVersion,
+                  endpointGeneration: nextEndpointGen,
+                  updatedAt: now,
+                })
+                .where(inArray(siemOutbox.id, matchingIds));
+            }
           }
         }
       }
@@ -931,9 +958,9 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           deadLetteredCount: sql`${siemDestinations.deadLetteredCount} + ${quarantinedBacklogCount}`,
           circuitState: locked.circuitState === "open" ? "half_open" : locked.circuitState,
           circuitOpenUntil: locked.circuitState === "open" ? null : locked.circuitOpenUntil,
-          // Invalidate any in-flight worker lease when endpoint changes so old snapshots stop immediately.
-          leaseOwnerJobId: endpointChanged ? null : locked.leaseOwnerJobId,
-          leaseExpiresAt: endpointChanged ? null : locked.leaseExpiresAt,
+          // Invalidate any in-flight worker lease on ANY configuration revision bump so stale snapshots cut off cleanly.
+          leaseOwnerJobId: null,
+          leaseExpiresAt: null,
           version: nextVersion,
           updatedAt: now,
         })
@@ -964,6 +991,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             categories: nextCategories.length,
             backlog_migrated: migratedBacklogCount,
             backlog_quarantined: quarantinedBacklogCount,
+            filtered_queued: filteredQueuedCount,
           },
           occurredAt: now,
         },
@@ -1045,8 +1073,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             input.enabled && !locked.enabled ? now : locked.lastCursorProgressAt,
           circuitState: input.enabled && locked.circuitState === "open" ? "half_open" : locked.circuitState,
           circuitOpenUntil: input.enabled && locked.circuitState === "open" ? null : locked.circuitOpenUntil,
-          leaseOwnerJobId: input.enabled ? locked.leaseOwnerJobId : null,
-          leaseExpiresAt: input.enabled ? locked.leaseExpiresAt : null,
+          leaseOwnerJobId: null,
+          leaseExpiresAt: null,
           version: nextVersion,
           updatedAt: now,
         })
@@ -1240,6 +1268,22 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         dropped_attributes: 0,
       });
 
+      // Re-verify revision immediately before dialing so an intervening edit never dispatches a stale snapshot.
+      const [currentRev] = await deps.db
+        .select({ version: siemDestinations.version })
+        .from(siemDestinations)
+        .where(eq(siemDestinations.id, row.id))
+        .limit(1);
+      if (!currentRev) throw notFound("DESTINATION_NOT_FOUND");
+      if (currentRev.version !== row.version) {
+        throw conflict("VERSION_MISMATCH", "This destination was modified before the probe started. Reload and try again.");
+      }
+
+      const probeBudgetMs = Math.min(30_000, row.connectTimeoutMs + row.writeTimeoutMs + 2_000);
+      const probeAbort = new AbortController();
+      const probeTimer = setTimeout(() => probeAbort.abort(), probeBudgetMs);
+      probeTimer.unref?.();
+
       let outcome: "completed" | "failed" | "unknown" = "failed";
       let reasonCode: string | null = null;
       let receiptConfirmation: SiemReceiptConfirmation = "none";
@@ -1251,6 +1295,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           secrets,
           events: [syntheticEvent],
           egress: getEgressPort(deps.services),
+          signal: probeAbort.signal,
         });
         outcome = "completed";
         receiptConfirmation = delivered.receiptConfirmation;
@@ -1259,6 +1304,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         outcome = classified.uncertainAfterWrite ? "unknown" : "failed";
         reasonCode = classified.reasonCode;
         receiptConfirmation = "none";
+      } finally {
+        clearTimeout(probeTimer);
       }
 
       const finishedAt = deps.clock.now();
@@ -1540,13 +1587,12 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
   }
 
   /**
-   * Acquires an exclusive destination lease with:
+   * Acquires an exclusive destination lease anchored to MySQL's authoritative `UTC_TIMESTAMP(3)` clock with:
    * - Unique per-claim-attempt `token` (`lease_<ulid>`) so retries of the same `jobId` never share identity.
    * - Destination-local monotonic `fence` (`lastFencingToken + 1`) so cross-job fencing tokens never block newer jobs.
    */
   async function acquireDestinationLease(destId: number, job?: ClaimedJob<unknown>): Promise<DestinationLease | null> {
     const now = deps.clock.now();
-    const expiresAt = new Date(now.getTime() + LEASE_DURATION_MS);
     const token = `lease_${ulid(now.getTime())}`;
 
     return deps.db.transaction(async (tx) => {
@@ -1559,7 +1605,11 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           and(
             eq(siemDestinations.id, destId),
             eq(siemDestinations.enabled, true),
-            or(isNull(siemDestinations.leaseOwnerJobId), lte(siemDestinations.leaseExpiresAt, now)),
+            or(
+              isNull(siemDestinations.leaseOwnerJobId),
+              isNull(siemDestinations.leaseExpiresAt),
+              sql`${siemDestinations.leaseExpiresAt} <= UTC_TIMESTAMP(3)`,
+            ),
           ),
         )
         .for("update")
@@ -1572,13 +1622,19 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         .update(siemDestinations)
         .set({
           leaseOwnerJobId: token,
-          leaseExpiresAt: expiresAt,
+          leaseExpiresAt: sql`DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ${LEASE_DURATION_SECONDS} SECOND)`,
           lastFencingToken: nextFence,
         })
         .where(eq(siemDestinations.id, row.id));
 
+      const [updated] = await tx
+        .select()
+        .from(siemDestinations)
+        .where(eq(siemDestinations.id, row.id))
+        .limit(1);
+
       return {
-        row: { ...row, leaseOwnerJobId: token, leaseExpiresAt: expiresAt, lastFencingToken: nextFence },
+        row: updated ?? { ...row, leaseOwnerJobId: token, lastFencingToken: nextFence },
         token,
         fence: nextFence,
       };
@@ -1603,26 +1659,37 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     destId: number,
     lease: DestinationLease,
     expectedEndpointGen: number,
+    expectedVersion?: number,
     job?: ClaimedJob<unknown>,
-  ): Promise<SiemDestinationRow> {
+  ): Promise<{ locked: SiemDestinationRow; remainingLeaseMs: number }> {
     if (job) await job.assertStillOwned(tx);
-    const [locked] = await tx
-      .select()
+    const [found] = await tx
+      .select({
+        row: siemDestinations,
+        remainingUs: sql<number>`TIMESTAMPDIFF(MICROSECOND, UTC_TIMESTAMP(3), ${siemDestinations.leaseExpiresAt})`,
+      })
       .from(siemDestinations)
       .where(eq(siemDestinations.id, destId))
       .for("update")
       .limit(1);
 
+    const remainingUs = Number(found?.remainingUs ?? 0);
     if (
-      !locked ||
-      !locked.enabled ||
-      locked.leaseOwnerJobId !== lease.token ||
-      locked.lastFencingToken !== lease.fence ||
-      locked.endpointGeneration !== expectedEndpointGen
+      !found ||
+      !found.row.enabled ||
+      found.row.leaseOwnerJobId !== lease.token ||
+      found.row.lastFencingToken !== lease.fence ||
+      found.row.endpointGeneration !== expectedEndpointGen ||
+      (expectedVersion !== undefined && found.row.version !== expectedVersion) ||
+      !found.row.leaseExpiresAt ||
+      remainingUs <= 0
     ) {
-      throw conflict("LEASE_LOST", "Destination lease or endpoint generation changed.");
+      throw conflict("LEASE_LOST", "Destination lease, revision, or endpoint generation changed or expired.");
     }
-    return locked;
+    return {
+      locked: found.row,
+      remainingLeaseMs: Math.max(0, Math.floor(remainingUs / 1_000)),
+    };
   }
 
   async function projectEventsForDestination(params: {
@@ -1745,7 +1812,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
 
       const insertedInPage = await deps.db.transaction(async (tx) => {
-        await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
+        await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, dest.version, job);
 
         if (toInsert.length > 0) {
           await tx
@@ -1762,7 +1829,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             lastCursorProgressAt: now,
             prunedAuditCount: sql`${siemDestinations.prunedAuditCount} + ${batchPruned}`,
             missingAuditGapCount: sql`${siemDestinations.missingAuditGapCount} + ${batchMissing}`,
-            leaseExpiresAt: new Date(now.getTime() + LEASE_DURATION_MS),
+            leaseExpiresAt: sql`DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ${LEASE_DURATION_SECONDS} SECOND)`,
             updatedAt: now,
           })
           .where(eq(siemDestinations.id, dest.id));
@@ -1828,17 +1895,22 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       if (job?.signal.aborted) break;
       const now = deps.clock.now();
 
-      // Re-read current destination row + verify lease & endpoint generation BEFORE decrypting or dialing.
-      const [dest] = await deps.db.select().from(siemDestinations).where(eq(siemDestinations.id, destId)).limit(1);
-      if (
-        !dest ||
-        !dest.enabled ||
-        dest.leaseOwnerJobId !== lease.token ||
-        dest.lastFencingToken !== lease.fence ||
-        dest.endpointGeneration !== lease.row.endpointGeneration
-      ) {
+      // Unconditionally verify active DB UTC lease, endpoint generation, and capture consistent revision BEFORE decrypting or dialing.
+      let preflight: { locked: SiemDestinationRow; remainingLeaseMs: number };
+      try {
+        preflight = await deps.db.transaction(async (tx) =>
+          assertDestinationLeaseInTx(tx, destId, lease, lease.row.endpointGeneration, undefined, job),
+        );
+      } catch {
         break;
       }
+
+      if (preflight.remainingLeaseMs <= 750) {
+        break;
+      }
+
+      const dest = preflight.locked;
+      const snapshotVersion = dest.version;
 
       let effectiveCircuit = dest.circuitState as SiemCircuitState;
       if (effectiveCircuit === "open") {
@@ -1865,6 +1937,26 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         .limit(limit);
 
       if (fifoHead.length === 0) break;
+
+      // Filter any queued rows that no longer match the current destination severity/category scope.
+      const staleScopeIds = fifoHead
+        .filter(
+          (candidate) =>
+            !matchesDestinationFilter(candidate.projectedJson, {
+              minSeverity: dest.minSeverity as Severity,
+              categories: dest.categoriesJson,
+            }),
+        )
+        .map((r) => r.id);
+
+      if (staleScopeIds.length > 0) {
+        await deps.db.transaction(async (tx) => {
+          await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, snapshotVersion, job);
+          await tx.delete(siemOutbox).where(inArray(siemOutbox.id, staleScopeIds));
+        });
+        continue;
+      }
+
       if (fifoHead[0]!.nextAttemptAt.getTime() > now.getTime()) {
         // Head of queue is still in retry backoff; preserve strict FIFO order.
         break;
@@ -1877,39 +1969,101 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
       if (readyRows.length === 0) break;
 
-      // Verify job fence right before outbound network I/O so an expired worker never transmits.
-      if (job) {
-        await deps.db.transaction(async (tx) => {
-          await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
-        });
+      // Re-verify unexpired DB UTC lease + revision right before outbound network I/O and cap socket budget to remaining lease.
+      let sendGuard: { locked: SiemDestinationRow; remainingLeaseMs: number };
+      try {
+        sendGuard = await deps.db.transaction(async (tx) =>
+          assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, snapshotVersion, job),
+        );
+      } catch {
+        break;
       }
+      if (sendGuard.remainingLeaseMs <= 750) {
+        break;
+      }
+
+      const ioBudgetMs = Math.max(250, sendGuard.remainingLeaseMs - 500);
+      const batchAbort = new AbortController();
+      const onParentAbort = () => batchAbort.abort();
+      job?.signal.addEventListener("abort", onParentAbort, { once: true });
+      const leaseAbortTimer = setTimeout(() => batchAbort.abort(), ioBudgetMs);
+      leaseAbortTimer.unref?.();
 
       let deliveryError: SiemTransportError | null = null;
       let receiptConfirmation: SiemReceiptConfirmation = "none";
 
       try {
         const secrets = await readDestinationSecretsFromRow(dest, deps.settings, deps.crypto);
+        const baseTransport = toTransportConfig(dest, deps.config.deploymentProfile);
+        const cappedTransport = {
+          ...baseTransport,
+          connectTimeoutMs: Math.min(baseTransport.connectTimeoutMs, ioBudgetMs),
+          writeTimeoutMs: Math.min(baseTransport.writeTimeoutMs, ioBudgetMs),
+        };
         const res = await deliverProjectedBatch({
           pool,
-          dest: toTransportConfig(dest, deps.config.deploymentProfile),
+          dest: cappedTransport,
           secrets,
           events: readyRows.map((r) => r.projectedJson),
           egress: getEgressPort(deps.services),
-          signal: job?.signal,
+          signal: batchAbort.signal,
         });
         receiptConfirmation = res.receiptConfirmation;
       } catch (err) {
         deliveryError = classifySocketError(err, false);
+      } finally {
+        clearTimeout(leaseAbortTimer);
+        job?.signal.removeEventListener("abort", onParentAbort);
       }
 
       const completedAt = deps.clock.now();
+      let cutoffStop = false;
 
       if (!deliveryError) {
         const rowIds = readyRows.map((r) => r.id);
+        let countedDelivered = 0;
         await deps.db.transaction(async (tx) => {
-          await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
+          if (job) await job.assertStillOwned(tx);
+          const [postRow] = await tx
+            .select({
+              row: siemDestinations,
+              remainingUs: sql<number>`TIMESTAMPDIFF(MICROSECOND, UTC_TIMESTAMP(3), ${siemDestinations.leaseExpiresAt})`,
+            })
+            .from(siemDestinations)
+            .where(eq(siemDestinations.id, dest.id))
+            .for("update")
+            .limit(1);
 
+          if (!postRow || postRow.row.endpointGeneration !== dest.endpointGeneration) {
+            cutoffStop = true;
+            return;
+          }
+
+          // Batch was accepted on this endpoint generation: remove outbox rows so they are never re-sent.
           await tx.delete(siemOutbox).where(inArray(siemOutbox.id, rowIds));
+          countedDelivered = rowIds.length;
+
+          const leaseStillValid =
+            postRow.row.enabled &&
+            postRow.row.version === snapshotVersion &&
+            postRow.row.leaseOwnerJobId === lease.token &&
+            postRow.row.lastFencingToken === lease.fence &&
+            Boolean(postRow.row.leaseExpiresAt) &&
+            Number(postRow.remainingUs ?? 0) > 0;
+
+          if (!leaseStillValid) {
+            // In-flight cutoff: destination revision changed or lease expired mid-flight; record deliveredCount only,
+            // never overwriting the newer revision's circuit/receipt/failure state.
+            await tx
+              .update(siemDestinations)
+              .set({
+                deliveredCount: sql`${siemDestinations.deliveredCount} + ${rowIds.length}`,
+              })
+              .where(eq(siemDestinations.id, dest.id));
+            cutoffStop = true;
+            return;
+          }
+
           await tx
             .update(siemDestinations)
             .set({
@@ -1921,21 +2075,70 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
               lastFailureReason: null,
               deliveredCount: sql`${siemDestinations.deliveredCount} + ${rowIds.length}`,
               receiptConfirmation,
-              leaseExpiresAt: new Date(completedAt.getTime() + LEASE_DURATION_MS),
+              leaseExpiresAt: sql`DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ${LEASE_DURATION_SECONDS} SECOND)`,
               updatedAt: completedAt,
             })
             .where(eq(siemDestinations.id, dest.id));
         });
-        delivered += rowIds.length;
+        delivered += countedDelivered;
+        if (cutoffStop) break;
       } else {
         const reasonCode = deliveryError.reasonCode;
         const retryable = deliveryError.retryable;
         const uncertainAfterWrite = deliveryError.uncertainAfterWrite;
 
         let batchDeadLetters = 0;
+        let recordedFailure = false;
         await deps.db.transaction(async (tx) => {
-          const locked = await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
+          if (job) await job.assertStillOwned(tx);
+          const [postRow] = await tx
+            .select({
+              row: siemDestinations,
+              remainingUs: sql<number>`TIMESTAMPDIFF(MICROSECOND, UTC_TIMESTAMP(3), ${siemDestinations.leaseExpiresAt})`,
+            })
+            .from(siemDestinations)
+            .where(eq(siemDestinations.id, dest.id))
+            .for("update")
+            .limit(1);
 
+          if (!postRow || postRow.row.endpointGeneration !== dest.endpointGeneration) {
+            cutoffStop = true;
+            return;
+          }
+
+          const locked = postRow.row;
+          const leaseStillValid =
+            locked.enabled &&
+            locked.version === snapshotVersion &&
+            locked.leaseOwnerJobId === lease.token &&
+            locked.lastFencingToken === lease.fence &&
+            Boolean(locked.leaseExpiresAt) &&
+            Number(postRow.remainingUs ?? 0) > 0;
+
+          if (!leaseStillValid) {
+            // In-flight cutoff: preserve post-write uncertainty on the outbox rows without overwriting newer destination config state.
+            if (uncertainAfterWrite) {
+              const rowIds = readyRows.map((r) => r.id);
+              await tx
+                .update(siemOutbox)
+                .set({
+                  uncertainDelivery: true,
+                  lastReasonCode: reasonCode,
+                  updatedAt: completedAt,
+                })
+                .where(and(inArray(siemOutbox.id, rowIds), eq(siemOutbox.endpointGeneration, dest.endpointGeneration)));
+              await tx
+                .update(siemDestinations)
+                .set({
+                  uncertainCount: sql`${siemDestinations.uncertainCount} + ${readyRows.length}`,
+                })
+                .where(eq(siemDestinations.id, dest.id));
+            }
+            cutoffStop = true;
+            return;
+          }
+
+          recordedFailure = true;
           for (const item of readyRows) {
             const nextAttempts = item.attempts + 1;
             const exhaust = !retryable || nextAttempts >= item.maxAttempts;
@@ -1992,7 +2195,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
               uncertainCount: uncertainAfterWrite
                 ? sql`${siemDestinations.uncertainCount} + ${readyRows.length}`
                 : locked.uncertainCount,
-              leaseExpiresAt: new Date(completedAt.getTime() + LEASE_DURATION_MS),
+              leaseExpiresAt: sql`DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ${LEASE_DURATION_SECONDS} SECOND)`,
               updatedAt: completedAt,
             })
             .where(eq(siemDestinations.id, dest.id));
@@ -2052,8 +2255,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           }
         });
 
-        failed += readyRows.length;
-        deadLettered += batchDeadLetters;
+        if (recordedFailure) {
+          failed += readyRows.length;
+          deadLettered += batchDeadLetters;
+        }
         break;
       }
     }
@@ -2171,6 +2376,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             oldestPendingAgeSeconds: 0,
             maxLagSeq: 0,
             maxCursorLagAgeSeconds: 0,
+            missingAuditGaps: 0,
+            prunedAuditEvents: 0,
           },
           checkedAt,
         },
@@ -2189,12 +2396,14 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     let maxLagSeq = 0;
     let maxCursorLagAgeSeconds = 0;
     let totalMissingGaps = 0;
+    let totalPrunedAudit = 0;
 
     for (const row of rows) {
       const s = statsMap.get(row.id);
       totalQueued += s?.queuedCount ?? 0;
       totalDeadLetters += s?.deadLetterCount ?? 0;
       totalMissingGaps += row.missingAuditGapCount;
+      totalPrunedAudit += row.prunedAuditCount;
       if (row.enabled && s?.oldestQueuedCreatedAt) {
         const age = Math.max(0, Math.floor((checkedAt.getTime() - s.oldestQueuedCreatedAt.getTime()) / 1_000));
         if (age > oldestPendingAgeSeconds) oldestPendingAgeSeconds = age;
@@ -2219,6 +2428,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       maxLagSeq,
       maxCursorLagAgeSeconds,
       missingAuditGaps: totalMissingGaps,
+      prunedAuditEvents: totalPrunedAudit,
     };
 
     if (enabledRows.length === 0) {
@@ -2263,7 +2473,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       } else if (hasExpiredCert) {
         summary = "One or more enabled SIEM destinations have an expired TLS certificate.";
       } else if (hasSpoolSaturation) {
-        summary = "A SIEM destination spool reached capacity; cursor projection is paused without dropping events.";
+        summary =
+          "A SIEM destination spool reached capacity; projection is paused at its current audit cursor (unprojected records remain subject to upstream audit retention until the spool drains).";
       } else if (hasOpenCircuit) {
         summary = "One or more SIEM destination circuit breakers are open after repeated transport failures.";
       } else if (totalDeadLetters > 0) {

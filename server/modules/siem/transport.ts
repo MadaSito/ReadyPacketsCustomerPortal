@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import https from "node:https";
 import net from "node:net";
 import tls, { type PeerCertificate, type TLSSocket } from "node:tls";
@@ -208,10 +209,25 @@ function verifyServerIdentityStrict(expectedHost: string, cert: PeerCertificate)
   return tls.checkServerIdentity(expectedHost, cert);
 }
 
+const MAX_POOL_SOCKET_AGE_MS = 5 * 60 * 1_000;
+
+function computeTlsSecretsFingerprint(secrets: ResolvedDestinationSecrets): string {
+  return crypto
+    .createHash("sha256")
+    .update(secrets.customCaPem ?? "")
+    .update("\0")
+    .update(secrets.clientCertPem ?? "")
+    .update("\0")
+    .update(secrets.clientKeyPem ?? "")
+    .digest("hex")
+    .slice(0, 16);
+}
+
 interface PooledTlsEntry {
   key: string;
   socket: TLSSocket;
   pinned: PinnedEgressTarget;
+  createdAtMs: number;
   healthy: boolean;
   lastError: unknown;
 }
@@ -280,12 +296,14 @@ export class SiemTlsConnectionPool {
       throw new SiemTransportError("TRANSPORT_ERROR", true, false);
     }
 
-    const versionKey = `${dest.publicId}:v${dest.version}`;
+    const nowMs = Date.now();
+    const versionKey = `${dest.publicId}:v${dest.version}:${computeTlsSecretsFingerprint(secrets)}`;
     const existing = this.entries.get(dest.publicId);
     if (
       existing &&
       existing.key === versionKey &&
       existing.healthy &&
+      nowMs - existing.createdAtMs < MAX_POOL_SOCKET_AGE_MS &&
       !existing.socket.destroyed &&
       existing.socket.writable &&
       existing.pinned.address === pinned.address &&
@@ -378,6 +396,7 @@ export class SiemTlsConnectionPool {
       key: versionKey,
       socket,
       pinned,
+      createdAtMs: Date.now(),
       healthy: true,
       lastError: null,
     };
@@ -695,7 +714,8 @@ async function deliverOtlpHttpsBatch(
             return;
           }
           if (status >= 500) {
-            reject(new SiemTransportError("HTTP_SERVER_ERROR", true, false));
+            // Request body was already transmitted; an upstream collector or proxy may or may not have ingested the batch.
+            reject(new SiemTransportError("HTTP_SERVER_ERROR", true, wroteBody));
             return;
           }
           reject(new SiemTransportError("HTTP_CLIENT_ERROR", false, false));

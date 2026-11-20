@@ -276,9 +276,16 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
       session_ref: "ses_raw",
       source_address_ref: "203.0.113.42",
       ipAddress: "203.0.113.42",
+      safe_counts: {
+        events: 2,
+        secret_customer_metric_name: 7,
+      },
       attributes: {
         auth_method: "totp",
+        role: "SuperSecretToken",
+        status: "MixedCaseBearerLikeToken",
         mfa_verified: true,
+        arbitrary_boolean_flag_name: true,
         version: 3,
         unallowlisted_free_text: "arbitrary customer text",
         arbitrary_amount: 999999,
@@ -303,11 +310,18 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect(serialized).not.toContain("bob@example.org");
     expect(serialized).not.toContain("argon2id");
     expect(serialized).not.toContain("arbitrary customer text");
+    expect(serialized).not.toContain("SuperSecretToken");
+    expect(serialized).not.toContain("MixedCaseBearerLikeToken");
+    expect(projected.safe_counts).toEqual({ events: 2 });
+    expect("secret_customer_metric_name" in projected.safe_counts).toBe(false);
     expect(projected.attributes.auth_method).toBe("totp");
     expect(projected.attributes.mfa_verified).toBe(true);
     expect(projected.attributes.version).toBe(3);
+    expect("role" in projected.attributes).toBe(false);
+    expect("status" in projected.attributes).toBe(false);
+    expect("arbitrary_boolean_flag_name" in projected.attributes).toBe(false);
     expect("unallowlisted_free_text" in projected.attributes).toBe(false);
     expect("arbitrary_amount" in projected.attributes).toBe(false);
-    expect(projected.dropped_attributes).toBeGreaterThanOrEqual(6);
+    expect(projected.dropped_attributes).toBeGreaterThanOrEqual(10);
   });
 });

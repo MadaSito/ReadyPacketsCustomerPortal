@@ -2,6 +2,7 @@ import https from "node:https";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import tls from "node:tls";
+import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -19,6 +20,9 @@ import { siemDestinations, siemOutbox } from "./schema.js";
 import {
   SIEM_CIRCUIT_COOLDOWN_SECONDS,
   SIEM_CIRCUIT_THRESHOLD,
+  SIEM_DEFAULT_CA_BUNDLE,
+  SIEM_DEFAULT_CLIENT_CERT,
+  SIEM_DEFAULT_CLIENT_KEY,
   SIEM_MAX_ATTEMPTS,
   SIEM_OLDEST_ALERT_SECONDS,
   SIEM_SPOOL_MAX_EVENTS,
@@ -1569,6 +1573,178 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
     expect(c4.delivered).toBe(1);
     await waitForCount(() => liveReceiver.frames.length, 4);
     expect(liveReceiver.handshakeCount).toBe(2);
+
+    await siem.close!();
+  });
+
+  it("enforces scope-narrowing backlog pruning, zero global mTLS fallback, DB-UTC lease expiry, global CA pool eviction, and OTLP 5xx uncertainty", async () => {
+    const { h, siem, auditStream } = setupModule();
+    const admin = steppedUpAdmin(h.clock.now());
+
+    // 1. H1: Global mTLS client cert/key settings are NEVER implicitly sent on a destination that did not bind client credentials.
+    const globalClient = pki.issueClientCert({ commonName: "global-unused-client" });
+    await h.settings.setSecret(SIEM_DEFAULT_CLIENT_CERT.key, globalClient.certPem);
+    await h.settings.setSecret(SIEM_DEFAULT_CLIENT_KEY.key, globalClient.keyPem);
+    await h.settings.setSecret(SIEM_DEFAULT_CA_BUNDLE.key, pki.ca.certPem);
+
+    const mtlsServerCert = pki.issueServerCert({
+      commonName: "strict-mtls.siem.test",
+      dnsNames: ["strict-mtls.siem.test"],
+    });
+    const mtlsServer = await startTlsReceiver({
+      certPem: mtlsServerCert.certPem,
+      keyPem: mtlsServerCert.keyPem,
+      clientCaPem: pki.ca.certPem,
+      requireClientCert: true,
+    });
+    activeServers.push(mtlsServer);
+
+    const noClientDest = await siem.createDestination(admin, {
+      name: "No Implicit mTLS",
+      enabled: false,
+      format: "syslog_rfc5425",
+      host: "strict-mtls.siem.test",
+      port: mtlsServer.port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+    });
+
+    // Without per-destination sealed mTLS credentials, strict mTLS server rejects handshake even when global settings exist.
+    const noClientProbe = await siem.sendTestEvent(admin, { publicId: noClientDest.publicId });
+    expect(noClientProbe.outcome).not.toBe("completed");
+    expect(mtlsServer.frames.length).toBe(0);
+
+    // 2. H1 (scope narrowing) + M pool (global CA rotation evicts pooled TLS socket):
+    const plainTlsCert = pki.issueServerCert({
+      commonName: "scope-pool.siem.test",
+      dnsNames: ["scope-pool.siem.test"],
+    });
+    const plainReceiver = await startTlsReceiver({
+      certPem: plainTlsCert.certPem,
+      keyPem: plainTlsCert.keyPem,
+    });
+    activeServers.push(plainReceiver);
+
+    // Create destination initially offline (port where nothing listens yet) or pause delivery to project INFO + ERROR rows, then narrow to ERROR.
+    const scopeDest = await siem.createDestination(admin, {
+      name: "Scope & Pool Receiver",
+      enabled: true,
+      format: "syslog_rfc5425",
+      host: "scope-pool.siem.test",
+      port: plainReceiver.port,
+      allowPrivateNetwork: true,
+      minSeverity: "INFO",
+      categories: ["security", "admin"],
+    });
+
+    // First cycle delivers via global SIEM_DEFAULT_CA_BUNDLE (`handshakeCount === 1`).
+    const ev1 = auditStream.append({ event_name: "auth.pool.one", severity_text: "ERROR", severity_number: 17, category: "security" });
+    const p1 = await siem.runDeliveryCycle({ destinationPublicId: scopeDest.publicId });
+    expect(p1.delivered).toBe(1);
+    await waitForCount(() => plainReceiver.frames.length, 1);
+    expect(plainReceiver.frames[0]).toContain(ev1.event_id);
+    expect(plainReceiver.handshakeCount).toBe(1);
+
+    // Rotate global SIEM_DEFAULT_CA_BUNDLE (append whitespace/comment-equivalent second CA cert) without touching destination version -> pool MUST reconnect!
+    const extraPki = createTestPki();
+    await h.settings.setSecret(SIEM_DEFAULT_CA_BUNDLE.key, `${pki.ca.certPem}\n${extraPki.ca.certPem}`);
+    const ev2 = auditStream.append({ event_name: "auth.pool.two", severity_text: "ERROR", severity_number: 17, category: "security" });
+    const p2 = await siem.runDeliveryCycle({ destinationPublicId: scopeDest.publicId });
+    expect(p2.delivered).toBe(1);
+    await waitForCount(() => plainReceiver.frames.length, 2);
+    expect(plainReceiver.frames[1]).toContain(ev2.event_id);
+    expect(plainReceiver.handshakeCount).toBe(2);
+
+    // Seed queued INFO + ERROR rows on `scopeDest` (simulating already-projected backlog before narrowing scope), then narrow `minSeverity` to `ERROR` and `categories` to `["security"]`.
+    const infoEv = auditStream.append({ event_name: "admin.low_sev.queued", severity_text: "INFO", severity_number: 9, category: "admin" });
+    const errEv = auditStream.append({ event_name: "auth.high_sev.queued", severity_text: "ERROR", severity_number: 17, category: "security" });
+
+    // Pause network by opening circuit momentarily so `runDeliveryCycle` projects both events into `siem_outbox` without transmitting yet.
+    await testDb.db
+      .update(siemDestinations)
+      .set({
+        circuitState: "open",
+        circuitOpenUntil: new Date(h.clock.now().getTime() + 600_000),
+      })
+      .where(eq(siemDestinations.publicId, scopeDest.publicId));
+
+    const projectedOnly = await siem.runDeliveryCycle({ destinationPublicId: scopeDest.publicId });
+    expect(projectedOnly.projected).toBe(2);
+    expect(projectedOnly.delivered).toBe(0);
+
+    const currentScope = await siem.getDestination(admin, scopeDest.publicId);
+    expect(currentScope.delivery.queuedCount).toBe(2);
+
+    // Narrow filter to `minSeverity: "ERROR"` and `categories: ["security"]` -> queued INFO/admin row is immediately pruned!
+    const narrowed = await siem.updateDestination(admin, {
+      publicId: scopeDest.publicId,
+      expectedVersion: currentScope.version,
+      minSeverity: "ERROR",
+      categories: ["security"],
+    });
+    expect(narrowed.delivery.queuedCount).toBe(1);
+
+    // Clear circuit cooldown and deliver -> ONLY `errEv` is transmitted; `infoEv` is never forwarded!
+    await testDb.db
+      .update(siemDestinations)
+      .set({ circuitState: "closed", circuitOpenUntil: null })
+      .where(eq(siemDestinations.publicId, scopeDest.publicId));
+
+    const afterNarrow = await siem.runDeliveryCycle({ destinationPublicId: scopeDest.publicId });
+    expect(afterNarrow.delivered).toBe(1);
+    await waitForCount(() => plainReceiver.frames.length, 3);
+    expect(plainReceiver.frames[2]).toContain(errEv.event_id);
+    expect(plainReceiver.frames.some((f) => f.includes(infoEv.event_id))).toBe(false);
+
+    // 3. H4: Stale worker lease expired according to MySQL `UTC_TIMESTAMP(3)` is reclaimed even when `h.clock` is skewed weeks earlier.
+    await testDb.db
+      .update(siemDestinations)
+      .set({
+        leaseOwnerJobId: "lease_stale_dead_worker",
+        leaseExpiresAt: sql`DATE_SUB(UTC_TIMESTAMP(3), INTERVAL 5 SECOND)`,
+      })
+      .where(eq(siemDestinations.publicId, scopeDest.publicId));
+
+    const reclaimedEv = auditStream.append({ event_name: "auth.lease.reclaimed", severity_text: "ERROR", severity_number: 17, category: "security" });
+    const reclaimed = await siem.runDeliveryCycle({ destinationPublicId: scopeDest.publicId });
+    expect(reclaimed.delivered).toBe(1);
+    await waitForCount(() => plainReceiver.frames.length, 4);
+    expect(plainReceiver.frames[3]).toContain(reclaimedEv.event_id);
+
+    // 4. M receipt: OTLP HTTPS 503 after request body write preserves `uncertainDelivery = true` and `uncertainCount > 0`.
+    const otlpCert = pki.issueServerCert({
+      commonName: "otlp-uncertain.siem.test",
+      dnsNames: ["otlp-uncertain.siem.test"],
+    });
+    const otlpCollector = await startHttpsOtlpCollector({
+      certPem: otlpCert.certPem,
+      keyPem: otlpCert.keyPem,
+    });
+    activeServers.push(otlpCollector);
+    otlpCollector.setResponseStatus(503);
+    await h.settings.set(SIEM_MAX_ATTEMPTS.key, 1);
+
+    const otlpDest = await siem.createDestination(admin, {
+      name: "OTLP 503 Uncertain",
+      enabled: true,
+      format: "otlp_https",
+      host: "otlp-uncertain.siem.test",
+      port: otlpCollector.port,
+      otlpPath: "/v1/logs",
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    auditStream.append({ event_name: "auth.otlp.503", severity_text: "ERROR", severity_number: 17, category: "security" });
+    const otlpCycle = await siem.runDeliveryCycle({ destinationPublicId: otlpDest.publicId });
+    expect(otlpCycle.deadLettered).toBeGreaterThanOrEqual(1);
+
+    const afterOtlp = await siem.getDestination(admin, otlpDest.publicId);
+    expect(afterOtlp.delivery.uncertainCount).toBe(otlpCycle.deadLettered);
+    const dlq = await siem.listDeadLetters(admin, { destinationPublicId: otlpDest.publicId });
+    expect(dlq.items).toHaveLength(otlpCycle.deadLettered);
+    expect(dlq.items.every((item) => item.uncertainDelivery && item.lastReasonCode === "HTTP_SERVER_ERROR")).toBe(true);
 
     await siem.close!();
   });

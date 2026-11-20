@@ -2,7 +2,7 @@
 
 ## 1. Scope & Ownership Summary
 
-- **Owned & Implemented here:** `server/modules/siem/**` (`types.ts`, `schema.ts`, `settings.ts`, `projection.ts`, `rfc5424.ts`, `formats.ts`, `transport.ts`, `validation.ts`, `router.ts`, `index.ts`, `testPki.ts`, `rfc5424.test.ts`, `siem.test.ts`, `API.md`, `VERIFICATION.md`) + `siem.read` capability registration in `shared/capabilities.ts`.
+- **Owned & Implemented here:** `server/modules/siem/**` (`types.ts`, `schema.ts`, `settings.ts`, `projection.ts`, `rfc5424.ts`, `formats.ts`, `transport.ts`, `validation.ts`, `router.ts`, `index.ts`, `testPki.ts`, `rfc5424.test.ts`, `siem.test.ts`, `API.md`, `VERIFICATION.md`), `tests/integration/siem-forwarding.test.ts`, + `siem.read` capability registration in `shared/capabilities.ts`.
 - **Client UI ownership:** `client/src/features/siem/**` (`/admin/siem`) was reassigned by `/root` to `portable_ops_engineer` and integrated against `server/modules/siem/API.md` & `router.ts`.
 
 ---
@@ -28,16 +28,16 @@
 6. **RFC 5425 octet-counting & multi-byte UTF-8 truncation:** `frameOctetCounted` prefixes exact UTF-8 byte length (`<byteLen> <msg>`); `truncateUtf8Safe` never splits multi-byte UTF-8 sequences (`東京...`) and marks `truncated="true"`.
 7. **JSON Lines (`jsonl_tls`) & ArcSight CEF (`cef_tls`) adapters:** Escapes pipe/backslash/newline injection attempts and wraps CEF inside RFC 5424 + RFC 5425 octet-counted TLS frames.
 8. **OTLP/HTTP JSON (`otlp_https`) `ExportLogsServiceRequest`:** Maps `timeUnixNano`, `observedTimeUnixNano`, `severityNumber`, `severityText`, `traceId`, `spanId`, and resource attributes.
-9. **Defense-in-depth external projection (`projection.ts`):** Strips `actor_user_id`, `resource_public_id`, `session_ref`, `source_address_ref`, raw IPs, emails, secrets, and enforces a strict typed external attribute allowlist (`EXTERNAL_STRING_ATTRIBUTE_KEYS`, `EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS`, `EXTERNAL_NUMERIC_ATTRIBUTE_KEYS`).
+9. **Defense-in-depth external projection (`projection.ts`):** Strips `actor_user_id`, `resource_public_id`, `session_ref`, `source_address_ref`, raw IPs, emails, secrets, and enforces strict typed allowlists + closed/lowercase value vocabularies across `EXTERNAL_SAFE_COUNT_KEYS`, `EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS`, `EXTERNAL_STRING_ATTRIBUTE_KEYS`, `EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS`, and `EXTERNAL_NUMERIC_ATTRIBUTE_KEYS`.
 
-### `server/modules/siem/siem.test.ts` (14 integration & regression tests — all passing against MySQL 8 + in-process `node:tls` / `node:https` receivers)
+### `server/modules/siem/siem.test.ts` (15 module & regression tests — all passing against MySQL 8 + in-process `node:tls` / `node:https` receivers)
 1. **Truthful health lifecycle (`ModuleLifecycle.health()`):** Verifies `not_configured` -> `disabled` -> `ok` -> `degraded` (CA expiring <= 14 days) -> `failing` (CA expired), plus write-only secret redaction.
 2. **RFC 5425 TLS octet-counted delivery, socket pooling, reconnect, and off-host checkpoint custody:** Proves TLS handshake reuse (`handshakeCount === 1` across batches), clean reconnect on collector restart, filtering by `minSeverity`/`categories`, self-event loop prevention (`siem.*`), and `audit.checkpoint.created` (`checkpoint_seq` + `head_link_hmac_sha256`) custody forwarding.
 3. **Certificate & SAN hostname validation:** Wrong hostname (`TLS_HOSTNAME_MISMATCH`) and untrusted CA (`TLS_CERT_UNTRUSTED`) deliver `0` frames with `receiptConfirmation: "none"`.
 4. **Mutual TLS (mTLS):** Collector with `requestCert: true, rejectUnauthorized: true` rejects unauthenticated client (`0` frames), `updateDestination` rejects mismatched cert/key pair (`MTLS_KEY_MISMATCH`), and valid client cert/key succeeds (`completed`, `transport_accepted`).
 5. **Multi-adapter TLS delivery:** Verifies `jsonl_tls`, `cef_tls`, and `otlp_https` (`Authorization: Bearer ...`, `receiptConfirmation: "collector_2xx"`) against live TLS/HTTPS servers.
 6. **SSRF & outbound egress enforcement:** Blocks cloud metadata IP (`169.254.169.254` even when `allowPrivateNetwork: true`) and unapproved RFC1918 addresses (`EGRESS_BLOCKED`).
-7. **Retry/backoff, circuit breaker, dead-lettering, spool cap, restart resume, and step-up replay:** Uses `FakeClock` to verify exponential backoff, circuit open (`CONNECTION_REFUSED`), dead-lettering at `maxAttempts`, backpressure pause at `spool_max_events` without dropping audit events, clean resume across `createSiemModule` restart, and step-up dead-letter replay draining all 105 events.
+7. **Retry/backoff, circuit breaker, dead-lettering, spool cap, restart resume, and step-up replay:** Uses `FakeClock` to verify exponential backoff, circuit open (`CONNECTION_REFUSED`), dead-lettering at `maxAttempts`, backpressure pause at `spool_max_events` (qualified honestly against upstream audit retention), clean resume across `createSiemModule` restart, and step-up dead-letter replay draining all 105 events.
 8. **Multi-worker concurrency:** Proves concurrent `runDeliveryCycle` calls claim per-destination leases without double-sending.
 9. **Zero-trust RBAC, step-up MFA, and fail-closed transactional audit:** Verifies anonymous (`UNAUTHORIZED`), customer/staff/remediation-admin (`FORBIDDEN`), unstepped/stale-step-up admin (`STEP_UP_REQUIRED`), and full transaction + secret rollback on `AUDIT_UNAVAILABLE`.
 10. **Cross-Model Review Rules 1, 2, 3:** Runs full `create -> update -> delete` lifecycle on a `connectionLimit: 1` MySQL pool without self-deadlock, catches in-tx role demotion & session revocation (`SESSION_NOT_CURRENT`), and proves `siem.destination.deleted` is recorded in `tx` while the row still exists before deletion.
@@ -45,6 +45,10 @@
 12. **Security Review & Audit `S-1` — Retention-pruned empty pages & missing gaps:** Proves `events: []` with advanced `nextCursor` (`pruned: 250`) persists progress under lease and delivers subsequent events, while `missing > 0` records durable `siem.audit.loss_detected` (`WARN`, `AUDIT_EVENTS_MISSING`) and sets `health()` to `failing`.
 13. **Security Review — Cross-job fencing, live egress revocation, and fail-closed egress port:** Proves high `job.fencingToken` on a retried job never starves subsequent scheduled jobs at `fencingToken: 1`, live egress revocation immediately evicts pooled TLS sockets (`EGRESS_BLOCKED`, `0` post-revocation frames), and missing `services.integrations.egress` fails closed.
 14. **Security Review — Strict FIFO head-of-line backoff & isolated step-up `sendTestEvent`:** Proves newer queued events never overtake a backed-off head event, `destinations.test` enforces `siem.manage` step-up, and probe sockets are one-shot without evicting the worker's pooled TLS socket.
+15. **Assurance Re-Review Regressions (`H1`, `H4`, `M pool`, `M receipt`):** Proves global `SIEM_DEFAULT_CLIENT_CERT`/`KEY` are never implicitly sent without per-destination endpoint consent, narrowing `minSeverity`/`categories` immediately prunes non-matching queued backlog rows, worker leases are anchored to MySQL `UTC_TIMESTAMP(3)` with remaining-lease I/O abort budgets and clean in-flight revision cutoffs, global `SIEM_DEFAULT_CA_BUNDLE` rotation evicts pooled TLS sockets, and OTLP HTTPS `5xx` responses preserve `uncertainDelivery = true` (`HTTP_SERVER_ERROR`).
+
+### `tests/integration/siem-forwarding.test.ts` (1 full-stack HTTP + MySQL + TLS journey — passing)
+1. **End-to-end assembled system journey:** Real `createContainer` + MySQL + `createApp` via Supertest -> admin bootstrap (`identity.provisionLocalAccount`), sign-in, password change, TOTP MFA enrolment, and step-up over HTTP -> sanctioned loopback egress rule (`integrations.admin.egress.create`) -> enabled RFC 5425 TLS destination trusting runtime-generated CA -> real failed sign-in (`identity.signIn`) + real setting update (`platform.admin.settings.update`) -> real job queue execution (`audit.chain.seal` + `siem.deliver` via `drainJobs()`) -> verifies octet-framed RFC 5424 messages carry the exact `X-Request-Id` response headers in structured data and JSON payload with zero secret/PII leakage -> verifies untrusted-CA destination delivers `0` bytes and transitions `siem.admin.health` and `platform.admin.health` to `failing`.
 
 ---
 
@@ -52,12 +56,13 @@
 
 ```bash
 source scripts/dev/env.sh
-scripts/dev/tc.sh 'server/modules/siem'
-scripts/dev/lint.sh server/modules/siem
+scripts/dev/tc.sh 'server/modules/siem|client/src/features/siem|tests/integration/siem-forwarding'
+scripts/dev/lint.sh server/modules/siem tests/integration/siem-forwarding.test.ts
 scripts/dev/test.sh server/modules/siem
+scripts/dev/test.sh tests/integration/siem-forwarding.test.ts
 ```
 
-All commands exited `0` (`23/23` server tests passing).
+All commands exited `0` (`25/25` server & integration tests passing).
 
 ---
 

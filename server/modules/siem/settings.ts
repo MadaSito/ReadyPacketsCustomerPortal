@@ -263,22 +263,14 @@ export async function readDestinationSecretsFromRow(
 ): Promise<ResolvedDestinationSecrets> {
   const endpointKey = computeEndpointKey(row);
   let customCaPem = decryptRowSlot(crypto, row.caEnc, row.publicId, row.version, endpointKey, "ca");
-  let clientCertPem = decryptRowSlot(crypto, row.clientCertEnc, row.publicId, row.version, endpointKey, "cert");
-  let clientKeyPem = decryptRowSlot(crypto, row.clientKeyEnc, row.publicId, row.version, endpointKey, "key");
+  const clientCertPem = decryptRowSlot(crypto, row.clientCertEnc, row.publicId, row.version, endpointKey, "cert");
+  const clientKeyPem = decryptRowSlot(crypto, row.clientKeyEnc, row.publicId, row.version, endpointKey, "key");
   const authSecret = decryptRowSlot(crypto, row.authSecretEnc, row.publicId, row.version, endpointKey, "auth");
 
+  // Only server-verification CA trust may fall back to an installation-wide CA bundle;
+  // mTLS client keys and collector auth tokens are NEVER implicitly sent unless sealed on this destination's endpoint.
   if (!customCaPem) {
     customCaPem = await settings.getSecret(SIEM_DEFAULT_CA_BUNDLE.key, tx);
-  }
-  if (!clientCertPem && !clientKeyPem) {
-    const [defaultCert, defaultKey] = await Promise.all([
-      settings.getSecret(SIEM_DEFAULT_CLIENT_CERT.key, tx),
-      settings.getSecret(SIEM_DEFAULT_CLIENT_KEY.key, tx),
-    ]);
-    if (defaultCert && defaultKey) {
-      clientCertPem = defaultCert;
-      clientKeyPem = defaultKey;
-    }
   }
 
   return { customCaPem, clientCertPem, clientKeyPem, authSecret };
