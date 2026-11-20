@@ -12,6 +12,8 @@ import { IntegritySummary } from "./IntegrityPage";
 import { buildQuery, DEFAULT_FILTERS, invalidIdentifier, readParam, type AuditEnvelope, type EventDetail, type ExportView, type IntegrityStatus } from "./model";
 import RetentionPage, { RetentionView } from "./RetentionPage";
 import { SavedQueriesTable } from "./SavedQueriesPage";
+import { auditFeature } from "./routes";
+import IntegrityWidget from "./widgets/IntegrityWidget";
 
 /* ---- tRPC mock: every procedure path resolves through `handlers[path]` ---- */
 const { handlers, fetchMock } = vi.hoisted(() => ({ handlers: {} as Record<string, (input: unknown) => unknown>, fetchMock: vi.fn() }));
@@ -270,6 +272,38 @@ describe("exports and retention pages", () => {
   it("retention view renders policies and holds accessibly", async () => {
     const { container } = renderUi(<RetentionView state={{ policies: [], holds: [], runs: [] }} onEditPolicy={() => undefined} onReleaseHold={() => undefined} />);
     expect(screen.getByText("No legal holds")).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe("console overview widget", () => {
+  const status: IntegrityStatus = {
+    headSeq: 1234, headHash: "a".repeat(64), lastSealedAt: "2026-11-20T11:59:00.000Z", lastVerifiedAt: "2026-11-20T11:00:00.000Z", lastVerifyOk: true,
+    lastVerifyBreakSeq: null, unsealed: 3, oldestUnsealedAgeSeconds: 10, horizonSeconds: 900, counts: { events: 1237, sealed: 1234, tombstones: 0 },
+    checkpointPublicKey: "pk", checkpointKeyRef: "k1", emitter: { recordFailures: 2, lastRecordFailureAt: null, notesDropped: 0, notesQueued: 0 },
+  };
+
+  it("is registered as an admin console card gated on audit.read", () => {
+    expect(auditFeature.widgets).toEqual([expect.objectContaining({ key: "audit.integrity", area: "console", access: "admin", capability: "audit.read", span: 4 })]);
+  });
+
+  it("summarises integrity with one h2 and a link to the full page", async () => {
+    handlers["audit.integrity.status"] = () => status;
+    const { container } = renderUi(<IntegrityWidget />);
+    expect(await screen.findByText("Chain verified")).toBeInTheDocument();
+    expect(screen.getAllByRole("heading")).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 2, name: "Audit integrity" })).toBeInTheDocument();
+    expect(screen.getByText("1,234")).toBeInTheDocument();
+    expect(screen.getByText("2 recording failures")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open integrity" })).toHaveAttribute("href", "/admin/audit/integrity");
+    await expectNoAxeViolations(container);
+  });
+
+  it("shows an error state, never zeros, when the status cannot be read", async () => {
+    handlers["audit.integrity.status"] = () => { throw new Error("offline"); };
+    const { container } = renderUi(<IntegrityWidget />);
+    expect(await screen.findByRole("button", { name: /try again|retry/iu })).toBeInTheDocument();
+    expect(screen.queryByText("Sealed records")).toBeNull();
     await expectNoAxeViolations(container);
   });
 });

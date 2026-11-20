@@ -14,5 +14,6 @@ export const auditFeature: FeatureRoutes = {
     { ...admin, path: "/admin/audit/integrity", title: "Audit integrity", component: lazy(() => import("./IntegrityPage")) },
     { access: "admin", capability: "audit.retention.manage", path: "/admin/audit/retention", title: "Audit retention", component: lazy(() => import("./RetentionPage")) },
   ],
+  widgets: [{ key: "audit.integrity", area: "console", access: "admin", capability: "audit.read", order: 40, span: 4, component: lazy(() => import("./widgets/IntegrityWidget")) }],
   nav: [{ ...admin, label: "Audit center", href: "/admin/audit", icon: ScrollText, area: "console", group: "Security", order: 34 }],
 };

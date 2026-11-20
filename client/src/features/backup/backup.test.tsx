@@ -12,6 +12,7 @@ import {
 } from "./model";
 import RestorePage from "./RestorePage";
 import RetentionPage, { policyErrors } from "./RetentionPage";
+import BackupsWidget, { BackupsWidgetBody } from "./BackupsWidget";
 import { backupFeature } from "./routes";
 
 /* ---- tRPC mock: every procedure path resolves through `handlers[path]` ---- */
@@ -349,3 +350,41 @@ import { Route } from "wouter";
 function BackupDetailRoute() {
   return <Route path="/admin/backups/:backupId"><BackupDetailPage /></Route>;
 }
+
+describe("Backups console widget", () => {
+  it("is registered as an admin console card gated on backup.read", () => {
+    expect(backupFeature.widgets).toEqual([expect.objectContaining({ key: "backup.status", area: "console", access: "admin", capability: "backup.read", span: 4 })]);
+  });
+
+  it("shows posture with one h2 and a link to the backups page", async () => {
+    const { container } = renderUi(<BackupsWidget />);
+    expect(await screen.findByText("Last successful backup")).toBeInTheDocument();
+    expect(screen.getAllByRole("heading")).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 2, name: "Backups" })).toBeInTheDocument();
+    expect(screen.getByText("Configured")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open backups" })).toHaveAttribute("href", "/admin/backups");
+    await expectNoAxeViolations(container);
+  });
+
+  it("warns when there is no successful backup and the key is missing", async () => {
+    handlers["backup.admin.list"] = () => listPage([archive({ state: "failed", completedAt: null, isLastKnownGood: false })], { keyConfigured: false });
+    const { container } = renderUi(<BackupsWidget />);
+    expect(await screen.findByText("No successful backup")).toBeInTheDocument();
+    expect(screen.getAllByText("Not configured")).toHaveLength(2);
+    await expectNoAxeViolations(container);
+  });
+
+  it("flags a stale last backup", () => {
+    const old = archive({ createdAt: new Date(NOW.getTime() - 30 * 3_600_000), completedAt: new Date(NOW.getTime() - 30 * 3_600_000) });
+    renderUi(<BackupsWidgetBody list={listPage([old])} now={NOW.getTime()} />);
+    expect(screen.getByText(/^Out of date/u)).toBeInTheDocument();
+  });
+
+  it("shows an error state, never an empty posture, when the list cannot be read", async () => {
+    handlers["backup.admin.list"] = () => { throw new Error("offline"); };
+    const { container } = renderUi(<BackupsWidget />);
+    expect(await screen.findByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.queryByText("No successful backup")).toBeNull();
+    await expectNoAxeViolations(container);
+  });
+});

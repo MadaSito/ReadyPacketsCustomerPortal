@@ -13,5 +13,6 @@ export const backupFeature: FeatureRoutes = {
     { ...read, path: "/admin/backups/retention", title: "Backup retention", component: lazy(() => import("./RetentionPage")) },
     { ...read, path: "/admin/backups/:backupId", title: "Backup", component: lazy(() => import("./BackupDetailPage")) },
   ],
+  widgets: [{ key: "backup.status", area: "console", access: "admin", capability: "backup.read", order: 41, span: 4, component: lazy(() => import("./BackupsWidget")) }],
   nav: [{ ...read, label: "Backups", href: "/admin/backups", icon: DatabaseBackup, area: "console", group: "Platform", order: 83 }],
 };
