@@ -20,5 +20,10 @@ export const RUNTIME = {
 
 export const apiUrl = (path: string): string => `${RUNTIME.apiBase}${path.startsWith("/") ? path : `/${path}`}`;
 
-/** Resolves a public asset (brand/…, fonts/…) relative to the document so it works under any base path. */
-export const assetUrl = (relativePath: string): string => new URL(relativePath.replace(/^\//, ""), document.baseURI).toString();
+/**
+ * Resolves a public asset (brand/…, fonts/…). Standard builds are served at the origin root with nested path
+ * routes, so assets are root-absolute; the preview build lives under an unknown path prefix with hash routing,
+ * so assets resolve relative to the document.
+ */
+export const assetUrl = (relativePath: string): string =>
+  new URL(`${RUNTIME.preview ? "" : "/"}${relativePath.replace(/^\//, "")}`, document.baseURI).toString();

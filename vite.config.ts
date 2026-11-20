@@ -7,7 +7,6 @@ import { defineConfig } from "vite";
  * Build modes:
  *   pnpm build           → production bundle (path routing, same-origin API, cookie session)
  *   pnpm build:preview   → sandboxed-iframe demo bundle (hash routing, proxied API, in-memory session)
- * `base: "./"` keeps every asset URL relative so the bundle works under any path prefix.
  * The PWA service worker is added by the UI foundation engineer (static shell only; never authenticated data).
  */
 export default defineConfig(({ mode }) => {
@@ -16,7 +15,9 @@ export default defineConfig(({ mode }) => {
   process.env.VITE_RP_RUNTIME = preview ? "preview" : "standard";
   return {
     root: path.resolve(import.meta.dirname, "client"),
-    base: "./",
+    // Preview is served under an unknown path prefix → relative URLs. Production is served at the origin
+    // root with path routing (nested URLs) → absolute URLs.
+    base: preview ? "./" : "/",
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
