@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { MailOpen } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "wouter";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
@@ -22,6 +22,7 @@ export default function MailPage() {
   const [pendingResend, setPendingResend] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [capture, setCapture] = useState<Capture | null>(null);
+  const captureOpener = useRef<HTMLButtonElement | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [resendError, setResendError] = useState<string | null>(null);
@@ -32,11 +33,18 @@ export default function MailPage() {
   const attempts = useQuery(trpc.jobs.admin.mailDetail.queryOptions({ publicId: selected?.publicId ?? "" }, { enabled: !!selected }));
   const rows = result.data?.pages.flatMap((page) => page.items) ?? [];
 
+  const closeCapture = useCallback(() => {
+    setCapture(null);
+    const opener = captureOpener.current;
+    captureOpener.current = null;
+    requestAnimationFrame(() => opener?.isConnected && opener.focus());
+  }, []);
+
   useEffect(() => {
     if (!capture) return;
-    const timer = setTimeout(() => setCapture(null), 120_000);
+    const timer = setTimeout(closeCapture, 120_000);
     return () => clearTimeout(timer);
-  }, [capture]);
+  }, [capture, closeCapture]);
 
   const viewCapture = async (publicId: string) => {
     setCaptureError(null);
@@ -89,7 +97,10 @@ export default function MailPage() {
         <Button variant="secondary" onClick={() => setSelected(row)} aria-label={`Attempts for message ${row.publicId}`}>Attempts</Button>
         {row.canResend ? <Button variant="secondary" aria-label={`Resend message ${row.publicId}`} onClick={() => setPendingResend(row.publicId)}>Resend</Button> : null}
         {row.canViewCapture ? <Button variant="secondary" aria-label={`View capture for message ${row.publicId}`}
-          disabled={capturing} onClick={() => void viewCapture(row.publicId)}>View capture</Button> : null}
+          disabled={capturing} onClick={(event) => {
+            captureOpener.current = event.currentTarget;
+            void viewCapture(row.publicId);
+          }}>View capture</Button> : null}
       </div>} />
     <LoadMore hasMore={result.hasNextPage} loading={result.isFetchingNextPage} onLoadMore={() => void result.fetchNextPage()}
       summary={!result.isPending && !result.isError ? `Showing ${rows.length} messages` : undefined} />
@@ -115,10 +126,12 @@ export default function MailPage() {
       {resendError ? <Callout tone="danger" live="assertive">{resendError}</Callout> : null}
     </ConfirmDialog> : null}
     {capture ? <Dialog title="Captured mail" description="Testing only. This message was not sent, and viewing it is audited."
-      open onOpenChange={(open) => { if (!open) setCapture(null); }}>
-      <KeyValueList items={[{ label: "Recipient", value: <span className="break-all">{capture.to}</span> },
-        { label: "Subject", value: capture.subject }]} />
-      <CodeBlock label="Plain-text message" wrap>{capture.text}</CodeBlock>
+      open onOpenChange={(open) => { if (!open) closeCapture(); }}>
+      <div className="ph-no-capture" data-clarity-mask="true">
+        <KeyValueList items={[{ label: "Recipient", value: <span className="break-all">{capture.to}</span> },
+          { label: "Subject", value: capture.subject }]} />
+        <CodeBlock label="Plain-text message" wrap>{capture.text}</CodeBlock>
+      </div>
     </Dialog> : null}
   </>;
 }

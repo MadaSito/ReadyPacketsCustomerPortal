@@ -214,10 +214,13 @@ export function createJobsAdmin(deps: ModuleDeps) {
       )).orderBy(desc(mailOutbox.publicId)).limit(limit + 1);
       const rows = await query;
       const now = clock.now();
+      const canReadCaptures = deps.config.deploymentProfile !== "production"
+        && rows.some((row) => row.state === "captured" && row.expiresAt > now)
+        && await (mailEngineFor(deps.mailer)?.captureEnabled() ?? false);
       const safe = rows.map(({ hasPayload, ...row }) => ({
         ...row,
         canResend: hasPayload && ["held", "failed"].includes(row.state) && row.expiresAt > now && row.generation < 20,
-        canViewCapture: row.state === "captured" && row.expiresAt > now && deps.config.deploymentProfile !== "production",
+        canViewCapture: row.state === "captured" && row.expiresAt > now && canReadCaptures,
       }));
       return pageOf(safe, limit);
     },

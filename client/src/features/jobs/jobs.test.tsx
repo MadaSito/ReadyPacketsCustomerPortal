@@ -91,6 +91,29 @@ describe("Jobs administration pages", () => {
     await expectNoAxeViolations();
   });
 
+  it("reveals captured mail only on request and keeps it out of the mutation cache", async () => {
+    const user = userEvent.setup();
+    const load = vi.fn(() => ({ to: "preview@example.test", subject: "Preview", text: "<a>Example preview text</a>" }));
+    const view = renderConsole(<MailPage />, {
+      "jobs.admin.listMail": () => ({
+        items: [{ publicId: mailId, template: "test.captured", state: "captured", canViewCapture: true, updatedAt: date }],
+        nextCursor: null,
+      }),
+      "jobs.admin.capture": load,
+    });
+    const table = await screen.findByRole("table", { name: "Outgoing mail" });
+    const opener = within(table).getByRole("button", { name: `View capture for message ${mailId}` });
+    expect(load).not.toHaveBeenCalled();
+    await user.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "Captured mail" });
+    expect(load).toHaveBeenCalledWith({ publicId: mailId });
+    expect(within(dialog).getByText("<a>Example preview text</a>")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).not.toBeInTheDocument();
+    expect(view.queryClient.getMutationCache().getAll()).toHaveLength(0);
+    await user.click(within(dialog).getByRole("button", { name: "Close dialog" }));
+    expect(screen.queryByText("<a>Example preview text</a>")).not.toBeInTheDocument();
+  });
+
   it("shows the next slot as paused while maintenance is on", async () => {
     renderConsole(<SchedulesPage />, {
       "jobs.admin.schedules": () => ({ paused: true, items: [{ name: "test.daily", everyMs: 86_400_000, nextSlot: date, last: null }] }),
