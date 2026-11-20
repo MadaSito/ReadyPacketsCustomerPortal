@@ -173,7 +173,7 @@ export interface BackupKeySourceOptions {
  * Throws DomainError (fail closed, never echoing secret material) if configured improperly or weak.
  */
 export async function resolveBackupKeyring(
-  settings: SettingsStore,
+  settings: SettingsStore | null | undefined,
   options: BackupKeySourceOptions = {},
 ): Promise<ResolvedBackupKeyring | null> {
   const env = options.env ?? process.env;
@@ -198,6 +198,9 @@ export async function resolveBackupKeyring(
     return parseBackupKeySpec(envValue, defaultKeyId, custodyMode);
   }
 
+  if (!settings) {
+    return null;
+  }
   const fallbackSecret = await readSecret(settings, BACKUP_ENCRYPTION_KEY);
   if (fallbackSecret !== null && fallbackSecret.trim().length > 0) {
     return parseBackupKeySpec(fallbackSecret, defaultKeyId, "settings_secret");
@@ -208,7 +211,7 @@ export async function resolveBackupKeyring(
 
 /** Requires a valid backup keyring; throws NOT_CONFIGURED / BACKUP_KEY_MISSING if absent (no silent plaintext). */
 export async function requireBackupKeyring(
-  settings: SettingsStore,
+  settings: SettingsStore | null | undefined,
   options: BackupKeySourceOptions = {},
 ): Promise<ResolvedBackupKeyring> {
   const keyring = await resolveBackupKeyring(settings, options);

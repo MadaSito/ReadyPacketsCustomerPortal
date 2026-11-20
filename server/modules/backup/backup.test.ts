@@ -3,8 +3,9 @@
  * retention + legal holds, and cross-model transaction safety tests against real MySQL + mysqldump/mysql
  * + LocalObjectStorage. SYNTHETIC DATA ONLY (`*.example.test`).
  */
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -13,7 +14,7 @@ import express from "express";
 import mysql from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ModuleDeps, Services } from "../../container.js";
-import { DomainError } from "../../core/errors.js";
+import { conflict, DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
@@ -47,8 +48,15 @@ import { createSettingsStore } from "../platform/settingsStore.js";
 import { registerBackupHttpRoutes } from "./http.js";
 import {
   createBackupModule,
+  executeIsolatedCliRestore,
   expectedRestoreConfirmationText,
 } from "./index.js";
+import { requireBackupKeyring } from "./keys.js";
+import {
+  assertNoLiveSchemaWritePrivilegeFromGrants,
+  createPrivateDefaultsFile,
+  parseValidatedMysqlTarget,
+} from "./mysqlCli.js";
 import { backupRouter } from "./router.js";
 import {
   backupArchives,
@@ -100,6 +108,13 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
   let adminPublicId = "";
   let customerUserId = 0;
   let customerPublicId = "";
+  let staffUserId = 0;
+  let staffPublicId = "";
+
+  // Dedicated target-scoped recovery MySQL credentials (`GRANT ALL PRIVILEGES ON \`rp_test_restore\_%\`.*` & `\`rp_vfy\_%\`.*`).
+  let recoveryDbUser = "";
+  let recoveryMysqlUrl = "";
+  let allowSameUserFallback = false;
 
   // Mutable live actor session state so tests can exercise in-transaction session revocation / role downgrade!
   const actorDirectory = new Map<
@@ -166,6 +181,29 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     });
   }
 
+  async function execRootMysqlDdl(statements: string[]): Promise<boolean> {
+    try {
+      const rootConn = await mysql.createConnection({ uri: baseMysqlUrl() });
+      try {
+        for (const stmt of statements) {
+          await rootConn.query(stmt);
+        }
+        return true;
+      } finally {
+        await rootConn.end();
+      }
+    } catch {
+      try {
+        execFileSync("sudo", ["-n", "mysql", "-u", "root", "-e", statements.join("; ")], {
+          stdio: "ignore",
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+
   beforeAll(async () => {
     tdb = await createTestDb({ schema: TEST_SCHEMA });
     tempRoot = await mkdtemp(path.join(os.tmpdir(), "rp-backup-suite-"));
@@ -178,6 +216,52 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     rawKeyBase64 = randomBytes(32).toString("base64");
     await writeFile(keyFilePath, `${rawKeyBase64}\n`, { mode: 0o600 });
     await chmod(keyFilePath, 0o600);
+
+    // Provision a dedicated target-scoped recovery MySQL user (`rp_dr_test_*`) with ZERO grants on `tdb.name`.
+    const drSuffix = randomBytes(4).toString("hex");
+    recoveryDbUser = `rp_dr_test_${drSuffix}`;
+    const recoveryDbPass = `dr_pass_${randomBytes(12).toString("hex")}`;
+    const parsedBase = new URL(`${baseMysqlUrl()}/rp_recovery_placeholder`);
+    const provisioned = await execRootMysqlDdl([
+      `CREATE USER IF NOT EXISTS '${recoveryDbUser}'@'localhost' IDENTIFIED BY '${recoveryDbPass}'`,
+      `CREATE USER IF NOT EXISTS '${recoveryDbUser}'@'127.0.0.1' IDENTIFIED BY '${recoveryDbPass}'`,
+      `CREATE USER IF NOT EXISTS '${recoveryDbUser}'@'%' IDENTIFIED BY '${recoveryDbPass}'`,
+      `GRANT ALL PRIVILEGES ON \`rp_test_restore\\_%\`.* TO '${recoveryDbUser}'@'localhost'`,
+      `GRANT ALL PRIVILEGES ON \`rp_test_restore\\_%\`.* TO '${recoveryDbUser}'@'127.0.0.1'`,
+      `GRANT ALL PRIVILEGES ON \`rp_test_restore\\_%\`.* TO '${recoveryDbUser}'@'%'`,
+      `GRANT ALL PRIVILEGES ON \`rp_vfy\\_%\`.* TO '${recoveryDbUser}'@'localhost'`,
+      `GRANT ALL PRIVILEGES ON \`rp_vfy\\_%\`.* TO '${recoveryDbUser}'@'127.0.0.1'`,
+      `GRANT ALL PRIVILEGES ON \`rp_vfy\\_%\`.* TO '${recoveryDbUser}'@'%'`,
+      "FLUSH PRIVILEGES",
+    ]);
+    if (provisioned) {
+      // Warm caching_sha2_password server cache via local mysql CLI over TCP before mysql2 (tls=off) connects.
+      try {
+        execFileSync(
+          "mysql",
+          [
+            "--protocol=TCP",
+            "-h",
+            parsedBase.hostname,
+            "-P",
+            parsedBase.port || "3306",
+            "-u",
+            recoveryDbUser,
+            `-p${recoveryDbPass}`,
+            "-e",
+            "SELECT 1",
+          ],
+          { stdio: "ignore" },
+        );
+      } catch {
+        // Ignore if mysql client binary handles TLS differently; openValidatedMysqlConnection will verify.
+      }
+      recoveryMysqlUrl = `mysql://${recoveryDbUser}:${recoveryDbPass}@${parsedBase.hostname}:${parsedBase.port || "3306"}/rp_test_restore_placeholder?tls=off`;
+      allowSameUserFallback = false;
+    } else {
+      recoveryMysqlUrl = `${baseMysqlUrl()}/rp_test_restore_placeholder?tls=off`;
+      allowSameUserFallback = true;
+    }
 
     const h = createTestDeps({ db: tdb.db });
     const now = new Date("2026-04-01T11:00:00.000Z");
@@ -214,21 +298,49 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       updatedAt: now,
     });
     customerUserId = Number(custIns.insertId);
+
+    staffPublicId = ulid(now.getTime() + 2);
+    const [staffIns] = await tdb.db.insert(users).values({
+      publicId: staffPublicId,
+      emailEnc: h.deps.crypto.encrypt("bob.staff@portal.example.test", `users.email:${staffPublicId}`),
+      emailIndex: h.deps.crypto.blindIndex("bob.staff@portal.example.test", "users.email"),
+      nameEnc: h.deps.crypto.encrypt("Bob Staff", `users.name:${staffPublicId}`),
+      passwordHash: "$argon2id$v=19$m=19456,t=2,p=1$synthetic$synthetichash_staff_old",
+      mustChangePassword: false,
+      role: "staff",
+      status: "active",
+      emailVerifiedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    staffUserId = Number(staffIns.insertId);
   }, 60_000);
 
   afterAll(async () => {
     const admin = await mysql.createConnection({ uri: baseMysqlUrl() });
     for (const dbName of createdRestoreDbs) {
-      if (/^rp_test_restore_[a-z0-9_]+$/.test(dbName)) {
+      if (/^rp_(test_restore|vfy)_[a-z0-9_]+$/.test(dbName)) {
         await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
       }
     }
     await admin.end();
+    if (recoveryDbUser && !allowSameUserFallback) {
+      await execRootMysqlDdl([
+        `DROP USER IF EXISTS '${recoveryDbUser}'@'localhost'`,
+        `DROP USER IF EXISTS '${recoveryDbUser}'@'127.0.0.1'`,
+        `DROP USER IF EXISTS '${recoveryDbUser}'@'%'`,
+        "FLUSH PRIVILEGES",
+      ]);
+    }
     if (tdb) await tdb.cleanup();
     if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
   });
 
-  function buildRealStorageHarness(customEnv: NodeJS.ProcessEnv, customDb = tdb.db) {
+  function buildRealStorageHarness(
+    customEnv: NodeJS.ProcessEnv,
+    customDb = tdb.db,
+    recoveryUrlOverride?: string,
+  ) {
     const harness = createTestDeps({
       db: customDb,
       config: { storageDir: liveStorageDir, databaseUrl: tdb.url },
@@ -246,6 +358,7 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     const mod = createBackupModule(deps, {
       env: customEnv,
       databaseUrlOverride: tdb.url,
+      ...(recoveryUrlOverride !== undefined ? { recoveryDatabaseUrlOverride: recoveryUrlOverride } : {}),
     });
     (deps.services as unknown as Record<string, unknown>).backup = mod;
     return { harness, deps, mod, realStorage };
@@ -308,7 +421,11 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       ...deps,
       audit: realEmitter,
     };
-    const realMod = createBackupModule(realDeps, { env, databaseUrlOverride: tdb.url });
+    const realMod = createBackupModule(realDeps, {
+      env,
+      databaseUrlOverride: tdb.url,
+      ...(allowSameUserFallback ? {} : { recoveryDatabaseUrlOverride: recoveryMysqlUrl }),
+    });
     (realDeps.services as unknown as Record<string, unknown>).backup = realMod;
 
     // Seed synthetic private objects in LocalObjectStorage + DB rows
@@ -415,6 +532,33 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       publicKey: "c3ludGhldGljLWNvc2Uta2V5",
       counter: 5,
       nameEnc: deps.crypto.encrypt("Security Key", `assurance.passkey:${passkeyPublicId}`),
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    // Seed staff MFA + revocable passkey BEFORE backup so post-backup suspension/demotion/rotation/revocation can be tested!
+    const staffAssurancePublicId = ulid(now.getTime() + 28);
+    const staffRecoverySetId = ulid(now.getTime() + 29);
+    await tdb.db.insert(assuranceAccounts).values({
+      publicId: staffAssurancePublicId,
+      userId: staffUserId,
+      totpSecretEnc: deps.crypto.encrypt("KRSXG5CTMVRXEZLU", `assurance.totp:${staffAssurancePublicId}`),
+      lastTotpStep: 80,
+      recoverySetId: staffRecoverySetId,
+      recoveryAcknowledgedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const revokedPasskeyPublicId = ulid(now.getTime() + 32);
+    const revokedPasskeyIndex = randomBytes(32).toString("hex");
+    await tdb.db.insert(assurancePasskeys).values({
+      publicId: revokedPasskeyPublicId,
+      userId: staffUserId,
+      credentialId: "c3RhZmYtcmV2b2tlZC1jcmVkZW50aWFs",
+      credentialIndex: revokedPasskeyIndex,
+      publicKey: "c3RhZmYtcmV2b2tlZC1jb3NlLWtleQ",
+      counter: 3,
+      nameEnc: deps.crypto.encrypt("Lost Staff Key", `assurance.passkey:${revokedPasskeyPublicId}`),
       createdAt: now,
       updatedAt: now,
     });
@@ -539,8 +683,10 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     const postVerifyHealth = await realMod.health!();
     expect(postVerifyHealth.find((h) => h.component === "backup.status")?.state).toBe("ok");
 
-    // 3. Simulate post-backup anti-replay security events on the LIVE database BEFORE restoring:
-    // - TOTP step advances well beyond floor(now / 30s) so we prove live watermark propagation too!
+    // 3. Simulate post-backup anti-replay & account lifecycle security events on the LIVE database BEFORE restoring:
+    // - TOTP step advances well beyond floor(now / 30s) so we prove live watermark propagation;
+    // - Staff account (`staffUserId`) is SUSPENDED, DEMOTED to customer, has password rotated, has TOTP secret rotated,
+    //   and has its lost passkey deleted!
     const highTotpStep = Math.floor(deps.clock.now().getTime() / 30_000) + 500;
     const postBackupNow = deps.clock.now();
     await tdb.db
@@ -560,16 +706,47 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       .set({ hits: 9 })
       .where(eq(rateLimitCounters.slot, 42));
 
-    // 4. Restore into an ISOLATED target database (`rp_test_restore_*`) and isolated sandbox storage subdir
+    const rotatedCustomerHash = "$argon2id$v=19$m=19456,t=2,p=1$synthetic$synthetichash_cust_ROTATED";
+    await tdb.db
+      .update(users)
+      .set({ passwordHash: rotatedCustomerHash, mustChangePassword: true, updatedAt: postBackupNow })
+      .where(eq(users.id, customerUserId));
+
+    const rotatedStaffHash = "$argon2id$v=19$m=19456,t=2,p=1$synthetic$synthetichash_staff_ROTATED";
+    const rotatedStaffTotpEnc = deps.crypto.encrypt("MFRGGZDFMZTWQ2LK", `assurance.totp:${staffAssurancePublicId}`);
+    await tdb.db
+      .update(users)
+      .set({
+        status: "suspended",
+        role: "customer",
+        passwordHash: rotatedStaffHash,
+        mustChangePassword: true,
+        updatedAt: postBackupNow,
+      })
+      .where(eq(users.id, staffUserId));
+    await tdb.db
+      .update(assuranceAccounts)
+      .set({
+        totpSecretEnc: rotatedStaffTotpEnc,
+        lastTotpStep: highTotpStep + 10,
+        updatedAt: postBackupNow,
+      })
+      .where(eq(assuranceAccounts.userId, staffUserId));
+    await tdb.db.delete(assurancePasskeys).where(eq(assurancePasskeys.publicId, revokedPasskeyPublicId));
+
+    // 4. Operator-only isolated restore (`preserve_continuity`) using dedicated target-scoped recovery credentials
     const isolatedDbName = `rp_test_restore_${randomBytes(4).toString("hex")}`;
     createdRestoreDbs.push(isolatedDbName);
 
-    const drill = await realMod.restoreToIsolatedTarget(admin, {
+    const drill = await realMod.restoreToIsolatedTargetDirect({
       backupPublicId: archiveSummary.publicId,
       targetDatabaseName: isolatedDbName,
-      targetStoragePath: "drill-alpha",
+      targetStorageDir: path.join(sandboxRootDir, "drill-alpha"),
+      recoveryDatabaseUrl: recoveryMysqlUrl,
       continuityMode: "preserve_continuity",
       confirmationText: expectedRestoreConfirmationText(archiveSummary.publicId, isolatedDbName),
+      actorUserId: adminUserId,
+      ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
     });
 
     expect(drill.state).toBe("completed");
@@ -591,7 +768,7 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       .where(eq(userSessions.publicId, liveSessPublicId));
     expect(liveSessionStillActive?.revokedAt).toBeNull();
 
-    // 6. Inspect ISOLATED restored database directly via mysql2 to prove §7.3 continuity invariants!
+    // 6. Inspect ISOLATED restored database directly via mysql2 to prove §7.3 continuity + account lifecycle invariants!
     const restoredConn = await mysql.createConnection({ uri: `${baseMysqlUrl()}/${isolatedDbName}` });
     try {
       const [sessRows] = await restoredConn.query<mysql.RowDataPacket[]>(
@@ -640,6 +817,36 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       );
       expect(Number(rlRows[0]?.hits)).toBe(9);
 
+      // Post-backup password rotation, account suspension, role demotion, MFA rotation, and passkey deletion reconciled:
+      // historic pre-rotation password hashes and pre-rotation TOTP secrets are cleared fail-closed!
+      const [custReconciled] = await restoredConn.query<mysql.RowDataPacket[]>(
+        "SELECT password_hash, must_change_password FROM users WHERE public_id = ?",
+        [customerPublicId],
+      );
+      expect(custReconciled[0]?.password_hash).toBeNull();
+      expect(Boolean(custReconciled[0]?.must_change_password)).toBe(true);
+
+      const [staffRows] = await restoredConn.query<mysql.RowDataPacket[]>(
+        "SELECT status, role, password_hash, must_change_password FROM users WHERE public_id = ?",
+        [staffPublicId],
+      );
+      expect(staffRows[0]?.status).toBe("suspended");
+      expect(staffRows[0]?.role).toBe("customer");
+      expect(staffRows[0]?.password_hash).toBeNull();
+      expect(Boolean(staffRows[0]?.must_change_password)).toBe(true);
+
+      const [staffMfaRows] = await restoredConn.query<mysql.RowDataPacket[]>(
+        "SELECT totp_secret_enc FROM assurance_accounts WHERE public_id = ?",
+        [staffAssurancePublicId],
+      );
+      expect(staffMfaRows[0]?.totp_secret_enc).toBeNull();
+
+      const [revokedPkRows] = await restoredConn.query<mysql.RowDataPacket[]>(
+        "SELECT COUNT(*) AS cnt FROM assurance_passkeys WHERE public_id = ?",
+        [revokedPasskeyPublicId],
+      );
+      expect(Number(revokedPkRows[0]?.cnt)).toBe(0);
+
       // Queued jobs & mail quarantined; external SIEM flag disabled!
       const [qJobs] = await restoredConn.query<mysql.RowDataPacket[]>(
         "SELECT state, reason_code FROM job_runs WHERE type = 'engagement.digest'",
@@ -673,19 +880,48 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     const restoredFileBytes = await readFile(path.join(sandboxRootDir, "drill-alpha", fileStorageKey));
     expect(restoredFileBytes.equals(secretCanaryPayload)).toBe(true);
 
-    // 7. Also exercise `quarantine_credentials` mode on a second isolated DB
-    const quarantineDbName = `rp_test_restore_${randomBytes(4).toString("hex")}`;
-    createdRestoreDbs.push(quarantineDbName);
-    const quarantineDrill = await realMod.restoreToIsolatedTarget(admin, {
-      backupPublicId: archiveSummary.publicId,
-      targetDatabaseName: quarantineDbName,
-      targetStoragePath: "drill-quarantine",
-      continuityMode: "quarantine_credentials",
-      confirmationText: expectedRestoreConfirmationText(archiveSummary.publicId, quarantineDbName),
+    // 7. Standalone OFFLINE `.rpbk` archive CLI restore (NO live DB ledger, defaults to `quarantine_credentials`)!
+    const offlineDbName = `rp_test_restore_${randomBytes(4).toString("hex")}`;
+    createdRestoreDbs.push(offlineDbName);
+    const offlineArchivePath = path.join(liveStorageDir, dbArchiveRow!.storageKey!);
+    const offlineKeyring = await requireBackupKeyring(null, { env });
+    const offlineRes = await executeIsolatedCliRestore({
+      archiveFilePath: offlineArchivePath,
+      recoveryDatabaseUrl: recoveryMysqlUrl,
+      targetDatabaseName: offlineDbName,
+      targetStorageDir: path.join(sandboxRootDir, "drill-offline-quarantine"),
+      confirmationText: expectedRestoreConfirmationText(archiveSummary.publicId, offlineDbName),
+      keyring: offlineKeyring,
+      config: deps.config,
+      clock: deps.clock,
+      logger: deps.logger,
+      crypto: deps.crypto,
+      guardLiveDatabaseUrl: tdb.url,
+      guardLiveStorageDir: liveStorageDir,
+      ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
     });
-    expect(quarantineDrill.state).toBe("completed");
+    expect(offlineRes.state).toBe("completed");
+    expect(offlineRes.continuityMode).toBe("quarantine_credentials");
+    expect(offlineRes.manualAccountReviewRequired).toBe(true);
+    expect(offlineRes.continuity.auditChainVerified).toBe("verified");
 
-    const qConn = await mysql.createConnection({ uri: `${baseMysqlUrl()}/${quarantineDbName}` });
+    // Confirm canonical `createChainService.verifyRange()` passes on the standalone offline restored database!
+    const offlineRestoredDb = createDatabase(`${baseMysqlUrl()}/${offlineDbName}`, 1);
+    try {
+      const offlineChain = createChainService({
+        db: offlineRestoredDb.db,
+        clock: deps.clock,
+        logger: deps.logger,
+        auditChainKey: deps.config.auditChainKey,
+        installationId: deps.config.installationId,
+      });
+      const chainReport = await offlineChain.verify();
+      expect(chainReport.ok).toBe(true);
+    } finally {
+      await offlineRestoredDb.close();
+    }
+
+    const qConn = await mysql.createConnection({ uri: `${baseMysqlUrl()}/${offlineDbName}` });
     try {
       const [uRows] = await qConn.query<mysql.RowDataPacket[]>(
         "SELECT password_hash, must_change_password, status FROM users WHERE id = ?",
@@ -694,6 +930,11 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       expect(uRows[0]?.password_hash).toBeNull();
       expect(Boolean(uRows[0]?.must_change_password)).toBe(true);
       expect(uRows[0]?.status).toBe("pending_activation");
+
+      const [completedAuditRows] = await qConn.query<mysql.RowDataPacket[]>(
+        "SELECT event_name FROM audit_events WHERE event_name = 'backup.restore.completed'",
+      );
+      expect(completedAuditRows.length).toBe(1);
     } finally {
       await qConn.end();
     }
@@ -731,7 +972,9 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
         backupPublicId: backup.publicId,
         targetDatabaseName: untouchableDb,
         targetStorageDir: path.join(sandboxRootDir, "tampered-target"),
+        recoveryDatabaseUrl: recoveryMysqlUrl,
         confirmationText: expectedRestoreConfirmationText(backup.publicId, untouchableDb),
+        ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
       }),
     ).rejects.toMatchObject({
       code: "CONFLICT",
@@ -775,7 +1018,7 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     expect(restoredVerify.state).toBe("completed");
   }, 45_000);
 
-  it("refuses live database target, non-empty target database, overlapping storage dir, and wrong confirmation phrase", async () => {
+  it("refuses live database target, live credential reuse, over-broad grants, non-empty target database, overlapping storage dir, and wrong confirmation phrase", async () => {
     const env: NodeJS.ProcessEnv = {
       RP_BACKUP_KEY_FILE: keyFilePath,
       RP_BACKUP_KEY_ID: "bk-primary-2026",
@@ -789,13 +1032,46 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       .limit(1);
     const backupId = latest!.publicId;
 
+    // 0. Live credential reuse (`recoveryDatabaseUrl: tdb.url`) -> LIVE_CREDENTIAL_REUSE_REFUSED
+    await expect(
+      mod.restoreToIsolatedTargetDirect({
+        backupPublicId: backupId,
+        targetDatabaseName: "rp_test_restore_samecred",
+        targetStorageDir: path.join(sandboxRootDir, "same-cred"),
+        recoveryDatabaseUrl: tdb.url,
+        confirmationText: expectedRestoreConfirmationText(backupId, "rp_test_restore_samecred"),
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "LIVE_CREDENTIAL_REUSE_REFUSED",
+    });
+
+    // 0b. Grant evaluator refuses `*.*` global write/DDL and wildcard live-schema grants (`rp\_%`), allows target-scoped grants
+    expect(() =>
+      assertNoLiveSchemaWritePrivilegeFromGrants(["GRANT ALL PRIVILEGES ON *.* TO `bad`@`%`"], tdb.name),
+    ).toThrow(/RESTORE_PRIVILEGE_ISOLATION_VIOLATED/);
+    expect(() =>
+      assertNoLiveSchemaWritePrivilegeFromGrants(["GRANT ALL PRIVILEGES ON `rp\\_%`.* TO `bad`@`%`"], tdb.name),
+    ).toThrow(/RESTORE_PRIVILEGE_ISOLATION_VIOLATED/);
+    expect(() =>
+      assertNoLiveSchemaWritePrivilegeFromGrants(
+        [
+          "GRANT USAGE ON *.* TO `rp_dr`@`%`",
+          "GRANT ALL PRIVILEGES ON `rp_test_restore\\_%`.* TO `rp_dr`@`%`",
+        ],
+        tdb.name,
+      ),
+    ).not.toThrow();
+
     // 1. Confirmation mismatch
     await expect(
       mod.restoreToIsolatedTargetDirect({
         backupPublicId: backupId,
         targetDatabaseName: "rp_test_restore_ok",
         targetStorageDir: path.join(sandboxRootDir, "wrong-confirm"),
+        recoveryDatabaseUrl: recoveryMysqlUrl,
         confirmationText: "RESTORE WRONG PHRASE",
+        ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
       }),
     ).rejects.toMatchObject({
       code: "VALIDATION",
@@ -808,6 +1084,7 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
         backupPublicId: backupId,
         targetDatabaseName: tdb.name,
         targetStorageDir: path.join(sandboxRootDir, "live-db-attempt"),
+        recoveryDatabaseUrl: recoveryMysqlUrl,
         confirmationText: expectedRestoreConfirmationText(backupId, tdb.name),
       }),
     ).rejects.toMatchObject({
@@ -822,7 +1099,9 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
         backupPublicId: backupId,
         targetDatabaseName: overlapDb,
         targetStorageDir: path.join(liveStorageDir, "nested-restore"),
+        recoveryDatabaseUrl: recoveryMysqlUrl,
         confirmationText: expectedRestoreConfirmationText(backupId, overlapDb),
+        ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
       }),
     ).rejects.toMatchObject({
       code: "CONFLICT",
@@ -842,7 +1121,9 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
         backupPublicId: backupId,
         targetDatabaseName: populatedDb,
         targetStorageDir: path.join(sandboxRootDir, "non-empty-db"),
+        recoveryDatabaseUrl: recoveryMysqlUrl,
         confirmationText: expectedRestoreConfirmationText(backupId, populatedDb),
+        ...(allowSameUserFallback ? { allowSameUserInTestOnly: true } : {}),
       }),
     ).rejects.toMatchObject({
       code: "CONFLICT",
@@ -1054,13 +1335,18 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     const pendingMfaAdmin = makeAdminPrincipal({ state: "remediation", pendingSteps: ["enroll_mfa"] });
     await expect(callerFor(pendingMfaAdmin).backup.admin.list()).rejects.toMatchObject({ code: "FORBIDDEN" });
 
-    // 5. Admin WITHOUT fresh step-up -> read succeeds, step-up mutations (`runNow`, `verify`, `restoreIsolated`, `runRetention`) reject!
+    // 5. Admin WITHOUT fresh step-up -> read succeeds, step-up mutations (`runNow`, `verify`, `runRetention`) reject!
+    // Web-initiated restore (`restoreIsolated`) is permanently absent from the web/tRPC surface!
+    expect("restoreIsolated" in (callerFor(null).backup.admin as Record<string, unknown>)).toBe(false);
     const staleStepUpAdmin = makeAdminPrincipal({
       stepUpAt: new Date(deps.clock.now().getTime() - 30 * 60 * 1000),
     });
     const listed = await callerFor(staleStepUpAdmin).backup.admin.list();
     expect(listed.items.length).toBeGreaterThanOrEqual(1);
     await expect(callerFor(staleStepUpAdmin).backup.admin.runNow()).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      callerFor(staleStepUpAdmin).backup.admin.runRetention({ dryRun: false }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
 
     // 6. Raw HTTP download route: streams `.rpbk` with nosniff, no-store, attachment filename
     const targetBackupId = listed.items.find((i) => i.state === "completed")!.publicId;
@@ -1134,5 +1420,114 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     expect(headers.get("content-disposition")).toContain(`readypackets-backup-${targetBackupId}.rpbk`);
     const downloadedBuf = Buffer.concat(chunks);
     expect(downloadedBuf.subarray(0, 8).toString("ascii")).toBe("RPBK0001");
+  });
+
+  it("enforces server/db/connectionOptions.ts TLS options for MySQL client defaults files, fenced lease checks, and crash-safe two-phase retention", async () => {
+    // 1. Disallowed URL query params (`?ssl=false`, `?multipleStatements=true`) are rejected via connectionOptionsFromUrl
+    expect(() => parseValidatedMysqlTarget("mysql://u:p@db.example.test:3306/rp_prod?ssl=false")).toThrow(
+      expect.objectContaining({ reasonCode: "DATABASE_URL_INVALID" }),
+    );
+    expect(() =>
+      parseValidatedMysqlTarget("mysql://u:p@db.example.test:3306/rp_prod?multipleStatements=true"),
+    ).toThrow(expect.objectContaining({ reasonCode: "DATABASE_URL_INVALID" }));
+
+    // 2. Valid `tls=required&tlsCaFile=...` produces a `0600` defaults file enforcing VERIFY_IDENTITY, TLSv1.2+, local-infile=0, TCP
+    const caPath = path.join(tempRoot, "synthetic-ca.pem");
+    await writeFile(caPath, "-----BEGIN CERTIFICATE-----\nU1lOVEhFVElDX0NB\n-----END CERTIFICATE-----\n", {
+      mode: 0o600,
+    });
+    const validatedTls = parseValidatedMysqlTarget(
+      `mysql://rp_user:s3cr3t@db.example.test:3306/rp_prod?tls=required&tlsCaFile=${encodeURIComponent(caPath)}`,
+    );
+    expect(validatedTls.tlsRequired).toBe(true);
+    expect(validatedTls.tlsCaFile).toBe(caPath);
+    const cnf = await createPrivateDefaultsFile(validatedTls);
+    try {
+      const st = await stat(cnf.filePath);
+      expect(st.mode & 0o777).toBe(0o600);
+      const cnfText = await readFile(cnf.filePath, "utf8");
+      expect(cnfText).toContain("protocol=TCP");
+      expect(cnfText).toContain("local-infile=0");
+      expect(cnfText).toContain("ssl-mode=VERIFY_IDENTITY");
+      expect(cnfText).toContain("tls-version=TLSv1.2,TLSv1.3");
+      expect(cnfText).toContain(`ssl-ca="${caPath}"`);
+    } finally {
+      await cnf.cleanup();
+    }
+
+    // 3. Fenced job lease check (`assertFence(tx)` throwing `JOB_LEASE_LOST`) aborts commit without marking archive completed
+    const env: NodeJS.ProcessEnv = { RP_BACKUP_KEY_FILE: keyFilePath };
+    const { harness, deps, mod, realStorage } = buildRealStorageHarness(env);
+    await expect(
+      mod.runBackupDirect({
+        actorUserId: adminUserId,
+        assertFence: async () => {
+          throw conflict("JOB_LEASE_LOST", "This job no longer owns its lease.");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "JOB_LEASE_LOST" });
+
+    // 4. Two-phase crash-safe retention (`RETENTION_PURGE_PENDING`): if `storage.delete` fails after Phase 1 commit,
+    // `storageKey` remains intact (`purgedAt === null`) and the next retention run finishes physical deletion!
+    await tdb.db.delete(backupLegalHolds);
+    await tdb.db.delete(backupVerifications);
+    await tdb.db.delete(backupRestoreDrills);
+    await tdb.db.delete(backupArchives);
+
+    const oldBkp = await mod.runBackupDirect({ actorUserId: adminUserId });
+    await mod.verifyBackupDirect(oldBkp.publicId);
+    harness.clock.advance(86_400_000 * 15);
+    const lkgBkp = await mod.runBackupDirect({ actorUserId: adminUserId });
+    await mod.verifyBackupDirect(lkgBkp.publicId);
+    harness.clock.advance(86_400_000 * 30);
+
+    const freshAdmin = makeAdminPrincipal({ stepUpAt: deps.clock.now() });
+    await mod.updateRetentionPolicy(freshAdmin, {
+      keepLastCount: 1,
+      maxAgeDays: 5,
+      scheduleEnabled: true,
+      autoPruneEnabled: true,
+    });
+
+    const [oldBefore] = await tdb.db.select().from(backupArchives).where(eq(backupArchives.publicId, oldBkp.publicId));
+    const oldKey = oldBefore!.storageKey!;
+
+    let failDeleteOnce = true;
+    const origDelete = realStorage.delete.bind(realStorage);
+    realStorage.delete = async (key: string) => {
+      if (failDeleteOnce) {
+        failDeleteOnce = false;
+        throw new Error("Simulated transient disk unlink error");
+      }
+      return origDelete(key);
+    };
+
+    try {
+      await expect(mod.runRetention(freshAdmin, { dryRun: false })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        reasonCode: "RETENTION_STORAGE_DELETE_PARTIAL",
+      });
+      const [pendingRow] = await tdb.db
+        .select()
+        .from(backupArchives)
+        .where(eq(backupArchives.publicId, oldBkp.publicId));
+      expect(pendingRow?.reasonCode).toBe("RETENTION_PURGE_PENDING");
+      expect(pendingRow?.storageKey).toBe(oldKey);
+      expect(pendingRow?.purgedAt).toBeNull();
+      expect(await realStorage.stat(oldKey)).not.toBeNull();
+
+      // Retry retention -> finishes purging the `RETENTION_PURGE_PENDING` blob and sets `purgedAt`!
+      const retryRun = await mod.runRetention(freshAdmin, { dryRun: false });
+      expect(retryRun.prunedCount).toBe(1);
+      const [purgedRow] = await tdb.db
+        .select()
+        .from(backupArchives)
+        .where(eq(backupArchives.publicId, oldBkp.publicId));
+      expect(purgedRow?.storageKey).toBeNull();
+      expect(purgedRow?.purgedAt).not.toBeNull();
+      expect(await realStorage.stat(oldKey)).toBeNull();
+    } finally {
+      realStorage.delete = origDelete;
+    }
   });
 });

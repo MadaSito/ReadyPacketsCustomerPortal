@@ -2,33 +2,39 @@
  * Backup & disaster-recovery module — public service surface and factory.
  * Owner: recovery_ops_engineer.
  */
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { and, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { OperationState } from "../../../shared/domain.js";
+import { readSecretEnv } from "../../config/env.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, CryptoError, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { ClaimedJob, JobResult, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import { createObjectStorage } from "../files/storage.js";
-import { orderFiles } from "../files/schema.js";
 import { users } from "../identity/schema.js";
-import { jobRuns } from "../jobs/schema.js";
 import { isFlagEnabled, readSetting, writeSetting } from "../platform/index.js";
-import { platformPresentationImages } from "../platform/schema.js";
 import { assertBackupActorInTx, assertBackupPrincipalPrecheck } from "./actorGuard.js";
 import { createBackupBundleStream, readAndValidateBackupBundle, sealManifest, type BundleObjectSource } from "./bundle.js";
 import { reconcileAndVerifyIsolatedRestore } from "./continuity.js";
 import { decryptBackupStream, encryptBackupStream } from "./crypto.js";
 import { requireBackupKeyring, resolveBackupKeyring, type BackupKeySourceOptions } from "./keys.js";
 import {
-  assertValidIsolatedDatabaseName,
   loadSqlGzIntoIsolatedDatabase,
   openMysqldumpGzStream,
+  openValidatedMysqlConnection,
+  parseValidatedMysqlTarget,
   prepareIsolatedTargetDatabase,
+  type DatabaseSnapshotMetadata,
 } from "./mysqlCli.js";
+import {
+  executeIsolatedCliRestore,
+  reserveIsolatedStorageDirectory,
+  type IsolatedRestoreExecutionResult,
+} from "./offlineRestore.js";
 import { buildRetentionPlan, type RetentionKeepReason } from "./retention.js";
 import {
   backupArchives,
@@ -140,9 +146,13 @@ export interface RetentionPlanItem {
   keepReason: RetentionKeepReason | null;
 }
 
+export { executeIsolatedCliRestore, reserveIsolatedStorageDirectory, type IsolatedRestoreExecutionResult };
+
 export interface BackupModuleOptions extends BackupKeySourceOptions {
   /** Override database URL for mysqldump/mysql in isolated test harnesses where config.databaseUrl is synthetic. */
   databaseUrlOverride?: string;
+  /** Optional dedicated scratch/recovery MySQL URL (`RP_RECOVERY_DATABASE_URL`) for isolated scratch verification & CLI drills. */
+  recoveryDatabaseUrlOverride?: string;
 }
 
 export interface BackupModule extends ModuleLifecycle {
@@ -174,31 +184,34 @@ export interface BackupModule extends ModuleLifecycle {
     actorUserId?: number | null;
     correlationId?: string;
     backupPublicId?: string;
-    assertFence?: () => Promise<void>;
+    assertFence?: (tx?: Tx) => Promise<void>;
+    abortSignal?: AbortSignal;
   }): Promise<BackupArchiveSummary>;
   verifyBackup(principal: SessionPrincipal, backupPublicId: string): Promise<BackupVerificationSummary>;
   verifyBackupDirect(
     backupPublicId: string,
-    options?: { actorUserId?: number | null; correlationId?: string },
-  ): Promise<BackupVerificationSummary>;
-  restoreToIsolatedTarget(
-    principal: SessionPrincipal,
-    input: {
-      backupPublicId: string;
-      targetDatabaseName: string;
-      targetStoragePath?: string;
-      continuityMode?: ContinuityMode;
-      confirmationText: string;
+    options?: {
+      actorUserId?: number | null;
+      correlationId?: string;
+      assertFence?: (tx?: Tx) => Promise<void>;
     },
-  ): Promise<RestoreDrillSummary>;
+  ): Promise<BackupVerificationSummary>;
+  /**
+   * Operator CLI / test-only isolated restore entry point (NEVER exposed on web/tRPC).
+   * Requires dedicated recovery credentials (`recoveryDatabaseUrl` or `RP_RECOVERY_DATABASE_URL(_FILE)`) unless
+   * `allowSameUserInTestOnly` is explicitly set in unit tests.
+   */
   restoreToIsolatedTargetDirect(input: {
     backupPublicId: string;
     targetDatabaseName: string;
     targetStorageDir: string;
+    recoveryDatabaseUrl?: string;
+    archiveFilePath?: string;
     continuityMode?: ContinuityMode;
     confirmationText: string;
     actorUserId?: number | null;
     correlationId?: string;
+    allowSameUserInTestOnly?: boolean;
   }): Promise<RestoreDrillSummary>;
   getRetentionPolicy(principal: SessionPrincipal): Promise<{
     keepLastCount: number;
@@ -240,6 +253,10 @@ interface FilesBackupCollectorLike {
     tx: Tx,
     input: { after?: string; limit: number },
   ): Promise<{ items: { publicId: string; storageKey: string; size: number; sha256: string }[]; nextCursor: string | null }>;
+}
+
+function isJobLeaseLostError(error: unknown): boolean {
+  return error instanceof DomainError && error.reasonCode === "JOB_LEASE_LOST";
 }
 
 function encodeCursor(createdAt: Date, id: number): string {
@@ -360,14 +377,91 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     };
   }
 
-  async function collectPrivateObjectsForBackup(existingTables: ReadonlySet<string>): Promise<BundleObjectSource[]> {
+  /**
+   * Captures private storage object inventory and active writer job count inside ONE `REPEATABLE READ`
+   * `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY` MySQL connection immediately after `mysqldump`
+   * has started its own consistent snapshot, minimizing DB/object-inventory skew while pre-verifying every
+   * referenced object's SHA-256 and byte size on disk before sealing the bundle.
+   */
+  async function captureConsistentObjectInventoryAndWriters(): Promise<{
+    objects: BundleObjectSource[];
+    activeWriters: number;
+  }> {
     const collected = new Map<string, BundleObjectSource>();
-    const filesMod = deps.services.files as unknown as Partial<FilesBackupCollectorLike> | undefined;
+    let activeWriters = 0;
 
+    const target = parseValidatedMysqlTarget(effectiveDatabaseUrl());
+    const conn = await openValidatedMysqlConnection(effectiveDatabaseUrl());
+    try {
+      await conn.query("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      try {
+        const [tblRows] = await conn.query(
+          "SELECT TABLE_NAME AS tableName FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
+          [target.database],
+        );
+        const existingTables = new Set(
+          (tblRows as { tableName: string }[]).map((r) => String(r.tableName)),
+        );
+
+        if (existingTables.has("job_runs")) {
+          const [wRows] = await conn.query(
+            "SELECT COUNT(*) AS cnt FROM `job_runs` WHERE `state` = 'running' AND `type` <> ?",
+            [BACKUP_JOB_CREATE],
+          );
+          activeWriters = Number(((wRows as { cnt: number | bigint }[])[0])?.cnt ?? 0);
+        }
+
+        if (existingTables.has("order_files")) {
+          const [fRows] = await conn.query(
+            "SELECT `public_id` AS publicId, `storage_key` AS storageKey, `byte_size` AS byteSize, `sha256` FROM `order_files` WHERE `purged_at` IS NULL ORDER BY `id` ASC",
+          );
+          for (const r of fRows as { publicId: string; storageKey: string; byteSize: number; sha256: string }[]) {
+            if (!collected.has(r.storageKey)) {
+              collected.set(r.storageKey, {
+                storageKey: r.storageKey,
+                expectedSize: Number(r.byteSize),
+                expectedSha256: String(r.sha256),
+                sourceTable: "order_files",
+                recordPublicId: String(r.publicId),
+                open: () => deps.storage.get(r.storageKey),
+              });
+            }
+          }
+        }
+
+        if (existingTables.has("platform_presentation_images")) {
+          const [imgRows] = await conn.query(
+            "SELECT `public_id` AS publicId, `storage_key` AS storageKey, `byte_size` AS byteSize, `sha256` FROM `platform_presentation_images` WHERE `deleted_at` IS NULL ORDER BY `id` ASC",
+          );
+          for (const img of imgRows as { publicId: string; storageKey: string; byteSize: number; sha256: string }[]) {
+            if (!collected.has(img.storageKey)) {
+              collected.set(img.storageKey, {
+                storageKey: img.storageKey,
+                expectedSize: Number(img.byteSize),
+                expectedSha256: String(img.sha256),
+                sourceTable: "platform_presentation_images",
+                recordPublicId: String(img.publicId),
+                open: () => deps.storage.get(img.storageKey),
+              });
+            }
+          }
+        }
+      } finally {
+        await conn.query("COMMIT").catch(() => {});
+      }
+    } finally {
+      await conn.end().catch(() => {});
+    }
+
+    // Also include any custom files collector registered in unit harnesses
+    const filesMod = deps.services.files as unknown as Partial<FilesBackupCollectorLike> | undefined;
     if (filesMod && typeof filesMod.backupFiles === "function") {
       let cursor: string | undefined;
       while (true) {
-        const page = await deps.db.transaction((tx) => filesMod.backupFiles!(tx, { ...(cursor ? { after: cursor } : {}), limit: 250 }));
+        const page = await deps.db.transaction((tx) =>
+          filesMod.backupFiles!(tx, { ...(cursor ? { after: cursor } : {}), limit: 250 }),
+        );
         for (const item of page.items) {
           if (!collected.has(item.storageKey)) {
             collected.set(item.storageKey, {
@@ -383,57 +477,9 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         if (!page.nextCursor) break;
         cursor = page.nextCursor;
       }
-    } else if (existingTables.has("order_files")) {
-      const rows = await deps.db
-        .select({
-          publicId: orderFiles.publicId,
-          storageKey: orderFiles.storageKey,
-          byteSize: orderFiles.byteSize,
-          sha256: orderFiles.sha256,
-        })
-        .from(orderFiles)
-        .where(isNull(orderFiles.purgedAt))
-        .orderBy(orderFiles.id);
-      for (const r of rows) {
-        if (!collected.has(r.storageKey)) {
-          collected.set(r.storageKey, {
-            storageKey: r.storageKey,
-            expectedSize: r.byteSize,
-            expectedSha256: r.sha256,
-            sourceTable: "order_files",
-            recordPublicId: r.publicId,
-            open: () => deps.storage.get(r.storageKey),
-          });
-        }
-      }
     }
 
-    if (existingTables.has("platform_presentation_images")) {
-      const imgs = await deps.db
-        .select({
-          publicId: platformPresentationImages.publicId,
-          storageKey: platformPresentationImages.storageKey,
-          byteSize: platformPresentationImages.byteSize,
-          sha256: platformPresentationImages.sha256,
-        })
-        .from(platformPresentationImages)
-        .where(isNull(platformPresentationImages.deletedAt))
-        .orderBy(platformPresentationImages.id);
-      for (const img of imgs) {
-        if (!collected.has(img.storageKey)) {
-          collected.set(img.storageKey, {
-            storageKey: img.storageKey,
-            expectedSize: img.byteSize,
-            expectedSha256: img.sha256,
-            sourceTable: "platform_presentation_images",
-            recordPublicId: img.publicId,
-            open: () => deps.storage.get(img.storageKey),
-          });
-        }
-      }
-    }
-
-    // Pre-verify every referenced object exists and matches its recorded digest before starting archive stream
+    // Pre-verify every referenced object exists and matches its recorded digest before sealing archive stream
     for (const item of collected.values()) {
       const stat = await deps.storage.stat(item.storageKey);
       if (!stat) {
@@ -452,16 +498,10 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       }
     }
 
-    return [...collected.values()].sort((a, b) => a.storageKey.localeCompare(b.storageKey));
-  }
-
-  async function countActiveWriterJobs(existingTables: ReadonlySet<string>): Promise<number> {
-    if (!existingTables.has("job_runs")) return 0;
-    const [row] = await deps.db
-      .select({ cnt: sql<number>`COUNT(*)` })
-      .from(jobRuns)
-      .where(and(eq(jobRuns.state, "running"), sql`${jobRuns.type} <> ${BACKUP_JOB_CREATE}`));
-    return Number(row?.cnt ?? 0);
+    return {
+      objects: [...collected.values()].sort((a, b) => a.storageKey.localeCompare(b.storageKey)),
+      activeWriters,
+    };
   }
 
   async function runBackupDirect(
@@ -470,7 +510,8 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       actorUserId?: number | null;
       correlationId?: string;
       backupPublicId?: string;
-      assertFence?: () => Promise<void>;
+      assertFence?: (tx?: Tx) => Promise<void>;
+      abortSignal?: AbortSignal;
     } = {},
   ): Promise<BackupArchiveSummary> {
     const now = deps.clock.now();
@@ -485,6 +526,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     } catch (error) {
       const reasonCode = error instanceof DomainError ? error.reasonCode : "BACKUP_KEY_INVALID";
       await deps.db.transaction(async (tx) => {
+        await runOpts.assertFence?.(tx);
         const [existing] = await tx
           .select({ id: backupArchives.id })
           .from(backupArchives)
@@ -531,8 +573,9 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
 
     const activeKey = keyring.keys.get(keyring.currentKeyId)!;
 
-    // Ensure `backup_archives` row exists in `running` state BEFORE snapshot so row count is deterministic.
+    // Ensure `backup_archives` row exists in `running` state BEFORE snapshot, fenced inside tx!
     await deps.db.transaction(async (tx) => {
+      await runOpts.assertFence?.(tx);
       const [existing] = await tx
         .select({ id: backupArchives.id })
         .from(backupArchives)
@@ -566,19 +609,32 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       }
     });
 
+    // Unique per-attempt storage key so concurrent or retried workers never overwrite one another's object!
     const storageKey = deps.storage.newKey("backups");
     let storageWritten = false;
+    let publicationCommitted = false;
 
     try {
       await runOpts.assertFence?.();
 
-      const dumpHandle = await openMysqldumpGzStream(effectiveDatabaseUrl(), () => deps.clock.now());
-      const existingTables = new Set(dumpHandle.snapshot.tableNames);
-      const activeWriters = await countActiveWriterJobs(existingTables);
-      const objects = await collectPrivateObjectsForBackup(existingTables);
+      const dumpHandle = await openMysqldumpGzStream(
+        effectiveDatabaseUrl(),
+        () => deps.clock.now(),
+        runOpts.abortSignal,
+      );
+      await dumpHandle.waitSnapshotStarted();
+
+      const { objects, activeWriters } = await captureConsistentObjectInventoryAndWriters();
 
       let builtManifestSha256 = "";
       let dbDumpCompletedAt = dumpHandle.startedAt;
+      let streamedSnapshot: DatabaseSnapshotMetadata = {
+        tableNames: [],
+        tableRowCounts: {},
+        migrationCount: 0,
+        lastMigrationHash: null,
+        lastMigrationCreatedAt: null,
+      };
 
       const bundleStream = createBackupBundleStream({
         now: () => deps.clock.now(),
@@ -588,11 +644,12 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           finalizeSqlStats: async () => {
             const finalized = await dumpHandle.finalize();
             dbDumpCompletedAt = finalized.completedAt;
+            streamedSnapshot = finalized.snapshot;
             return {
               uncompressedBytes: finalized.uncompressedBytes,
               uncompressedSha256: finalized.uncompressedSha256,
-              tableNames: dumpHandle.snapshot.tableNames,
-              tableRowCounts: dumpHandle.snapshot.tableRowCounts,
+              tableNames: finalized.snapshot.tableNames,
+              tableRowCounts: finalized.snapshot.tableRowCounts,
             };
           },
         }),
@@ -612,9 +669,9 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
               activeWriterJobsAtCapture: activeWriters,
             },
             schema: {
-              migrationCount: dumpHandle.snapshot.migrationCount,
-              lastMigrationHash: dumpHandle.snapshot.lastMigrationHash,
-              lastMigrationCreatedAt: dumpHandle.snapshot.lastMigrationCreatedAt,
+              migrationCount: streamedSnapshot.migrationCount,
+              lastMigrationHash: streamedSnapshot.lastMigrationHash,
+              lastMigrationCreatedAt: streamedSnapshot.lastMigrationCreatedAt,
             },
             requiredKeys: {
               backupKeyId: keyring.currentKeyId,
@@ -663,12 +720,12 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         throw new DomainError("UNAVAILABLE", "STORAGE_WRITE_MISMATCH", "Encrypted backup archive digest mismatched after write.");
       }
 
-      await runOpts.assertFence?.();
-
       const completedAt = deps.clock.now();
       const objectTotalBytes = objects.reduce((acc, o) => acc + o.expectedSize, 0);
 
+      // Atomic publication fenced by `assertFence(tx)` INSIDE the commit transaction!
       await deps.db.transaction(async (tx) => {
+        await runOpts.assertFence?.(tx);
         await tx
           .update(backupArchives)
           .set({
@@ -678,8 +735,8 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
             encryptedSizeBytes: storedInfo.size,
             archiveSha256: storedInfo.sha256,
             manifestSha256: builtManifestSha256,
-            schemaMigrationCount: dumpHandle.snapshot.migrationCount,
-            lastMigrationHash: dumpHandle.snapshot.lastMigrationHash,
+            schemaMigrationCount: streamedSnapshot.migrationCount,
+            lastMigrationHash: streamedSnapshot.lastMigrationHash,
             objectCount: objects.length,
             objectTotalBytes,
             offHostCopyStatus: "local_only",
@@ -702,7 +759,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
             safeCounts: {
               encrypted_bytes: storedInfo.size,
               objects: objects.length,
-              tables: dumpHandle.snapshot.tableNames.length,
+              tables: streamedSnapshot.tableNames.length,
             },
             attributes: {
               backup_key_id: keyring.currentKeyId,
@@ -714,13 +771,52 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           tx,
         );
       });
+      publicationCommitted = true;
 
-      const [finalRow] = await deps.db.select().from(backupArchives).where(eq(backupArchives.publicId, archivePublicId)).limit(1);
-      const lastKnownGoodId = await computeLastKnownGoodId();
-      return toArchiveSummary(finalRow!, 0, lastKnownGoodId);
+      // Post-commit summary read MUST NEVER trigger storage unlink or overwrite `state = 'completed'` if it fails!
+      const [finalRow] = await deps.db
+        .select()
+        .from(backupArchives)
+        .where(eq(backupArchives.publicId, archivePublicId))
+        .limit(1)
+        .catch(() => []);
+      const lastKnownGoodId = await computeLastKnownGoodId().catch(() => null);
+      if (finalRow) {
+        return toArchiveSummary(finalRow, 0, lastKnownGoodId);
+      }
+      return {
+        publicId: archivePublicId,
+        state: "completed",
+        reasonCode: null,
+        trigger,
+        encryptedSizeBytes: storedInfo.size,
+        archiveSha256: storedInfo.sha256,
+        backupKeyId: keyring.currentKeyId,
+        keyCustodyMode: keyring.custodyMode,
+        releaseRef: deps.config.releaseRef,
+        schemaMigrationCount: streamedSnapshot.migrationCount,
+        lastMigrationHash: streamedSnapshot.lastMigrationHash,
+        objectCount: objects.length,
+        objectTotalBytes,
+        verificationStatus: "unverified",
+        lastVerifiedAt: null,
+        offHostCopyStatus: "local_only",
+        activeHoldCount: 0,
+        isLastKnownGood: false,
+        purgedAt: null,
+        createdAt: now,
+        completedAt,
+      };
     } catch (error) {
+      if (publicationCommitted) {
+        throw error;
+      }
       if (storageWritten) {
         await deps.storage.delete(storageKey).catch(() => {});
+      }
+      // If worker lost its job lease (`JobLeaseLostError`), NEVER overwrite another worker's `backup_archives` row!
+      if (isJobLeaseLostError(error)) {
+        throw error;
       }
       const reasonCode =
         error instanceof DomainError
@@ -731,6 +827,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       const failedAt = deps.clock.now();
       await deps.db
         .transaction(async (tx) => {
+          await runOpts.assertFence?.(tx);
           await tx
             .update(backupArchives)
             .set({
@@ -762,15 +859,24 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     }
   }
 
+  function configuredScratchRecoveryUrl(): string | undefined {
+    if (options.recoveryDatabaseUrlOverride) return options.recoveryDatabaseUrlOverride;
+    return readSecretEnv("RP_RECOVERY_DATABASE_URL", options.env ?? process.env);
+  }
+
   async function verifyBackupDirect(
     backupPublicId: string,
-    verifyOpts: { actorUserId?: number | null; correlationId?: string } = {},
+    verifyOpts: {
+      actorUserId?: number | null;
+      correlationId?: string;
+      assertFence?: (tx?: Tx) => Promise<void>;
+    } = {},
   ): Promise<BackupVerificationSummary> {
     const startedAt = deps.clock.now();
     const correlationId = verifyOpts.correlationId ?? getRequestContext()?.correlationId ?? ulid(startedAt.getTime());
 
     const [archive] = await deps.db.select().from(backupArchives).where(eq(backupArchives.publicId, backupPublicId)).limit(1);
-    if (!archive || archive.purgedAt !== null) {
+    if (!archive || archive.purgedAt !== null || archive.reasonCode === "RETENTION_PURGE_PENDING") {
       throw notFound("BACKUP_NOT_FOUND");
     }
     if (archive.state !== "completed" || !archive.storageKey) {
@@ -781,6 +887,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     const verificationPublicId = ulid(startedAt.getTime());
 
     try {
+      await verifyOpts.assertFence?.();
       const encryptedStream = await deps.storage.get(archive.storageKey);
       const decryptor = decryptBackupStream(encryptedStream, {
         keyring,
@@ -812,6 +919,80 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         throw new CryptoError("TAMPERED");
       }
 
+      // Optional isolated scratch-target restore + continuity + semantic integrity check when dedicated scratch
+      // recovery credentials (`RP_RECOVERY_DATABASE_URL(_FILE)`) are configured!
+      let verificationScope: "byte_and_manifest" | "scratch_restore_verified" = "byte_and_manifest";
+      const scratchRecoveryUrl = configuredScratchRecoveryUrl();
+      if (scratchRecoveryUrl) {
+        const scratchDbName = `rp_vfy_${verificationPublicId.slice(-16).toLowerCase()}`;
+        const scratchParentBase =
+          options.env?.RP_RECOVERY_SANDBOX_DIR ?? process.env.RP_RECOVERY_SANDBOX_DIR ?? tmpdir();
+        await mkdir(scratchParentBase, { recursive: true, mode: 0o700 });
+        const scratchStorageDir = await mkdtemp(path.join(scratchParentBase, "rp-vfy-"));
+        let reservedScratchDb: Awaited<ReturnType<typeof prepareIsolatedTargetDatabase>> | null = null;
+        try {
+          reservedScratchDb = await prepareIsolatedTargetDatabase({
+            recoveryDatabaseUrl: scratchRecoveryUrl,
+            targetDatabaseName: scratchDbName,
+            liveDatabaseUrl: effectiveDatabaseUrl(),
+            enforceTargetScopedGrants: true,
+          });
+          const scratchStorage = createObjectStorage({
+            config: { storageDir: scratchStorageDir },
+            logger: deps.logger,
+          });
+          const scratchStream = await deps.storage.get(archive.storageKey);
+          const scratchDec = decryptBackupStream(scratchStream, {
+            keyring,
+            expectedBackupPublicId: archive.publicId,
+          });
+          await readAndValidateBackupBundle(scratchDec.plaintext, {
+            onSqlGz: async (gzStream) => {
+              await loadSqlGzIntoIsolatedDatabase(reservedScratchDb!.targetDatabaseUrl, gzStream, {
+                uncompressedBytes: parsedBundle.manifest.databaseDump.uncompressedBytes,
+                uncompressedSha256: parsedBundle.manifest.databaseDump.uncompressedSha256,
+              });
+            },
+            onObject: async (objKey, objStream) => {
+              await scratchStorage.put(objKey, Readable.from(objStream));
+            },
+          });
+          scratchDec.result();
+
+          const { continuity, integrity } = await reconcileAndVerifyIsolatedRestore({
+            targetDatabaseUrl: reservedScratchDb.targetDatabaseUrl,
+            isolatedStorage: scratchStorage,
+            manifest: parsedBundle.manifest,
+            continuityMode: "quarantine_credentials",
+            backupPublicId: archive.publicId,
+            config: deps.config,
+            clock: deps.clock,
+            logger: deps.logger,
+            crypto: deps.crypto,
+          });
+          if (!integrity.passed || continuity.auditChainVerified === "failed") {
+            throw new DomainError(
+              "CONFLICT",
+              "SCRATCH_VERIFY_INTEGRITY_FAILED",
+              "Isolated scratch-target continuity or semantic integrity check failed.",
+            );
+          }
+          verificationScope = "scratch_restore_verified";
+        } finally {
+          if (reservedScratchDb) {
+            const cleanupConn = await openValidatedMysqlConnection(scratchRecoveryUrl, { withoutDatabase: true }).catch(
+              () => null,
+            );
+            if (cleanupConn) {
+              await cleanupConn.query(`DROP DATABASE IF EXISTS \`${scratchDbName}\``).catch(() => {});
+              await cleanupConn.end().catch(() => {});
+            }
+            await reservedScratchDb.release();
+          }
+          await rm(scratchStorageDir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+
       const presentDataKeyIds = new Set(Object.keys(deps.config.dataKeyring.keys));
       const missingDataKeyIds = parsedBundle.manifest.requiredKeys.dataKeyringAllIds.filter(
         (id) => !presentDataKeyIds.has(id),
@@ -821,6 +1002,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime());
 
       await deps.db.transaction(async (tx) => {
+        await verifyOpts.assertFence?.(tx);
         await tx.insert(backupVerifications).values({
           publicId: verificationPublicId,
           backupId: archive.id,
@@ -865,6 +1047,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
             },
             attributes: {
               key_readiness: keyReadiness,
+              verification_scope: verificationScope,
             },
           },
           tx,
@@ -878,6 +1061,9 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         .limit(1);
       return toVerificationSummary(vRow!, archive.publicId);
     } catch (error) {
+      if (isJobLeaseLostError(error)) {
+        throw error;
+      }
       const reasonCode =
         error instanceof CryptoError
           ? `ARCHIVE_${error.reasonCode}`
@@ -888,6 +1074,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime());
 
       await deps.db.transaction(async (tx) => {
+        await verifyOpts.assertFence?.(tx);
         await tx.insert(backupVerifications).values({
           publicId: verificationPublicId,
           backupId: archive.id,
@@ -972,53 +1159,29 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     };
   }
 
-  async function validateAndPrepareIsolatedStorageDir(targetStorageDir: string): Promise<string> {
-    if (!path.isAbsolute(targetStorageDir)) {
-      throw validation("INVALID_TARGET_STORAGE", "Isolated target storage path must be an absolute directory.");
-    }
-    const resolvedTarget = path.resolve(targetStorageDir);
-    const resolvedLive = path.resolve(deps.config.storageDir);
-    if (
-      resolvedTarget === "/" ||
-      resolvedTarget === resolvedLive ||
-      resolvedTarget.startsWith(`${resolvedLive}${path.sep}`) ||
-      resolvedLive.startsWith(`${resolvedTarget}${path.sep}`)
-    ) {
-      throw conflict(
-        "LIVE_STORAGE_OVERLAP",
-        "Isolated restore storage directory must not equal or overlap the live storage directory.",
-      );
-    }
-    await mkdir(resolvedTarget, { recursive: true, mode: 0o700 });
-    const entries = await readdir(resolvedTarget);
-    if (entries.length > 0) {
-      throw conflict(
-        "TARGET_STORAGE_NOT_EMPTY",
-        "Isolated restore storage directory must be empty before restoration.",
-      );
-    }
-    return resolvedTarget;
-  }
-
   async function restoreToIsolatedTargetDirect(input: {
     backupPublicId: string;
     targetDatabaseName: string;
     targetStorageDir: string;
+    recoveryDatabaseUrl?: string;
+    archiveFilePath?: string;
     continuityMode?: ContinuityMode;
     confirmationText: string;
     actorUserId?: number | null;
     correlationId?: string;
+    allowSameUserInTestOnly?: boolean;
   }): Promise<RestoreDrillSummary> {
-    const startedAt = deps.clock.now();
-    const correlationId = input.correlationId ?? getRequestContext()?.correlationId ?? ulid(startedAt.getTime());
-    const continuityMode: ContinuityMode = input.continuityMode ?? "preserve_continuity";
-    const drillPublicId = ulid(startedAt.getTime());
+    const keyring = await requireBackupKeyring(deps.settings, options);
+    const recoveryUrl =
+      input.recoveryDatabaseUrl ??
+      configuredScratchRecoveryUrl() ??
+      (input.allowSameUserInTestOnly ? effectiveDatabaseUrl() : undefined);
 
-    const expectedConfirmation = expectedRestoreConfirmationText(input.backupPublicId, input.targetDatabaseName);
-    if (input.confirmationText.trim() !== expectedConfirmation) {
-      throw validation(
-        "CONFIRMATION_MISMATCH",
-        `Type the exact confirmation phrase "${expectedConfirmation}" to proceed.`,
+    if (!recoveryUrl) {
+      throw new DomainError(
+        "FORBIDDEN",
+        "RECOVERY_CREDENTIALS_REQUIRED",
+        "Isolated restore requires separate operator credentials via RP_RECOVERY_DATABASE_URL or RP_RECOVERY_DATABASE_URL_FILE.",
       );
     }
 
@@ -1027,302 +1190,64 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       .from(backupArchives)
       .where(eq(backupArchives.publicId, input.backupPublicId))
       .limit(1);
-    if (!archive || archive.purgedAt !== null) {
-      throw notFound("BACKUP_NOT_FOUND");
-    }
-    if (archive.state !== "completed" || !archive.storageKey) {
-      throw conflict("BACKUP_NOT_RESTORABLE", "Only completed encrypted backups can be restored.");
-    }
 
-    // Validate isolated DB and isolated storage targets BEFORE opening archive or mutating anything
-    try {
-      assertValidIsolatedDatabaseName(effectiveDatabaseUrl(), input.targetDatabaseName);
-    } catch (error) {
-      const reasonCode = error instanceof DomainError ? error.reasonCode : "INVALID_TARGET_DATABASE";
-      await deps.audit.record({
-        category: "backup",
-        eventName: "backup.restore.refused",
-        action: "restore",
-        outcome: "refused",
-        severity: "WARN",
-        reasonCode,
-        actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-        resource: { type: "backup_archive", publicId: archive.publicId },
-        correlationId,
-      });
-      throw error;
-    }
-
-    let resolvedTargetStorage: string;
-    try {
-      resolvedTargetStorage = await validateAndPrepareIsolatedStorageDir(input.targetStorageDir);
-    } catch (error) {
-      const reasonCode = error instanceof DomainError ? error.reasonCode : "INVALID_TARGET_STORAGE";
-      await deps.audit.record({
-        category: "backup",
-        eventName: "backup.restore.refused",
-        action: "restore",
-        outcome: "refused",
-        severity: "WARN",
-        reasonCode,
-        actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-        resource: { type: "backup_archive", publicId: archive.publicId },
-        correlationId,
-      });
-      throw error;
-    }
-
-    const keyring = await requireBackupKeyring(deps.settings, options);
-
-    // Pass 1: Full pre-write cryptographic & manifest verification so a tampered archive NEVER partially populates a target!
-    let verifiedManifest;
-    try {
-      const pass1Stream = await deps.storage.get(archive.storageKey);
-      const pass1Dec = decryptBackupStream(pass1Stream, {
-        keyring,
-        expectedBackupPublicId: archive.publicId,
-      });
-      let pass1SqlVerify = { uncompressedBytes: 0, uncompressedSha256: "", validMarkers: false };
-      const pass1Bundle = await readAndValidateBackupBundle(pass1Dec.plaintext, {
-        onSqlGz: async (gzStream) => {
-          pass1SqlVerify = await consumeSqlForVerify(gzStream);
-        },
-      });
-      const pass1Stats = pass1Dec.result();
-      if (archive.archiveSha256 && pass1Stats.archiveSha256 !== archive.archiveSha256) {
-        throw new CryptoError("TAMPERED");
+    if (!input.archiveFilePath) {
+      if (!archive || archive.purgedAt !== null || archive.reasonCode === "RETENTION_PURGE_PENDING") {
+        throw notFound("BACKUP_NOT_FOUND");
       }
-      if (
-        pass1SqlVerify.uncompressedBytes !== pass1Bundle.manifest.databaseDump.uncompressedBytes ||
-        pass1SqlVerify.uncompressedSha256 !== pass1Bundle.manifest.databaseDump.uncompressedSha256 ||
-        !pass1SqlVerify.validMarkers
-      ) {
-        throw new CryptoError("TAMPERED");
+      if (archive.state !== "completed" || !archive.storageKey) {
+        throw conflict("BACKUP_NOT_RESTORABLE", "Only completed encrypted backups can be restored.");
       }
-      verifiedManifest = pass1Bundle.manifest;
-    } catch (error) {
-      const reasonCode =
-        error instanceof CryptoError
-          ? `ARCHIVE_${error.reasonCode}`
-          : error instanceof DomainError
-            ? error.reasonCode
-            : "RESTORE_PREVERIFY_FAILED";
-      await deps.db.transaction(async (tx) => {
-        await tx.insert(backupRestoreDrills).values({
-          publicId: drillPublicId,
-          backupId: archive.id,
-          state: "failed",
-          reasonCode,
-          targetDatabaseName: input.targetDatabaseName,
-          continuityMode,
-          completedAt: deps.clock.now(),
-          createdAt: startedAt,
-          requestedByUserId: input.actorUserId ?? null,
-          correlationId,
-        });
-        await deps.audit.record(
-          {
-            category: "backup",
-            eventName: "backup.restore.failed",
-            action: "restore",
-            outcome: "failed",
-            severity: "ERROR",
-            reasonCode,
-            actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-            resource: { type: "backup_archive", publicId: archive.publicId },
-            correlationId,
-          },
-          tx,
-        );
-      });
-      throw new DomainError("CONFLICT", reasonCode, "Archive verification failed; isolated target was not modified.");
     }
 
-    // Prepare isolated MySQL target database (must not exist or must have 0 tables)
-    let targetDbInfo: { targetDatabaseUrl: string; createdDatabase: boolean };
-    try {
-      targetDbInfo = await prepareIsolatedTargetDatabase(effectiveDatabaseUrl(), input.targetDatabaseName);
-    } catch (error) {
-      const reasonCode = error instanceof DomainError ? error.reasonCode : "TARGET_DB_PREPARE_FAILED";
-      await deps.audit.record({
-        category: "backup",
-        eventName: "backup.restore.refused",
-        action: "restore",
-        outcome: "refused",
-        severity: "WARN",
-        reasonCode,
-        actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-        resource: { type: "backup_archive", publicId: archive.publicId },
-        correlationId,
-      });
-      throw error;
-    }
-
-    const isolatedStorage = createObjectStorage({
-      config: { storageDir: resolvedTargetStorage },
+    const result = await executeIsolatedCliRestore({
+      ...(input.archiveFilePath
+        ? { archiveFilePath: input.archiveFilePath }
+        : { openArchiveStream: () => deps.storage.get(archive!.storageKey!) }),
+      expectedBackupPublicId: input.backupPublicId,
+      recoveryDatabaseUrl: recoveryUrl,
+      targetDatabaseName: input.targetDatabaseName,
+      targetStorageDir: input.targetStorageDir,
+      confirmationText: input.confirmationText,
+      continuityMode: input.continuityMode ?? "quarantine_credentials",
+      keyring,
+      config: deps.config,
+      clock: deps.clock,
       logger: deps.logger,
+      crypto: deps.crypto,
+      ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+      ...(input.allowSameUserInTestOnly ? { allowSameUserInTestOnly: true } : {}),
+      liveLedger: {
+        db: deps.db,
+        audit: deps.audit,
+        liveDatabaseUrl: effectiveDatabaseUrl(),
+        liveStorageDir: deps.config.storageDir,
+        archiveId: archive?.id ?? null,
+        expectedArchiveSha256: archive?.archiveSha256 ?? null,
+        actorUserId: input.actorUserId ?? null,
+      },
     });
 
-    try {
-      // Pass 2: Stream authenticated SQL into isolated database and objects into isolated LocalObjectStorage
-      const pass2Stream = await deps.storage.get(archive.storageKey);
-      const pass2Dec = decryptBackupStream(pass2Stream, {
-        keyring,
-        expectedBackupPublicId: archive.publicId,
-      });
-
-      await readAndValidateBackupBundle(pass2Dec.plaintext, {
-        onSqlGz: async (gzStream) => {
-          await loadSqlGzIntoIsolatedDatabase(targetDbInfo.targetDatabaseUrl, gzStream, {
-            uncompressedBytes: verifiedManifest.databaseDump.uncompressedBytes,
-            uncompressedSha256: verifiedManifest.databaseDump.uncompressedSha256,
-          });
-        },
-        onObject: async (storageKey, objStream) => {
-          await isolatedStorage.put(storageKey, Readable.from(objStream));
-        },
-      });
-      pass2Dec.result();
-
-      // Reconcile §7.3 security-state continuity and verify §7.2 semantic integrity
-      const { continuity, integrity } = await reconcileAndVerifyIsolatedRestore({
-        liveDatabaseUrl: effectiveDatabaseUrl(),
-        targetDatabaseUrl: targetDbInfo.targetDatabaseUrl,
-        isolatedStorage,
-        manifest: verifiedManifest,
-        continuityMode,
-        backupPublicId: archive.publicId,
-        config: deps.config,
-        clock: deps.clock,
-        logger: deps.logger,
-        crypto: deps.crypto,
-      });
-
-      const completedAt = deps.clock.now();
-      const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime());
-      const achievedDataAgeMs = Math.max(0, completedAt.getTime() - archive.createdAt.getTime());
-      const state: OperationState = integrity.passed ? "completed" : "failed";
-      const reasonCode = integrity.passed ? null : "INTEGRITY_CHECK_FAILED";
-
-      await deps.db.transaction(async (tx) => {
-        await tx.insert(backupRestoreDrills).values({
-          publicId: drillPublicId,
-          backupId: archive.id,
-          state,
-          reasonCode,
-          targetDatabaseName: input.targetDatabaseName,
-          continuityMode,
-          achievedDataAgeMs,
-          durationMs,
-          continuityReportJson: continuity,
-          integrityReportJson: integrity,
-          requestedByUserId: input.actorUserId ?? null,
-          correlationId,
-          completedAt,
-          createdAt: startedAt,
-        });
-        await deps.audit.record(
-          {
-            category: "backup",
-            eventName: integrity.passed ? "backup.restore.completed" : "backup.restore.failed",
-            action: "restore",
-            outcome: integrity.passed ? "completed" : "failed",
-            severity: integrity.passed ? "INFO" : "ERROR",
-            ...(reasonCode ? { reasonCode } : {}),
-            actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-            resource: { type: "backup_archive", publicId: archive.publicId },
-            correlationId,
-            durationMs,
-            safeCounts: {
-              sessions_revoked: continuity.sessionsRevoked,
-              tokens_retired: continuity.singleUseTokensRetired,
-              objects_checked: integrity.objectsChecked,
-              tables_checked: integrity.tablesChecked,
-            },
-            attributes: {
-              target_database: input.targetDatabaseName,
-              continuity_mode: continuityMode,
-              audit_chain: continuity.auditChainVerified,
-            },
-          },
-          tx,
-        );
-      });
-
-      if (!integrity.passed) {
-        throw new DomainError(
-          "CONFLICT",
-          "INTEGRITY_CHECK_FAILED",
-          "Isolated restore completed extraction, but post-restore semantic integrity reconciliation failed.",
-        );
-      }
-
-      return {
-        publicId: drillPublicId,
-        backupPublicId: archive.publicId,
-        state,
-        reasonCode,
-        targetDatabaseName: input.targetDatabaseName,
-        continuityMode,
-        achievedDataAgeMs,
-        durationMs,
-        continuity,
-        integrity,
-        createdAt: startedAt,
-        completedAt,
-      };
-    } catch (error) {
-      if (error instanceof DomainError && error.reasonCode === "INTEGRITY_CHECK_FAILED") {
-        throw error;
-      }
-      const reasonCode =
-        error instanceof DomainError
-          ? error.reasonCode
-          : error instanceof CryptoError
-            ? `ARCHIVE_${error.reasonCode}`
-            : "RESTORE_EXECUTION_FAILED";
-      const failedAt = deps.clock.now();
-      await deps.db
-        .transaction(async (tx) => {
-          await tx.insert(backupRestoreDrills).values({
-            publicId: drillPublicId,
-            backupId: archive.id,
-            state: "failed",
-            reasonCode,
-            targetDatabaseName: input.targetDatabaseName,
-            continuityMode,
-            durationMs: Math.max(0, failedAt.getTime() - startedAt.getTime()),
-            continuityReportJson: null,
-            integrityReportJson: null,
-            requestedByUserId: input.actorUserId ?? null,
-            correlationId,
-            completedAt: failedAt,
-            createdAt: startedAt,
-          });
-          await deps.audit.record(
-            {
-              category: "backup",
-              eventName: "backup.restore.failed",
-              action: "restore",
-              outcome: "failed",
-              severity: "ERROR",
-              reasonCode,
-              actor: input.actorUserId ? { userId: input.actorUserId, role: "admin" } : { role: "system" },
-              resource: { type: "backup_archive", publicId: archive.publicId },
-              correlationId,
-            },
-            tx,
-          );
-        })
-        .catch(() => {});
-      if (error instanceof DomainError) throw error;
-      throw new DomainError("UNAVAILABLE", reasonCode, "Isolated restore failed before reconciliation completed.");
-    }
+    return {
+      publicId: result.drillPublicId,
+      backupPublicId: result.backupPublicId,
+      state: result.state,
+      reasonCode: result.reasonCode,
+      targetDatabaseName: result.targetDatabaseName,
+      continuityMode: result.continuityMode,
+      achievedDataAgeMs: result.achievedDataAgeMs,
+      durationMs: result.durationMs,
+      continuity: result.continuity,
+      integrity: result.integrity,
+      createdAt: result.createdAt,
+      completedAt: result.completedAt,
+    };
   }
 
   async function executeRetentionInternal(
     actorPrincipal: SessionPrincipal | null,
     dryRun: boolean,
+    assertFence?: (tx?: Tx) => Promise<void>,
   ): Promise<{ prunedCount: number; items: RetentionPlanItem[] }> {
     const now = deps.clock.now();
 
@@ -1360,17 +1285,26 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       };
     }
 
-    // Destructive retention apply: lock actor -> lock candidate archives -> lock active holds -> audit IN TX -> delete storage keys after commit.
-    const keysToDeleteAfterCommit: string[] = [];
+    // Two-phase crash-safe deletion ledger (MEDIUM-2):
+    // Phase 1 (in tx, fenced): lock actor, candidate archives, and active holds; mark eligible archives
+    //   `reasonCode = 'RETENTION_PURGE_PENDING'` while keeping `storageKey` non-null and `purgedAt = null`;
+    //   write durable pre-delete intent audit event (`backup.retention.executed` / `phase: 'intent'`).
+    // Phase 2 (outside tx): physically delete each `storageKey`, tracking succeeded vs failed unlinks.
+    // Phase 3 (in tx, fenced): ONLY clear `storageKey = null` and set `purgedAt` for physically deleted archives,
+    //   leaving failed unlinks in `RETENTION_PURGE_PENDING` with `storageKey` intact for automatic retry!
+    const targetsToDelete: { id: number; publicId: string; storageKey: string }[] = [];
     let finalItems: RetentionPlanItem[] = [];
-    let prunedCount = 0;
+    let evaluatedCount = 0;
+    let keepLastCountSnapshot = 0;
+    let maxAgeDaysSnapshot = 0;
 
     await deps.db.transaction(async (tx) => {
+      await assertFence?.(tx);
       if (actorPrincipal) {
         await assertBackupActorInTx(deps.services, deps.clock, actorPrincipal, "backup.retention.manage", tx);
       }
-      const keepLastCount = await readSetting(deps.settings, BACKUP_RETENTION_KEEP_COUNT, tx);
-      const maxAgeDays = await readSetting(deps.settings, BACKUP_RETENTION_MAX_AGE_DAYS, tx);
+      keepLastCountSnapshot = await readSetting(deps.settings, BACKUP_RETENTION_KEEP_COUNT, tx);
+      maxAgeDaysSnapshot = await readSetting(deps.settings, BACKUP_RETENTION_MAX_AGE_DAYS, tx);
 
       const rows = await tx
         .select()
@@ -1403,69 +1337,178 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           createdAt: r.createdAt,
           purgedAt: r.purgedAt,
         })),
-        { keepLastCount, maxAgeDays },
+        { keepLastCount: keepLastCountSnapshot, maxAgeDays: maxAgeDaysSnapshot },
         now,
       );
 
-      const toPrune = plan.filter((p) => p.action === "prune");
-      prunedCount = toPrune.length;
-      finalItems = plan.map((p) => ({
-        backupPublicId: p.backupPublicId,
-        createdAt: p.createdAt,
-        action: p.action,
-        keepReason: p.keepReason,
-      }));
+      evaluatedCount = plan.length;
+      const rowById = new Map(rows.map((r) => [r.id, r]));
 
-      // Record durable audit BEFORE mutating/deleting so audit failure aborts any prune!
+      // Re-evaluate previously interrupted `RETENTION_PURGE_PENDING` rows too: if protected by hold or last_known_good now, cancel pending!
+      const cancelPendingIds: number[] = [];
+      for (const p of plan) {
+        const row = rowById.get(p.id)!;
+        const shouldPurge =
+          p.action === "prune" ||
+          (row.reasonCode === "RETENTION_PURGE_PENDING" &&
+            p.keepReason !== "legal_hold" &&
+            p.keepReason !== "last_known_good" &&
+            p.keepReason !== "non_terminal_or_unknown");
+        if (shouldPurge && row.storageKey) {
+          targetsToDelete.push({ id: row.id, publicId: row.publicId, storageKey: row.storageKey });
+        } else if (row.reasonCode === "RETENTION_PURGE_PENDING" && !shouldPurge) {
+          cancelPendingIds.push(row.id);
+        }
+      }
+
+      finalItems = plan.map((p) => {
+        const forced = targetsToDelete.some((t) => t.id === p.id);
+        return {
+          backupPublicId: p.backupPublicId,
+          createdAt: p.createdAt,
+          action: forced ? "prune" : p.action,
+          keepReason: forced ? null : p.keepReason,
+        };
+      });
+
+      if (cancelPendingIds.length > 0) {
+        await tx
+          .update(backupArchives)
+          .set({ reasonCode: null, updatedAt: now })
+          .where(inArray(backupArchives.id, cancelPendingIds));
+      }
+
+      if (targetsToDelete.length > 0) {
+        // Record durable pre-delete intent BEFORE any physical object deletion!
+        await deps.audit.record(
+          {
+            category: "backup",
+            eventName: "backup.retention.intent",
+            action: "delete",
+            outcome: "attempted",
+            severity: "WARN",
+            actor: actorPrincipal ? { userId: actorPrincipal.userId, role: actorPrincipal.role } : { role: "system" },
+            resource: { type: "backup_retention" },
+            safeCounts: {
+              evaluated: evaluatedCount,
+              pending_delete: targetsToDelete.length,
+            },
+            attributes: {
+              dry_run: false,
+              keep_last_count: keepLastCountSnapshot,
+              max_age_days: maxAgeDaysSnapshot,
+            },
+          },
+          tx,
+        );
+        await tx
+          .update(backupArchives)
+          .set({
+            reasonCode: "RETENTION_PURGE_PENDING",
+            updatedAt: now,
+          })
+          .where(
+            inArray(
+              backupArchives.id,
+              targetsToDelete.map((t) => t.id),
+            ),
+          );
+      } else {
+        await deps.audit.record(
+          {
+            category: "backup",
+            eventName: "backup.retention.executed",
+            action: "delete",
+            outcome: "completed",
+            severity: "INFO",
+            actor: actorPrincipal ? { userId: actorPrincipal.userId, role: actorPrincipal.role } : { role: "system" },
+            resource: { type: "backup_retention" },
+            safeCounts: {
+              evaluated: evaluatedCount,
+              pruned: 0,
+              kept: evaluatedCount,
+            },
+            attributes: {
+              dry_run: false,
+              keep_last_count: keepLastCountSnapshot,
+              max_age_days: maxAgeDaysSnapshot,
+            },
+          },
+          tx,
+        );
+      }
+    });
+
+    if (targetsToDelete.length === 0) {
+      return { prunedCount: 0, items: finalItems };
+    }
+
+    // Phase 2: Physically delete storage objects outside the DB transaction; retain storageKey for any unlink error!
+    const succeededIds: number[] = [];
+    const failedIds: number[] = [];
+    for (const target of targetsToDelete) {
+      try {
+        await deps.storage.delete(target.storageKey);
+        succeededIds.push(target.id);
+      } catch (err) {
+        failedIds.push(target.id);
+        deps.logger.warn("failed to unlink pruned backup object; retaining storageKey for retry", {
+          backupPublicId: target.publicId,
+          errorName: err instanceof Error ? err.name : "unknown",
+        });
+      }
+    }
+
+    // Phase 3: Clear `storageKey` and set `purgedAt` ONLY for physically unlinked objects; record durable completion/failure!
+    const completedNow = deps.clock.now();
+    await deps.db.transaction(async (tx) => {
+      await assertFence?.(tx);
+      if (succeededIds.length > 0) {
+        await tx
+          .update(backupArchives)
+          .set({
+            storageKey: null,
+            purgedAt: completedNow,
+            reasonCode: "RETENTION_PURGED",
+            updatedAt: completedNow,
+          })
+          .where(inArray(backupArchives.id, succeededIds));
+      }
       await deps.audit.record(
         {
           category: "backup",
           eventName: "backup.retention.executed",
           action: "delete",
-          outcome: "completed",
-          severity: prunedCount > 0 ? "WARN" : "INFO",
+          outcome: failedIds.length === 0 ? "completed" : "failed",
+          severity: failedIds.length === 0 ? "WARN" : "ERROR",
+          ...(failedIds.length > 0 ? { reasonCode: "RETENTION_STORAGE_DELETE_PARTIAL" } : {}),
           actor: actorPrincipal ? { userId: actorPrincipal.userId, role: actorPrincipal.role } : { role: "system" },
           resource: { type: "backup_retention" },
           safeCounts: {
-            evaluated: plan.length,
-            pruned: prunedCount,
-            kept: plan.length - prunedCount,
+            evaluated: evaluatedCount,
+            pruned: succeededIds.length,
+            failed_unlink: failedIds.length,
+            kept: Math.max(0, evaluatedCount - targetsToDelete.length),
           },
           attributes: {
             dry_run: false,
-            keep_last_count: keepLastCount,
-            max_age_days: maxAgeDays,
+            keep_last_count: keepLastCountSnapshot,
+            max_age_days: maxAgeDaysSnapshot,
           },
         },
         tx,
       );
-
-      if (toPrune.length > 0) {
-        const pruneIds = toPrune.map((p) => p.id);
-        for (const entry of toPrune) {
-          if (entry.storageKey) keysToDeleteAfterCommit.push(entry.storageKey);
-        }
-        await tx
-          .update(backupArchives)
-          .set({
-            storageKey: null,
-            purgedAt: now,
-            updatedAt: now,
-          })
-          .where(inArray(backupArchives.id, pruneIds));
-      }
     });
 
-    // Perform private storage object deletion outside the DB transaction so I/O never holds row locks.
-    for (const key of keysToDeleteAfterCommit) {
-      await deps.storage.delete(key).catch((err) => {
-        deps.logger.warn("failed to unlink pruned backup object after commit", {
-          errorName: err instanceof Error ? err.name : "unknown",
-        });
-      });
+    if (failedIds.length > 0) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "RETENTION_STORAGE_DELETE_PARTIAL",
+        `${String(failedIds.length)} backup archive object(s) could not be unlinked; storage keys retained in RETENTION_PURGE_PENDING for retry.`,
+      );
     }
 
-    return { prunedCount, items: finalItems };
+    return { prunedCount: succeededIds.length, items: finalItems };
   }
 
   // Register fenced background jobs and schedules at construction time (safe — no dereference of deps.services.*)
@@ -1488,7 +1531,8 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           actorUserId: job.payload?.actorUserId ?? null,
           correlationId: job.correlationId,
           ...(job.payload?.backupPublicId ? { backupPublicId: job.payload.backupPublicId } : {}),
-          assertFence: () => job.assertStillOwned(),
+          assertFence: (tx) => job.assertStillOwned(tx),
+          abortSignal: job.signal,
         });
         return {
           outcome: "completed",
@@ -1498,6 +1542,9 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           },
         };
       } catch (error) {
+        if (isJobLeaseLostError(error)) {
+          throw error;
+        }
         const reasonCode = error instanceof DomainError ? error.reasonCode : "BACKUP_JOB_FAILED";
         return { outcome: "failed", reasonCode, retryable: false };
       }
@@ -1524,12 +1571,18 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       }
       try {
         await job.assertStillOwned();
-        const res = await verifyBackupDirect(targetPublicId, { correlationId: job.correlationId });
+        const res = await verifyBackupDirect(targetPublicId, {
+          correlationId: job.correlationId,
+          assertFence: (tx) => job.assertStillOwned(tx),
+        });
         return {
           outcome: "completed",
           safeCounts: { authenticated_bytes: res.authenticatedBytes ?? 0 },
         };
       } catch (error) {
+        if (isJobLeaseLostError(error)) {
+          throw error;
+        }
         const reasonCode = error instanceof DomainError ? error.reasonCode : "VERIFY_JOB_FAILED";
         return { outcome: "failed", reasonCode, retryable: false };
       }
@@ -1541,11 +1594,19 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     async (job: ClaimedJob<unknown>): Promise<JobResult> => {
       await job.assertStillOwned();
       const autoPrune = await isFlagEnabled(deps.settings, BACKUP_RETENTION_AUTO_PRUNE);
-      const res = await executeRetentionInternal(null, !autoPrune);
-      return {
-        outcome: "completed",
-        safeCounts: { pruned: res.prunedCount, evaluated: res.items.length },
-      };
+      try {
+        const res = await executeRetentionInternal(null, !autoPrune, (tx) => job.assertStillOwned(tx));
+        return {
+          outcome: "completed",
+          safeCounts: { pruned: res.prunedCount, evaluated: res.items.length },
+        };
+      } catch (error) {
+        if (isJobLeaseLostError(error)) {
+          throw error;
+        }
+        const reasonCode = error instanceof DomainError ? error.reasonCode : "RETENTION_JOB_FAILED";
+        return { outcome: "failed", reasonCode, retryable: true };
+      }
     },
   );
 
@@ -1913,63 +1974,6 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
 
     verifyBackupDirect,
 
-    async restoreToIsolatedTarget(principal, input) {
-      const now = deps.clock.now();
-      assertBackupPrincipalPrecheck(principal, "backup.restore", now);
-      if (await isMaintenanceDraining()) {
-        throw new DomainError("MAINTENANCE", "MAINTENANCE_DRAINING", "System is draining for maintenance.");
-      }
-
-      const sandboxRootEnv = options.env?.RP_RECOVERY_SANDBOX_DIR ?? process.env.RP_RECOVERY_SANDBOX_DIR;
-      let sandboxRoot = sandboxRootEnv;
-
-      await deps.db.transaction(async (tx) => {
-        await assertBackupActorInTx(deps.services, deps.clock, principal, "backup.restore", tx);
-        if (!sandboxRoot) {
-          sandboxRoot = await readSetting(deps.settings, BACKUP_RECOVERY_SANDBOX_ROOT, tx);
-        }
-        await deps.audit.record(
-          {
-            category: "backup",
-            eventName: "backup.restore.requested",
-            action: "restore",
-            outcome: "attempted",
-            severity: "WARN",
-            actor: { userId: principal.userId, role: principal.role },
-            resource: { type: "backup_archive", publicId: input.backupPublicId },
-            attributes: {
-              target_database: input.targetDatabaseName,
-              continuity_mode: input.continuityMode ?? "preserve_continuity",
-            },
-          },
-          tx,
-        );
-      });
-
-      const resolvedRoot = path.resolve(sandboxRoot!);
-      let targetStorageDir: string;
-      if (input.targetStoragePath) {
-        if (!/^[a-z0-9][a-z0-9_-]{2,63}$/.test(input.targetStoragePath)) {
-          throw validation(
-            "INVALID_TARGET_STORAGE",
-            "Target storage subdirectory name must be 3-64 lowercase alphanumeric, dash, or underscore characters.",
-          );
-        }
-        targetStorageDir = path.join(resolvedRoot, input.targetStoragePath);
-      } else {
-        targetStorageDir = path.join(resolvedRoot, `drill-${ulid(now.getTime()).toLowerCase()}`);
-      }
-
-      return restoreToIsolatedTargetDirect({
-        backupPublicId: input.backupPublicId,
-        targetDatabaseName: input.targetDatabaseName,
-        targetStorageDir,
-        ...(input.continuityMode ? { continuityMode: input.continuityMode } : {}),
-        confirmationText: input.confirmationText,
-        actorUserId: principal.userId,
-      });
-    },
-
     restoreToIsolatedTargetDirect,
 
     async getRetentionPolicy(principal) {
@@ -2053,12 +2057,12 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       await deps.db.transaction(async (tx) => {
         await assertBackupActorInTx(deps.services, deps.clock, principal, "backup.retention.manage", tx);
         const [archive] = await tx
-          .select({ id: backupArchives.id, purgedAt: backupArchives.purgedAt })
+          .select({ id: backupArchives.id, purgedAt: backupArchives.purgedAt, reasonCode: backupArchives.reasonCode })
           .from(backupArchives)
           .where(eq(backupArchives.publicId, input.backupPublicId))
           .limit(1)
           .for("update");
-        if (!archive || archive.purgedAt !== null) {
+        if (!archive || archive.purgedAt !== null || archive.reasonCode === "RETENTION_PURGE_PENDING") {
           throw notFound("BACKUP_NOT_FOUND");
         }
         await tx.insert(backupLegalHolds).values({

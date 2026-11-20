@@ -1,11 +1,14 @@
 /**
  * Backup module — tRPC router (`trpc.backup.*`). Owner: recovery_ops_engineer.
- * All administrative operations require `adminProcedure` + granular capability (+ fresh step-up for mutations).
+ *
+ * Security surface note:
+ *  Per integrator security decision (`REVIEW-audit-siem-backup.md`), web-initiated restore is NOT exposed.
+ *  Restore is strictly an offline/operator CLI procedure (`scripts/ops/restore/restore-isolated.ts`) into an
+ *  isolated target database and isolated storage directory using dedicated operator credentials.
  */
 import { z } from "zod";
 import { OPERATION_STATES } from "../../../shared/domain.js";
 import { adminProcedure, requireCapability, router } from "../../trpc/trpc.js";
-import { CONTINUITY_MODES } from "./schema.js";
 
 const publicIdSchema = z.string().regex(/^[A-Za-z0-9_-]{10,64}$/);
 const reasonCodeSchema = z.string().regex(/^[A-Z][A-Z0-9_]{1,63}$/);
@@ -47,20 +50,6 @@ export const backupRouter = router({
       .use(requireCapability("backup.verify"))
       .input(z.strictObject({ backupPublicId: publicIdSchema }))
       .mutation(({ ctx, input }) => ctx.services.backup.verifyBackup(ctx.session, input.backupPublicId)),
-
-    restoreIsolated: adminProcedure
-      .meta({ rateLimit: "expensive" })
-      .use(requireCapability("backup.restore"))
-      .input(
-        z.strictObject({
-          backupPublicId: publicIdSchema,
-          targetDatabaseName: z.string().min(3).max(64),
-          targetStoragePath: z.string().min(3).max(64).optional(),
-          continuityMode: z.enum(CONTINUITY_MODES).optional(),
-          confirmationText: z.string().min(1).max(200),
-        }),
-      )
-      .mutation(({ ctx, input }) => ctx.services.backup.restoreToIsolatedTarget(ctx.session, input)),
 
     retentionPolicy: adminProcedure
       .use(requireCapability("backup.read"))
