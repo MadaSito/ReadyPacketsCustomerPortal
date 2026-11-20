@@ -26,7 +26,7 @@ import {
 import { ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { ImportOrderInput, PortableOrder, PortableSelection } from "./types.js";
 import type { WorkflowService } from "./workflows.js";
-import { DEFAULT_WORKFLOW, findState, initialState } from "./workflowTypes.js";
+import { DEFAULT_WORKFLOW, findState } from "./workflowTypes.js";
 
 export interface PortableDeps {
   db: Db;
