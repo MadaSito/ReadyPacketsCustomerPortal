@@ -14,6 +14,13 @@ type MailState = (typeof MAIL_STATES)[number];
 type Page = { limit?: number; cursor?: string };
 export type JobList = Page & { type?: string; state?: JobState };
 export type MailList = Page & { state?: MailState };
+export type OutboxJobDisposition =
+  | { state: "running_live" }
+  | { state: "queued_live" }
+  | { state: "settled_unknown" }
+  | { state: "canceled_queued" }
+  | { state: "missing" }
+  | { state: "terminal"; jobState: Exclude<JobState, "queued" | "running"> };
 const activeMessage = "Maintenance is in progress. Some operations are temporarily unavailable.";
 
 const jobView = {
@@ -85,8 +92,50 @@ export function createJobsAdmin(deps: ModuleDeps) {
     return counts ?? { running: 0, unresolved: 0 };
   }
 
+  async function lockJob(tx: Tx, publicId: string) {
+    const [row] = await tx.select().from(jobRuns).where(eq(jobRuns.publicId, publicId)).limit(1).for("update");
+    return row;
+  }
+
+  async function cancelQueued(tx: Tx, row: typeof jobRuns.$inferSelect, system = false):
+    Promise<{ publicId: string; state: "unknown" | "canceled" }> {
+    const now = clock.now();
+    const uncertain = row.interruptionPending;
+    const state = uncertain ? "unknown" : "canceled";
+    const reasonCode = uncertain ? "JOB_RETRY_CANCELED_UNCERTAIN" : "JOB_CANCELED";
+    await tx.update(jobRuns).set({ state, reasonCode, interruptionPending: false, payloadEnc: null, updatedAt: now })
+      .where(eq(jobRuns.id, row.id));
+    if (row.type === "jobs.mail.deliver") {
+      const [mail] = await tx.select().from(mailOutbox)
+        .where(and(eq(mailOutbox.jobPublicId, row.publicId), eq(mailOutbox.state, "queued"))).limit(1).for("update");
+      if (mail) {
+        await tx.update(mailOutbox).set({ state: "canceled", reasonCode: "MAIL_CANCELED", payloadEnc: null, updatedAt: now })
+          .where(eq(mailOutbox.id, mail.id));
+        await mailAudit(deps, tx, mail, "job.mail.canceled", "canceled", "MAIL_CANCELED", system);
+      }
+    }
+    await jobAudit(deps, tx, row, "job.canceled", "canceled", "JOB_CANCELED", system);
+    if (uncertain) await jobAudit(deps, tx, row, "job.unknown", "unknown", reasonCode, system);
+    return { publicId: row.publicId, state };
+  }
+
   return {
     isDraining,
+    async reconcileOutboxJob(jobPublicId: string, tx: Tx, options?: { cancelQueued?: boolean }): Promise<OutboxJobDisposition> {
+      const row = await lockJob(tx, jobPublicId);
+      if (!row) return { state: "missing" };
+      if (row.state === "running") {
+        const engine = engineFor(deps.jobs);
+        if (!engine) throw new DomainError("UNAVAILABLE", "JOB_QUEUE_UNAVAILABLE", "The durable job queue is unavailable.");
+        return engine.reconcileOutboxLease(tx, row);
+      }
+      if (row.state === "queued") {
+        if (!options?.cancelQueued) return { state: "queued_live" };
+        await cancelQueued(tx, row, true);
+        return { state: "canceled_queued" };
+      }
+      return { state: "terminal", jobState: row.state };
+    },
     async maintenanceBanner() {
       const active = await isDraining();
       return { active, message: active ? activeMessage : null };
@@ -145,27 +194,10 @@ export function createJobsAdmin(deps: ModuleDeps) {
     async cancel(principal: SessionPrincipal | null, publicId: string) {
       await authorize(principal, "jobs.manage");
       return db.transaction(async (tx) => {
-        const [row] = await tx.select().from(jobRuns).where(eq(jobRuns.publicId, publicId)).limit(1).for("update");
+        const row = await lockJob(tx, publicId);
         if (!row) throw notFound();
         if (row.state !== "queued") throw conflict("JOB_CANCEL_UNSAFE", "Only jobs that are waiting to run can be canceled.");
-        const now = clock.now();
-        const uncertain = row.interruptionPending;
-        const state = uncertain ? "unknown" : "canceled";
-        const reasonCode = uncertain ? "JOB_RETRY_CANCELED_UNCERTAIN" : "JOB_CANCELED";
-        await tx.update(jobRuns).set({ state, reasonCode, interruptionPending: false, payloadEnc: null, updatedAt: now })
-          .where(eq(jobRuns.id, row.id));
-        if (row.type === "jobs.mail.deliver") {
-          const [mail] = await tx.select().from(mailOutbox)
-            .where(and(eq(mailOutbox.jobPublicId, row.publicId), eq(mailOutbox.state, "queued"))).limit(1).for("update");
-          if (mail) {
-            await tx.update(mailOutbox).set({ state: "canceled", reasonCode: "MAIL_CANCELED", payloadEnc: null, updatedAt: now })
-              .where(eq(mailOutbox.id, mail.id));
-            await mailAudit(deps, tx, mail, "job.mail.canceled", "canceled", "MAIL_CANCELED");
-          }
-        }
-        await jobAudit(deps, tx, row, "job.canceled", "canceled", "JOB_CANCELED");
-        if (uncertain) await jobAudit(deps, tx, row, "job.unknown", "unknown", reasonCode);
-        return { publicId: row.publicId, state };
+        return cancelQueued(tx, row);
       });
     },
     async retry(principal: SessionPrincipal | null, publicId: string) {

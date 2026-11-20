@@ -266,6 +266,68 @@ describe("MySQL durable job leases", () => {
     expect(f.h.audit.recordedInTx).toEqual([true, true, true, true]);
   });
 
+  it("reconciles an expired outbox claim atomically without replaying it", async () => {
+    const h = createTestDeps({ db: t.db });
+    const audit = createAuditEmitter(h.deps);
+    const jobs = createJobQueue({ ...h.deps, audit });
+    const admin = createJobsAdmin({ ...h.deps, jobs, audit });
+    const engine = engineFor(jobs)!;
+    jobs.register("test.outbox", done, { retrySafe: true });
+    const inspect = (id: string) => t.db.transaction((tx) => admin.reconcileOutboxJob(id, tx));
+    expect(await inspect("01M7WGMXNDR7EDAAKVG8XQVQYT")).toEqual({ state: "missing" });
+    const { jobId } = await jobs.enqueue("test.outbox", null);
+    expect(await inspect(jobId)).toEqual({ state: "queued_live" });
+    const claim = (await engine.claim())!;
+    expect(await t.db.transaction((tx) => admin.reconcileOutboxJob(jobId, tx, { cancelQueued: true })))
+      .toEqual({ state: "running_live" });
+    await expireLease(jobId);
+    await expect(t.db.transaction(async (tx) => {
+      expect(await admin.reconcileOutboxJob(jobId, tx)).toEqual({ state: "settled_unknown" });
+      throw new Error("outbox relationship changed");
+    })).rejects.toThrow("outbox relationship changed");
+    expect(await t.db.select().from(jobRuns)).toMatchObject([{ state: "running" }]);
+    expect(await t.db.select().from(jobAttempts)).toMatchObject([{ state: "running" }]);
+    expect(await t.db.select().from(auditEvents)).toHaveLength(2);
+    expect(await inspect(jobId)).toEqual({ state: "settled_unknown" });
+    expect(await inspect(jobId)).toEqual({ state: "terminal", jobState: "unknown" });
+    expect(await engine.finish(claim, { outcome: "completed" })).toBe(false);
+    expect(await t.db.select().from(jobRuns)).toMatchObject([{
+      state: "unknown", reasonCode: "JOB_LEASE_EXPIRED", leaseUntil: null, allowRetry: false,
+    }]);
+    expect(await t.db.select().from(jobAttempts)).toMatchObject([{
+      state: "interrupted", reasonCode: "JOB_LEASE_EXPIRED",
+    }]);
+    expect(await t.db.select().from(auditEvents)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventName: "job.lease.expired", jobId, actorRole: "system", durability: "durable" }),
+      expect.objectContaining({ eventName: "job.unknown", jobId, actorRole: "system", durability: "durable" }),
+    ]));
+  });
+
+  it("cancels queued outbox jobs without erasing uncertain effects from earlier attempts", async () => {
+    const f = fixture();
+    f.jobs.register("test.outbox", done, { retrySafe: true });
+    const cancel = (id: string) => t.db.transaction((tx) => f.admin.reconcileOutboxJob(id, tx, { cancelQueued: true }));
+    const plain = await f.jobs.enqueue("test.outbox", null);
+    f.h.audit.failRecords = true;
+    await expect(cancel(plain.jobId)).rejects.toMatchObject({ code: "AUDIT_UNAVAILABLE" });
+    f.h.audit.failRecords = false;
+    expect(await cancel(plain.jobId)).toEqual({ state: "canceled_queued" });
+    expect(await cancel(plain.jobId)).toEqual({ state: "terminal", jobState: "canceled" });
+    const interrupted = await f.jobs.enqueue("test.outbox", null);
+    await f.engine.claim();
+    await expireLease(interrupted.jobId);
+    expect(await f.engine.reap()).toBe(1);
+    expect(await cancel(interrupted.jobId)).toEqual({ state: "canceled_queued" });
+    expect(await cancel(interrupted.jobId)).toEqual({ state: "terminal", jobState: "unknown" });
+    expect(await t.db.select().from(jobRuns).where(eq(jobRuns.publicId, interrupted.jobId))).toMatchObject([{
+      state: "unknown", reasonCode: "JOB_RETRY_CANCELED_UNCERTAIN", payloadEnc: null, interruptionPending: false,
+    }]);
+    expect(f.h.audit.named("job.canceled")).toMatchObject([
+      { jobId: plain.jobId, actor: { role: "system" } },
+      { jobId: interrupted.jobId, actor: { role: "system" } },
+    ]);
+  });
+
   it("rejects wrong roles, remediation sessions, missing or future step-up, and bad pagination", async () => {
     const f = fixture();
     await expect(f.admin.list(fakePrincipal({ role: "staff" }), {})).rejects.toMatchObject({ code: "FORBIDDEN" });

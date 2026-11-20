@@ -98,6 +98,16 @@ function workerContext<T>(deps: QueueDeps, job: Pick<JobRow, "correlationId">, f
   }), fn);
 }
 
+async function hasLiveLease(tx: Tx, row: JobRow): Promise<boolean> {
+  if (!row.leaseUntil) return false;
+  // MySQL samples statement time before any lock wait. Run this after locking
+  // the job in a separate statement, including in a caller's repeatable-read tx.
+  const [valid] = await tx.select({ id: jobRuns.id }).from(jobRuns).where(and(
+    eq(jobRuns.id, row.id), gt(jobRuns.leaseUntil, dbNow),
+  )).limit(1).for("update");
+  return valid !== undefined;
+}
+
 function safeCounts(counts: Record<string, number> | undefined): Record<string, number> | undefined {
   if (!counts) return undefined;
   return Object.fromEntries(Object.entries(counts).slice(0, 16).filter(([key, value]) =>
@@ -255,13 +265,7 @@ export class JobEngine implements JobQueue {
     const [row] = await tx.select().from(jobRuns).where(and(
       eq(jobRuns.publicId, job.jobId), eq(jobRuns.state, "running"), eq(jobRuns.fencingToken, job.fencingToken),
     )).limit(1).for("update");
-    if (!row?.leaseUntil) return undefined;
-    // MySQL samples statement time before any lock wait. Check in a new statement
-    // after locking, so all processes use the same time source without a stale sample.
-    const [valid] = await tx.select({ id: jobRuns.id }).from(jobRuns).where(and(
-      eq(jobRuns.id, row.id), gt(jobRuns.leaseUntil, dbNow),
-    )).limit(1).for("update");
-    return valid ? row : undefined;
+    return row && await hasLiveLease(tx, row) ? row : undefined;
   }
 
   async heartbeat(claim: ActiveClaim): Promise<void> {
@@ -362,14 +366,25 @@ export class JobEngine implements JobQueue {
         eq(jobRuns.state, "running"), lte(jobRuns.leaseUntil, dbNow),
       )).orderBy(asc(jobRuns.leaseUntil), asc(jobRuns.id)).limit(16).for("update", { skipLocked: true });
       for (const row of stale) {
-        await workerContext(deps, row, async () => {
-          await jobAudit(deps, tx, row, "job.lease.expired", "attempted", "JOB_LEASE_EXPIRED", true);
-          await this.#settle(tx, row, "interrupted", "JOB_LEASE_EXPIRED",
-            row.retrySafe && this.#handlers.get(row.type)?.retrySafe === true);
-        });
+        await this.#settleExpired(tx, row, row.retrySafe && this.#handlers.get(row.type)?.retrySafe === true);
       }
       return stale.length;
     }, { isolationLevel: "read committed" });
+  }
+
+  /** Internal port for Jobs admin: the caller already holds the running row lock. */
+  async reconcileOutboxLease(tx: Tx, row: JobRow): Promise<{ state: "running_live" } | { state: "settled_unknown" }> {
+    if (row.state !== "running") throw new Error("JOB_RECONCILIATION_STATE_INVALID");
+    if (await hasLiveLease(tx, row)) return { state: "running_live" };
+    await this.#settleExpired(tx, row, false);
+    return { state: "settled_unknown" };
+  }
+
+  async #settleExpired(tx: Tx, row: JobRow, safeToRetry: boolean): Promise<void> {
+    await workerContext(this.deps, row, async () => {
+      await jobAudit(this.deps, tx, row, "job.lease.expired", "attempted", "JOB_LEASE_EXPIRED", true);
+      await this.#settle(tx, row, "interrupted", "JOB_LEASE_EXPIRED", safeToRetry);
+    });
   }
 
   async #settle(

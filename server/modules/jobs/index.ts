@@ -6,6 +6,7 @@ import { engineFor, ensureMaintenanceGate } from "./queue.js";
 import { startWorker, type WorkerHandle } from "./worker.js";
 
 export type { WorkerHandle } from "./worker.js";
+export type { OutboxJobDisposition } from "./admin.js";
 export type JobsModule = ReturnType<typeof createJobsAdmin> & { startWorker(): Promise<WorkerHandle> };
 
 export function createJobsModule(deps: ModuleDeps): JobsModule {
