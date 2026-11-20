@@ -66,3 +66,8 @@ Independently inspected portable remediation `23b3aba` and platform remediation 
 - **Portable, 63 passed:** `tamper.test.ts` (27), `roundtrip.test.ts` (8), `legacy.test.ts` (12), and `cli-policy.test.ts` (16).
 - **Platform and identity, 68 passed:** `configTransfer.example.test.ts` (8), `presentation.example.test.ts` (14), `reencrypt.example.test.ts` (5), and `identity.test.ts` (41).
 - **Scope:** Each of the eight test files ran separately through `scripts/dev/test.sh`. No production behavior, ambiguous commit fault injection, or end-to-end invocation of the bootstrap CLI was verified.
+
+### Portable follow-up · 2026-11-20
+
+- **C7 · Closed at `4a440d3`:** The legacy adapter now checks every converted record type and accounts for normalized record bytes and distinct object bytes before returning a package. The converted-result check runs after conversion, so it is an acceptance bound, not a bound on peak conversion memory; the envelope and source-file preflight limits still apply earlier. The independent legacy suite passed all 13 tests, including rejection for expanded history and metadata-only input.
+- **Legacy file handle · Closed at `4a440d3`:** The reader now retries short reads and closes the source descriptor before invoking legacy conversion. The same independent rerun emitted no file-descriptor collection warnings. P1 remains the only partly open original finding as of this follow-up.
