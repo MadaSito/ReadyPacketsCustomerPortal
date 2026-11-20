@@ -30,6 +30,12 @@ describe("dashboard", () => {
     expect(widgetsFor(all, "customer", "customer").map((x) => x.key)).toEqual(["c"]);
   });
 
+  it("hides widgets whose capability the role does not hold", () => {
+    const all = [{ ...w("siem", "console", "staff", 1), capability: "siem.read" as const }, w("open", "console", "staff", 2)];
+    expect(widgetsFor(all, "console", "staff").map((x) => x.key)).toEqual(["open"]);
+    expect(widgetsFor(all, "console", "admin").map((x) => x.key)).toEqual(["siem", "open"]);
+  });
+
   it("derives required actions from assurance state", () => {
     const base = { mfaEnrolled: true, recoveryCodesAcknowledged: true, totpEnrolled: true };
     expect(requiredActionsFor({ ...base, passkeyCount: 1, recoveryCodesRemaining: 10 })).toEqual([]);

@@ -5,6 +5,7 @@
  * never breaks the dashboard.
  */
 import { Component, Suspense, type ComponentType, type ReactNode } from "react";
+import { roleHasCapability } from "@shared/capabilities";
 import type { UserRole } from "@shared/domain";
 import type { DashboardWidget, RouteAccess } from "@/lib/routes";
 import { Card, Skeleton } from "@/ui";
@@ -64,7 +65,9 @@ export function canSee(access: RouteAccess, role: UserRole): boolean {
 
 export function widgetsFor(widgets: readonly DashboardWidget[], area: DashboardWidget["area"], role: UserRole): DashboardWidget[] {
   // Ties on `order` put the narrower card first so it leads its row (e.g. a 4-wide status card beside an 8-wide one).
-  return widgets.filter((w) => w.area === area && canSee(w.access, role)).sort((a, b) => a.order - b.order || a.span - b.span);
+  // Capability is a UI hint only (the server authorizes every read); it keeps cards a role can never load off the page.
+  const allowed = (w: DashboardWidget) => !w.capability || roleHasCapability(role, w.capability);
+  return widgets.filter((w) => w.area === area && canSee(w.access, role) && allowed(w)).sort((a, b) => a.order - b.order || a.span - b.span);
 }
 
 class WidgetBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
