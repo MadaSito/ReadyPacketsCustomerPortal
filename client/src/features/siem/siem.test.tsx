@@ -6,6 +6,7 @@ import Console from "./Console";
 import Destination from "./Destination";
 import Editor from "./Editor";
 import { siemFeature } from "./routes";
+import SiemForwardingWidget from "./widgets/SiemForwardingWidget";
 
 const { id, correlation, state, create, update, test, replay, purge } = vi.hoisted(() => ({
   id: "01JAFJ8VEGZ9GPVRR2S9KTYZME",
@@ -51,8 +52,29 @@ vi.mock("@/lib/trpc", () => {
         return state.empty ? [] : [destination];
       }),
       get: endpoint("get", () => destination),
-    }, health: endpoint("health", () => ({ components: [{ component: "siem.delivery", state: "degraded",
-      summary: "Delivery needs review.", metrics: { queued_events: 4 }, checkedAt: occurredAt }] })),
+    }, health: endpoint("health", () => {
+      if (state.broken) throw new Error("private backend detail");
+      return {
+        components: [{
+          component: "siem.delivery",
+          state: state.empty ? "not_configured" : "degraded",
+          summary: state.empty ? "No SIEM or syslog forwarding destinations are configured." : "Delivery needs review.",
+          metrics: {
+            configuredDestinations: state.empty ? 0 : 1,
+            enabledDestinations: state.empty ? 0 : 1,
+            queueDepth: state.empty ? 0 : 4,
+            deadLetters: state.empty ? 0 : 1,
+            oldestPendingAgeSeconds: state.empty ? 0 : 125,
+            maxLagSeq: state.empty ? 0 : 12,
+            maxCursorLagAgeSeconds: state.empty ? 0 : 65,
+            missingAuditGaps: 0,
+            prunedAuditEvents: state.empty ? 0 : 3,
+            customCounterValue: 7,
+          },
+          checkedAt: occurredAt,
+        }],
+      };
+    }),
     deadLetters: { list: endpoint("quarantine", () => [quarantined]) } } },
     audit: { search: endpoint("activity", () => [activity]) } }),
   };
@@ -80,6 +102,26 @@ describe("SIEM administration", () => {
     expect((await screen.findAllByRole("link", { name: "Security collector" })).length).toBeGreaterThan(0);
     expect(screen.getAllByText("4 queued · 1 quarantined").length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "Forwarding health" })).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: "Delivery status" })).toBeTruthy();
+    expect(screen.queryByText("siem.delivery")).toBeNull();
+    expect(screen.getByText("Degraded")).toBeTruthy();
+    for (const label of [
+      "Configured destinations",
+      "Enabled destinations",
+      "Queue depth",
+      "Dead letters",
+      "Oldest pending (age)",
+      "Max sequence lag",
+      "Max cursor lag (age)",
+      "Missing audit gaps",
+      "Pruned audit events",
+      "Custom counter value",
+    ]) {
+      expect(screen.getByText(label)).toBeTruthy();
+    }
+    expect(screen.getByText("2 min 5 s")).toBeTruthy();
+    expect(screen.getByText("1 min 5 s")).toBeTruthy();
+    expect(screen.queryByText("customCounterValue")).toBeNull();
     await expectNoAxeViolations(container);
   });
 
@@ -87,10 +129,49 @@ describe("SIEM administration", () => {
     state.empty = true;
     const empty = renderUi(<Console />);
     await screen.findByText("No destinations configured");
+    expect(await screen.findByText("Not configured")).toBeTruthy();
+    expect(screen.queryByText("not configured")).toBeNull();
     empty.unmount();
     state.broken = true;
     renderUi(<Console />);
+    expect(await screen.findAllByRole("button", { name: /try again|retry/i })).toHaveLength(2);
+    expect(screen.queryByText("private backend detail")).toBeNull();
+  });
+
+  it("renders the console overview SIEM forwarding widget across configured, unconfigured, and error states with no axe violations", async () => {
+    expect(siemFeature.widgets?.[0]).toMatchObject({
+      key: "siem.forwarding",
+      area: "console",
+      access: "admin",
+      capability: "siem.read",
+      span: 4,
+    });
+
+    const configured = renderUi(<SiemForwardingWidget />);
+    expect(await screen.findByText("Degraded")).toBeTruthy();
+    expect(screen.getAllByRole("heading")).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 2, name: "SIEM forwarding" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open SIEM" }).getAttribute("href")).toBe("/admin/siem");
+    expect(screen.getByText("1 of 1")).toBeTruthy();
+    expect(screen.getByText("2 min 5 s")).toBeTruthy();
+    expect(screen.getByText("1 dead-lettered")).toBeTruthy();
+    await expectNoAxeViolations(configured.container);
+    configured.unmount();
+
+    state.empty = true;
+    const unconfigured = renderUi(<SiemForwardingWidget />);
+    expect(await screen.findByText("Not configured")).toBeTruthy();
+    expect(screen.getAllByRole("heading")).toHaveLength(1);
+    expect(screen.getByRole("link", { name: "Add destination" }).getAttribute("href")).toBe("/admin/siem/new");
+    await expectNoAxeViolations(unconfigured.container);
+    unconfigured.unmount();
+
+    state.empty = false;
+    state.broken = true;
+    renderUi(<SiemForwardingWidget />);
     expect(await screen.findByRole("button", { name: /try again|retry/i })).toBeTruthy();
+    expect(screen.queryByText("Not configured")).toBeNull();
+    expect(screen.queryByText("0 of 0")).toBeNull();
     expect(screen.queryByText("private backend detail")).toBeNull();
   });
 

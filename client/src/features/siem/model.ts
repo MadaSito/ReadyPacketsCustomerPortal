@@ -1,9 +1,12 @@
 import type { inferRouterInputs, inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
+import type { Tone } from "@/ui";
 
 type Inputs = inferRouterInputs<AppRouter>;
 type Outputs = inferRouterOutputs<AppRouter>;
 export type Destination = Outputs["siem"]["admin"]["destinations"]["get"];
+export type SiemHealthComponent = Outputs["siem"]["admin"]["health"]["components"][number];
+export type SiemHealthState = SiemHealthComponent["state"];
 export type Quarantined = Outputs["siem"]["admin"]["deadLetters"]["list"]["items"][number];
 export type AuditItem = Outputs["audit"]["search"]["items"][number];
 export type TestResult = Outputs["siem"]["admin"]["destinations"]["test"];
@@ -31,4 +34,65 @@ export const receipt = {
 } satisfies Record<TestResult["receiptConfirmation"], string>;
 export function auditLink(id: string) {
   return `/admin/audit?${new URLSearchParams({ correlationId: id })}`;
+}
+
+export const SIEM_HEALTH_META: Record<SiemHealthState, { label: string; tone: Tone }> = {
+  ok: { label: "Healthy", tone: "success" },
+  degraded: { label: "Degraded", tone: "warning" },
+  failing: { label: "Failing", tone: "danger" },
+  disabled: { label: "Disabled", tone: "neutral" },
+  not_configured: { label: "Not configured", tone: "warning" },
+};
+
+export const SIEM_COMPONENT_TITLES: Record<string, string> = {
+  "siem.delivery": "Delivery status",
+};
+
+export const SIEM_METRIC_LABELS: Record<string, string> = {
+  configuredDestinations: "Configured destinations",
+  enabledDestinations: "Enabled destinations",
+  queueDepth: "Queue depth",
+  deadLetters: "Dead letters",
+  oldestPendingAgeSeconds: "Oldest pending (age)",
+  maxLagSeq: "Max sequence lag",
+  maxCursorLagAgeSeconds: "Max cursor lag (age)",
+  missingAuditGaps: "Missing audit gaps",
+  prunedAuditEvents: "Pruned audit events",
+};
+
+const DURATION_SECOND_METRICS = new Set(["oldestPendingAgeSeconds", "maxCursorLagAgeSeconds"]);
+
+export function humanizeKey(key: string): string {
+  const spaced = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/[._-]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  if (!spaced) return key;
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+export function formatAgeSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0 s";
+  const rounded = Math.round(seconds);
+  if (rounded < 60) return `${rounded} s`;
+  const minutes = Math.floor(rounded / 60);
+  const remSeconds = rounded % 60;
+  if (minutes < 60) return remSeconds > 0 ? `${minutes} min ${remSeconds} s` : `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  if (hours < 48) return remMinutes > 0 ? `${hours} h ${remMinutes} min` : `${hours} h`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+export function siemComponentTitle(component: string): string {
+  return SIEM_COMPONENT_TITLES[component] ?? humanizeKey(component);
+}
+
+export function formatSiemMetric(key: string, value: number): { label: string; display: string } {
+  const label = SIEM_METRIC_LABELS[key] ?? humanizeKey(key);
+  const display = DURATION_SECOND_METRICS.has(key) ? formatAgeSeconds(value) : value.toLocaleString();
+  return { label, display };
 }

@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
 import { useTRPC } from "@/lib/trpc";
 import { Badge, Button, Card, DataTable, DateTime, EmptyState, ErrorState, KeyValueList, PageHeader, Section, Spinner } from "@/ui";
-import { BASE, FORMATS, type Destination } from "./model";
+import { BASE, FORMATS, formatSiemMetric, SIEM_HEALTH_META, siemComponentTitle, type Destination } from "./model";
 
 export function DestinationStatus({ value }: { value: Destination }) {
   if (!value.enabled) return <Badge tone="neutral">Paused</Badge>;
@@ -25,14 +25,20 @@ export default function Console() {
             ? <ErrorState error={health.error} onRetry={() => void health.refetch()} />
             : health.data.components.length === 0 ? <EmptyState title="No health checks reported" headingLevel={3} />
             : <div className="grid gap-3 md:grid-cols-2">
-                {health.data.components.map((item) => (
-                  <Card key={item.component} title={item.component} headingLevel={3}
-                    actions={<Badge tone={item.state === "failing" ? "danger" : item.state === "degraded" ? "warning" : "neutral"}>{item.state.replaceAll("_", " ")}</Badge>}>
-                    <p className="mb-2 text-sm text-body">{item.summary}</p>
-                    <KeyValueList columns={2} items={[{ label: "Checked", value: <DateTime value={item.checkedAt} /> },
-                      ...Object.entries(item.metrics ?? {}).map(([label, value]) => ({ label: label.replaceAll("_", " "), value: <span className="tabular-nums">{value.toLocaleString()}</span> }))]} />
-                  </Card>
-                ))}
+                {health.data.components.map((item) => {
+                  const meta = SIEM_HEALTH_META[item.state];
+                  return (
+                    <Card key={item.component} title={siemComponentTitle(item.component)} headingLevel={3}
+                      actions={<Badge tone={meta.tone}>{meta.label}</Badge>}>
+                      <p className="mb-2 text-sm text-body">{item.summary}</p>
+                      <KeyValueList columns={2} items={[{ label: "Checked", value: <DateTime value={item.checkedAt} /> },
+                        ...Object.entries(item.metrics ?? {}).map(([key, value]) => {
+                          const metric = formatSiemMetric(key, value);
+                          return { label: metric.label, value: <span className="tabular-nums">{metric.display}</span> };
+                        })]} />
+                    </Card>
+                  );
+                })}
               </div>}
         </Section>
         <Section title="Destinations">
