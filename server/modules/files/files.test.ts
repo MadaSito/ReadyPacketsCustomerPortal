@@ -173,6 +173,37 @@ describe("private file admission and authorization", () => {
     expect(h.audit.recordedInTx.every(Boolean)).toBe(true);
   });
 
+  it("records object-level write denials after rollback and precise visibility/removal outcomes (review F-1, F-2)", async () => {
+    const file = await add();
+    await files.setVisibility(staff, file.publicId, "staff_only");
+    const changed = h.audit.named("file.visibility.changed");
+    expect(changed.map((e) => [e.outcome, e.attributes])).toEqual([["completed", { from_visibility: "customer_visible", to_visibility: "staff_only" }]]);
+
+    await files.remove(staff, file.publicId);
+    await files.remove(staff, file.publicId);
+    expect(h.audit.named("file.removed").map((e) => [e.outcome, e.reasonCode])).toEqual([["completed", undefined], ["refused", "ALREADY_REMOVED"]]);
+    await files.restore(staff, file.publicId);
+    expect(h.audit.recordedInTx.every(Boolean)).toBe(true);
+
+    h.audit.recordedInTx = [];
+    locked = "legal_hold";
+    await expect(files.setVisibility(staff, file.publicId, "customer_visible")).rejects.toMatchObject({ code: "LOCKED" });
+    locked = "none";
+    orderOwner = grantee; // the file's recorded owner no longer matches the order: object-level refusal inside the tx
+    await expect(files.remove(staff, file.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    const denied = h.audit.named("file.access.denied");
+    expect(denied.map((e) => [e.category, e.outcome, e.action, e.reasonCode, e.resource])).toEqual([
+      ["security", "denied", "update", "ORDER_LOCKED", { type: "file", publicId: file.publicId }],
+      ["security", "denied", "delete", "FILE_NOT_FOUND", { type: "file", publicId: file.publicId }],
+    ]);
+    expect(h.audit.recordedInTx).toEqual([false, false]); // durable, after rollback, never on the held transaction
+    expect(h.audit.named("file.visibility.changed")).toHaveLength(1);
+
+    h.audit.failRecords = true; // the refusal itself never depends on the denial record
+    await expect(files.remove(staff, file.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    h.audit.failRecords = false;
+  });
+
   it("refuses commit without durable audit and requires fresh step-up for type rules", async () => {
     const plan = await files.beginUpload(owner, orderPublicId, upload);
     const staged = await files.stageUpload("synthetic.wav", Readable.from([exampleWav()]), plan.rules);

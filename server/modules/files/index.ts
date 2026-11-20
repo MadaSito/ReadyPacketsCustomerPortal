@@ -360,9 +360,31 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     return output(await findFile(publicId, tx, true));
   }
 
+  /** Object-level write denials raised inside the write transaction (review F-1): recorded durably AFTER it has
+   *  rolled back, never on a second pool connection while the tx is held. Best effort: the request is refused
+   *  regardless. Capability refusals before the tx are recorded by the tRPC capability guard. */
+  const deniedCodes = new Set(["NOT_FOUND", "FORBIDDEN", "LOCKED", "REMEDIATION_REQUIRED", "STEP_UP_REQUIRED", "UNAUTHENTICATED"]);
+  async function recordWriteDenied(principal: SessionPrincipal, filePublicId: string, action: string, error: unknown) {
+    if (!(error instanceof DomainError) || !deniedCodes.has(error.code)) return;
+    await audit.record({
+      category: "security", eventName: "file.access.denied", action, outcome: "denied", severity: "WARN",
+      actor: actor(principal), reasonCode: error.reasonCode,
+      ...(publicIdShape(filePublicId) ? { resource: { type: "file", publicId: filePublicId } } : {}),
+    }).catch(() => undefined);
+  }
+
   async function writeFile(principal: SessionPrincipal, filePublicId: string, change: { visibility: FileVisibility } | "delete" | "restore") {
     fullCapability(principal, typeof change === "object" ? "files.visibility.change" : "files.manage");
     const policy = change === "delete" ? await rules() : null;
+    try {
+      return await writeFileInTx(principal, filePublicId, change, policy);
+    } catch (error) {
+      await recordWriteDenied(principal, filePublicId, typeof change === "object" ? "update" : change, error);
+      throw error;
+    }
+  }
+
+  function writeFileInTx(principal: SessionPrincipal, filePublicId: string, change: { visibility: FileVisibility } | "delete" | "restore", policy: FileRules | null) {
     return currentTx(async (tx) => {
       const initial = await findFile(filePublicId, tx);
       const order = await deps.services.orders.assertCanWriteOrderById(principal, initial.orderId, { kind: "file", tx, forUpdate: true });
@@ -371,10 +393,18 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       enforceVisibility(row, principal, order.ownerUserId, true);
       if (row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
       const now = clock.now();
+      let outcome: AuditEventInput["outcome"] = "completed";
+      let reasonCode: string | undefined;
+      let attributes: AuditEventInput["attributes"];
       if (typeof change === "object") {
         if (row.deletedAt) throw notFound("FILE_NOT_FOUND");
         await tx.update(orderFiles).set(change).where(eq(orderFiles.id, row.id));
-      } else if (change === "delete" && !row.deletedAt) {
+        attributes = { from_visibility: row.visibility, to_visibility: change.visibility };
+      } else if (change === "delete" && row.deletedAt) {
+        // Review F-2: a repeated delete changes nothing and must not claim a completed removal.
+        outcome = "refused";
+        reasonCode = "ALREADY_REMOVED";
+      } else if (change === "delete") {
         await tx.update(orderFiles).set({ deletedAt: now, purgeAfter: new Date(now.getTime() + policy!.retentionDays * day) }).where(eq(orderFiles.id, row.id));
       } else if (change === "restore") {
         if (!row.deletedAt || !row.purgeAfter || row.purgeAfter <= now) {
@@ -383,8 +413,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         await tx.update(orderFiles).set({ deletedAt: null, purgeAfter: null }).where(eq(orderFiles.id, row.id));
       }
       await tx.delete(fileDownloadTickets).where(eq(fileDownloadTickets.fileId, row.id));
-      await audit.record(event(principal, typeof change === "object" ? "file.visibility.changed" : change === "delete" ? "file.removed" : "file.restored",
-        typeof change === "object" ? "update" : change, "completed", filePublicId), tx);
+      await audit.record({
+        ...event(principal, typeof change === "object" ? "file.visibility.changed" : change === "delete" ? "file.removed" : "file.restored",
+          typeof change === "object" ? "update" : change, outcome, filePublicId, reasonCode),
+        ...(attributes ? { attributes } : {}),
+      }, tx);
       return output(await findFile(filePublicId, tx, true));
     });
   }
