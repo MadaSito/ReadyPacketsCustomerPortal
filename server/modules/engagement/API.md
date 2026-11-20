@@ -197,17 +197,17 @@ None (`registerEngagementHttpRoutes` is a no-op; attachments use `files` module 
 - `engagement.search.time_budget_ms` — int `100..5000`, default `1500`, `internal`
 
 ### Audit Events
-- `engagement.message.sent` (`business`) — attributes: `{ orderPublicId, visibility, attachmentCount }`
-- `engagement.message.imported` (`portable_transfer`)
-- `engagement.ticket.created` (`business`) — attributes: `{ ticketNumber, category, hasRelatedOrder }`
-- `engagement.ticket.replied` (`business`) — attributes: `{ ticketNumber, internalOnly, actorRole }`
-- `engagement.ticket.status.changed` (`business`) — attributes: `{ ticketNumber, fromStatus, toStatus }`
-- `engagement.ticket.assigned` (`admin`) — attributes: `{ ticketNumber, assigneePublicId }`
-- `engagement.ticket.priority.changed` (`admin`) — attributes: `{ ticketNumber, fromPriority, toPriority }`
-- `engagement.ticket.imported` (`portable_transfer`)
-- `engagement.notification.preferences.updated` (`business`) — attributes: `{ category, inApp, email }`
+- `engagement.message.sent` (`business`) — attributes: `{ order_public_id, visibility, attachment_count }`
+- `engagement.message.imported` (`portable_transfer`) — attributes: `{ order_public_id, preserved_public_id }`
+- `engagement.ticket.created` (`business`) — attributes: `{ ticket_number, category, has_related_order }`
+- `engagement.ticket.replied` (`business`) — attributes: `{ ticket_number, internal_only, actor_role }`
+- `engagement.ticket.status.changed` (`business`) — attributes: `{ ticket_number, from_status, to_status }`
+- `engagement.ticket.assigned` (`admin`) — attributes: `{ ticket_number, assignee_public_id }`
+- `engagement.ticket.priority.changed` (`admin`) — attributes: `{ ticket_number, from_priority, to_priority }`
+- `engagement.ticket.imported` (`portable_transfer`) — attributes: `{ ticket_number, reference_remapped }`
+- `engagement.notification.preferences.updated` (`business`) — attributes: `{ category, in_app, email }`
 - `engagement.notifications.retention.purged` (`job`) — `safeCounts: { deleted }`
-- `engagement.search.executed` (`admin` / `security`) — recorded for staff/admin global searches (`safeCounts: { orders, tickets, messages, customers }`, `durationMs`, never logs query text!)
+- `engagement.search.executed` (`admin` / `security`) — recorded for staff/admin global searches (`safeCounts: { orders, tickets, messages, customers }`, `attributes: { global_scope, timed_out }`, `durationMs`, never logs query text)
 - `authz.engagement.denied` (`security`, outcome `denied`) — cross-tenant / unauthorized attempts
 
 ### Health

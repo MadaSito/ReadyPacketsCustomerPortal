@@ -430,9 +430,9 @@ export function createMessagesService(deps: ModuleDeps, notifications: Notificat
           actor: { userId: principal.userId, role: principal.role },
           resource: { type: "order_message", publicId },
           attributes: {
-            orderPublicId: order.publicId,
+            order_public_id: order.publicId,
             visibility,
-            attachmentCount: attachmentIds.length,
+            attachment_count: attachmentIds.length,
           },
         },
         tx,

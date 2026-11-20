@@ -1,7 +1,23 @@
-import { useState, type FormEvent } from "react";
-import { Bell, Search } from "lucide-react";
-import { useLocation } from "wouter";
-import { Field, IconButton, Input } from "@/ui";
+import { useEffect, useState, type FormEvent } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Bell, CheckCheck, Search } from "lucide-react";
+import { Link, useLocation } from "wouter";
+import { errorMessage, useTRPC } from "@/lib/trpc";
+import type { SearchDomain } from "@server/modules/engagement/types";
+import {
+  Badge,
+  Button,
+  DateTime,
+  Drawer,
+  EmptyState,
+  ErrorState,
+  Field,
+  IconButton,
+  Input,
+  Skeleton,
+  useToast,
+} from "@/ui";
+import { safeInternalPath } from "./helpers";
 
 export interface NotificationBellPopoverProps {
   area: "customer" | "console";
@@ -11,20 +27,219 @@ export interface GlobalSearchBoxProps {
   className?: string;
 }
 
+export function useNotificationBellData(options: { includeList?: boolean } = {}) {
+  const trpc = useTRPC();
+  const queryClient = useQueryClient();
+  const toast = useToast();
+
+  const unreadQuery = useQuery(trpc.engagement.notifications.unreadCount.queryOptions({}));
+  const listQuery = useQuery({
+    ...trpc.engagement.notifications.list.queryOptions({ limit: 10 }),
+    enabled: options.includeList ?? true,
+  });
+
+  const invalidateAll = () => {
+    void queryClient.invalidateQueries({ queryKey: trpc.engagement.notifications.pathKey() });
+  };
+
+  const markReadMutation = useMutation(
+    trpc.engagement.notifications.markRead.mutationOptions({
+      onSuccess: invalidateAll,
+      onError: (err) =>
+        toast.show({
+          tone: "danger",
+          title: "Could not mark notification read",
+          description: errorMessage(err),
+        }),
+    }),
+  );
+
+  const markAllReadMutation = useMutation(
+    trpc.engagement.notifications.markAllRead.mutationOptions({
+      onSuccess: invalidateAll,
+      onError: (err) =>
+        toast.show({
+          tone: "danger",
+          title: "Could not mark notifications read",
+          description: errorMessage(err),
+        }),
+    }),
+  );
+
+  return {
+    unreadCount: unreadQuery.data?.unreadCount ?? 0,
+    items: listQuery.data?.items ?? [],
+    isLoading: listQuery.isPending,
+    error: listQuery.error,
+    refetch: () => {
+      void unreadQuery.refetch();
+      void listQuery.refetch();
+    },
+    markRead: (notificationId: string) => markReadMutation.mutate({ notificationId }),
+    markAllRead: () => markAllReadMutation.mutate({}),
+    markingAll: markAllReadMutation.isPending,
+  };
+}
+
 /**
- * Shell header notification bell (44 px IconButton).
- * Wired to `trpc.engagement.notifications.*` once engagementRouter procedures are mounted.
+ * Shell header notification bell (44 px touch target) + accessible side Drawer.
  */
 export function NotificationBellPopover({ area: _area }: NotificationBellPopoverProps) {
-  const [, navigate] = useLocation();
+  const [open, setOpen] = useState(false);
+  const {
+    unreadCount,
+    items,
+    isLoading,
+    error,
+    refetch,
+    markRead,
+    markAllRead,
+    markingAll,
+  } = useNotificationBellData({ includeList: open });
+
+  const buttonLabel =
+    unreadCount > 0 ? `Notifications (${unreadCount} unread)` : "Notifications";
+
   return (
-    <IconButton
-      label="Notifications"
-      icon={<Bell className="h-5 w-5" aria-hidden="true" />}
-      variant="ghost"
-      onClick={() => navigate("/notifications")}
-    />
+    <Drawer
+      open={open}
+      onOpenChange={setOpen}
+      side="right"
+      width="md"
+      title="Notifications"
+      description="Recent alerts across your orders, tickets, and account."
+      trigger={
+        <Button
+          variant="ghost"
+          aria-label={buttonLabel}
+          title={buttonLabel}
+          className="relative size-11 p-0"
+        >
+          <Bell className="size-5" aria-hidden="true" />
+          {unreadCount > 0 ? (
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute -top-0.5 -right-0.5 inline-flex min-w-5 items-center justify-center rounded-full bg-action px-1.5 py-0.5 text-xs leading-none font-semibold text-on-action"
+            >
+              {unreadCount > 99 ? "99+" : unreadCount}
+            </span>
+          ) : null}
+        </Button>
+      }
+      footer={
+        <Button asChild variant="secondary" block onClick={() => setOpen(false)}>
+          <Link href="/notifications">View all notifications & preferences</Link>
+        </Button>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Badge tone={unreadCount > 0 ? "brand" : "neutral"}>
+            {unreadCount > 0 ? `${unreadCount} unread` : "All caught up"}
+          </Badge>
+          {unreadCount > 0 ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              leadingIcon={<CheckCheck aria-hidden="true" />}
+              loading={markingAll}
+              onClick={markAllRead}
+            >
+              Mark all read
+            </Button>
+          ) : null}
+        </div>
+
+        {isLoading ? (
+          <Skeleton lines={4} />
+        ) : error ? (
+          <ErrorState error={error} onRetry={refetch} />
+        ) : items.length === 0 ? (
+          <EmptyState
+            icon={Bell}
+            title="No notifications yet"
+            description="Alerts for order updates, messages, and support replies will appear here."
+          />
+        ) : (
+          <ul className="flex flex-col gap-2" aria-label="Recent notifications">
+            {items.map((item) => {
+              const safeHref = safeInternalPath(item.link);
+              const isUnread = item.readAt === null;
+              return (
+                <li
+                  key={item.publicId}
+                  className="rounded-[var(--radius-card)] border border-line bg-surface-soft p-3"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="min-w-0 font-semibold break-words text-ink">{item.title}</p>
+                    {isUnread ? <Badge tone="brand">Unread</Badge> : null}
+                  </div>
+                  <p className="mt-1 text-sm break-words whitespace-pre-wrap text-body">
+                    {item.body}
+                  </p>
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+                    <DateTime value={item.createdAt} format="relative" />
+                    <div className="flex items-center gap-2">
+                      {safeHref ? (
+                        <Button
+                          asChild
+                          variant="link"
+                          size="sm"
+                          onClick={() => {
+                            if (isUnread) markRead(item.publicId);
+                            setOpen(false);
+                          }}
+                        >
+                          <Link href={safeHref}>Open</Link>
+                        </Button>
+                      ) : null}
+                      {isUnread ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => markRead(item.publicId)}
+                        >
+                          Mark read
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </Drawer>
   );
+}
+
+/**
+ * Debounced bounded search hook backed by `trpc.engagement.search.query`.
+ */
+export function useBoundedSearch(
+  rawQuery: string,
+  options: { domains?: SearchDomain[]; limitPerDomain?: number; debounceMs?: number } = {},
+) {
+  const trpc = useTRPC();
+  const normalized = rawQuery.normalize("NFC").trim();
+  const [debounced, setDebounced] = useState(normalized);
+
+  useEffect(() => {
+    const delay = options.debounceMs ?? 250;
+    const handle = setTimeout(() => setDebounced(normalized), delay);
+    return () => clearTimeout(handle);
+  }, [normalized, options.debounceMs]);
+
+  const enabled = debounced.length >= 2 && debounced.length <= 64;
+  return useQuery({
+    ...trpc.engagement.search.query.queryOptions({
+      query: enabled ? debounced : "aa",
+      domains: options.domains,
+      limitPerDomain: options.limitPerDomain ?? 5,
+    }),
+    enabled,
+  });
 }
 
 /**
@@ -56,7 +271,7 @@ export function GlobalSearchBox({ className }: GlobalSearchBoxProps) {
       <IconButton
         type="submit"
         label="Run search"
-        icon={<Search className="h-4 w-4" aria-hidden="true" />}
+        icon={<Search className="size-4" aria-hidden="true" />}
         variant="ghost"
       />
     </form>

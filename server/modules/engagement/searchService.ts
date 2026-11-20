@@ -504,8 +504,8 @@ export function createSearchService(deps: ModuleDeps) {
           customers: resultCustomers.length,
         },
         attributes: {
-          globalScope: true,
-          timedOut,
+          global_scope: true,
+          timed_out: timedOut,
         },
       });
     }

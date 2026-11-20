@@ -327,8 +327,8 @@ export function createPortableEngagementService(deps: ModuleDeps) {
         resource: { type: "order_message", publicId: targetPublicId },
         importId: input.importId,
         attributes: {
-          orderPublicId: input.targetOrderPublicId,
-          preservedPublicId: targetPublicId === input.sourcePublicId,
+          order_public_id: input.targetOrderPublicId,
+          preserved_public_id: targetPublicId === input.sourcePublicId,
         },
       },
       tx,
@@ -500,8 +500,8 @@ export function createPortableEngagementService(deps: ModuleDeps) {
         importId: input.importId,
         safeCounts: { replies: input.replies.length },
         attributes: {
-          ticketNumber: targetTicketNumber,
-          referenceRemapped: targetTicketNumber !== input.sourceTicketNumber,
+          ticket_number: targetTicketNumber,
+          reference_remapped: targetTicketNumber !== normalizedSourceTicketNum,
         },
       },
       tx,

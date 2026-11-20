@@ -369,7 +369,7 @@ export function createNotificationsService(deps: ModuleDeps) {
           resource: { type: "notification_preference", publicId: principal.userPublicId },
           attributes: {
             category: input.category,
-            inApp: input.inApp,
+            in_app: input.inApp,
             email: input.email,
           },
         },

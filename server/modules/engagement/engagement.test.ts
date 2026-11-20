@@ -653,7 +653,16 @@ describe("engagement module — messages, tickets, notifications, bounded search
           idempotencyKey: nextIdemKey("tkt"),
         }),
       ).rejects.toMatchObject({ code: "NOT_FOUND" });
-      expect(h.audit.named("authz.engagement.denied").length).toBeGreaterThanOrEqual(2);
+      await expect(
+        eveCaller.engagement.tickets.close({ ticketId: created.ticket.publicId }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+      await expect(
+        eveCaller.engagement.tickets.reopen({
+          ticketId: created.ticket.publicId,
+          reason: "Cross-tenant reopen attempt",
+        }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+      expect(h.audit.named("authz.engagement.denied").length).toBeGreaterThanOrEqual(4);
 
       // Staff assigns ticket to staffTwo (tests ascending userId lock order too!) and sets priority
       const assigned = await staffCaller.engagement.tickets.admin.assign({
