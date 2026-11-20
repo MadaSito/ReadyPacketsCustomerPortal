@@ -13,9 +13,10 @@ old=$(readlink -f "$base/current")
 [[ "$old" =~ ^"$base"/releases/[0-9a-f]{40}$ ]] || die 'unexpected current release layout'
 [[ "$old" != "$release" ]] || die 'release is already installed'
 [[ -L "$site" ]] || die 'the managed nginx site is required'
-secret_ok migrator_database_url
-secret_ok backup_database_url
+prepare_dirs
+credentials_ok
 secret_ok rp_backup_key
+assert_service_identity
 build_release
 
 printf '%s\n' 'In the portal, enable Jobs maintenance and verify queue_drained with no unreconciled unknown attempts.'
@@ -72,6 +73,7 @@ point_release "$old" previous
 point_release "$release" current
 phase=verifying
 record_phase
+install_unit_files
 systemctl start "$worker" "$web"
 check_http local
 check_http edge

@@ -14,6 +14,7 @@ readonly timer=readypackets-backup.timer
 readonly node=/usr/local/bin/node pnpm=/usr/local/bin/pnpm
 readonly origin=my.readypackets.com
 readonly -a app_keys=(rp_data_keyring rp_index_key rp_pseudonym_key rp_token_hash_key rp_audit_chain_key)
+unset NODE_OPTIONS NODE_PATH
 
 die() { printf 'ReadyPackets: %s\n' "$*" >&2; exit 1; }
 confirm() {
@@ -38,7 +39,7 @@ check_host() {
     [[ $(mysql --protocol=socket --batch --skip-column-names --execute='SELECT VERSION()') =~ ^8\.4\. ]] ||
         die 'cannot verify the local MySQL 8.4 server via the root socket account'
     local command
-    for command in nginx systemctl systemd-run git tar runuser curl openssl; do
+    for command in nginx systemctl systemd-run git tar curl openssl; do
         command -v "$command" >/dev/null || die "$command is required"
     done
 }
@@ -47,20 +48,44 @@ prepare_dirs() {
     for name in readypackets readypackets-build; do
         getent passwd "$name" >/dev/null ||
             useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$name"
-        [[ $(id -u "$name") != 0 && $(id -gn "$name") == "$name" ]] ||
+        [[ $(id -u "$name") != 0 && $(id -gn "$name") == "$name" &&
+           $(id -G "$name") == "$(id -g "$name")" ]] ||
             die "invalid pre-existing service/build user: $name"
     done
-    install -d -o root -g root -m 0755 "$base" "$base/releases" /var/www/readypackets-acme
+    [[ $(id -u readypackets) != "$(id -u readypackets-build)" ]] || die 'build and application identities must be distinct'
+    root_directory /opt 755
+    root_directory /etc 755
+    root_directory /var 755
+    root_directory /var/www 755
+    root_directory "$base" 755
+    root_directory "$base/releases" 755
+    root_directory "$conf" 700
+    root_directory "$conf/secrets" 700
+    root_directory /var/www/readypackets-acme 755
+    [[ ! -L /var/lib/readypackets && ! -L "$storage" && ! -L /var/cache/readypackets-build ]] ||
+        die 'refusing symlinked state or cache directory'
     install -d -o root -g readypackets -m 0750 /var/lib/readypackets
     install -d -o readypackets -g readypackets -m 0700 "$storage"
     install -d -o readypackets-build -g readypackets-build -m 0700 /var/cache/readypackets-build
-    install -d -o root -g root -m 0700 "$conf" "$conf/secrets"
     [[ $(realpath -e "$storage") == "$storage" && $(realpath -e "$base") == "$base" ]] ||
         die 'storage and release roots must be distinct, non-symlinked paths'
 }
+root_directory() {
+    local dir=$1 mode=$2
+    [[ ! -L "$dir" ]] || die "refusing symlinked custody directory: $dir"
+    if [[ ! -e "$dir" ]]; then install -d -o root -g root -m "0$mode" -- "$dir"; fi
+    [[ -d "$dir" && $(stat -c '%a:%u:%g' -- "$dir") == "$mode:0:0" && $(realpath -e -- "$dir") == "$dir" ]] ||
+        die "unexpected owner, permissions or resolved path: $dir"
+}
 build_as_user() {
-    runuser -u readypackets-build -- env -i PATH="$PATH" HOME=/var/cache/readypackets-build \
-        bash -c 'umask 022; exec "$@"' bash "$@"
+    systemd-run --wait --collect --pipe --service-type=exec \
+        --property=User=readypackets-build --property=Group=readypackets-build \
+        --property=UMask=0022 --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+        --property=ProtectHome=yes --property=PrivateTmp=yes --property=PrivateDevices=yes \
+        --property=CapabilityBoundingSet= --property=KillMode=control-group \
+        --property="InaccessiblePaths=$conf" \
+        --property="ReadWritePaths=$PWD /var/cache/readypackets-build" \
+        --working-directory="$PWD" --setenv=PATH="$PATH" --setenv=HOME=/var/cache/readypackets-build "$@"
 }
 resolve_release() {
     local ref=$1
@@ -70,34 +95,48 @@ resolve_release() {
     [[ "$commit" == "$ref" ]] || die 'expected a commit, not a tag'
     release="$base/releases/$commit"
 }
-build_release() {
-    if [[ -d "$release" ]]; then
-        [[ -f "$release/release.env" && -f "$release/dist/server/main.js" && -f "$release/dist/public/index.html" ]] ||
-            die "existing release is incomplete: $release"
-        return
-    fi
-    local stage expected
-    stage=$(mktemp -d "$base/releases/.build.XXXXXXXX")
-    # Remove only this newly created staging directory, never persistent state.
-    (
-        trap 'rm -rf -- "$stage"' EXIT
-        (umask 022; git -C "$repo" archive "$commit" | tar --no-same-owner --no-same-permissions -xf - -C "$stage")
-        chown -hR readypackets-build:readypackets-build "$stage"
-        chmod 0755 "$stage"
+build_release() (
+        local reviewed stage= publish= expected entry
+        reviewed=$(mktemp -d "$base/releases/.reviewed.XXXXXXXX")
+        trap 'rm -rf -- "$reviewed"; if [[ -n "$stage" ]]; then rm -rf -- "$stage"; fi; if [[ -n "$publish" ]]; then rm -rf -- "$publish"; fi' EXIT
+        git -C "$repo" cat-file -e "$commit:migrations/meta/_journal.json" 2>/dev/null ||
+            die 'reviewed release is missing a migration journal'
+        git -C "$repo" ls-tree -r "$commit" -- migrations package.json |
+            while IFS= read -r entry; do
+                [[ "$entry" == "100644 blob "* || "$entry" == "100755 blob "* ]] ||
+                    die 'reviewed migration input and package metadata must be regular Git blobs'
+            done
+        git -C "$repo" archive "$commit" -- migrations package.json |
+            tar --no-same-owner --no-same-permissions -xf - -C "$reviewed"
+        [[ -f "$reviewed/migrations/meta/_journal.json" && -f "$reviewed/package.json" ]] ||
+            die 'reviewed release archive is incomplete'
+        if [[ -e "$release" || -L "$release" ]]; then
+            "$node" "$deploy_src/prepare-release.mjs" check "$commit" "$release"
+            cmp -s -- "$reviewed/package.json" "$release/package.json" &&
+                diff -qr -- "$reviewed/migrations" "$release/migrations" >/dev/null ||
+                die 'existing release metadata or migrations differ from reviewed inputs'
+            exit 0
+        fi
+        stage=$(mktemp -d "$base/releases/.build.XXXXXXXX")
+        expected=$("$node" -p \
+            'JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).packageManager.replace(/^pnpm@/, "").split("+")[0]' \
+            "$reviewed/package.json")
+        [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'invalid reviewed packageManager version'
+        chown readypackets-build:readypackets-build "$stage"
         cd "$stage"
-        expected=$("$node" -p 'require("./package.json").packageManager.replace(/^pnpm@/, "").split("+")[0]')
+        git -C "$repo" archive "$commit" | build_as_user /usr/bin/tar --no-same-owner --no-same-permissions -xf -
         [[ $(build_as_user "$pnpm" --version) == "$expected" ]] || die "install pnpm $expected at $pnpm"
-        build_as_user "$pnpm" install --frozen-lockfile
+        # A hoisted production tree avoids publishing pnpm's development-store symlinks.
+        build_as_user "$pnpm" install --frozen-lockfile --prod=false --config.node-linker=hoisted
         build_as_user "$pnpm" build
-        [[ -f dist/server/main.js && -f dist/public/index.html && -f migrations/meta/_journal.json ]] ||
-            die 'release is missing expected artifacts'
-        chown -hR root:root "$stage"
-        chmod -R go-w "$stage"
-        printf 'RP_RELEASE_REF=%s\n' "$commit" > release.env
-        mv -T -- "$stage" "$release"
-        trap - EXIT
-    )
-}
+        build_as_user "$pnpm" prune --prod --config.node-linker=hoisted
+        cd "$base/releases"
+        publish=$(mktemp -d "$base/releases/.publish.XXXXXXXX")
+        "$node" "$deploy_src/prepare-release.mjs" import "$commit" "$stage" "$publish" "$(id -u readypackets-build)" "$reviewed"
+        chmod 0755 -- "$publish"
+        mv -T -- "$publish" "$release"
+        publish=
+)
 point_release() {
     local target=$1 name=$2 temp
     temp=$(mktemp -d "$base/.link.XXXXXXXX")
@@ -110,9 +149,41 @@ secret_ok() {
     [[ ! -L "$file" && -f "$file" && -s "$file" && $(stat -c '%a:%u:%g' "$file") == 600:0:0 ]] ||
         die "expected a root-owned 0600 secret: $file"
 }
+validate_dsn() {
+    "$node" "$deploy_src/validate-dsn.mjs" "$1"
+}
+credentials_ok() {
+    local name
+    for name in database_url migrator_database_url backup_database_url; do
+        secret_ok "$name"
+        validate_dsn "$name" < "$conf/secrets/$name"
+    done
+}
+install_unit_files() {
+    local unit
+    for unit in "$web" "$worker" 'readypackets-backup@.service' "$timer"; do
+        install -m 0644 "$deploy_src/systemd/$unit" "$unit_dir/$unit"
+    done
+    for unit in "$web" "$worker" 'readypackets-backup@.service'; do
+        install -d -m 0755 "$unit_dir/$unit.d"
+        install -m 0644 "$deploy_src/systemd/readypackets-runtime.conf" "$unit_dir/$unit.d/10-runtime.conf"
+    done
+    systemctl daemon-reload
+    assert_service_identity
+}
+assert_service_identity() {
+    local unit
+    for unit in "$web" "$worker" readypackets-backup@cli.service readypackets-backup@pre_upgrade.service; do
+        [[ $(systemctl show "$unit" -p User --value) == readypackets &&
+           $(systemctl show "$unit" -p Group --value) == readypackets &&
+           $(systemctl show "$unit" -p NoNewPrivileges --value) == yes &&
+           $(systemctl show "$unit" -p ProtectSystem --value) == strict ]] ||
+            die "unexpected effective systemd identity or sandbox for $unit"
+    done
+}
 write_env() {
     local id
-    if [[ ! -e "$conf/portal.env" ]]; then
+    if [[ ! -e "$conf/portal.env" && ! -L "$conf/portal.env" ]]; then
         id="rp-$(openssl rand -hex 12)"
         printf '%s\n' NODE_ENV=production RP_DEPLOYMENT_PROFILE=production HOST=127.0.0.1 PORT=5000 \
             RP_CANONICAL_ORIGIN=https://my.readypackets.com RP_ALIAS_HOSTS=portal.readypackets.com \
@@ -120,7 +191,7 @@ write_env() {
             "RP_INSTALLATION_ID=$id" "RP_STORAGE_DIR=$storage" \
             "RP_STATIC_DIR=$base/current/dist/public" > "$conf/portal.env"
     fi
-    [[ ! -L "$conf/portal.env" && $(stat -c '%a:%u:%g' "$conf/portal.env") == 600:0:0 ]] ||
+    [[ ! -L "$conf/portal.env" && -f "$conf/portal.env" && $(stat -c '%a:%u:%g' "$conf/portal.env") == 600:0:0 ]] ||
         die "expected a root-owned 0600 environment file: $conf/portal.env"
 }
 migrate_release() {
@@ -133,7 +204,8 @@ migrate_release() {
         --property="LoadCredential=migrator_database_url:$conf/secrets/migrator_database_url" \
         --working-directory="$target" --setenv=PATH="$PATH" --setenv=NODE_ENV=production \
         --setenv=HOME=/nonexistent --setenv=RP_MIGRATIONS_DIR="$target/migrations" \
-        /bin/bash -c 'export DATABASE_URL_FILE="$CREDENTIALS_DIRECTORY/migrator_database_url"; exec "$@"' bash "$pnpm" db:migrate
+        /bin/bash -c 'export DATABASE_URL_FILE="$CREDENTIALS_DIRECTORY/migrator_database_url"; exec "$@"' \
+        bash "$node" "$target/dist/ops/migrate.js"
 }
 bootstrap_admin() {
     local email name key
@@ -154,7 +226,7 @@ bootstrap_admin() {
             export RP_PSEUDONYM_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_pseudonym_key"
             export RP_TOKEN_HASH_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_token_hash_key"
             export RP_AUDIT_CHAIN_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_audit_chain_key"
-            exec /usr/local/bin/node --import tsx scripts/ops/create-admin.ts "$@"
+            exec /usr/local/bin/node dist/ops/create-admin.js "$@"
         ' bash --email "$email" --name "$name" </dev/tty
 }
 check_http() {

@@ -8,6 +8,9 @@ StartLimitBurst=4
 
 [Service]
 Type=simple
+User=readypackets
+Group=readypackets
+NoNewPrivileges=yes
 # Install with readypackets-runtime.conf as the 10-runtime.conf drop-in.
 Environment=RP_ROLE=worker
 LoadCredential=database_url:/etc/readypackets/secrets/database_url

@@ -9,18 +9,20 @@
 CREATE DATABASE `__RP_SCHEMA__` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 CREATE USER '__RP_APP__'@'127.0.0.1' IDENTIFIED BY RANDOM PASSWORD REQUIRE SSL;
 CREATE USER '__RP_MIGRATOR__'@'127.0.0.1' IDENTIFIED BY RANDOM PASSWORD REQUIRE SSL;
--- Exception: the current backup snapshot client cannot negotiate verified TLS from the
--- app's DSN TLS options. LOCAL LOOPBACK ONLY; see INSTALL.md and VERIFICATION.md.
-CREATE USER '__RP_BACKUP__'@'127.0.0.1' IDENTIFIED BY RANDOM PASSWORD;
+-- Verified TLS is recommended even over loopback. A dedicated loopback-only
+-- exception may omit REQUIRE SSL only if approved; see INSTALL.md.
+CREATE USER '__RP_BACKUP__'@'127.0.0.1' IDENTIFIED BY RANDOM PASSWORD REQUIRE SSL;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON `__RP_SCHEMA__`.* TO '__RP_APP__'@'127.0.0.1';
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES
     ON `__RP_SCHEMA__`.* TO '__RP_MIGRATOR__'@'127.0.0.1';
-GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `__RP_SCHEMA__`.* TO '__RP_BACKUP__'@'127.0.0.1';
--- Current mysqldump disables table locks, tablespaces, GTID purge and flushes; no
--- LOCK TABLES, RELOAD, PROCESS or global privileges are granted by default. If
--- a reviewed dump approach needs locks, scope LOCK TABLES to this schema. Use
--- a separate temporary DBA workflow for global RELOAD, not the persistent account.
+GRANT SELECT, SHOW VIEW ON `__RP_SCHEMA__`.* TO '__RP_BACKUP__'@'127.0.0.1';
+-- SELECT reads table data; SHOW VIEW lets mysqldump read view definitions if present.
+-- The native dump explicitly excludes triggers, events and stored routines.
+-- MySQL TRIGGER/EVENT also authorize writes; never add them merely for dumping.
+-- The dump uses --single-transaction with --skip-lock-tables, --no-tablespaces
+-- and --set-gtid-purged=OFF, so this profile grants no LOCK TABLES, PROCESS,
+-- RELOAD or FLUSH_TABLES. Re-review the exact flags and grants if these change.
 
 -- Phase B: after install.sh creates tables, before running any backup.
 -- Backup's CLI uses this same account to persist its run, audit and verification ledger.

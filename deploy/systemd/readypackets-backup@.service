@@ -5,10 +5,13 @@ After=network-online.target mysql.service
 
 [Service]
 Type=oneshot
+User=readypackets
+Group=readypackets
+NoNewPrivileges=yes
 Environment=RP_ROLE=worker
 Environment=DATABASE_URL_FILE=%d/backup_database_url
 Environment=RP_BACKUP_KEY_FILE=%d/rp_backup_key
 LoadCredential=backup_database_url:/etc/readypackets/secrets/backup_database_url
 LoadCredential=rp_backup_key:/etc/readypackets/secrets/rp_backup_key
-ExecStart=/usr/local/bin/node --import tsx scripts/ops/backup/run-backup.ts --trigger %i --verify
+ExecStart=/usr/local/bin/node /opt/readypackets/current/dist/ops/run-backup.js --trigger %i --verify
 TimeoutStartSec=2h

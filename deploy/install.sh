@@ -19,7 +19,6 @@ for name in fullchain.pem privkey.pem; do
     [[ -r "/etc/letsencrypt/live/readypackets-portal/$name" ]] || die 'issue the dual-host certificate first; see INSTALL.md'
 done
 prepare_dirs
-build_release
 write_env
 
 write_url() {
@@ -27,32 +26,14 @@ write_url() {
     if [[ ! -e "$conf/secrets/$name" && ! -L "$conf/secrets/$name" ]]; then
         read -r -s -p "Paste $name (input hidden): " url </dev/tty
         printf '\n' >&2
-        [[ "$url" == mysql://* && "$url" != *[[:space:]]* ]] || die 'expected a mysql:// URL without raw whitespace'
-        if [[ "$name" == backup_database_url ]]; then
-            [[ "$url" =~ @127\.0\.0\.1(:3306)?/[a-zA-Z0-9_]+(\?tls=off)?$ ]] ||
-                die 'this release expects backup connections on IPv4 loopback only; see INSTALL.md'
-        else
-            printf '%s' "$url" | "$node" -e '
-                try {
-                    const u = new URL(require("node:fs").readFileSync(0, "utf8"));
-                    const tls = u.searchParams.getAll("tls");
-                    const valid = u.protocol === "mysql:" && u.hostname && u.username && u.password &&
-                        !u.hash && /^\/[a-zA-Z0-9_]+$/.test(u.pathname) &&
-                        tls.length === 1 && tls[0] === "required" &&
-                        [...u.searchParams.keys()].every(k => k === "tls" || k === "tlsCaFile") &&
-                        (!u.searchParams.has("tlsCaFile") ||
-                            (u.searchParams.getAll("tlsCaFile").length === 1 && u.searchParams.get("tlsCaFile").startsWith("/")));
-                    process.exit(valid ? 0 : 1);
-                } catch { process.exit(1); }
-            ' || die 'runtime and migrator DSNs must use verified TLS'
-        fi
-        printf '%s\n' "$url" > "$conf/secrets/$name"
+        printf '%s' "$url" | validate_dsn "$name"
+        (set -C; printf '%s\n' "$url" > "$conf/secrets/$name")
     fi
-    secret_ok "$name"
 }
 write_url database_url
 write_url migrator_database_url
 write_url backup_database_url
+credentials_ok
 
 keys_present=0
 for key in "${app_keys[@]}"; do
@@ -63,22 +44,34 @@ for key in "${app_keys[@]}"; do
 done
 if ((keys_present == 0)); then
     (
-        cd "$release"
-        generated=$(mktemp -d /run/readypackets-keys.XXXXXXXX)
+        # Independent of release code, dependency builds and the build account.
+        generated=$(mktemp -d "$conf/secrets/.keys.XXXXXXXX")
         trap 'rm -rf -- "$generated"' EXIT
-        chown readypackets-build:readypackets-build "$generated"
-        build_as_user "$node" --import tsx scripts/ops/keys/generate.ts --out-dir "$generated" >/dev/null
+        key_id="k$(date -u +%Y%m%d)"
+        material=$(openssl rand -base64 32)
+        printf '{"current":"%s","keys":{"%s":"%s"}}\n' "$key_id" "$key_id" "$material" \
+            > "$generated/rp_data_keyring"
+        unset material
         for key in "${app_keys[@]}"; do
-            install -m 0600 -o root -g root "$generated/$key" "$conf/secrets/$key"
+            if [[ "$key" != rp_data_keyring ]]; then openssl rand -base64 32 > "$generated/$key"; fi
+        done
+        for key in "${app_keys[@]}"; do
+            ln -- "$generated/$key" "$conf/secrets/$key"
         done
     )
 elif ((keys_present != ${#app_keys[@]})); then
     die 'partial key set; reconcile custody before retrying, never replace existing keys'
 fi
 if [[ ! -e "$conf/secrets/rp_backup_key" && ! -L "$conf/secrets/rp_backup_key" ]]; then
-    openssl rand -base64 32 > "$conf/secrets/rp_backup_key"
+    (
+        backup_key=$(mktemp "$conf/secrets/.backup-key.XXXXXXXX")
+        trap 'rm -f -- "$backup_key"' EXIT
+        openssl rand -base64 32 > "$backup_key"
+        ln -- "$backup_key" "$conf/secrets/rp_backup_key"
+    )
 fi
 secret_ok rp_backup_key
+build_release
 
 # Record ambiguity before any potentially nontransactional database operation.
 if [[ ! -e "$base/current" ]]; then
@@ -89,14 +82,7 @@ if [[ ! -e "$base/current" ]]; then
     rm -f -- "$conf/install-migration-pending"
 fi
 
-for unit in "$web" "$worker" 'readypackets-backup@.service' "$timer"; do
-    install -m 0644 "$deploy_src/systemd/$unit" "$unit_dir/$unit"
-done
-for unit in "$web" "$worker" 'readypackets-backup@.service'; do
-    install -d -m 0755 "$unit_dir/$unit.d"
-    install -m 0644 "$deploy_src/systemd/readypackets-runtime.conf" "$unit_dir/$unit.d/10-runtime.conf"
-done
-systemctl daemon-reload
+install_unit_files
 install -m 0644 "$deploy_src/nginx/readypackets-tls.conf" "$nginx_dir/snippets/readypackets-tls.conf"
 install -m 0644 "$deploy_src/nginx/readypackets-portal.conf" "$nginx_dir/sites-available/readypackets-portal.conf"
 ln -sfn -- "$nginx_dir/sites-available/readypackets-portal.conf" "$site"
