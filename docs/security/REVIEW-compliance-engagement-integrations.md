@@ -31,6 +31,14 @@ The runtime review covered Compliance `e400060`, Integrations `3f99849` plus the
 - **ENG-03 (resolved for note-only updates in `b097e92`)**: `ticketsService.ts:1109–1128,1426–1435` does not advance the public update/message timestamps for note-only activity with no public status change. Staff assignment preserves the update timestamp; an intentional public status change remains visible.
 - **Targeted verification**: `scripts/dev/test.sh server/modules/engagement/engagement.test.ts` passed all 12 tests, including the two new regression cases for search anti-starvation, reply pagination, and metadata isolation. The independent Compliance rerun passed all seven tests in `server/modules/compliance/compliance.test.ts` at the initial review checkpoint; that suite does not resolve `BILL-01`.
 
+## Compliance follow-up
+
+- **BILL-01 (contained for this release in `b7a524a`)**: `invoicesService.ts:158,1450–1527` declares provider ledger booking disabled and implements receipt deduplication, durable refusal audit, and `applied: false`, with no invoice, payment, or refund mutations on that path. The initial Stripe event-identity and financial-state concerns are not cleared for a future release that enables booking.
+- **COMP-04 (resolved in `b7a524a`)**: `router.ts:40–50` uses the default public listing, and `policiesService.ts:193–201,369–423,463–473,524–546` limits the public audience, validates current effective/version/hash eligibility under shared locking reads, and derives the evidence method from the server flow and signature requirement.
+- **COMP-05 (resolved for new submissions in `b7a524a`)**: `intakeService.ts:153–197,438–488` uses the same-transaction order facts and enforces catalog or workflow scope before creating a submission. Existing historical records remain separately readable to authorized order viewers.
+- **COMP-06 (partially resolved in `b7a524a`)**: `intakeService.ts:351–410` paginates revision answers and decrypts only the requested page; `:258–286` no longer selects historical answer ciphertext in the summary query. The summary still loads all non-null historical review notes and discards all but the latest per submission in JavaScript. Limit the query itself to the latest review note per submission. The detail route also calls this summary path.
+- **Targeted verification**: `scripts/dev/test.sh server/modules/compliance/compliance.test.ts` passed all eight tests, including the provider no-booking and policy/intake regression. This verifies the current disabled ledger behavior, not live Stripe settlement.
+
 ## Controls reviewed and evidence limits
 
 - **Billing**: Invoice body and ledger detail enforce parent-order read authority. Draft invoices and staff-only payment notes are excluded from the customer view. The manual payment and refund operations lock the invoice, validate currency and check remaining/refundable amounts. These checks do not make provider event reconciliation safe.
