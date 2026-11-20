@@ -20,9 +20,12 @@ read it, but the browser attaches it to same-origin requests.
 
 ## Accepted residual
 If a visitor consents on a public page and then signs in from another tab of the same browser, the vendor
-script in the first tab could issue same-origin read requests that carry the new session. State-changing
-requests still require the CSRF token, which the tainted page never receives. Removing this residual requires
-serving the public pages from a separate origin, which is what the marketing site already is.
+script in the first tab runs on the same origin as that session. It could issue same-origin requests that carry
+the session cookie, and because the CSRF token is delivered in a script-readable cookie it could also attach a
+valid CSRF token. CSRF protection therefore does not constrain same-origin vendor code. What still applies is
+per-operation authorization and the step-up requirement on privileged actions; ordinary reads and ordinary
+writes available to that account are exposed. Removing this residual requires serving the public pages from a
+separate origin, which is what the marketing site already is.
 
 ## Consequences
 The recommended configuration is analytics on `www.readypackets.com` and none on the portal. No real Clarity
