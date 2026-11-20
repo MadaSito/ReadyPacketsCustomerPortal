@@ -104,9 +104,13 @@ const STAFF_WRITE_CAPABILITY: Record<OrderWriteKind, Capability> = {
 };
 
 export function createOrderPolicy(deps: PolicyDeps) {
-  async function deny(principal: SessionPrincipal, reasonCode: string, orderPublicId: string | null, action: string) {
-    try {
-      await deps.audit.record({
+  /**
+   * Denials are durable but never written through the caller's transaction (it is about to roll back) and,
+   * when the caller holds a transaction, never awaited on a second pool connection (a saturated pool would
+   * self-deadlock): the write is queued and completes once a connection is free.
+   */
+  async function deny(principal: SessionPrincipal, reasonCode: string, orderPublicId: string | null, action: string, inTx = false) {
+    const write = () => deps.audit.record({
         category: "security",
         eventName: "authz.order.denied",
         action,
@@ -116,6 +120,12 @@ export function createOrderPolicy(deps: PolicyDeps) {
         actor: { userId: principal.userId, role: principal.role },
         resource: { type: "order", publicId: orderPublicId && ULID_PATTERN.test(orderPublicId) ? orderPublicId : null },
       });
+    if (inTx) {
+      void write().catch(() => undefined); // refused regardless; see above
+      return;
+    }
+    try {
+      await write();
     } catch {
       // The request is refused regardless; a denial performs no write that needs audit atomicity.
     }
@@ -124,7 +134,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
   async function resolve(principal: SessionPrincipal, key: OrderKey, options: AccessOptions, action: string) {
     const label = "publicId" in key ? key.publicId : null;
     if (!isFull(principal)) {
-      await deny(principal, "REMEDIATION_SESSION", label, action);
+      await deny(principal, "REMEDIATION_SESSION", label, action, options.tx !== undefined);
       throw ORDER_NOT_FOUND();
     }
     if ("publicId" in key && (typeof key.publicId !== "string" || !ULID_PATTERN.test(key.publicId))) {
@@ -144,7 +154,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
       if (grant) accessRole = grant.role;
     }
     if (!accessRole) {
-      await deny(principal, principal.role === "customer" ? "NOT_OWNER_OR_GRANTEE" : "CAPABILITY_NOT_GRANTED", row.publicId, action);
+      await deny(principal, principal.role === "customer" ? "NOT_OWNER_OR_GRANTEE" : "CAPABILITY_NOT_GRANTED", row.publicId, action, options.tx !== undefined);
       throw ORDER_NOT_FOUND();
     }
     return { row, accessRole };
@@ -207,7 +217,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
       const { row, accessRole } = await resolve(principal, { publicId: orderPublicId }, options, "write");
       const verdict = writeVerdict(principal, accessRole, row.lockState, options.kind);
       if (verdict) {
-        await deny(principal, verdict.reasonCode, row.publicId, "write");
+        await deny(principal, verdict.reasonCode, row.publicId, "write", options.tx !== undefined);
         throw verdict;
       }
       return toView(row, accessRole, principal);
@@ -220,7 +230,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
       const { row, accessRole } = await resolve(principal, { id: orderId }, options, "write");
       const verdict = writeVerdict(principal, accessRole, row.lockState, options.kind);
       if (verdict) {
-        await deny(principal, verdict.reasonCode, row.publicId, "write");
+        await deny(principal, verdict.reasonCode, row.publicId, "write", options.tx !== undefined);
         throw verdict;
       }
       return toView(row, accessRole, principal);

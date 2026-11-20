@@ -82,7 +82,17 @@ export interface OrderListItem {
 export function createOrderService(deps: OrderServiceDeps) {
   /** Defence in depth: the router already enforces step-up for these capabilities; services re-check. */
   function assertFreshStepUp(principal: SessionPrincipal): void {
-    if (!hasFreshStepUp(principal, deps.clock.now())) throw forbidden("STEP_UP_REQUIRED");
+    if (!hasFreshStepUp(principal, deps.clock.now())) throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Please confirm your password and authentication code to continue.");
+  }
+
+  /**
+   * Re-validates the ACTOR inside the transaction (not the request-start session snapshot): still active,
+   * same role, role still grants the capability. Called as the FIRST statement of the transaction so the
+   * REPEATABLE READ snapshot is current; the actor row is not locked, so no actor/target lock ordering arises.
+   */
+  async function assertActorCurrent(principal: SessionPrincipal, tx: Tx, capability: Parameters<typeof roleHasCapability>[1]): Promise<void> {
+    const actor = await identityPort(deps.services).getUser(principal.userId, { tx });
+    if (!actor || actor.status !== "active" || actor.role !== principal.role || !roleHasCapability(actor.role, capability)) throw forbidden("ACTOR_NOT_AUTHORIZED");
   }
 
   const { policy, workflows } = deps;
@@ -642,6 +652,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     /* ----------------------------------------------------------------- locks */
     async setLock(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; lockState: OrderLockState; reasonCode: string }) {
       return deps.db.transaction(async (tx) => {
+        if (principal.role !== "customer") await assertActorCurrent(principal, tx, "orders.manage");
         const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
         const staffSide = view.accessRole === "staff" || view.accessRole === "admin";
         if (!staffSide || !roleHasCapability(principal.role, "orders.manage")) {
@@ -696,6 +707,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       assertFreshStepUp(principal);
       const reference = normalizeReference(input.newReference);
       return deps.db.transaction(async (tx) => {
+        await assertActorCurrent(principal, tx, "orders.identifiers.change");
         const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
         if (view.version !== input.expectedVersion) throw staleVersion();
         if (view.lockState === "legal_hold") throw orderLocked(view.lockState);
@@ -781,6 +793,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       let committed: { view: OrderAccessView; toUserId: number; revokedGrants: number };
       try {
         committed = await deps.db.transaction(async (tx) => {
+          await assertActorCurrent(principal, tx, "orders.reassign");
           const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
           if (view.version !== input.expectedVersion) throw staleVersion();
           if (view.lockState === "legal_hold") throw orderLocked(view.lockState);
@@ -866,12 +879,14 @@ export function createOrderService(deps: OrderServiceDeps) {
       return items.map((item) => ({ publicId: item.publicId, reference: item.reference, projectName: item.projectName, statusLabel: item.statusLabel, updatedAt: item.updatedAt }));
     },
 
-    async getOrderRefById(orderId: number, tx?: DbOrTx) {
-      const [row] = await (tx ?? deps.db)
+    async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
+      if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
+      const query = (tx ?? deps.db)
         .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
         .from(orders)
         .where(eq(orders.id, orderId))
         .limit(1);
+      const [row] = options.forUpdate ? await query.for("update") : await query;
       return row ?? null;
     },
   };

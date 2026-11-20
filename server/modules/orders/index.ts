@@ -36,7 +36,8 @@ export interface OrdersModule extends ModuleLifecycle {
   listAccessibleOrderIds(principal: SessionPrincipal, options?: { limit?: number; tx?: DbOrTx }): Promise<AccessibleOrderIds>;
   getOrderSummary(principal: SessionPrincipal, orderPublicId: string): Promise<OrderSummary>;
   /** Trusted lookup for jobs/collectors that already authorised. */
-  getOrderRefById(orderId: number, tx?: DbOrTx): Promise<OrderRef | null>;
+  /** `forUpdate` (requires tx) locks the order row — use it before acting on lockState (e.g. retention purge). */
+  getOrderRefById(orderId: number, tx?: DbOrTx, options?: { forUpdate?: boolean }): Promise<OrderRef | null>;
   searchOrders(principal: SessionPrincipal, query: string, limit?: number): Promise<OrderSearchHit[]>;
 
   /* ---- portable hooks ---- */

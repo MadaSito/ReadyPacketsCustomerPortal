@@ -10,6 +10,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
 import { orderGrants, orderLineItems, orderReassignments, orders } from "./schema.js";
+import { users } from "../identity/schema.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, idemKey, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
 
 let t: TestDb;
@@ -481,9 +482,20 @@ describe("reassignment", () => {
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: staff.publicId, operationId: idemKey() }), "VALIDATION:TARGET_NOT_ELIGIBLE");
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: alice.publicId, operationId: idemKey() }), "CONFLICT:TARGET_IS_OWNER");
     await expectError(mod.orders.reassign(staff.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:CAPABILITY_NOT_GRANTED");
+    // Actor re-validated inside the transaction: a demoted/suspended admin with a still-valid session is refused.
+    const exAdmin = await insertUser(h, t.db, { role: "admin", stepUp: true });
+    await t.db.update(users).set({ status: "suspended" }).where(eq(users.id, exAdmin.id));
+    await expectError(mod.orders.reassign(exAdmin.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    await expectError(mod.orders.changeReference(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-2", reasonCode: "FIX" }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    await expectError(mod.orders.setLock(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "review", reasonCode: "FIX" }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    // Trusted ref lookup can lock the order row (files retention) and refuses a lock without a transaction.
+    await t.db.transaction(async (tx) => {
+      expect(await mod.getOrderRefById(view.id, tx, { forUpdate: true })).toMatchObject({ publicId: order.publicId, lockState: "none" });
+    });
+    await expectError(mod.getOrderRefById(view.id, undefined, { forUpdate: true }), "VALIDATION:TX_REQUIRED");
     const noStepUp = { ...admin.principal, stepUpAt: null };
-    await expectError(mod.orders.reassign(noStepUp, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:STEP_UP_REQUIRED");
-    await expectError(mod.orders.changeReference(noStepUp, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-1", reasonCode: "FIX" }), "FORBIDDEN:STEP_UP_REQUIRED");
+    await expectError(mod.orders.reassign(noStepUp, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+    await expectError(mod.orders.changeReference(noStepUp, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-1", reasonCode: "FIX" }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
     await expectError(mod.orders.reassign(admin.principal, { ...base, expectedVersion: view.version + 5, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "CONFLICT:STALE_VERSION");
     expect(h.audit.named("order.reassign.refused").map((e) => e.reasonCode)).toEqual(expect.arrayContaining(["TARGET_INACTIVE", "TARGET_NOT_ELIGIBLE", "TARGET_IS_OWNER"]));
   });
