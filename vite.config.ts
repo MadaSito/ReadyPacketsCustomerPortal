@@ -2,12 +2,17 @@ import path from "node:path";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
+import { VitePWA } from "vite-plugin-pwa";
 
 /**
  * Build modes:
  *   pnpm build           → production bundle (path routing, same-origin API, cookie session)
  *   pnpm build:preview   → sandboxed-iframe demo bundle (hash routing, proxied API, in-memory session)
- * The PWA service worker is added by the UI foundation engineer (static shell only; never authenticated data).
+ *
+ * Service worker (standard builds only): precaches immutable static assets and a static offline page. It never
+ * caches the application document (it carries a per-response CSP nonce and runtime configuration) and never
+ * caches /api/** or any authenticated response. Navigations are network-only with the offline page as the
+ * fallback. Updates are user-driven (no skipWaiting); the app registers the worker itself.
  */
 export default defineConfig(({ mode }) => {
   const preview = mode === "preview";
@@ -18,7 +23,36 @@ export default defineConfig(({ mode }) => {
     // Preview is served under an unknown path prefix → relative URLs. Production is served at the origin
     // root with path routing (nested URLs) → absolute URLs.
     base: preview ? "./" : "/",
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      ...(preview
+        ? []
+        : [
+            VitePWA({
+              injectRegister: false,
+              registerType: "prompt",
+              manifest: false,
+              filename: "sw.js",
+              strategies: "generateSW",
+              workbox: {
+                globPatterns: ["offline.html", "offline.css", "assets/**/*.{js,css}", "fonts/*.woff2", "brand/*.png", "favicon.ico", "manifest.webmanifest"],
+                navigateFallback: null,
+                cleanupOutdatedCaches: true,
+                clientsClaim: false,
+                skipWaiting: false,
+                runtimeCaching: [
+                  { urlPattern: ({ url }) => url.pathname.startsWith("/api/"), handler: "NetworkOnly" },
+                  {
+                    urlPattern: ({ request }) => request.mode === "navigate",
+                    handler: "NetworkOnly",
+                    options: { precacheFallback: { fallbackURL: "offline.html" } },
+                  },
+                ],
+              },
+            }),
+          ]),
+    ],
     resolve: {
       alias: {
         "@shared": path.resolve(import.meta.dirname, "shared"),
