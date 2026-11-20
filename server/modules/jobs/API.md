@@ -1,0 +1,28 @@
+# Jobs, maintenance and mail API
+
+## Cross-module contracts
+
+- `createJobQueue(deps: QueueDeps): JobQueue` and `createMailer(deps: QueueDeps & { jobs: JobQueue }): Mailer` in `queue.ts`. Use `deps.jobs` and `deps.mailer` for the contracts from `server/core/types.ts`; use `services.jobAdmin` for maintenance and workforce controls.
+- `JobQueue.enqueue(type, payload, options?, tx?) → { jobId }`: transaction support; a repeated key in one type returns the original job. Do not place raw credential or auth material in job payloads.
+- `JobQueue.register(type, handler, options?)`: bounded retries for failure the handler explicitly classifies as retryable and without an uncertain effect; interrupted execution is recoverable automatically only when registered with `{ retrySafe: true }`. Declare that mode only when all writes and provider effects are fenced or independently idempotent.
+- `ClaimedJob.assertStillOwned(tx?) → void`: call immediately before external effects; pass the same transaction used for local publication to hold the claim fence until publication commits. External mutations still require provider idempotency or reconciliation.
+- `JobQueue.registerSchedule({ name, type, everyMs, payload? })`: fixed UTC epoch-aligned slot and durable unique slot key; missed slots are skipped, never replayed after restart, drain, or outage. On recovery the current slot may be queued immediately.
+- `JobsModule.isDraining(): Promise<boolean>`: privileged writers and new long-running operations use this authoritative check and fail closed on errors.
+- `JobsModule.startWorker(): Promise<WorkerHandle>`; `WorkerHandle.stop(): Promise<void>`: stops claims immediately, gives started work a bounded settlement window, then signals cancellation and commits an interruption disposition if possible. An unsettled handler rejects stop; an HTTP listener stopping is not proof external effects ceased.
+- `Mailer.registerTemplate(template)` and `Mailer.enqueue(mail, tx?)` follow the core contract. Only registered variable names are allowed. All variables and literal recipients are encrypted. Stable outbox idempotency keys are unique; expired or already accepted/unknown messages are not automatically resent. Recipient user IDs resolve a current address at execution time.
+
+## Console procedures
+
+- `jobs.maintenanceBanner`: public-safe `active` boolean and fixed text only.
+- `jobs.admin.list`, `detail`, `schedules`, `listMail`, `maintenance`: full administrator plus `jobs.read`.
+- `jobs.admin.cancel`, `retry`, `resend`: full administrator plus `jobs.manage`; queued-only cancellation; retries require safe classification; unknown effects never replay automatically.
+- `jobs.admin.setMaintenance`, `capture`: full administrator and fresh step-up (maintenance and mail capability gates respectively). Capture reads are audited, only in explicit non-production capture mode, and never present content as delivered.
+- No raw HTTP routes.
+
+## Configuration and evidence
+
+- `jobs.mail.capture`: boolean setting, defaults off; production refuses use.
+- `jobs.mail.deliver`: one non-retry-safe job per mail delivery operation. Safe outcomes distinguish queued, sending, accepted (not delivery confirmation), held, captured, failed, expired, and unknown.
+- `jobs.mail.expire`: recurring bounded cleanup of expired encrypted outbox data and development captures.
+- `jobs.queue` and `jobs.mail`: queue depth/oldest/stuck/unknown health and mail hold/unknown health.
+- Audit namespace: `job.enqueued`, `job.claimed`, `job.completed`, `job.failed`, `job.canceled`, `job.unknown`, `job.retry.queued`, `job.lease.expired`, `job.maintenance.changed`, `job.mail.*`. Events use `category: job` and no payload, recipient or rendered content.
