@@ -18,6 +18,8 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { readSecretFile, SecretFileError, type SecretFileOptions } from "./secretFiles.js";
 
+/** Exact value an operator must set in RP_PREVIEW_ACKNOWLEDGED to run the preview profile. */
+export const PREVIEW_ACKNOWLEDGEMENT = "synthetic-data-only";
 export const DEPLOYMENT_PROFILES = ["production", "development", "test", "preview"] as const;
 export type DeploymentProfile = (typeof DEPLOYMENT_PROFILES)[number];
 
@@ -36,6 +38,7 @@ export interface EnvVariable {
 export const ENV_VARIABLES: readonly EnvVariable[] = [
   { name: "NODE_ENV", secret: false, required: true, description: "production | development | test" },
   { name: "RP_DEPLOYMENT_PROFILE", secret: false, required: false, description: "production | development | test | preview (defaults from NODE_ENV). preview is for the sandboxed demo only." },
+  { name: "RP_PREVIEW_ACKNOWLEDGED", secret: false, required: false, description: "Required with RP_DEPLOYMENT_PROFILE=preview: must be exactly synthetic-data-only (the preview never holds real customer data)" },
   { name: "RP_ROLE", secret: false, required: false, description: "web | worker | all (default all)" },
   { name: "HOST", secret: false, required: false, description: "Listen address (default 127.0.0.1; keep loopback behind Nginx)" },
   { name: "PORT", secret: false, required: false, description: "Listen port (default 5000)" },
@@ -384,6 +387,11 @@ function evaluate(env: Env, options: LoadOptions): Evaluation {
     if (hosts.some(isReadyPacketsHost)) {
       err("RP_DEPLOYMENT_PROFILE", "the preview profile must never be used on a readypackets.com origin");
     }
+    if (env.RP_PREVIEW_ACKNOWLEDGED !== PREVIEW_ACKNOWLEDGEMENT) {
+      err("RP_PREVIEW_ACKNOWLEDGED", `must be exactly ${PREVIEW_ACKNOWLEDGEMENT} when the preview profile is used`);
+    }
+  } else if (env.RP_PREVIEW_ACKNOWLEDGED !== undefined) {
+    warn("RP_PREVIEW_ACKNOWLEDGED", "has no effect outside the preview profile; remove it");
   }
   if (config.aliasHosts.includes(origin.hostname)) err("RP_ALIAS_HOSTS", "must not contain the canonical hostname");
   if (config.previousIndexKey) warn("RP_INDEX_KEY_PREVIOUS", "a blind-index transition is in progress; remove once complete");

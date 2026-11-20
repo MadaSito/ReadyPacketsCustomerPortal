@@ -67,6 +67,8 @@ export interface PublicSlide {
   image: { id: string; alt: string; url: string } | null;
 }
 export interface PublicPresentation {
+  /** True only on the preview deployment profile: shells must render a permanent "Preview — synthetic data only" banner. */
+  preview: boolean;
   slides: PublicSlide[];
   /** Auto-advance is off by default; clients must also honour prefers-reduced-motion and offer pause. */
   slideshow: { autoAdvance: boolean; intervalSeconds: number };
@@ -84,7 +86,7 @@ export interface PlatformModule extends ModuleLifecycle {
   /** Summary for /readyz — never component details. */
   readiness(): Promise<{ ready: boolean; state: HealthState }>;
   /** Public first-run state; reveals nothing beyond whether an administrator exists. */
-  setupStatus(): Promise<{ administratorExists: boolean }>;
+  setupStatus(): Promise<{ administratorExists: boolean; preview: boolean }>;
   setupChecklist(): Promise<SetupChecklistItem[]>;
   /** Public sign-in presentation fields only. */
   presentation(): Promise<PublicPresentation>;

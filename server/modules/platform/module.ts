@@ -99,6 +99,7 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
   const { db, clock, logger, config, audit, storage } = deps;
   const log = logger.child({ component: "platform" });
   const migrationsDir = config.migrationsDir ?? "migrations";
+  const preview = config.deploymentProfile === "preview";
   let readinessCache: { at: number; value: { ready: boolean; state: HealthState } } | null = null;
 
   const settingsAdmin = (): PlatformSettingsStore => {
@@ -368,17 +369,21 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
         throw error;
       }
     },
+    init() {
+      // Exactly one startup WARN per process (container calls init once after construction).
+      if (preview) log.warn("preview profile active: relaxed framing/CORS, in-memory session transport, synthetic data only", { event: "platform.preview_profile.active" });
+    },
     schemaStatus,
     healthReport,
     readiness,
     async setupStatus() {
       // Fail closed: when unknown, claim an administrator exists so no first-run path is advertised.
       const admin = await hasAdministrator();
-      return { administratorExists: admin ?? true };
+      return { administratorExists: admin ?? true, preview };
     },
     setupChecklist,
     async presentation() {
-      return presentationService.publicPresentation();
+      return { preview, ...(await presentationService.publicPresentation()) };
     },
     async health() {
       // Platform's own components are produced by healthReport(); this keeps generic callers working.

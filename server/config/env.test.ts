@@ -124,10 +124,28 @@ describe("config: strict validation", () => {
       "RP_DEPLOYMENT_PROFILE: the preview profile must never be used on a readypackets.com origin",
     );
     // the default marketing origin is an outbound link only and does not block preview
-    const preview = loadConfig(prodEnv({ NODE_ENV: "development", RP_DEPLOYMENT_PROFILE: "preview", RP_CANONICAL_ORIGIN: "https://demo.example.test" }));
+    const preview = loadConfig(prodEnv({ NODE_ENV: "development", RP_DEPLOYMENT_PROFILE: "preview", RP_PREVIEW_ACKNOWLEDGED: "synthetic-data-only", RP_CANONICAL_ORIGIN: "https://demo.example.test" }));
     expect(preview.previewTransportEnabled).toBe(true);
     expect(isReadyPacketsHost("notreadypackets.com")).toBe(false);
     expect(isReadyPacketsHost("my.readypackets.com.")).toBe(true);
+  });
+
+  it("requires the exact synthetic-data acknowledgement for the preview profile in every NODE_ENV", () => {
+    const rule = "RP_PREVIEW_ACKNOWLEDGED: must be exactly synthetic-data-only when the preview profile is used";
+    for (const nodeEnv of ["production", "development", "test"]) {
+      for (const ack of [undefined, "", "yes", "synthetic-data-only ", "SYNTHETIC-DATA-ONLY"]) {
+        const issues = problemsOf(prodEnv({ NODE_ENV: nodeEnv, RP_DEPLOYMENT_PROFILE: "preview", RP_CANONICAL_ORIGIN: "https://demo.example.test", RP_PREVIEW_ACKNOWLEDGED: ack }));
+        expect(issues).toContain(rule);
+      }
+      const ok = problemsOf(prodEnv({ NODE_ENV: nodeEnv, RP_DEPLOYMENT_PROFILE: "preview", RP_CANONICAL_ORIGIN: "https://demo.example.test", RP_PREVIEW_ACKNOWLEDGED: "synthetic-data-only" }));
+      expect(ok).not.toContain(rule);
+    }
+    // acknowledgement never unlocks a readypackets.com origin
+    expect(problemsOf(prodEnv({ RP_DEPLOYMENT_PROFILE: "preview", RP_PREVIEW_ACKNOWLEDGED: "synthetic-data-only" }))).toContain(
+      "RP_DEPLOYMENT_PROFILE: the preview profile must never be used on a readypackets.com origin",
+    );
+    const diagnosis = diagnoseConfig(prodEnv({ RP_PREVIEW_ACKNOWLEDGED: "synthetic-data-only" }));
+    expect(diagnosis.problems).toContainEqual({ variable: "RP_PREVIEW_ACKNOWLEDGED", rule: "has no effect outside the preview profile; remove it", severity: "warning" });
   });
 
   it("accepts only exact numeric trusted-proxy IPs/CIDRs", () => {

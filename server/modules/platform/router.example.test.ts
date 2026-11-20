@@ -45,9 +45,9 @@ const update = { key: PRESENTATION_SUPPORT_TEXT.key, value: "Call us", expectedV
 
 describe("platform router authorization", () => {
   it("public procedures expose only safe data", async () => {
-    expect(await caller(null).setupStatus()).toEqual({ administratorExists: true });
+    expect(await caller(null).setupStatus()).toEqual({ administratorExists: true, preview: false });
     const presentation = await caller(null).presentation();
-    expect(Object.keys(presentation).sort()).toEqual(["announcement", "slides", "slideshow", "supportText"]);
+    expect(Object.keys(presentation).sort()).toEqual(["announcement", "preview", "slides", "slideshow", "supportText"]);
   });
 
   it("denies anonymous, customer, staff and remediation sessions on admin procedures", async () => {

@@ -70,7 +70,7 @@ export function createPresentationService(deps: PresentationDeps) {
     }
   }
 
-  async function publicPresentation(): Promise<PublicPresentation & { slideshow: { autoAdvance: boolean; intervalSeconds: number } }> {
+  async function publicPresentation(): Promise<Omit<PublicPresentation, "preview">> {
     const [slides, slideshow, supportText, announcement] = await Promise.all([
       readSetting(settings, PRESENTATION_SLIDES),
       readSetting(settings, PRESENTATION_SLIDESHOW),

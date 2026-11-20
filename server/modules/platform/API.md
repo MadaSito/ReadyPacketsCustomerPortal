@@ -85,7 +85,7 @@ interface PlatformModule extends ModuleLifecycle {
    *  all critical); peer modules never make the node unready. Cached 2 s. */
   readiness(): Promise<{ ready: boolean; state: HealthState }>;
   /** [impl] Public first-run state. Never reveals counts or identities. */
-  setupStatus(): Promise<{ administratorExists: boolean }>;
+  setupStatus(): Promise<{ administratorExists: boolean; preview: boolean }>;
   /** [impl] Admin checklist with honest states pulled from module health + config. */
   setupChecklist(): Promise<SetupChecklistItem[]>;
   /** [impl] Public sign-in presentation (plain text only). */
@@ -95,7 +95,7 @@ type SchemaStatus = { state: "current" | "behind" | "ahead" | "unknown" | "unrea
 type HealthReport = { state: HealthState; checkedAt: Date; components: ModuleHealth[] };
 type SetupChecklistItem = { id: "admin_exists" | "mfa_enforced" | "canonical_origin" | "smtp" | "backups" | "siem" | "keys_distinct" | "schema";
   state: "complete" | "incomplete" | "not_configured" | "unknown"; summary: string; required: boolean };
-type PublicPresentation = { slides; supportText; announcement; slideshow: { autoAdvance: boolean; intervalSeconds: number } };
+type PublicPresentation = { preview: boolean; slides; supportText; announcement; slideshow: { autoAdvance: boolean; intervalSeconds: number } };
 ```
 
 `createFieldCrypto(config)` (server/security/fieldCrypto.ts) returns `PlatformFieldCrypto extends FieldCrypto` with
@@ -131,20 +131,27 @@ extra **[impl]** `keyIdOf(envelope)`, `needsReencryption(envelope)`, `reencrypt(
 
 | Procedure | Guard | Notes |
 | --- | --- | --- |
-| `setupStatus` (query) | public | `{ administratorExists }` |
-| `presentation` (query) | public | slides / supportText / announcement (plain text, allowlisted images) |
+| `setupStatus` (query) | public | `{ administratorExists, preview }` |
+| `presentation` (query) | public | `preview`, slides, slideshow, supportText, announcement (plain text, allowlisted images) |
 | `admin.settings.list` (query) | admin | declared settings by group; secrets as `{ configured, updatedAt }`; values + `version` for non-secrets |
 | `admin.settings.update` (mutation) | admin + `platform.settings.manage` (step-up) | `{ key, value, expectedVersion }` → optimistic concurrency (`CONFLICT/VERSION_MISMATCH`) |
 | `admin.settings.setSecret` (mutation) | admin + `platform.settings.manage` (step-up) | `{ key, value: string \| null, expectedVersion }`; response never echoes the value |
 | `admin.features.list` / `admin.features.set` | admin / + step-up | flags default OFF |
 | `admin.health` (query) | staff + `platform.health.read` | full HealthReport |
 | `admin.setupChecklist` (query) | admin | |
-| `admin.presentation.get` / `admin.presentation.update` | admin / + step-up | `expectedVersion` |
-| `admin.presentation.images` (query) | admin | allowlisted + uploaded image ids |
+| `admin.presentation.get` (query) | admin | `{ settings: SettingView[] (presentation group), images: PresentationImageSummary[] }`; edit values via `admin.settings.update` |
 | `admin.presentation.deleteImage` (mutation) | admin + step-up | `{ id }`; `IMAGE_IN_USE` if referenced by slides |
 | `admin.config.export` (mutation) | admin + `platform.settings.manage` (step-up) | `{ includeSecrets, passphrase? }` |
 | `admin.config.importPreview` (mutation) | admin + step-up | dry-run diff, no writes |
 | `admin.config.importApply` (mutation) | admin + step-up | `{ document, passphrase?, expectedPreviewDigest }` |
+
+### Preview profile
+
+`RP_DEPLOYMENT_PROFILE=preview` additionally requires `RP_PREVIEW_ACKNOWLEDGED=synthetic-data-only` (exact value, in every
+NODE_ENV; otherwise `ConfigError` naming the variable) and is always refused on readypackets.com hosts and aliases.
+Platform logs one WARN at startup (`init()`): "preview profile active: relaxed framing/CORS, in-memory session transport,
+synthetic data only". `preview: true` on `setupStatus` and `presentation` tells shells to render a permanent
+"Preview — synthetic data only" banner.
 
 ## 5. Raw HTTP routes
 

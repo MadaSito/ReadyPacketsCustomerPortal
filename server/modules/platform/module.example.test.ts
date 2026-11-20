@@ -163,11 +163,23 @@ describe("health aggregation, readiness and setup", () => {
   });
 
   it("setupStatus fails closed when identity is unavailable", async () => {
-    expect(await platform.setupStatus()).toEqual({ administratorExists: true });
+    expect(await platform.setupStatus()).toEqual({ administratorExists: true, preview: false });
     (h.services as unknown as Record<string, unknown>).identity = { hasActiveAdministrator: async () => false };
-    expect(await platform.setupStatus()).toEqual({ administratorExists: false });
+    expect(await platform.setupStatus()).toEqual({ administratorExists: false, preview: false });
     (h.services as unknown as Record<string, unknown>).identity = { hasActiveAdministrator: async () => Promise.reject(new Error("x")) };
-    expect(await platform.setupStatus()).toEqual({ administratorExists: true });
+    expect(await platform.setupStatus()).toEqual({ administratorExists: true, preview: false });
+  });
+
+  it("flags the preview profile publicly and warns exactly once at startup", async () => {
+    const warnings: string[] = [];
+    const capture = { ...silentLogger, warn: (message: string) => void warnings.push(message), child: () => capture };
+    const previewPlatform = createPlatformModule({ ...h.deps, logger: capture, config: { ...h.deps.config, deploymentProfile: "preview" } });
+    previewPlatform.init?.();
+    expect(warnings).toEqual(["preview profile active: relaxed framing/CORS, in-memory session transport, synthetic data only"]);
+    expect(await previewPlatform.setupStatus()).toMatchObject({ preview: true });
+    expect(await previewPlatform.presentation()).toMatchObject({ preview: true });
+    platform.init?.();
+    expect(await platform.presentation()).toMatchObject({ preview: false });
   });
 
   it("builds the admin setup checklist from identity and health", async () => {

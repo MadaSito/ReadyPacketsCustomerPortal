@@ -224,7 +224,7 @@ describe("presentation service", () => {
 
   it("public read returns only safe fields and the default slide", async () => {
     const view = await platform.presentation();
-    expect(Object.keys(view).sort()).toEqual(["announcement", "slides", "slideshow", "supportText"]);
+    expect(Object.keys(view).sort()).toEqual(["announcement", "preview", "slides", "slideshow", "supportText"]);
     expect(view.slides[0]).toMatchObject({ id: "welcome", image: null });
     expect(view.announcement).toBeNull();
     expect(view.slideshow).toEqual({ autoAdvance: false, intervalSeconds: 8 });
