@@ -103,7 +103,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
               <GlobalSearchSlot className="flex w-full items-center gap-2 [&>*:first-child]:min-w-0 [&>*:first-child]:flex-1" />
             </div>
             <Link
-              href="/search"
+              href="/admin/search"
               aria-label="Search"
               className="inline-flex size-11 shrink-0 items-center justify-center rounded-[var(--radius-control)] text-body hover:bg-surface-sunken hover:text-ink md:hidden"
             >

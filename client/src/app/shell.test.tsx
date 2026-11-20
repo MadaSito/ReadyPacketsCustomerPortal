@@ -146,7 +146,7 @@ describe("avatar initials (D4)", () => {
 });
 
 describe("console header search (D5)", () => {
-  it("inline search only from md up; a single 44px Search link to /search below md", () => {
+  it("inline search only from md up; a single 44px Search link to /admin/search below md", () => {
     renderUi(
       <ConsoleShell user={user("admin")}>
         <h1>Page</h1>
@@ -159,7 +159,7 @@ describe("console header search (D5)", () => {
     expect(inline.className).toContain("min-w-[20rem]");
     const links = screen.getAllByRole("link", { name: "Search" });
     expect(links).toHaveLength(1);
-    expect(links[0]).toHaveAttribute("href", "/search");
+    expect(links[0]).toHaveAttribute("href", "/admin/search");
     expect(links[0]?.className).toContain("size-11");
     expect(links[0]?.className).toContain("md:hidden");
   });

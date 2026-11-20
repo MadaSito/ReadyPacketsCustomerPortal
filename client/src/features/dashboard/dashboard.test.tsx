@@ -5,7 +5,7 @@ import type { MeResult } from "@/lib/authApi";
 import type * as registryModule from "@/app/registry";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { requiredActionsFor } from "./components/RequiredActions";
-import { widgetsFor } from "./components/WidgetGrid";
+import { gridSpans, packRows, WidgetGrid, widgetsFor } from "./components/WidgetGrid";
 import ConsoleOverviewPage from "./pages/ConsoleOverviewPage";
 import CustomerHomePage, { greeting } from "./pages/CustomerHomePage";
 
@@ -55,5 +55,41 @@ describe("dashboard", () => {
     const { container } = renderUi(<ConsoleOverviewPage />, { api: fakeAuthApi({ me: async () => me("staff") }) });
     expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
+  });
+});
+
+describe("console overview grid layout", () => {
+  const cw = (key: string, order: number, span: DashboardWidget["span"], access: DashboardWidget["access"] = "staff"): DashboardWidget => ({ key, area: "console", access, order, span, component: () => <section aria-label={key}>{key}</section> });
+  // Mirrors the registered console widgets (orders.pipeline and platform.system_health share order 10).
+  const REGISTERED = [cw("orders.pipeline", 10, 8), cw("platform.system_health", 10, 4), cw("engagement.console_queue", 20, 6), cw("audit.integrity", 40, 4, "admin"), cw("backup.status", 41, 4, "admin"), cw("siem.forwarding", 42, 4, "admin")];
+
+  it("orders: system health, pipeline, queue, audit, backups, siem", () => {
+    expect(widgetsFor(REGISTERED, "console", "admin").map((x) => x.key)).toEqual(["platform.system_health", "orders.pipeline", "engagement.console_queue", "audit.integrity", "backup.status", "siem.forwarding"]);
+  });
+
+  it("packs rows with no ragged gaps at lg (12) and md (2)", () => {
+    expect(packRows([4, 8, 6, 4, 4, 4], 12)).toEqual([4, 8, 6, 6, 6, 6]);
+    expect(packRows([4, 8, 6], 12)).toEqual([4, 8, 12]);
+    expect(packRows([4, 4, 4, 4], 12)).toEqual([4, 4, 4, 12]);
+    expect(packRows([12, 8, 4], 12)).toEqual([12, 8, 4]);
+    const admin = gridSpans(widgetsFor(REGISTERED, "console", "admin"));
+    expect(admin.map((s) => s.lg)).toEqual([4, 8, 6, 6, 6, 6]);
+    expect(admin.map((s) => s.md)).toEqual([2, 2, 1, 1, 1, 1]);
+    const staff = gridSpans(widgetsFor(REGISTERED, "console", "staff"));
+    expect(staff.map((s) => s.lg)).toEqual([4, 8, 12]);
+    expect(staff.map((s) => s.md)).toEqual([2, 2, 2]);
+  });
+
+  it("renders 1 column on phones, 2 from md, 12 from lg, with stretch-to-row-height cards", () => {
+    const { container } = renderUi(<WidgetGrid widgets={widgetsFor(REGISTERED, "console", "admin")} />);
+    const grid = container.firstElementChild as HTMLElement;
+    for (const c of ["grid-cols-1", "md:grid-cols-2", "lg:grid-cols-12", "items-stretch"]) expect(grid.className).toContain(c);
+    const cell = (key: string) => container.querySelector(`[data-widget="${key}"]`)?.className ?? "";
+    expect(cell("platform.system_health")).toContain("lg:col-span-4");
+    expect(cell("platform.system_health")).toContain("md:col-span-2");
+    expect(cell("audit.integrity")).toContain("lg:col-span-6");
+    expect(cell("siem.forwarding")).toContain("md:col-span-1");
+    expect(cell("siem.forwarding")).toContain("*:flex-1");
+    expect(screen.getByLabelText("siem.forwarding")).toBeInTheDocument();
   });
 });
