@@ -24,7 +24,7 @@ export const SIEM_BATCH_SIZE = defineSetting({
   schema: z.number().int().min(1).max(500), // explicit bounds required
   default: 100,
   sensitivity: "internal",                  // "public" (safe for unauthenticated pages) | "internal" (admins only)
-  exportable: true,                         // included in configuration export (default true)
+  exportable: true,                         // included in configuration export (default true for settings)
 });
 
 export const SIEM_CLIENT_KEY = defineSecret({
@@ -34,6 +34,7 @@ export const SIEM_CLIENT_KEY = defineSecret({
   label: "TLS client private key",
   description: "PEM private key for mutual TLS.",
   schema: z.string().min(1).max(16384),     // validated before encryption; optional (default: 1..8192 chars)
+  // exportable defaults to FALSE for secrets — opt in with exportable: true (encrypted export needs a passphrase)
 });
 
 export const SIEM_FORWARDING = defineFeatureFlag({
@@ -44,9 +45,9 @@ export const SIEM_FORWARDING = defineFeatureFlag({
 });                                         // ALL flags default OFF; no way to declare a default-on flag
 
 // At call time (inside methods, never at factory time if it needs I/O):
-const size = await readSetting(deps.settings, SIEM_BATCH_SIZE);            // typed; falls back to default if unset/invalid
+const size = await readSetting(deps.settings, SIEM_BATCH_SIZE, tx?);       // typed; default if unset/invalid; pass tx inside a transaction
 await writeSetting(deps.settings, SIEM_BATCH_SIZE, 200, tx);               // validated + audited
-const pem = await readSecret(deps.settings, SIEM_CLIENT_KEY);              // server-side only; null if not configured
+const pem = await readSecret(deps.settings, SIEM_CLIENT_KEY, tx?);         // server-side only; null if not configured
 const on  = await deps.settings.isFeatureEnabled("siem.forwarding");       // false unless an admin enabled it
 ```
 
@@ -64,10 +65,11 @@ These helpers work against the core `SettingsStore` interface, so they also work
 - Every change is audited durably (`platform.setting.changed` / `platform.secret.changed` /
   `platform.feature.changed`) in the same transaction as the write. Pass your `tx` if you write inside your
   own transaction; otherwise the store opens one. Audit failure ⇒ no write.
-- Process-local read cache: 5 s TTL, invalidated on every local write.
+- Process-local read cache: 5 s TTL, invalidated on every local write (other processes may see a stale value for ≤ 5 s).
+  Reads with `tx` bypass the cache and read inside the transaction (team rule: never a second pool connection in a tx).
 
 `SETTING_GROUPS`: `general, presentation, security, identity, mail, integrations, observability, backup, jobs,
-files, orders, engagement, compliance, portable, analytics`. Ask platform_engineer to add a group.
+files, orders, engagement, compliance, portable, analytics, features`. Ask platform_engineer to add a group.
 
 ## 2. Service interface — `deps.services.platform: PlatformModule`
 
@@ -79,7 +81,8 @@ interface PlatformModule extends ModuleLifecycle {
   schemaStatus(): Promise<SchemaStatus>;
   /** [impl] Aggregates ModuleLifecycle.health() of services.allModules, each bounded by a timeout (default 2 s). */
   healthReport(options?: { timeoutMs?: number }): Promise<HealthReport>;
-  /** [impl] For /readyz: { ready, state } only — no component details. ready=false if db/schema/keys failing. */
+  /** [impl] For /readyz: { ready, state } only. Uses ONLY platform's own components (database, schema, keys —
+   *  all critical); peer modules never make the node unready. Cached 2 s. */
   readiness(): Promise<{ ready: boolean; state: HealthState }>;
   /** [impl] Public first-run state. Never reveals counts or identities. */
   setupStatus(): Promise<{ administratorExists: boolean }>;
@@ -91,12 +94,28 @@ interface PlatformModule extends ModuleLifecycle {
 type SchemaStatus = { state: "current" | "behind" | "ahead" | "unknown" | "unreadable"; releaseCount: number; appliedCount: number; lastReleaseTag: string | null };
 type HealthReport = { state: HealthState; checkedAt: Date; components: ModuleHealth[] };
 type SetupChecklistItem = { id: "admin_exists" | "mfa_enforced" | "canonical_origin" | "smtp" | "backups" | "siem" | "keys_distinct" | "schema";
-  state: "complete" | "incomplete" | "not_configured" | "unknown"; summary: string };
+  state: "complete" | "incomplete" | "not_configured" | "unknown"; summary: string; required: boolean };
+type PublicPresentation = { slides; supportText; announcement; slideshow: { autoAdvance: boolean; intervalSeconds: number } };
 ```
 
 `createFieldCrypto(config)` (server/security/fieldCrypto.ts) returns `PlatformFieldCrypto extends FieldCrypto` with
 extra **[impl]** `keyIdOf(envelope)`, `needsReencryption(envelope)`, `reencrypt(envelope, aad)`,
 `blindIndexCandidates(value, purpose)` (current + previous index key during a blind-index transition).
+
+### Internals for platform's own router/http (not for other modules)
+
+- `actorGuard(principal, capability = "platform.settings.manage") → (tx) => Promise<void>` — runs FIRST inside every
+  privileged mutation transaction: `identity.sessions.assertCurrent(principal, tx)` (locks users → sessions), then
+  requires full session, role admin, step-up younger than `STEP_UP_MAX_AGE_MS`. Failure ⇒ `FORBIDDEN` with
+  `ACTOR_UNVERIFIABLE | NO_FULL_SESSION | ROLE_NOT_PERMITTED | STEP_UP_REQUIRED`; nothing is written.
+  Lock order: users → user_sessions → platform_settings → platform_presentation_images.
+- `updateSetting(key, value, expectedVersion, guard)`, `presentationService.uploadImage(bytes, guard)`,
+  `presentationService.deleteImage(id, guard)` (refused `IMAGE_IN_USE` while referenced; audit before soft delete),
+  `presentationService.purgeDeletedImageObjects(limit ≤ 500)` (oldest first, `object_purged_at` success marker,
+  retried next sweep; also runs bounded after each delete), `configTransfer().exportDocument(options, guard)` /
+  `apply(raw, digest, guard, passphrase?)`.
+- Config transfer KDF: scrypt, async, one derivation per operation, concurrency 1, queue 4; over the limit ⇒
+  `RATE_LIMITED/KDF_BUSY`.
 
 ## 3. What platform needs from others (coded against these; tell me if you differ)
 
@@ -122,6 +141,7 @@ extra **[impl]** `keyIdOf(envelope)`, `needsReencryption(envelope)`, `reencrypt(
 | `admin.setupChecklist` (query) | admin | |
 | `admin.presentation.get` / `admin.presentation.update` | admin / + step-up | `expectedVersion` |
 | `admin.presentation.images` (query) | admin | allowlisted + uploaded image ids |
+| `admin.presentation.deleteImage` (mutation) | admin + step-up | `{ id }`; `IMAGE_IN_USE` if referenced by slides |
 | `admin.config.export` (mutation) | admin + `platform.settings.manage` (step-up) | `{ includeSecrets, passphrase? }` |
 | `admin.config.importPreview` (mutation) | admin + step-up | dry-run diff, no writes |
 | `admin.config.importApply` (mutation) | admin + step-up | `{ document, passphrase?, expectedPreviewDigest }` |
@@ -138,16 +158,19 @@ extra **[impl]** `keyIdOf(envelope)`, `needsReencryption(envelope)`, `reencrypt(
 `platform.setting.changed`, `platform.secret.changed`, `platform.feature.changed`, `platform.presentation.changed`,
 `platform.presentation.image.uploaded`, `platform.config.exported`, `platform.config.import.previewed`,
 `platform.config.imported`, `platform.config.import.refused`, `platform.schema.contract.refused`,
-`platform.crypto.reencrypt.batch`. Attributes: `settingKey` (declared key — a fixed identifier, not user data),
+`platform.crypto.reencrypt.batch`, `platform.crypto.reencrypt.reset`, `platform.presentation.image.deleted`,
+`platform.presentation.image.refused`. Attributes: `settingKey` (declared key — a fixed identifier, not user data),
 `oldValue`/`newValue` only for booleans, numbers and short identifier-like strings; otherwise `valueChanged: true`.
 Secrets: never any value; `configured: boolean` only.
 
 ## 7. Configuration and keys
 
 - `loadConfig(env)` / `testConfig()` (server/config/env.ts) — strict, fail-closed. `diagnoseConfig(env)` returns
-  `{ ok, issues: { variable, rule }[] }` (never values). Every variable is documented in `server/config/env.example`.
-- CLIs: `tsx scripts/ops/keys/doctor.ts` (config doctor), `tsx scripts/ops/keys/generate.ts` (prints new keys once),
-  re-encryption runbook in `scripts/ops/keys/RUNBOOK.md`.
+  `{ ok, problems: { variable, rule, severity }[] }` (never values). Every variable is documented in `server/config/env.example`.
+- CLIs: `tsx scripts/ops/keys/doctor.ts [--json]` (exit 0/78), `tsx scripts/ops/keys/generate.ts --out-dir DIR | --stdout`
+  plus `--rotate-data-key` / `--retire-data-key ID`. Rotation, blind-index transition, AAD inventory and backup-key notes:
+  `scripts/ops/keys/RUNBOOK.md`.
+- Health component names emitted by platform: `platform.database`, `platform.schema`, `platform.keys` (critical for readiness), `platform.settings`.
 
 ## 8. Feature flags / settings declared by platform
 
