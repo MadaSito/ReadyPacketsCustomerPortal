@@ -33,6 +33,9 @@ export const PROVIDER_RE = /^[a-z][a-z0-9_.-]{0,31}$/;
 /** Safe printable charset for attribute strings: no quotes, angle brackets, backslash, control chars, @. */
 export const ATTRIBUTE_STRING_RE = /^[A-Za-z0-9 _.,:;/#()+=*~-]{0,128}$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
+const DIGEST_KEY = /_(sha256|hash)$/;
+/** Public ids across modules: ULIDs and `[A-Za-z0-9_-]{10,64}` ids (backup, orders). */
+const PUBLIC_ID_VALUE = /^[A-Za-z0-9_-]{10,64}$/;
 
 export const MAX_ATTRIBUTES = 24;
 export const MAX_SAFE_COUNTS = 16;
@@ -132,17 +135,23 @@ export function normaliseAttributeKey(key: string): string {
 
 export function sanitiseAttribute(key: string, value: unknown): SafeAttributeValue | undefined {
   if (!ATTRIBUTE_KEY_RE.test(key)) return undefined;
-  if (SENSITIVE_KEY.test(key) || PII_KEY.test(key)) {
+  if (SENSITIVE_KEY.test(key)) return typeof value === "boolean" ? value : undefined;
+  // Opaque public identifiers (`note_public_id`): the key may contain a personal-field word ("note") but the value is
+  // an id, so only an id-shaped value is accepted, and a long id is not mistaken for a token.
+  if (key.endsWith("_public_id") && typeof value === "string") return PUBLIC_ID_VALUE.test(value) ? value : undefined;
+  if (PII_KEY.test(key)) {
     // A flag ABOUT a secret or personal field (`password_updated: true`, `secrets_included: false`) carries no
-    // secret material; any other value type under such a key is dropped.
+    // secret material; any other value type — including a digest of personal data (`email_hash`) — is dropped.
     return typeof value === "boolean" ? value : undefined;
   }
+  // Evidence digests: SHA-256 hex under `*_sha256` or `*_hash` keys (`content_hash`, `schema_hash`). 64 hex chars would
+  // otherwise trip the long-token scan below; anything else under such a key goes through the normal string rules.
+  if (typeof value === "string" && DIGEST_KEY.test(key) && SHA256_HEX.test(value)) return value;
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") {
     return Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER ? value : undefined;
   }
   if (typeof value !== "string") return undefined;
-  if (key.endsWith("_sha256") && SHA256_HEX.test(value)) return value;
   if (!ATTRIBUTE_STRING_RE.test(value)) return undefined;
   if (scanValue(value).hits.length > 0) return undefined;
   return value;

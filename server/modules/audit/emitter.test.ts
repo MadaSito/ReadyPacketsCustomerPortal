@@ -84,6 +84,42 @@ describe("audit emitter (real MySQL)", () => {
     expect(JSON.stringify(row)).not.toContain("hunter2");
   });
 
+  it("keeps legitimate evidence shapes intact (regression: demo seed dropped note_public_id and content/schema hashes)", async () => {
+    const hex = "0123456789abcdef".repeat(4);
+    const shapes = {
+      // order.note.added
+      visibility: "internal", note_public_id: "01JD0000000000000000000003",
+      // policy.accepted / policy.version.published
+      document_public_id: "01JD0000000000000000000004", content_hash: hex, method: "checkbox", has_order_binding: false, requires_acceptance: true,
+      // intake.questionnaire.created / intake.version.published
+      slug: "synthetic-intake", scope_kind: "catalog_item", schema_hash: hex, version_number: 2,
+      // backup-style long public id and a *_sha256 digest
+      backup_public_id: "bk_" + "a1B2c3D4e5".repeat(5), export_sha256: hex,
+    };
+    await emitter.record({ category: "business", eventName: "policy.accepted", action: "accept", outcome: "completed", attributes: shapes });
+    const [row] = await t.db.select().from(auditEvents);
+    const env = rowToEnvelope(row!);
+    expect(env.dropped_attributes).toBe(0);
+    expect(env.attributes).toEqual(shapes);
+  });
+
+  it("still drops personal or token-shaped values under id/digest keys", async () => {
+    await emitter.record({
+      category: "business", eventName: "order.note.added", action: "create", outcome: "completed",
+      attributes: {
+        email_hash: "0123456789abcdef".repeat(4), // digest of personal data: PII key wins
+        note_public_id: "someone@example.test", // not id-shaped
+        content_hash: "A".repeat(20) + "b1C2d3E4f5G6h7I8j9K0l1M2n3", // not SHA-256 hex → long-token scan
+        token_sha256: "0123456789abcdef".repeat(4), // secret-named key: booleans only
+      },
+    });
+    const [row] = await t.db.select().from(auditEvents);
+    const env = rowToEnvelope(row!);
+    expect(env.attributes).toEqual({});
+    expect(env.dropped_attributes).toBe(4);
+    expect(JSON.stringify(row)).not.toContain("example.test");
+  });
+
   it("drops unsafe attributes instead of storing them", async () => {
     await emitter.record({
       category: "security",

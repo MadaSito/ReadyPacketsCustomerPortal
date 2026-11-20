@@ -21,7 +21,7 @@ Validation (strict; applied by both `record` and `note`):
 | `resource.type` | `^[a-z][a-z0-9_]{0,47}$` | throw |
 | `resource.publicId` | ULID or `^[A-Za-z0-9_.:-]{1,64}$` | dropped |
 | ids (`correlationId`, `jobId`, `packageId`, `importId`, `deliveryId`) | `^[A-Za-z0-9_.:-]{1,64}$` | dropped |
-| `attributes` | ≤ 24 keys, key `^[a-z][a-z0-9_]{0,39}$` not sensitive-named; value primitive, string ≤ 128 chars, safe charset, no e-mail/JWT/bearer/key/URL-credential/long-token patterns | key dropped, `dropped_attributes` count stored |
+| `attributes` | ≤ 24 keys, key `^[a-z][a-z0-9_]{0,39}$` not sensitive-named; value primitive, string ≤ 128 chars, safe charset, no e-mail/JWT/bearer/key/URL-credential/long-token patterns. Secret- or personal-named keys keep booleans only. Exceptions: `*_public_id` keys accept an id-shaped value `^[A-Za-z0-9_-]{10,64}$` (even if the prefix is a personal-field word such as `note_`); `*_sha256` / `*_hash` keys accept 64-char lower-case SHA-256 hex unless the key is secret- or personal-named (`email_hash` is dropped) | key dropped, `dropped_attributes` count stored |
 | `safeCounts` | ≤ 16 keys, finite integers 0..2^53 | key dropped |
 
 Request context fills `actor` (userId, role, session), request/trace/span/correlation ids, origin and source
