@@ -46,6 +46,9 @@ export interface System {
   close(): Promise<void>;
 }
 
+/** Every response a Browser has seen (status, headers, raw text) — for whole-run negative assertions. */
+export const responseLog: { path: string; status: number; headers: Record<string, unknown>; text: string }[] = [];
+
 let probeAddress = 0;
 /** A fresh documentation-range client address (RFC 5737 TEST-NET-3) for a single probe request. */
 export function freshProbeAddress(): string {
@@ -174,6 +177,7 @@ export class Browser {
   }
 
   absorb(res: Response): Response {
+    responseLog.push({ path: String((res as unknown as { req?: { path?: string } }).req?.path ?? ""), status: res.status, headers: { ...res.headers }, text: res.text ?? "" });
     const lines = (res.headers["set-cookie"] as unknown as string[] | undefined) ?? [];
     for (const line of lines) {
       this.setCookies.push(line);

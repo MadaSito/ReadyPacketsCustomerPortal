@@ -160,7 +160,19 @@ describe("customer journey (assembled system)", () => {
     expect(replay.status).toBe(404);
   });
 
-  it.todo("sends a message on the order thread (engagement router not yet mounted: trpc.engagement is empty)");
+  it("sends a message on the order thread and reads it back", async () => {
+    const input = { orderId, body: "Is the delivery date confirmed?", idempotencyKey: "journey-customer-msg-0001" };
+    await expectCsrfRequired("engagement.messages.send", input);
+    const sent = await browser().mutate<{ publicId: string }>("engagement.messages.send", input);
+    const message = Browser.ok(sent);
+    await expectAudited(sent.requestId, "engagement.message.sent");
+    // Idempotent replay returns the same message instead of posting twice.
+    const replay = Browser.ok(await browser().mutate<{ publicId: string }>("engagement.messages.send", input));
+    expect(replay.publicId).toBe(message.publicId);
+    const thread = JSON.stringify(Browser.ok(await browser().query("engagement.messages.listByOrder", { orderId })));
+    expect(thread).toContain("Is the delivery date confirmed?");
+    expect(thread.split(message.publicId).length - 1).toBe(1);
+  });
 
   it("signs out: cookies are cleared and the old session token is dead", async () => {
     const token = browser().sessionToken!;
