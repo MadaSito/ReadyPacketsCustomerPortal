@@ -243,7 +243,7 @@ the delete statement (retention.ts:201–226).
 | O-1 (**fixed: fc45501, snake_case at source**) | orders/orderService.ts:628,749 and others | camelCase attribute keys | Now normalised by the envelope; switch to snake_case at the source. `previous_reference`/`new_reference` are local-only by design |
 | C-1 (**fixed: b7a524a, actorAuth.ts:20,56 outside tx**) | compliance/invoicesService.ts:148, intakeService.ts:99, policiesService.ts:120, actorAuth.ts:55 | Service-level capability and remediation denials throw `forbidden()` with no audit; only tRPC-level denials are recorded | Add a `deny(actor, reasonCode, resource)` helper recording `authz.compliance.denied` (security, denied) outside any tx |
 | C-2 (**fixed: b7a524a, invoicesService.ts:1211,1428 after rollback**) | compliance/invoicesService.ts:1066–1080, 1279–1289 | Financial refusals (payment on a voided/unissued invoice, currency mismatch, over-refund) are not recorded | Record `invoice.payment.refused` / `invoice.refund.refused` (business, refused, reasonCode) after rollback |
-| E-1 | engagement (working tree) | Re-check after the owner reports done | Check denial coverage on ticket reply/close by non-owners, and snake_case keys |
+| E-1 (**fixed: 683c794, ticketsService.ts:296–326 durable `authz.engagement.denied` CROSS_TENANT_TICKET in a pre-tx preflight; snake_case keys**) | engagement (working tree) | Re-check after the owner reports done | Check denial coverage on ticket reply/close by non-owners, and snake_case keys |
 | S-1 (**fixed: 727a0cf, siem/index.ts:1774 durable `siem.audit.loss_detected`**) | siem consumer of `readEventsAfter` | Must use the new `pruned`/`missing` counts | Advance the cursor on empty batches when `nextCursor` changed. On `missing > 0`, record a durable `siem.audit.loss_detected` (WARN, reasonCode `AUDIT_EVENTS_MISSING`) |
 | B-1 (**closed: confirmed by reading index.ts:1419–1452 — record in tx before archive update; storage delete after commit**) | backup/index.ts:2030 | Retention run request: the owner should confirm `backup.retention.executed` is written in the same tx as each deletion, before the object delete. Not verified by me | Confirm, or move the record before the delete |
 
@@ -268,7 +268,7 @@ Not verified: end-to-end correlation through a live SMTP or SIEM receiver (no ne
 
 ## Re-check status (2026-11-20)
 
-Fixes above were verified by reading the cited lines at the listed commit; the owners report their module tests pass (I did not re-run them). Still open: E-1 (engagement re-check pending owner's done report). Web-initiated restore was removed from the backup tRPC surface by integrator decision; restore audit coverage now belongs to the operator CLI (scripts/ops/restore/**) and is not re-reviewed here.
+Fixes above were verified by reading the cited lines at the listed commit; the owners report their module tests pass (I did not re-run them). No findings remain open. Web-initiated restore was removed from the backup tRPC surface by integrator decision; restore audit coverage now belongs to the operator CLI (scripts/ops/restore/**) and is not re-reviewed here.
 
 ## Not verified / limitations
 
