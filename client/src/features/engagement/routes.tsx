@@ -26,6 +26,13 @@ export const engagementFeature: FeatureRoutes = {
     { path: "/notifications", access: "customer", title: "Notifications", component: NotificationsPage },
     { path: "/search", access: "customer", title: "Search", component: SearchPage },
     {
+      path: "/admin/search",
+      access: "staff",
+      title: "Search",
+      component: SearchPage,
+      capability: "search.global",
+    },
+    {
       path: "/admin/tickets",
       access: "staff",
       title: "Support queue",

@@ -22,10 +22,10 @@ Owner paths: `server/modules/engagement/**`, `client/src/features/engagement/**`
   - `exportForSubject` (decrypted user-authored messages, tickets + non-internal replies, notifications, preferences), `eraseForSubject` (pseudonymizes closed-ticket content + clears search tokens while skipping active/legal-hold records), `purgeExpired` (acquires `FOR UPDATE` row locks, re-checks `compliance.hasActiveHold` inside the transaction, records durable `engagement.retention.purged` audit event *before* deleting expired closed tickets), and workspace `exportBundle` / `importBundle` with dry-run plan and deterministic ULID idempotency.
 
 ### 1.2 Client (`client/src/features/engagement/**`)
-- **Shell Exports (`shell.tsx`)**: `NotificationBellPopover` (accessible `Drawer` trigger button with unread count badge, mark-read / mark-all-read actions) and `GlobalSearchBox` (navigates to `/search?q=...` without `window.location`).
+- **Shell Exports (`shell.tsx`)**: `NotificationBellPopover` (accessible `Drawer` trigger button with unread count badge, mark-read / mark-all-read actions) and `GlobalSearchBox` (navigates staff/admin in the console to `/admin/search?q=...` and customers to `/search?q=...` without `window.location`).
 - **Order Detail Embed (`OrderMessagesTab.tsx`)**: Embedded order thread with plain-text JSX rendering, lock banner, attachment chips, read-receipt indicators, staff internal-note toggle, and keyboard shortcut (`Ctrl/Cmd+Enter`).
-- **Customer Pages (`pages/`)**: `CustomerMessagesPage` (`/messages`), `SupportTicketsPage` (`/support`), `NewSupportTicketPage` (`/support/new`), `SupportTicketDetailPage` (`/support/:ticketId` with `"Load newer replies"` pagination, close confirmation `Modal`, and reopen form), `NotificationsPage` (`/notifications` with feed + per-category preference switches and locked `security` row), `SearchPage` (`/search` with grouped domain cards and partial-timeout `Banner`).
-- **Staff / Admin Console Pages (`pages/` & `widgets/`)**: `AdminTicketsPage` (`/admin/tickets`), `AdminTicketDetailPage` (`/admin/tickets/:ticketId`), `AdminMessagesPage` (`/admin/messages`), `CustomerEngagementWidget`, `ConsoleQueueWidget`, and `routes.tsx` (`engagementCustomerRoutes`, `engagementConsoleRoutes`).
+- **Customer Pages (`pages/`)**: `CustomerMessagesPage` (`/messages`), `SupportTicketsPage` (`/support`), `NewSupportTicketPage` (`/support/new`), `SupportTicketDetailPage` (`/support/:ticketId` with `"Load newer replies"` pagination, close confirmation `Modal`, and reopen form), `NotificationsPage` (`/notifications` with feed + per-category preference switches and locked `security` row), `SearchPage` (`/search` for customers and `/admin/search` for staff/admin inside the console frame, with area-aware links and partial-timeout `Callout`).
+- **Staff / Admin Console Pages (`pages/` & `widgets/`)**: `AdminTicketsPage` (`/admin/tickets`), `AdminTicketDetailPage` (`/admin/tickets/:ticketId`), `AdminMessagesPage` (`/admin/messages`), `SearchPage` (`/admin/search` with `access: "staff"` and `capability: "search.global"`, omitted from sidebar `nav`), `CustomerEngagementWidget`, `ConsoleQueueWidget`, and `routes.tsx` (`engagementFeature`).
 
 ---
 
@@ -41,7 +41,7 @@ Executed via sandbox scripts (`source scripts/dev/env.sh`):
    - Result: 0 errors, 0 warnings (verified no `sql.raw`, no browser storage APIs, no raw hex/palette classes, no `dangerouslySetInnerHTML`, React 19 hooks rules clean).
 3. **Integration & Accessibility Tests**:
    - Command: `scripts/dev/test.sh server/modules/engagement/engagement.test.ts` and `scripts/dev/test.sh client/src/features/engagement/engagement.test.tsx`
-   - Result: **2 test files passed, 17/17 tests passed**:
+   - Result: **2 test files passed, 18/18 tests passed**:
      - `server/modules/engagement/engagement.test.ts` (**12 tests against real MySQL 8**):
        1. Order messages: owner, contributor write, viewer read-only (`GRANT_READ_ONLY`), grant revocation, staff internal notes invisible to customers, unread counts & read receipts, idempotency.
        2. Negative authz & lock enforcement: cross-tenant `NOT_FOUND` + `authz.engagement.denied` audit, customer internal-note rejection, `staff_only` attachment rejection, `archived`/`cancelled`/`legal_hold` lock enforcement (`ORDER_LOCKED_FOR_MESSAGING`).
@@ -53,12 +53,13 @@ Executed via sandbox scripts (`source scripts/dev/env.sh`):
        8. Unverified MFA step-up session rejection (`MFA_STEP_UP_REQUIRED`) and in-transaction revoked/suspended actor rejection.
        9. Cross-tenant search anti-starvation: 120 matching tokens from another tenant do not starve an authorized user's single matching ticket/message; lowercase reference prefix query matches uppercase-normalized references.
        10. Ticket detail pagination & internal-note metadata isolation: 65 replies paginate cleanly (`50` + `15` via `repliesNextCursor`), `internalOnly` notes do not leak to customer pages, and `internalOnly` replies + `admin.assign` leave customer-visible `updatedAt` and `lastMessageAt` unchanged.
-     - `client/src/features/engagement/engagement.test.tsx` (**5 client test suites with `axe-core` WCAG checks**):
+     - `client/src/features/engagement/engagement.test.tsx` (**6 client test suites with `axe-core` WCAG checks**):
        1. Shell `NotificationBellPopover` + `GlobalSearchBox`: unread count badge, accessible `Drawer` open/mark-read/mark-all-read, `/search?q=...` navigation, zero `axe` violations.
        2. `OrderMessagesTab`: renders `<script>alert("xss")</script>` strictly as inert text (`container.querySelector("script") === null`), sends message with idempotency key, zero `axe` violations.
        3. All 6 customer pages (`/messages`, `/support`, `/support/new`, `/support/:ticketId` including `"Load newer replies"` cursor pagination + close modal, `/notifications`, `/search` with `partial: true` banner) — interactive flows + zero `axe` violations on every page.
        4. All 3 staff/admin pages (`/admin/tickets`, `/admin/tickets/:ticketId` internal notes + triage controls, `/admin/messages`) + both dashboard widgets (`CustomerEngagementWidget`, `ConsoleQueueWidget`) — interactive flows + zero `axe` violations on every surface.
        5. Honest loading/error/empty states across list/detail pages & widgets (`SupportTicketsPage`, `CustomerMessagesPage`, `NotificationsPage`, `AdminTicketsPage`, `SupportTicketDetailPage`, `CustomerEngagementWidget`): verifies `EmptyState` never renders during pending or failed queries, failed queries render `@/ui` `ErrorState` (`safeMessage`, `Reference: <requestId>`, and `Try again` retry button) with zero `axe` violations, and `EmptyState` renders only after a successful empty response.
+       6. Console vs. customer search routing (`E-2`): verifies `/admin/search` route registration (`access: "staff"`, `capability: "search.global"`, omitted from sidebar `nav`), `GlobalSearchBox` sending staff/admin to `/admin/search?q=...` and customers to `/search?q=...`, `SearchPage` rendering console links (`/admin/orders/:id`, `/admin/tickets/:id`, `/admin/orders/:id/messages`, `/admin/messages`, `/admin/customers/:id`) and keeping re-submissions on `/admin/search` for staff/admin while keeping customer routes (`/orders/:id`, `/support/:id`, `/orders/:id/messages`, `/messages`) unchanged, with zero `axe` violations.
 
 ---
 

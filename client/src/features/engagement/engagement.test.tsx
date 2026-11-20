@@ -4,11 +4,12 @@ import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import type { ReactElement } from "react";
 import superjson from "superjson";
 import { describe, expect, it, vi } from "vitest";
-import { Route } from "wouter";
+import { Route, useLocation, useSearch } from "wouter";
 import type { AppRouter } from "@server/trpc/root";
 import type { SafeErrorData } from "@server/trpc/trpc";
 import { fakeAuthApi, createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { dropInfiniteDirectionLink, TRPCProvider } from "@/lib/trpc";
+import { engagementFeature } from "./routes";
 import { GlobalSearchBox, NotificationBellPopover } from "./shell";
 import OrderMessagesTab, { OrderMessagesUnreadBadge } from "./OrderMessagesTab";
 import CustomerMessagesPage from "./pages/CustomerMessagesPage";
@@ -896,5 +897,192 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
     expect(screen.getByText("req_widget_503")).toBeInTheDocument();
     expect(screen.queryByText("0 unread")).not.toBeInTheDocument();
     widgetErrorView.unmount();
+  });
+
+  it("routes staff/admin search to /admin/search with console links while keeping customer search on /search", async () => {
+    const user = userEvent.setup();
+
+    function LocationProbe() {
+      const [loc] = useLocation();
+      const search = useSearch();
+      return <output data-testid="location-probe">{search ? `${loc}?${search}` : loc}</output>;
+    }
+
+    // 1. Route & nav registration check (console route exists with staff + search.global; never in sidebar nav)
+    const adminSearchRoute = engagementFeature.routes.find((r) => r.path === "/admin/search");
+    expect(adminSearchRoute).toBeDefined();
+    expect(adminSearchRoute?.access).toBe("staff");
+    expect(adminSearchRoute?.capability).toBe("search.global");
+    const customerSearchRoute = engagementFeature.routes.find((r) => r.path === "/search");
+    expect(customerSearchRoute?.access).toBe("customer");
+    expect((engagementFeature.nav ?? []).some((item) => item.href === "/admin/search")).toBe(false);
+    expect((engagementFeature.nav ?? []).some((item) => item.href === "/search")).toBe(false);
+
+    // 2. GlobalSearchBox in console (staff & admin) navigates to /admin/search?q=...
+    const staffHeaderSearch = renderEngagement(
+      <>
+        <GlobalSearchBox />
+        <LocationProbe />
+      </>,
+      {},
+      { path: "/admin/orders", role: "staff" },
+    );
+    await user.type(screen.getByRole("searchbox", { name: "Global search" }), "RP-2026{Enter}");
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/admin/search?q=RP-2026");
+    staffHeaderSearch.unmount();
+
+    const adminHeaderSearch = renderEngagement(
+      <>
+        <GlobalSearchBox />
+        <LocationProbe />
+      </>,
+      {},
+      { path: "/admin", role: "admin" },
+    );
+    await user.type(screen.getByRole("searchbox", { name: "Global search" }), "RP-2026{Enter}");
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/admin/search?q=RP-2026");
+    adminHeaderSearch.unmount();
+
+    // 3. GlobalSearchBox for customer navigates to /search?q=... (unchanged)
+    const customerHeaderSearch = renderEngagement(
+      <>
+        <GlobalSearchBox />
+        <LocationProbe />
+      </>,
+      {},
+      { path: "/orders", role: "customer" },
+    );
+    await user.type(screen.getByRole("searchbox", { name: "Global search" }), "RP-2026{Enter}");
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/search?q=RP-2026");
+    customerHeaderSearch.unmount();
+
+    // 4. SearchPage at /admin/search renders console links and preserves /admin/search on re-submit
+    const mockSearchPayload = {
+      orders: [
+        {
+          publicId: ORDER_ID,
+          reference: "RP-2026-0001",
+          projectName: "Exhibit B Packet",
+          statusLabel: "In review",
+          updatedAt: FIXED_DATE,
+        },
+      ],
+      tickets: [
+        {
+          publicId: TICKET_ID,
+          ticketNumber: "TKT-20261120-ABCD23",
+          subject: "Exhibit B formatting question",
+          category: "order",
+          status: "open",
+          priority: "high",
+          relatedOrderReference: "RP-2026-0001",
+          updatedAt: FIXED_DATE,
+        },
+      ],
+      messages: [
+        {
+          publicId: "01JENG00000000000000000099",
+          orderPublicId: ORDER_ID,
+          orderReference: "RP-2026-0001",
+          visibility: "internal",
+          snippet: "Internal coordination note on RP-2026-0001.",
+          createdAt: FIXED_DATE,
+        },
+      ],
+      customers: [
+        {
+          publicId: CUSTOMER_ID,
+          customerRef: "CUST-2026-0042",
+          name: "Alice Customer",
+          status: "active",
+        },
+      ],
+      meta: { timedOut: false, budgetMs: 800 },
+    };
+
+    const staffSearchView = renderEngagement(
+      <>
+        <SearchPage />
+        <LocationProbe />
+      </>,
+      { "engagement.search.query": () => mockSearchPayload },
+      { path: "/admin/search?q=RP-2026", role: "staff" },
+    );
+
+    const staffOrderLink = await screen.findByRole("link", { name: /RP-2026-0001 — Exhibit B Packet/ });
+    expect(staffOrderLink).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);
+    expect(
+      screen.getByRole("link", { name: /TKT-20261120-ABCD23 — Exhibit B formatting question/ }),
+    ).toHaveAttribute("href", `/admin/tickets/${TICKET_ID}`);
+    expect(screen.getByRole("link", { name: "Order RP-2026-0001" })).toHaveAttribute(
+      "href",
+      `/admin/orders/${ORDER_ID}/messages`,
+    );
+    expect(screen.getByRole("link", { name: "All messages" })).toHaveAttribute(
+      "href",
+      "/admin/messages",
+    );
+    expect(screen.getByRole("link", { name: "Alice Customer" })).toHaveAttribute(
+      "href",
+      `/admin/customers/${CUSTOMER_ID}`,
+    );
+    await expectNoAxeViolations(staffSearchView.container);
+
+    const staffInput = screen.getByLabelText(/Search terms/i);
+    await user.clear(staffInput);
+    await user.type(staffInput, "TKT-2026");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/admin/search?q=TKT-2026");
+    staffSearchView.unmount();
+
+    // 5. SearchPage at /search for customer renders customer links and omits customers card
+    const customerSearchView = renderEngagement(
+      <>
+        <SearchPage />
+        <LocationProbe />
+      </>,
+      {
+        "engagement.search.query": () => ({
+          ...mockSearchPayload,
+          messages: [
+            {
+              publicId: "01JENG00000000000000000098",
+              orderPublicId: ORDER_ID,
+              orderReference: "RP-2026-0001",
+              visibility: "customer",
+              snippet: "Customer-visible update on RP-2026-0001.",
+              createdAt: FIXED_DATE,
+            },
+          ],
+          customers: [],
+        }),
+      },
+      { path: "/search?q=RP-2026", role: "customer" },
+    );
+
+    const customerOrderLink = await screen.findByRole("link", {
+      name: /RP-2026-0001 — Exhibit B Packet/,
+    });
+    expect(customerOrderLink).toHaveAttribute("href", `/orders/${ORDER_ID}`);
+    expect(
+      screen.getByRole("link", { name: /TKT-20261120-ABCD23 — Exhibit B formatting question/ }),
+    ).toHaveAttribute("href", `/support/${TICKET_ID}`);
+    expect(screen.getByRole("link", { name: "Order RP-2026-0001" })).toHaveAttribute(
+      "href",
+      `/orders/${ORDER_ID}/messages`,
+    );
+    expect(screen.getByRole("link", { name: "All conversations" })).toHaveAttribute(
+      "href",
+      "/messages",
+    );
+    expect(screen.queryByRole("link", { name: "Alice Customer" })).not.toBeInTheDocument();
+    await expectNoAxeViolations(customerSearchView.container);
+
+    const customerInput = screen.getByLabelText(/Search terms/i);
+    await user.clear(customerInput);
+    await user.type(customerInput, "TKT-2026");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    expect(screen.getByTestId("location-probe")).toHaveTextContent("/search?q=TKT-2026");
+    customerSearchView.unmount();
   });
 });

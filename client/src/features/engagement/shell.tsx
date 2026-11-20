@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Bell, CheckCheck, Search } from "lucide-react";
 import { Link, useLocation } from "wouter";
+import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import type { SearchDomain } from "@server/modules/engagement/types";
 import {
@@ -24,6 +25,7 @@ export interface NotificationBellPopoverProps {
 }
 
 export interface GlobalSearchBoxProps {
+  area?: "customer" | "console";
   className?: string;
 }
 
@@ -247,16 +249,27 @@ export function useBoundedSearch(
 
 /**
  * Console/shell bounded global search input.
+ * Routes staff/admin (or console area) to `/admin/search?q=...` and customers to `/search?q=...`.
  */
-export function GlobalSearchBox({ className }: GlobalSearchBoxProps) {
-  const [, navigate] = useLocation();
+export function GlobalSearchBox({ area, className }: GlobalSearchBoxProps) {
+  const [location, navigate] = useLocation();
+  const { me } = useSession();
   const [query, setQuery] = useState("");
+
+  const isConsole =
+    area !== undefined
+      ? area === "console"
+      : location === "/admin" ||
+        location.startsWith("/admin/") ||
+        me?.user.role === "staff" ||
+        me?.user.role === "admin";
+  const searchBasePath = isConsole ? "/admin/search" : "/search";
 
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const trimmed = query.normalize("NFC").trim();
     if (trimmed.length >= 2) {
-      navigate(`/search?q=${encodeURIComponent(trimmed)}`);
+      navigate(`${searchBasePath}?q=${encodeURIComponent(trimmed)}`);
     }
   };
 

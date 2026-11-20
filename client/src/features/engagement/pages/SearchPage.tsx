@@ -1,7 +1,9 @@
 import { useState, type FormEvent } from "react";
+import type { inferRouterOutputs } from "@trpc/server";
 import { LifeBuoy, MessageSquare, Package, Search, Users } from "lucide-react";
 import { Link, useLocation, useSearch } from "wouter";
 import type { SearchDomain } from "@server/modules/engagement/types";
+import type { AppRouter } from "@server/trpc/root";
 import { useSession } from "@/lib/session";
 import {
   Badge,
@@ -20,11 +22,175 @@ import {
 import { TicketPriorityBadge, TicketStatusBadge } from "../helpers";
 import { useBoundedSearch } from "../shell";
 
+type SearchQueryOutput = inferRouterOutputs<AppRouter>["engagement"]["search"]["query"];
+
+interface SearchResultsListProps {
+  data: SearchQueryOutput;
+  isStaffArea: boolean;
+  domainFilter: SearchDomain | "all";
+}
+
+function SearchResultsList({ data, isStaffArea, domainFilter }: SearchResultsListProps) {
+  return (
+    <div className="flex flex-col gap-6">
+      {data.meta.timedOut ? (
+        <Callout tone="warning" title="Partial results shown">
+          The search time budget elapsed before every domain finished. Narrow your terms for faster matches.
+        </Callout>
+      ) : null}
+
+      {data.orders.length > 0 ? (
+        <Card title="Orders" actions={<Badge tone="neutral">{data.orders.length}</Badge>}>
+          <ul className="flex flex-col divide-y divide-line" aria-label="Matching orders">
+            {data.orders.map((order) => (
+              <li
+                key={order.publicId}
+                className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0"
+              >
+                <div className="min-w-0">
+                  <Link
+                    href={isStaffArea ? `/admin/orders/${order.publicId}` : `/orders/${order.publicId}`}
+                    className="font-semibold text-action underline-offset-2 hover:underline"
+                  >
+                    {order.reference} — {order.projectName}
+                  </Link>
+                  <p className="text-xs text-muted">
+                    Updated <DateTime value={order.updatedAt} format="relative" />
+                  </p>
+                </div>
+                <Badge tone="info" icon={<Package aria-hidden="true" />}>
+                  {order.statusLabel}
+                </Badge>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      ) : null}
+
+      {data.tickets.length > 0 ? (
+        <Card title="Support tickets" actions={<Badge tone="neutral">{data.tickets.length}</Badge>}>
+          <ul className="flex flex-col divide-y divide-line" aria-label="Matching support tickets">
+            {data.tickets.map((ticket) => (
+              <li
+                key={ticket.publicId}
+                className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0"
+              >
+                <div className="min-w-0">
+                  <Link
+                    href={isStaffArea ? `/admin/tickets/${ticket.publicId}` : `/support/${ticket.publicId}`}
+                    className="font-semibold break-words text-action underline-offset-2 hover:underline"
+                  >
+                    {ticket.ticketNumber} — {ticket.subject}
+                  </Link>
+                  <p className="text-xs text-muted">
+                    Updated <DateTime value={ticket.updatedAt} format="relative" />
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <TicketStatusBadge status={ticket.status} staffView={isStaffArea} />
+                  <TicketPriorityBadge priority={ticket.priority} />
+                </div>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      ) : null}
+
+      {data.messages.length > 0 ? (
+        <Card
+          title="Order messages"
+          actions={
+            <div className="flex items-center gap-2">
+              <Link
+                href={isStaffArea ? "/admin/messages" : "/messages"}
+                className="text-xs font-medium text-action underline-offset-2 hover:underline"
+              >
+                {isStaffArea ? "All messages" : "All conversations"}
+              </Link>
+              <Badge tone="neutral">{data.messages.length}</Badge>
+            </div>
+          }
+        >
+          <ul className="flex flex-col divide-y divide-line" aria-label="Matching order messages">
+            {data.messages.map((msg) => (
+              <li key={msg.publicId} className="flex flex-col gap-1 py-3 first:pt-0 last:pb-0">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Link
+                    href={
+                      isStaffArea
+                        ? `/admin/orders/${msg.orderPublicId}/messages`
+                        : `/orders/${msg.orderPublicId}/messages`
+                    }
+                    className="font-semibold text-action underline-offset-2 hover:underline"
+                  >
+                    Order {msg.orderReference}
+                  </Link>
+                  <div className="flex items-center gap-2">
+                    {msg.visibility === "internal" ? (
+                      <Badge tone="warning">Internal note</Badge>
+                    ) : (
+                      <Badge tone="neutral" icon={<MessageSquare aria-hidden="true" />}>
+                        Message
+                      </Badge>
+                    )}
+                    <span className="text-xs text-muted">
+                      <DateTime value={msg.createdAt} format="relative" />
+                    </span>
+                  </div>
+                </div>
+                {/* Plain text snippet */}
+                <p className="break-words text-sm text-body">{msg.snippet}</p>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      ) : null}
+
+      {isStaffArea && data.customers.length > 0 ? (
+        <Card title="Customers" actions={<Badge tone="neutral">{data.customers.length}</Badge>}>
+          <ul className="flex flex-col divide-y divide-line" aria-label="Matching customers">
+            {data.customers.map((customer) => (
+              <li
+                key={customer.publicId}
+                className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0"
+              >
+                <div className="min-w-0">
+                  <Link
+                    href={`/admin/customers/${customer.publicId}`}
+                    className="font-semibold text-action underline-offset-2 hover:underline"
+                  >
+                    {customer.name}
+                  </Link>
+                  {customer.customerRef ? (
+                    <p className="text-xs text-muted">{customer.customerRef}</p>
+                  ) : null}
+                </div>
+                <Badge tone="neutral" icon={<Users aria-hidden="true" />}>
+                  {customer.status}
+                </Badge>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      ) : null}
+
+      {data.tickets.length === 0 && domainFilter === "tickets" ? (
+        <EmptyState icon={LifeBuoy} title="No matching tickets" />
+      ) : null}
+    </div>
+  );
+}
+
 export default function SearchPage() {
   const searchString = useSearch();
-  const [, navigate] = useLocation();
+  const [location, navigate] = useLocation();
   const { me } = useSession();
-  const isStaffArea = me?.user.role === "staff" || me?.user.role === "admin";
+  const isStaffArea =
+    location === "/admin" ||
+    location.startsWith("/admin/") ||
+    me?.user.role === "staff" ||
+    me?.user.role === "admin";
+  const searchBasePath = isStaffArea ? "/admin/search" : "/search";
 
   const urlQ = new URLSearchParams(searchString).get("q") ?? "";
   const [draftState, setDraftState] = useState<{ sourceUrlQ: string; input: string }>({
@@ -46,19 +212,20 @@ export default function SearchPage() {
     event.preventDefault();
     const trimmed = inputValue.normalize("NFC").trim();
     if (trimmed.length >= 2) {
-      navigate(`/search?q=${encodeURIComponent(trimmed)}`, { replace: true });
+      navigate(`${searchBasePath}?q=${encodeURIComponent(trimmed)}`, { replace: true });
     } else {
-      navigate("/search", { replace: true });
+      navigate(searchBasePath, { replace: true });
     }
   };
 
   const normalized = activeQuery.normalize("NFC").trim();
   const data = searchQuery.data;
+  const visibleCustomersCount = isStaffArea ? (data?.customers.length ?? 0) : 0;
   const totalHits =
     (data?.orders.length ?? 0) +
     (data?.tickets.length ?? 0) +
     (data?.messages.length ?? 0) +
-    (data?.customers.length ?? 0);
+    visibleCustomersCount;
 
   return (
     <div className="flex flex-col gap-6">
@@ -127,142 +294,7 @@ export default function SearchPage() {
           description="Check the reference number or try fewer keywords."
         />
       ) : (
-        <div className="flex flex-col gap-6">
-          {data.meta.timedOut ? (
-            <Callout tone="warning" title="Partial results shown">
-              The search time budget elapsed before every domain finished. Narrow your terms for faster matches.
-            </Callout>
-          ) : null}
-
-          {data.orders.length > 0 ? (
-            <Card
-              title="Orders"
-              actions={<Badge tone="neutral">{data.orders.length}</Badge>}
-            >
-              <ul className="flex flex-col divide-y divide-line" aria-label="Matching orders">
-                {data.orders.map((order) => (
-                  <li key={order.publicId} className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0">
-                    <div className="min-w-0">
-                      <Link
-                        href={isStaffArea ? `/admin/orders/${order.publicId}` : `/orders/${order.publicId}`}
-                        className="font-semibold text-action underline-offset-2 hover:underline"
-                      >
-                        {order.reference} — {order.projectName}
-                      </Link>
-                      <p className="text-xs text-muted">
-                        Updated <DateTime value={order.updatedAt} format="relative" />
-                      </p>
-                    </div>
-                    <Badge tone="info" icon={<Package aria-hidden="true" />}>
-                      {order.statusLabel}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          ) : null}
-
-          {data.tickets.length > 0 ? (
-            <Card
-              title="Support tickets"
-              actions={<Badge tone="neutral">{data.tickets.length}</Badge>}
-            >
-              <ul className="flex flex-col divide-y divide-line" aria-label="Matching support tickets">
-                {data.tickets.map((ticket) => (
-                  <li key={ticket.publicId} className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0">
-                    <div className="min-w-0">
-                      <Link
-                        href={isStaffArea ? `/admin/tickets/${ticket.publicId}` : `/support/${ticket.publicId}`}
-                        className="font-semibold break-words text-action underline-offset-2 hover:underline"
-                      >
-                        {ticket.ticketNumber} — {ticket.subject}
-                      </Link>
-                      <p className="text-xs text-muted">
-                        Updated <DateTime value={ticket.updatedAt} format="relative" />
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <TicketStatusBadge status={ticket.status} staffView={isStaffArea} />
-                      <TicketPriorityBadge priority={ticket.priority} />
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          ) : null}
-
-          {data.messages.length > 0 ? (
-            <Card
-              title="Order messages"
-              actions={<Badge tone="neutral">{data.messages.length}</Badge>}
-            >
-              <ul className="flex flex-col divide-y divide-line" aria-label="Matching order messages">
-                {data.messages.map((msg) => (
-                  <li key={msg.publicId} className="flex flex-col gap-1 py-3 first:pt-0 last:pb-0">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <Link
-                        href={
-                          isStaffArea
-                            ? `/admin/orders/${msg.orderPublicId}/messages`
-                            : `/orders/${msg.orderPublicId}/messages`
-                        }
-                        className="font-semibold text-action underline-offset-2 hover:underline"
-                      >
-                        Order {msg.orderReference}
-                      </Link>
-                      <div className="flex items-center gap-2">
-                        {msg.visibility === "internal" ? (
-                          <Badge tone="warning">Internal note</Badge>
-                        ) : (
-                          <Badge tone="neutral" icon={<MessageSquare aria-hidden="true" />}>
-                            Message
-                          </Badge>
-                        )}
-                        <span className="text-xs text-muted">
-                          <DateTime value={msg.createdAt} format="relative" />
-                        </span>
-                      </div>
-                    </div>
-                    {/* Plain text snippet */}
-                    <p className="break-words text-sm text-body">{msg.snippet}</p>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          ) : null}
-
-          {data.customers.length > 0 ? (
-            <Card
-              title="Customers"
-              actions={<Badge tone="neutral">{data.customers.length}</Badge>}
-            >
-              <ul className="flex flex-col divide-y divide-line" aria-label="Matching customers">
-                {data.customers.map((customer) => (
-                  <li key={customer.publicId} className="flex flex-wrap items-center justify-between gap-2 py-3 first:pt-0 last:pb-0">
-                    <div className="min-w-0">
-                      <Link
-                        href={`/admin/customers/${customer.publicId}`}
-                        className="font-semibold text-action underline-offset-2 hover:underline"
-                      >
-                        {customer.name}
-                      </Link>
-                      {customer.customerRef ? (
-                        <p className="text-xs text-muted">{customer.customerRef}</p>
-                      ) : null}
-                    </div>
-                    <Badge tone="neutral" icon={<Users aria-hidden="true" />}>
-                      {customer.status}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          ) : null}
-
-          {data.tickets.length === 0 && domainFilter === "tickets" ? (
-            <EmptyState icon={LifeBuoy} title="No matching tickets" />
-          ) : null}
-        </div>
+        <SearchResultsList data={data} isStaffArea={isStaffArea} domainFilter={domainFilter} />
       )}
     </div>
   );
