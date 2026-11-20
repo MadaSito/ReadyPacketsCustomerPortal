@@ -1,6 +1,6 @@
 # Backup & Disaster Recovery Module — API (v1)
 
-Owner: `recovery_ops_engineer`. Paths: `server/modules/backup/**`, `client/src/features/backup/**`, `deploy/**`, `.github/**`, `scripts/ops/{backup,restore,install}/**`, `docs/runbooks/**`.
+Owner: `recovery_ops_engineer`. Owned paths: `server/modules/backup/**`, `scripts/ops/{backup,restore,install}/**`, `docs/operations/BACKUP_AND_RESTORE.md` (`deploy/**` handed to `files_engineer`, `.github/**` to `portable_contract_engineer`, `client/src/features/backup/**` to `audit_engineer`).
 
 Status markers: **[sig]** signature published, implementation in progress; **[impl]** implemented + tested.
 
@@ -149,11 +149,14 @@ export interface BackupModule extends ModuleLifecycle {
     keepLastCount: number;
     maxAgeDays: number;
     scheduleEnabled: boolean;
+    autoPruneEnabled: boolean;
+    recoverySandboxRoot: string;
   }>;
   updateRetentionPolicy(principal: SessionPrincipal, input: {
     keepLastCount: number;
     maxAgeDays: number;
     scheduleEnabled: boolean;
+    autoPruneEnabled?: boolean;
   }): Promise<void>;
   previewRetention(principal: SessionPrincipal): Promise<{ items: RetentionPlanItem[] }>;
   runRetention(principal: SessionPrincipal, input: { dryRun: boolean }): Promise<{ prunedCount: number; items: RetentionPlanItem[] }>;
@@ -171,23 +174,29 @@ Per `BUILD_CONTRACT.md` §5.1, backup collectors read:
 - Private object inventory from `order_files` (`purged_at IS NULL`, including soft-deleted and superseded versions; coordinated with `files_engineer`'s `backupFiles` / `order_files`) and `platform_presentation_images` (`deleted_at IS NULL`), streamed via `deps.storage.get(storageKey)`.
 - During isolated restore: connects only to the newly created isolated `targetDatabaseName` and isolated `targetStorageDir` to run §7.3 security-state continuity updates (`user_sessions`, `identity_tokens`, `assurance_accounts`, `assurance_recovery_codes`, `assurance_passkeys`, `assurance_challenges`, `file_download_tickets`, `http_rate_limit_counters`, `job_runs`, `mail_outbox`, `platform_settings`, `audit_events`/`audit_chain`). Never writes to live tables except its own `backup_*` and `deps.audit.record`.
 
-## 4. tRPC Procedures (`trpc.backup.*`)
+## 4. tRPC Procedures (`trpc.backup.admin.*`) **[impl]**
 
-All procedures live under `backupRouter.admin.*` and require `adminProcedure` + capability:
+Router mounted at `trpc.backup` (`server/modules/backup/router.ts`). Note: JSON wire transport serializes `Date` fields as ISO-8601 strings unless SuperJSON is active; check `client/src/lib/trpc` conventions.
 
-| Procedure | Capability | Step-up | Notes |
-| --- | --- | --- | --- |
-| `admin.list` (query) | `backup.read` | No | Paginated archives + key/off-host posture |
-| `admin.detail` (query) | `backup.read` | No | Archive detail + verifications + drills + holds |
-| `admin.runNow` (mutation) | `backup.run` | **Yes** | Enqueues fenced job `backup.create` (refuses immediately if key missing or draining) |
-| `admin.verify` (mutation) | `backup.verify` | No | Runs full byte-level AEAD + manifest verification |
-| `admin.restoreIsolated` (mutation) | `backup.restore` | **Yes** | Isolated-target restore + continuity + integrity report |
-| `admin.retentionPolicy` (query) | `backup.read` | No | Current retention & schedule config |
-| `admin.updateRetentionPolicy` (mutation) | `backup.retention.manage` | **Yes** | Updates `keepLastCount`, `maxAgeDays`, `scheduleEnabled` |
-| `admin.previewRetention` (query) | `backup.read` | No | Dry-run retention plan |
-| `admin.runRetention` (mutation) | `backup.retention.manage` | **Yes** | Executes retention (`dryRun: boolean`) |
-| `admin.createHold` (mutation) | `backup.retention.manage` | **Yes** | Places legal hold on archive |
-| `admin.releaseHold` (mutation) | `backup.retention.manage` | **Yes** | Releases legal hold |
+Common regexes & confirmation phrase:
+- `publicIdSchema`: `/^[A-Za-z0-9_-]{10,64}$/`
+- `reasonCodeSchema`: `/^[A-Z][A-Z0-9_]{1,63}$/` (uppercase snake_case, e.g. `"LITIGATION_HOLD"`, `"DR_DRILL_COMPLETE"`)
+- `targetDatabaseName` / `targetStoragePath`: `/^[A-Za-z0-9_]{3,64}$/` for DB name (must NOT equal the live DB name or start with system prefixes `mysql`, `information_schema`, `performance_schema`, `sys`); `/^[A-Za-z0-9._-]{3,64}$/` leaf directory name under `recoverySandboxRoot` for `targetStoragePath` (optional — defaults to `restore-<drillPublicId>`).
+- Exact `confirmationText` required for `restoreIsolated`: `` `RESTORE ${backupPublicId} TO ${targetDatabaseName}` ``
+
+| Procedure | Type | Capability | Step-up | Exact Input | Exact Output |
+| --- | --- | --- | --- | --- | --- |
+| `backup.admin.list` | `query` | `backup.read` | No | `{ cursor?: string; limit?: number /* 1..100 */; state?: OperationState } \| undefined` | `{ items: BackupArchiveSummary[]; nextCursor: string \| null; keyConfigured: boolean; keyCustodyWarning: string \| null; offHostStatusNote: string }` |
+| `backup.admin.detail` | `query` | `backup.read` | No | `{ backupPublicId: string }` | `{ archive: BackupArchiveSummary; verifications: BackupVerificationSummary[]; restores: RestoreDrillSummary[]; holds: BackupLegalHoldView[] }` |
+| `backup.admin.runNow` | `mutation` | `backup.run` | **Yes** (`STEP_UP_REQUIRED` if missing/stale) | `{ trigger?: "manual" \| "pre_upgrade" } \| undefined` | `{ backupPublicId: string; jobId: string }` |
+| `backup.admin.verify` | `mutation` | `backup.verify` | No | `{ backupPublicId: string }` | `BackupVerificationSummary` |
+| `backup.admin.restoreIsolated` | `mutation` | `backup.restore` | **Yes** | `{ backupPublicId: string; targetDatabaseName: string; targetStoragePath?: string; continuityMode?: "preserve_continuity" \| "quarantine_credentials"; confirmationText: string }` | `RestoreDrillSummary` |
+| `backup.admin.retentionPolicy` | `query` | `backup.read` | No | `void` | `{ keepLastCount: number; maxAgeDays: number; scheduleEnabled: boolean; autoPruneEnabled: boolean; recoverySandboxRoot: string }` |
+| `backup.admin.updateRetentionPolicy` | `mutation` | `backup.retention.manage` | **Yes** | `{ keepLastCount: number /* 1..365 */; maxAgeDays: number /* 1..3650 */; scheduleEnabled: boolean; autoPruneEnabled?: boolean }` | `{ ok: true }` |
+| `backup.admin.previewRetention` | `query` | `backup.read` | No | `void` | `{ items: RetentionPlanItem[] }` |
+| `backup.admin.runRetention` | `mutation` | `backup.retention.manage` | **Yes** (`dryRun: false` requires step-up; router enforces capability, service enforces step-up when `!dryRun`) | `{ dryRun: boolean }` | `{ prunedCount: number; items: RetentionPlanItem[] }` |
+| `backup.admin.createHold` | `mutation` | `backup.retention.manage` | **Yes** | `{ backupPublicId: string; reasonCode: string; note: string /* 3..500 chars */ }` | `BackupLegalHoldView` |
+| `backup.admin.releaseHold` | `mutation` | `backup.retention.manage` | **Yes** | `{ holdPublicId: string; releaseReasonCode: string }` | `{ ok: true }` |
 
 ## 5. Raw HTTP Routes (`/api/backup/*`)
 

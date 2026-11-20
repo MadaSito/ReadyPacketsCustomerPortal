@@ -1,0 +1,14 @@
+[Unit]
+Description=ReadyPackets encrypted verified backup (%i)
+Wants=network-online.target
+After=network-online.target mysql.service
+
+[Service]
+Type=oneshot
+Environment=RP_ROLE=worker
+Environment=DATABASE_URL_FILE=%d/backup_database_url
+Environment=RP_BACKUP_KEY_FILE=%d/rp_backup_key
+LoadCredential=backup_database_url:/etc/readypackets/secrets/backup_database_url
+LoadCredential=rp_backup_key:/etc/readypackets/secrets/rp_backup_key
+ExecStart=/usr/local/bin/node --import tsx scripts/ops/backup/run-backup.ts --trigger %i --verify
+TimeoutStartSec=2h

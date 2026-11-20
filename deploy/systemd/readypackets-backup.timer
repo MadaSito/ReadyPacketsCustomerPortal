@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ReadyPackets encrypted verified backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+Unit=readypackets-backup@cli.service
+
+[Install]
+WantedBy=timers.target

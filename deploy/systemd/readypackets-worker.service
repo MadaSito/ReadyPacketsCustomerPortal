@@ -1,0 +1,57 @@
+[Unit]
+Description=ReadyPackets Customer Portal — Background Job, SIEM & Backup Worker (RP_ROLE=worker)
+Documentation=https://my.readypackets.com
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=readypackets
+Group=readypackets
+WorkingDirectory=/opt/readypackets/current
+
+# Non-executable key/value configuration file (0640 root:readypackets).
+# Prefer `RP_BACKUP_KEY_FILE=/etc/readypackets/secrets/backup_key` (0600/0640) for encrypted backup jobs.
+EnvironmentFile=/etc/readypackets/portal.env
+Environment=NODE_ENV=production
+Environment=RP_ROLE=worker
+
+ExecStart=/usr/bin/node dist/server/main.js
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+# Allow bounded drain time for in-flight mysqldump / encrypted archive verification jobs
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+
+# Hardened systemd sandboxing
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# Worker requires read/write access to private object storage (including `_backups/`) and isolated recovery sandbox
+ReadOnlyPaths=/etc/readypackets /opt/readypackets
+ReadWritePaths=/var/lib/readypackets/storage /var/lib/readypackets-recovery
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=readypackets-worker
+
+[Install]
+WantedBy=multi-user.target

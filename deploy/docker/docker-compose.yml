@@ -1,0 +1,172 @@
+# Self-Hosted Docker Compose Profile — ReadyPackets Customer Portal
+#
+# Security posture:
+#  - Every application container runs as UID/GID 10001 with `read_only: true`, `no-new-privileges:true`, and `cap_drop: [ALL]`.
+#  - Secrets are supplied strictly via 0600 host files mounted through Docker `secrets:` (`*_FILE` env vars) — never inline.
+#  - MySQL 8.4 resides on an internal-only bridge network (`rp_backend`) with zero host-exposed ports.
+#  - `portal-web` binds strictly to `127.0.0.1:5000:5000` behind your host TLS reverse proxy (`deploy/nginx/my.readypackets.com.conf`).
+
+name: readypackets
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --binlog-expire-logs-seconds=604800
+    environment:
+      MYSQL_DATABASE: readypackets
+      MYSQL_USER: readypackets_app
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_app_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+    secrets:
+      - mysql_app_password
+      - mysql_root_password
+    volumes:
+      - rp_mysql_data:/var/lib/mysql
+    networks:
+      - rp_backend
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=\"$$(cat /run/secrets/mysql_root_password)\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  portal-migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment: &portal_common_env
+      NODE_ENV: production
+      RP_DEPLOYMENT_PROFILE: production
+      RP_CANONICAL_ORIGIN: https://my.readypackets.com
+      RP_ALIAS_HOSTS: portal.readypackets.com
+      RP_TRUSTED_PROXIES: 127.0.0.1
+      RP_INSTALLATION_ID: rp-prod-primary
+      RP_STORAGE_DIR: /var/lib/readypackets/storage
+      RP_RECOVERY_SANDBOX_DIR: /var/lib/readypackets-recovery
+      DATABASE_URL_FILE: /run/secrets/database_url
+      RP_DATA_KEYRING_FILE: /run/secrets/rp_data_keyring
+      RP_INDEX_KEY_FILE: /run/secrets/rp_index_key
+      RP_PSEUDONYM_KEY_FILE: /run/secrets/rp_pseudonym_key
+      RP_TOKEN_HASH_KEY_FILE: /run/secrets/rp_token_hash_key
+      RP_AUDIT_CHAIN_KEY_FILE: /run/secrets/rp_audit_chain_key
+      RP_BACKUP_KEY_FILE: /run/secrets/rp_backup_key
+    secrets: &portal_secrets
+      - database_url
+      - rp_data_keyring
+      - rp_index_key
+      - rp_pseudonym_key
+      - rp_token_hash_key
+      - rp_audit_chain_key
+      - rp_backup_key
+    command: ["./node_modules/.bin/tsx", "scripts/ops/migrate.ts"]
+    networks:
+      - rp_backend
+
+  portal-web:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      portal-migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      <<: *portal_common_env
+      RP_ROLE: web
+      HOST: 0.0.0.0
+      PORT: "5000"
+    secrets: *portal_secrets
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - rp_object_storage:/var/lib/readypackets/storage
+    networks:
+      - rp_backend
+      - rp_edge
+
+  portal-worker:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      portal-migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      <<: *portal_common_env
+      RP_ROLE: worker
+    secrets: *portal_secrets
+    healthcheck:
+      disable: true
+    volumes:
+      - rp_object_storage:/var/lib/readypackets/storage
+      - rp_recovery_sandbox:/var/lib/readypackets-recovery
+    networks:
+      - rp_backend
+
+volumes:
+  rp_mysql_data:
+  rp_object_storage:
+  rp_recovery_sandbox:
+
+networks:
+  rp_backend:
+    internal: true
+  rp_edge:
+
+secrets:
+  mysql_app_password:
+    file: ./secrets/mysql_app_password
+  mysql_root_password:
+    file: ./secrets/mysql_root_password
+  database_url:
+    file: ./secrets/database_url
+  rp_data_keyring:
+    file: ./secrets/rp_data_keyring
+  rp_index_key:
+    file: ./secrets/rp_index_key
+  rp_pseudonym_key:
+    file: ./secrets/rp_pseudonym_key
+  rp_token_hash_key:
+    file: ./secrets/rp_token_hash_key
+  rp_audit_chain_key:
+    file: ./secrets/rp_audit_chain_key
+  rp_backup_key:
+    file: ./secrets/rp_backup_key

@@ -1,0 +1,58 @@
+[Unit]
+Description=ReadyPackets Customer Portal — HTTP Web Server (RP_ROLE=web)
+Documentation=https://my.readypackets.com
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=readypackets
+Group=readypackets
+WorkingDirectory=/opt/readypackets/current
+
+# Non-executable key/value configuration file (0640 root:readypackets).
+# Secrets are referenced via `<NAME>_FILE=/etc/readypackets/secrets/<name>` (0600/0640) or systemd LoadCredential.
+EnvironmentFile=/etc/readypackets/portal.env
+Environment=NODE_ENV=production
+Environment=RP_ROLE=web
+Environment=HOST=127.0.0.1
+Environment=PORT=5000
+
+ExecStart=/usr/bin/node dist/server/main.js
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+
+# Hardened systemd sandboxing
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+# Explicit least-privilege filesystem access
+ReadOnlyPaths=/etc/readypackets /opt/readypackets
+ReadWritePaths=/var/lib/readypackets/storage
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=readypackets-portal
+
+[Install]
+WantedBy=multi-user.target
