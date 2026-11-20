@@ -6,7 +6,7 @@ import { and, eq, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { SessionPrincipal, Tx } from "../../core/types.js";
+import type { AuditEventInput, SessionPrincipal, Tx } from "../../core/types.js";
 import type { TransitionStep, UserRole } from "../../../shared/domain.js";
 import { readSetting } from "../platform/settingsRegistry.js";
 import { normalizeEmail } from "./normalize.js";
@@ -55,10 +55,54 @@ export function createAuthService(i: AuthInternals) {
   const { deps, hasher, repo, tokens, sessions, transitions } = i;
   const preview = (path: string) => (deps.config.deploymentProfile === "preview" ? { previewLink: path } : {});
 
+  // Throttle refusals leave a sampled best-effort note: at most one per (category, subject) per minute, so an
+  // attacker cannot flood the audit trail. The subject key (a blind index or public id) is never recorded.
+  const throttleNotes = new Map<string, number>();
   async function throttle(category: "user_login" | "auth_high_risk", key: string): Promise<void> {
     const verdict = await deps.rateLimiter.consume(category, key);
-    if (!verdict.allowed) throw rateLimited(verdict.retryAfterSeconds);
+    if (verdict.allowed) return;
+    const now = deps.clock.now().getTime();
+    const slot = `${category}:${key}`;
+    const last = throttleNotes.get(slot);
+    if (last === undefined || now - last >= 60_000 || now < last) {
+      if (throttleNotes.size >= 4096) throttleNotes.clear();
+      throttleNotes.set(slot, now);
+      deps.audit.note({
+        category: "security", eventName: "auth.rate_limited", action: "request", outcome: "denied", severity: "WARN",
+        reasonCode: "RATE_LIMITED", attributes: { category, subject: key.slice(0, key.indexOf(":")) },
+      });
+    }
+    throw rateLimited(verdict.retryAfterSeconds);
   }
+
+  /**
+   * Runs `work` (normally one transaction) and, when it fails with an error `describe` recognises, records the
+   * denial durably AFTER the rollback — outside the failed tx, so the event survives it. The original error is
+   * always rethrown; if the durable write itself fails the event degrades to a best-effort note.
+   */
+  async function recordDenial<T>(work: () => Promise<T>, describe: (error: unknown) => AuditEventInput | null): Promise<T> {
+    try {
+      return await work();
+    } catch (error) {
+      const event = describe(error);
+      if (event) {
+        try {
+          await deps.audit.record(event);
+        } catch {
+          deps.audit.note(event);
+        }
+      }
+      throw error;
+    }
+  }
+  const linkRejected = (purpose: "verify_email" | "password_reset" | "activation") => (error: unknown): AuditEventInput | null =>
+    error instanceof DomainError && error.reasonCode === "LINK_INVALID"
+      ? {
+          category: "security", eventName: "auth.token.rejected", action: "verify", outcome: "denied", severity: "WARN",
+          reasonCode: "LINK_INVALID", actor: { role: "anonymous" }, attributes: { purpose },
+        }
+      : null;
+  const racedLogins = new WeakSet<Error>();
 
   async function claimNewRef(tx: Tx, userId: number, requested?: string | null): Promise<string> {
     if (requested) {
@@ -292,9 +336,13 @@ export function createAuthService(i: AuthInternals) {
         });
         throw badCredentials();
       }
-      const result = await deps.db.transaction(async (tx) => {
+      const result = await recordDenial(() => deps.db.transaction(async (tx) => {
         const locked = await repo.byId(user.id, { tx, forUpdate: true });
-        if (!locked || locked.status !== "active" || locked.passwordHash !== user.passwordHash) throw badCredentials();
+        if (!locked || locked.status !== "active" || locked.passwordHash !== user.passwordHash) {
+          const raced = badCredentials();
+          racedLogins.add(raced);
+          throw raced;
+        }
         if (locked.passwordHash && hasher.needsRehash(locked.passwordHash)) {
           // Compare-and-set on the hash we verified against (review ID-01).
           await tx
@@ -317,12 +365,17 @@ export function createAuthService(i: AuthInternals) {
           tx,
         );
         return { ...created, nextStep: steps[0] ?? null };
-      });
+      }), (error) => error instanceof Error && racedLogins.has(error)
+        ? {
+            category: "security", eventName: "auth.login.failed", action: "login", outcome: "denied", severity: "WARN",
+            reasonCode: "CREDENTIAL_CHANGED_CONCURRENTLY", actor: { role: "anonymous" }, resource: { type: "user", publicId: user.publicId },
+          }
+        : null);
       return { issued: result.issued, nextStep: result.nextStep, sessionId: result.sessionId, userId: user.id };
     },
 
     async verifyEmail(token: string, session: SessionPrincipal | null): Promise<{ verified: true; issued?: IssuedSession }> {
-      return deps.db.transaction(async (tx) => {
+      return recordDenial(() => deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, token, ["verify_email"]);
         if (!consumed || consumed.user.status !== "active") throw invalidLink();
         const now = deps.clock.now();
@@ -343,7 +396,7 @@ export function createAuthService(i: AuthInternals) {
           tx,
         );
         return { verified: true as const, ...(issued ? { issued } : {}) };
-      });
+      }), linkRejected("verify_email"));
     },
 
     async resendVerification(principal: SessionPrincipal): Promise<{ accepted: true; previewLink?: string }> {
@@ -449,7 +502,7 @@ export function createAuthService(i: AuthInternals) {
         // Hash outside the lock only after a cheap shape check; policy is checked inside with user context.
         return hasher.hash(input.password);
       })();
-      await deps.db.transaction(async (tx) => {
+      await recordDenial(() => deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, input.token, ["password_reset", "admin_set_password"]);
         if (!consumed || consumed.user.status !== "active" || consumed.user.authSource !== "local") throw invalidLink();
         const view = toView(deps.crypto, consumed.user);
@@ -477,13 +530,13 @@ export function createAuthService(i: AuthInternals) {
           { template: "auth.password_changed", to: { userId: consumed.user.id }, vars: {}, idempotencyKey: `auth.password_changed:${consumed.user.publicId}:${deps.clock.now().getTime()}` },
           tx,
         );
-      });
+      }), linkRejected("password_reset"));
       return { reset: true };
     },
 
     async activateAccount(input: { token: string; password: string }): Promise<{ activated: true }> {
       const passwordHash = await hasher.hash(input.password);
-      await deps.db.transaction(async (tx) => {
+      await recordDenial(() => deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, input.token, ["invitation"]);
         if (!consumed || consumed.user.status !== "pending_activation") throw invalidLink();
         const view = toView(deps.crypto, consumed.user);
@@ -514,7 +567,7 @@ export function createAuthService(i: AuthInternals) {
           },
           tx,
         );
-      });
+      }), linkRejected("activation"));
       return { activated: true };
     },
 
@@ -526,7 +579,7 @@ export function createAuthService(i: AuthInternals) {
         });
       }
       await throttle("auth_high_risk", `pwchange:${principal.userPublicId}`);
-      const issued = await deps.db.transaction(async (tx) => {
+      const issued = await recordDenial(() => deps.db.transaction(async (tx) => {
         await sessions.assertCurrent(principal, tx); // locks users row then session row
         const user = await repo.byId(principal.userId, { tx });
         if (!user) throw badCredentials();
@@ -563,7 +616,13 @@ export function createAuthService(i: AuthInternals) {
           tx,
         );
         return rotated;
-      });
+      }), (error) => error instanceof DomainError && error.reasonCode === "CURRENT_PASSWORD_INCORRECT"
+        ? {
+            category: "security", eventName: "auth.password.change_denied", action: "update", outcome: "denied", severity: "WARN",
+            reasonCode: "CURRENT_PASSWORD_INCORRECT", actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "user", publicId: principal.userPublicId },
+          }
+        : null);
       const { nextStep } = await nextStepFor(principal.userId, principal.sessionId);
       return { issued, nextStep };
     },

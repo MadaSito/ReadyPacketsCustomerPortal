@@ -129,6 +129,12 @@ describe("identity module (MySQL)", () => {
       expect(call.key).toMatch(/^register:[0-9a-f]{64}$/);
       h.rateLimiter.blocked.add("auth_high_risk");
       await rejects(identity.auth.register({ email: "x@example.test", name: "T", password: PW }, {}), "RATE_LIMITED");
+      // I-3: one sampled note per subject per minute; the subject key never appears.
+      await rejects(identity.auth.register({ email: "x@example.test", name: "T", password: PW }, {}), "RATE_LIMITED");
+      const notes = h.audit.notes.filter((n) => n.eventName === "auth.rate_limited");
+      expect(notes).toHaveLength(1);
+      expect(notes[0]).toMatchObject({ outcome: "denied", attributes: { category: "auth_high_risk", subject: "register" } });
+      expect(JSON.stringify(notes)).not.toMatch(/[0-9a-f]{64}|example\.test/);
     });
 
     it("audit failure ⇒ no account row", async () => {
@@ -152,6 +158,24 @@ describe("identity module (MySQL)", () => {
       expect(new Set(errors.map((e) => `${e.code}|${e.safeMessage}`)).size).toBe(1);
       expect(h.audit.named("auth.login.failed").map((e) => e.reasonCode)).toEqual(["UNKNOWN_ACCOUNT", "BAD_PASSWORD", "ACCOUNT_INACTIVE"]);
       expect(h.rateLimiter.calls.every((c) => c.category === "user_login" && /^acct:[0-9a-f]{64}$/.test(c.key))).toBe(true);
+    });
+
+    it("a password change racing a sign-in is refused uniformly and recorded after rollback (I-5)", async () => {
+      const user = await makeUser();
+      const target = db.db as unknown as { transaction: (...args: unknown[]) => Promise<unknown> };
+      const original = target.transaction;
+      target.transaction = async (...args: unknown[]) => {
+        target.transaction = original; // one-shot: the hash changes between verification and the locked re-check
+        await db.db.update(users).set({ passwordHash: "$argon2id$changed-concurrently" }).where(eq(users.id, user.id));
+        return original.apply(db.db, args);
+      };
+      try {
+        await rejects(identity.auth.signIn({ email: user.email, password: PW }, {}), "BAD_CREDENTIALS");
+      } finally {
+        target.transaction = original;
+      }
+      expect(h.audit.named("auth.login.failed").at(-1)).toMatchObject({ reasonCode: "CREDENTIAL_CHANGED_CONCURRENTLY", resource: { publicId: user.publicId } });
+      expect(h.audit.recordedInTx.at(-1)).toBe(false);
     });
 
     it("issues a server-side session whose token is stored only hashed; first step is mfa_challenge", async () => {
@@ -280,6 +304,8 @@ describe("identity module (MySQL)", () => {
       const token = tokenOf(r.previewLink);
       await identity.auth.verifyEmail(token, null);
       await rejects(identity.auth.verifyEmail(token, null), "LINK_INVALID");
+      expect(h.audit.named("auth.token.rejected").at(-1)).toMatchObject({ reasonCode: "LINK_INVALID", attributes: { purpose: "verify_email" } });
+      expect(JSON.stringify(h.audit.events)).not.toContain(token);
 
       const r2 = await identity.auth.register({ email: `v2${Date.now()}@example.test`, name: "V", password: PW }, {});
       h.clock.advance(24 * 3_600_000 + 1);
@@ -348,6 +374,7 @@ describe("identity module (MySQL)", () => {
       const link = tokenFromMail(h.mailer.last("auth.password_reset")!.vars.link);
       await identity.auth.resetPassword({ token: link, password: PW2 });
       await rejects(identity.auth.resetPassword({ token: link, password: PW2 }), "LINK_INVALID");
+      expect(h.audit.named("auth.token.rejected").at(-1)).toMatchObject({ attributes: { purpose: "password_reset" } });
       expect(await identity.sessionResolver.resolve({ token: sessionToken, transport: "cookie" })).toBeNull();
       expect(await identity.verifyPassword(user.id, PW2)).toBe(true);
 
@@ -385,6 +412,10 @@ describe("identity module (MySQL)", () => {
       const other = await session(user.email);
       const current = await session(user.email);
       await rejects(identity.auth.changePassword(current.principal, { currentPassword: PW2, newPassword: PW2 }), "CURRENT_PASSWORD_INCORRECT");
+      // I-1: recorded durably after the rollback (outside the failed tx).
+      expect(h.audit.named("auth.password.change_denied")[0]).toMatchObject({ outcome: "denied", reasonCode: "CURRENT_PASSWORD_INCORRECT", resource: { publicId: user.publicId } });
+      expect(h.audit.recordedInTx.at(-1)).toBe(false);
+      expect(JSON.stringify(h.audit.events)).not.toContain(PW2);
       const result = await identity.auth.changePassword(current.principal, { currentPassword: PW, newPassword: PW2 });
       expect(await identity.sessionResolver.resolve({ token: other.token, transport: "cookie" })).toBeNull();
       expect(await identity.sessionResolver.resolve({ token: current.token, transport: "cookie" })).toBeNull();
@@ -500,6 +531,7 @@ describe("identity module (MySQL)", () => {
       expect(created.previewLink).toMatch(/^\/activate\?token=/);
       await identity.auth.activateAccount({ token: tokenOf(created.previewLink), password: PW2 });
       await rejects(identity.auth.activateAccount({ token: tokenOf(created.previewLink), password: PW2 }), "LINK_INVALID");
+      expect(h.audit.named("auth.token.rejected").at(-1)).toMatchObject({ attributes: { purpose: "activation" } });
       expect(h.audit.named("admin.customer.created")).toHaveLength(1);
 
       for (const profile of ["test", "production"] as const) {
@@ -566,7 +598,20 @@ describe("identity module (MySQL)", () => {
       expect(page.nextCursor).not.toBeNull();
       const next = await identity.searchCustomers(principal, { limit: 1, cursor: page.nextCursor! });
       expect(next.items[0]?.publicId).not.toBe(page.items[0]?.publicId);
-      expect(h.audit.notes.some((n) => n.eventName === "admin.customer.searched")).toBe(true);
+      expect(h.audit.named("admin.customer.searched").length).toBeGreaterThan(0);
+      expect(h.audit.notes.some((n) => n.eventName === "admin.customer.searched")).toBe(false);
+    });
+
+    it("admin PII reads are durable and fail closed (I-4)", async () => {
+      const customer = await makeUser();
+      const admin = await makeUser({ role: "admin" });
+      const { principal } = await session(admin.email, { stepUp: true });
+      await identity.admin.getCustomer(principal, customer.publicId);
+      expect(h.audit.named("admin.customer.viewed")[0]?.resource).toEqual({ type: "user", publicId: customer.publicId });
+      h.audit.failRecords = true;
+      await expect(identity.admin.getCustomer(principal, customer.publicId)).rejects.toThrow();
+      await expect(identity.searchCustomers(principal, {})).rejects.toThrow();
+      h.audit.failRecords = false;
     });
   });
 

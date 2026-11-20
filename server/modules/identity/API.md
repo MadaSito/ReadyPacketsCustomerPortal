@@ -170,6 +170,13 @@ admin-initiated set-password) returned to that administrator. Never for `request
 `auth.password.reset_requested` (outcome attempted), `auth.password.reset_dispatch` (system; completed/refused), `auth.password.reset_completed|changed|set_by_admin`, `auth.session.rotated|revoked|revoked_all`,
 `admin.customer.created|status_changed|reference_changed|invitation_sent` (admin), `admin.staff.created|role_changed` (admin),
 `identity.customer.imported_pending` (portable_transfer).
+Denials recorded durably AFTER the failed tx rolls back (outside it, so they survive; degrade to a note only if the
+durable write fails; the original error is always rethrown): `auth.password.change_denied` (CURRENT_PASSWORD_INCORRECT),
+`auth.token.rejected` { purpose: verify_email | password_reset | activation } (LINK_INVALID; never the token),
+`auth.login.failed` CREDENTIAL_CHANGED_CONCURRENTLY (hash changed between verification and the locked re-check).
+`auth.rate_limited` { category, subject: register|acct|verify|reset|pwchange } — sampled best-effort note, at most one per
+subject per minute per process; the subject key itself is never recorded. `admin.customer.searched|viewed` are durable
+`record()` calls awaited before any data is returned (audit unavailable ⇒ the read fails closed).
 
 ## Session activity (idle clock)
 Every authenticated request the resolver accepts (background refetches included) refreshes `last_seen_at`, at most

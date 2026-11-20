@@ -233,7 +233,8 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async searchCustomers(principal: SessionPrincipal, input: { query?: string; status?: UserStatus; cursor?: string; limit?: number }) {
       await require(principal, "customers.read_all", "identity.searchCustomers");
       const page = await listUsers(["customer"], input);
-      deps.audit.note({
+      // Admin PII reads are durable and fail closed: no audit row ⇒ no data returned.
+      await deps.audit.record({
         category: "admin",
         eventName: "admin.customer.searched",
         action: "search",
@@ -253,11 +254,12 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
         .where(eq(customerRefHistory.userId, row.id))
         .orderBy(desc(customerRefHistory.changedAt))
         .limit(50);
-      deps.audit.note({ category: "admin", eventName: "admin.customer.viewed", action: "read", outcome: "completed", resource: { type: "user", publicId } });
       const view = toView(deps.crypto, row);
+      const activeSessions = await sessions.countLive(row.id);
+      await deps.audit.record({ category: "admin", eventName: "admin.customer.viewed", action: "read", outcome: "completed", resource: { type: "user", publicId } });
       return {
         customer: { ...listItem(row), mustChangePassword: view.mustChangePassword, hasPassword: view.hasPassword, version: row.version, statusReasonCode: row.statusReasonCode, statusChangedAt: row.statusChangedAt },
-        activeSessions: await sessions.countLive(row.id),
+        activeSessions,
         referenceHistory: history.map((h) => ({ previousReference: h.previousReference, newReference: h.newReference, reasonCode: h.reasonCode, changedAt: h.changedAt })),
       };
     },
