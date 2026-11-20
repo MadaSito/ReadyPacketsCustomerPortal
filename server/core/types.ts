@@ -334,6 +334,12 @@ export interface RateLimiter {
   consume(category: RateLimitCategory, key: string, cost?: number): Promise<{ allowed: boolean; retryAfterSeconds: number }>;
 }
 
+/** Implemented by the real database-backed limiter; fakes need not provide it. */
+export interface MaintainableRateLimiter extends RateLimiter {
+  /** Registers the bounded-growth cleanup job/schedule. Called once by the container after the queue exists. */
+  registerMaintenance(jobs: JobQueue): void;
+}
+
 /* ------------------------------------------------------------- core deps bag */
 
 /** Infrastructure handed to every module factory. Module-to-module dependencies are passed explicitly. */

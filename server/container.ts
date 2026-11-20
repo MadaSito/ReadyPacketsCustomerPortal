@@ -16,7 +16,7 @@
  */
 import type { AppConfig } from "./config/env.js";
 import { systemClock } from "./core/clock.js";
-import type { Clock, CoreDeps, Db, Logger, ModuleLifecycle, SessionResolver } from "./core/types.js";
+import type { Clock, CoreDeps, Db, Logger, MaintainableRateLimiter, ModuleLifecycle, SessionResolver } from "./core/types.js";
 import { createDatabase, type DatabaseHandle } from "./db/client.js";
 import { createLogger } from "./observability/logger.js";
 import { createFieldCrypto } from "./security/fieldCrypto.js";
@@ -98,6 +98,9 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   const queueDeps = { config, db, clock, logger, audit, crypto, settings };
   const jobs = overrides.core?.jobs ?? createJobQueue(queueDeps);
   const mailer = overrides.core?.mailer ?? createMailer({ ...queueDeps, jobs });
+  if (!overrides.core?.rateLimiter && "registerMaintenance" in rateLimiter) {
+    (rateLimiter as MaintainableRateLimiter).registerMaintenance(jobs);
+  }
 
   const core: CoreDeps = { config, db, clock, logger, audit, crypto, settings, mailer, jobs, storage, rateLimiter };
   const services = { ...core } as Services;
