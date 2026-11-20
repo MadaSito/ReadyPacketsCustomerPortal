@@ -21,7 +21,11 @@ export const LINK_PATHS: Record<IdentityTokenPurpose, string> = {
 export function createTokenService(deps: ModuleDeps) {
   return {
     /** Retires outstanding tokens of the purpose and issues a fresh one. Call inside the user's transaction. */
-    async issue(tx: Tx, userId: number, purpose: IdentityTokenPurpose): Promise<{ token: string; expiresAt: Date; path: string; url: string }> {
+    async issue(
+      tx: Tx,
+      userId: number,
+      purpose: IdentityTokenPurpose,
+    ): Promise<{ token: string; tokenId: number; expiresAt: Date; path: string; url: string; mailKey: string }> {
       const now = deps.clock.now();
       await tx
         .update(identityTokens)
@@ -29,9 +33,14 @@ export function createTokenService(deps: ModuleDeps) {
         .where(and(eq(identityTokens.userId, userId), eq(identityTokens.purpose, purpose), isNull(identityTokens.consumedAt)));
       const token = randomToken(32);
       const expiresAt = new Date(now.getTime() + TOKEN_TTL_MS[purpose]);
-      await tx.insert(identityTokens).values({ userId, purpose, tokenHash: deps.crypto.hashToken(token), expiresAt });
+      const [inserted] = await tx
+        .insert(identityTokens)
+        .values({ userId, purpose, tokenHash: deps.crypto.hashToken(token), expiresAt, createdAt: now })
+        .$returningId();
       const path = `${LINK_PATHS[purpose]}?token=${token}`;
-      return { token, expiresAt, path, url: `${deps.config.canonicalOrigin}${path}` };
+      const tokenId = inserted!.id;
+      // Mail idempotency key derives from the token ROW id, never from the bearer secret.
+      return { token, tokenId, expiresAt, path, url: `${deps.config.canonicalOrigin}${path}`, mailKey: `identity.token:${tokenId}` };
     },
 
     async retireAll(tx: Tx, userId: number, purposes: readonly IdentityTokenPurpose[], reason: string): Promise<void> {

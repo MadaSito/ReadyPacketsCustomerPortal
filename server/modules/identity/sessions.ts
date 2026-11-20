@@ -59,10 +59,16 @@ export const sessionNotCurrent = () =>
 export function createSessionService(deps: ModuleDeps, transitions: TransitionService) {
   const db = (tx?: DbOrTx) => tx ?? deps.db;
 
-  async function policy() {
+  /*
+   * Session policy (idle/absolute), read on every use so policy changes affect existing sessions. Inside a
+   * transaction the read goes through THAT transaction's connection (readSetting(..., tx)) — never through the
+   * settings pool while a connection is held (one-connection pools would deadlock — review ID-06).
+   */
+  async function policy(tx?: DbOrTx) {
+    const t = tx as Tx | undefined;
     const [idleMinutes, absoluteHours] = await Promise.all([
-      readSetting(deps.settings, SESSION_IDLE_MINUTES),
-      readSetting(deps.settings, SESSION_ABSOLUTE_HOURS),
+      readSetting(deps.settings, SESSION_IDLE_MINUTES, t),
+      readSetting(deps.settings, SESSION_ABSOLUTE_HOURS, t),
     ]);
     return { idleMs: idleMinutes * 60_000, absoluteMs: absoluteHours * 3_600_000 };
   }
@@ -124,7 +130,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       options: { authMethod: AuthMethod; userAgent?: string },
     ): Promise<{ sessionId: string; issued: IssuedSession }> {
       const now = deps.clock.now();
-      const p = await policy();
+      const p = await policy(tx);
       const token = randomToken(32);
       const csrfSecret = randomToken(32);
       const absoluteExpiresAt = new Date(now.getTime() + p.absoluteMs);
@@ -175,7 +181,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         .where(eq(userSessions.publicId, sessionId))
         .limit(1);
       if (!joined) return null;
-      const p = await policy();
+      const p = await policy(opts.tx);
       return {
         sessionId,
         userId: joined.user.id,
@@ -190,12 +196,18 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       };
     },
 
-    /** Locks users row then session row; rejects stale principals. Returns pendingSteps re-derived in tx. */
-    async assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<{ pendingSteps: TransitionStep[] }> {
+    /**
+     * Locks users row then session row; rejects stale principals (revoked/expired/inactive, role or CSRF
+     * secret changed by an in-flight rotation). Returns the PERSISTED authority re-derived inside tx.
+     */
+    async assertCurrent(
+      principal: SessionPrincipal,
+      tx: Tx,
+    ): Promise<{ pendingSteps: TransitionStep[]; role: UserRole; stepUpAt: Date | null; mfaVerifiedAt: Date | null }> {
       const [user] = await tx.select().from(users).where(eq(users.id, principal.userId)).limit(1).for("update");
       const row = await sessionRow(tx, principal.sessionId, true);
       if (!user || !row || row.userId !== user.id) throw sessionNotCurrent();
-      if (!isLive(row, user, deps.clock.now(), await policy())) throw sessionNotCurrent();
+      if (!isLive(row, user, deps.clock.now(), await policy(tx))) throw sessionNotCurrent();
       if (user.role !== principal.role) throw sessionNotCurrent();
       let secret: string;
       try {
@@ -204,7 +216,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         throw sessionNotCurrent();
       }
       if (secret !== principal.csrfSecret) throw sessionNotCurrent();
-      return { pendingSteps: await transitions.derive(user, row, tx) };
+      return { pendingSteps: await transitions.derive(user, row, tx), role: user.role, stepUpAt: row.stepUpAt, mfaVerifiedAt: row.mfaVerifiedAt };
     },
 
     async listForUser(userId: number, currentSessionId: string): Promise<SessionListItem[]> {

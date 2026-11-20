@@ -2,7 +2,7 @@
  * Public account flows: registration, sign-in, e-mail verification, password reset, invitation activation,
  * change password, sign-out. Uniform responses + timing; no account enumeration.
  */
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
@@ -18,6 +18,12 @@ import { REGISTRATION_ENABLED, RESEND_MIN_INTERVAL_MS } from "./settings.js";
 import type { TokenService } from "./tokens.js";
 import type { TransitionService } from "./transitions.js";
 import { emailColumns, emailIndexOf, generateCustomerRef, isDuplicate, nameColumns, toView, type UserRepo } from "./users.js";
+
+export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
+export interface PasswordResetJob {
+  /** Blind index only — never the address, never auth material. */
+  emailIndex: string;
+}
 
 export interface CallMeta {
   ipAddress?: string;
@@ -147,20 +153,31 @@ export function createAuthService(i: AuthInternals) {
       const passwordHash = await hasher.hash(input.password); // always hash: uniform timing
       const existing = await repo.byEmail(email);
       if (existing) {
-        await deps.mailer.enqueue({
-          template: "auth.account_exists",
-          to: { userId: existing.id },
-          vars: { signInLink: `${deps.config.canonicalOrigin}/sign-in`, resetLink: `${deps.config.canonicalOrigin}/forgot-password` },
-          idempotencyKey: `auth.account_exists:${existing.publicId}:${Math.floor(deps.clock.now().getTime() / 3_600_000)}`,
-        });
-        await deps.audit.record({
-          category: "security",
-          eventName: "auth.register.requested",
-          action: "register",
-          outcome: "refused",
-          reasonCode: "EXISTING_ACCOUNT",
-          actor: { role: "anonymous" },
-          resource: { type: "user", publicId: existing.publicId },
+        // Same shape of work as the create branch (one transaction, one mail enqueue, one audit row) so the
+        // response and its timing do not distinguish existing addresses (review ID-04). Residual timing
+        // differences (row insert vs none) are documented in VERIFICATION.md as not benchmarked.
+        await deps.db.transaction(async (tx) => {
+          await deps.mailer.enqueue(
+            {
+              template: "auth.account_exists",
+              to: { userId: existing.id },
+              vars: { signInLink: `${deps.config.canonicalOrigin}/sign-in`, resetLink: `${deps.config.canonicalOrigin}/forgot-password` },
+              idempotencyKey: `auth.account_exists:${existing.publicId}:${Math.floor(deps.clock.now().getTime() / 3_600_000)}`,
+            },
+            tx,
+          );
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "auth.register.requested",
+              action: "register",
+              outcome: "refused",
+              reasonCode: "EXISTING_ACCOUNT",
+              actor: { role: "anonymous" },
+              resource: { type: "user", publicId: existing.publicId },
+            },
+            tx,
+          );
         });
         return { accepted: true };
       }
@@ -169,7 +186,7 @@ export function createAuthService(i: AuthInternals) {
           const created = await insertUser(tx, { email, name: input.name, role: "customer", status: "active", origin: "register", passwordHash });
           const link = await tokens.issue(tx, created.id, "verify_email");
           await deps.mailer.enqueue(
-            { template: "auth.verify_email", to: { userId: created.id }, vars: { name: input.name, link: link.url }, idempotencyKey: `auth.verify_email:${link.token.slice(0, 16)}`, expiresAt: link.expiresAt },
+            { template: "auth.verify_email", to: { userId: created.id }, vars: { name: input.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
             tx,
           );
           await deps.audit.record(
@@ -216,7 +233,11 @@ export function createAuthService(i: AuthInternals) {
         const locked = await repo.byId(user.id, { tx, forUpdate: true });
         if (!locked || locked.status !== "active" || locked.passwordHash !== user.passwordHash) throw badCredentials();
         if (locked.passwordHash && hasher.needsRehash(locked.passwordHash)) {
-          await tx.update(users).set({ passwordHash: await hasher.hash(input.password) }).where(eq(users.id, user.id));
+          // Compare-and-set on the hash we verified against (review ID-01).
+          await tx
+            .update(users)
+            .set({ passwordHash: await hasher.hash(input.password) })
+            .where(and(eq(users.id, user.id), eq(users.passwordHash, locked.passwordHash), eq(users.status, "active")));
         }
         const created = await sessions.create(tx, locked, { authMethod: "local", userAgent: meta.userAgent });
         const steps = await transitions.derive(locked, { mfaVerifiedAt: null }, tx);
@@ -264,63 +285,88 @@ export function createAuthService(i: AuthInternals) {
 
     async resendVerification(principal: SessionPrincipal): Promise<{ accepted: true; previewLink?: string }> {
       await throttle("auth_high_risk", `verify:${principal.userPublicId}`);
-      const user = await repo.byId(principal.userId);
-      if (!user || user.emailVerifiedAt !== null) return { accepted: true };
-      const last = await tokens.lastIssuedAt(deps.db, user.id, "verify_email");
-      if (last && deps.clock.now().getTime() - last.getTime() < RESEND_MIN_INTERVAL_MS) return { accepted: true };
       return deps.db.transaction(async (tx) => {
+        // Eligibility + cooldown are decided under the users row lock (review ID-03).
+        const user = await repo.byId(principal.userId, { tx, forUpdate: true });
+        if (!user || user.status !== "active" || user.emailVerifiedAt !== null) return { accepted: true as const };
+        const last = await tokens.lastIssuedAt(tx, user.id, "verify_email");
+        if (last && deps.clock.now().getTime() - last.getTime() < RESEND_MIN_INTERVAL_MS) return { accepted: true as const };
         const view = toView(deps.crypto, user);
         const link = await tokens.issue(tx, user.id, "verify_email");
         await deps.mailer.enqueue(
-          { template: "auth.verify_email", to: { userId: user.id }, vars: { name: view.name, link: link.url }, idempotencyKey: `auth.verify_email:${link.token.slice(0, 16)}`, expiresAt: link.expiresAt },
+          { template: "auth.verify_email", to: { userId: user.id }, vars: { name: view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
           tx,
         );
         await deps.audit.record(
           { category: "security", eventName: "auth.email.verification_sent", action: "notify", outcome: "completed", resource: { type: "user", publicId: user.publicId } },
           tx,
         );
+        // Authenticated caller, own account: preview may return its own verification link.
         return { accepted: true as const, ...preview(link.path) };
       });
     },
 
-    async requestPasswordReset(input: { email: string }): Promise<{ accepted: true; previewLink?: string }> {
-      const email = normalizeEmail(input.email);
-      await throttle("auth_high_risk", `reset:${emailIndexOf(deps.crypto, email)}`);
-      const user = await repo.byEmail(email);
-      if (!user || user.status !== "active" || user.authSource !== "local") {
-        await deps.audit.record({
-          category: "security",
-          eventName: "auth.password.reset_requested",
-          action: "request",
-          outcome: "refused",
-          reasonCode: user ? "ACCOUNT_NOT_ELIGIBLE" : "UNKNOWN_ACCOUNT",
-          actor: { role: "anonymous" },
-          resource: user ? { type: "user", publicId: user.publicId } : { type: "user" },
-        });
-        return { accepted: true };
-      }
-      const last = await tokens.lastIssuedAt(deps.db, user.id, "password_reset");
-      if (last && deps.clock.now().getTime() - last.getTime() < RESEND_MIN_INTERVAL_MS) return { accepted: true };
+    /**
+     * Public "forgot password". Identical work and response for every address (review ID-04): throttle, one
+     * durable job keyed only by the e-mail blind index, one `attempted` audit row. Eligibility, cooldown,
+     * token issuance and mail happen in the job under the users row lock. Never returns a link (ID-02).
+     */
+    async requestPasswordReset(input: { email: string }): Promise<{ accepted: true }> {
+      const emailIndex = emailIndexOf(deps.crypto, normalizeEmail(input.email));
+      await throttle("auth_high_risk", `reset:${emailIndex}`);
+      const slot = Math.floor(deps.clock.now().getTime() / RESEND_MIN_INTERVAL_MS);
+      await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 });
+      await deps.audit.record({
+        category: "security",
+        eventName: "auth.password.reset_requested",
+        action: "request",
+        outcome: "attempted",
+        actor: { role: "anonymous" },
+        resource: { type: "user" },
+      });
+      return { accepted: true };
+    },
+
+    /** Job handler for PASSWORD_RESET_JOB. Pure database work in one transaction ⇒ retry-safe. */
+    async dispatchPasswordReset(payload: PasswordResetJob): Promise<"issued" | "ineligible" | "cooldown"> {
+      if (!/^[0-9a-f]{64}$/.test(payload.emailIndex)) return "ineligible";
       return deps.db.transaction(async (tx) => {
-        const locked = await repo.byId(user.id, { tx, forUpdate: true });
-        if (!locked) return { accepted: true as const };
+        const [peek] = await tx.select({ id: users.id }).from(users).where(eq(users.emailIndex, payload.emailIndex)).limit(1);
+        const user = peek ? await repo.byId(peek.id, { tx, forUpdate: true }) : null;
+        if (!user || user.status !== "active" || user.authSource !== "local") {
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "auth.password.reset_dispatch",
+              action: "request",
+              outcome: "refused",
+              reasonCode: user ? "ACCOUNT_NOT_ELIGIBLE" : "UNKNOWN_ACCOUNT",
+              actor: { role: "system" },
+              resource: user ? { type: "user", publicId: user.publicId } : { type: "user" },
+            },
+            tx,
+          );
+          return "ineligible" as const;
+        }
+        const last = await tokens.lastIssuedAt(tx, user.id, "password_reset");
+        if (last && deps.clock.now().getTime() - last.getTime() < RESEND_MIN_INTERVAL_MS) return "cooldown" as const;
         const link = await tokens.issue(tx, user.id, "password_reset");
         await deps.mailer.enqueue(
-          { template: "auth.password_reset", to: { userId: user.id }, vars: { link: link.url }, idempotencyKey: `auth.password_reset:${link.token.slice(0, 16)}`, expiresAt: link.expiresAt },
+          { template: "auth.password_reset", to: { userId: user.id }, vars: { link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
           tx,
         );
         await deps.audit.record(
           {
             category: "security",
-            eventName: "auth.password.reset_requested",
+            eventName: "auth.password.reset_dispatch",
             action: "request",
             outcome: "completed",
-            actor: { role: "anonymous" },
+            actor: { role: "system" },
             resource: { type: "user", publicId: user.publicId },
           },
           tx,
         );
-        return { accepted: true as const, ...preview(link.path) };
+        return "issued" as const;
       });
     },
 
@@ -332,7 +378,7 @@ export function createAuthService(i: AuthInternals) {
       })();
       await deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, input.token, ["password_reset", "admin_set_password"]);
-        if (!consumed || consumed.user.status !== "active") throw invalidLink();
+        if (!consumed || consumed.user.status !== "active" || consumed.user.authSource !== "local") throw invalidLink();
         const view = toView(deps.crypto, consumed.user);
         assertPasswordAcceptable(input.password, { email: view.email, name: view.name });
         await tx

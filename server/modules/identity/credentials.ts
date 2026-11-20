@@ -3,7 +3,7 @@
  * No route ever returns an existing password; temporary passwords are generated here and shown once by the caller.
  */
 import { randomInt } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { DomainError, notFound } from "../../core/errors.js";
 import type { Tx } from "../../core/types.js";
 import { assertPasswordAcceptable, type AuthInternals } from "./auth.js";
@@ -30,12 +30,22 @@ export function createCredentialService(i: AuthInternals) {
     generateTemporaryPassword,
 
     /** Verifies the user's current password (uniform timing) and transparently upgrades the hash. */
+    /**
+     * Verifies the current password. With `tx` the users row is locked first (callers inside a mutation
+     * transaction). A transparent rehash is a compare-and-set on the exact hash that was verified and on
+     * `status = active`, so it can never overwrite a concurrent password change (review ID-01); if the CAS
+     * matches no row the password is no longer current and false is returned.
+     */
     async verifyPassword(userId: number, password: string, opts: { tx?: Tx } = {}): Promise<boolean> {
-      const user = await repo.byId(userId, opts.tx ? { tx: opts.tx } : {});
+      const user = await repo.byId(userId, opts.tx ? { tx: opts.tx, forUpdate: true } : {});
       const ok = await hasher.verify(user?.passwordHash ?? null, password);
-      if (!ok || !user || user.status !== "active") return false;
-      if (user.passwordHash && hasher.needsRehash(user.passwordHash)) {
-        await (opts.tx ?? deps.db).update(users).set({ passwordHash: await hasher.hash(password) }).where(eq(users.id, user.id));
+      if (!ok || !user || !user.passwordHash || user.status !== "active" || user.authSource !== "local") return false;
+      if (hasher.needsRehash(user.passwordHash)) {
+        const [result] = await (opts.tx ?? deps.db)
+          .update(users)
+          .set({ passwordHash: await hasher.hash(password) })
+          .where(and(eq(users.id, user.id), eq(users.passwordHash, user.passwordHash), eq(users.status, "active")));
+        if (result.affectedRows === 0) return false;
       }
       return true;
     },
@@ -84,7 +94,7 @@ export function createCredentialService(i: AuthInternals) {
       await tokens.retireAll(tx, user.id, ["password_reset"], "superseded");
       const link = await tokens.issue(tx, user.id, "admin_set_password");
       await deps.mailer.enqueue(
-        { template: "auth.admin_set_password", to: { userId: user.id }, vars: { link: link.url }, idempotencyKey: `auth.admin_set_password:${link.token.slice(0, 16)}`, expiresAt: link.expiresAt },
+        { template: "auth.admin_set_password", to: { userId: user.id }, vars: { link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
         tx,
       );
       await deps.audit.record(

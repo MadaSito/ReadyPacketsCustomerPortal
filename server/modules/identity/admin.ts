@@ -6,7 +6,8 @@
 import { and, asc, desc, eq, gt, inArray, like, lt, or, type SQL } from "drizzle-orm";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
-import { roleHasCapability, type Capability } from "../../../shared/capabilities.js";
+import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
+import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { AuthInternals, AuthService } from "./auth.js";
 import { namePrefixes, normalizeEmail, normalizeName } from "./normalize.js";
@@ -134,8 +135,45 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     return { items, nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null };
   }
 
-  async function loadTarget(tx: Tx, publicId: string, roles: readonly UserRole[]): Promise<UserRow> {
-    const row = await repo.byPublicId(publicId, { tx, forUpdate: true });
+  /**
+   * In-transaction authorization for every admin mutation (review ID-05). Locks the actor's and the target's
+   * users rows in canonical id order (deterministic ⇒ two admins acting on each other serialize instead of
+   * both passing their checks), then re-validates the actor from PERSISTED state under those locks: session
+   * live and not rotated, role unchanged and still granting `capability`, no pending account steps, and —
+   * for step-up capabilities — a fresh persisted step-up. Only then may the caller apply effects.
+   */
+  async function authorizeInTx(tx: Tx, principal: SessionPrincipal, capability: Capability, targetPublicId?: string): Promise<UserRow | null> {
+    let targetId: number | null = null;
+    if (targetPublicId !== undefined) {
+      const [peek] = await tx.select({ id: users.id }).from(users).where(eq(users.publicId, targetPublicId)).limit(1);
+      if (!peek) throw notFound("USER_NOT_FOUND");
+      targetId = peek.id;
+    }
+    const ids = [...new Set([principal.userId, ...(targetId !== null ? [targetId] : [])])].sort((a, b) => a - b);
+    const locked = await tx.select().from(users).where(inArray(users.id, ids)).orderBy(asc(users.id)).for("update");
+    const current = await sessions.assertCurrent(principal, tx);
+    const now = deps.clock.now().getTime();
+    const stepUpAge = current.stepUpAt ? now - current.stepUpAt.getTime() : -1;
+    const reason =
+      current.pendingSteps.length > 0
+        ? "ACCOUNT_STEPS_PENDING"
+        : !roleHasCapability(current.role, capability)
+          ? "CAPABILITY_NOT_GRANTED"
+          : STEP_UP_CAPABILITIES.has(capability) && !(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)
+            ? "STEP_UP_REQUIRED"
+            : null;
+    if (reason) {
+      if (reason === "STEP_UP_REQUIRED") throw new DomainError("FORBIDDEN", "STEP_UP_REQUIRED", "Confirm your identity again to continue.");
+      throw forbidden(reason);
+    }
+    if (targetId === null) return null;
+    const target = locked.find((row) => row.id === targetId);
+    if (!target) throw notFound("USER_NOT_FOUND"); // deleted between peek and lock
+    return target;
+  }
+
+  async function loadTarget(tx: Tx, principal: SessionPrincipal, capability: Capability, publicId: string, roles: readonly UserRole[]): Promise<UserRow> {
+    const row = await authorizeInTx(tx, principal, capability, publicId);
     if (!row || !roles.includes(row.role)) throw notFound("USER_NOT_FOUND");
     return row;
   }
@@ -144,7 +182,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     const view = toView(deps.crypto, row);
     const link = await tokens.issue(tx, row.id, "invitation");
     await deps.mailer.enqueue(
-      { template: "auth.invitation", to: { userId: row.id }, vars: { name: view.name, link: link.url }, idempotencyKey: `auth.invitation:${link.token.slice(0, 16)}`, expiresAt: link.expiresAt },
+      { template: "auth.invitation", to: { userId: row.id }, vars: { name: view.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
       tx,
     );
     return preview(link.path);
@@ -157,9 +195,10 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     reasonCode: string,
     roles: readonly UserRole[],
     eventName: string,
+    capability: Capability,
   ): Promise<{ status: UserStatus }> {
     return deps.db.transaction(async (tx) => {
-      const row = await loadTarget(tx, publicId, roles);
+      const row = await loadTarget(tx, principal, capability, publicId, roles);
       if (row.id === principal.userId) throw conflict("SELF_STATUS_CHANGE", "You cannot change the status of your own account.");
       const next: UserStatus = status === "active" ? (row.passwordHash || row.status === "active" ? "active" : "pending_activation") : status;
       if (row.status === next) return { status: next };
@@ -223,6 +262,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async createCustomer(principal: SessionPrincipal, input: { email: string; name: string; customerRef?: string }) {
       await require(principal, "customers.manage", "identity.admin.customers.create");
       return deps.db.transaction(async (tx) => {
+        await authorizeInTx(tx, principal, "customers.manage");
         const created = await auth.insertUser(tx, {
           email: input.email,
           name: input.name,
@@ -243,9 +283,10 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     },
 
     async resendInvitation(principal: SessionPrincipal, publicId: string, roles: readonly UserRole[] = ["customer"]) {
-      await require(principal, roles.includes("customer") ? "customers.manage" : "staff.manage", "identity.admin.resendInvitation");
+      const capability: Capability = roles.includes("customer") ? "customers.manage" : "staff.manage";
+      await require(principal, capability, "identity.admin.resendInvitation");
       return deps.db.transaction(async (tx) => {
-        const row = await loadTarget(tx, publicId, roles);
+        const row = await loadTarget(tx, principal, capability, publicId, roles);
         if (row.status !== "pending_activation") throw conflict("NOT_PENDING_ACTIVATION", "This account is already activated.");
         const last = await tokens.lastIssuedAt(tx, row.id, "invitation");
         if (last && deps.clock.now().getTime() - last.getTime() < RESEND_MIN_INTERVAL_MS) {
@@ -262,18 +303,18 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
 
     async setCustomerStatus(principal: SessionPrincipal, publicId: string, status: "active" | "suspended" | "deactivated", reasonCode: string) {
       await require(principal, "customers.manage", "identity.admin.customers.setStatus");
-      return setStatus(principal, publicId, status, reasonCode, ["customer"], "admin.customer.status_changed");
+      return setStatus(principal, publicId, status, reasonCode, ["customer"], "admin.customer.status_changed", "customers.manage");
     },
 
     async setStaffStatus(principal: SessionPrincipal, publicId: string, status: "active" | "suspended" | "deactivated", reasonCode: string) {
       await require(principal, "staff.manage", "identity.admin.staff.setStatus");
-      return setStatus(principal, publicId, status, reasonCode, ["staff", "admin"], "admin.staff.status_changed");
+      return setStatus(principal, publicId, status, reasonCode, ["staff", "admin"], "admin.staff.status_changed", "staff.manage");
     },
 
     async changeReference(principal: SessionPrincipal, publicId: string, newReference: string, expectedVersion: number, reasonCode: string) {
       await require(principal, "customers.reference.change", "identity.admin.customers.changeReference");
       return deps.db.transaction(async (tx) => {
-        const row = await loadTarget(tx, publicId, ["customer"]);
+        const row = await loadTarget(tx, principal, "customers.reference.change", publicId, ["customer"]);
         if (row.version !== expectedVersion) throw conflict("STALE_VERSION", "This customer was changed by someone else. Reload and try again.");
         if (row.customerRef === newReference) throw validation("REFERENCE_UNCHANGED", "The new reference is the same as the current one.");
         await repo.reserveRef(tx, newReference, row.id); // permanent reservation; fails for any current or retired value
@@ -292,7 +333,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async revokeUserSessions(principal: SessionPrincipal, publicId: string) {
       await require(principal, "sessions.revoke_any", "identity.admin.users.revokeSessions");
       return deps.db.transaction(async (tx) => {
-        const row = await loadTarget(tx, publicId, ["customer", "staff", "admin"]);
+        const row = await loadTarget(tx, principal, "sessions.revoke_any", publicId, ["customer", "staff", "admin"]);
         const revoked = await sessions.revokeAllForUser(row.id, {
           reason: "admin_revoked",
           tx,
@@ -314,6 +355,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async createStaff(principal: SessionPrincipal, input: { email: string; name: string; role: "staff" | "admin" }) {
       await require(principal, "staff.manage", "identity.admin.staff.create");
       return deps.db.transaction(async (tx) => {
+        await authorizeInTx(tx, principal, "staff.manage");
         const created = await auth.insertUser(tx, { email: input.email, name: input.name, role: input.role, status: "pending_activation", origin: "admin" });
         const row = (await repo.byId(created.id, { tx, forUpdate: true }))!;
         const invitation = await sendInvitation(tx, row);
@@ -328,7 +370,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async changeRole(principal: SessionPrincipal, publicId: string, role: UserRole, expectedVersion: number) {
       await require(principal, "staff.manage", "identity.admin.staff.changeRole");
       return deps.db.transaction(async (tx) => {
-        const row = await loadTarget(tx, publicId, ["customer", "staff", "admin"]);
+        const row = await loadTarget(tx, principal, "staff.manage", publicId, ["customer", "staff", "admin"]);
         if (row.id === principal.userId) throw conflict("SELF_ROLE_CHANGE", "You cannot change your own role.");
         if (row.version !== expectedVersion) throw conflict("STALE_VERSION", "This account was changed by someone else. Reload and try again.");
         if (row.role === role) return { role, version: row.version };

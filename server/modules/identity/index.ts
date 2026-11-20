@@ -7,7 +7,7 @@ import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, SessionResolver, Tx } from "../../core/types.js";
 import type { TransitionStep, UserRole } from "../../../shared/domain.js";
 import { createAdminService, type AdminService, type CustomerListItem, type Page } from "./admin.js";
-import { createAuthService, type AuthService } from "./auth.js";
+import { createAuthService, PASSWORD_RESET_JOB, type PasswordResetJob, type AuthService } from "./auth.js";
 import { createCredentialService } from "./credentials.js";
 import { IDENTITY_MAIL_TEMPLATES } from "./mail.js";
 import { argon2ParamsFor, createPasswordHasher } from "./password/hasher.js";
@@ -80,6 +80,16 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
   const admin = createAdminService(internals, auth);
 
   for (const template of IDENTITY_MAIL_TEMPLATES) deps.mailer.registerTemplate(template);
+  // Public forgot-password work runs here, off the request path (review ID-04). One transaction of pure
+  // database work (mail goes to the transactional outbox) ⇒ retry-safe.
+  deps.jobs.register<PasswordResetJob>(
+    PASSWORD_RESET_JOB,
+    async (job) => {
+      const outcome = await auth.dispatchPasswordReset(job.payload);
+      return { outcome: "completed", safeCounts: { [outcome]: 1 } };
+    },
+    { retrySafe: true },
+  );
 
   const view = (row: Awaited<ReturnType<typeof repo.byId>>) => (row ? toView(deps.crypto, row) : null);
 
