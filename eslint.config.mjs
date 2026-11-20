@@ -2,6 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
 import jsxA11y from "eslint-plugin-jsx-a11y";
+import globals from "globals";
 
 export default tseslint.config(
   { ignores: ["dist/**", "node_modules/**", "migrations/**", "ref/**", "coverage/**", "client/public/**"] },
@@ -31,6 +32,12 @@ export default tseslint.config(
   },
   {
     files: ["scripts/**/*.ts", "portable/cli/**/*.ts"],
+    rules: { "no-console": "off" },
+  },
+  {
+    // Operator-side Node scripts (installer helpers, build script). They print to the operator's terminal.
+    files: ["deploy/**/*.mjs", "scripts/**/*.mjs", "*.mjs"],
+    languageOptions: { globals: { ...globals.node } },
     rules: { "no-console": "off" },
   },
   {
