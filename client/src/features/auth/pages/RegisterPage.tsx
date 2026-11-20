@@ -1,0 +1,116 @@
+import { useState, type FormEvent } from "react";
+import { Link } from "wouter";
+import { PASSWORD_POLICY, countCodePoints } from "@shared/domain";
+import { useAuthApi, type Accepted } from "@/lib/authApi";
+import { errorMessage, safeError } from "@/lib/trpc";
+import { Button, Callout, Checkbox, Field, Input } from "@/ui";
+import { AuthLayout } from "../components/AuthLayout";
+import { FormError, PasswordInput, PasswordMeter, PreviewLinkCallout, useFocusOnError } from "../components/bits";
+
+export default function RegisterPage() {
+  const api = useAuthApi();
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [accepted, setAccepted] = useState(false);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<Accepted | null>(null);
+  const [busy, setBusy] = useState(false);
+  const errorRef = useFocusOnError(error);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const next: Record<string, string> = {};
+    if (!name.trim()) next.name = "Enter your name.";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) next.email = "Enter a valid email address.";
+    const length = countCodePoints(password);
+    if (length < PASSWORD_POLICY.minLength) next.password = `Use at least ${PASSWORD_POLICY.minLength} characters.`;
+    if (length > PASSWORD_POLICY.maxLength) next.password = `Use at most ${PASSWORD_POLICY.maxLength} characters.`;
+    if (!accepted) next.accepted = "You need to accept the Terms and Privacy Notice to create an account.";
+    setErrors(next);
+    if (Object.keys(next).length) {
+      setError("Please fix the highlighted fields.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const result = await api.register({ name: name.trim(), email: email.trim(), password });
+      setPassword("");
+      setDone(result);
+    } catch (err) {
+      const safe = safeError(err);
+      if (safe?.fieldErrors?.password?.[0]) setErrors({ password: safe.fieldErrors.password[0] });
+      setError(errorMessage(err, "We couldn't create the account. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <AuthLayout showcase title="Check your email">
+        <Callout tone="success" live="polite" title="Almost there">
+          If this address can be registered, we've sent a link to confirm it. Follow the link to finish setting up your account and multi-factor authentication.
+        </Callout>
+        <PreviewLinkCallout link={done.previewLink} label="open the verification link" />
+        <Button asChild variant="secondary" block className="mt-6">
+          <Link href="/sign-in">Back to sign in</Link>
+        </Button>
+      </AuthLayout>
+    );
+  }
+
+  return (
+    <AuthLayout
+      showcase
+      title="Create your account"
+      description="Order, track and receive your business packets in one secure place."
+      below={
+        <>
+          Already have an account?{" "}
+          <Link href="/sign-in" className="font-semibold text-action underline-offset-2 hover:underline">
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <FormError message={error} focusRef={errorRef} />
+      <form onSubmit={submit} noValidate className="flex flex-col gap-5">
+        <Field label="Full name" error={errors.name} required>
+          <Input name="name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} maxLength={160} />
+        </Field>
+        <Field label="Email" error={errors.email} required>
+          <Input type="email" name="email" autoComplete="email" inputMode="email" autoCapitalize="none" spellCheck={false} value={email} onChange={(e) => setEmail(e.target.value)} maxLength={254} />
+        </Field>
+        <Field label="Password" error={errors.password} required>
+          <PasswordInput name="new-password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} aria-describedby="register-pw-meter" />
+        </Field>
+        <PasswordMeter id="register-pw-meter" password={password} />
+        <Checkbox
+          label={
+            <>
+              I agree to the{" "}
+              <Link href="/terms" className="text-action underline underline-offset-2">
+                Terms of Service
+              </Link>{" "}
+              and{" "}
+              <Link href="/privacy" className="text-action underline underline-offset-2">
+                Privacy Notice
+              </Link>
+            </>
+          }
+          description="You'll confirm the current versions after signing in."
+          checked={accepted}
+          onCheckedChange={setAccepted}
+          error={errors.accepted}
+          required
+        />
+        <Button type="submit" size="lg" block loading={busy}>
+          Create account
+        </Button>
+      </form>
+    </AuthLayout>
+  );
+}

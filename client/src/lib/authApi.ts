@@ -46,7 +46,25 @@ export interface PasskeyChallenge {
   options: unknown;
 }
 
+export interface PublicSlide {
+  id: string;
+  title: string;
+  body: string;
+  /** Same-origin path (allowlisted /brand/… asset or /api/platform/presentation/images/<id>). */
+  image: { id: string; alt: string; url: string } | null;
+}
+export interface PublicPresentation {
+  slides: PublicSlide[];
+  slideshow: { autoAdvance: boolean; intervalSeconds: number };
+  supportText: string;
+  announcement: { text: string; tone: "info" | "warning" } | null;
+}
+
 export interface AuthApi {
+  /** platform.presentation (public): sign-in slideshow + support text. */
+  presentation(): Promise<PublicPresentation>;
+  /** jobs.maintenanceBanner (public). */
+  maintenanceBanner(): Promise<{ active: boolean; message: string | null }>;
   me(): Promise<MeResult>;
   passwordPolicy(): Promise<{ minLength: number; maxLength: number }>;
   signIn(input: { email: string; password: string }): Promise<{ nextStep: TransitionStep | null }>;
@@ -76,6 +94,8 @@ export function createAuthApi(client: unknown): AuthApi {
   const q = <T,>(ns: string, name: string, input?: unknown) => c[ns]![name]!.query!(input) as Promise<T>;
   const m = <T,>(ns: string, name: string, input?: unknown) => c[ns]![name]!.mutate!(input) as Promise<T>;
   return {
+    presentation: () => q("platform", "presentation"),
+    maintenanceBanner: () => q("jobs", "maintenanceBanner"),
     me: () => q("identity", "me"),
     passwordPolicy: () => q("identity", "passwordPolicy"),
     signIn: (i) => m("identity", "signIn", i),
