@@ -349,6 +349,10 @@ describe("workflow transitions", () => {
   it("enforces who may trigger, requires notes, records history and notifies the customer", async () => {
     const order = await newOrder(alice);
     let view = await mod.assertCanReadOrder(alice.principal, order.publicId);
+    expect((await mod.orders.get(alice.principal, order.publicId)).transitions).toEqual([
+      { to: "canceled", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: false },
+    ]);
+    expect((await mod.orders.get(staff.principal, order.publicId, "console")).transitions.map((t) => t.actionLabel)).toEqual(["Move to In review", "Cancel order"]);
     await expectError(mod.orders.transition(alice.principal, { orderId: order.publicId, expectedVersion: view.version, toStatus: "in_review" }), "FORBIDDEN:TRANSITION_NOT_ALLOWED");
     expect(h.audit.named("order.transition.denied").length).toBeGreaterThan(0);
     engagement.notifications = [];
@@ -361,6 +365,7 @@ describe("workflow transitions", () => {
     expect(detail.statusLabel).toBe("Action needed");
     expect(detail.history.map((e) => e.toStatus)).toEqual(["awaiting_customer", "in_review", "submitted"]);
     expect(detail.transitions.map((x) => x.to)).toEqual(["in_review"]);
+    expect(detail.transitions[0]).toMatchObject({ actionLabel: "Return to review", destructive: false });
     expect(detail.notes.some((n) => n.body === "Need details")).toBe(true);
   });
 

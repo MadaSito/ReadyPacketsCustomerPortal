@@ -34,6 +34,8 @@ export const workflowTransitionSchema = z.strictObject({
   allowedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(3),
   notifyCustomer: z.boolean(),
   requiresNote: z.boolean().default(false),
+  /** Optional verb phrase for the action button (e.g. "Start review"). Derived from the target state when absent. */
+  actionLabel: label.optional(),
 });
 
 export const workflowDefinitionSchema = z
@@ -94,12 +96,24 @@ export const DEFAULT_WORKFLOW: WorkflowDefinition = {
     { from: "submitted", to: "in_review", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: false },
     { from: "submitted", to: "canceled", allowedBy: ["customer", "staff", "admin"], notifyCustomer: true, requiresNote: false },
     { from: "in_review", to: "awaiting_customer", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: true },
-    { from: "awaiting_customer", to: "in_review", allowedBy: ["customer", "staff", "admin"], notifyCustomer: false, requiresNote: false },
+    { from: "awaiting_customer", to: "in_review", allowedBy: ["customer", "staff", "admin"], notifyCustomer: false, requiresNote: false, actionLabel: "Return to review" },
     { from: "in_review", to: "in_progress", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: false },
     { from: "in_progress", to: "delivered", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: false },
-    { from: "delivered", to: "completed", allowedBy: ["customer", "staff", "admin"], notifyCustomer: true, requiresNote: false },
-    { from: "delivered", to: "in_progress", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: true },
+    { from: "delivered", to: "completed", allowedBy: ["customer", "staff", "admin"], notifyCustomer: true, requiresNote: false, actionLabel: "Mark as completed" },
+    { from: "delivered", to: "in_progress", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: true, actionLabel: "Reopen work" },
     { from: "in_review", to: "canceled", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: true },
     { from: "in_progress", to: "canceled", allowedBy: ["admin"], notifyCustomer: true, requiresNote: true },
   ],
 };
+
+/** Terminal states whose key names a cancellation are presented as destructive actions. */
+export function isCancelState(state: { key: string; kind: string }): boolean {
+  return state.kind === "terminal" && /cancel/.test(state.key);
+}
+
+/** Verb label for a transition button: the definition's actionLabel, else "Cancel order" / "Move to <state>". */
+export function transitionActionLabel(transition: { actionLabel?: string }, target: { key: string; kind: string } | undefined, targetLabel: string): string {
+  if (transition.actionLabel) return transition.actionLabel;
+  if (target && isCancelState(target)) return "Cancel order";
+  return `Move to ${targetLabel}`;
+}

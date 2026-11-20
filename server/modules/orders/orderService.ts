@@ -19,7 +19,7 @@ import { allocateReference, normalizeReference, reserveReference } from "./refer
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderSummary, NoteVisibility } from "./types.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
-import { findState, initialState, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
+import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
 export interface OrderServiceDeps {
   db: Db;
@@ -499,7 +499,17 @@ export function createOrderService(deps: OrderServiceDeps) {
           hasNote: entry.noteId !== null && visibleNoteIds.has(entry.noteId),
           occurredAt: entry.occurredAt,
         })),
-        transitions: transitions.map((t) => ({ to: t.to, label: label(t.to)!, requiresNote: t.requiresNote })),
+        transitions: transitions.map((t) => {
+          const target = findState(bound.definition, t.to);
+          const targetLabel = label(t.to)!;
+          return {
+            to: t.to,
+            label: targetLabel,
+            actionLabel: transitionActionLabel(t, target, targetLabel),
+            destructive: target ? isCancelState(target) : false,
+            requiresNote: t.requiresNote,
+          };
+        }),
       };
       });
     },

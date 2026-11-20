@@ -81,7 +81,7 @@ const detail = {
   lineItems: [{ publicId: "01JTESTLINE00000000000000A", productPublicId: null, productVersion: 1, name: "Synthetic item", description: "Demo", features: [], unitPriceMinor: 1250, currency: "USD", quantity: 2, lineTotalMinor: 2500 }],
   notes: [{ publicId: "01JTESTNOTE00000000000000A", visibility: "customer", authorRole: "customer", mine: true, body: "Customer note", createdAt: now }],
   history: [{ publicId: "01JTESTHIST00000000000000A", fromLabel: null, toLabel: "Submitted", toStatus: "submitted", actorRole: "customer", reasonCode: "CREATED", hasNote: false, occurredAt: now }],
-  transitions: [{ to: "canceled", label: "Canceled", requiresNote: true }],
+  transitions: [{ to: "canceled", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: true }],
 };
 const catalog = [
   {
@@ -240,12 +240,26 @@ describe("order detail host", () => {
     handlers.set("orders.transition", () => ({ version: 4 }));
     const user = userEvent.setup();
     renderDetail(`/orders/${ORDER_ID}`);
-    await user.click(await screen.findByRole("button", { name: "Canceled" }));
-    const dialog = await screen.findByRole("dialog");
-    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel order" }));
+    const dialog = await screen.findByRole("dialog", { name: "Cancel this order?" });
+    await user.click(within(dialog).getByRole("button", { name: "Yes, cancel order" }));
     expect(await within(dialog).findByText("A note is required for this change.")).toBeInTheDocument();
     expect(calls.some((c) => c.path === "orders.transition")).toBe(false);
     await expectNoAxeViolations(dialog);
+  });
+
+  it("customer sees a verb action (not a state name); Keep order closes the dialog without a change", async () => {
+    handlers.set("orders.get", () => detail);
+    const user = userEvent.setup();
+    renderDetail(`/orders/${ORDER_ID}`);
+    const action = await screen.findByRole("button", { name: "Cancel order" });
+    expect(screen.queryByRole("button", { name: "Canceled" })).not.toBeInTheDocument();
+    await user.click(action);
+    const dialog = await screen.findByRole("dialog", { name: "Cancel this order?" });
+    expect(within(dialog).getAllByRole("button").map((b) => b.textContent?.trim()).filter(Boolean)).toEqual(expect.arrayContaining(["Keep order", "Yes, cancel order"]));
+    await user.click(within(dialog).getByRole("button", { name: "Keep order" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(calls.some((c) => c.path === "orders.transition")).toBe(false);
   });
 
   it("unknown or forbidden orders show one indistinguishable error page", async () => {
@@ -281,6 +295,72 @@ describe("console", () => {
     const { container } = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
     expect((await screen.findAllByRole("link", { name: "RP-2026-000001" }))[0]).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);
     await expectNoAxeViolations(container);
+  });
+
+  it("console transitions use unique verb labels and every confirm dialog has a Cancel button", async () => {
+    session.role = "admin";
+    const transitions = [
+      { to: "in_review", label: "In review", actionLabel: "Move to In review", destructive: false, requiresNote: false },
+      { to: "awaiting_customer", label: "Awaiting customer", actionLabel: "Move to Awaiting customer", destructive: false, requiresNote: true },
+      { to: "in_progress", label: "In progress", actionLabel: "Move to In progress", destructive: false, requiresNote: false },
+      { to: "canceled", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: true },
+    ];
+    handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions }));
+    handlers.set("orders.admin.referenceHistory", () => []);
+    const user = userEvent.setup();
+    const { container } = renderUi(
+      <Route path="/admin/orders/:orderId">
+        <AdminOrderDetailPage />
+      </Route>,
+      { path: `/admin/orders/${ORDER_ID}` },
+    );
+    for (const name of ["Move to In review", "Move to Awaiting customer", "Move to In progress", "Cancel order"]) expect(await screen.findByRole("button", { name })).toBeInTheDocument();
+    for (const name of ["In review", "Awaiting customer", "In progress", "Canceled"]) expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Move to In review" }));
+    let dialog = await screen.findByRole("dialog", { name: "Change status to “In review”?" });
+    expect(within(dialog).getByRole("button", { name: "Confirm" })).toBeInTheDocument();
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    for (const action of ["Change lock", "Change reference", "Reassign to another customer"]) {
+      await user.click(screen.getByRole("button", { name: action }));
+      dialog = await screen.findByRole("dialog");
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    }
+    expect(calls.some((c) => c.path.startsWith("orders.admin.") && !c.path.endsWith("get") && !c.path.endsWith("referenceHistory"))).toBe(false);
+  });
+
+  it("change reference updates breadcrumb, subtitle and summary immediately and shows a toast", async () => {
+    session.role = "admin";
+    let current = { ...detail, accessRole: "admin", transitions: [] as typeof detail.transitions };
+    handlers.set("orders.admin.get", () => current);
+    handlers.set("orders.admin.referenceHistory", () => []);
+    handlers.set("orders.admin.changeReference", (input) => {
+      const { newReference } = input as { newReference: string };
+      current = { ...current, reference: newReference, version: current.version + 1 };
+      return { reference: newReference, version: current.version };
+    });
+    const user = userEvent.setup();
+    renderUi(
+      <Route path="/admin/orders/:orderId">
+        <AdminOrderDetailPage />
+      </Route>,
+      { path: `/admin/orders/${ORDER_ID}` },
+    );
+    expect(await screen.findByText("Order RP-2026-000001")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Change reference" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText(/New reference/), "RP-QA-0001");
+    await user.selectOptions(within(dialog).getByLabelText(/Reason/), "CORRECTION");
+    await user.click(within(dialog).getByRole("button", { name: "Change reference" }));
+    expect(await screen.findByText("Reference changed")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Order RP-QA-0001")).toBeInTheDocument());
+    expect(screen.queryByText("Order RP-2026-000001")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("navigation", { name: /breadcrumb/i })).getByText("RP-QA-0001")).toBeInTheDocument();
+    expect(screen.getAllByText("RP-QA-0001").length).toBeGreaterThanOrEqual(2); // breadcrumb + summary (subtitle asserted above)
+    expect(calls.find((c) => c.path === "orders.admin.changeReference")?.input).toMatchObject({ orderId: ORDER_ID, expectedVersion: 3, newReference: "RP-QA-0001", reasonCode: "CORRECTION" });
   });
 
   it("console detail shows staff tabs and admin actions; reassignment requires typing the reference", async () => {

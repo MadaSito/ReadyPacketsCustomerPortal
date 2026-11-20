@@ -236,22 +236,38 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
   );
 }
 
+type TransitionOption = OrderDetail["transitions"][number];
+
+/** Button text is always a verb; duplicates (e.g. two cancel states) are disambiguated with the target state. */
+function transitionButtons(options: TransitionOption[]) {
+  const counts = new Map<string, number>();
+  for (const option of options) counts.set(option.actionLabel, (counts.get(option.actionLabel) ?? 0) + 1);
+  return options.map((option) => ({ ...option, text: (counts.get(option.actionLabel) ?? 0) > 1 ? `${option.actionLabel} (${option.label})` : option.actionLabel }));
+}
+
 function TransitionControl({ order }: { order: OrderDetail }) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const toast = useToast();
   const transition = useMutation(trpc.orders.transition.mutationOptions());
-  const [target, setTarget] = useState<{ to: string; label: string; requiresNote: boolean } | null>(null);
+  const [target, setTarget] = useState<(TransitionOption & { text: string }) | null>(null);
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   if (order.transitions.length === 0) return null;
+  const buttons = transitionButtons(order.transitions);
+  const close = () => {
+    if (transition.isPending) return;
+    setTarget(null);
+    setNote("");
+    setError(null);
+  };
   const submit = async () => {
     if (!target) return;
     if (target.requiresNote && !note.trim()) return setError("A note is required for this change.");
     setError(null);
     try {
       await transition.mutateAsync({ orderId: order.publicId, expectedVersion: order.version, toStatus: target.to, note: note.trim() || undefined });
-      toast.show({ tone: "success", title: `Status changed to ${target.label}` });
+      toast.show({ tone: "success", title: target.destructive ? "Order canceled" : `Status changed to ${target.label}` });
       setTarget(null);
       setNote("");
       await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
@@ -259,24 +275,33 @@ function TransitionControl({ order }: { order: OrderDetail }) {
       setError(errorMessage(err));
     }
   };
+  const title = target ? (target.destructive ? "Cancel this order?" : `Change status to “${target.label}”?`) : "Change status";
+  const description = target?.destructive
+    ? "The order will be canceled and can't be resumed. Everyone with access to the order will be notified."
+    : "Everyone with access to the order will be notified.";
   return (
     <>
       <div className="flex flex-wrap gap-2">
-        {order.transitions.map((option) => (
-          <Button key={option.to} variant="secondary" onClick={() => (setTarget(option), setNote(""), setError(null))}>
-            {option.label}
+        {buttons.map((option) => (
+          <Button key={option.to} variant={option.destructive ? "danger" : "secondary"} onClick={() => (setTarget(option), setNote(""), setError(null))}>
+            {option.text}
           </Button>
         ))}
       </div>
       <Dialog
         open={target !== null}
-        onOpenChange={(open) => (open ? undefined : setTarget(null))}
-        title={target ? `Change status to “${target.label}”?` : "Change status"}
-        description="Everyone with access to the order will be notified."
+        onOpenChange={(open) => (open ? undefined : close())}
+        title={title}
+        description={description}
         footer={
-          <Button loading={transition.isPending} onClick={() => void submit()}>
-            Confirm
-          </Button>
+          <>
+            <Button variant="secondary" onClick={close} disabled={transition.isPending}>
+              {target?.destructive ? "Keep order" : "Cancel"}
+            </Button>
+            <Button variant={target?.destructive ? "danger" : "primary"} loading={transition.isPending} onClick={() => void submit()}>
+              {target?.destructive ? "Yes, cancel order" : "Confirm"}
+            </Button>
+          </>
         }
       >
         <div className="flex flex-col gap-4">

@@ -133,9 +133,14 @@ function PublishDialog({ workflow, onClose }: { workflow: WorkflowRow; onClose: 
       title={`Publish a new version of ${workflow.name}`}
       description="The server validates the definition: unique state keys, exactly one start state, and transitions between known states."
       footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={publish.isPending}>
+            Cancel
+          </Button>
         <Button loading={publish.isPending} onClick={() => void submit()}>
           Publish
         </Button>
+        </>
       }
     >
       <div className="flex flex-col gap-4">

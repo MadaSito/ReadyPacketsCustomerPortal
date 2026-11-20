@@ -163,9 +163,14 @@ function GroupDialog({ group, onClose }: { group: Group | null; onClose: () => v
       onOpenChange={(open) => (open ? undefined : onClose())}
       title={group ? "Edit group" : "New group"}
       footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={create.isPending || update.isPending}>
+            Cancel
+          </Button>
         <Button loading={create.isPending || update.isPending} onClick={() => void submit()}>
           Save group
         </Button>
+        </>
       }
     >
       <form onSubmit={submit} noValidate className="flex flex-col gap-4">
@@ -235,9 +240,14 @@ function ProductDialog({ groups, product, groupId, onClose }: { groups: Group[];
       title={product ? "Edit product" : "New product"}
       description={product ? "Changing the name, description, features or price publishes a new version. Existing orders are not affected." : undefined}
       footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={create.isPending || update.isPending}>
+            Cancel
+          </Button>
         <Button loading={create.isPending || update.isPending} onClick={() => void submit()}>
           Save product
         </Button>
+        </>
       }
     >
       <form onSubmit={submit} noValidate className="flex flex-col gap-4">

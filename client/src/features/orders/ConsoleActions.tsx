@@ -36,9 +36,31 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
   const role = me?.user.role;
   const isAdmin = role === "admin";
   const canManage = role !== undefined && role !== "customer" && roleHasCapability(role, "orders.manage");
-  const setLock = useMutation(trpc.orders.admin.setLock.mutationOptions());
-  const changeReference = useMutation(trpc.orders.admin.changeReference.mutationOptions());
-  const reassign = useMutation(trpc.orders.admin.reassign.mutationOptions());
+  /**
+   * Every successful change patches the cached detail immediately (so the header, breadcrumb and summary
+   * update without waiting for a refetch) and then invalidates every orders query (detail, list, history).
+   */
+  const patchDetail = (patch: { version?: number; reference?: string; lockState?: LockState }) => {
+    queryClient.setQueryData(trpc.orders.admin.get.queryKey({ orderId }), (current) => (current ? { ...current, ...patch } : current));
+  };
+  const refresh = () => queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey(), refetchType: "all" });
+  const setLock = useMutation(
+    trpc.orders.admin.setLock.mutationOptions({
+      onSuccess: async (result) => {
+        patchDetail({ version: result.version, lockState: result.lockState as LockState });
+        await refresh();
+      },
+    }),
+  );
+  const changeReference = useMutation(
+    trpc.orders.admin.changeReference.mutationOptions({
+      onSuccess: async (result) => {
+        patchDetail({ version: result.version, reference: result.reference });
+        await refresh();
+      },
+    }),
+  );
+  const reassign = useMutation(trpc.orders.admin.reassign.mutationOptions({ onSuccess: () => refresh() }));
   const history = useQuery(trpc.orders.admin.referenceHistory.queryOptions({ orderId }));
   const [dialog, setDialog] = useState<"lock" | "reference" | "reassign" | null>(null);
   const [lockTarget, setLockTarget] = useState<LockState>(lockState === "none" ? "review" : "none");
@@ -57,17 +79,25 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
     setConfirmText("");
     setOperationId(newIdempotencyKey());
   };
-  const done = async (title: string) => {
+  const done = (title: string) => {
     toast.show({ tone: "success", title });
     setDialog(null);
-    await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
   };
+  const busy = setLock.isPending || changeReference.isPending || reassign.isPending;
+  const close = () => {
+    if (!busy) setDialog(null);
+  };
+  const cancelButton = (
+    <Button variant="secondary" onClick={close} disabled={busy}>
+      Cancel
+    </Button>
+  );
   const run = async (action: () => Promise<unknown>, title: string) => {
     setError(null);
     if (!reasonCode) return setError("Choose a reason.");
     try {
       await action();
-      await done(title);
+      done(title);
     } catch (err) {
       if (err instanceof StepUpCancelledError) return;
       setError(errorMessage(err));
@@ -118,13 +148,16 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
 
       <Dialog
         open={dialog === "lock"}
-        onOpenChange={(value) => (value ? undefined : setDialog(null))}
+        onOpenChange={(value) => (value ? undefined : close())}
         title="Change lock"
         description="Locks block changes only; people with access can still view and download."
         footer={
+          <>
+            {cancelButton}
           <Button loading={setLock.isPending} onClick={() => void run(() => setLock.mutateAsync({ orderId, expectedVersion: version, lockState: lockTarget, reasonCode }), "Lock updated")}>
             Apply
           </Button>
+          </>
         }
       >
         <div className="flex flex-col gap-4">
@@ -140,10 +173,12 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
 
       <Dialog
         open={dialog === "reference"}
-        onOpenChange={(value) => (value ? undefined : setDialog(null))}
+        onOpenChange={(value) => (value ? undefined : close())}
         title="Change order reference"
         description={`The current reference ${reference} will be retired and reserved permanently. It can never be reused.`}
         footer={
+          <>
+            {cancelButton}
           <Button
             loading={changeReference.isPending}
             onClick={() =>
@@ -155,6 +190,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
           >
             Change reference
           </Button>
+          </>
         }
       >
         <div className="flex flex-col gap-4">
@@ -170,10 +206,12 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
 
       <Dialog
         open={dialog === "reassign"}
-        onOpenChange={(value) => (value ? undefined : setDialog(null))}
+        onOpenChange={(value) => (value ? undefined : close())}
         title="Reassign order"
         description="Ownership moves to the selected customer. Every share is revoked, file ownership moves with the order, and outstanding download links stop working."
         footer={
+          <>
+            {cancelButton}
           <Button
             variant="danger"
             disabled={confirmText.trim() !== reference}
@@ -190,6 +228,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
           >
             Reassign order
           </Button>
+          </>
         }
       >
         <div className="flex flex-col gap-4">
