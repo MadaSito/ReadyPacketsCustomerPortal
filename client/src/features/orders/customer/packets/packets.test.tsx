@@ -1,8 +1,23 @@
-import { fireEvent, screen, within } from "@testing-library/react";
+import { fireEvent, renderHook, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { inferRouterOutputs } from "@trpc/server";
+import type { ReactNode } from "react";
+import type { AppRouter } from "@server/trpc/root";
+import type * as trpcModule from "@/lib/trpc";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
-import { bundleHint, isPacketCatalog, nonPacketGroups, PacketPicker, packetItems, PacketSummary, type OrderQuote, type PickerGroup, type PacketTier } from "./index";
+import { useOrderQuote, bundleHint, isPacketCatalog, nonPacketGroups, PacketPicker, packetItems, PacketSummary, type OrderQuote, type PickerGroup, type PacketTier } from "./index";
+
+const { quoteFn } = vi.hoisted(() => ({ quoteFn: vi.fn() }));
+vi.mock("@/lib/trpc", async (original) => ({
+  ...(await original<typeof trpcModule>()),
+  useTRPC: () => ({ orders: { quote: { queryOptions: (input: unknown, opts: object) => ({ queryKey: ["orders.quote", input], queryFn: () => quoteFn(input), ...opts }) } } }),
+}));
+
+// Compile-time: the router's catalog.list output satisfies the picker's structural input type.
+type CatalogList = inferRouterOutputs<AppRouter>["orders"]["catalog"]["list"];
+export const catalogFitsPicker = (groups: CatalogList): readonly PickerGroup[] => groups;
 
 const PRICES: Record<PacketTier, number> = { Basic: 45000, Standard: 135000, Premium: 250000 };
 const packet = (n: number, name: string): PickerGroup => ({
@@ -150,5 +165,30 @@ describe("PacketSummary", () => {
   it("bundleHint is null without a rule", () => {
     expect(bundleHint(quote({ bundle: null }))).toBeNull();
     expect(bundleHint(null)).toBeNull();
+  });
+});
+
+describe("useOrderQuote", () => {
+  const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { gcTime: 0 } } })}>{children}</QueryClientProvider>;
+
+  it("does not call the server for an empty selection, and passes the exact items when there is one", async () => {
+    quoteFn.mockReset();
+    quoteFn.mockResolvedValue(quote());
+    const { result, rerender } = renderHook(({ items }) => useOrderQuote(items), { wrapper, initialProps: { items: [] as Array<{ productPublicId: string; quantity: number }> } });
+    expect(result.current).toEqual({ quote: null, pending: false, error: null });
+    expect(quoteFn).not.toHaveBeenCalled();
+    rerender({ items: [{ productPublicId: "p1-basic", quantity: 1 }] });
+    await waitFor(() => expect(result.current.quote?.totalMinor).toBe(180002));
+    expect(result.current.pending).toBe(false);
+    expect(quoteFn).toHaveBeenCalledWith({ items: [{ productPublicId: "p1-basic", quantity: 1 }] });
+  });
+
+  it("surfaces a validation error without retrying", async () => {
+    quoteFn.mockReset();
+    quoteFn.mockRejectedValue(new Error("PACKET_TIER_CONFLICT"));
+    const { result } = renderHook(() => useOrderQuote([{ productPublicId: "p1-basic", quantity: 1 }]), { wrapper });
+    await waitFor(() => expect(result.current.error).toBeTruthy());
+    expect(result.current.quote).toBeNull();
+    expect(quoteFn).toHaveBeenCalledTimes(1);
   });
 });
