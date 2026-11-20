@@ -53,10 +53,18 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     log.info("shutdown requested", { signal });
-    const timer = setTimeout(() => process.exit(1), 30_000);
-    timer.unref();
-    await Promise.allSettled(shutdownTasks.map((task) => task()));
+    const results = await Promise.allSettled(shutdownTasks.map((task) => task()));
+    if (results.some((result) => result.status === "rejected")) {
+      // A component could not PROVE it stopped (for example a job handler that has not reached a durable
+      // boundary). Fail closed: keep the database open so in-flight work can still settle or be fenced, do
+      // not report a clean exit, and leave the final decision to the supervisor's stop timeout
+      // (systemd TimeoutStopSec), after which the stale-lease reaper marks the attempt `unknown`.
+      log.error("shutdown incomplete: a component did not confirm a clean stop", { signal });
+      process.exitCode = 70;
+      return;
+    }
     await container.close();
+    log.info("shutdown complete", { signal });
     process.exit(0);
   };
   process.on("SIGTERM", () => void stop("SIGTERM"));
