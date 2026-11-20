@@ -31,7 +31,9 @@ export type ActiveClaim = { job: ClaimedJob; controller: AbortController };
 export const JOB_TYPE = /^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$/;
 const CORRELATION = /^[A-Za-z0-9_.:-]{1,64}$/;
 const SAFE_REASON = /^[A-Z][A-Z0-9_]{0,63}$/;
-export const LEASE_MS = 30_000;
+const LEASE_MS = 30_000;
+const dbNow = sql`UTC_TIMESTAMP(3)`;
+const newLease = sql`TIMESTAMPADD(MICROSECOND, ${LEASE_MS * 1000}, ${dbNow})`;
 export const MAINTENANCE_ID = 1;
 
 export const keyHash = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -202,12 +204,11 @@ export class JobEngine implements JobQueue {
       if (!candidate) return null;
       const attempt = candidate.attempt + 1;
       const fencingToken = candidate.fencingToken + 1;
-      const leaseUntil = new Date(now.getTime() + LEASE_MS);
-      await tx.update(jobRuns).set({ state: "running", leaseUntil, attempt, fencingToken, updatedAt: now })
+      await tx.update(jobRuns).set({ state: "running", leaseUntil: newLease, attempt, fencingToken, updatedAt: now })
         .where(eq(jobRuns.id, candidate.id));
       await tx.insert(jobAttempts).values({ jobId: candidate.id, fencingToken, attempt, state: "running", startedAt: now });
       await workerContext(deps, candidate, () => jobAudit(deps, tx, candidate, "job.claimed", "attempted", undefined, true));
-      return { ...candidate, attempt, fencingToken, leaseUntil };
+      return { ...candidate, attempt, fencingToken };
     }, { isolationLevel: "read committed" });
     if (!row) return null;
     const controller = new AbortController();
@@ -240,10 +241,14 @@ export class JobEngine implements JobQueue {
   async #owned(tx: Tx, job: ClaimedJob): Promise<JobRow | undefined> {
     const [row] = await tx.select().from(jobRuns).where(and(
       eq(jobRuns.publicId, job.jobId), eq(jobRuns.state, "running"), eq(jobRuns.fencingToken, job.fencingToken),
-      gt(jobRuns.leaseUntil, this.deps.clock.now()),
     )).limit(1).for("update");
-    // Recheck after the lock wait; the SQL-bound time was sampled before it.
-    return row?.leaseUntil && row.leaseUntil.getTime() > this.deps.clock.now().getTime() ? row : undefined;
+    if (!row?.leaseUntil) return undefined;
+    // MySQL samples statement time before any lock wait. Check in a new statement
+    // after locking, so all processes use the same time source without a stale sample.
+    const [valid] = await tx.select({ id: jobRuns.id }).from(jobRuns).where(and(
+      eq(jobRuns.id, row.id), gt(jobRuns.leaseUntil, dbNow),
+    )).limit(1).for("update");
+    return valid ? row : undefined;
   }
 
   async heartbeat(claim: ActiveClaim): Promise<void> {
@@ -253,7 +258,7 @@ export class JobEngine implements JobQueue {
         const row = await this.#owned(tx, claim.job);
         if (!row || claim.controller.signal.aborted) return false;
         const now = this.deps.clock.now();
-        await tx.update(jobRuns).set({ leaseUntil: new Date(now.getTime() + LEASE_MS), updatedAt: now })
+        await tx.update(jobRuns).set({ leaseUntil: newLease, updatedAt: now })
           .where(eq(jobRuns.id, row.id));
         return true;
       }, { isolationLevel: "read committed" });
@@ -327,7 +332,7 @@ export class JobEngine implements JobQueue {
     // Keep each transaction small and hold no gate: stale claims must settle even while draining.
     return deps.db.transaction(async (tx) => {
       const stale = await tx.select().from(jobRuns).where(and(
-        eq(jobRuns.state, "running"), lte(jobRuns.leaseUntil, deps.clock.now()),
+        eq(jobRuns.state, "running"), lte(jobRuns.leaseUntil, dbNow),
       )).orderBy(asc(jobRuns.leaseUntil), asc(jobRuns.id)).limit(16).for("update", { skipLocked: true });
       for (const row of stale) {
         await workerContext(deps, row, async () => {

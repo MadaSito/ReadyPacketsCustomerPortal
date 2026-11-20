@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
+import type { DeploymentProfile } from "../../config/env.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, Tx } from "../../core/types.js";
@@ -32,6 +33,10 @@ type DeliveryDeps = {
   findRecipient(userId: number): Promise<{ email: string; status: string } | null>;
   send(input: RenderedMail & { html: string; signal: AbortSignal }): Promise<SmtpDeliveryResult>;
 };
+
+export function allowsMailCapture(profile: DeploymentProfile): boolean {
+  return profile === "development" || profile === "test";
+}
 
 export const MAIL_CAPTURE = defineSetting({
   key: "jobs.mail.capture",
@@ -133,8 +138,8 @@ export class MailEngine implements Mailer {
 
   async captureEnabled(): Promise<boolean> {
     const enabled = await readSetting(this.deps.settings, MAIL_CAPTURE);
-    if (enabled && this.deps.config.deploymentProfile === "production") {
-      throw new DomainError("FORBIDDEN", "MAIL_CAPTURE_FORBIDDEN", "Mail capture is not available in production.");
+    if (enabled && !allowsMailCapture(this.deps.config.deploymentProfile)) {
+      throw new DomainError("FORBIDDEN", "MAIL_CAPTURE_FORBIDDEN", "Mail capture is available only in development and test.");
     }
     return enabled;
   }

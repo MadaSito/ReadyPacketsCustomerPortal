@@ -5,7 +5,7 @@ import { ULID_PATTERN } from "../../core/ids.js";
 import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
-import { mailAudit, mailEngineFor } from "./mail.js";
+import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
 import { engineFor, ensureMaintenanceGate, gateDraining, jobAudit, MAINTENANCE_ID } from "./queue.js";
 import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailOutbox } from "./schema.js";
 
@@ -223,7 +223,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
       )).orderBy(desc(mailOutbox.publicId)).limit(limit + 1);
       const rows = await query;
       const now = clock.now();
-      const canReadCaptures = deps.config.deploymentProfile !== "production"
+      const canReadCaptures = allowsMailCapture(deps.config.deploymentProfile)
         && rows.some((row) => row.state === "captured" && row.expiresAt > now)
         && await (mailEngineFor(deps.mailer)?.captureEnabled() ?? false);
       const safe = rows.map(({ hasPayload, ...row }) => ({

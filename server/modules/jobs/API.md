@@ -21,7 +21,7 @@
 
 ## Configuration and evidence
 
-- `jobs.mail.capture`: boolean setting, defaults off; production refuses use.
+- `jobs.mail.capture`: boolean setting, defaults off; only development and test allow use. Preview and production refuse capture.
 - `jobs.mail.deliver`: one non-retry-safe job per generation. Safe outcomes distinguish queued, sending, accepted (not delivery confirmation), held, captured, failed, expired, canceled, and unknown. A held or definitively refused message may be resent while its encrypted payload remains valid; no automatic retry on failure or ambiguous submission.
 - `jobs.mail.expire`: recurring bounded cleanup of expired encrypted outbox data and development captures. Sensitive payloads default to 30 minutes, other messages to 24 hours; a caller can supply the authoritative expiry up to 72 hours. Captures are readable for at most 15 minutes, and already expired data cannot be read or sent. Physical cleanup is deferred while workers are unavailable or maintenance is active.
 - `jobs.queue` and `jobs.mail`: queue depth/oldest/stuck/unknown health and mail hold/unknown health.

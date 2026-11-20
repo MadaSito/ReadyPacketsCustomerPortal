@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
@@ -8,7 +8,7 @@ import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
-import { createJobQueue, createMailer, engineFor, LEASE_MS } from "./queue.js";
+import { createJobQueue, createMailer, engineFor } from "./queue.js";
 import { jobsRouter } from "./router.js";
 import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox } from "./schema.js";
 import { startWorker } from "./worker.js";
@@ -23,6 +23,10 @@ beforeEach(async () => {
 });
 
 const done = async () => ({ outcome: "completed" as const });
+async function expireLease(jobId?: string): Promise<void> {
+  await t.db.update(jobRuns).set({ leaseUntil: sql`UTC_TIMESTAMP(3) - INTERVAL 1 SECOND` })
+    .where(jobId === undefined ? eq(jobRuns.state, "running") : eq(jobRuns.publicId, jobId));
+}
 function latch(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((ready) => { resolve = ready; });
@@ -82,14 +86,22 @@ describe("MySQL durable job leases", () => {
 
   it("uses lease renewal, retries an explicit safe type, and fences stale publication", async () => {
     const f = fixture();
+    const fast = fixture();
+    fast.jobs.register("test.safe", done, { retrySafe: true });
     f.jobs.register("test.safe", done, { retrySafe: true });
     const { jobId } = await f.jobs.enqueue("test.safe", { payload: 1 });
     const old = (await f.engine.claim())!;
-    f.h.clock.advance(20_000);
+    fast.h.clock.advance(120_000);
+    expect(await fast.engine.reap()).toBe(0);
+    const [before] = await t.db.select({ leaseUntil: jobRuns.leaseUntil }).from(jobRuns).where(eq(jobRuns.publicId, jobId));
+    await t.db.update(jobRuns).set({ leaseUntil: sql`UTC_TIMESTAMP(3) + INTERVAL 10 SECOND` }).where(eq(jobRuns.publicId, jobId));
+    f.h.clock.advance(120_000);
     await f.engine.heartbeat(old);
-    f.h.clock.advance(20_000);
+    const [renewed] = await t.db.select({ leaseUntil: jobRuns.leaseUntil }).from(jobRuns).where(eq(jobRuns.publicId, jobId));
+    expect(old.job.signal.aborted).toBe(false);
+    expect(Math.abs(renewed!.leaseUntil!.getTime() - before!.leaseUntil!.getTime())).toBeLessThan(10_000);
     expect(await f.engine.reap()).toBe(0);
-    f.h.clock.advance(11_000);
+    await expireLease(jobId);
     expect(await f.engine.reap()).toBe(1);
     expect(await f.engine.claim()).toBeNull();
     f.h.clock.advance(2_000);
@@ -117,7 +129,7 @@ describe("MySQL durable job leases", () => {
     await f.jobs.enqueue("test.unsafe", null);
     expect(await f.engine.claim()).toBeNull();
     expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "draining", running: 1 });
-    f.h.clock.advance(LEASE_MS + 1);
+    await expireLease(a.jobId);
     expect(await f.engine.reap()).toBe(1);
     await f.engine.heartbeat(old);
     expect(old.job.signal.aborted).toBe(true);
@@ -139,7 +151,7 @@ describe("MySQL durable job leases", () => {
     const { jobId: failed } = await f.jobs.enqueue("test.safe", "fail");
     await f.engine.claim();
     await f.engine.claim();
-    f.h.clock.advance(LEASE_MS + 1);
+    await expireLease();
     expect(await f.engine.reap()).toBe(2);
     await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
     expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 2 });
@@ -151,7 +163,7 @@ describe("MySQL durable job leases", () => {
     await f.admin.setMaintenance(f.operator, { active: false, expectedActive: true });
     const { jobId } = await f.jobs.enqueue("test.safe", "fails after interruption");
     await f.engine.claim();
-    f.h.clock.advance(LEASE_MS + 2_000);
+    await expireLease(jobId);
     await f.engine.reap();
     f.h.clock.advance(2_000);
     await f.engine.execute((await f.engine.claim())!);
@@ -387,7 +399,7 @@ describe("MySQL transactional mail outbox", () => {
     const execution = f.engine.execute(active);
     try {
       await entered.promise;
-      f.h.clock.advance(LEASE_MS + 1);
+      await expireLease(active.job.jobId);
       expect(await f.engine.reap()).toBe(1);
     } finally {
       release.resolve();
@@ -419,15 +431,26 @@ describe("MySQL transactional mail outbox", () => {
     expect(current).toMatchObject({ state: "captured", captureEnc: null });
   });
 
-  it("refuses capture and sends nothing when accidentally enabled in production", async () => {
-    const f = fixture({ config: { deploymentProfile: "production" } });
+  it.each(["production", "preview"] as const)("refuses capture and sends nothing when accidentally enabled in %s", async (deploymentProfile) => {
+    const dev = fixture();
+    setDelivery(dev, "accepted");
+    await dev.h.settings.set(MAIL_CAPTURE.key, true);
+    await dev.mailer.enqueue(input);
+    await dev.engine.execute((await dev.engine.claim())!);
+    const [existing] = await t.db.select().from(mailOutbox);
+    expect(existing?.state).toBe("captured");
+
+    const f = fixture({ config: { deploymentProfile } });
     const ports = setDelivery(f, "accepted");
     await f.h.settings.set(MAIL_CAPTURE.key, true);
-    await f.mailer.enqueue(input);
+    await f.mailer.enqueue({ ...input, idempotencyKey: "mail-key-second" });
     await f.engine.execute((await f.engine.claim())!);
-    const [row] = await t.db.select().from(mailOutbox);
+    const [row] = await t.db.select().from(mailOutbox).where(eq(mailOutbox.state, "failed"));
     expect(row).toMatchObject({ state: "failed", reasonCode: "MAIL_CAPTURE_FORBIDDEN", captureEnc: null });
-    await expect(f.admin.capture(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_CAPTURE_FORBIDDEN" });
+    expect((await f.admin.listMail(f.operator, { state: "captured" })).items).toMatchObject([
+      { publicId: existing!.publicId, canViewCapture: false },
+    ]);
+    await expect(f.admin.capture(f.operator, existing!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_CAPTURE_FORBIDDEN" });
     expect(ports.send).not.toHaveBeenCalled();
   });
 });
