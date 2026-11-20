@@ -77,4 +77,4 @@ Owner: ui_foundation_engineer. The UI kit is documented in `client/src/ui/README
 ## PWA
 
 - Files: `client/public/manifest.webmanifest`, `offline.html` and `offline.css`. `app/PwaUpdatePrompt.tsx` registers `${BASE_URL}sw.js`, but not in dev or preview builds.
-- The vite-plugin-pwa config was sent to the integrator. It precaches the static shell only, uses NetworkOnly for `/api`, and the update is user-driven (`SKIP_WAITING`).
+- The integrator configured VitePWA in vite.config.ts. It precaches static assets only (index.html is not precached because it carries a per-response CSP nonce), makes navigations NetworkOnly with an offline.html fallback, makes `/api` NetworkOnly, and the update is user-driven (`SKIP_WAITING`).
