@@ -84,6 +84,11 @@ describe("PacketPicker", () => {
     expect(names.map((n) => n.match(/^(Not included|Basic|Standard|Premium)/)?.[1])).toEqual(["Not included", "Basic", "Standard", "Premium"]);
     expect(names[1]).toContain("$450.01");
     expect(names[1]).toContain("Timeline: 48-72 hours");
+    // Name, price and timeline are separate lines in every tile.
+    const label = (radios[2] as HTMLButtonElement).labels?.[0];
+    const nameBlock = label?.querySelector("span.flex-col");
+    expect([...(nameBlock?.children ?? [])].map((el) => el.textContent)).toEqual(["Standard", "$1,350.01"]);
+    expect(nameBlock?.className).not.toContain("flex-wrap");
     expect(radios[0]).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByText("Rush review")).not.toBeInTheDocument();
     await expectNoAxeViolations(container);

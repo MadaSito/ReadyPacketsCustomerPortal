@@ -2,7 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { Button, Checkbox, ErrorState, ConfirmDialog, DataTable, Dialog, Drawer, Field, Input, StatusBadge, useStepUp, useToast } from "@/ui";
+import { Button, Checkbox, ErrorState, Tabs, ConfirmDialog, DataTable, Dialog, Drawer, Field, Input, StatusBadge, useStepUp, useToast } from "@/ui";
 import { OPERATION_STATES } from "@shared/domain";
 import { render } from "@testing-library/react";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "./testing";
@@ -231,5 +231,53 @@ describe("ErrorState step-up (D3)", () => {
     expect(screen.queryByRole("button", { name: "Verify identity" })).not.toBeInTheDocument();
     const bare = render(<ErrorState error={stepUpError} />);
     expect(within(bare.container).getByText("We couldn't load this")).toBeInTheDocument();
+  });
+});
+
+describe("Tabs: active tab is revealed in the scrolling list (narrow screens)", () => {
+  const items = ["Overview", "Messages", "Files", "Billing", "Production"].map((label) => ({ value: label.toLowerCase(), label, content: <p>{label} panel</p> }));
+  // jsdom has no layout: the list is 0–100 px wide and each tab is 80 px, laid out from the current scrollLeft.
+  function layout() {
+    const list = screen.getByRole("tablist");
+    vi.spyOn(list, "getBoundingClientRect").mockReturnValue({ left: 0, right: 100, top: 0, bottom: 44, width: 100, height: 44, x: 0, y: 0, toJSON: () => ({}) });
+    screen.getAllByRole("tab").forEach((tab, index) => {
+      vi.spyOn(tab, "getBoundingClientRect").mockImplementation(() => {
+        const left = index * 80 - list.scrollLeft;
+        return { left, right: left + 80, top: 0, bottom: 44, width: 80, height: 44, x: left, y: 0, toJSON: () => ({}) };
+      });
+    });
+    return list;
+  }
+
+  it("scrolls horizontally (never smooth, never the page) on selection and on mount", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const { unmount } = renderUi(<Tabs label="Order sections" items={items} />);
+    const list = layout();
+    expect(list.scrollLeft).toBe(0);
+    await user.click(screen.getByRole("tab", { name: "Production" }));
+    // Production spans 320–400 → scrolled so its right edge (plus 4 px) is inside the 100 px list.
+    expect(list.scrollLeft).toBe(304);
+    await user.click(screen.getByRole("tab", { name: "Overview" }));
+    expect(list.scrollLeft).toBe(0);
+    expect(scrollIntoView).not.toHaveBeenCalled();
+    unmount();
+
+    // Mount with an off-screen tab selected (controlled).
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const rect = (left: number, width: number) => ({ left, right: left + width, top: 0, bottom: 44, width, height: 44, x: left, y: 0, toJSON: () => ({}) });
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      if (this.getAttribute("role") === "tablist") return rect(0, 100) as DOMRect;
+      const tabs = [...(this.parentElement?.querySelectorAll('[role="tab"]') ?? [])];
+      const index = tabs.indexOf(this);
+      return (index >= 0 ? rect(index * 80 - (this.parentElement?.scrollLeft ?? 0), 80) : rect(0, 0)) as DOMRect;
+    };
+    try {
+      renderUi(<Tabs label="Order sections" items={items} value="production" />);
+      expect(screen.getByRole("tablist").scrollLeft).toBe(304);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = original;
+    }
   });
 });

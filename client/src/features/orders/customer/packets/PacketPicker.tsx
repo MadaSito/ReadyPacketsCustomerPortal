@@ -53,10 +53,11 @@ function PacketCard({ packet, selection, headingLevel, onSelect }: { packet: Pac
           { value: NOT_INCLUDED, label: "Not included", description: "Leave this packet out" },
           ...packet.tiers.map((tier) => ({
             value: tier.publicId,
+            // Name, price and timeline each on their own line so every tile reads the same at any width.
             label: (
-              <span className="flex flex-wrap items-baseline justify-between gap-x-2">
+              <span className="flex flex-col">
                 <span>{tier.tier}</span>
-                <Money value={money(tier.priceMinor, tier.currency)} />
+                <Money value={money(tier.priceMinor, tier.currency)} className="block" />
               </span>
             ),
             description: tier.timeline ? `Timeline: ${tier.timeline}` : undefined,

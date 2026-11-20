@@ -1,6 +1,6 @@
 import { Tabs as RTabs } from "radix-ui";
 import { ChevronRight } from "lucide-react";
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { cn } from "./cn";
 
@@ -23,10 +23,36 @@ export interface TabsProps {
 }
 
 /** WAI-ARIA tabs (arrow-key navigation). The list scrolls horizontally on narrow screens. */
+/**
+ * Bring the active tab fully into the horizontally scrolling list. Horizontal only (never scrolls the page,
+ * unlike scrollIntoView with an off-screen list) and instant (no smooth scrolling, so reduced motion holds).
+ */
+export function revealActiveTab(list: HTMLElement | null): void {
+  const tab = list?.querySelector<HTMLElement>('[role="tab"][data-state="active"]');
+  if (!list || !tab) return;
+  const box = list.getBoundingClientRect();
+  const item = tab.getBoundingClientRect();
+  const pad = 4;
+  if (item.left < box.left) list.scrollLeft = Math.max(0, list.scrollLeft - (box.left - item.left + pad));
+  else if (item.right > box.right) list.scrollLeft += item.right - box.right + pad;
+}
+
 export function Tabs({ items, value, defaultValue, onValueChange, label, className }: TabsProps) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const [uncontrolled, setUncontrolled] = useState(defaultValue ?? items[0]?.value);
+  const active = value ?? uncontrolled;
+  useLayoutEffect(() => revealActiveTab(listRef.current), [active]);
   return (
-    <RTabs.Root value={value} defaultValue={defaultValue ?? items[0]?.value} onValueChange={onValueChange} className={cn("min-w-0", className)}>
-      <RTabs.List aria-label={label} className="-mx-1 flex gap-1 overflow-x-auto border-b border-line px-1 [scrollbar-width:thin]">
+    <RTabs.Root
+      value={value}
+      defaultValue={defaultValue ?? items[0]?.value}
+      onValueChange={(next) => {
+        setUncontrolled(next);
+        onValueChange?.(next);
+      }}
+      className={cn("min-w-0", className)}
+    >
+      <RTabs.List ref={listRef} aria-label={label} className="-mx-1 flex gap-1 overflow-x-auto border-b border-line px-1 [scrollbar-width:thin]">
         {items.map((item) => (
           <RTabs.Trigger
             key={item.value}
