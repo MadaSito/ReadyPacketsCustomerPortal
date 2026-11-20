@@ -262,6 +262,12 @@ describe("audit center (real MySQL, real emitter)", () => {
       const tail = await mod.readEventsAfter(again.nextCursor, 1000);
       expect(tail.events).toHaveLength(0);
       expect(tail.nextCursor).toBe(again.nextCursor);
+      // A forged tombstone (bad receipt) and a deleted chain row are both unexplained loss, not pruning.
+      const [s6] = await t.db.select({ chain: auditChain, event: auditEvents }).from(auditChain).innerJoin(auditEvents, eq(auditEvents.id, auditChain.eventRowId)).where(eq(auditChain.seq, 6));
+      await t.db.insert(auditTombstones).values({ eventRowId: s6!.event.id, eventId: s6!.chain.eventId, seq: 6, eventDigest: s6!.chain.eventDigest, category: "business", occurredAt: s6!.event.occurredAt, retentionRunId: "01JD0000000000000000000000", removedAt: h.clock.now(), receipt: "0".repeat(64) });
+      await t.db.delete(auditEvents).where(eq(auditEvents.id, s6!.event.id));
+      await t.db.delete(auditChain).where(eq(auditChain.seq, 7));
+      expect(await mod.readEventsAfter(null, 1000)).toMatchObject({ pruned: 3, missing: 3 });
     });
 
     it("a DB-only actor cannot disguise a deletion as pruning (tombstone receipts are keyed)", async () => {

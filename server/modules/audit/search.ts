@@ -248,12 +248,14 @@ export function decodeSeqCursor(cursor: string | null): number {
 
 /**
  * Commit-safe ordered read for forwarders: sealed events in chain seq order.
- * - Seqs whose event was removed by retention AND carry a valid-looking tombstone are counted in `pruned`.
- * - Seqs with neither event nor tombstone are counted in `missing` (unexplained loss — consumers should alert;
- *   `verifyChain` authenticates tombstone receipts).
- * - A window consisting only of removed seqs does not return an empty batch while more remains: reading
- *   continues (bounded) until events are found or the sealed head is reached, so `events.length === 0` with
- *   `nextCursor` at head means "caught up".
+ * - `pruned`: seqs whose event row is gone AND whose tombstone receipt authenticates (keyed HMAC over
+ *   seq|event_id|digest|run_id, same check as verifyChain) — authenticated retention removals.
+ * - `missing`: unexplained loss — event gone with no tombstone or an invalid receipt, OR a seq absent from the
+ *   chain itself (gap between returned seqs, or head ahead of the last chain row). Consumers should alert and run
+ *   verifyChain.
+ * - Removed-only windows are read through for at most 20 pages (≤ 20 000 seqs) per call. So `events: []` with an
+ *   ADVANCED `nextCursor` means "more may remain, call again"; `events: []` with `nextCursor === cursor` (or at
+ *   `headSeq`) means caught up.
  */
 export async function readEventsAfter(
   ctx: AuditCtx,
@@ -263,27 +265,43 @@ export async function readEventsAfter(
   let after = decodeSeqCursor(cursor);
   const bounded = Math.min(Math.max(1, Math.floor(limit)), 1000);
   const head = await ctx.chain.head();
+  const keys = ctx.chain.keys;
   const events: AuditEnvelope[] = [];
   let pruned = 0;
   let missing = 0;
   let advanced = false;
-  // At most 20 pages (≤ 20k seqs) of removed-only rows per call keeps the call bounded.
   for (let page = 0; page < 20 && events.length === 0 && after < head.headSeq; page += 1) {
     const rows = await ctx.deps.db
-      .select({ seq: auditChain.seq, event: auditEvents, tombSeq: auditTombstones.seq })
+      .select({ chain: auditChain, event: auditEvents, tomb: auditTombstones })
       .from(auditChain)
       .leftJoin(auditEvents, eq(auditEvents.id, auditChain.eventRowId))
       .leftJoin(auditTombstones, eq(auditTombstones.seq, auditChain.seq))
       .where(and(gt(auditChain.seq, after), lte(auditChain.seq, head.headSeq)))
       .orderBy(asc(auditChain.seq))
       .limit(bounded);
-    if (rows.length === 0) break;
-    for (const r of rows) {
-      if (r.event) events.push(rowToEnvelope(r.event, r.seq));
-      else if (r.tombSeq !== null) pruned += 1;
-      else missing += 1;
+    if (rows.length === 0) {
+      // Head claims seqs that have no chain rows: unexplained loss up to the head.
+      missing += head.headSeq - after;
+      after = head.headSeq;
+      advanced = true;
+      break;
     }
-    after = rows[rows.length - 1]!.seq;
+    for (const { chain, event, tomb } of rows) {
+      if (chain.seq > after + 1) missing += chain.seq - after - 1; // chain-row gap
+      after = chain.seq;
+      if (event) {
+        events.push(rowToEnvelope(event, chain.seq));
+      } else if (
+        tomb &&
+        tomb.eventId === chain.eventId &&
+        tomb.eventDigest === chain.eventDigest &&
+        tomb.receipt === keys.tombstone(chain.seq, chain.eventId, chain.eventDigest, tomb.retentionRunId)
+      ) {
+        pruned += 1;
+      } else {
+        missing += 1;
+      }
+    }
     advanced = true;
   }
   return { events, nextCursor: advanced ? encodeSeqCursor(after) : cursor, headSeq: head.headSeq, pruned, missing };

@@ -47,10 +47,10 @@ For other modules (SIEM, backup, portable):
 ```ts
 /**
  * Commit-safe order: events in hash-chain sequence order (only committed+sealed events). cursor = opaque string or null.
- * Seqs whose event is gone are skipped and counted: `pruned` = authenticated-looking retention tombstone exists,
- * `missing` = no tombstone (unexplained loss: alert, then run verifyChain, which checks tombstone receipts).
- * Retention-only windows are read through (≤ 20 pages per call), so `events: []` means caught up to `headSeq`
- * (or 20 pages of removed rows: call again — nextCursor advanced).
+ * Seqs whose event is gone are skipped and counted: `pruned` = tombstone whose keyed receipt authenticates
+ * (same check as verifyChain); `missing` = unexplained loss (no/invalid tombstone, chain-row gap, or head ahead of
+ * the chain rows) — alert and run verifyChain. Removed-only windows are read through for ≤ 20 pages per call:
+ * `events: []` with an advanced nextCursor = call again; unchanged nextCursor = caught up to `headSeq`.
  */
 readEventsAfter(cursor: string | null, limit: number /* 1..1000 */): Promise<{ events: AuditEnvelope[]; nextCursor: string | null; headSeq: number; pruned: number; missing: number }>
 /**
