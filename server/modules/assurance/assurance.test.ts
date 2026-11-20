@@ -13,7 +13,7 @@ import { users, userSessions } from "../identity/schema.js";
 import { createAssuranceModule } from "./index.js";
 import { assuranceRouter } from "./router.js";
 import * as assuranceSchema from "./schema.js";
-import { totp } from "./store.js";
+import { totp, totpStep } from "./store.js";
 import { syntheticAuthenticator } from "./webauthn.test-fixture.js";
 
 const { assuranceAccounts, assuranceChallenges, assurancePasskeys, assuranceRecoveryCodes } = assuranceSchema;
@@ -183,6 +183,75 @@ describe("assurance: isolated transactional model", () => {
     h.clock.advance(10_000);
     await expect(blocked()).rejects.toMatchObject({ code: "RATE_LIMITED" });
     expect(rateLimitNotes()).toHaveLength(2);
+  });
+
+  function wrongTotp(secret: string) {
+    const code = ["000000", "000001", "000002", "000003"]
+      .find((candidate) => totpStep(secret, candidate, h.clock.now()) === null)!;
+    return { method: "totp", code } as const;
+  }
+
+  it("serializes consecutive TOTP failures, escalates cooldowns, and resets after a valid proof", async () => {
+    const { account, result } = await enroll();
+    const verify = (factor: { method: "totp"; code: string }) =>
+      h.services.assurance.verifySecondFactor(account.userId, factor);
+    const [where, app] = [eq(assuranceAccounts.userId, account.userId), totp(result.secret)];
+    const state = async () => (await db.db.select().from(assuranceAccounts).where(where))[0]!;
+    for (let i = 0; i < 9; i++)
+      await expect(verify(wrongTotp(result.secret))).resolves.toBe(false);
+    expect(await state()).toMatchObject({ totpFailures: 9, totpLockedUntil: null });
+
+    h.audit.failRecords = true;
+    await expect(verify(wrongTotp(result.secret))).rejects.toMatchObject({ code: "AUDIT_UNAVAILABLE" });
+    expect(await state()).toMatchObject({ totpFailures: 9, totpLockedUntil: null });
+    h.audit.failRecords = false;
+
+    const until = new Date(+h.clock.now() + 30_000);
+    const failed = wrongTotp(result.secret);
+    await expect(Promise.all([verify(failed), verify(failed), verify(failed)])).resolves.toEqual([false, false, false]);
+    expect(await state()).toMatchObject({ totpFailures: 10, totpLockedUntil: until });
+    expect(h.audit.named("auth.totp.locked")).toMatchObject([{ reasonCode: "TOTP_COOLDOWN" }]);
+    expect(h.audit.recordedInTx.at(-1)).toBe(true);
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ userId: account.userId, kind: "security.totp_locked", skipEmail: true }),
+      expect.anything(),
+    );
+
+    h.clock.advance(29_999);
+    await expect(verify({ method: "totp", code: app.generate({ timestamp: +h.clock.now() + 30_000 }) })).resolves.toBe(false);
+    expect(await state()).toMatchObject({ totpFailures: 10, totpLockedUntil: until });
+    h.clock.advance(1);
+    await expect(verify(wrongTotp(result.secret))).resolves.toBe(false);
+    expect(await state()).toMatchObject({ totpFailures: 11, totpLockedUntil: new Date(+h.clock.now() + 60_000) });
+    h.clock.advance(60_000);
+    await expect(verify({ method: "totp", code: app.generate({ timestamp: +h.clock.now() }) })).resolves.toBe(true);
+    expect(await state()).toMatchObject({ totpFailures: 0, totpLockedUntil: null });
+    expect(h.audit.named("auth.totp.locked")).toHaveLength(1);
+  });
+
+  it("hard-locks enrolled TOTP until independently authorized replacement without disabling recovery", async () => {
+    const { account, result, recovery } = await enroll();
+    const where = eq(assuranceAccounts.userId, account.userId);
+    const state = async () => (await db.db.select().from(assuranceAccounts).where(where))[0]!;
+    await db.db.update(assuranceAccounts).set({ totpFailures: 49 }).where(where);
+    await expect(h.services.assurance.verifySecondFactor(account.userId, wrongTotp(result.secret))).resolves.toBe(false);
+    expect(await state()).toMatchObject({ totpFailures: 50, totpLockedUntil: null });
+    expect(h.audit.named("auth.totp.locked")).toMatchObject([{ reasonCode: "TOTP_REPLACEMENT_REQUIRED" }]);
+    h.clock.advance(3_600_000);
+    const current = (secret: string) => ({ method: "totp", code: totp(secret).generate({ timestamp: +h.clock.now() }) }) as const;
+    await expect(h.services.assurance.verifySecondFactor(account.userId, current(result.secret))).resolves.toBe(false);
+    const full = { ...account, state: "full", pendingSteps: [], mfaVerifiedAt: h.clock.now() } as const;
+    await expect(caller(full).stepUp({
+      password: "synthetic-password", factor: { method: "recovery_code", code: recovery.recoveryCodes![0]! },
+    })).resolves.toEqual({ ok: true });
+    expect(await state()).toMatchObject({ totpFailures: 50, totpLockedUntil: null });
+
+    const withStepUp = caller({ ...full, stepUpAt: h.clock.now() });
+    const replacement = await withStepUp.beginTotpEnrollment();
+    await withStepUp.confirmTotpEnrollment({ code: current(replacement.secret).code });
+    expect(await state()).toMatchObject({ totpFailures: 0, totpLockedUntil: null });
+    h.clock.advance(30_000);
+    await expect(h.services.assurance.verifySecondFactor(account.userId, current(replacement.secret))).resolves.toBe(true);
   });
 
   it("redeems a recovery code exactly once concurrently and notifies only once", async () => {

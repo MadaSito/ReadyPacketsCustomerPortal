@@ -9,6 +9,8 @@ export const assuranceAccounts = mysqlTable("assurance_accounts", {
   userId: refColumn("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   totpSecretEnc: text("totp_secret_enc"),
   lastTotpStep: refColumn("last_totp_step"),
+  totpFailures: int("totp_failures", { unsigned: true }).notNull().default(0),
+  totpLockedUntil: utcDateTime("totp_locked_until"),
   pendingTotpSecretEnc: text("pending_totp_secret_enc"),
   pendingTotpSessionId: char("pending_totp_session_id", { length: 26 }),
   pendingTotpExpiresAt: utcDateTime("pending_totp_expires_at"),

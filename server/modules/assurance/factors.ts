@@ -21,6 +21,9 @@ interface AuthenticationBinding {
 }
 
 const clearedPending = { pendingTotpSecretEnc: null, pendingTotpExpiresAt: null, pendingTotpSessionId: null } as const;
+const clearedTotpFailures = { totpFailures: 0, totpLockedUntil: null } as const;
+const TOTP_COOLDOWN_THRESHOLD = 10;
+const TOTP_FAILURE_LIMIT = 50;
 const ok = { ok: true } as const;
 
 export function createFactorService(deps: ModuleDeps) {
@@ -49,21 +52,49 @@ export function createFactorService(deps: ModuleDeps) {
     else requireTransition(actor, "enroll_mfa");
   }
 
+  async function countTotpFailure(tx: Tx, account: AssuranceAccount, now: Date, actor?: AuditActor): Promise<void> {
+    const totpFailures = account.totpFailures + 1;
+    const hardLock = totpFailures === TOTP_FAILURE_LIMIT;
+    const cooldownMs = totpFailures < TOTP_COOLDOWN_THRESHOLD
+      ? 0
+      : Math.min(3_600_000, 30_000 * 2 ** (totpFailures - TOTP_COOLDOWN_THRESHOLD));
+    await tx.update(assuranceAccounts).set({
+      totpFailures, totpLockedUntil: hardLock || !cooldownMs ? null : new Date(+now + cooldownMs), updatedAt: now,
+    }).where(eq(assuranceAccounts.id, account.id));
+    if (totpFailures !== TOTP_COOLDOWN_THRESHOLD && !hardLock) return;
+    await record("auth.totp.locked", tx, actor, {
+      action: "throttle", outcome: "denied", severity: "WARN",
+      reasonCode: hardLock ? "TOTP_REPLACEMENT_REQUIRED" : "TOTP_COOLDOWN",
+    });
+    await deps.services.engagement.notify({
+      userId: account.userId, kind: "security.totp_locked",
+      title: hardLock ? "Your authenticator app must be replaced" : "Authenticator attempts temporarily limited",
+      body: hardLock
+        ? "Authenticator app verification was disabled after repeated unsuccessful attempts. Use another verification method to replace the app, or contact support."
+        : "Repeated unsuccessful attempts temporarily limited authenticator app verification. If these attempts were not yours, contact support.",
+      link: "/account/security", skipEmail: true,
+    }, tx);
+  }
+
   async function proof(
     tx: Tx, account: AssuranceAccount, input: SecondFactorInput, binding: AuthenticationBinding,
     actor?: AuditActor,
   ): Promise<boolean> {
     const now = deps.clock.now();
     if (input.method === "totp") {
-      if (!account.totpSecretEnc) return false;
+      if (!account.totpSecretEnc || account.totpFailures >= TOTP_FAILURE_LIMIT ||
+        (account.totpLockedUntil && +account.totpLockedUntil > +now)) return false;
       const secret = deps.crypto.decrypt(account.totpSecretEnc, secretAad(account, false));
       const step = totpStep(secret, input.code, now);
-      if (step === null) return false;
-      if (account.lastTotpStep !== null && step <= account.lastTotpStep) {
+      const replayed = step !== null && account.lastTotpStep !== null && step <= account.lastTotpStep;
+      if (replayed)
         await record("auth.totp.replay_denied", tx, actor, { outcome: "denied", reasonCode: "TOTP_REPLAY", severity: "WARN" });
+      if (step === null || replayed) {
+        await countTotpFailure(tx, account, now, actor);
         return false;
       }
-      await tx.update(assuranceAccounts).set({ lastTotpStep: step, updatedAt: now }).where(eq(assuranceAccounts.id, account.id));
+      await tx.update(assuranceAccounts).set({ ...clearedTotpFailures, lastTotpStep: step, updatedAt: now })
+        .where(eq(assuranceAccounts.id, account.id));
       return true;
     }
     if (input.method === "recovery_code") {
@@ -158,7 +189,8 @@ export function createFactorService(deps: ModuleDeps) {
           return null;
         }
         await tx.update(assuranceAccounts).set({
-          ...clearedPending, totpSecretEnc: deps.crypto.encrypt(secret, secretAad(account, false)), lastTotpStep: step, updatedAt: now,
+          ...clearedPending, ...clearedTotpFailures,
+          totpSecretEnc: deps.crypto.encrypt(secret, secretAad(account, false)), lastTotpStep: step, updatedAt: now,
         }).where(eq(assuranceAccounts.id, account.id));
         const recovery = account.recoverySetId
           ? { recoveryCodes: null, recoverySetId: null }
@@ -251,7 +283,7 @@ export function createFactorService(deps: ModuleDeps) {
         if ((await getPasskeys(tx, actor.userId)).length < 1)
           throw conflict("LAST_STRONG_FACTOR", "Register a passkey before removing your authenticator app.");
         await tx.update(assuranceAccounts).set({
-          ...clearedPending, totpSecretEnc: null, lastTotpStep: null, updatedAt: now,
+          ...clearedPending, ...clearedTotpFailures, totpSecretEnc: null, lastTotpStep: null, updatedAt: now,
         }).where(eq(assuranceAccounts.id, account.id));
         await record("auth.totp.disabled", tx, actor, { action: "delete" });
         return ok;

@@ -91,7 +91,8 @@ export async function clearFactors(tx: Tx, userId: number, now: Date): Promise<v
   await tx.delete(assurancePasskeys).where(eq(assurancePasskeys.userId, userId));
   await tx.delete(assuranceChallenges).where(eq(assuranceChallenges.userId, userId));
   await tx.update(assuranceAccounts).set({
-    totpSecretEnc: null, lastTotpStep: null, pendingTotpSecretEnc: null, pendingTotpSessionId: null,
+    totpSecretEnc: null, lastTotpStep: null, totpFailures: 0, totpLockedUntil: null,
+    pendingTotpSecretEnc: null, pendingTotpSessionId: null,
     pendingTotpExpiresAt: null, recoverySetId: null, recoveryAcknowledgedAt: null, updatedAt: now,
   }).where(eq(assuranceAccounts.id, account.id));
 }
