@@ -157,5 +157,7 @@ Notes on how the checks behave on this repository:
   the variable is set; `pnpm audit --prod` runs in every case.
 - **Reviewed exceptions.** `.github/codeql-baseline.json` lists CodeQL findings accepted after review, each
   with a written justification; an entry that no longer matches a finding fails the gate so it gets removed.
+  On pull requests CodeQL reports only findings on the changed lines, so unmatched entries are listed
+  without failing there; the complete analysis on `main` enforces them.
   `.gitleaksignore` lists exact gitleaks fingerprints of synthetic test fixtures. Adding to either file is a
   security-relevant change and needs the same review as code.
