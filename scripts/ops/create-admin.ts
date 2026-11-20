@@ -12,12 +12,12 @@
  *
  * Exit codes: 0 created · 1 failed · 64 usage · 73 an administrator already exists · 78 configuration.
  */
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import readline from "node:readline";
 import { Writable } from "node:stream";
 import { ConfigError, loadConfig } from "../../server/config/env.js";
 import { createContainer } from "../../server/container.js";
 import { DomainError } from "../../server/core/errors.js";
+import { readSecretFile } from "./lib/secretFile.js";
 
 function argument(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
@@ -44,27 +44,6 @@ async function promptHidden(question: string): Promise<string> {
     });
   } finally {
     rl.close();
-  }
-}
-
-/**
- * Reads a one-line secret through a single descriptor: must be a regular file owned by the invoking user (or
- * root), not readable by group/others, and at most 1 KiB. Only one trailing newline is removed — other
- * whitespace is part of the secret. Neither the path nor the content is ever printed.
- */
-function readSecretFile(file: string): string {
-  const fd = openSync(file, "r");
-  try {
-    const stat = fstatSync(fd);
-    const uid = typeof process.getuid === "function" ? process.getuid() : stat.uid;
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || (stat.uid !== uid && stat.uid !== 0) || stat.size === 0 || stat.size > 1024) {
-      throw new Error("unsafe secret file");
-    }
-    const buffer = Buffer.alloc(stat.size);
-    const read = readSync(fd, buffer, 0, stat.size, 0);
-    return buffer.subarray(0, read).toString("utf8").replace(/\r?\n$/, "");
-  } finally {
-    closeSync(fd);
   }
 }
 
