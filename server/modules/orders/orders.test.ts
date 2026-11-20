@@ -5,7 +5,7 @@ import { DomainError } from "../../core/errors.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Services } from "../../container.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
-import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
+import { createTestDeps, type fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
@@ -273,6 +273,17 @@ describe("sharing", () => {
     await expectError(mod.assertCanWriteOrder(carol.principal, order.publicId, { kind: "status" }), "FORBIDDEN:OWNER_ONLY");
   });
 
+  it("locking re-check sees a revocation committed after the caller's REPEATABLE READ snapshot", async () => {
+    const grants = await mod.sharing.list(alice.principal, order.publicId);
+    const carolGrant = grants.find((g) => g.email === carol.email && g.status === "active")!;
+    await t.db.transaction(async (tx) => {
+      // Establish the snapshot before the revocation commits on another connection.
+      await tx.select({ id: orderGrants.id }).from(orderGrants).where(eq(orderGrants.publicId, carolGrant.publicId));
+      await mod.sharing.revoke(alice.principal, { orderId: order.publicId, grantId: carolGrant.publicId });
+      await expectError(mod.assertCanWriteOrder(carol.principal, order.publicId, { kind: "file", tx, forUpdate: true }), "NOT_FOUND:ORDER_NOT_FOUND");
+    });
+  });
+
   it("revocation takes effect immediately on the next check", async () => {
     await mod.sharing.revoke(alice.principal, { orderId: order.publicId, grantId });
     await expectError(mod.assertCanReadOrder(bob.principal, order.publicId), "NOT_FOUND:ORDER_NOT_FOUND");
@@ -530,6 +541,15 @@ describe("portable hooks", () => {
     await expectError(t.db.transaction((tx) => mod.importOrder({ ...input, targetOwnerUserId: bob.id }, tx)), "CONFLICT:IMPORT_LINK_CONFLICT");
     await expectError(t.db.transaction((tx) => mod.importOrder({ ...input, sourceOrderPublicId: "SRC-2", targetOwnerUserId: admin.id }, tx)), "VALIDATION:IMPORT_OWNER_NOT_ELIGIBLE");
     await expectError(t.db.transaction((tx) => mod.importOrder({ ...input, sourceOrderPublicId: "SRC-3", totalMinor: 1 }, tx)), "VALIDATION:IMPORT_TOTAL_MISMATCH");
+    await expectError(t.db.transaction((tx) => mod.importOrder({ ...input, sourceOrderPublicId: "SRC-5", statusKey: "mystery_state" }, tx)), "VALIDATION:IMPORT_STATUS_UNSUPPORTED");
+    expect(await mod.isPortableStatusSupported("in_progress")).toBe(true);
+    expect(await mod.isPortableStatusSupported("mystery_state")).toBe(false);
+    expect(await mod.isPortableStatusSupported("")).toBe(false);
+    expect(mod.preflightImportOrder(input)).toMatchObject({ ok: true });
+    expect(mod.preflightImportOrder({ ...input, lineItems: [{ ...input.lineItems[0]!, lineTotalMinor: 4999 }] })).toMatchObject({ ok: false, reasonCode: "IMPORT_LINE_TOTAL_MISMATCH", paths: ["lineItems.0.lineTotalMinor"] });
+    expect(mod.preflightImportOrder({ ...input, lineItems: [{ ...input.lineItems[0]!, currency: "USD" }] })).toMatchObject({ ok: false, reasonCode: "IMPORT_MIXED_CURRENCY" });
+    expect(mod.preflightImportOrder({ ...input, totalMinor: 4999 })).toMatchObject({ ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH" });
+    expect(mod.preflightImportOrder({ ...input, projectName: "" })).toMatchObject({ ok: false, reasonCode: "IMPORT_ORDER_INVALID" });
     // reference collision ⇒ fresh target reference
     const collide = await t.db.transaction((tx) => mod.importOrder({ ...input, sourceOrderPublicId: "SRC-4" }, tx));
     expect(collide.reference).toMatch(/^RP-2026-/);

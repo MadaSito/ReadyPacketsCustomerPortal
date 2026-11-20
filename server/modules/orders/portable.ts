@@ -26,7 +26,7 @@ import {
 import { ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { ImportOrderInput, PortableOrder, PortableSelection } from "./types.js";
 import type { WorkflowService } from "./workflows.js";
-import { findState, initialState } from "./workflowTypes.js";
+import { DEFAULT_WORKFLOW, findState, initialState } from "./workflowTypes.js";
 
 export interface PortableDeps {
   db: Db;
@@ -109,6 +109,53 @@ export interface ImportReceipt {
 
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
+export type ImportPreflightIssue =
+  | "IMPORT_ORDER_INVALID"
+  | "IMPORT_CURRENCY_UNSUPPORTED"
+  | "IMPORT_MIXED_CURRENCY"
+  | "IMPORT_LINE_TOTAL_MISMATCH"
+  | "IMPORT_TOTAL_MISMATCH";
+
+/**
+ * Pure, write-free preflight of one imported order (schema, currency, exact line math, summed total).
+ * importOrder runs the same checks again at apply time.
+ */
+export function preflightImportOrder(raw: unknown): { ok: true; input: ImportOrderInput } | { ok: false; reasonCode: ImportPreflightIssue; paths: string[] } {
+  const parsed = importOrderInputSchema.safeParse(raw);
+  if (!parsed.success) return { ok: false, reasonCode: "IMPORT_ORDER_INVALID", paths: parsed.error.issues.slice(0, 10).map((i) => i.path.join(".")) };
+  const input = parsed.data;
+  try {
+    assertCurrency(input.currency);
+  } catch {
+    return { ok: false, reasonCode: "IMPORT_CURRENCY_UNSUPPORTED", paths: ["currency"] };
+  }
+  let sum = 0;
+  for (const [index, item] of input.lineItems.entries()) {
+    if (item.currency !== input.currency) return { ok: false, reasonCode: "IMPORT_MIXED_CURRENCY", paths: [`lineItems.${index}.currency`] };
+    const product = item.unitPriceMinor * item.quantity;
+    if (!Number.isSafeInteger(product) || product !== item.lineTotalMinor)
+      return { ok: false, reasonCode: "IMPORT_LINE_TOTAL_MISMATCH", paths: [`lineItems.${index}.lineTotalMinor`] };
+    sum += item.lineTotalMinor;
+    if (!Number.isSafeInteger(sum)) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  }
+  if (input.lineItems.length > 0 && sum !== input.totalMinor) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  return { ok: true, input };
+}
+
+const PREFLIGHT_MESSAGES: Record<ImportPreflightIssue, string> = {
+  IMPORT_ORDER_INVALID: "The imported order is not valid.",
+  IMPORT_CURRENCY_UNSUPPORTED: "The imported order currency is not supported.",
+  IMPORT_MIXED_CURRENCY: "Imported line items must share the order currency.",
+  IMPORT_LINE_TOTAL_MISMATCH: "An imported line total does not match its price and quantity.",
+  IMPORT_TOTAL_MISMATCH: "The imported order total does not match its line items.",
+};
+
+function assertImportOrderPreflight(raw: unknown): ImportOrderInput {
+  const result = preflightImportOrder(raw);
+  if (!result.ok) throw validation(result.reasonCode, PREFLIGHT_MESSAGES[result.reasonCode], { issues: result.paths });
+  return result.input;
+}
+
 export function createPortableHooks(deps: PortableDeps) {
   async function findImportedOrder(sourceInstallationId: string, sourceOrderPublicId: string, tx?: DbOrTx) {
     const [row] = await (tx ?? deps.db)
@@ -138,6 +185,15 @@ export function createPortableHooks(deps: PortableDeps) {
 
   return {
     findImportedOrder,
+
+    /** Write-free: is this status key known to the current default workflow (or the built-in default if none is installed yet)? */
+    async isPortableStatusSupported(statusKey: string, tx?: DbOrTx): Promise<boolean> {
+      if (typeof statusKey !== "string" || statusKey.length === 0 || statusKey.length > 64) return false;
+      const current = await deps.workflows.currentDefault(tx ?? deps.db);
+      return findState(current ? current.definition : DEFAULT_WORKFLOW, statusKey) !== undefined;
+    },
+
+    preflightImportOrder,
 
     /** Bounded export projection (internal notes and grants are excluded — grants are authority, not data). */
     async portableOrders(tx: DbOrTx, selection: PortableSelection): Promise<{ items: PortableOrder[]; nextAfter: number | null }> {
@@ -224,17 +280,7 @@ export function createPortableHooks(deps: PortableDeps) {
 
     /** Transactional, idempotent adoption of one imported order inside the portable import transaction. */
     async importOrder(raw: ImportOrderInput, tx: Tx): Promise<ImportReceipt> {
-      const parsed = importOrderInputSchema.safeParse(raw);
-      if (!parsed.success) throw validation("IMPORT_ORDER_INVALID", "The imported order is not valid.", { issues: parsed.error.issues.slice(0, 10).map((i) => i.path.join(".")) });
-      const input = parsed.data;
-      assertCurrency(input.currency);
-      for (const item of input.lineItems) {
-        if (item.currency !== input.currency) throw validation("IMPORT_MIXED_CURRENCY", "Imported line items must share the order currency.");
-        if (item.unitPriceMinor * item.quantity !== item.lineTotalMinor) throw validation("IMPORT_LINE_TOTAL_MISMATCH", "An imported line total does not match its price and quantity.");
-      }
-      const sum = input.lineItems.reduce((acc, item) => acc + item.lineTotalMinor, 0);
-      if (input.lineItems.length > 0 && sum !== input.totalMinor) throw validation("IMPORT_TOTAL_MISMATCH", "The imported order total does not match its line items.");
-
+      const input = assertImportOrderPreflight(raw);
       const existing = await findImportedOrder(input.sourceInstallationId, input.sourceOrderPublicId, tx);
       if (existing) {
         if (existing.ownerUserId !== input.targetOwnerUserId) throw conflict("IMPORT_LINK_CONFLICT", "This source order was already imported for a different customer.");
@@ -248,7 +294,9 @@ export function createPortableHooks(deps: PortableDeps) {
       const now = deps.clock.now();
       const workflow = await deps.workflows.ensureDefault(tx);
       const knownStatus = findState(workflow.definition, input.statusKey);
-      const statusKey = knownStatus ? knownStatus.key : initialState(workflow.definition).key;
+      // Never guess: an unknown source status refuses the import instead of silently mapping.
+      if (!knownStatus) throw validation("IMPORT_STATUS_UNSUPPORTED", "The imported order status is not supported by this installation.");
+      const statusKey = knownStatus.key;
 
       let reference: string | null = null;
       if (input.sourceReference) {

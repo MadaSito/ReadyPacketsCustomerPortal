@@ -43,6 +43,10 @@ export interface OrdersModule extends ModuleLifecycle {
   portableOrders(tx: DbOrTx, selection: PortableSelection): Promise<{ items: PortableOrder[]; nextAfter: number | null }>;
   importOrder(input: ImportOrderInput, tx: Tx): Promise<ImportReceipt>;
   findImportedOrder: PortableHooks["findImportedOrder"];
+  /** Write-free; unknown statuses are refused by importOrder (IMPORT_STATUS_UNSUPPORTED), never mapped. */
+  isPortableStatusSupported: PortableHooks["isPortableStatusSupported"];
+  /** Pure preflight (schema, currency, exact line math, summed total); importOrder re-runs it. */
+  preflightImportOrder: PortableHooks["preflightImportOrder"];
   checkCatalogViability(items: { productPublicId?: string; name: string; currency: string }[]): Promise<{ matched: number; unmatched: number }>;
 
   /* ---- services used by the router ---- */
@@ -73,6 +77,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     portableOrders: portable.portableOrders,
     importOrder: portable.importOrder,
     findImportedOrder: portable.findImportedOrder,
+    isPortableStatusSupported: portable.isPortableStatusSupported,
+    preflightImportOrder: portable.preflightImportOrder,
     checkCatalogViability: catalog.checkViability,
     catalog,
     workflows,
