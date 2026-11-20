@@ -1,7 +1,7 @@
 /**
  * Service-worker registration + "update available" prompt (no virtual modules, so the shell builds with or
  * without vite-plugin-pwa). The SW precaches the static shell only; /api and authenticated content are
- * NetworkOnly (config: docs in features/dashboard/VERIFICATION.md). Not registered in dev or the preview build.
+ * NetworkOnly (config: see app/API.md § PWA). Not registered in dev or the preview build.
  * Update flow: new worker installs → waits → user chooses Reload → SKIP_WAITING → controllerchange → reload.
  */
 import { RefreshCw } from "lucide-react";
