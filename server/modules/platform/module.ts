@@ -211,9 +211,11 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
   async function readiness(): Promise<{ ready: boolean; state: HealthState }> {
     const nowMs = clock.now().getTime();
     if (readinessCache && nowMs - readinessCache.at < READINESS_CACHE_MS) return readinessCache.value;
-    const report = await healthReport();
-    const criticalFailing = report.components.some((c) => CRITICAL_COMPONENTS.has(c.component) && c.state === "failing");
-    const value = { ready: !criticalFailing, state: report.state };
+    // Readiness depends ONLY on the platform's own critical components (database, schema, keys): a slow or
+    // failing peer module (SMTP, SIEM, backup…) must never take the portal out of the load balancer.
+    const own = await ownHealth();
+    const criticalFailing = own.some((c) => CRITICAL_COMPONENTS.has(c.component) && c.state === "failing");
+    const value = { ready: !criticalFailing, state: overallState(own) };
     readinessCache = { at: nowMs, value };
     return value;
   }
