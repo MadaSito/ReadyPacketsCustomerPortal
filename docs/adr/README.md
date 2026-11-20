@@ -26,3 +26,5 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0019 | Audit chain keys and off-host checkpoints | Accepted |
 | 0020 | Release scope: installable web app first; optional integrations disabled | Accepted |
 | 0021 | Analytics on the portal origin: quarantine and accepted residual | Accepted |
+| 0022 | Offerings matrix is catalog data; Packet 7 is a bundle rule; Packet 8 not loaded | Accepted (owner confirmation requested) |
+| 0023 | Production pipeline webhooks P101 / P201: manual, validated, outbox-delivered, off by default | Accepted |

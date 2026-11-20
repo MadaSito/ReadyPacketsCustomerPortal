@@ -111,6 +111,8 @@ Read [Install on Ubuntu 24.04](docs/operations/INSTALL.md) and [release gates](d
 - [0019 Audit chain keys and off-host checkpoints](docs/adr/0019-audit-chain-key-custody.md)
 - [0020 Release scope: installable web app first; optional integrations ship disabled](docs/adr/0020-delivery-scope-mobile-and-integrations.md)
 - [0021 Analytics on the portal origin: quarantine and accepted residual](docs/adr/0021-analytics-origin-residual.md)
+- [0022 Offerings matrix is catalog data; Packet 7 is a bundle rule; Packet 8 not loaded](docs/adr/0022-offerings-matrix-as-catalog-data.md)
+- [0023 Production pipeline webhooks P101 / P201](docs/adr/0023-production-pipeline-webhooks.md)
 
 ### Security
 
