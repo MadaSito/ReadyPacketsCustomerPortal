@@ -33,6 +33,11 @@ export interface IdentityModule extends ModuleLifecycle {
   generateTemporaryPassword(): string;
   issueAdminSetPasswordLink(userId: number, opts: { tx: Tx }): Promise<{ previewLink?: string }>;
   hasActiveAdministrator(): Promise<boolean>;
+  /** Service-internal (ops scripts only; never on tRPC/HTTP). See API.md. */
+  provisionLocalAccount(
+    input: { email: string; name: string; role: UserRole; password: string; mustChangePassword: boolean; customerRef?: string | null },
+    opts: { tx: Tx; reason: "bootstrap_admin" | "demo_seed" },
+  ): Promise<{ userId: number; publicId: string; customerRef: string | null }>;
   isCustomerRefAvailable(reference: string, tx?: DbOrTx): Promise<boolean>;
   sessions: {
     markMfaVerified(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;
@@ -105,6 +110,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     generateTemporaryPassword: credentials.generateTemporaryPassword,
     issueAdminSetPasswordLink: credentials.issueAdminSetPasswordLink,
     hasActiveAdministrator: () => repo.hasActiveAdministrator(),
+    provisionLocalAccount: auth.provisionLocalAccount,
     isCustomerRefAvailable: (reference, tx) => repo.isCustomerRefAvailable(reference, tx),
     sessions: {
       markMfaVerified: sessions.markMfaVerified,

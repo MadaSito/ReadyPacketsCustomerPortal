@@ -570,6 +570,60 @@ describe("identity module (MySQL)", () => {
     });
   });
 
+  describe("provisionLocalAccount (ops scripts)", () => {
+    const provision = (role: "admin" | "customer", reason: "bootstrap_admin" | "demo_seed", email = `ops${++seq}.${Date.now()}@example.test`) =>
+      db.db.transaction((tx) => identity.provisionLocalAccount({ email, name: "Ops Person", role, password: PW, mustChangePassword: true }, { tx: tx as Tx, reason }));
+
+    it("bootstrap creates an active verified admin (mustChange, no MFA ⇒ first sign-in forces enrolment), audited as system", async () => {
+      await db.db.update(users).set({ status: "deactivated" }).where(eq(users.role, "admin"));
+      const email = `boot${Date.now()}@example.test`;
+      const created = await provision("admin", "bootstrap_admin", email);
+      const row = await userRow(created.userId);
+      expect(row).toMatchObject({ role: "admin", status: "active", mustChangePassword: true, authSource: "local" });
+      expect(row.emailVerifiedAt).not.toBeNull();
+      expect(h.audit.named("identity.account.provisioned")[0]).toMatchObject({ actor: { role: "system" }, attributes: { reason: "bootstrap_admin", role: "admin" } });
+      expect(JSON.stringify(h.audit.events)).not.toContain(email);
+      const signed = await identity.auth.signIn({ email, password: PW }, {});
+      expect(signed.nextStep).toBe("enroll_mfa");
+    });
+
+    it("bootstrap refuses when an active administrator exists (ADMIN_EXISTS)", async () => {
+      await makeUser({ role: "admin" });
+      await rejects(provision("admin", "bootstrap_admin"), "ADMIN_EXISTS");
+    });
+
+    it("two concurrent bootstraps on an empty install: exactly one succeeds", async () => {
+      await db.db.update(users).set({ status: "deactivated" }).where(eq(users.role, "admin"));
+      const results = await Promise.allSettled([provision("admin", "bootstrap_admin"), provision("admin", "bootstrap_admin")]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const loser = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+      expect((loser.reason as DomainError).reasonCode).toBe("ADMIN_EXISTS");
+    });
+
+    it("demo_seed is refused in production and allowed elsewhere; policy and duplicates still apply", async () => {
+      build({ deploymentProfile: "production" });
+      await rejects(provision("customer", "demo_seed"), "DEMO_SEED_FORBIDDEN");
+      build({ deploymentProfile: "preview" });
+      const email = `seed${Date.now()}@example.test`;
+      const created = await provision("customer", "demo_seed", email);
+      expect(created.customerRef).toMatch(/^RP-/);
+      await rejects(provision("customer", "demo_seed", email), "EMAIL_IN_USE");
+      await rejects(
+        db.db.transaction((tx) => identity.provisionLocalAccount({ email: "w@example.test", name: "W", role: "customer", password: "short", mustChangePassword: false }, { tx: tx as Tx, reason: "demo_seed" })),
+        "PASSWORD_TOO_SHORT",
+      );
+    });
+
+    it("audit failure ⇒ no account", async () => {
+      build({ deploymentProfile: "preview" });
+      const email = `seedaf${Date.now()}@example.test`;
+      h.audit.failRecords = true;
+      await expect(provision("customer", "demo_seed", email)).rejects.toThrow();
+      h.audit.failRecords = false;
+      expect(await identity.findUserIdByEmail(email)).toBeNull();
+    });
+  });
+
   describe("router", () => {
     const createCaller = createCallerFactory(identityRouter);
     const issued: unknown[] = [];

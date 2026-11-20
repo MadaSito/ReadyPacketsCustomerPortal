@@ -42,6 +42,17 @@ issueAdminSetPasswordLink(userId: number, opts: { tx: Tx }): Promise<{ previewLi
 // (integrator decision). Callers revoke sessions themselves first (lock order users → sessions → tokens).
 hasActiveAdministrator(): Promise<boolean>;     // ≥1 user role=admin status=active
 
+// SERVICE-INTERNAL — ops scripts only (scripts/ops/create-admin.ts, seed-demo.ts); never on tRPC/HTTP.
+provisionLocalAccount(input: {
+  email: string; name: string; role: UserRole; password: string; mustChangePassword: boolean; customerRef?: string | null;
+}, opts: { tx: Tx; reason: "bootstrap_admin" | "demo_seed" }): Promise<{ userId: number; publicId: string; customerRef: string | null }>;
+// ACTIVE + e-mail-verified local account, Argon2id after the normal policy (VALIDATION PASSWORD_* / CONFLICT
+// EMAIL_IN_USE); no session; MFA not enrolled (first sign-in ⇒ enroll_mfa). Audit `identity.account.provisioned`
+// (actor system, attributes { reason, role, must_change_password }) in the same tx (audit failure ⇒ no account).
+// bootstrap_admin: role must be admin (VALIDATION BOOTSTRAP_ROLE_INVALID); CONFLICT ADMIN_EXISTS when an active
+// admin exists — serialized by a per-database MySQL named lock + FOR UPDATE read of the active-admin set
+// (CONFLICT BOOTSTRAP_BUSY if the lock is not obtained in 15 s). demo_seed: FORBIDDEN DEMO_SEED_FORBIDDEN in production.
+
 sessions: {
   markMfaVerified(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;  // sets mfaVerifiedAt + rotates
   markStepUp(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;       // sets stepUpAt (+mfaVerifiedAt) + rotates
@@ -166,7 +177,8 @@ Password rehash is compare-and-set on the verified hash (`WHERE id AND password_
 
 ## Settings keys
 `identity.session.idle_minutes` (default 30), `identity.session.absolute_hours` (default 12),
-`identity.registration.enabled` (default true). Sign-in throttling is the rate limiter's `user_login` category
+`identity.registration.enabled` (default true; when false `register` returns FORBIDDEN REGISTRATION_DISABLED —
+admin-created invitations and provisioning are unaffected). Sign-in throttling is the rate limiter's `user_login` category
 (keys `acct:<emailIndex>`; the HTTP layer adds the client-address key); other public flows use `auth_high_risk`.
 
 ## Jobs

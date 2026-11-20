@@ -2,12 +2,12 @@
  * Public account flows: registration, sign-in, e-mail verification, password reset, invitation activation,
  * change password, sign-out. Uniform responses + timing; no account enumeration.
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
-import type { TransitionStep } from "../../../shared/domain.js";
+import type { TransitionStep, UserRole } from "../../../shared/domain.js";
 import { readSetting } from "../platform/settingsRegistry.js";
 import { normalizeEmail } from "./normalize.js";
 import type { PasswordHasher } from "./password/hasher.js";
@@ -138,9 +138,72 @@ export function createAuthService(i: AuthInternals) {
     return { pendingSteps, nextStep: pendingSteps[0] ?? null };
   }
 
+  /**
+   * Service-internal provisioning for ops scripts (create-admin, demo seed). NOT exposed on tRPC/HTTP.
+   * Creates an ACTIVE, e-mail-verified local account (policy-checked Argon2id hash); no session; MFA not
+   * enrolled, so the first sign-in still forces enrolment. Audited as `system` in the caller's tx.
+   *  - bootstrap_admin: refuses with CONFLICT ADMIN_EXISTS if an active administrator exists. Serialized
+   *    across processes by a per-database named lock held across check + insert; the active-admin set is
+   *    read with FOR UPDATE (a concurrent uncommitted insert blocks that read until it commits).
+   *  - demo_seed: refused in the production profile.
+   */
+  async function provisionLocalAccount(
+    input: { email: string; name: string; role: UserRole; password: string; mustChangePassword: boolean; customerRef?: string | null },
+    opts: { tx: Tx; reason: "bootstrap_admin" | "demo_seed" },
+  ): Promise<{ userId: number; publicId: string; customerRef: string | null }> {
+    const { tx, reason } = opts;
+    if (reason === "demo_seed" && deps.config.deploymentProfile === "production") {
+      throw new DomainError("FORBIDDEN", "DEMO_SEED_FORBIDDEN", "Demo accounts cannot be created in production.");
+    }
+    if (reason === "bootstrap_admin" && input.role !== "admin") {
+      throw validation("BOOTSTRAP_ROLE_INVALID", "The bootstrap account must be an administrator.");
+    }
+    const email = normalizeEmail(input.email);
+    assertPasswordAcceptable(input.password, { email, name: input.name });
+    const passwordHash = await hasher.hash(input.password); // before any lock
+    let named = false;
+    try {
+      if (reason === "bootstrap_admin") {
+        const [rows] = (await tx.execute(sql`SELECT GET_LOCK(CONCAT('rp.identity.bootstrap.', DATABASE()), 15) AS got`)) as unknown as [{ got: number | null }[]];
+        if (Number(rows[0]?.got) !== 1) throw new DomainError("CONFLICT", "BOOTSTRAP_BUSY", "Another administrator bootstrap is in progress. Try again.");
+        named = true;
+        if ((await repo.countActiveAdmins(tx)) > 0) {
+          throw new DomainError("CONFLICT", "ADMIN_EXISTS", "An active administrator already exists. Use the console to add administrators.");
+        }
+      }
+      const created = await insertUser(tx, {
+        email,
+        name: input.name,
+        role: input.role,
+        status: "active",
+        origin: reason,
+        passwordHash,
+        customerRef: input.customerRef ?? null,
+        emailVerifiedAt: deps.clock.now(),
+      });
+      if (input.mustChangePassword) await tx.update(users).set({ mustChangePassword: true }).where(eq(users.id, created.id));
+      await deps.audit.record(
+        {
+          category: "security",
+          eventName: "identity.account.provisioned",
+          action: "create",
+          outcome: "completed",
+          actor: { role: "system" },
+          resource: { type: "user", publicId: created.publicId },
+          attributes: { reason, role: input.role, must_change_password: input.mustChangePassword },
+        },
+        tx,
+      );
+      return { userId: created.id, publicId: created.publicId, customerRef: created.customerRef };
+    } finally {
+      if (named) await tx.execute(sql`SELECT RELEASE_LOCK(CONCAT('rp.identity.bootstrap.', DATABASE()))`).catch(() => undefined);
+    }
+  }
+
   return {
     insertUser,
     claimNewRef,
+    provisionLocalAccount,
 
     async register(input: { email: string; name: string; password: string }, meta: CallMeta): Promise<{ accepted: true; previewLink?: string }> {
       if (!(await readSetting(deps.settings, REGISTRATION_ENABLED))) {
