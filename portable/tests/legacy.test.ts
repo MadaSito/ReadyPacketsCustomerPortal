@@ -145,6 +145,19 @@ describe("legacy v2 adapter", () => {
     await expect(openPackage({ input: f, passphrase: PASS, limits: { maxTotalUncompressed: 8 } })).rejects.toMatchObject({ code: "SIZE_LIMIT" });
   });
 
+  it("budgets expanded records (items/history/provenance) and metadata-only packages", async () => {
+    const many = { ...order("o1", "c1"), statusHistory: Array.from({ length: 20 }, (_, k) => ({ fromStatus: null, toStatus: "new", reason: `r${k}`, occurredAt: "2026-01-01T00:00:00.000Z" })) };
+    const f = path.join(dir, "expanded.rptransfer");
+    await writeFile(f, seal(V2E, V2, payload(V2, "order", { customers: [customer("c1", "ada@legacy.example.test")], orders: [many], files: [] })));
+    // Only 1 customer and 1 order at top level, but 20 derived history records.
+    await expect(openPackage({ input: f, passphrase: PASS, limits: { maxRecordsPerType: 5 } })).rejects.toMatchObject({ code: "SIZE_LIMIT", detail: { recordType: "order-status-history" } });
+    // Metadata only (no files): the normalized record bytes alone exceed the total budget.
+    await expect(openPackage({ input: f, passphrase: PASS, limits: { maxTotalUncompressed: 2048 } })).rejects.toMatchObject({ code: "SIZE_LIMIT" });
+    const ok = await openPackage({ input: f, passphrase: PASS });
+    expect((await ok.verify()).ok).toBe(true);
+    await ok.close();
+  });
+
   it("detects a forged legacy packageId", async () => {
     const pkg = await open(seal(V2E, V2, payload(V2, "customer", { customers: [customer("c1", "ada@legacy.example.test")], orders: [], files: [] }, { badId: true })));
     const report = await pkg.verify();

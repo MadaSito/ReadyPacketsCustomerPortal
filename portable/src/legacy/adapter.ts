@@ -121,6 +121,26 @@ export async function openLegacyPackage(bytes: Buffer, passphrase: string | Uint
   return LegacyPackage.build(raw, payloadFormat, limits, manifestSha256, ciphertextSha256);
 }
 
+/**
+ * Budget over the EXPANDED result (every derived record type incl. items, history, file versions and
+ * provenance, plus normalized record bytes and object bytes) — the same limits a v3 package is held to.
+ */
+function enforceConvertedBudget(c: Converted, limits: PortableLimits): void {
+  let total = 0;
+  for (const [type, list] of c.records) {
+    if (list.length > limits.maxRecordsPerType) throw new PortableError("SIZE_LIMIT", "The upgraded legacy package has too many records of one type.", { recordType: type });
+    for (const rec of list) {
+      total += Buffer.byteLength(canonicalJson(rec)) + 1;
+      if (total > limits.maxTotalUncompressed) throw new PortableError("SIZE_LIMIT", "The upgraded legacy package exceeds the total size limit.");
+    }
+  }
+  for (const buf of c.objects.values()) {
+    if (buf.length > limits.maxObjectBytes) throw new PortableError("SIZE_LIMIT", "A legacy file exceeds the object size limit.");
+    total += buf.length;
+    if (total > limits.maxTotalUncompressed) throw new PortableError("SIZE_LIMIT", "The upgraded legacy package exceeds the total size limit.");
+  }
+}
+
 interface Converted {
   records: Map<RecordType, AnyRecord[]>;
   objects: Map<string, Buffer>;
@@ -417,7 +437,9 @@ class LegacyPackage implements PortablePackage {
   }
 
   static build(raw: unknown, payloadFormat: string, limits: PortableLimits, manifestSha256: string, ciphertextSha256: string): LegacyPackage {
-    return new LegacyPackage(convertLegacyPayload(raw, payloadFormat), limits, manifestSha256, ciphertextSha256);
+    const converted = convertLegacyPayload(raw, payloadFormat);
+    enforceConvertedBudget(converted, limits);
+    return new LegacyPackage(converted, limits, manifestSha256, ciphertextSha256);
   }
 
   async verify(): Promise<VerificationReport> {

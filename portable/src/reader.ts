@@ -18,7 +18,7 @@ import { CONTRACT_MAJOR, CONTRACT_MINOR, ManifestSchema, parseVersion, type Mani
 import { RECORD_TYPE_ORDER, referencesOf, type RecordOf, type RecordType } from "./contract/records.js";
 import { scanExclusions } from "./contract/exclusions.js";
 import { checkRecord } from "./validate.js";
-import { MAGIC, decryptBody, openEnvelopeHeader } from "./crypto/envelope.js";
+import { MAGIC, decryptBody, openEnvelopeHeader, readExact } from "./crypto/envelope.js";
 import { openEntryStream, openZip, readEntryBuffer, type OpenedZip } from "./archive/zip.js";
 import { splitLines } from "./lines.js";
 import { computeContentDigest } from "./digest.js";
@@ -56,9 +56,9 @@ export async function openPackage(opts: OpenPackageOptions): Promise<PortablePac
     await fh.read(peek, 0, 8, 0);
     if (peek[0] === 0x7b /* { */) {
       if (st.size > limits.maxLegacyPackageBytes) throw new PortableError("SIZE_LIMIT", "The legacy package exceeds its size limit.");
-      const bytes = Buffer.alloc(st.size);
-      await fh.read(bytes, 0, st.size, 0);
-      if ((await fh.stat()).size !== st.size) throw new PortableError("IO_ERROR", "The package changed while being read.");
+      const bytes = await readExact(fh, 0, st.size); // full read loop (short reads are retried)
+      if (bytes.length !== st.size || (await fh.stat()).size !== st.size) throw new PortableError("IO_ERROR", "The package changed while being read.");
+      await fh.close();
       return await openLegacyPackage(bytes, opts.passphrase, limits);
     }
     if (!peek.equals(MAGIC)) throw new PortableError("UNSUPPORTED_ENVELOPE", "The file is not a ReadyPackets portable package.");

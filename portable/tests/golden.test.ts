@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openPackage } from "../src/reader.js";
 import { RECORD_TYPE_ORDER } from "../src/contract/records.js";
-import { SCHEMA_DIR, buildSchemas } from "../scripts/export-schemas.js";
+import { RECORDS_DOC, SCHEMA_DIR, buildRecordsDoc, buildSchemas } from "../scripts/export-schemas.js";
 import { PASS, cleanup, tmpDir, writeSample } from "./fixtures.js";
 
 const GOLDEN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "golden-v3.rpkg");
@@ -38,6 +38,7 @@ describe("exported JSON Schemas", () => {
     const docs = buildSchemas();
     expect(docs.size).toBe(RECORD_TYPE_ORDER.length + 1);
     for (const [name, text] of docs) expect(await readFile(path.join(SCHEMA_DIR, name), "utf8"), name).toBe(text);
+    expect(await readFile(RECORDS_DOC, "utf8")).toBe(buildRecordsDoc());
   });
 
   it("record schemas are closed (strict) and declare heldUnknown", () => {

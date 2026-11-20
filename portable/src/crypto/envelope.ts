@@ -163,7 +163,7 @@ export class EncryptStream extends Transform {
   }
 }
 
-async function readExact(fh: FileHandle, position: number, length: number): Promise<Buffer> {
+export async function readExact(fh: FileHandle, position: number, length: number): Promise<Buffer> {
   const buf = Buffer.alloc(length);
   let off = 0;
   while (off < length) {
