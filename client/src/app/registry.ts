@@ -1,5 +1,6 @@
 /** Feature registry. Owner: integrator (/root). One line per feature; features never import each other. */
-import type { FeatureRoutes } from "@/lib/routes";
+import { createElement, type ComponentType } from "react";
+import type { FeatureRoutes, RouteDef, RouteWrapper } from "@/lib/routes";
 import { authFeature } from "@/features/auth/routes";
 import { dashboardFeature } from "@/features/dashboard/routes";
 import { identityFeature } from "@/features/identity/routes";
@@ -34,7 +35,20 @@ export const FEATURES: readonly FeatureRoutes[] = [
   integrationsFeature,
 ];
 
-export const ALL_ROUTES = FEATURES.flatMap((feature) => feature.routes);
+export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);
+
+/** Applies registered wrappers (outermost first) to a route's component; routes without wrappers are untouched. */
+export function applyRouteWrappers(route: RouteDef, wrappers: readonly RouteWrapper[] = ROUTE_WRAPPERS): RouteDef {
+  const matching = wrappers.filter((wrapper) => wrapper.path === route.path);
+  if (matching.length === 0) return route;
+  const Inner = route.component as ComponentType;
+  const Wrapped: ComponentType = () =>
+    matching.reduceRight((child, wrapper) => createElement(wrapper.component, null, child), createElement(Inner));
+  Wrapped.displayName = `Wrapped(${route.path})`;
+  return { ...route, component: Wrapped };
+}
+
+export const ALL_ROUTES = FEATURES.flatMap((feature) => feature.routes).map((route) => applyRouteWrappers(route));
 export const ALL_NAV = FEATURES.flatMap((feature) => feature.nav ?? []).sort((a, b) => a.order - b.order);
 export const ORDER_TABS = FEATURES.flatMap((feature) => feature.orderTabs ?? []).sort((a, b) => a.order - b.order);
 export const CUSTOMER_TABS = FEATURES.flatMap((feature) => feature.customerTabs ?? []).sort((a, b) => a.order - b.order);

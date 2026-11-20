@@ -4,7 +4,7 @@
  * The UI foundation renders them inside the correct shell and enforces `access` client-side; the SERVER is
  * always the authority — hiding a link is never an authorization control.
  */
-import type { ComponentType, LazyExoticComponent } from "react";
+import type { ComponentType, LazyExoticComponent, ReactNode } from "react";
 import type { Capability } from "@shared/capabilities";
 
 export type RouteAccess =
@@ -74,6 +74,19 @@ export interface DashboardWidget {
   component: LazyExoticComponent<ComponentType> | ComponentType;
 }
 
+/**
+ * A feature may wrap ANOTHER feature's route without importing it (for example compliance requiring current
+ * policy acceptance before the new-order page). The wrapper renders `children` when its condition is met.
+ * This is a convenience for the visitor only — the server enforces the same rule.
+ */
+export interface RouteWrapper {
+  /** Exact `RouteDef.path` to wrap. */
+  path: string;
+  component: ComponentType<{ children: ReactNode }>;
+  /** Lower runs outermost. */
+  order: number;
+}
+
 export interface FeatureRoutes {
   routes: RouteDef[];
   nav?: NavItem[];
@@ -83,4 +96,6 @@ export interface FeatureRoutes {
   customerTabs?: CustomerTab[];
   /** Cards contributed to the dashboards (host: dashboard feature). */
   widgets?: DashboardWidget[];
+  /** Wrappers applied around routes owned by other features (see `RouteWrapper`). */
+  routeWrappers?: RouteWrapper[];
 }
