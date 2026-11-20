@@ -53,6 +53,8 @@ export interface WriteOptions {
 }
 
 export interface PlatformSettingsStore extends SettingsStore {
+  /** Loads every settings row into the cache (one query). Call outside transactions to pre-warm. */
+  warm(): Promise<void>;
   describe(filter?: { group?: SettingGroup; kinds?: readonly SettingView["kind"][] }): Promise<SettingView[]>;
   describeOne(key: string): Promise<SettingView>;
   /** Returns the new version. */
@@ -85,13 +87,25 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
   const cache = new Map<string, { expires: number; row: Row | null }>();
   const log = logger.child({ component: "platform.settings" });
 
-  async function loadRow(key: string): Promise<Row | null> {
+  /**
+   * Cached read. On a miss the WHOLE (bounded) settings table is loaded in one query so a burst of reads
+   * costs one pooled connection. When `tx` is given the read runs on the caller's connection (no second
+   * pool checkout inside a transaction) and bypasses the cache.
+   */
+  async function loadRow(key: string, tx?: Tx): Promise<Row | null> {
+    if (tx) {
+      const [row] = await tx.select().from(platformSettings).where(eq(platformSettings.settingKey, key)).limit(1);
+      return row ?? null;
+    }
     const now = clock.now().getTime();
     const hit = cache.get(key);
     if (hit && hit.expires > now) return hit.row;
-    const [row] = await db.select().from(platformSettings).where(eq(platformSettings.settingKey, key)).limit(1);
-    const value = row ?? null;
-    cache.set(key, { expires: now + SETTINGS_CACHE_TTL_MS, row: value });
+    const rows = await loadAll();
+    const expires = clock.now().getTime() + SETTINGS_CACHE_TTL_MS;
+    for (const def of listSettingDefinitions()) cache.set(def.key, { expires, row: rows.get(def.key) ?? null });
+    for (const [rowKey, row] of rows) cache.set(rowKey, { expires, row });
+    const value = rows.get(key) ?? null;
+    cache.set(key, { expires, row: value });
     return value;
   }
 
@@ -206,10 +220,10 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
   }
 
   const store: PlatformSettingsStore = {
-    async get<T>(key: string, parse: (raw: unknown) => T, fallback: T): Promise<T> {
+    async get<T>(key: string, parse: (raw: unknown) => T, fallback: T, tx?: Tx): Promise<T> {
       const def = getSettingDefinition(key);
       if (def?.kind === "secret") return fallback;
-      const row = await loadRow(key);
+      const row = await loadRow(key, tx);
       if (!row || row.valueJson === null || row.valueJson === undefined) return fallback;
       try {
         if (def) def.schema.parse(row.valueJson);
@@ -224,10 +238,10 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       await store.update(key, value, { tx });
     },
 
-    async getSecret(key) {
+    async getSecret(key: string, tx?: Tx) {
       const def = requireDefinition(key);
       if (def.kind !== "secret") throw validation("SETTING_KIND_MISMATCH", "That setting is not a secret.");
-      const row = await loadRow(key);
+      const row = await loadRow(key, tx);
       if (!row?.secretEnc) return null;
       try {
         return crypto.decrypt(row.secretEnc, secretAad(key));
@@ -242,10 +256,10 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       await store.updateSecret(key, value, { tx });
     },
 
-    async isFeatureEnabled(flag) {
+    async isFeatureEnabled(flag: string, tx?: Tx) {
       const def = getSettingDefinition(flagKey(flag));
       if (!def || def.kind !== "flag") return false;
-      const row = await loadRow(def.key);
+      const row = await loadRow(def.key, tx);
       return row?.valueJson === true;
     },
 
@@ -311,6 +325,12 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       if (def.kind === "secret") throw validation("SETTING_KIND_MISMATCH", "That setting is a secret.");
       const stored = parseStored(def, await loadRow(key));
       return stored?.valid ? stored.value : undefined;
+    },
+
+    async warm() {
+      const rows = await loadAll();
+      const expires = clock.now().getTime() + SETTINGS_CACHE_TTL_MS;
+      for (const def of listSettingDefinitions()) cache.set(def.key, { expires, row: rows.get(def.key) ?? null });
     },
 
     invalidate(key) {

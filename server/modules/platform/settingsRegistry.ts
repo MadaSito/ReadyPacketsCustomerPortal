@@ -185,22 +185,22 @@ export function flagKey(flag: string): string {
 
 /* ------------------------------------------------------------------ typed helpers */
 
-export async function readSetting<T>(settings: SettingsStore, def: ValueSettingDefinition<T>): Promise<T> {
-  return settings.get(def.key, (raw) => def.schema.parse(raw), def.default);
+export async function readSetting<T>(settings: SettingsStore, def: ValueSettingDefinition<T>, tx?: Tx): Promise<T> {
+  return settings.get(def.key, (raw) => def.schema.parse(raw), def.default, tx);
 }
 
 export async function writeSetting<T>(settings: SettingsStore, def: ValueSettingDefinition<T>, value: T, tx?: Tx): Promise<void> {
   await settings.set(def.key, def.schema.parse(value), tx);
 }
 
-export async function readSecret(settings: SettingsStore, def: SecretSettingDefinition): Promise<string | null> {
-  return settings.getSecret(def.key);
+export async function readSecret(settings: SettingsStore, def: SecretSettingDefinition, tx?: Tx): Promise<string | null> {
+  return settings.getSecret(def.key, tx);
 }
 
-export async function isSecretConfigured(settings: SettingsStore, def: SecretSettingDefinition): Promise<boolean> {
-  return (await settings.getSecret(def.key)) !== null;
+export async function isSecretConfigured(settings: SettingsStore, def: SecretSettingDefinition, tx?: Tx): Promise<boolean> {
+  return (await settings.getSecret(def.key, tx)) !== null;
 }
 
-export async function isFlagEnabled(settings: SettingsStore, def: FeatureFlagDefinition): Promise<boolean> {
-  return settings.isFeatureEnabled(def.flag);
+export async function isFlagEnabled(settings: SettingsStore, def: FeatureFlagDefinition, tx?: Tx): Promise<boolean> {
+  return settings.isFeatureEnabled(def.flag, tx);
 }
