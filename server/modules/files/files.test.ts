@@ -7,7 +7,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { DomainError, notFound } from "../../core/errors.js";
 import { newRequestContext } from "../../core/requestContext.js";
-import type { SessionPrincipal } from "../../core/types.js";
+import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { setHttpState } from "../../http/requestState.js";
 import { registerFilesHttpRoutes } from "./http.js";
 import { createFilesModule, type FilesModule, type UploadOptions } from "./index.js";
@@ -31,6 +31,8 @@ let orderOwner: SessionPrincipal;
 let orderStage: string;
 let orderOrigin: "portal" | "import";
 let revokedSession: string | null;
+let persistedAdminStepUp: Date | null | undefined;
+let holdAtPurgeLock: boolean;
 
 beforeAll(async () => {
   t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, fileAccessLog } });
@@ -51,6 +53,8 @@ beforeEach(async () => {
   orderStage = "intake";
   orderOrigin = "portal";
   revokedSession = null;
+  persistedAdminStepUp = undefined;
+  holdAtPurgeLock = false;
   const read = async (principal: SessionPrincipal, id: number | string) => {
     if (id !== orderPublicId && id !== orderId) throw notFound("ORDER_NOT_FOUND");
     const accessRole = principal.role !== "customer" ? principal.role
@@ -71,12 +75,17 @@ beforeEach(async () => {
   };
   h.services.orders = {
     assertCanReadOrder: read, assertCanWriteOrder: write, assertCanReadOrderById: read, assertCanWriteOrderById: write,
+    async getOrderRefById(id: number, tx?: Tx, options?: { forUpdate?: boolean }) {
+      if (id !== orderId) return null;
+      if (tx && options?.forUpdate && holdAtPurgeLock) locked = "legal_hold";
+      return { id, publicId: orderPublicId, lockState: locked };
+    },
   } as unknown as TestHarness["services"]["orders"];
   h.services.identity = {
     sessions: {
       async assertCurrent(principal: SessionPrincipal) {
         if (principal.sessionId === revokedSession) throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Please sign in again.");
-        return { pendingSteps: [] };
+        return { pendingSteps: [], role: principal.role, stepUpAt: persistedAdminStepUp === undefined ? principal.stepUpAt : persistedAdminStepUp };
       },
     },
   } as unknown as TestHarness["services"]["identity"];
@@ -188,6 +197,18 @@ describe("private file admission and authorization", () => {
     await files.cleanUpload(staged);
   });
 
+  it("rejects rule changes after session revocation or loss of persisted step-up", async () => {
+    const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
+    const { rules } = await files.adminOverview(admin);
+    revokedSession = admin.sessionId;
+    await expect(files.setTypeRules(admin, { ...rules, extensions: ["pdf"] })).rejects.toMatchObject({ code: "UNAUTHENTICATED" });
+    revokedSession = null;
+    persistedAdminStepUp = null;
+    await expect(files.setTypeRules(admin, { ...rules, extensions: ["pdf"] })).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    expect((await files.adminOverview(admin)).rules).toEqual(rules);
+    expect(h.audit.named("file.rules.changed")).toEqual([]);
+  });
+
   it("requires a configured scan to consume all bytes and fails closed on incomplete scanning", async () => {
     const integrated = createFilesModule(h.deps, { scanner: {
       async health() { return "ok"; },
@@ -198,6 +219,43 @@ describe("private file admission and authorization", () => {
       .rejects.toMatchObject({ reasonCode: "FILE_SCANNER_UNAVAILABLE" });
     expect(h.storage.objects.size).toBe(0);
     expect(await integrated.health?.()).toEqual(expect.arrayContaining([expect.objectContaining({ component: "files.antivirus", state: "ok" })]));
+  });
+});
+
+describe("retention custody", () => {
+  it("rechecks holds under lock and refuses to unlink without durable intent", async () => {
+    const file = await add();
+    await files.remove(staff, file.publicId);
+    h.clock.advance(31 * 86_400_000);
+    const run = async () => {
+      await h.jobs.enqueue("files.retention", {});
+      return h.jobs.runAll("files.retention");
+    };
+    holdAtPurgeLock = true;
+    await expect(run()).resolves.toMatchObject([{ safeCounts: { purged: 0 } }]);
+    expect(h.storage.objects.size).toBe(1);
+    expect(h.audit.named("file.retention.purged").map(({ outcome }) => outcome)).toEqual(["attempted"]);
+    holdAtPurgeLock = false;
+    locked = "none";
+    h.audit.failRecords = true;
+    await expect(run()).rejects.toMatchObject({ code: "AUDIT_UNAVAILABLE" });
+    expect(h.storage.objects.size).toBe(1);
+    h.audit.failRecords = false;
+    const originalRecord = h.audit.record.bind(h.audit);
+    const record = vi.spyOn(h.audit, "record").mockImplementation(async (event, tx) => {
+      if (event.outcome === "completed") {
+        throw new DomainError("AUDIT_UNAVAILABLE", "AUDIT_UNAVAILABLE", "Audit is temporarily unavailable.");
+      }
+      await originalRecord(event, tx);
+    });
+    await expect(run()).rejects.toMatchObject({ code: "AUDIT_UNAVAILABLE" });
+    expect(h.storage.objects.size).toBe(1);
+    record.mockRestore();
+    await expect(run()).resolves.toMatchObject([{ safeCounts: { purged: 1 } }]);
+    expect(h.storage.objects.size).toBe(0);
+    expect((await t.db.select().from(orderFiles))[0]?.purgedAt).toEqual(h.clock.now());
+    expect(h.audit.named("file.retention.purged").map(({ outcome }) => outcome)).toEqual(["attempted", "attempted", "attempted", "completed"]);
+    expect(h.audit.recordedInTx.slice(-2)).toEqual([false, true]);
   });
 });
 
@@ -322,7 +380,16 @@ describe("portable classification and backup traversal", () => {
     };
     await expect(files.validatePortableObject(input)).resolves.toEqual({ extension: "webm", contentType: "audio/webm" });
     await expect(t.db.transaction((tx) => files.adoptVerifiedObject({ ...input, ownerUserId: stranger.userId }, tx))).rejects.toMatchObject({ code: "NOT_FOUND" });
-    const imported = await t.db.transaction((tx) => files.adoptVerifiedObject(input, tx));
+    const settingGet = vi.spyOn(h.deps.settings, "get");
+    const imported = await t.db.transaction(async (tx) => {
+      const file = await files.adoptVerifiedObject(input, tx);
+      expect(settingGet.mock.calls[0]?.[3]).toBe(tx);
+      const auditSpy = vi.spyOn(h.deps.audit, "record");
+      const opened = await files.openForExport(admin, file.publicId, orderPublicId, tx);
+      expect(auditSpy.mock.calls.at(-1)?.[1]).toBe(tx);
+      expect(await buffer(opened.stream)).toEqual(exampleWebm("audio", true));
+      return file;
+    });
     expect(imported.contentType).toBe("audio/webm");
     expect(imported.createdAt).toEqual(input.createdAt);
     const exported = await t.db.transaction((tx) => files.portableFiles(tx, { principal: admin, limit: 10 }));

@@ -1,4 +1,4 @@
-import { and, count, eq, gt, inArray, isNotNull, isNull, lte, sql } from "drizzle-orm";
+import { and, count, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Readable } from "node:stream";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -94,7 +94,7 @@ export interface FilesModule extends ModuleLifecycle {
   list(principal: SessionPrincipal, orderPublicId: string, options: ListOptions): Promise<Page<FileRecord> & { canUpload: boolean; uploadPolicy: UploadPolicy | null }>;
   assertCanReadFile(principal: SessionPrincipal, filePublicId: string, orderPublicId?: string): Promise<FileRecord>;
   enumerateOrderFiles(principal: SessionPrincipal, orderPublicId: string, options?: ListOptions): Promise<Page<FileRecord>>;
-  openForExport(principal: SessionPrincipal, filePublicId: string, orderPublicId: string): Promise<Download>;
+  openForExport(principal: SessionPrincipal, filePublicId: string, orderPublicId: string, tx?: Tx): Promise<Download>;
   issueDownloadTicket(principal: SessionPrincipal, filePublicId: string): Promise<{ ticket: string; expiresAt: Date }>;
   redeemDownloadTicket(principal: SessionPrincipal, ticket: string): Promise<Download>;
   recordDownloadDenied(principal: SessionPrincipal | null, reason: string): Promise<void>;
@@ -109,7 +109,7 @@ export interface FilesModule extends ModuleLifecycle {
   setTypeRules(principal: SessionPrincipal, rules: FileRules): Promise<FileRules>;
   revokeTicketsForOrder(orderId: number, tx?: Tx): Promise<void>;
   reassignOrderFiles(orderId: number, ownerUserId: number, tx: Tx): Promise<void>;
-  validatePortableObject(input: { stagedObject: StoredObjectInfo; displayName: string; category: FileCategory; contentType?: string }): Promise<{ extension: string; contentType: string }>;
+  validatePortableObject(input: { stagedObject: StoredObjectInfo; displayName: string; category: FileCategory; contentType?: string }, tx?: Tx): Promise<{ extension: string; contentType: string }>;
   adoptVerifiedObject(input: AdoptVerifiedObjectInput, tx: Tx): Promise<FileRecord>;
   portableFiles(tx: Tx, options: { principal: SessionPrincipal; after?: string; limit: number; orderIds?: readonly number[] }): Promise<Page<PortableStoredFile>>;
   backupFiles(tx: Tx, options: { after?: string; limit: number }): Promise<Page<BackupStoredFile>>;
@@ -134,8 +134,9 @@ const encodeCursor = (publicId: string) => Buffer.from(publicId, "ascii").toStri
 export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: FileScanProvider } = {}): FilesModule {
   const { db, clock, storage, audit, crypto, logger, settings } = deps;
   const local = storage as Partial<LocalObjectStorage>;
-  const rules = () => readSetting(settings, fileRulesSetting);
+  const rules = (tx?: Tx) => readSetting(settings, fileRulesSetting, tx);
   const currentTx = <T>(fn: (tx: Tx) => Promise<T>) => db.transaction(fn, { isolationLevel: "read committed" });
+  let retentionCursor: { after: Date; id: number } | undefined;
 
   function requireFull(principal: SessionPrincipal) {
     if (principal.state !== "full" || principal.pendingSteps.length > 0) {
@@ -149,6 +150,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     if (current.pendingSteps.length) {
       throw new DomainError("REMEDIATION_REQUIRED", "ACCOUNT_STEP_PENDING", "Please finish securing your account to continue.");
     }
+    return current;
   }
 
   function actor(principal: SessionPrincipal | null): NonNullable<AuditEventInput["actor"]> {
@@ -284,10 +286,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     return classification;
   }
 
-  async function validatePortable(input: Parameters<FilesModule["validatePortableObject"]>[0]) {
+  async function validatePortable(input: Parameters<FilesModule["validatePortableObject"]>[0], tx?: Tx) {
     const displayName = sanitizeDisplayName(input.displayName);
     if (!stagingKey.test(input.stagedObject.key)) throw validation("INVALID_FILE_REFERENCE", "The staged file reference is invalid.");
-    const options = await rules();
+    const options = await rules(tx);
     if (!Number.isSafeInteger(input.stagedObject.size) || input.stagedObject.size <= 0 || input.stagedObject.size > options.maxFileBytes) {
       throw validation("INVALID_FILE_SIZE", "The staged file is empty or exceeds the allowed size.");
     }
@@ -394,30 +396,44 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const expired = await db.select({ id: fileDownloadTickets.id }).from(fileDownloadTickets)
       .where(lte(fileDownloadTickets.expiresAt, now)).orderBy(fileDownloadTickets.expiresAt).limit(1000);
     if (expired.length) await db.delete(fileDownloadTickets).where(inArray(fileDownloadTickets.id, expired.map(({ id }) => id)));
-    const candidates = await db.select({ id: orderFiles.id }).from(orderFiles)
-      .where(and(isNotNull(orderFiles.deletedAt), lte(orderFiles.purgeAfter, now), isNull(orderFiles.purgedAt)))
-      .orderBy(orderFiles.purgeAfter).limit(100);
+    const candidates = await db.select({
+      id: orderFiles.id, orderId: orderFiles.orderId, publicId: orderFiles.publicId, purgeAfter: orderFiles.purgeAfter,
+    }).from(orderFiles)
+      .where(and(isNotNull(orderFiles.deletedAt), lte(orderFiles.purgeAfter, now), isNull(orderFiles.purgedAt),
+        retentionCursor ? or(gt(orderFiles.purgeAfter, retentionCursor.after),
+          and(eq(orderFiles.purgeAfter, retentionCursor.after), gt(orderFiles.id, retentionCursor.id))) : undefined))
+      .orderBy(orderFiles.purgeAfter, orderFiles.id).limit(100);
     let purged = 0;
     for (const candidate of candidates) {
       job.signal.throwIfAborted();
       await job.assertStillOwned();
-      const didPurge = await db.transaction(async (tx) => {
+      const initialOrder = await deps.services.orders.getOrderRefById(candidate.orderId);
+      if (!initialOrder || initialOrder.lockState === "legal_hold") continue;
+      const input: AuditEventInput = {
+        category: "file", eventName: "file.retention.purged", action: "purge", outcome: "attempted",
+        actor: { role: "system" }, resource: { type: "file", publicId: candidate.publicId }, correlationId: job.correlationId, jobId: job.jobId,
+      };
+      // Commit intent before acquiring the publication transaction. A lost commit after an unlink
+      // leaves a durable attempted event; the retry can safely unlink an already absent object.
+      await audit.record(input);
+      const didPurge = await currentTx(async (tx) => {
+        await job.assertStillOwned(tx);
+        const order = await deps.services.orders.getOrderRefById(candidate.orderId, tx, { forUpdate: true });
+        if (!order || order.lockState === "legal_hold") return false;
         const [row] = await tx.select().from(orderFiles).where(eq(orderFiles.id, candidate.id)).limit(1).for("update");
         if (!row?.deletedAt || !row.purgeAfter || row.purgedAt || row.purgeAfter > now) return false;
-        const input: AuditEventInput = {
-          category: "file", eventName: "file.retention.purged", action: "purge", outcome: "attempted",
-          actor: { role: "system" }, resource: { type: "file", publicId: row.publicId }, correlationId: job.correlationId, jobId: job.jobId,
-        };
-        // The intent must be committed durably BEFORE the external effect. Retry is idempotent if the
-        // process dies after unlink and before updating the row; that attempt stays unresolved.
-        await audit.record(input);
+        if (row.orderId !== order.id || row.orderPublicId !== order.publicId || row.publicId !== candidate.publicId) return false;
+        await audit.record({ ...input, outcome: "completed" }, tx);
+        job.signal.throwIfAborted();
         await storage.delete(row.storageKey);
         await tx.update(orderFiles).set({ purgedAt: now }).where(eq(orderFiles.id, row.id));
-        await audit.record({ ...input, outcome: "completed" }, tx);
         return true;
       });
       if (didPurge) purged++;
     }
+    // Cycle through due rows so a batch of held orders cannot indefinitely starve later files.
+    const last = candidates.at(-1);
+    retentionCursor = candidates.length === 100 && last?.purgeAfter ? { after: last.purgeAfter, id: last.id } : undefined;
     return { outcome: "completed", safeCounts: { purged, stagingRemoved, expiredTickets: expired.length } };
   });
   deps.jobs.registerSchedule({ name: retentionJob, type: retentionJob, everyMs: 60 * 60_000 });
@@ -526,17 +542,18 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     async assertCanReadFile(principal, filePublicId, orderPublicId) {
       return output(await currentTx((tx) => readFile(principal, filePublicId, orderPublicId, tx)));
     },
-    async openForExport(principal, filePublicId, orderPublicId) {
+    async openForExport(principal, filePublicId, orderPublicId, callerTx) {
       fullCapability(principal, "portable.export");
       let stream: Readable | undefined;
       try {
-        return await currentTx(async (tx) => {
+        const open = async (tx: Tx) => {
           const row = await readFile(principal, filePublicId, orderPublicId, tx);
           await audit.record(event(principal, "file.export.open", "export", "attempted", filePublicId), tx);
           const file = output(row);
           stream = await readObject(row);
           return { file, stream };
-        });
+        };
+        return await (callerTx ? open(callerTx) : currentTx(open));
       } catch (error) {
         stream?.destroy();
         throw error;
@@ -623,7 +640,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     async setTypeRules(principal, value) {
       fullCapability(principal, "platform.settings.manage", true);
       if (principal.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
-      return db.transaction(async (tx) => {
+      return currentTx(async (tx) => {
+        const current = await requireCurrent(principal, tx);
+        fullCapability({ ...principal, role: current.role, stepUpAt: current.stepUpAt }, "platform.settings.manage", true);
+        if (current.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
         await writeSetting(settings, fileRulesSetting, value, tx);
         await audit.record(event(principal, "file.rules.changed", "update", "completed"), tx);
         return value;
@@ -636,8 +656,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       await tx.update(orderFiles).set({ ownerUserId }).where(eq(orderFiles.orderId, orderId));
       await service.revokeTicketsForOrder(orderId, tx);
     },
-    async validatePortableObject(input) {
-      const { classification } = await validatePortable(input);
+    async validatePortableObject(input, tx) {
+      const { classification } = await validatePortable(input, tx);
       return { extension: classification.extension, contentType: classification.mime };
     },
     async adoptVerifiedObject(input, tx) {
@@ -653,7 +673,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (order.publicId !== input.orderPublicId || order.ownerUserId !== input.ownerUserId || order.origin !== "import") {
         throw notFound("ORDER_NOT_FOUND");
       }
-      const staged = await validatePortable(input);
+      const staged = await validatePortable(input, tx);
       await scanStaged(staged);
       const file = await insertVersion(tx, input.principal, {
         ...input, staged, storageKey: input.destinationKey, statusKey: order.statusKey, imported: true,
