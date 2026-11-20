@@ -117,8 +117,8 @@ write_env() {
         printf '%s\n' NODE_ENV=production RP_DEPLOYMENT_PROFILE=production HOST=127.0.0.1 PORT=5000 \
             RP_CANONICAL_ORIGIN=https://my.readypackets.com RP_ALIAS_HOSTS=portal.readypackets.com \
             RP_TRUSTED_PROXIES=127.0.0.1 RP_LOG_LEVEL=info RP_SERVICE_NAME=readypackets \
-            "RP_INSTALLATION_ID=$id" "RP_STORAGE_DIR=$storage" "RP_STATIC_DIR=$base/current/dist/public" \
-            "RP_RECOVERY_SANDBOX_DIR=$storage/recovery-sandbox" > "$conf/portal.env"
+            "RP_INSTALLATION_ID=$id" "RP_STORAGE_DIR=$storage" \
+            "RP_STATIC_DIR=$base/current/dist/public" > "$conf/portal.env"
     fi
     [[ ! -L "$conf/portal.env" && $(stat -c '%a:%u:%g' "$conf/portal.env") == 600:0:0 ]] ||
         die "expected a root-owned 0600 environment file: $conf/portal.env"

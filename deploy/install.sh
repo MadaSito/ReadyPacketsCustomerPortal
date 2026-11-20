@@ -32,8 +32,19 @@ write_url() {
             [[ "$url" =~ @127\.0\.0\.1(:3306)?/[a-zA-Z0-9_]+(\?tls=off)?$ ]] ||
                 die 'this release expects backup connections on IPv4 loopback only; see INSTALL.md'
         else
-            [[ "$url" == *\?tls=required* || "$url" == *\&tls=required* ]] ||
-                die 'runtime and migrator DSNs must use verified TLS'
+            printf '%s' "$url" | "$node" -e '
+                try {
+                    const u = new URL(require("node:fs").readFileSync(0, "utf8"));
+                    const tls = u.searchParams.getAll("tls");
+                    const valid = u.protocol === "mysql:" && u.hostname && u.username && u.password &&
+                        !u.hash && /^\/[a-zA-Z0-9_]+$/.test(u.pathname) &&
+                        tls.length === 1 && tls[0] === "required" &&
+                        [...u.searchParams.keys()].every(k => k === "tls" || k === "tlsCaFile") &&
+                        (!u.searchParams.has("tlsCaFile") ||
+                            (u.searchParams.getAll("tlsCaFile").length === 1 && u.searchParams.get("tlsCaFile").startsWith("/")));
+                    process.exit(valid ? 0 : 1);
+                } catch { process.exit(1); }
+            ' || die 'runtime and migrator DSNs must use verified TLS'
         fi
         printf '%s\n' "$url" > "$conf/secrets/$name"
     fi

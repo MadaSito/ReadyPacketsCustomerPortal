@@ -24,10 +24,25 @@ timer_enabled=no
 if systemctl is-enabled --quiet "$timer"; then timer_enabled=yes; fi
 phase=draining
 record_phase() {
-    printf 'phase=%s\nold=%s\ncandidate=%s\nbackup_timer_enabled=%s\n' "$phase" "$old" "$release" "$timer_enabled" > "$conf/upgrade-state"
+    local state
+    state=$(mktemp "$conf/.upgrade-state.XXXXXXXX")
+    printf 'phase=%s\nold=%s\ncandidate=%s\nbackup_timer_enabled=%s\n' "$phase" "$old" "$release" "$timer_enabled" > "$state"
+    mv -fT -- "$state" "$conf/upgrade-state"
 }
 record_phase
-trap 'status=$?; if ((status != 0)); then printf "Upgrade interrupted (%s); keep traffic fenced. Follow INSTALL.md.\n" "$phase" >&2; fi' EXIT
+on_upgrade_exit() {
+    local status=$?
+    if ((status != 0)); then
+        touch "$maintenance" || true
+        if [[ "$phase" == migration_started || "$phase" == verifying ]]; then
+            systemctl disable --now "$timer" "$web" "$worker" || true
+        fi
+        printf 'Upgrade interrupted (%s); keep traffic fenced. Follow INSTALL.md.\n' "$phase" >&2
+    fi
+}
+trap on_upgrade_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 touch "$maintenance"
 systemctl disable --now "$timer"
 systemctl disable "$web" "$worker"
