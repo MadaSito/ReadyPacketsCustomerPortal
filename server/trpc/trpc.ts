@@ -32,6 +32,13 @@ export interface TrpcContext {
 export interface ProcedureMeta {
   /** Rate-limit budget for this procedure. Default `api`. Batches are charged per call. */
   rateLimit?: RateLimitCategory;
+  /**
+   * Session-discovery endpoints (identity.me) are called by every anonymous page load to learn whether a
+   * session exists. Refusing them is expected, not a security signal, so the refusal is NOT written to the
+   * tamper-evident audit chain (an unauthenticated visitor must not be able to grow it at will). The call is
+   * still rate limited and still appears in the request log with its correlation id.
+   */
+  sessionProbe?: boolean;
 }
 
 /** Fresh step-up window for high-impact capabilities. */
@@ -195,9 +202,9 @@ async function recordDenial(ctx: TrpcContext, path: string, reasonCode: string):
   }
 }
 
-const requireSession = t.middleware(async ({ ctx, next, path }) => {
+const requireSession = t.middleware(async ({ ctx, next, path, meta }) => {
   if (!ctx.session) {
-    await recordDenial(ctx, path, "NO_SESSION");
+    if (!meta?.sessionProbe) await recordDenial(ctx, path, "NO_SESSION");
     throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
   }
   return next({ ctx: { ...ctx, session: ctx.session } });

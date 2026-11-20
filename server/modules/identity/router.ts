@@ -89,7 +89,7 @@ export const identityRouter = router({
   }),
 
   /** The single next-action endpoint: the client renders `nextStep` and nothing else decides routing. */
-  me: sessionProcedure.query(async ({ ctx }) => {
+  me: sessionProcedure.meta({ sessionProbe: true }).query(async ({ ctx }) => {
     const user = await ctx.services.identity.getUser(ctx.session.userId);
     if (!user) throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
     const timing = await ctx.services.identity.sessions.timing(ctx.session.sessionId);

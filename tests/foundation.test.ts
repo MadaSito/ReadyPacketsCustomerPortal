@@ -57,6 +57,7 @@ describe("foundation: procedure guards", () => {
   const appRouter = router({
     open: publicProcedure.query(() => "open"),
     transition: sessionProcedure.query(() => "transition"),
+    probe: sessionProcedure.meta({ sessionProbe: true }).query(() => "probe"),
     data: protectedProcedure.query(() => "data"),
     admin: adminProcedure.query(() => "admin"),
     reassign: protectedProcedure.use(requireCapability("orders.reassign")).mutation(() => "moved"),
@@ -78,6 +79,14 @@ describe("foundation: procedure guards", () => {
     await expect(caller(remediation).data()).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(caller(remediation).transition()).resolves.toBe("transition");
     expect(h.audit.named("authz.access.denied").map((event) => event.reasonCode)).toEqual(["NO_SESSION", "REMEDIATION_SESSION"]);
+  });
+
+  it("refuses an anonymous session probe without writing to the audit chain", async () => {
+    const before = h.audit.named("authz.access.denied").length;
+    await expect(caller(null).probe()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(h.audit.named("authz.access.denied")).toHaveLength(before);
+    await expect(caller(null).transition()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(h.audit.named("authz.access.denied")).toHaveLength(before + 1);
   });
 
   it("enforces role, capability and fresh step-up", async () => {
