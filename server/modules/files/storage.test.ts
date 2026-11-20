@@ -74,3 +74,15 @@ it("rejects traversal, malformed keys, symlink namespaces and linked leaves", as
   await expect(storage.move(throughLink, storage.newKey("files"))).rejects.toThrow();
   await expect(storage.delete(throughLink)).rejects.toThrow();
 });
+
+it("sweeps only upload-owned staging keys and associated abandoned partials", async () => {
+  const uploaded = storage.newUploadKey();
+  const portable = storage.newKey("staging");
+  await storage.put(uploaded, Buffer.from("synthetic upload"));
+  await storage.put(portable, Buffer.from("synthetic portable"));
+  const abandoned = storage.newUploadKey().split("/")[1]!;
+  await writeFile(join(storageDir, "staging", `.partial-${abandoned}`), "abandoned", { mode: 0o600 });
+  expect(await storage.sweepStaging(new Date(Date.now() + 60_000))).toBe(2);
+  expect(await storage.stat(uploaded)).toBeNull();
+  expect(await storage.stat(portable)).not.toBeNull();
+});

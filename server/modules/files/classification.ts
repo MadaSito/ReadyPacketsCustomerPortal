@@ -45,7 +45,7 @@ async function webm(read: FileReader, size: number): Promise<FileClassification 
   let iterations = 0;
   async function* children(start: number, end: number, streamRoot = false) {
     while (start < end) {
-      if (++iterations > 1024) throw new MalformedMedia();
+      if (++iterations > 50_000) throw new MalformedMedia();
       const head = await read(start, Math.min(12, end - start));
       const id = vint(head, 0, true);
       const length = id && vint(head, id.width, false);
@@ -71,8 +71,19 @@ async function webm(read: FileReader, size: number): Promise<FileClassification 
     } else if (header && !segment && root.id === 0x18538067) {
       segment = true;
       for await (const part of children(root.start, root.end, true)) {
-        if (part.id === 0x1f43b675) cluster ||= part.end > part.start;
-        if (part.id !== 0x1654ae6b) continue;
+        if (part.id === 0x1f43b675) {
+          const permitted = new Set([0xe7, 0x5854, 0xa7, 0xab, 0xa3, 0xa0, 0xec, 0xbf]);
+          for await (const entry of children(part.start, part.end)) {
+            if (!permitted.has(entry.id)) throw new MalformedMedia();
+            if (entry.id === 0xa3 || entry.id === 0xa0) cluster ||= entry.end - entry.start > 3;
+          }
+        }
+        if (part.id !== 0x1654ae6b) {
+          if (![0x114d9b74, 0x1549a966, 0x1f43b675, 0x1c53bb6b, 0x1254c367, 0xec, 0xbf].includes(part.id)) {
+            throw new MalformedMedia();
+          }
+          continue;
+        }
         if (cluster) throw new MalformedMedia();
         for await (const track of children(part.start, part.end)) {
           if (track.id !== 0xae) continue;
@@ -97,7 +108,7 @@ class MalformedMedia extends Error {}
 
 async function mp4(read: FileReader, size: number, head: Buffer): Promise<FileClassification | null> {
   let iterations = 0;
-  async function* boxes(start: number, end: number, top = false) {
+  async function* boxes(start: number, end: number) {
     while (start < end) {
       if (++iterations > 4096 || end - start < 8) throw new MalformedMedia();
       const header = await read(start, Math.min(16, end - start));
@@ -110,7 +121,7 @@ async function mp4(read: FileReader, size: number, head: Buffer): Promise<FileCl
         if (extended > BigInt(end - start)) throw new MalformedMedia();
         bytes = Number(extended);
         length = 16;
-      } else if (bytes === 0 && top && name === "mdat") bytes = end - start;
+      }
       if (bytes < length || bytes > end - start || !/^[\x20-\x7e]{4}$/u.test(name)) throw new MalformedMedia();
       yield { name, start: start + length, end: start + bytes };
       start += bytes;
@@ -122,8 +133,13 @@ async function mp4(read: FileReader, size: number, head: Buffer): Promise<FileCl
   let video = false;
   let media = false;
   let movie = false;
-  for await (const top of boxes(0, size, true)) {
+  let fileType = false;
+  for await (const top of boxes(0, size)) {
     if (!["ftyp", "moov", "mdat", "moof", "free", "skip", "wide", "sidx", "mfra", "styp", "prft", "emsg", "pdin"].includes(top.name)) return null;
+    if (top.name === "ftyp") {
+      if (fileType || top.start !== 8 || top.end - top.start < 8 || (top.end - top.start) % 4 !== 0) return null;
+      fileType = true;
+    }
     if (top.name === "mdat") media ||= top.end > top.start;
     if (top.name !== "moov") continue;
     if (movie) return null;
@@ -142,7 +158,7 @@ async function mp4(read: FileReader, size: number, head: Buffer): Promise<FileCl
       }
     }
   }
-  if (!media || !movie || (!audio && !video) || (brand === "M4A " && video)) return null;
+  if (!fileType || !media || !movie || (!audio && !video) || (brand === "M4A " && video)) return null;
   return video ? { extension: "mp4", mime: "video/mp4" } : { extension: "m4a", mime: "audio/mp4" };
 }
 
@@ -248,7 +264,10 @@ async function wav(read: FileReader, size: number, head: Buffer): Promise<boolea
 // These conservative PDF gates are not content disarm, a renderer, or a malware scanner.
 async function passivePdf(read: FileReader, size: number): Promise<boolean> {
   const tail = (await read(Math.max(0, size - 1024), Math.min(1024, size))).toString("latin1");
-  if (!/startxref\s+\d+\s+%%EOF[\x00\t\n\f\r ]*$/u.test(tail)) return false;
+  const trailer = /startxref\s+(\d{1,10})\s+%%EOF[\t\n\f\r ]*$/u.exec(tail);
+  if (!trailer) return false;
+  const xref = Number(trailer[1]);
+  if (xref < 8 || xref + 5 >= size || !/^xref[\r\n \t]$/u.test((await read(xref, 5)).toString("ascii"))) return false;
   let overlap = "";
   for (let offset = 0; offset < size;) {
     const bytes = await read(offset, Math.min(32768, size - offset));

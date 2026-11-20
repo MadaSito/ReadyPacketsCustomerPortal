@@ -61,6 +61,7 @@ export const fileAccessLog = mysqlTable("file_access_log", {
   filePublicId: char("file_public_id", { length: 26 }),
   userId: refColumn("user_id"),
   requestId: char("request_id", { length: 26 }),
+  traceId: char("trace_id", { length: 32 }),
   correlationId: varchar("correlation_id", { length: 64 }),
   outcome: mysqlEnum("outcome", ["attempted", "completed", "failed", "denied", "unknown"]).notNull(),
   reasonCode: varchar("reason_code", { length: 64 }),

@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -10,12 +10,15 @@ import type { Logger, ObjectStorage } from "../../core/types.js";
 
 const namespaces = ["files", "staging", "exports", "backups", "quarantine"] as const;
 const keyPattern = /^(files|staging|exports|backups|quarantine)\/([0-9a-f]{32})$/;
-const partialPattern = /^\.partial-[0-9a-f]{32}$/;
-const leafPattern = /^[0-9a-f]{32}$/;
+// Staging is also used by portable transfers. The reserved upload partition retains 120 random
+// bits and is issued only by this adapter's upload-specific generator, never from request data.
+const uploadPartition = "f1";
+const uploadOwnedLeaf = /^(?:\.partial-)?f1[0-9a-f]{30}$/u;
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 export interface LocalObjectStorage extends ObjectStorage {
+  newUploadKey(): string;
   checkRoot(): Promise<void>;
   sweepStaging(before: Date, signal?: AbortSignal): Promise<number>;
   inspect<T>(key: string, inspect: (read: (offset: number, length: number) => Promise<Buffer>, size: number) => Promise<T>): Promise<T>;
@@ -143,7 +146,12 @@ export function createObjectStorage({ config, logger }: { config: Pick<AppConfig
   return {
     newKey(name) {
       if (!namespaces.includes(name)) throw validation("INVALID_OBJECT_NAMESPACE", "The object namespace is invalid.");
-      return `${name}/${randomBytes(16).toString("hex")}`;
+      let leaf: string;
+      do { leaf = randomBytes(16).toString("hex"); } while (name === "staging" && leaf.startsWith(uploadPartition));
+      return `${name}/${leaf}`;
+    },
+    newUploadKey() {
+      return `staging/${uploadPartition}${randomBytes(15).toString("hex")}`;
     },
     async checkRoot() {
       const fd = await openRoot();
@@ -156,7 +164,7 @@ export function createObjectStorage({ config, logger }: { config: Pick<AppConfig
       return locked([key], async () => {
         const dir = await namespace(name);
         const target = fdPath(dir, leaf);
-        const partialName = `.partial-${randomBytes(16).toString("hex")}`;
+        const partialName = `.partial-${leaf}`;
         const temporary = fdPath(dir, partialName);
         let handle: FileHandle | undefined;
         let ownTemporary = false;
@@ -309,9 +317,10 @@ export function createObjectStorage({ config, logger }: { config: Pick<AppConfig
       const directory = await namespace("staging");
       let removed = 0;
       try {
-        for (const leaf of await readdir(fdPath(directory))) {
+        for await (const entry of await opendir(fdPath(directory))) {
           signal?.throwIfAborted();
-          if (!leafPattern.test(leaf) && !partialPattern.test(leaf)) continue;
+          const leaf = entry.name;
+          if (!entry.isFile() || !uploadOwnedLeaf.test(leaf)) continue;
           if (busyKeys.has(`staging/${leaf}`)) continue;
           const path = fdPath(directory, leaf);
           try {
@@ -327,6 +336,7 @@ export function createObjectStorage({ config, logger }: { config: Pick<AppConfig
           } catch (error) {
             if (!isErrno(error, "ENOENT")) logger.warn("Refused unsafe staging cleanup entry");
           }
+          if (removed >= 1000) break;
         }
         if (removed) await directory.sync();
         return removed;

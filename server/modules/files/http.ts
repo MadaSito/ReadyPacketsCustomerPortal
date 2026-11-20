@@ -1,9 +1,200 @@
-/**
- * Files module — raw HTTP routes (uploads, downloads, signed webhooks). Owner: files module engineer.
- * Leave empty if the module needs none. Routes mount under /api/files/… AFTER session resolution and
- * CSRF/origin enforcement, except routes registered through `registerRawRoutes` (signed webhooks only).
- */
-import type { Router } from "express";
+import busboy from "busboy";
+import type { Request, Router } from "express";
+import { Readable, Transform } from "node:stream";
+import { finished } from "node:stream/promises";
+import { z } from "zod";
 import type { Services } from "../../container.js";
+import { DomainError, validation } from "../../core/errors.js";
+import { ULID_PATTERN } from "../../core/ids.js";
+import { sendPrivateDownload } from "../../http/downloads.js";
+import { getHttpState, requireFullSession } from "../../http/requestState.js";
+import type { StagedUpload, UploadAuthorization } from "./index.js";
+import { fileCategories, fileVisibilities } from "./schema.js";
 
-export function registerFilesHttpRoutes(_router: Router, _services: Services): void {}
+const options = z.strictObject({
+  category: z.enum(fileCategories).default("supporting"),
+  visibility: z.enum(fileVisibilities).default("customer_visible"),
+  versionOf: z.string().length(26).regex(ULID_PATTERN).optional(),
+});
+const downloadBody = z.strictObject({ ticket: z.string().length(43).regex(/^[a-zA-Z0-9_-]{43}$/) });
+const multipartInvalid = () => validation("INVALID_MULTIPART", "Send one or more files using the multipart file fields.");
+const requestTooLarge = () => validation("UPLOAD_REQUEST_TOO_LARGE", "The upload request exceeds the allowed size.");
+const countExceeded = () => validation("TOO_MANY_FILES", "This upload contains too many files.");
+const fileTooLarge = () => validation("FILE_TOO_LARGE", "The file exceeds the allowed size.");
+
+type Candidate = { staged: StagedUpload } | { error: unknown };
+
+async function readMultipart(req: Request, services: Services, plan: UploadAuthorization): Promise<Candidate[]> {
+  const type = req.get("content-type");
+  if (!type || !/^multipart\/form-data(?:;|$)/iu.test(type)) throw multipartInvalid();
+  const length = req.get("content-length");
+  if (length && (!/^\d{1,15}$/u.test(length) || Number(length) > plan.rules.maxRequestBytes)) throw requestTooLarge();
+  const requestedFiles = plan.versionOf ? 1 : plan.rules.maxFiles;
+  let parser: ReturnType<typeof busboy>;
+  try {
+    parser = busboy({
+      headers: req.headers,
+      preservePath: false,
+      defParamCharset: "utf8",
+      limits: { files: requestedFiles, fields: 0, parts: requestedFiles + 1, fileSize: plan.rules.maxFileBytes + 1, headerPairs: 32 },
+    });
+  } catch {
+    throw multipartInvalid();
+  }
+
+  const files: Promise<Candidate>[] = [];
+  const active = new Set<Readable>();
+  let envelopeError: DomainError | undefined;
+  let total = 0;
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      total += chunk.length;
+      if (total > plan.rules.maxRequestBytes) return done(requestTooLarge());
+      done(null, chunk);
+    },
+  });
+
+  const fail = (error: DomainError) => {
+    envelopeError ??= error;
+    req.unpipe(meter);
+    meter.unpipe(parser);
+    // Do not destroy req's socket here: the outer pipeline may still return a safe error.
+    if (!req.destroyed) req.resume();
+    for (const stream of active) stream.destroy(error);
+    meter.destroy();
+    if (!parser.destroyed) parser.destroy(error);
+  };
+  const aborted = () => fail(validation("UPLOAD_INTERRUPTED", "The upload did not finish."));
+  req.once("aborted", aborted);
+  req.once("error", aborted);
+  meter.on("error", (error: unknown) => fail(error instanceof DomainError ? error : multipartInvalid()));
+  parser.on("error", (error: unknown) => fail(error instanceof DomainError ? error : multipartInvalid()));
+  parser.once("filesLimit", () => fail(countExceeded()));
+  parser.once("fieldsLimit", () => fail(multipartInvalid()));
+  parser.once("partsLimit", () => fail(countExceeded()));
+  parser.on("file", (name, stream, info) => {
+    if (envelopeError) {
+      stream.on("error", () => {});
+      stream.resume();
+      return;
+    }
+    active.add(stream);
+    // Close and parser failures can arrive before async staging attaches the stream iterator.
+    stream.on("error", () => {});
+    const candidate = (async (): Promise<Candidate> => {
+      try {
+        if (name !== "files" || !info.filename ||
+            !["7bit", "8bit", "binary"].includes(info.encoding.toLowerCase())) {
+          fail(multipartInvalid());
+          return { error: multipartInvalid() };
+        }
+        // A per-file staging refusal must not destroy Busboy's stream: the multipart parser waits
+        // for its end event, including when skipping the rest of an over-limit part.
+        const input = Readable.from(stream.iterator({ destroyOnReturn: false }), { objectMode: false });
+        const staged = await services.files.stageUpload(info.filename, input, plan.rules);
+        if (stream.truncated) {
+          await services.files.cleanUpload(staged);
+          return { error: fileTooLarge() };
+        }
+        return { staged };
+      } catch (error) {
+        if (!stream.destroyed) stream.resume();
+        return { error: stream.truncated ? fileTooLarge() : error };
+      } finally {
+        active.delete(stream);
+      }
+    })();
+    files.push(candidate);
+  });
+
+  try {
+    const fullyParsed = finished(parser, { cleanup: true });
+    req.pipe(meter).pipe(parser);
+    await fullyParsed.catch(() => { envelopeError ??= multipartInvalid(); });
+    const candidates = await Promise.all(files);
+    if (envelopeError || candidates.length === 0) {
+      await Promise.all(candidates.flatMap((candidate) => "staged" in candidate ? [services.files.cleanUpload(candidate.staged)] : []));
+      throw envelopeError ?? multipartInvalid();
+    }
+    return candidates;
+  } finally {
+    req.off("aborted", aborted);
+    req.off("error", aborted);
+  }
+}
+
+export function registerFilesHttpRoutes(router: Router, services: Services): void {
+  router.post("/upload/:orderId", async (req, res) => {
+    const principal = requireFullSession(req);
+    const orderId = req.params.orderId;
+    const query = options.safeParse(req.query);
+    if (!orderId || orderId.length !== 26 || !ULID_PATTERN.test(orderId) || !query.success) throw multipartInvalid();
+    const plan = await services.files.beginUpload(principal, orderId, query.data);
+    let candidates: Candidate[];
+    try {
+      candidates = await readMultipart(req, services, plan);
+    } catch (error) {
+      if (error instanceof DomainError) {
+        if (error.reasonCode === "UPLOAD_REQUEST_TOO_LARGE" && req.httpVersionMajor === 1) res.set("Connection", "close");
+        await services.files.rejectUpload(principal, orderId, error.reasonCode);
+      }
+      throw error;
+    }
+    try {
+      const results = [];
+      for (const [index, candidate] of candidates.entries()) {
+        try {
+          if ("error" in candidate) throw candidate.error;
+          if (req.aborted || res.destroyed) throw validation("UPLOAD_INTERRUPTED", "The upload did not finish.");
+          results.push({ index, outcome: "completed", file: await services.files.commitUpload(principal, plan, candidate.staged) });
+        } catch (error) {
+          if (error instanceof DomainError && error.code === "AUDIT_UNAVAILABLE") throw error;
+          if (error instanceof DomainError && (["NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED", "LOCKED", "CONFLICT", "VALIDATION", "REMEDIATION_REQUIRED"].includes(error.code)
+              || error.reasonCode === "FILE_SCANNER_UNAVAILABLE")) {
+            await services.files.rejectUpload(principal, orderId, error.reasonCode);
+            results.push({ index, outcome: "refused", reason: error.reasonCode, message: error.safeMessage });
+          } else {
+            await services.files.rejectUpload(principal, orderId, "FILE_UPLOAD_UNCONFIRMED");
+            results.push({ index, outcome: "unknown", reason: "FILE_UPLOAD_UNCONFIRMED", message: "The upload could not be confirmed. Reload the file list before retrying." });
+          }
+        }
+      }
+      res.set("Cache-Control", "no-store").json({ results });
+    } finally {
+      await Promise.all(candidates.flatMap((candidate) => "staged" in candidate ? [services.files.cleanUpload(candidate.staged)] : []));
+    }
+  });
+
+  router.post("/download", async (req, res) => {
+    let principal;
+    try {
+      principal = requireFullSession(req);
+    } catch (error) {
+      if (error instanceof DomainError) await services.files.recordDownloadDenied(getHttpState(req).session, error.reasonCode);
+      throw error;
+    }
+    const body = downloadBody.safeParse(req.body);
+    if (!body.success) {
+      await services.files.recordDownloadDenied(principal, "DOWNLOAD_TICKET_INVALID");
+      throw validation("DOWNLOAD_TICKET_INVALID", "The download request is invalid.");
+    }
+    const { file, stream } = await services.files.redeemDownloadTicket(principal, body.data.ticket);
+    let outcome: "completed" | "failed" | "unknown" = "unknown";
+    try {
+      await sendPrivateDownload(res, { stream, filename: file.displayName, contentType: file.contentType, size: file.size });
+      if (res.writableFinished) outcome = "completed";
+    } catch (error) {
+      if (!res.headersSent && !res.destroyed) {
+        outcome = "failed";
+        throw error;
+      }
+      res.destroy();
+    } finally {
+      stream.destroy();
+      // A result audit cannot retroactively recall bytes written. The durable pre-send attempted row
+      // remains true because we deliberately do not call it completed until the stream finishes.
+      await services.files.recordDownloadResult(principal, file.publicId, outcome)
+        .catch(() => services.logger.error("Private download outcome could not be recorded"));
+    }
+  });
+}

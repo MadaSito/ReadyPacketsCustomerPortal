@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { defineSetting } from "../platform/index.js";
+import { defineSetting } from "../platform/settingsRegistry.js";
 import { allowedExtensions } from "./classification.js";
 
 export const hardMaxFileBytes = 100 * 1024 * 1024;
