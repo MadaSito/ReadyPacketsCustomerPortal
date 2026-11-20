@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-20 (end of session 01). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-20 (end of session 01, after increment 02). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -25,7 +25,9 @@ listed under "Verified" has not been proven and must not be described as working
 | Integrations | PostHog and Microsoft Clarity (configurable project id, consent-gated, off by default); Stripe, SAML and SharePoint are disabled scaffolds | `server/modules/integrations`, `client/src/features/integrations` |
 | UI | design system on the brand kit, light/dark/system themes, customer shell with mobile tab bar, console shell, installable PWA shell with offline page | `client/src/{ui,app,styles}`, `client/public` |
 | Deployment | one installer for a VPS (nginx + systemd), upgrade and uninstall scripts, optional Docker profile, CI and security workflows | `deploy/`, `.github/workflows` |
-| Documentation | 21 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
+| Offerings catalog (increment 02) | Master Offerings Matrix v3.0 as owner-controlled data (`data/catalog/readypackets-offerings-v3.0.json`, 18 products = Packets 1–6 × Basic / Standard / Premium, 112 deliverables), audited `ops:catalog-import`, one tier per packet, server-quoted totals, bundle rule (15% when all six packets are in one order), packet picker in the order wizard, tier / outcome / timeline / deliverables on orders | `data/catalog`, `scripts/ops/catalog*`, `server/modules/orders`, `client/src/features/orders` |
+| Production pipeline (increment 02) | manual Phase I (P101) and Phase II (P201) webhook triggers from the console order page, exact field set of the reference documents, encrypted outbox with fenced retries and reconciliation, destination pinning, pre-send order revalidation, admin settings behind step-up, dispatch list; disabled until configured | `server/modules/integrations/production`, `client/src/features/integrations/production`, `docs/integrations/PRODUCTION_WEBHOOKS.md` |
+| Documentation | 23 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
 
@@ -50,7 +52,43 @@ In a real browser against the preview build with synthetic data:
 - audit trail after a clean seed and a QA pass contains no routine scheduler noise and no anonymous
   session-probe refusals
 
+## Verified for increment 02 (integrator's own runs)
+
+Automated, whole project, at commit `888e7eb` (commit `949d00c` afterwards changed two UI files; for it the
+type check, the lint of the touched folders and the two touched test files were rerun, not the full suite):
+
+- type check clean; ESLint clean
+- full test run: 86 files, 1056 tests passed, 5 placeholders (`todo`), no failures
+- migrations test 4 of 4, including an upgrade of a baseline database that already holds orders and catalog
+  rows (existing orders get subtotal = total, no discount; existing rows get an empty deliverables list);
+  the same upgrade was also run once against the preview database holding session-01 data; the schema
+  generator reports no drift after `migrations/0001_offerings_and_production_dispatch.sql`
+- preview build succeeds; a clean database was migrated and seeded with the offerings file
+
+In a real browser against the preview build with synthetic data:
+
+- customer: packet picker at 1440 px and 320 px (six packets, one radio group each, arrow keys change the
+  tier, deliverables disclosure, no horizontal overflow), server-quoted summary, "add all six for 15% off"
+  hint, all six packets → subtotal $7,740.00, bundle −$1,161.00, total $6,579.00 on the review step and on
+  the placed order; order detail shows tier, timeline, outcome and deliverables; customers have no
+  "Production" tab
+- administrator: catalog page with packet groups, tiers, deliverable counts and the bundle rule; production
+  pipeline page (settings save requires step-up; dispatch list); console order "Production" tab with the
+  P101 preview — one packet → `packet "1"`, `tier "Premium"`; two packets → `packet "7"`, `tier "Mixed"`
+  and a `bundle_scope_manifest` string listing each packet; all six → `"7"` / `"Mixed"` with six entries;
+  "Start Phase I" stays disabled while the endpoints are not configured
+- staff: see the "Production" tab with client name and email masked in the preview; the production
+  settings page is "Page not found" for staff
+
+Reviewed by a second engineer (not the author): production webhooks, findings PW-01 to PW-08, all closed
+(`docs/security/REVIEW-production-webhooks.md`).
+
 ## Not verified
+
+- production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to any real
+  receiver; TLS to the real host, receiver-side de-duplication across retries, and a full
+  P101 → artifacts → P201 run are untested. Keep the pipeline disabled until an operator has tested it
+  with a synthetic order.
 
 - installation on a real host with `deploy/install.sh`, nginx, TLS certificates and systemd
 - outbound mail through a real SMTP server (mail is held in the outbox until configured)
@@ -65,6 +103,13 @@ In a real browser against the preview build with synthetic data:
 
 ## Outstanding and known limits
 
+- Increment 02 decisions the owner should confirm: Packet 8 is not loaded or offered; the 15% bundle
+  discount applies only when all six packets are in one order; `order_scope_mode` is never sent (per the
+  corrected P101 document); P101 / P201 are started by staff by hand and there is no callback from the
+  pipeline; `customer_id` is the customer's portal reference and `order_id` is the order reference at the
+  time P101 is sent (the reference documents show a different identifier format in their examples).
+- The packet summary shows no figures when an order contains only non-packet catalog items.
+
 - Five tests are placeholders (`todo`): passkey cross-user isolation fixture, policy acceptance cross-order
   fixture, and three admin journeys through the fully assembled app (SIEM, backup/integrations, audit
   center UI). The underlying module behaviour has its own tests.
@@ -78,7 +123,8 @@ In a real browser against the preview build with synthetic data:
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).
-- GitHub: see the session log for whether the repository was pushed in this session.
+- GitHub: not pushed yet (connection not authorised during session 01). History is local commits plus a copy
+  in the project files; the CI and security workflows have never run.
 
 ## How to continue
 
