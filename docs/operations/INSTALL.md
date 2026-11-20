@@ -47,11 +47,51 @@ sudo bash deploy/install.sh <REVIEWED_FULL_COMMIT_SHA>
 The installer prompts for three MySQL connection URLs and for the initial administrator. Enter a percent-encoded username/password, not a shell-escaped password; database secrets are not placed on the command line. Use `mysql://ACCOUNT:ENCODED_PASSWORD@127.0.0.1:3306/SCHEMA?tls=required&tlsCaFile=/absolute/path/to/mysql-ca.pem` for all three credentials by default. Omit `tlsCaFile` only if both the Node driver and native MySQL clients trust the issuer. Install and upgrade validate all saved credential files as well as newly entered URLs. A documented, approved backup exception may omit TLS only with a parsed host of `127.0.0.1`, `[::1]`, or `localhost` (keep `localhost` mapped exclusively to loopback); the shipped SQL template still requires SSL. Unix socket DSNs are not accepted because the shared database URL format does not support them. Do not weaken runtime or migrator TLS. Verify the transport policy works against the exact release before customer data is admitted.
 
 - **Paths and services**: Before building, root generates any initial encryption and signing keys with the host OpenSSL, directly under the root-owned `0700` secrets directory. `readypackets-build` builds without credentials in transient systemd units, with the secrets directory inaccessible. Promotion copies validated regular files and directories (not links) into a separate root-owned staging tree, takes the final package manifest and migration files directly from the reviewed Git commit, and publishes by atomic rename under `/opt/readypackets/releases/`. The Nginx edge serves via the application, not this tree. Each base unit requires the unprivileged `readypackets` identity; the installed drop-in supplies additional sandboxing. `/etc/readypackets/portal.env` and source credential files are root-owned `0600`; systemd supplies `*_FILE` values via `LoadCredential`. Never source the environment file or put URL/key values in it. `MemoryDenyWriteExecute` is not enabled because it would prevent the Node/V8 JIT from running.
-- **Production commands**: The release prunes dev dependencies. Migration, administrator bootstrap, backup, restore and key tools use plain Node with the compiled `dist/ops/*.js` entry points; do not depend on `tsx` or the repository source tree in production. The demo seed is not included in the installed release.
+- **Production commands**: The release prunes dev dependencies. Migration, administrator bootstrap, offerings catalog import, backup, restore and key tools use plain Node with the compiled `dist/ops/*.js` entry points; do not depend on `tsx` or the repository source tree in production. The demo seed is not included in the installed release.
 - **Repeated install**: Rerunning with the same SHA preserves keys, installation ID, prior admin marker, database, and uploads. It will not switch to another release. If bootstrap was skipped, rerun this installer to create the first admin. If bootstrap was interrupted after submission, first check whether the account exists; a successful creation must not be retried blindly. If a cleanly recreated site used a different certificate setup, reconcile the root-owned TLS snippet before reloading Nginx.
 - **Existing installations**: If an earlier installer generated production keys under the build account, review the historical custody before reuse and plan any rotation using the key runbook and retained decrypt keys. The new installer does not overwrite existing key material.
 - **Enable MFA**: Use `https://my.readypackets.com` to sign in with the temporary password. Change it and enroll an authenticator, then store recovery codes offline. Verify a fresh MFA step-up for sensitive operations. Provision a second named, secured admin using the portal before relying on production self-service. Leave external authentication disabled until its trust and recovery procedures have been tested.
 - **SMTP**: Configure the approved SMTP host in integration egress policy and the admin console with authenticated TLS (implicit TLS or required STARTTLS as supported). Enter credentials through the console rather than in unit files or Git. Test delivery to an approved inbox and confirm sender authentication, expiry, and redacted delivery status. Never enable local mail capture in production.
+
+### Load the offerings catalog (optional)
+
+`install.sh` does not populate product catalog rows automatically. After schema migrations and first-administrator creation have completed, an operator may load the shipped ReadyPackets offerings matrix (`/opt/readypackets/current/data/catalog/readypackets-offerings-v3.0.json`, validated against `data/catalog/offerings.schema.json`) using `dist/ops/catalog-import.js` as the audited system actor `ops.catalog_import`.
+
+Run `--dry-run` first to validate the offerings file and execute the import inside a rolled-back transaction before applying it:
+
+```bash
+run_catalog_import() {
+  sudo systemd-run --wait --collect --pipe --service-type=exec \
+    --property=User=readypackets --property=Group=readypackets --property=UMask=0077 \
+    --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
+    --property=PrivateTmp=yes --property=PrivateDevices=yes --property=CapabilityBoundingSet= \
+    --property=ReadWritePaths=/var/lib/readypackets/storage \
+    --property=EnvironmentFile=/etc/readypackets/portal.env \
+    --property=EnvironmentFile=/opt/readypackets/current/release.env \
+    --property=LoadCredential=database_url:/etc/readypackets/secrets/database_url \
+    --property=LoadCredential=rp_data_keyring:/etc/readypackets/secrets/rp_data_keyring \
+    --property=LoadCredential=rp_index_key:/etc/readypackets/secrets/rp_index_key \
+    --property=LoadCredential=rp_pseudonym_key:/etc/readypackets/secrets/rp_pseudonym_key \
+    --property=LoadCredential=rp_token_hash_key:/etc/readypackets/secrets/rp_token_hash_key \
+    --property=LoadCredential=rp_audit_chain_key:/etc/readypackets/secrets/rp_audit_chain_key \
+    --working-directory=/opt/readypackets/current --setenv=RP_ROLE=web \
+    /bin/bash -c '
+      export DATABASE_URL_FILE="$CREDENTIALS_DIRECTORY/database_url"
+      export RP_DATA_KEYRING_FILE="$CREDENTIALS_DIRECTORY/rp_data_keyring"
+      export RP_INDEX_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_index_key"
+      export RP_PSEUDONYM_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_pseudonym_key"
+      export RP_TOKEN_HASH_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_token_hash_key"
+      export RP_AUDIT_CHAIN_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_audit_chain_key"
+      exec /usr/local/bin/node dist/ops/catalog-import.js "$@"
+    ' bash "$@"
+}
+
+run_catalog_import --dry-run
+run_catalog_import
+```
+
+- **Default vs custom file**: With no `--file` flag, `dist/ops/catalog-import.js` resolves `<release>/data/catalog/readypackets-offerings-v3.0.json` from the promoted release tree. When `--file <path>` is passed, relative paths resolve against the working directory (`/opt/readypackets/current`); place custom offerings JSON files outside `/home` and `/root` (for example, a root-owned `0644` file under `/opt/readypackets/`) because `ProtectHome=yes` makes home directories inaccessible to `readypackets`.
+- **Idempotency and exit codes**: The command matches groups and products by `groupKey` / `productKey`, writes a new product version only when content changes, updates `orders.bundle_rule`, and never deletes or deactivates existing catalog items. Exit codes: `0` imported or dry-run ok, `1` failed, `64` usage, `65` invalid offerings file, `66` file not readable, `78` configuration.
 
 ## Backups and audit forwarding
 

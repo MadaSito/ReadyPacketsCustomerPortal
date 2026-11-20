@@ -4,11 +4,13 @@ import path from "node:path";
 
 const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK, O_DIRECTORY, O_CREAT, O_EXCL, O_WRONLY } = fs.constants;
 const read = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
-const trees = ["dist", "migrations", "node_modules"];
+const trees = ["dist", "migrations", "node_modules", "data/catalog"];
 const required = [
   "package.json", "dist/server/main.js", "dist/public/index.html", "migrations/meta/_journal.json",
-  "dist/ops/migrate.js", "dist/ops/create-admin.js", "dist/ops/run-backup.js", "dist/ops/verify-backup.js",
+  "dist/ops/migrate.js", "dist/ops/create-admin.js", "dist/ops/catalog-import.js",
+  "dist/ops/run-backup.js", "dist/ops/verify-backup.js",
   "dist/ops/restore-isolated.js", "dist/ops/generate-keys.js", "dist/ops/keys-doctor.js",
+  "data/catalog/readypackets-offerings-v3.0.json", "data/catalog/offerings.schema.json",
 ];
 const fdPath = (fd, name) => `/proc/self/fd/${fd}/${name}`;
 
@@ -32,6 +34,7 @@ function visit(source, uid, dest, promoted = false) {
         // Package-manager command shims are not needed at runtime.
         if (!promoted && dest && name === ".bin" && dest.includes("/node_modules")) continue;
         if (dest?.endsWith("/dist/ops") && /^seed-demo\.js(?:\.map)?$/.test(name)) continue;
+        if (!promoted && dest?.endsWith("/data") && name !== "catalog") continue;
         visit(fdPath(fd, name), uid, dest ? path.join(dest, name) : undefined, promoted);
       }
     } else if (dest) {
@@ -90,7 +93,7 @@ try {
         (target.mode & 0o777) !== 0o700 || fs.readdirSync(second).length) {
       throw new Error("expected a fresh root-only publication directory");
     }
-    importEntries(first, second, Number(buildUid), ["dist", "node_modules"]);
+    importEntries(first, second, Number(buildUid), ["dist", "node_modules", "data"]);
     importEntries(reviewed, second, 0, ["migrations", "package.json"]);
     fs.writeFileSync(path.join(second, "release.env"), `RP_RELEASE_REF=${commit}\n`, { flag: "wx", mode: 0o644 });
     validateRelease(second, commit);
