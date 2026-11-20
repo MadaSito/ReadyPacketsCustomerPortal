@@ -11,7 +11,7 @@ describe("database URL handling", () => {
 
   it("requires certificate verification when TLS is requested", () => {
     const o = connectionOptionsFromUrl("mysql://app:x@db/portal?tls=required");
-    expect(o.ssl).toMatchObject({ rejectUnauthorized: true, minVersion: "TLSv1.2" });
+    expect(o.ssl).toMatchObject({ rejectUnauthorized: true, verifyIdentity: true, minVersion: "TLSv1.2" });
   });
 
   it.each([

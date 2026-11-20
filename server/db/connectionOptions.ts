@@ -66,7 +66,9 @@ export function connectionOptionsFromUrl(url: string): ConnectionOptions {
         throw new DatabaseUrlError("The database TLS CA file could not be read.");
       }
     }
-    options.ssl = { rejectUnauthorized: true, minVersion: "TLSv1.2", ...(ca ? { ca } : {}) };
+    // mysql2 skips server-name verification unless `verifyIdentity` is set, so a certificate issued by a
+    // trusted CA for a different host would otherwise be accepted.
+    options.ssl = { rejectUnauthorized: true, verifyIdentity: true, minVersion: "TLSv1.2", ...(ca ? { ca } : {}) };
   }
   return options;
 }
