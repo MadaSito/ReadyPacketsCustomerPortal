@@ -70,6 +70,27 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: MySQL 8.4 client tools (the backup module calls mysqldump / mysql 8.4; the runner ships 8.0)
+        # docs/operations/INSTALL.md requires the Oracle MySQL 8.4 tools matching the server. The repository
+        # signing key is downloaded to a file and its fingerprint is checked before apt may trust it.
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          MYSQL_APT_KEY_FPR: BCA43417C3B485DD128EC6D4B7B3B788A8D3785C
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/mysql.asc" https://repo.mysql.com/RPM-GPG-KEY-mysql-2025
+          got="$(gpg --show-keys --with-colons "$RUNNER_TEMP/mysql.asc" | awk -F: '$1=="fpr"{print $10; exit}')"
+          test "$got" = "$MYSQL_APT_KEY_FPR" || { echo "unexpected MySQL repository key fingerprint: $got"; exit 1; }
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/mysql.gpg "$RUNNER_TEMP/mysql.asc"
+          echo "deb [signed-by=/etc/apt/keyrings/mysql.gpg] https://repo.mysql.com/apt/ubuntu noble mysql-8.4-lts" \
+            | sudo tee /etc/apt/sources.list.d/mysql-8.4-lts.list >/dev/null
+          sudo systemctl stop mysql 2>/dev/null || true
+          sudo apt-get remove -y --purge 'mysql-server*' 'mysql-client*' >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends mysql-community-client
+          mysqldump --version
+          mysqldump --version | grep -Eq 'Ver 8\.4\.' || { echo "mysqldump is not 8.4"; exit 1; }
       - name: Server, shared, scripts, portable and integration tests (node)
         run: pnpm test:server
       - name: Client component tests (jsdom)

@@ -1,0 +1,26 @@
+# gitleaks baseline: findings reviewed one by one on 2026-11-20 and confirmed to be synthetic test fixtures
+# or prose (fake PostHog / Stripe test-style keys, hand-made JWTs with the payload "synthetic", idempotency
+# keys, algorithm names in documentation). None is a credential. Each line is one exact fingerprint
+# (commit:file:rule:line), so any NEW finding still fails the security workflow. Do not add a line here
+# without reviewing the finding; never add a real secret - rotate it and remove it from history instead.
+71b9153e40505ff3e592aa72c365d04ebda76ebf:client/src/features/auth/legal.test.tsx:generic-api-key:127
+71b9153e40505ff3e592aa72c365d04ebda76ebf:client/src/features/auth/legal.test.tsx:generic-api-key:95
+a529a0252473d24ca6d5e22808849e9938ee9336:client/src/features/integrations/admin/integrationsAdmin.test.tsx:generic-api-key:209
+988d61536440047fa9df383f754c92dba6451042:portable/API.md:generic-api-key:100
+4a440d381edc49c0d20539a27036676a6a311c32:portable/API.md:generic-api-key:112
+8dda0eda254228fc86c120c1fdb38beb6121fc98:portable/tests/archive-exclusions.test.ts:jwt:164
+9f0d2e2caeb42ef42c6bd6b6f1992e2a53df0399:server/modules/audit/emitter.test.ts:generic-api-key:113
+a94da54426540af71d01c305ab2d556e51e07cb2:server/modules/audit/emitter.test.ts:jwt:83
+e400060876c5b796877a07495c10d7c6a59fe3d7:server/modules/compliance/compliance.test.ts:generic-api-key:812
+896c74cc4d62f08eeb307409fa190e4ea2ff8de2:server/modules/integrations/integrations.test.ts:generic-api-key:729
+896c74cc4d62f08eeb307409fa190e4ea2ff8de2:server/modules/integrations/integrations.test.ts:generic-api-key:755
+896c74cc4d62f08eeb307409fa190e4ea2ff8de2:server/modules/integrations/integrations.test.ts:generic-api-key:770
+896c74cc4d62f08eeb307409fa190e4ea2ff8de2:server/modules/integrations/integrations.test.ts:stripe-access-token:730
+208f124cf43841839f2c8e18c88480b127ecc972:server/modules/platform/configTransfer.example.test.ts:generic-api-key:52
+208f124cf43841839f2c8e18c88480b127ecc972:server/modules/platform/configTransfer.example.test.ts:generic-api-key:53
+3b43736e33afaf9710759167bab0f67525bd2236:server/modules/platform/settingsStore.example.test.ts:generic-api-key:124
+3b43736e33afaf9710759167bab0f67525bd2236:server/modules/platform/settingsStore.example.test.ts:generic-api-key:143
+7c319dbcc5a24debf696a0d8e4e13cce0fdfaeb6:tests/integration/isolation.test.ts:generic-api-key:115
+7c319dbcc5a24debf696a0d8e4e13cce0fdfaeb6:tests/integration/isolation.test.ts:generic-api-key:120
+7c319dbcc5a24debf696a0d8e4e13cce0fdfaeb6:tests/integration/isolation.test.ts:generic-api-key:198
+4754829aeb6b32db6a1c60f8eeeab7f54290823d:tests/integration/journey-integrations.test.ts:generic-api-key:14
