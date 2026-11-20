@@ -1,7 +1,7 @@
 # Compliance module — Policies, Intake & Billing Evidence API (v1)
 
-Owner: `compliance_engineer`.
-Paths: `server/modules/compliance/**`, `client/src/features/compliance/**`.
+Owner: `compliance_engineer` (`server/modules/compliance/**`, `client/src/features/compliance/routes.tsx`, `client/src/features/compliance/shared.tsx`).
+UI split: `files_engineer` owns `client/src/features/compliance/customer/**`; `orders_engineer` owns `client/src/features/compliance/admin/**`.
 Import types from `server/modules/compliance/index.ts`; reach the instance at call time via `deps.services.compliance`.
 
 ## 1. Cross-module service interface (`ComplianceModule`)
@@ -11,13 +11,14 @@ All public identifiers exposed across module/API boundaries are 26-char ULIDs (`
 ```ts
 export type PolicyAudience = "all" | "customer" | "staff";
 export type PolicyContentFormat = "plain_text" | "safe_markdown";
-export type PolicyAcceptanceMethod = "portal_checkbox" | "registration" | "typed_signature" | "imported_history";
+export type PolicyAcceptanceMethod = "portal_checkbox" | "registration" | "typed_signature" | "imported_historical";
 
-export interface RequiredPolicySummary {
+export interface PublishedPolicyView {
   documentPublicId: string;
   slug: string;
   title: string;
   audience: PolicyAudience;
+  requiresAcceptance: boolean;
   requiresTypedSignature: boolean;
   versionPublicId: string;
   versionNumber: number;
@@ -25,8 +26,9 @@ export interface RequiredPolicySummary {
   contentFormat: PolicyContentFormat;
   bodyText: string;
   contentHash: string; // SHA-256 hex of NFC + LF-normalized bodyText
+  changeSummary: string | null;
   effectiveAt: Date;
-  publishedAt: Date;
+  publishedAt: Date | null;
 }
 
 export type InvoiceStatus = "draft" | "issued" | "paid" | "void";
@@ -38,86 +40,74 @@ export type PaymentMethod =
   | "card_manual"
   | "waiver"
   | "provider_online"
+  | "imported_historical"
   | "other";
 
-export interface ProviderPaymentInput {
-  /** e.g. "stripe" */
+export interface RecordProviderPaymentInput {
   provider: string;
-  /** Stable provider event ID (idempotency key, e.g. Stripe evt_...). */
   providerEventId: string;
-  /** Provider payment/charge or refund reference (non-secret, e.g. pi_..., ch_..., re_...). */
-  providerReference: string;
-  /** Target invoice publicId. */
-  invoicePublicId: string;
-  /** Positive integer minor units. */
+  providerPaymentId?: string;
+  providerReference?: string;
+  invoicePublicId?: string;
+  orderPublicId?: string;
+  kind?: "succeeded" | "failed" | "refunded" | "payment" | "refund";
   amountMinor: number;
-  /** 3-letter ISO 4217 currency code; must match invoice currency. */
   currency: string;
-  /** Defaults to "payment"; pass "refund" for confirmed provider refund webhooks. */
-  kind?: "payment" | "refund";
+  reasonCode?: string;
+  reason?: string;
+  occurredAt?: Date;
   receivedAt?: Date;
   refundedAt?: Date;
-  reason?: string;
-  paymentProviderReference?: string;
   tx?: Tx;
 }
 
-export interface ProviderPaymentResult {
-  evidencePublicId: string;
-  paymentPublicId?: string;
-  refundPublicId?: string;
-  invoicePublicId: string;
-  invoiceStatus: InvoiceStatus;
+export interface RecordProviderPaymentResult {
+  applied: boolean;
   duplicate: boolean;
-}
-
-export interface PortableComplianceEvidenceBatch {
-  policyVersions: PortablePolicyVersionRecord[];
-  policyAcceptances: PortablePolicyAcceptanceRecord[];
-  intakeDefinitions: PortableIntakeDefinitionRecord[];
-  intakeSubmissions: PortableIntakeSubmissionRecord[];
-  invoices: PortableInvoiceRecord[];
-  payments: PortablePaymentRecord[];
-  refunds: PortableRefundRecord[];
-  nextAfter: string | null;
+  reasonCode?: string;
+  recordPublicId?: string;
+  invoicePublicId?: string;
+  invoiceStatus?: InvoiceStatus;
 }
 
 export interface ComplianceModule extends ModuleLifecycle {
   /**
    * Returns published, effective, required policy versions that `userId` has NOT yet accepted on this installation.
    * Empty array means all required policies are accepted.
-   * Called by `orders` before order creation and surfaced on the customer dashboard.
    */
-  requiredAcceptancesFor(userId: number, opts?: { audience?: "customer" | "staff"; tx?: DbOrTx }): Promise<RequiredPolicySummary[]>;
+  requiredAcceptancesFor(userId: number, opts?: { audience?: "customer" | "staff" | "admin"; tx?: DbOrTx }): Promise<PublishedPolicyView[]>;
 
   /**
    * Convenience gate for order creation: throws DomainError("CONFLICT", "POLICY_ACCEPTANCE_REQUIRED", ...)
    * with `{ pendingCount, slugs }` if `requiredAcceptancesFor(userId)` is non-empty.
    */
-  assertRequiredPoliciesAccepted(userId: number, opts?: { audience?: "customer" | "staff"; tx?: DbOrTx }): Promise<void>;
+  assertRequiredPoliciesAccepted(userId: number, opts?: { audience?: "customer" | "staff" | "admin"; tx?: DbOrTx }): Promise<void>;
 
   /**
    * Records policy acceptances captured during account registration (inside identity's registration tx if needed).
-   * Verifies each version is currently published and matches `contentHash`.
+   * Verifies each version is currently published, effective, audience-eligible, and matches `contentHash`.
    */
   recordRegistrationAcceptances(
     input: {
       userId: number;
+      actorRole?: "customer" | "staff" | "admin";
       items: readonly { versionPublicId: string; contentHash: string; signerName?: string }[];
     },
     opts?: { tx?: Tx },
   ): Promise<{ recorded: number }>;
 
   /**
-   * Narrow idempotent hook for `integrations_engineer` (e.g. verified Stripe webhook) to record confirmed online payment evidence.
-   * Idempotent on `(provider, providerEventId)`. Never trusts status flags; re-derives invoice status from payment/refund ledger.
+   * Disabled-scaffold hook for `integrations_engineer` (verified Stripe webhook receipt).
+   * Per integrator security decision, `PROVIDER_LEDGER_BOOKING_ENABLED === false` (compile-time constant):
+   * signed provider events are durably deduplicated in `compliance_provider_events` and audited
+   * (`invoice.provider_event.scaffold_recorded`, outcome `refused`, reason `PROVIDER_LEDGER_DISABLED_IN_RELEASE`),
+   * then acknowledged with `applied: false` and ZERO effect on invoices, payments, or refunds.
    */
-  recordProviderPayment(input: ProviderPaymentInput): Promise<ProviderPaymentResult>;
+  recordProviderPayment(input: RecordProviderPaymentInput): Promise<RecordProviderPaymentResult>;
 
   /**
    * Read-only snapshot hook for `portable_ops_engineer`.
    * Enumerates safe, non-executable historical evidence for authorized `orderIds` (order publicIds), cursor-paginated by `after`.
-   * Excludes all secrets, raw IPs, session IDs and tokens. Decrypts encrypted intake answers for portable archival under the package AEAD envelope.
    */
   portableEvidence(
     tx: DbOrTx,
@@ -130,8 +120,7 @@ export interface ComplianceModule extends ModuleLifecycle {
   /**
    * Import hook for `portable_ops_engineer`.
    * Stores historical policy versions/acceptances, intake definitions/submissions, and invoices/payments/refunds with `origin = "import"`
-   * and explicit `(importId, sourceInstallationId, sourcePublicId)` provenance.
-   * Idempotent on `(sourceInstallationId, sourcePublicId)`. Never fabricates local active consent, never triggers provider webhooks or emails.
+   * and explicit `(importId, sourceInstallationId, sourcePublicId)` provenance. Never fabricates local active consent.
    */
   importPortableEvidence(input: ImportComplianceEvidenceInput, tx: Tx): Promise<ImportComplianceEvidenceResult>;
 }
@@ -139,87 +128,87 @@ export interface ComplianceModule extends ModuleLifecycle {
 
 ## 2. Dependencies on other modules (`deps.services.*`, accessed at call time only)
 
-- `services.identity`: `getUser(userId, { tx })`, `getUserByPublicId(publicId, { tx })`
+- `services.identity`: `getUser(userId)`, `sessions.assertCurrent(principal, tx)`, `sessions.getState(sessionId, { tx })`
 - `services.orders`:
   - `assertCanReadOrder(principal, orderPublicId, { tx })`
-  - `assertCanWriteOrder(principal, orderPublicId, { kind: "intake" | "invoice", tx })`
+  - `assertCanWriteOrder(principal, orderPublicId, { kind: "intake" | "invoice", tx, forUpdate: true })`
   - `listAccessibleOrderIds(principal, { limit, tx })`
-  - `getOrderSummary(principal, orderPublicId)`
   - `getOrderRefById(orderId, tx)`
-- `services.engagement` (optional/guarded): `notify({ userId, kind, title, body, link })` on invoice issued or intake returned for changes.
-- `services.integrations` (optional/guarded): online payment configuration check (`isOnlinePaymentConfigured` fallback to `false` -> UI shows `"Online payment is not configured"` honestly).
+  - `portableOrders(dbOrTx, { limit: 1, orderIds: [orderId] })` (for `tx`-safe `catalog_item` + `workflow` intake scope matching)
+- `services.engagement` (optional/guarded): `notify(..., tx)` on invoice issued/paid or intake returned for changes.
 
 ## 3. Capabilities (`shared/capabilities.ts`)
 
-| Capability | Granted to | Purpose |
-| --- | --- | --- |
-| `policies.manage` | `admin` | Author drafts, publish immutable policy versions, configure required flags, view acceptance reports |
-| `intake.manage` | `admin` | Create/edit draft questionnaires, publish immutable questionnaire versions |
-| `intake.review` | `staff`, `admin` | Review customer intake submissions (`accepted` / `returned_for_changes`) subject to order write-lock |
-| `invoices.read_all` | `staff`, `admin` | List/read all order invoices and payment/refund evidence |
-| `invoices.record_payment` | `staff`, `admin` | Record manual payment evidence on issued invoices subject to order write-lock (`kind: "invoice"`) |
-| `invoices.manage` | `staff`, `admin` | Create draft invoices, issue invoices, void unpaid/fully-refunded invoices, record refund evidence |
+| Capability | Granted to | Step-up required | Purpose |
+| --- | --- | --- | --- |
+| `policies.manage` | `admin` | Yes | Author drafts, publish immutable policy versions, configure required flags, view acceptance reports |
+| `intake.manage` | `admin` | No | Create/edit draft questionnaires, publish immutable questionnaire versions |
+| `intake.review` | `staff`, `admin` | No | Review customer intake submissions (`accepted` / `returned_for_changes`) subject to order write-lock |
+| `invoices.read_all` | `staff`, `admin` | No | List/read all order invoices and payment/refund evidence |
+| `invoices.record_payment` | `staff`, `admin` | Yes | Capability token retained for RBAC compatibility; manual payment & refund routes enforce `invoices.manage` + step-up |
+| `invoices.manage` | `staff`, `admin` | Yes | Create/edit draft invoices, issue invoices, void unpaid/fully-refunded invoices, record manual payments & refunds |
 
 ## 4. tRPC procedures (`trpc.compliance.*`)
 
 | Procedure | Guard | Summary |
 | --- | --- | --- |
-| `policies.listPublished` | `publicProcedure` | Active published policy documents + current effective version text & SHA-256 `contentHash` (for `/register` and public reading) |
-| `policies.myStatus` | `protectedProcedure` | Current published policies, pending required acceptances, and caller's own acceptance evidence history |
-| `policies.accept` | `protectedProcedure` | `{ versionPublicId, contentHash, method, signerName?, orderPublicId? }` — binds acceptance to exact version + hash, records timestamp (`deps.clock`), `requestId`, pseudonymised IP |
-| `policies.admin.listDocuments` | `adminProcedure` + `policies.manage` | All policy documents with draft & published version counts |
-| `policies.admin.getDocument` | `adminProcedure` + `policies.manage` | Document detail + all versions (draft & published) |
-| `policies.admin.createDocument` | `adminProcedure` + `policies.manage` | Create policy document metadata + initial draft version |
-| `policies.admin.updateDocument` | `adminProcedure` + `policies.manage` | Update title, audience, `requiresAcceptance`, `requiresTypedSignature`, `active` (`expectedVersion`) |
-| `policies.admin.createDraftVersion` | `adminProcedure` + `policies.manage` | Create new draft version (cloned or fresh) |
-| `policies.admin.updateDraftVersion` | `adminProcedure` + `policies.manage` | Edit draft body/effectiveAt/versionLabel; **refuses published versions (`CONFLICT/POLICY_VERSION_IMMUTABLE`)** |
-| `policies.admin.deleteDraftVersion` | `adminProcedure` + `policies.manage` | Delete draft version only; **refuses published versions (`CONFLICT/POLICY_VERSION_IMMUTABLE`)** |
-| `policies.admin.publishVersion` | `adminProcedure` + `policies.manage` | Lock `contentHash`, mark `published`, advance document current version, audit `policy.version.published` in `tx` |
-| `policies.admin.listAcceptances` | `adminProcedure` + `policies.manage` | Cursor-paginated acceptance evidence report filterable by `documentPublicId` / `versionPublicId` / `userPublicId` |
-| `intake.listForOrder` | `protectedProcedure` | Applicable published questionnaires + current submission status & decrypted answers for `orderId` (read-scoped via `orders.assertCanReadOrder`) |
-| `intake.getSubmission` | `protectedProcedure` | Submission detail + full revision history for `(orderId, questionnairePublicId)` |
-| `intake.saveDraft` | `protectedProcedure` | Save encrypted partial answers (`orders.assertCanWriteOrder(..., { kind: "intake" })`); appends `draft_saved` revision |
-| `intake.submit` | `protectedProcedure` | Full field validation against bound questionnaire version + lock check; transitions to `submitted` |
-| `intake.review` | `staffProcedure` + `intake.review` | Staff/admin decision (`accepted` \| `returned_for_changes`) + encrypted feedback note; respects order locks |
-| `intake.admin.listQuestionnaires` | `adminProcedure` + `intake.manage` | All questionnaires (by scope: `default`, `catalog_product`, `order_type`) |
-| `intake.admin.getQuestionnaire` | `adminProcedure` + `intake.manage` | Questionnaire + all draft/published versions |
-| `intake.admin.createQuestionnaire` | `adminProcedure` + `intake.manage` | Create questionnaire + v1 draft definition |
-| `intake.admin.updateQuestionnaire` | `adminProcedure` + `intake.manage` | Update metadata/scope/active (`expectedVersion`) |
-| `intake.admin.createDraftVersion` | `adminProcedure` + `intake.manage` | Create new draft version (cloned or fresh) |
-| `intake.admin.updateDraftVersion` | `adminProcedure` + `intake.manage` | Edit draft field definitions; published versions are immutable |
-| `intake.admin.deleteDraftVersion` | `adminProcedure` + `intake.manage` | Delete draft version (writes durable audit before delete) |
-| `intake.admin.publishVersion` | `adminProcedure` + `intake.manage` | Validate field schema, lock `definitionHash`, mark `published` |
-| `invoices.listMine` | `protectedProcedure` | Cursor-paginated customer-visible (`issued`/`paid`/`void`) invoices across accessible orders (`orders.listAccessibleOrderIds`) |
-| `invoices.listForOrder` | `protectedProcedure` | Invoices for one order (`orders.assertCanReadOrder`; hides `draft` from customers) |
-| `invoices.get` | `protectedProcedure` | Read-checked invoice detail + line snapshots + payment/refund ledger + online-payment availability (`onlinePaymentConfigured: boolean`) |
-| `invoices.admin.list` | `staffProcedure` + `invoices.read_all` | Cursor-paginated console invoice list with status/order/currency filters |
-| `invoices.admin.createDraft` | `adminProcedure` + `invoices.manage` | Create draft invoice for an order (`orders.assertCanWriteOrder(..., { kind: "invoice" })`) with integer minor-unit line snapshots |
-| `invoices.admin.updateDraft` | `adminProcedure` + `invoices.manage` | Update draft lines, discountMinor, taxMinor, dueAt, notes (`CONFLICT` if not `draft`) |
-| `invoices.admin.issue` | `adminProcedure` + `invoices.manage` | Assign sequential `invoiceNumber`, set `issuedAt`, derive status (`issued` or `paid` if `totalMinor === 0`) |
-| `invoices.admin.void` | `adminProcedure` + `invoices.manage` | Void unpaid or fully-refunded invoice (`CONFLICT/INVOICE_HAS_UNREFUNDED_PAYMENTS` if `netPaidMinor > 0`) |
-| `invoices.admin.recordManualPayment` | `staffProcedure` + `invoices.record_payment` | Record manual payment evidence (`method`, `reference`, `amountMinor`, `currency`, `receivedAt`, `idempotencyKey`); re-derives invoice status |
-| `invoices.admin.recordRefund` | `adminProcedure` + `invoices.manage` | Record separate refund evidence against invoice/payment (`amountMinor <= refundable`); re-derives invoice status |
+| `policies.listPublished` | `publicProcedure` | Active effective published policy documents excluding `staff`-only audience (`{ slug? }` filter; used by `/register` and `/legal`) |
+| `policies.myStatus` | `protectedProcedure` | `{ published, pendingRequired, acceptances }` filtered to caller's role audience |
+| `policies.accept` | `protectedProcedure` | `{ versionPublicId, contentHash, method?, signerName?, orderPublicId? }` — serialized `FOR SHARE` check of audience, `effectiveAt <= now`, current effective version, and `contentHash`; server derives `method` from `requiresTypedSignature` |
+| `policies.admin.listDocuments` | `policies.manage` | All policy documents (`PolicyDocumentAdminSummary[]`) |
+| `policies.admin.getDocument` | `policies.manage` | `{ document, versions }` for `{ documentPublicId }` |
+| `policies.admin.createDocument` | `policies.manage` (step-up) | `{ slug, title, audience, requiresAcceptance, requiresTypedSignature, versionLabel, contentFormat, bodyText, changeSummary?, effectiveAt? }` -> `{ documentPublicId, draftVersionPublicId, contentHash }` |
+| `policies.admin.updateDocument` | `policies.manage` (step-up) | `{ documentPublicId, expectedVersion, title, audience, requiresAcceptance, requiresTypedSignature, active }` -> `{ documentPublicId, version }` |
+| `policies.admin.createDraftVersion` | `policies.manage` (step-up) | `{ documentPublicId, versionLabel, contentFormat, bodyText, changeSummary?, effectiveAt? }` -> `{ versionPublicId, versionNumber, contentHash }` |
+| `policies.admin.updateDraftVersion` | `policies.manage` (step-up) | `{ versionPublicId, versionLabel, contentFormat, bodyText, changeSummary?, effectiveAt }` -> `{ versionPublicId, contentHash }`; refuses published versions (`POLICY_VERSION_IMMUTABLE`) |
+| `policies.admin.deleteDraftVersion` | `policies.manage` (step-up) | `{ versionPublicId }` -> `{ deleted: true }`; durable audit recorded before delete; refuses published versions |
+| `policies.admin.publishVersion` | `policies.manage` (step-up) | `{ versionPublicId, effectiveAt? }` -> `{ versionPublicId, contentHash, publishedAt, effectiveAt }` |
+| `policies.admin.listAcceptances` | `policies.manage` | `{ documentPublicId?, versionPublicId?, userPublicId?, cursor?, limit? }` -> `{ items, nextCursor }` |
+| `intake.listForOrder` | `protectedProcedure` | `{ items, lockState }` for `{ orderPublicId }` (`default`, `catalog_item`, and `workflow` scope; note-only projection) |
+| `intake.getSubmission` | `protectedProcedure` | `{ questionnaire, version, submission, revisions, nextCursor, canWrite }` for `{ orderPublicId, questionnairePublicId, cursor?, limit? }` |
+| `intake.saveDraft` | `protectedProcedure` | `{ orderPublicId, questionnairePublicId, answers }` -> `{ submissionPublicId, status, revisionNumber }` |
+| `intake.submit` | `protectedProcedure` | `{ orderPublicId, questionnairePublicId, answers }` -> `{ submissionPublicId, status, revisionNumber }` |
+| `intake.review` | `staffProcedure` + `intake.review` | `{ submissionPublicId, decision: "accepted" \| "returned_for_changes", reviewNote? }` -> `{ submissionPublicId, status, revisionNumber }` |
+| `intake.admin.listQuestionnaires` | `intake.manage` | `QuestionnaireAdminSummary[]` (`scopeKind: "default" \| "catalog_item" \| "workflow"`, `scopeRef`) |
+| `intake.admin.getQuestionnaire` | `intake.manage` | `{ questionnaire, versions }` for `{ questionnairePublicId }` |
+| `intake.admin.createQuestionnaire` | `intake.manage` | `{ slug, title, description?, scopeKind, scopeRef?, fields }` -> `{ questionnairePublicId, draftVersionPublicId, schemaHash }` |
+| `intake.admin.updateQuestionnaire` | `intake.manage` | `{ questionnairePublicId, expectedVersion, title, description?, scopeKind, scopeRef?, active }` -> `{ questionnairePublicId, version }` |
+| `intake.admin.saveDraftVersion` | `intake.manage` | `{ questionnairePublicId, versionPublicId?, fields }` -> `{ versionPublicId, versionNumber, schemaHash }`; published versions are immutable |
+| `intake.admin.publishVersion` | `intake.manage` | `{ versionPublicId }` -> `{ versionPublicId, schemaHash, publishedAt }` |
+| `invoices.listMine` | `protectedProcedure` | `{ status?, cursor?, limit? }` -> `{ items, nextCursor }` (customer-visible `issued`/`paid`/`void` only) |
+| `invoices.listForOrder` | `protectedProcedure` | `{ orderPublicId }` -> `InvoiceSummaryView[]` (hides `draft` from customers) |
+| `invoices.get` | `protectedProcedure` | `{ invoicePublicId }` -> `InvoiceDetailView` (`onlinePaymentConfigured: false`, `onlinePaymentMessage: "Online payment is not configured"`) |
+| `invoices.admin.list` | `staffProcedure` (`invoices.read_all`) | `{ status?, orderPublicId?, cursor?, limit? }` -> `{ items, nextCursor }` |
+| `invoices.admin.createDraft` | `staffProcedure` + `invoices.manage` (step-up) | `{ orderPublicId, currency, lines, discountMinor, taxMinor, dueAt?, memo? }` -> `{ invoicePublicId, totalMinor, currency }` |
+| `invoices.admin.updateDraft` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, expectedVersion, currency, lines, discountMinor, taxMinor, dueAt?, memo? }` -> `{ invoicePublicId, version, totalMinor }` |
+| `invoices.admin.issue` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, dueAt? }` -> `{ invoicePublicId, invoiceNumber, status, issuedAt }` |
+| `invoices.admin.void` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, reason }` -> `{ invoicePublicId, status: "void", voidedAt }` |
+| `invoices.admin.recordManualPayment` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, method, amountMinor, currency, reference, notes?, receivedAt?, idempotencyKey }` -> `{ paymentPublicId, invoiceStatus, balanceDueMinor, duplicate }` |
+| `invoices.admin.recordRefund` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, paymentPublicId, amountMinor, currency, reasonCode, reference, notes?, refundedAt?, idempotencyKey }` -> `{ refundPublicId, invoiceStatus, balanceDueMinor, duplicate }` |
 
 ## 5. Raw HTTP routes (`/api/compliance/...`)
 
 | Route | Guard | Purpose |
 | --- | --- | --- |
-| `GET /api/compliance/invoices/:invoiceId/pdf` | `requireFullSession` + order read scope | Generates clean dependency-free PDF-1.4 invoice document, audits `invoice.downloaded`, and streams via `sendPrivateDownload` (`Content-Disposition: attachment`, `nosniff`, `no-store`) |
+| `GET /api/compliance/invoices/:invoicePublicId/pdf` | `requireFullSession` + order read scope | Generates clean dependency-free PDF-1.4 invoice document, audits `invoice.downloaded` inside `tx`, and streams via `sendPrivateDownload` (`Content-Disposition: attachment`, `nosniff`, `no-store`) |
 
-## 6. Audit events (`deps.audit.record(..., tx)`)
+## 6. Audit events (all `snake_case` attributes)
 
-- Category `business` (or `admin` for authoring):
+- Category `admin` / `business` (in-tx on completion):
   - `policy.document.created`, `policy.document.updated`, `policy.version.draft_saved`, `policy.version.draft_deleted`, `policy.version.published` (`admin`)
-  - `policy.accepted` (`business`, attributes: `documentPublicId`, `versionPublicId`, `contentHash`, `method`)
+  - `policy.accepted` (`business`, attributes: `document_public_id`, `version_public_id`, `content_hash`, `method`, `has_order_binding`)
   - `intake.questionnaire.created`, `intake.questionnaire.updated`, `intake.version.draft_saved`, `intake.version.published` (`admin`)
-  - `intake.draft.saved`, `intake.submission.submitted`, `intake.submission.reviewed` (`business`)
-  - `invoice.draft.created`, `invoice.draft.updated`, `invoice.issued`, `invoice.voided` (`business`)
-  - `invoice.payment.recorded`, `invoice.payment.provider_recorded`, `invoice.refund.recorded` (`business`)
-  - `invoice.downloaded` (`business`)
+  - `intake.submission.draft_saved`, `intake.submission.submitted`, `intake.submission.reviewed` (`business`)
+  - `invoice.created`, `invoice.draft_updated`, `invoice.issued`, `invoice.voided` (`business`)
+  - `invoice.payment.recorded`, `invoice.refund.recorded`, `invoice.downloaded` (`business`)
+- Category `business` (recorded outside `tx` after rollback on financial refusal):
+  - `invoice.payment.refused`, `invoice.refund.refused` (outcome `refused`, `reasonCode`)
+- Category `integration`:
+  - `invoice.provider_event.scaffold_recorded` (outcome `refused`, `reasonCode: "PROVIDER_LEDGER_DISABLED_IN_RELEASE"`)
 - Category `portable_transfer`:
   - `compliance.evidence.imported`
-- Category `security`:
-  - `authz.compliance.denied` (cross-tenant / unauthorized access attempts, outcome `denied`)
+- Category `security` (recorded outside `tx` on capability/step-up/remediation denial):
+  - `authz.compliance.denied` (outcome `denied`, severity `WARN`)
 
 ## 7. Settings, mail templates & health
 
@@ -229,7 +218,10 @@ export interface ComplianceModule extends ModuleLifecycle {
   - `compliance.invoices.issuer_address`: string (0..400), default `""`, public
   - `compliance.invoices.payment_instructions`: string (0..1000), default `"Contact ReadyPackets billing support for wire/ACH remittance details."`, internal
 - Mail templates:
-  - `compliance.invoice_issued` (`vars: ["invoiceNumber", "orderReference", "amountFormatted", "dueDate", "link"]`)
-  - `compliance.intake_returned` (`vars: ["orderReference", "questionnaireTitle", "link"]`)
+  - `compliance.invoice_issued` (`vars: ["invoiceNumber", "orderReference", "portalPath"]`)
+  - `compliance.invoice_paid` (`vars: ["invoiceNumber", "orderReference", "portalPath"]`)
+  - `compliance.intake_returned` (`vars: ["orderReference", "questionnaireTitle", "portalPath"]`)
 - Health components:
-  - `compliance.policies`: `ok` (with `publishedDocuments` and `requiredDocuments` metrics; `not_configured` if zero published policies exist yet)
+  - `compliance.policies`: `ok` / `not_configured`
+  - `compliance.intake`: `ok` / `not_configured`
+  - `compliance.invoices`: `ok` (`issuedUnpaidInvoices` count)

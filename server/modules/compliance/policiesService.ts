@@ -1,12 +1,12 @@
 import { and, asc, count, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
-import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
+import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
-import { assertLiveActorInTx } from "./actorAuth.js";
+import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
   decodeIdCursor,
   encodeIdCursor,
@@ -112,12 +112,16 @@ export interface PolicyDocumentAdminSummary {
   updatedAt: Date;
 }
 
-function assertAdminPoliciesReadCapability(principal: SessionPrincipal): void {
+async function assertAdminPoliciesReadCapability(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  resource: { type: string; publicId?: string } = { type: "policy_document" },
+): Promise<void> {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
-    throw forbidden("REMEDIATION_SESSION");
+    await denyComplianceAuthz(deps, principal, "REMEDIATION_SESSION", resource);
   }
   if (!roleHasCapability(principal.role, "policies.manage")) {
-    throw forbidden("CAPABILITY_NOT_GRANTED");
+    await denyComplianceAuthz(deps, principal, "CAPABILITY_NOT_GRANTED", resource);
   }
 }
 
@@ -131,16 +135,21 @@ export function createPoliciesService(deps: ModuleDeps) {
   async function loadActiveEffectivePublishedPolicies(
     dbOrTx: DbOrTx,
     now: Date,
+    allowedAudiences?: readonly PolicyAudience[],
   ): Promise<
     Array<{
       doc: typeof policyDocuments.$inferSelect;
       ver: typeof policyVersions.$inferSelect;
     }>
   > {
+    const docConds = [eq(policyDocuments.active, true)];
+    if (allowedAudiences && allowedAudiences.length > 0) {
+      docConds.push(inArray(policyDocuments.audience, [...allowedAudiences]));
+    }
     const docs = await dbOrTx
       .select()
       .from(policyDocuments)
-      .where(eq(policyDocuments.active, true))
+      .where(and(...docConds))
       .orderBy(asc(policyDocuments.slug));
     if (docs.length === 0) return [];
 
@@ -176,9 +185,20 @@ export function createPoliciesService(deps: ModuleDeps) {
     return out;
   }
 
-  async function listPublished(): Promise<PublishedPolicyView[]> {
+  /**
+   * Lists currently active, effective published policies.
+   * When called without `callerRole` (the public `/legal` and `/register` endpoints),
+   * `audience = "staff"` documents are excluded in SQL before selecting or serializing.
+   */
+  async function listPublished(opts?: {
+    callerRole?: "customer" | "staff" | "admin";
+  }): Promise<PublishedPolicyView[]> {
     const now = deps.clock.now();
-    const pairs = await loadActiveEffectivePublishedPolicies(deps.db, now);
+    const allowedAudiences: readonly PolicyAudience[] =
+      !opts?.callerRole || opts.callerRole === "customer"
+        ? ["all", "customer"]
+        : ["all", "staff"];
+    const pairs = await loadActiveEffectivePublishedPolicies(deps.db, now, allowedAudiences);
     return pairs.map(({ doc, ver }) => ({
       documentPublicId: doc.publicId,
       slug: doc.slug,
@@ -291,8 +311,9 @@ export function createPoliciesService(deps: ModuleDeps) {
     pendingRequired: RequiredPolicySummary[];
     acceptances: PolicyAcceptanceEvidenceView[];
   }> {
+    const liveRole = await resolveTargetRole(principal.userId, undefined, deps.db);
     const [published, pendingRequired, rows] = await Promise.all([
-      listPublished(),
+      listPublished({ callerRole: liveRole }),
       requiredAcceptancesFor(principal.userId),
       deps.db
         .select({
@@ -335,48 +356,74 @@ export function createPoliciesService(deps: ModuleDeps) {
     input: {
       userId: number;
       actorRole: "customer" | "staff" | "admin";
-      principalForOrderCheck: SessionPrincipal | null;
+      resolvedOrderId: number | null;
+      resolvedOrderPublicId: string | null;
       versionPublicId: string;
       contentHash: string;
-      method: "portal_checkbox" | "registration" | "typed_signature";
+      flow: "portal" | "registration";
       signerName?: string | undefined;
-      orderPublicId?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
-    const [found] = await tx
-      .select({ doc: policyDocuments, ver: policyVersions })
+    const now = deps.clock.now();
+
+    const [ver] = await tx
+      .select()
       .from(policyVersions)
-      .innerJoin(policyDocuments, eq(policyVersions.documentId, policyDocuments.id))
       .where(eq(policyVersions.publicId, input.versionPublicId))
+      .for("share")
       .limit(1);
 
-    if (!found || found.ver.status !== "published" || found.ver.origin !== "portal" || !found.doc.active) {
+    if (!ver || ver.status !== "published" || ver.origin !== "portal") {
       throw notFound("POLICY_VERSION_NOT_FOUND");
     }
 
-    if (found.ver.contentHash !== input.contentHash) {
+    // Lock the parent document FOR SHARE so concurrent deactivation, audience edits,
+    // or publication of a superseding version are serialized against this acceptance.
+    const [doc] = await tx
+      .select()
+      .from(policyDocuments)
+      .where(eq(policyDocuments.id, ver.documentId))
+      .for("share")
+      .limit(1);
+
+    if (!doc || !doc.active || !audienceAppliesToRole(doc.audience, input.actorRole)) {
+      throw notFound("POLICY_VERSION_NOT_FOUND");
+    }
+
+    if (ver.effectiveAt.getTime() > now.getTime()) {
+      throw notFound("POLICY_VERSION_NOT_FOUND");
+    }
+
+    const [currentEffective] = await tx
+      .select({ id: policyVersions.id })
+      .from(policyVersions)
+      .where(
+        and(
+          eq(policyVersions.documentId, doc.id),
+          eq(policyVersions.status, "published"),
+          eq(policyVersions.origin, "portal"),
+          lte(policyVersions.effectiveAt, now),
+        ),
+      )
+      .orderBy(desc(policyVersions.versionNumber), desc(policyVersions.id))
+      .for("share")
+      .limit(1);
+
+    if (!currentEffective || currentEffective.id !== ver.id) {
+      throw conflict(
+        "POLICY_VERSION_SUPERSEDED",
+        "A newer version of this policy is now effective. Please reload and review the current version.",
+      );
+    }
+
+    if (ver.contentHash !== input.contentHash) {
       throw conflict(
         "POLICY_HASH_MISMATCH",
         "The policy text changed since this page was loaded. Please reload and review the current version.",
       );
     }
 
-    let resolvedOrderId: number | null = null;
-    let resolvedOrderPublicId: string | null = null;
-    if (input.orderPublicId) {
-      if (!input.principalForOrderCheck) {
-        throw forbidden("ORDER_SCOPE_REQUIRES_SESSION");
-      }
-      const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-      if (!ordersSvc) {
-        throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order verification is temporarily unavailable.");
-      }
-      const orderView = await ordersSvc.assertCanReadOrder(input.principalForOrderCheck, input.orderPublicId, { tx });
-      resolvedOrderId = orderView.id;
-      resolvedOrderPublicId = orderView.publicId;
-    }
-
-    if (found.doc.requiresTypedSignature) {
+    if (doc.requiresTypedSignature) {
       if (!input.signerName || input.signerName.trim().length < 2) {
         throw validation("TYPED_SIGNATURE_REQUIRED", "Please enter your full name to sign this policy.");
       }
@@ -396,7 +443,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       .where(
         and(
           eq(policyAcceptances.userId, input.userId),
-          eq(policyAcceptances.policyVersionId, found.ver.id),
+          eq(policyAcceptances.policyVersionId, ver.id),
           eq(policyAcceptances.origin, "portal"),
         ),
       )
@@ -407,7 +454,6 @@ export function createPoliciesService(deps: ModuleDeps) {
       return { acceptancePublicId: existing.publicId, duplicate: true };
     }
 
-    const now = deps.clock.now();
     const reqCtx = getRequestContext();
     const requestId = reqCtx?.requestId ?? ulid(now.getTime());
     const sourceAddressPseudonym = reqCtx?.ipAddress
@@ -415,24 +461,30 @@ export function createPoliciesService(deps: ModuleDeps) {
       : null;
 
     const acceptancePublicId = ulid(now.getTime());
-    const effectiveMethod: PolicyAcceptanceMethod = found.doc.requiresTypedSignature ? "typed_signature" : input.method;
-    const signerNameEnc = input.signerName
-      ? deps.crypto.encrypt(input.signerName.trim(), `policy_acceptances.signer_name:${acceptancePublicId}`)
-      : null;
+    // Derive method strictly on the server; never trust client-supplied method claims.
+    const effectiveMethod: PolicyAcceptanceMethod = doc.requiresTypedSignature
+      ? "typed_signature"
+      : input.flow === "registration"
+        ? "registration"
+        : "portal_checkbox";
+    const signerNameEnc =
+      doc.requiresTypedSignature && input.signerName
+        ? deps.crypto.encrypt(input.signerName.trim(), `policy_acceptances.signer_name:${acceptancePublicId}`)
+        : null;
 
     await tx.insert(policyAcceptances).values({
       publicId: acceptancePublicId,
       userId: input.userId,
-      documentId: found.doc.id,
-      policyVersionId: found.ver.id,
-      versionContentHash: found.ver.contentHash,
+      documentId: doc.id,
+      policyVersionId: ver.id,
+      versionContentHash: ver.contentHash,
       acceptedAt: now,
       requestId,
       sourceAddressPseudonym,
       method: effectiveMethod,
       signerNameEnc,
-      orderId: resolvedOrderId,
-      orderPublicId: resolvedOrderPublicId,
+      orderId: input.resolvedOrderId,
+      orderPublicId: input.resolvedOrderPublicId,
       origin: "portal",
       createdAt: now,
     });
@@ -446,11 +498,11 @@ export function createPoliciesService(deps: ModuleDeps) {
         actor: { userId: input.userId, role: input.actorRole },
         resource: { type: "policy_acceptance", publicId: acceptancePublicId },
         attributes: {
-          documentPublicId: found.doc.publicId,
-          versionPublicId: found.ver.publicId,
-          contentHash: found.ver.contentHash,
+          document_public_id: doc.publicId,
+          version_public_id: ver.publicId,
+          content_hash: ver.contentHash,
           method: effectiveMethod,
-          hasOrderBinding: resolvedOrderPublicId !== null,
+          has_order_binding: input.resolvedOrderPublicId !== null,
         },
       },
       tx,
@@ -464,22 +516,34 @@ export function createPoliciesService(deps: ModuleDeps) {
     input: {
       versionPublicId: string;
       contentHash: string;
-      method: "portal_checkbox" | "registration" | "typed_signature";
+      method?: "portal_checkbox" | "typed_signature" | undefined;
       signerName?: string | undefined;
       orderPublicId?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_version", publicId: input.versionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx);
+      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+      let resolvedOrderId: number | null = null;
+      let resolvedOrderPublicId: string | null = null;
+      if (input.orderPublicId) {
+        const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+        if (!ordersSvc) {
+          throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order verification is temporarily unavailable.");
+        }
+        const orderView = await ordersSvc.assertCanReadOrder(livePrincipal, input.orderPublicId, { tx });
+        resolvedOrderId = orderView.id;
+        resolvedOrderPublicId = orderView.publicId;
+      }
       return acceptPolicyInTx(tx, {
         userId: liveActor.userId,
         actorRole: liveActor.role,
-        principalForOrderCheck: { ...principal, role: liveActor.role },
+        resolvedOrderId,
+        resolvedOrderPublicId,
         versionPublicId: input.versionPublicId,
         contentHash: input.contentHash,
-        method: input.method,
+        flow: "portal",
         signerName: input.signerName,
-        orderPublicId: input.orderPublicId,
       });
     });
   }
@@ -497,10 +561,11 @@ export function createPoliciesService(deps: ModuleDeps) {
         const res = await acceptPolicyInTx(tx, {
           userId: input.userId,
           actorRole: "customer",
-          principalForOrderCheck: null,
+          resolvedOrderId: null,
+          resolvedOrderPublicId: null,
           versionPublicId: item.versionPublicId,
           contentHash: item.contentHash,
-          method: "registration",
+          flow: "registration",
           signerName: item.signerName,
         });
         if (!res.duplicate) recorded += 1;
@@ -514,7 +579,7 @@ export function createPoliciesService(deps: ModuleDeps) {
   /* --------------------------------------------------------- admin authoring */
 
   async function adminListDocuments(principal: SessionPrincipal): Promise<PolicyDocumentAdminSummary[]> {
-    assertAdminPoliciesReadCapability(principal);
+    await assertAdminPoliciesReadCapability(deps, principal, { type: "policy_document" });
     const docs = await deps.db.select().from(policyDocuments).orderBy(asc(policyDocuments.slug));
     if (docs.length === 0) return [];
 
@@ -571,7 +636,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     document: Omit<PolicyDocumentAdminSummary, "draftCount" | "publishedCount" | "currentPublishedVersion">;
     versions: PolicyVersionAdminView[];
   }> {
-    assertAdminPoliciesReadCapability(principal);
+    await assertAdminPoliciesReadCapability(deps, principal, { type: "policy_document", publicId: documentPublicId });
     const [doc] = await deps.db
       .select()
       .from(policyDocuments)
@@ -634,7 +699,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     const contentHash = hashPolicyContent(normalizedBody);
     const effectiveAt = input.effectiveAt ?? now;
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_document" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       const [existing] = await tx
@@ -689,8 +754,8 @@ export function createPoliciesService(deps: ModuleDeps) {
           attributes: {
             slug: input.slug,
             audience: input.audience,
-            requiresAcceptance: input.requiresAcceptance,
-            draftVersionPublicId,
+            requires_acceptance: input.requiresAcceptance,
+            draft_version_public_id: draftVersionPublicId,
           },
         },
         tx,
@@ -714,7 +779,7 @@ export function createPoliciesService(deps: ModuleDeps) {
   ): Promise<{ documentPublicId: string; version: number }> {
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_document", publicId: input.documentPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       const [doc] = await tx
@@ -752,8 +817,8 @@ export function createPoliciesService(deps: ModuleDeps) {
           resource: { type: "policy_document", publicId: doc.publicId },
           attributes: {
             audience: input.audience,
-            requiresAcceptance: input.requiresAcceptance,
-            requiresTypedSignature: input.requiresTypedSignature,
+            requires_acceptance: input.requiresAcceptance,
+            requires_typed_signature: input.requiresTypedSignature,
             active: input.active,
           },
         },
@@ -779,7 +844,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     const normalizedBody = normalizePolicyBody(input.bodyText);
     const contentHash = hashPolicyContent(normalizedBody);
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_document", publicId: input.documentPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       const [doc] = await tx
@@ -828,9 +893,9 @@ export function createPoliciesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "policy_version", publicId: versionPublicId },
           attributes: {
-            documentPublicId: doc.publicId,
-            versionNumber: nextNum,
-            contentHash,
+            document_public_id: doc.publicId,
+            version_number: nextNum,
+            content_hash: contentHash,
           },
         },
         tx,
@@ -855,7 +920,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     const normalizedBody = normalizePolicyBody(input.bodyText);
     const contentHash = hashPolicyContent(normalizedBody);
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_version", publicId: input.versionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       const [ver] = await tx
@@ -899,8 +964,8 @@ export function createPoliciesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "policy_version", publicId: ver.publicId },
           attributes: {
-            versionNumber: ver.versionNumber,
-            contentHash,
+            version_number: ver.versionNumber,
+            content_hash: contentHash,
           },
         },
         tx,
@@ -914,7 +979,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     principal: SessionPrincipal,
     versionPublicId: string,
   ): Promise<{ deleted: true }> {
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_version", publicId: versionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       // Re-check status under row lock and record durable audit BEFORE deletion.
@@ -937,7 +1002,7 @@ export function createPoliciesService(deps: ModuleDeps) {
           outcome: "completed",
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "policy_version", publicId: ver.publicId },
-          attributes: { versionNumber: ver.versionNumber },
+          attributes: { version_number: ver.versionNumber },
         },
         tx,
       );
@@ -954,7 +1019,7 @@ export function createPoliciesService(deps: ModuleDeps) {
   ): Promise<{ versionPublicId: string; contentHash: string; publishedAt: Date; effectiveAt: Date }> {
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "policy_version", publicId: input.versionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
 
       const [ver] = await tx
@@ -1011,11 +1076,11 @@ export function createPoliciesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "policy_version", publicId: ver.publicId },
           attributes: {
-            documentPublicId: doc.publicId,
+            document_public_id: doc.publicId,
             slug: doc.slug,
-            versionNumber: ver.versionNumber,
-            contentHash: lockedHash,
-            requiresAcceptance: doc.requiresAcceptance,
+            version_number: ver.versionNumber,
+            content_hash: lockedHash,
+            requires_acceptance: doc.requiresAcceptance,
           },
         },
         tx,
@@ -1043,7 +1108,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     >;
     nextCursor: string | null;
   }> {
-    assertAdminPoliciesReadCapability(principal);
+    await assertAdminPoliciesReadCapability(deps, principal, { type: "policy_acceptance" });
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
     const afterId = decodeIdCursor(input.cursor);
 

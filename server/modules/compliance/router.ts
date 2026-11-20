@@ -33,7 +33,6 @@ const policiesManageProc = protectedProcedure.use(requireCapability("policies.ma
 const intakeManageProc = protectedProcedure.use(requireCapability("intake.manage"));
 const intakeReviewProc = staffProcedure.use(requireCapability("intake.review"));
 const invoicesManageProc = staffProcedure.use(requireCapability("invoices.manage"));
-const invoicesRecordPaymentProc = staffProcedure.use(requireCapability("invoices.record_payment"));
 
 export const complianceRouter = router({
   /* ---------------------------------------------------------------- policies */
@@ -160,6 +159,8 @@ export const complianceRouter = router({
         z.strictObject({
           orderPublicId: publicIdSchema,
           questionnairePublicId: publicIdSchema,
+          cursor: z.string().max(128).optional(),
+          limit: z.number().int().min(1).max(25).default(10),
         }),
       )
       .query(async ({ ctx, input }) => {
@@ -338,14 +339,14 @@ export const complianceRouter = router({
           return ctx.services.compliance.invoices.admin.void(ctx.session, input);
         }),
 
-      recordManualPayment: invoicesRecordPaymentProc
+      recordManualPayment: invoicesManageProc
         .meta({ rateLimit: "form_submission" })
         .input(recordManualPaymentSchema)
         .mutation(async ({ ctx, input }) => {
           return ctx.services.compliance.invoices.admin.recordManualPayment(ctx.session, input);
         }),
 
-      recordRefund: invoicesRecordPaymentProc
+      recordRefund: invoicesManageProc
         .meta({ rateLimit: "form_submission" })
         .input(recordRefundSchema)
         .mutation(async ({ ctx, input }) => {

@@ -1,11 +1,11 @@
 import { and, asc, count, desc, eq, inArray, lt } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
-import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
+import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { readSetting } from "../platform/index.js";
-import { assertLiveActorInTx } from "./actorAuth.js";
+import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
   computeInvoiceTotals,
   decodeIdCursor,
@@ -136,18 +136,26 @@ function isStaffOrAdmin(principal: SessionPrincipal): boolean {
   return principal.role === "staff" || principal.role === "admin";
 }
 
-function assertStaffInvoiceRead(principal: SessionPrincipal): void {
+async function assertStaffInvoiceRead(deps: ModuleDeps, principal: SessionPrincipal): Promise<void> {
+  const resource = { type: "invoice" };
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
-    throw forbidden("REMEDIATION_SESSION");
+    await denyComplianceAuthz(deps, principal, "REMEDIATION_SESSION", resource);
   }
   if (
     !roleHasCapability(principal.role, "invoices.read_all") &&
     !roleHasCapability(principal.role, "invoices.manage") &&
     !roleHasCapability(principal.role, "invoices.record_payment")
   ) {
-    throw forbidden("CAPABILITY_NOT_GRANTED");
+    await denyComplianceAuthz(deps, principal, "CAPABILITY_NOT_GRANTED", resource);
   }
 }
+
+/**
+ * Compile-time constant per integrator security decision:
+ * Stripe / external online payment ledger booking is a DISABLED SCAFFOLD in this release
+ * and cannot be enabled by any runtime setting or feature flag.
+ */
+export const PROVIDER_LEDGER_BOOKING_ENABLED = false as const;
 
 export function createInvoicesService(deps: ModuleDeps) {
   function requireOrdersService() {
@@ -159,15 +167,7 @@ export function createInvoicesService(deps: ModuleDeps) {
   }
 
   async function isOnlinePaymentConfigured(): Promise<boolean> {
-    const integrations = (
-      deps.services as unknown as {
-        integrations?: { stripe?: { isOnlinePaymentConfigured?: () => Promise<boolean> } };
-      }
-    ).integrations;
-    if (integrations?.stripe && typeof integrations.stripe.isOnlinePaymentConfigured === "function") {
-      return Boolean(await integrations.stripe.isOnlinePaymentConfigured());
-    }
-    return false;
+    return PROVIDER_LEDGER_BOOKING_ENABLED;
   }
 
   async function computeLedgerSums(
@@ -380,13 +380,13 @@ export function createInvoicesService(deps: ModuleDeps) {
     );
     const visible = input.status
       ? candidates.filter((r) => {
-          const s = sumsMap.get(r.id) ?? { paidMinor: 0, refundedMinor: 0 };
+          const s = sumsMap.get(r.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
           return (
             deriveInvoiceStatus({
               totalMinor: r.totalMinor,
               issuedAt: r.issuedAt,
               voidedAt: r.voidedAt,
-              paidMinor: s.paidMinor,
+              grossPaidMinor: s.grossPaidMinor,
               refundedMinor: s.refundedMinor,
             }) === input.status
           );
@@ -527,7 +527,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         orderAllowsInvoiceWrite &&
         summary.status !== "draft" &&
         summary.status !== "void" &&
-        roleHasCapability(principal.role, "invoices.record_payment"),
+        roleHasCapability(principal.role, "invoices.manage"),
     };
   }
 
@@ -542,7 +542,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       limit?: number | undefined;
     },
   ): Promise<{ items: InvoiceSummaryView[]; nextCursor: string | null }> {
-    assertStaffInvoiceRead(principal);
+    await assertStaffInvoiceRead(deps, principal);
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 100);
     const afterId = decodeIdCursor(input.cursor);
     const ordersSvc = requireOrdersService();
@@ -605,7 +605,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     const now = deps.clock.now();
     const currency = input.currency.toUpperCase();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "invoice" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
       const ordersSvc = requireOrdersService();
@@ -656,14 +656,14 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice", publicId: invoicePublicId },
           attributes: {
-            orderPublicId: orderView.publicId,
+            order_public_id: orderView.publicId,
             currency,
-            subtotalMinor: computed.subtotalMinor,
-            discountMinor: computed.discountMinor,
-            taxMinor: computed.taxMinor,
-            totalMinor: computed.totalMinor,
+            subtotal_minor: computed.subtotalMinor,
+            discount_minor: computed.discountMinor,
+            tax_minor: computed.taxMinor,
+            total_minor: computed.totalMinor,
           },
-          safeCounts: { lineItems: computed.lines.length },
+          safeCounts: { line_items: computed.lines.length },
         },
         tx,
       );
@@ -693,7 +693,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     const now = deps.clock.now();
     const currency = input.currency.toUpperCase();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "invoice", publicId: input.invoicePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
@@ -760,11 +760,11 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice", publicId: inv.publicId },
           attributes: {
-            orderPublicId: inv.orderPublicId,
+            order_public_id: inv.orderPublicId,
             currency,
-            totalMinor: computed.totalMinor,
+            total_minor: computed.totalMinor,
           },
-          safeCounts: { lineItems: computed.lines.length },
+          safeCounts: { line_items: computed.lines.length },
         },
         tx,
       );
@@ -779,7 +779,7 @@ export function createInvoicesService(deps: ModuleDeps) {
   ): Promise<{ invoicePublicId: string; invoiceNumber: string; status: InvoiceStatus; issuedAt: Date }> {
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "invoice", publicId: input.invoicePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
@@ -852,10 +852,10 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice", publicId: inv.publicId },
           attributes: {
-            orderPublicId: orderView.publicId,
-            invoiceNumber,
+            order_public_id: orderView.publicId,
+            invoice_number: invoiceNumber,
             currency: inv.currency,
-            totalMinor: inv.totalMinor,
+            total_minor: inv.totalMinor,
             status: derivedStatus,
           },
         },
@@ -911,7 +911,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     }
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "invoice", publicId: input.invoicePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
@@ -976,9 +976,9 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice", publicId: inv.publicId },
           attributes: {
-            orderPublicId: inv.orderPublicId,
-            invoiceNumber: inv.invoiceNumber,
-            previousStatus: inv.status,
+            order_public_id: inv.orderPublicId,
+            invoice_number: inv.invoiceNumber,
+            previous_status: inv.status,
           },
         },
         tx,
@@ -1009,9 +1009,28 @@ export function createInvoicesService(deps: ModuleDeps) {
     const now = deps.clock.now();
     const receivedAt = input.receivedAt ?? now;
     const currency = input.currency.toUpperCase();
+    if (input.method === "provider_online") {
+      throw validation("INVALID_PAYMENT_METHOD", "Manual payments cannot claim online provider method.");
+    }
+    if (!input.idempotencyKey || input.idempotencyKey.trim().length < 8) {
+      throw validation("INVALID_IDEMPOTENCY_KEY", "An idempotency key of at least 8 characters is required.");
+    }
 
-    return deps.db.transaction(async (tx) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.record_payment");
+    const PAYMENT_REFUSAL_REASONS = new Set([
+      "IMPORTED_INVOICE_READ_ONLY",
+      "INVOICE_VOIDED",
+      "INVOICE_NOT_ISSUED",
+      "CURRENCY_MISMATCH",
+      "PAYMENT_EXCEEDS_BALANCE_DUE",
+      "ORDER_LOCKED",
+    ]);
+
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "invoice", publicId: input.invoicePublicId },
+      async (tx) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
       const [inv] = await tx
@@ -1135,12 +1154,12 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice_payment", publicId: paymentPublicId },
           attributes: {
-            invoicePublicId: inv.publicId,
-            orderPublicId: orderView.publicId,
+            invoice_public_id: inv.publicId,
+            order_public_id: orderView.publicId,
             method: input.method,
-            amountMinor: input.amountMinor,
+            amount_minor: input.amountMinor,
             currency,
-            derivedInvoiceStatus: nextStatus,
+            derived_invoice_status: nextStatus,
           },
         },
         tx,
@@ -1183,7 +1202,29 @@ export function createInvoicesService(deps: ModuleDeps) {
         balanceDueMinor: nextBalance,
         duplicate: false,
       };
-    });
+      },
+      {
+        onRefusalAfterRollback: async (err) => {
+          if (PAYMENT_REFUSAL_REASONS.has(err.reasonCode)) {
+            await deps.audit.record({
+              category: "business",
+              eventName: "invoice.payment.refused",
+              action: "refuse",
+              outcome: "refused",
+              reasonCode: err.reasonCode,
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "invoice", publicId: input.invoicePublicId },
+              attributes: {
+                invoice_public_id: input.invoicePublicId,
+                method: input.method,
+                amount_minor: input.amountMinor,
+                currency,
+              },
+            });
+          }
+        },
+      },
+    );
   }
 
   async function adminRecordRefund(
@@ -1208,9 +1249,24 @@ export function createInvoicesService(deps: ModuleDeps) {
     const now = deps.clock.now();
     const refundedAt = input.refundedAt ?? now;
     const currency = input.currency.toUpperCase();
+    if (!input.idempotencyKey || input.idempotencyKey.trim().length < 8) {
+      throw validation("INVALID_IDEMPOTENCY_KEY", "An idempotency key of at least 8 characters is required.");
+    }
 
-    return deps.db.transaction(async (tx) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.record_payment");
+    const REFUND_REFUSAL_REASONS = new Set([
+      "IMPORTED_INVOICE_READ_ONLY",
+      "PAYMENT_NOT_FOUND",
+      "CURRENCY_MISMATCH",
+      "REFUND_EXCEEDS_PAYMENT",
+      "ORDER_LOCKED",
+    ]);
+
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "invoice", publicId: input.invoicePublicId },
+      async (tx) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
       const [inv] = await tx
@@ -1345,13 +1401,13 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice_refund", publicId: refundPublicId },
           attributes: {
-            invoicePublicId: inv.publicId,
-            paymentPublicId: pmt.publicId,
-            orderPublicId: orderView.publicId,
-            reasonCode: input.reasonCode,
-            amountMinor: input.amountMinor,
+            invoice_public_id: inv.publicId,
+            payment_public_id: pmt.publicId,
+            order_public_id: orderView.publicId,
+            reason_code: input.reasonCode,
+            amount_minor: input.amountMinor,
             currency,
-            derivedInvoiceStatus: nextStatus,
+            derived_invoice_status: nextStatus,
           },
         },
         tx,
@@ -1363,24 +1419,48 @@ export function createInvoicesService(deps: ModuleDeps) {
         balanceDueMinor: nextBalance,
         duplicate: false,
       };
-    });
+      },
+      {
+        onRefusalAfterRollback: async (err) => {
+          if (REFUND_REFUSAL_REASONS.has(err.reasonCode)) {
+            await deps.audit.record({
+              category: "business",
+              eventName: "invoice.refund.refused",
+              action: "refuse",
+              outcome: "refused",
+              reasonCode: err.reasonCode,
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "invoice", publicId: input.invoicePublicId },
+              attributes: {
+                invoice_public_id: input.invoicePublicId,
+                payment_public_id: input.paymentPublicId,
+                reason_code: input.reasonCode,
+                amount_minor: input.amountMinor,
+                currency,
+              },
+            });
+          }
+        },
+      },
+    );
   }
 
-  /* ------------------------------------ verified provider webhook hook */
+  /* ------------------------------------ verified provider webhook hook (DISABLED SCAFFOLD) */
 
+  /**
+   * Per integrator security decision, online provider ledger booking is a DISABLED SCAFFOLD in this release
+   * (`PROVIDER_LEDGER_BOOKING_ENABLED === false` compile-time constant, cannot be enabled by settings/flags).
+   * Signed provider webhook events are durably deduplicated in `compliance_provider_events` and audited,
+   * then acknowledged with `applied: false` and ZERO effect on invoices, payments, or refunds.
+   */
   async function recordProviderPaymentInTx(
     tx: Tx,
     input: RecordProviderPaymentInput,
   ): Promise<RecordProviderPaymentResult> {
     const provider = input.provider.trim().toLowerCase().slice(0, 32);
     const providerEventId = input.providerEventId.trim().slice(0, 128);
-    const providerRef = (input.providerReference ?? input.providerPaymentId ?? providerEventId)
-      .trim()
-      .slice(0, 128);
     const kind = input.kind ?? "succeeded";
-    const occurredAt = input.receivedAt ?? input.occurredAt ?? deps.clock.now();
     const now = deps.clock.now();
-    const currency = input.currency.trim().toUpperCase();
 
     if (!provider || !providerEventId) {
       throw validation("INVALID_PROVIDER_EVENT", "Provider and providerEventId are required.");
@@ -1406,260 +1486,44 @@ export function createInvoicesService(deps: ModuleDeps) {
         applied: false,
         duplicate: true,
         reasonCode: "DUPLICATE_EVENT",
-        paymentPublicId: existingEvt.paymentPublicId ?? undefined,
-        recordPublicId: existingEvt.paymentPublicId ?? existingEvt.refundPublicId ?? undefined,
+        invoicePublicId: input.invoicePublicId,
       };
     }
-
-    let inv: typeof complianceInvoices.$inferSelect | undefined;
-    if (input.invoicePublicId) {
-      const [found] = await tx
-        .select()
-        .from(complianceInvoices)
-        .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
-        .limit(1);
-      inv = found;
-    } else if (input.orderPublicId) {
-      const candidates = await tx
-        .select()
-        .from(complianceInvoices)
-        .where(eq(complianceInvoices.orderPublicId, input.orderPublicId))
-        .orderBy(desc(complianceInvoices.id))
-        .for("update");
-      inv = candidates.find((c) => c.issuedAt !== null && c.voidedAt === null && c.origin === "portal");
-    }
-
-    if (!inv || inv.origin !== "portal" || inv.issuedAt === null || inv.voidedAt !== null) {
-      await tx.insert(complianceProviderEvents).values({
-        provider,
-        providerEventId,
-        invoiceId: inv?.id ?? null,
-        processedAt: now,
-      });
-      return {
-        applied: false,
-        duplicate: false,
-        reasonCode: !inv ? "INVOICE_NOT_FOUND" : inv.voidedAt ? "INVOICE_VOIDED" : "INVOICE_NOT_ISSUED",
-      };
-    }
-
-    if (currency !== inv.currency) {
-      await tx.insert(complianceProviderEvents).values({
-        provider,
-        providerEventId,
-        invoiceId: inv.id,
-        processedAt: now,
-      });
-      return {
-        applied: false,
-        duplicate: false,
-        reasonCode: "CURRENCY_MISMATCH",
-        invoicePublicId: inv.publicId,
-      };
-    }
-
-    if (kind === "refunded") {
-      const candidatePayments = await tx
-        .select()
-        .from(complianceInvoicePayments)
-        .where(
-          and(
-            eq(complianceInvoicePayments.invoiceId, inv.id),
-            eq(complianceInvoicePayments.status, "succeeded"),
-          ),
-        )
-        .orderBy(desc(complianceInvoicePayments.id))
-        .for("update");
-
-      const targetPayment =
-        candidatePayments.find((p) => p.reference === providerRef) ??
-        candidatePayments.find((p) => p.provider === provider) ??
-        candidatePayments[0];
-
-      if (!targetPayment) {
-        await tx.insert(complianceProviderEvents).values({
-          provider,
-          providerEventId,
-          invoiceId: inv.id,
-          processedAt: now,
-        });
-        return {
-          applied: false,
-          duplicate: false,
-          reasonCode: "ORIGINAL_PAYMENT_NOT_FOUND",
-          invoicePublicId: inv.publicId,
-        };
-      }
-
-      const priorRefunds = await tx
-        .select({ amountMinor: complianceInvoiceRefunds.amountMinor })
-        .from(complianceInvoiceRefunds)
-        .where(eq(complianceInvoiceRefunds.paymentId, targetPayment.id));
-      const alreadyRefunded = priorRefunds.reduce((s, r) => s + r.amountMinor, 0);
-      const refundable = Math.max(0, targetPayment.amountMinor - alreadyRefunded);
-      const appliedRefund = Math.min(input.amountMinor, refundable);
-
-      if (appliedRefund <= 0) {
-        await tx.insert(complianceProviderEvents).values({
-          provider,
-          providerEventId,
-          invoiceId: inv.id,
-          processedAt: now,
-        });
-        return {
-          applied: false,
-          duplicate: false,
-          reasonCode: "PAYMENT_ALREADY_REFUNDED",
-          invoicePublicId: inv.publicId,
-        };
-      }
-
-      const refundPublicId = ulid(now.getTime());
-      await tx.insert(complianceInvoiceRefunds).values({
-        publicId: refundPublicId,
-        invoiceId: inv.id,
-        paymentId: targetPayment.id,
-        amountMinor: appliedRefund,
-        currency,
-        reasonCode: input.reasonCode ?? "PROVIDER_REFUND",
-        reference: providerRef,
-        provider,
-        providerEventId,
-        refundedAt: occurredAt,
-        idempotencyKey: `prov:${provider}:${providerEventId}`,
-        origin: "portal",
-        createdAt: now,
-      });
-
-      await tx.insert(complianceProviderEvents).values({
-        provider,
-        providerEventId,
-        invoiceId: inv.id,
-        refundPublicId,
-        processedAt: now,
-      });
-
-      const sumsMap = await computeLedgerSums(tx, [inv.id]);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
-      const nextStatus = deriveInvoiceStatus({
-        issuedAt: inv.issuedAt,
-        voidedAt: inv.voidedAt,
-        totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
-        refundedMinor: sums.refundedMinor,
-      });
-
-      if (nextStatus !== inv.status) {
-        await tx
-          .update(complianceInvoices)
-          .set({ status: nextStatus, version: inv.version + 1, updatedAt: now })
-          .where(eq(complianceInvoices.id, inv.id));
-      }
-
-      await deps.audit.record(
-        {
-          category: "integration",
-          eventName: "invoice.refund.provider_recorded",
-          action: "create",
-          outcome: "completed",
-          actor: { role: "system" },
-          resource: { type: "invoice_refund", publicId: refundPublicId },
-          attributes: {
-            provider,
-            providerEventId,
-            invoicePublicId: inv.publicId,
-            amountMinor: appliedRefund,
-            currency,
-            derivedInvoiceStatus: nextStatus,
-          },
-        },
-        tx,
-      );
-
-      return {
-        applied: true,
-        duplicate: false,
-        recordPublicId: refundPublicId,
-        invoicePublicId: inv.publicId,
-        invoiceStatus: nextStatus,
-      };
-    }
-
-    const paymentPublicId = ulid(now.getTime());
-    const paymentStatus: PaymentRecordStatus = kind === "failed" ? "failed" : "succeeded";
-
-    await tx.insert(complianceInvoicePayments).values({
-      publicId: paymentPublicId,
-      invoiceId: inv.id,
-      method: "provider_online",
-      status: paymentStatus,
-      amountMinor: input.amountMinor,
-      currency,
-      reference: providerRef,
-      provider,
-      providerEventId,
-      receivedAt: occurredAt,
-      idempotencyKey: `prov:${provider}:${providerEventId}`,
-      origin: "portal",
-      createdAt: now,
-    });
 
     await tx.insert(complianceProviderEvents).values({
       provider,
       providerEventId,
-      invoiceId: inv.id,
-      paymentPublicId,
+      invoiceId: null,
+      paymentPublicId: null,
+      refundPublicId: null,
       processedAt: now,
     });
-
-    const sumsMap = await computeLedgerSums(tx, [inv.id]);
-    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
-    const nextStatus = deriveInvoiceStatus({
-      issuedAt: inv.issuedAt,
-      voidedAt: inv.voidedAt,
-      totalMinor: inv.totalMinor,
-      grossPaidMinor: sums.grossPaidMinor,
-      refundedMinor: sums.refundedMinor,
-    });
-
-    if (nextStatus !== inv.status) {
-      await tx
-        .update(complianceInvoices)
-        .set({ status: nextStatus, version: inv.version + 1, updatedAt: now })
-        .where(eq(complianceInvoices.id, inv.id));
-    }
 
     await deps.audit.record(
       {
         category: "integration",
-        eventName:
-          paymentStatus === "succeeded"
-            ? "invoice.payment.provider_recorded"
-            : "invoice.payment.provider_failed",
-        action: "create",
-        outcome: paymentStatus === "succeeded" ? "completed" : "failed",
+        eventName: "invoice.provider_event.scaffold_recorded",
+        action: "receive",
+        outcome: "refused",
+        reasonCode: "PROVIDER_LEDGER_DISABLED_IN_RELEASE",
         actor: { role: "system" },
-        resource: { type: "invoice_payment", publicId: paymentPublicId },
         attributes: {
           provider,
-          providerEventId,
-          invoicePublicId: inv.publicId,
-          amountMinor: input.amountMinor,
-          currency,
-          derivedInvoiceStatus: nextStatus,
+          provider_event_id: providerEventId,
+          kind,
+          invoice_public_id: input.invoicePublicId ?? null,
+          order_public_id: input.orderPublicId ?? null,
+          ledger_booking_enabled: PROVIDER_LEDGER_BOOKING_ENABLED,
         },
       },
       tx,
     );
 
     return {
-      applied: true,
+      applied: false,
       duplicate: false,
-      paymentPublicId,
-      recordPublicId: paymentPublicId,
-      invoicePublicId: inv.publicId,
-      invoiceStatus: nextStatus,
+      reasonCode: "PROVIDER_LEDGER_DISABLED_IN_RELEASE",
+      invoicePublicId: input.invoicePublicId,
     };
   }
 
@@ -1732,7 +1596,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     });
 
     // 2. Re-validate live actor + order read access and emit durable audit BEFORE bytes are streamed.
-    await deps.db.transaction(async (tx) => {
+    await runComplianceTx(deps, principal, { type: "invoice", publicId: detail.invoicePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx);
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
       await ordersSvc.assertCanReadOrder(livePrincipal, detail.orderPublicId, { tx });
@@ -1746,11 +1610,11 @@ export function createInvoicesService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "invoice", publicId: detail.invoicePublicId },
           attributes: {
-            orderPublicId: detail.orderPublicId,
-            invoiceNumber: detail.invoiceNumber,
+            order_public_id: detail.orderPublicId,
+            invoice_number: detail.invoiceNumber,
             status: detail.status,
           },
-          safeCounts: { pdfBytes: pdfBuffer.byteLength },
+          safeCounts: { pdf_bytes: pdfBuffer.byteLength },
         },
         tx,
       );

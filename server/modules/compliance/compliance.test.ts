@@ -11,7 +11,7 @@ import { users } from "../identity/schema.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrdersModule } from "../orders/index.js";
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
-import { computeInvoiceTotals, deriveInvoiceStatus, validateIntakeAnswers } from "./domain.js";
+import { computeInvoiceTotals, validateIntakeAnswers } from "./domain.js";
 import { createComplianceModule } from "./index.js";
 import * as complianceSchema from "./schema.js";
 
@@ -24,6 +24,7 @@ interface FakeOrderRecord {
   lockState: OrderLockState;
   origin: "portal" | "import";
   productPublicIds: string[];
+  workflowKey?: string;
   grants: Map<number, "contributor" | "viewer">;
 }
 
@@ -60,17 +61,23 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
     };
   }
 
+  async function assertCanReadOrder(principal: SessionPrincipal, orderPublicId: string): Promise<OrderAccessView> {
+    if (principal.state !== "full" || principal.pendingSteps.length > 0) throw notFound("ORDER_NOT_FOUND");
+    const order = ordersByPubId.get(orderPublicId);
+    if (!order) throw notFound("ORDER_NOT_FOUND");
+    const role = resolveRole(principal, order);
+    if (!role) throw notFound("ORDER_NOT_FOUND");
+    return toAccessView(order, role);
+  }
+
   return {
-    async assertCanReadOrder(principal, orderPublicId) {
-      if (principal.state !== "full" || principal.pendingSteps.length > 0) throw notFound("ORDER_NOT_FOUND");
-      const order = ordersByPubId.get(orderPublicId);
-      if (!order) throw notFound("ORDER_NOT_FOUND");
-      const role = resolveRole(principal, order);
-      if (!role) throw notFound("ORDER_NOT_FOUND");
-      return toAccessView(order, role);
-    },
-    async assertCanWriteOrder(principal, orderPublicId, options) {
-      const view = await this.assertCanReadOrder(principal, orderPublicId);
+    assertCanReadOrder,
+    async assertCanWriteOrder(
+      principal: SessionPrincipal,
+      orderPublicId: string,
+      options: { kind?: string; tx?: DbOrTx; forUpdate?: boolean },
+    ) {
+      const view = await assertCanReadOrder(principal, orderPublicId);
       const order = ordersByPubId.get(orderPublicId)!;
 
       // Mirror orders/API.md §1 access & lock rules
@@ -99,7 +106,7 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
       if (order.lockState !== "none") throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked.");
       return view;
     },
-    async listAccessibleOrderIds(principal) {
+    async listAccessibleOrderIds(principal: SessionPrincipal) {
       if (principal.role === "admin" || principal.role === "staff") return { all: true };
       const ids: number[] = [];
       for (const o of ordersByPubId.values()) {
@@ -120,6 +127,43 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
         lockState: o.lockState,
         statusKey: "in_progress",
       };
+    },
+    async portableOrders(_tx: DbOrTx, sel: { limit: number; orderIds?: number[] }) {
+      const targetIds = sel.orderIds ? new Set(sel.orderIds) : null;
+      const items = Array.from(ordersByPubId.values())
+        .filter((o) => (targetIds ? targetIds.has(o.id) : true))
+        .slice(0, sel.limit)
+        .map((o) => ({
+          id: o.id,
+          publicId: o.publicId,
+          reference: o.reference,
+          retiredReferences: [],
+          ownerUserId: o.ownerUserId,
+          projectName: o.reference,
+          statusKey: "in_progress",
+          workflowKey: o.workflowKey ?? "standard",
+          lockState: o.lockState,
+          totalMinor: 1000,
+          currency: "USD",
+          createdAt: new Date("2026-11-20T12:00:00.000Z"),
+          updatedAt: new Date("2026-11-20T12:00:00.000Z"),
+          submittedAt: new Date("2026-11-20T12:00:00.000Z"),
+          lineItems: o.productPublicIds.map((pid, idx) => ({
+            publicId: ulid(1_700_000_000_000 + idx),
+            productPublicId: pid,
+            productVersion: 1,
+            name: "Item",
+            description: "",
+            features: [],
+            unitPriceMinor: 1000,
+            currency: "USD",
+            quantity: 1,
+            lineTotalMinor: 1000,
+          })),
+          statusHistory: [],
+          customerNotes: [],
+        }));
+      return { items, nextAfter: null };
     },
     orders: {
       async get(principal: SessionPrincipal, orderPublicId: string) {
@@ -370,7 +414,7 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     ).rejects.toMatchObject({ reasonCode: "POLICY_HASH_MISMATCH" });
 
     // Accepting inside request context pseudonymizes IP (never stores raw IP) and passes exact hash check
-    const reqCtx = newRequestContext("test-accept");
+    const reqCtx = newRequestContext("test");
     reqCtx.ipAddress = "203.0.113.42";
     const accV1 = await runWithRequestContext(reqCtx, () =>
       compliance.policies.accept(customerAPrincipal, {
@@ -862,13 +906,13 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     expect(h.audit.recordedInTx[0]).toBe(true);
   });
 
-  it("handles verified provider payment & refund webhooks idempotently", async () => {
-    const { compliance } = makeHarness();
+  it("keeps online provider ledger disabled as a scaffold — valid signed payment/refund events record receipt + audit and leave the ledger unchanged", async () => {
+    const { h, compliance } = makeHarness();
 
     const draft = await compliance.invoices.admin.createDraft(staffPrincipal, {
       orderPublicId: orderB.publicId,
       currency: "USD",
-      lines: [{ description: "Online Stripe Test Package", quantity: 1, unitAmountMinor: 89_00 }],
+      lines: [{ description: "Online Stripe Disabled Scaffold Package", quantity: 1, unitAmountMinor: 89_00 }],
       discountMinor: 0,
       taxMinor: 0,
     });
@@ -877,34 +921,26 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     });
     expect(issued.invoiceNumber).toBe("RP-INV-2026-000002");
 
-    // Failed webhook does NOT mark invoice paid
-    const failedHook = await compliance.recordProviderPayment({
-      provider: "stripe",
-      providerEventId: "evt_fail_001",
-      providerReference: "pi_fail_001",
-      invoicePublicId: draft.invoicePublicId,
-      kind: "failed",
-      amountMinor: 89_00,
-      currency: "USD",
-    });
-    expect(failedHook.applied).toBe(true);
-    expect(failedHook.invoiceStatus).toBe("issued");
-
-    // Succeeded webhook (using integrations_engineer's exact signature) marks invoice paid
+    // Valid signed payment/checkout event arrives from webhook adapter:
+    // must record received-event row + audit note, return applied: false, and leave ledger 100% UNCHANGED!
+    h.audit.clear();
     const okHook = await compliance.recordProviderPayment({
       provider: "stripe",
       providerEventId: "evt_paid_001",
       providerReference: "pi_paid_001",
       invoicePublicId: draft.invoicePublicId,
+      kind: "succeeded",
       amountMinor: 89_00,
       currency: "USD",
       receivedAt: new Date("2026-11-20T13:00:00.000Z"),
     });
-    expect(okHook.applied).toBe(true);
+    expect(okHook.applied).toBe(false);
     expect(okHook.duplicate).toBe(false);
-    expect(okHook.invoiceStatus).toBe("paid");
+    expect(okHook.reasonCode).toBe("PROVIDER_LEDGER_DISABLED_IN_RELEASE");
+    expect(h.audit.named("invoice.provider_event.scaffold_recorded")).toHaveLength(1);
+    expect(h.audit.named("invoice.provider_event.scaffold_recorded")[0]?.outcome).toBe("refused");
 
-    // Replaying exact same providerEventId is strictly idempotent
+    // Duplicate delivery of the exact same providerEventId is idempotent and also leaves ledger unchanged
     const dupHook = await compliance.recordProviderPayment({
       provider: "stripe",
       providerEventId: "evt_paid_001",
@@ -916,7 +952,7 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     expect(dupHook.applied).toBe(false);
     expect(dupHook.duplicate).toBe(true);
 
-    // Provider refund webhook records refund and re-derives `issued`
+    // Provider refund event also leaves ledger unchanged
     const refundHook = await compliance.recordProviderPayment({
       provider: "stripe",
       providerEventId: "evt_refund_001",
@@ -926,9 +962,19 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
       amountMinor: 89_00,
       currency: "USD",
     });
-    expect(refundHook.applied).toBe(true);
-    expect(refundHook.invoiceStatus).toBe("issued");
-    expect(deriveInvoiceStatus({ issuedAt: new Date(), voidedAt: null, totalMinor: 89_00, grossPaidMinor: 89_00, refundedMinor: 89_00 })).toBe("issued");
+    expect(refundHook.applied).toBe(false);
+    expect(refundHook.reasonCode).toBe("PROVIDER_LEDGER_DISABLED_IN_RELEASE");
+
+    // Verify invoice status, balances, payments, and refunds are COMPLETELY UNCHANGED!
+    const afterEvents = await compliance.invoices.get(staffPrincipal, draft.invoicePublicId);
+    expect(afterEvents.status).toBe("issued");
+    expect(afterEvents.grossPaidMinor).toBe(0);
+    expect(afterEvents.refundedMinor).toBe(0);
+    expect(afterEvents.netPaidMinor).toBe(0);
+    expect(afterEvents.balanceDueMinor).toBe(89_00);
+    expect(afterEvents.payments).toHaveLength(0);
+    expect(afterEvents.refunds).toHaveLength(0);
+    expect(afterEvents.onlinePaymentConfigured).toBe(false);
   });
 
   it("exports normative portable v3 evidence in READ ONLY repeatable-read snapshots and imports inertly without fabricating active consent", async () => {
@@ -948,8 +994,8 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     expect(batch.intakeDefinitions.length).toBeGreaterThanOrEqual(1);
     expect(batch.intakeSubmissions.length).toBeGreaterThanOrEqual(1);
     expect(batch.invoices.length).toBeGreaterThanOrEqual(2);
-    expect(batch.payments.length).toBeGreaterThanOrEqual(3);
-    expect(batch.refunds.length).toBeGreaterThanOrEqual(2);
+    expect(batch.payments.length).toBeGreaterThanOrEqual(2);
+    expect(batch.refunds.length).toBeGreaterThanOrEqual(1);
     expect(batch.nextCursor).toBeNull();
 
     // Every emitted record satisfies RECORD_SCHEMAS and internal reference closure
@@ -1086,10 +1132,15 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
       // Spy on settings.get to prove `tx` is passed inside transactions!
       const txPassedFlags: boolean[] = [];
       const origGet = singleH.settings.get.bind(singleH.settings);
-      singleH.settings.get = async (key, parse, fallback, tx) => {
+      singleH.settings.get = (async <T>(
+        key: string,
+        parse: (raw: unknown) => T,
+        fallback: T,
+        tx?: unknown,
+      ): Promise<T> => {
         txPassedFlags.push(tx !== undefined);
         return origGet(key, parse, fallback);
-      };
+      }) as typeof singleH.settings.get;
       singleH.services.orders = buildFakeOrdersModule(ordersMap);
       singleH.services.compliance = createComplianceModule(singleH.deps);
 
@@ -1109,5 +1160,233 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     } finally {
       await singlePool.end();
     }
+  });
+
+  it("enforces reviewer security & audit invariants: staff policy audience isolation, server-derived acceptance method & effectiveAt/supersession, intake scope applicability, paginated revisions, and denial/refusal audits", async () => {
+    const { h, compliance } = makeHarness();
+
+    // 1. Staff-only policy must NEVER leak on public listPublished() or customer myStatus(), and customer accept() returns NOT_FOUND
+    const staffDoc = await compliance.policies.admin.createDocument(adminPrincipal, {
+      slug: "staff-security-charter",
+      title: "Internal Staff Security Charter",
+      audience: "staff",
+      requiresAcceptance: true,
+      requiresTypedSignature: false,
+      versionLabel: "1.0",
+      contentFormat: "plain_text",
+      bodyText: "Confidential staff security handling procedures.",
+    });
+    const pubStaffV1 = await compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: staffDoc.draftVersionPublicId,
+    });
+
+    const publicList = await compliance.policies.listPublished();
+    expect(publicList.some((p) => p.slug === "staff-security-charter")).toBe(false);
+
+    const custStatus = await compliance.policies.myStatus(customerAPrincipal);
+    expect(custStatus.published.some((p) => p.slug === "staff-security-charter")).toBe(false);
+
+    const staffStatus = await compliance.policies.myStatus(staffPrincipal);
+    expect(staffStatus.published.some((p) => p.slug === "staff-security-charter")).toBe(true);
+
+    await expect(
+      compliance.policies.accept(customerAPrincipal, {
+        versionPublicId: pubStaffV1.versionPublicId,
+        contentHash: pubStaffV1.contentHash,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // 2. Server-derived acceptance method + future effectiveAt + superseded version check
+    const checkboxDoc = await compliance.policies.admin.createDocument(adminPrincipal, {
+      slug: "acceptable-use",
+      title: "Acceptable Use Policy",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: false,
+      versionLabel: "1.0",
+      contentFormat: "plain_text",
+      bodyText: "Acceptable use v1.",
+    });
+    const pubUseV1 = await compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: checkboxDoc.draftVersionPublicId,
+    });
+
+    // Customer sends unsolicited `typed_signature` + `signerName` on a non-signature policy -> server derives `portal_checkbox` and ignores signerName!
+    const accUse = await compliance.policies.accept(customerAPrincipal, {
+      versionPublicId: pubUseV1.versionPublicId,
+      contentHash: pubUseV1.contentHash,
+      method: "typed_signature",
+      signerName: "Spoofed Signer",
+    });
+    const [accUseRow] = await tdb.db
+      .select()
+      .from(complianceSchema.policyAcceptances)
+      .where(eq(complianceSchema.policyAcceptances.publicId, accUse.acceptancePublicId));
+    expect(accUseRow?.method).toBe("portal_checkbox");
+    expect(accUseRow?.signerNameEnc).toBeNull();
+
+    // Publish v2 effective now -> v1 is now superseded for new acceptances (Customer B cannot accept v1!)
+    const draftUseV2 = await compliance.policies.admin.createDraftVersion(adminPrincipal, {
+      documentPublicId: checkboxDoc.documentPublicId,
+      versionLabel: "2.0",
+      contentFormat: "plain_text",
+      bodyText: "Acceptable use v2.",
+    });
+    await compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: draftUseV2.versionPublicId,
+    });
+    await expect(
+      compliance.policies.accept(customerBPrincipal, {
+        versionPublicId: pubUseV1.versionPublicId,
+        contentHash: pubUseV1.contentHash,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "POLICY_VERSION_SUPERSEDED" });
+
+    // Future effectiveAt version is not yet accept-eligible (`NOT_FOUND`)
+    const futureDoc = await compliance.policies.admin.createDocument(adminPrincipal, {
+      slug: "future-policy",
+      title: "Future Policy",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: false,
+      versionLabel: "1.0",
+      contentFormat: "plain_text",
+      bodyText: "Effective next year.",
+    });
+    const pubFuture = await compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: futureDoc.draftVersionPublicId,
+      effectiveAt: new Date("2027-06-01T00:00:00.000Z"),
+    });
+    await expect(
+      compliance.policies.accept(customerAPrincipal, {
+        versionPublicId: pubFuture.versionPublicId,
+        contentHash: pubFuture.contentHash,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // 3. Intake scope applicability (`catalog_item` + `workflow`) inside tx & paginated revisions
+    const unrelatedProductId = ulid(h.clock.now().getTime() + 50_000);
+    const catQ = await compliance.intake.admin.createQuestionnaire(adminPrincipal, {
+      slug: "hipaa-addendum",
+      title: "HIPAA Addendum",
+      scopeKind: "catalog_item",
+      scopeRef: unrelatedProductId,
+      fields: [{ key: "covered_entity", label: "Covered Entity Name", type: "short_text", required: true, sensitive: false }],
+    });
+    await compliance.intake.admin.publishVersion(adminPrincipal, catQ.draftVersionPublicId);
+
+    // Order A does NOT contain `unrelatedProductId` -> saveDraft & submit MUST reject with NOT_FOUND (no existence oracle)!
+    await expect(
+      compliance.intake.saveDraft(customerAPrincipal, {
+        orderPublicId: orderA.publicId,
+        questionnairePublicId: catQ.questionnairePublicId,
+        answers: { covered_entity: "Acme Health" },
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", reasonCode: "INTAKE_QUESTIONNAIRE_NOT_FOUND" });
+
+    // Workflow-scoped questionnaire: rejected on orderB (`standard`), accepted on orderA when `workflowKey === "expedited"`
+    const wfQ = await compliance.intake.admin.createQuestionnaire(adminPrincipal, {
+      slug: "expedited-intake",
+      title: "Expedited Workflow Intake",
+      scopeKind: "workflow",
+      scopeRef: "expedited",
+      fields: [{ key: "target_date", label: "Target Go-Live", type: "date", required: true, sensitive: false }],
+    });
+    await compliance.intake.admin.publishVersion(adminPrincipal, wfQ.draftVersionPublicId);
+
+    await expect(
+      compliance.intake.submit(customerBPrincipal, {
+        orderPublicId: orderB.publicId,
+        questionnairePublicId: wfQ.questionnairePublicId,
+        answers: { target_date: "2026-12-01" },
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", reasonCode: "INTAKE_QUESTIONNAIRE_NOT_FOUND" });
+
+    orderA.workflowKey = "expedited";
+    await compliance.intake.saveDraft(customerAPrincipal, {
+      orderPublicId: orderA.publicId,
+      questionnairePublicId: wfQ.questionnairePublicId,
+      answers: { target_date: "2026-12-01" },
+    });
+    await compliance.intake.saveDraft(customerAPrincipal, {
+      orderPublicId: orderA.publicId,
+      questionnairePublicId: wfQ.questionnairePublicId,
+      answers: { target_date: "2026-12-05" },
+    });
+    await compliance.intake.submit(customerAPrincipal, {
+      orderPublicId: orderA.publicId,
+      questionnairePublicId: wfQ.questionnairePublicId,
+      answers: { target_date: "2026-12-10" },
+    });
+
+    const page1 = await compliance.intake.getSubmission(customerAPrincipal, {
+      orderPublicId: orderA.publicId,
+      questionnairePublicId: wfQ.questionnairePublicId,
+      limit: 2,
+    });
+    expect(page1.revisions).toHaveLength(2);
+    expect(page1.nextCursor).not.toBeNull();
+    const page2 = await compliance.intake.getSubmission(customerAPrincipal, {
+      orderPublicId: orderA.publicId,
+      questionnairePublicId: wfQ.questionnairePublicId,
+      cursor: page1.nextCursor!,
+      limit: 2,
+    });
+    expect(page2.revisions).toHaveLength(1);
+    expect(page2.nextCursor).toBeNull();
+
+    // 4. Audit coverage C-1 (authz/step-up denial outside tx) & C-2 (financial refusal after rollback) & snake_case attributes
+    h.audit.clear();
+    await expect(
+      compliance.policies.admin.listDocuments(customerAPrincipal),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", reasonCode: "CAPABILITY_NOT_GRANTED" });
+    expect(h.audit.named("authz.compliance.denied")).toHaveLength(1);
+    expect(h.audit.named("authz.compliance.denied")[0]?.outcome).toBe("denied");
+    expect(h.audit.recordedInTx[0]).toBe(false);
+
+    // Stale/missing stepUpAt on staffPrincipal attempting `invoices.manage` mutation -> STEP_UP_REQUIRED + authz.compliance.denied!
+    const noStepUpStaff = fakePrincipal({
+      userId: staffPrincipal.userId,
+      userPublicId: staffPrincipal.userPublicId,
+      role: "staff",
+      stepUpAt: null,
+    });
+    h.audit.clear();
+    await expect(
+      compliance.invoices.admin.createDraft(noStepUpStaff, {
+        orderPublicId: orderA.publicId,
+        currency: "USD",
+        lines: [{ description: "Needs Step-Up", quantity: 1, unitAmountMinor: 10_00 }],
+        discountMinor: 0,
+        taxMinor: 0,
+      }),
+    ).rejects.toMatchObject({ code: "STEP_UP_REQUIRED", reasonCode: "STEP_UP_REQUIRED" });
+    expect(h.audit.named("authz.compliance.denied")).toHaveLength(1);
+    expect(h.audit.recordedInTx[0]).toBe(false);
+
+    // Financial refusal (payment exceeding balance due) records `invoice.payment.refused` after rollback with snake_case attributes
+    const refDraft = await compliance.invoices.admin.createDraft(staffPrincipal, {
+      orderPublicId: orderA.publicId,
+      currency: "USD",
+      lines: [{ description: "Refusal Audit Check", quantity: 1, unitAmountMinor: 20_00 }],
+      discountMinor: 0,
+      taxMinor: 0,
+    });
+    await compliance.invoices.admin.issue(staffPrincipal, { invoicePublicId: refDraft.invoicePublicId });
+    h.audit.clear();
+    await expect(
+      compliance.invoices.admin.recordManualPayment(staffPrincipal, {
+        invoicePublicId: refDraft.invoicePublicId,
+        method: "wire",
+        amountMinor: 25_00,
+        currency: "USD",
+        reference: "WIRE-TOO-HIGH",
+        idempotencyKey: "idem-wire-too-high",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PAYMENT_EXCEEDS_BALANCE_DUE" });
+    const refusedEvt = h.audit.named("invoice.payment.refused")[0];
+    expect(refusedEvt?.outcome).toBe("refused");
+    expect(refusedEvt?.reasonCode).toBe("PAYMENT_EXCEEDS_BALANCE_DUE");
+    expect(Object.keys(refusedEvt?.attributes ?? {}).every((k) => /^[a-z0-9_]+$/.test(k))).toBe(true);
   });
 });

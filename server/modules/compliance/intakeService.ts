@@ -1,12 +1,14 @@
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, lt } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
-import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
+import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { SessionPrincipal, Tx } from "../../core/types.js";
-import { assertLiveActorInTx } from "./actorAuth.js";
+import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
   canonicalizeIntakeFields,
+  decodeIdCursor,
+  encodeIdCursor,
   hashQuestionnaireFields,
   validateIntakeAnswers,
   type IntakeAnswerMap,
@@ -91,12 +93,16 @@ export interface IntakeRevisionView {
   occurredAt: Date;
 }
 
-function assertIntakeAdminRead(principal: SessionPrincipal): void {
+async function assertIntakeAdminRead(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  resource: { type: string; publicId?: string } = { type: "intake_questionnaire" },
+): Promise<void> {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
-    throw forbidden("REMEDIATION_SESSION");
+    await denyComplianceAuthz(deps, principal, "REMEDIATION_SESSION", resource);
   }
   if (!roleHasCapability(principal.role, "intake.manage")) {
-    throw forbidden("CAPABILITY_NOT_GRANTED");
+    await denyComplianceAuthz(deps, principal, "CAPABILITY_NOT_GRANTED", resource);
   }
 }
 
@@ -134,31 +140,60 @@ export function createIntakeService(deps: ModuleDeps) {
     return ordersSvc;
   }
 
-  async function resolveOrderProductPublicIds(
-    principal: SessionPrincipal,
-    orderPublicId: string,
-  ): Promise<Set<string>> {
+  interface OrderScopeFacts {
+    productPublicIds: ReadonlySet<string>;
+    workflowKey: string | null;
+  }
+
+  /**
+   * Resolves order catalog product IDs and workflow key on the caller's `dbOrTx` connection
+   * so applicability checks work identically in `listForOrder` and inside `writeSubmissionInTx`
+   * without acquiring a second pool connection.
+   */
+  async function resolveOrderScopeFacts(
+    dbOrTx: DbOrTx,
+    orderId: number,
+    fallback?: { principal: SessionPrincipal; orderPublicId: string },
+  ): Promise<OrderScopeFacts> {
     const ordersSvc = requireOrdersService();
     const productIds = new Set<string>();
-    if (ordersSvc.orders && typeof ordersSvc.orders.get === "function") {
-      const detail = await ordersSvc.orders.get(principal, orderPublicId);
+    let workflowKey: string | null = null;
+
+    if (typeof ordersSvc.portableOrders === "function") {
+      const snap = await ordersSvc.portableOrders(dbOrTx, { limit: 1, orderIds: [orderId] });
+      const ord = snap.items[0];
+      if (ord) {
+        workflowKey = ord.workflowKey ?? null;
+        for (const item of ord.lineItems) {
+          if (item.productPublicId) productIds.add(item.productPublicId);
+        }
+      }
+      return { productPublicIds: productIds, workflowKey };
+    }
+
+    if (dbOrTx === deps.db && fallback && ordersSvc.orders && typeof ordersSvc.orders.get === "function") {
+      const detail = await ordersSvc.orders.get(fallback.principal, fallback.orderPublicId);
       for (const item of detail.lineItems) {
         if (item.productPublicId) productIds.add(item.productPublicId);
       }
+      const maybeWf = (detail as { workflowKey?: unknown }).workflowKey;
+      if (typeof maybeWf === "string") workflowKey = maybeWf;
     }
-    return productIds;
+    return { productPublicIds: productIds, workflowKey };
   }
 
   function questionnaireMatchesOrder(
     q: typeof intakeQuestionnaires.$inferSelect,
-    productPublicIds: ReadonlySet<string>,
+    facts: OrderScopeFacts,
   ): boolean {
     if (!q.active) return false;
     if (q.scopeKind === "default") return true;
     if (q.scopeKind === "catalog_item") {
-      return q.scopeRef !== null && productPublicIds.has(q.scopeRef);
+      return q.scopeRef !== null && facts.productPublicIds.has(q.scopeRef);
     }
-    // Workflow-scoped questionnaires match when scopeRef is explicitly matched or default fallback
+    if (q.scopeKind === "workflow") {
+      return q.scopeRef !== null && facts.workflowKey !== null && q.scopeRef === facts.workflowKey;
+    }
     return false;
   }
 
@@ -173,7 +208,7 @@ export function createIntakeService(deps: ModuleDeps) {
   }> {
     const ordersSvc = requireOrdersService();
     const orderView = await ordersSvc.assertCanReadOrder(principal, orderPublicId);
-    const productPublicIds = await resolveOrderProductPublicIds(principal, orderPublicId);
+    const scopeFacts = await resolveOrderScopeFacts(deps.db, orderView.id, { principal, orderPublicId });
 
     const [allQuestionnaires, existingSubs] = await Promise.all([
       deps.db.select().from(intakeQuestionnaires).orderBy(asc(intakeQuestionnaires.slug)),
@@ -192,7 +227,7 @@ export function createIntakeService(deps: ModuleDeps) {
     const applicableQuestionnaires = allQuestionnaires.filter(
       (q) =>
         subByQuestionnaireId.has(q.id) ||
-        (q.currentPublishedVersionId !== null && questionnaireMatchesOrder(q, productPublicIds)),
+        (q.currentPublishedVersionId !== null && questionnaireMatchesOrder(q, scopeFacts)),
     );
 
     if (applicableQuestionnaires.length === 0) {
@@ -220,18 +255,28 @@ export function createIntakeService(deps: ModuleDeps) {
         : [];
     const versionById = new Map(versions.map((v) => [v.id, v]));
 
-    // Fetch latest review notes for submissions that were returned or accepted
+    // Project ONLY note fields (never encrypted 160 KB `answersEnc` blobs) to resolve latest review notes.
     const subIds = existingSubs.map((s) => s.id);
-    const revisions =
+    const noteRows =
       subIds.length > 0
         ? await deps.db
-            .select()
+            .select({
+              submissionId: intakeSubmissionRevisions.submissionId,
+              publicId: intakeSubmissionRevisions.publicId,
+              revisionNumber: intakeSubmissionRevisions.revisionNumber,
+              noteEnc: intakeSubmissionRevisions.noteEnc,
+            })
             .from(intakeSubmissionRevisions)
-            .where(inArray(intakeSubmissionRevisions.submissionId, subIds))
+            .where(
+              and(
+                inArray(intakeSubmissionRevisions.submissionId, subIds),
+                isNotNull(intakeSubmissionRevisions.noteEnc),
+              ),
+            )
             .orderBy(desc(intakeSubmissionRevisions.revisionNumber))
         : [];
     const latestNoteBySubId = new Map<number, string | null>();
-    for (const rev of revisions) {
+    for (const rev of noteRows) {
       if (!latestNoteBySubId.has(rev.submissionId) && rev.noteEnc) {
         latestNoteBySubId.set(
           rev.submissionId,
@@ -305,17 +350,26 @@ export function createIntakeService(deps: ModuleDeps) {
 
   async function getSubmission(
     principal: SessionPrincipal,
-    input: { orderPublicId: string; questionnairePublicId: string },
+    input: {
+      orderPublicId: string;
+      questionnairePublicId: string;
+      cursor?: string | undefined;
+      limit?: number | undefined;
+    },
   ): Promise<{
     item: OrderIntakeItemView;
     revisions: IntakeRevisionView[];
+    nextCursor: string | null;
   }> {
+    const pageLimit = Math.min(25, Math.max(1, input.limit ?? 10));
+    const cursorId = decodeIdCursor(input.cursor);
+
     const listed = await listForOrder(principal, input.orderPublicId);
     const item = listed.items.find((i) => i.questionnairePublicId === input.questionnairePublicId);
     if (!item) throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
 
     if (!item.submission) {
-      return { item, revisions: [] };
+      return { item, revisions: [], nextCursor: null };
     }
 
     const [subRow] = await deps.db
@@ -323,17 +377,26 @@ export function createIntakeService(deps: ModuleDeps) {
       .from(intakeSubmissions)
       .where(eq(intakeSubmissions.publicId, item.submission.submissionPublicId))
       .limit(1);
-    if (!subRow) return { item, revisions: [] };
+    if (!subRow) return { item, revisions: [], nextCursor: null };
+
+    const revConds = [eq(intakeSubmissionRevisions.submissionId, subRow.id)];
+    if (cursorId !== null) {
+      revConds.push(lt(intakeSubmissionRevisions.id, cursorId));
+    }
 
     const revs = await deps.db
       .select()
       .from(intakeSubmissionRevisions)
-      .where(eq(intakeSubmissionRevisions.submissionId, subRow.id))
-      .orderBy(desc(intakeSubmissionRevisions.revisionNumber));
+      .where(and(...revConds))
+      .orderBy(desc(intakeSubmissionRevisions.id))
+      .limit(pageLimit + 1);
+
+    const hasMore = revs.length > pageLimit;
+    const slice = hasMore ? revs.slice(0, pageLimit) : revs;
 
     return {
       item,
-      revisions: revs.map((r) => ({
+      revisions: slice.map((r) => ({
         revisionPublicId: r.publicId,
         revisionNumber: r.revisionNumber,
         eventKind: r.eventKind,
@@ -344,6 +407,7 @@ export function createIntakeService(deps: ModuleDeps) {
           : null,
         occurredAt: r.occurredAt,
       })),
+      nextCursor: hasMore && slice.length > 0 ? encodeIdCursor(slice[slice.length - 1]!.id) : null,
     };
   }
 
@@ -361,19 +425,28 @@ export function createIntakeService(deps: ModuleDeps) {
     status: IntakeSubmissionStatus;
     revisionNumber: number;
   }> {
-    const liveActor = await assertLiveActorInTx(deps, principal, tx);
-    const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+    // Canonical lock order: order row first via orders.assertCanWriteOrder(..., { tx, forUpdate: true }),
+    // then live actor re-validation (`users` FOR UPDATE + session check).
     const ordersSvc = requireOrdersService();
-    const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, input.orderPublicId, {
+    const orderView = await ordersSvc.assertCanWriteOrder(principal, input.orderPublicId, {
       kind: "intake",
       tx,
       forUpdate: true,
     });
+    const liveActor = await assertLiveActorInTx(deps, principal, tx);
+    if (liveActor.role !== principal.role) {
+      await ordersSvc.assertCanWriteOrder({ ...principal, role: liveActor.role }, input.orderPublicId, {
+        kind: "intake",
+        tx,
+        forUpdate: true,
+      });
+    }
 
     const [q] = await tx
       .select()
       .from(intakeQuestionnaires)
       .where(eq(intakeQuestionnaires.publicId, input.questionnairePublicId))
+      .for("share")
       .limit(1);
     if (!q) throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
 
@@ -402,8 +475,14 @@ export function createIntakeService(deps: ModuleDeps) {
           "This intake questionnaire is currently under review. Staff can return it if changes are needed.",
         );
       }
-    } else if (!q.active || !q.currentPublishedVersionId) {
-      throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
+    } else {
+      if (!q.active || !q.currentPublishedVersionId) {
+        throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
+      }
+      const scopeFacts = await resolveOrderScopeFacts(tx, orderView.id);
+      if (!questionnaireMatchesOrder(q, scopeFacts)) {
+        throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
+      }
     }
 
     const boundVersionId = existing ? existing.questionnaireVersionId : q.currentPublishedVersionId!;
@@ -499,14 +578,14 @@ export function createIntakeService(deps: ModuleDeps) {
         actor: { userId: liveActor.userId, role: liveActor.role },
         resource: { type: "intake_submission", publicId: submissionPublicId },
         attributes: {
-          orderPublicId: orderView.publicId,
-          questionnairePublicId: q.publicId,
-          questionnaireVersionPublicId: ver.publicId,
-          revisionNumber: nextRevision,
+          order_public_id: orderView.publicId,
+          questionnaire_public_id: q.publicId,
+          questionnaire_version_public_id: ver.publicId,
+          revision_number: nextRevision,
           status: nextStatus,
         },
         safeCounts: {
-          answeredFields: Object.values(cleanedAnswers).filter((v) => v !== null).length,
+          answered_fields: Object.values(cleanedAnswers).filter((v) => v !== null).length,
         },
       },
       tx,
@@ -523,7 +602,7 @@ export function createIntakeService(deps: ModuleDeps) {
     principal: SessionPrincipal,
     input: { orderPublicId: string; questionnairePublicId: string; answers: IntakeAnswerMap },
   ) {
-    return deps.db.transaction((tx) =>
+    return runComplianceTx(deps, principal, { type: "intake_submission" }, (tx) =>
       writeSubmissionInTx(tx, principal, { ...input, mode: "draft" }),
     );
   }
@@ -532,7 +611,7 @@ export function createIntakeService(deps: ModuleDeps) {
     principal: SessionPrincipal,
     input: { orderPublicId: string; questionnairePublicId: string; answers: IntakeAnswerMap },
   ) {
-    return deps.db.transaction((tx) =>
+    return runComplianceTx(deps, principal, { type: "intake_submission" }, (tx) =>
       writeSubmissionInTx(tx, principal, { ...input, mode: "submit" }),
     );
   }
@@ -553,7 +632,7 @@ export function createIntakeService(deps: ModuleDeps) {
       );
     }
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "intake_submission", publicId: input.submissionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "intake.review");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
@@ -629,10 +708,10 @@ export function createIntakeService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "intake_submission", publicId: sub.publicId },
           attributes: {
-            orderPublicId: orderView.publicId,
+            order_public_id: orderView.publicId,
             decision: input.decision,
-            revisionNumber: nextRevision,
-            hasReviewNote: trimmedNote.length > 0,
+            revision_number: nextRevision,
+            has_review_note: trimmedNote.length > 0,
           },
         },
         tx,
@@ -680,7 +759,7 @@ export function createIntakeService(deps: ModuleDeps) {
   /* --------------------------------------------------- admin questionnaires */
 
   async function adminListQuestionnaires(principal: SessionPrincipal): Promise<QuestionnaireAdminSummary[]> {
-    assertIntakeAdminRead(principal);
+    await assertIntakeAdminRead(deps, principal, { type: "intake_questionnaire" });
     const rows = await deps.db.select().from(intakeQuestionnaires).orderBy(asc(intakeQuestionnaires.slug));
     if (rows.length === 0) return [];
 
@@ -736,7 +815,7 @@ export function createIntakeService(deps: ModuleDeps) {
     questionnaire: Omit<QuestionnaireAdminSummary, "currentPublishedVersion" | "draftVersionPublicId">;
     versions: QuestionnaireVersionView[];
   }> {
-    assertIntakeAdminRead(principal);
+    await assertIntakeAdminRead(deps, principal, { type: "intake_questionnaire", publicId: questionnairePublicId });
     const [q] = await deps.db
       .select()
       .from(intakeQuestionnaires)
@@ -790,7 +869,7 @@ export function createIntakeService(deps: ModuleDeps) {
     const canonicalFields = canonicalizeIntakeFields(input.fields);
     const schemaHash = hashQuestionnaireFields(canonicalFields);
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "intake_questionnaire" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "intake.manage");
 
       const [existing] = await tx
@@ -840,11 +919,11 @@ export function createIntakeService(deps: ModuleDeps) {
           resource: { type: "intake_questionnaire", publicId: questionnairePublicId },
           attributes: {
             slug: input.slug,
-            scopeKind: input.scopeKind,
-            draftVersionPublicId,
-            schemaHash,
+            scope_kind: input.scopeKind,
+            draft_version_public_id: draftVersionPublicId,
+            schema_hash: schemaHash,
           },
-          safeCounts: { fieldCount: canonicalFields.length },
+          safeCounts: { field_count: canonicalFields.length },
         },
         tx,
       );
@@ -867,7 +946,7 @@ export function createIntakeService(deps: ModuleDeps) {
   ): Promise<{ questionnairePublicId: string; version: number }> {
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "intake_questionnaire", publicId: input.questionnairePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "intake.manage");
 
       const [q] = await tx
@@ -904,7 +983,7 @@ export function createIntakeService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "intake_questionnaire", publicId: q.publicId },
           attributes: {
-            scopeKind: input.scopeKind,
+            scope_kind: input.scopeKind,
             active: input.active,
           },
         },
@@ -927,7 +1006,7 @@ export function createIntakeService(deps: ModuleDeps) {
     const canonicalFields = canonicalizeIntakeFields(input.fields);
     const schemaHash = hashQuestionnaireFields(canonicalFields);
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "intake_questionnaire", publicId: input.questionnairePublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "intake.manage");
 
       const [q] = await tx
@@ -972,8 +1051,8 @@ export function createIntakeService(deps: ModuleDeps) {
             outcome: "completed",
             actor: { userId: liveActor.userId, role: liveActor.role },
             resource: { type: "intake_questionnaire_version", publicId: ver.publicId },
-            attributes: { questionnairePublicId: q.publicId, versionNumber: ver.versionNumber, schemaHash },
-            safeCounts: { fieldCount: canonicalFields.length },
+            attributes: { questionnaire_public_id: q.publicId, version_number: ver.versionNumber, schema_hash: schemaHash },
+            safeCounts: { field_count: canonicalFields.length },
           },
           tx,
         );
@@ -1011,8 +1090,8 @@ export function createIntakeService(deps: ModuleDeps) {
           outcome: "completed",
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "intake_questionnaire_version", publicId: versionPublicId },
-          attributes: { questionnairePublicId: q.publicId, versionNumber: nextNum, schemaHash },
-          safeCounts: { fieldCount: canonicalFields.length },
+          attributes: { questionnaire_public_id: q.publicId, version_number: nextNum, schema_hash: schemaHash },
+          safeCounts: { field_count: canonicalFields.length },
         },
         tx,
       );
@@ -1027,7 +1106,7 @@ export function createIntakeService(deps: ModuleDeps) {
   ): Promise<{ versionPublicId: string; schemaHash: string; publishedAt: Date }> {
     const now = deps.clock.now();
 
-    return deps.db.transaction(async (tx) => {
+    return runComplianceTx(deps, principal, { type: "intake_questionnaire_version", publicId: versionPublicId }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "intake.manage");
 
       const [ver] = await tx
@@ -1082,12 +1161,12 @@ export function createIntakeService(deps: ModuleDeps) {
           actor: { userId: liveActor.userId, role: liveActor.role },
           resource: { type: "intake_questionnaire_version", publicId: ver.publicId },
           attributes: {
-            questionnairePublicId: q.publicId,
+            questionnaire_public_id: q.publicId,
             slug: q.slug,
-            versionNumber: ver.versionNumber,
-            schemaHash: lockedHash,
+            version_number: ver.versionNumber,
+            schema_hash: lockedHash,
           },
-          safeCounts: { fieldCount: canonicalFields.length },
+          safeCounts: { field_count: canonicalFields.length },
         },
         tx,
       );

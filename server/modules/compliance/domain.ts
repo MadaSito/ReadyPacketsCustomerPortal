@@ -159,7 +159,8 @@ export const updatePolicyDraftSchema = z.strictObject({
 export const acceptPolicySchema = z.strictObject({
   versionPublicId: publicIdSchema,
   contentHash: sha256HexSchema,
-  method: z.enum(["portal_checkbox", "registration", "typed_signature"]).default("portal_checkbox"),
+  /** Optional UI hint; the server derives the authoritative acceptance method from the locked policy document. */
+  method: z.enum(["portal_checkbox", "typed_signature"]).optional(),
   signerName: nfcTrimmedString(1, 160).optional(),
   orderPublicId: publicIdSchema.optional(),
 });

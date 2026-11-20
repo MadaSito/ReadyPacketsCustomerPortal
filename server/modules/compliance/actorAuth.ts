@@ -7,11 +7,74 @@ import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { users } from "../identity/schema.js";
 
 /**
+ * Records `authz.compliance.denied` outside any transaction and throws `FORBIDDEN`.
+ */
+export async function denyComplianceAuthz(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  reasonCode: string,
+  resource: { type: string; publicId?: string },
+): Promise<never> {
+  await deps.audit.record({
+    category: "security",
+    eventName: "authz.compliance.denied",
+    action: "authorize",
+    outcome: "denied",
+    severity: "WARN",
+    reasonCode,
+    actor: { userId: principal.userId, role: principal.role },
+    resource,
+  });
+  throw forbidden(reasonCode);
+}
+
+/**
+ * Runs a compliance write transaction and, AFTER rollback on authz/step-up/remediation denial
+ * (or caller-supplied business refusal), records the durable audit event outside any transaction
+ * so neither rollback nor single-connection pools drop or deadlock the denial audit.
+ */
+export async function runComplianceTx<T>(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  resource: { type: string; publicId?: string },
+  fn: (tx: Tx) => Promise<T>,
+  options?: {
+    onRefusalAfterRollback?: (err: DomainError) => Promise<void>;
+  },
+): Promise<T> {
+  try {
+    return await deps.db.transaction(fn);
+  } catch (err) {
+    if (err instanceof DomainError) {
+      if (
+        err.code === "FORBIDDEN" ||
+        err.code === "STEP_UP_REQUIRED" ||
+        err.code === "REMEDIATION_REQUIRED"
+      ) {
+        await deps.audit.record({
+          category: "security",
+          eventName: "authz.compliance.denied",
+          action: "authorize",
+          outcome: "denied",
+          severity: "WARN",
+          reasonCode: err.reasonCode,
+          actor: { userId: principal.userId, role: principal.role },
+          resource,
+        });
+      } else if (options?.onRefusalAfterRollback) {
+        await options.onRefusalAfterRollback(err);
+      }
+    }
+    throw err;
+  }
+}
+
+/**
  * Re-validates the acting principal INSIDE `tx` so a mid-flight role demotion, account suspension,
  * or session revocation aborts the privileged write (fail closed).
  *
  * Lock ordering follows identity/API.md: `users` row FOR UPDATE (and `user_sessions` via
- * `identity.sessions.assertCurrent` when wired) BEFORE any compliance or order rows.
+ * `identity.sessions.assertCurrent` when wired) BEFORE any compliance rows.
  */
 export async function assertLiveActorInTx(
   deps: ModuleDeps,
@@ -47,7 +110,11 @@ export async function assertLiveActorInTx(
     .limit(1);
 
   if (!liveUser || liveUser.status !== "active") {
-    throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Your session is no longer active. Please sign in again.");
+    throw new DomainError(
+      "UNAUTHENTICATED",
+      "SESSION_NOT_CURRENT",
+      "Your session is no longer active. Please sign in again.",
+    );
   }
 
   if (requiredCapability) {
@@ -60,7 +127,11 @@ export async function assertLiveActorInTx(
       if (identitySvc?.sessions?.getState) {
         const liveSession = await identitySvc.sessions.getState(principal.sessionId, { tx });
         if (!liveSession || !liveSession.live) {
-          throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Your session is no longer active.");
+          throw new DomainError(
+            "UNAUTHENTICATED",
+            "SESSION_NOT_CURRENT",
+            "Your session is no longer active.",
+          );
         }
         stepUpAt = liveSession.stepUpAt;
       }
