@@ -1,2 +1,238 @@
-/* Global styles + design tokens. Owner: UI foundation engineer. */
+/*
+ * Global styles + design tokens. Owner: UI foundation engineer.
+ * Source of truth: docs/brand/BRAND_GUIDE.md and docs/brand/*.css. Light values live in @theme; html.dark
+ * overrides the same names. Feature code uses ONLY these semantic utilities (bg-surface, text-ink, …).
+ * Mirrored as data in client/src/ui/tokens.ts (contrast unit test) — keep both in sync.
+ */
 @import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/inter-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/inter-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/fonts/inter-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("/fonts/inter-700.woff2") format("woff2");
+}
+
+@theme {
+  --font-sans: "Inter", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+  --color-white: #ffffff;
+  --color-black: #000000;
+
+  --color-navy: #0D1B2A;
+  --color-navy-raised: #12263A;
+  --color-navy-elevated: #17304A;
+  --color-navy-border: #1F3A56;
+  --color-ink: #0D1B2A;
+  --color-body: #4A5568;
+  --color-muted: #5E6D82;
+  --color-line: #DFE5EC;
+  --color-surface: #FFFFFF;
+  --color-surface-soft: #F5F7FA;
+  --color-surface-sunken: #EEF2F7;
+  --color-teal: #20A090;
+  --color-teal-dark: #1A7A6E;
+  --color-teal-light: #2EC4B6;
+  --color-action: #137568;
+  --color-action-hover: #0E6056;
+  --color-on-action: #FFFFFF;
+  --color-danger-action: #B3261E;
+  --color-danger-action-hover: #8F1E18;
+  --color-on-danger-action: #FFFFFF;
+  --color-control-border: #7B8798;
+  --color-gold: #C9A84C;
+  --color-gold-dark: #A98C36;
+  --color-success: #157F52;
+  --color-warning: #8A570E;
+  --color-danger: #B3261E;
+  --color-info: #1A6FA8;
+  /* Tinted status backgrounds (derived, verified in contrast.test.ts). */
+  --color-success-soft: #EFF8F3;
+  --color-warning-soft: #FBF1E1;
+  --color-danger-soft: #FBEAE9;
+  --color-info-soft: #E6F0F8;
+  --color-action-soft: #E3F1EF;
+  /* Text on navy brand panels (both themes). */
+  --color-on-navy: #F2F8F8;
+  --color-on-navy-muted: #B8C7D2;
+  --color-focus: #137568;
+
+  --radius-card: 0.75rem;
+  --radius-control: 0.5rem;
+  --shadow-card: 0 1px 2px rgb(13 27 42 / 0.06), 0 1px 3px rgb(13 27 42 / 0.08);
+  --shadow-raised: 0 8px 24px rgb(13 27 42 / 0.12), 0 2px 6px rgb(13 27 42 / 0.08);
+
+  --breakpoint-xs: 22.5rem;
+
+  --animate-fade-in: rp-fade-in 160ms ease-out;
+  --animate-slide-in-left: rp-slide-in-left 200ms ease-out;
+  --animate-slide-in-right: rp-slide-in-right 200ms ease-out;
+}
+
+html.dark {
+  color-scheme: dark;
+  --color-navy: #071824;
+  --color-navy-raised: #0D2635;
+  --color-navy-elevated: #123444;
+  --color-navy-border: #275064;
+  --color-ink: #F2F8F8;
+  --color-body: #C4D2D8;
+  --color-muted: #92A8B2;
+  --color-line: #284656;
+  --color-surface: #091A27;
+  --color-surface-soft: #102634;
+  --color-surface-sunken: #142F3E;
+  --color-teal: #2EC4B6;
+  --color-teal-dark: #55D6C9;
+  --color-teal-light: #8CE8DC;
+  --color-action: #2EC4B6;
+  --color-action-hover: #55D6C9;
+  --color-on-action: #071824;
+  --color-danger-action: #FF8D87;
+  --color-danger-action-hover: #FFB2AD;
+  --color-on-danger-action: #071824;
+  --color-control-border: #708C9C;
+  --color-gold: #E2C26A;
+  --color-gold-dark: #C9A84C;
+  --color-success: #57CF91;
+  --color-warning: #EFBD65;
+  --color-danger: #FF8D87;
+  --color-info: #6DBCF0;
+  --color-success-soft: #10342C;
+  --color-warning-soft: #33301F;
+  --color-danger-soft: #3A2228;
+  --color-info-soft: #0F2E44;
+  --color-action-soft: #0F3438;
+  --color-on-navy: #F2F8F8;
+  --color-on-navy-muted: #B8C7D2;
+  --color-focus: #55D6C9;
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35), 0 1px 3px rgb(0 0 0 / 0.3);
+  --shadow-raised: 0 10px 28px rgb(0 0 0 / 0.45), 0 2px 6px rgb(0 0 0 / 0.3);
+}
+html:not(.dark) {
+  color-scheme: light;
+}
+
+@keyframes rp-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes rp-slide-in-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+@keyframes rp-slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    background-color: var(--color-surface-soft);
+  }
+  body {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.6;
+    color: var(--color-body);
+    background-color: var(--color-surface-soft);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv11", "ss01";
+    overflow-x: hidden;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    color: var(--color-ink);
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.011em;
+    text-wrap: balance;
+  }
+  p { text-wrap: pretty; }
+  code, pre, kbd, samp { font-family: var(--font-mono); font-size: 0.9em; }
+  input, textarea, select, button { font: inherit; color: inherit; }
+  @media (pointer: coarse) {
+    input:not([type="checkbox"]):not([type="radio"]), textarea, select { font-size: 1rem; }
+  }
+  :focus { outline: none; }
+  :focus-visible {
+    outline: 3px solid var(--color-focus);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+  ::selection { background-color: var(--color-action); color: var(--color-on-action); }
+  [hidden] { display: none !important; }
+  img { max-width: 100%; }
+}
+
+@layer components {
+  .rp-skip-link {
+    position: absolute;
+    left: 0.75rem;
+    top: -4rem;
+    z-index: 100;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-control);
+    background: var(--color-action);
+    color: var(--color-on-action);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .rp-skip-link:focus { top: 0.75rem; }
+
+  .prose-rp { color: var(--color-body); max-width: 72ch; }
+  .prose-rp h1 { font-size: 1.875rem; margin: 0 0 1rem; }
+  .prose-rp h2 { font-size: 1.375rem; margin: 2rem 0 0.75rem; }
+  .prose-rp h3 { font-size: 1.0625rem; margin: 1.5rem 0 0.5rem; }
+  .prose-rp p, .prose-rp ul, .prose-rp ol { margin: 0 0 1rem; }
+  .prose-rp ul { list-style: disc; padding-left: 1.25rem; }
+  .prose-rp ol { list-style: decimal; padding-left: 1.25rem; }
+  .prose-rp a { color: var(--color-action); text-decoration: underline; text-underline-offset: 2px; }
+  .prose-rp table { font-size: 0.9375rem; width: 100%; border-collapse: collapse; }
+  .prose-rp th, .prose-rp td { border-bottom: 1px solid var(--color-line); padding: 0.5rem; text-align: left; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :focus-visible { outline: 3px solid CanvasText; }
+  .rp-forced-border { border: 1px solid CanvasText; }
+}
