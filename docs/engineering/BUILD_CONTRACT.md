@@ -242,6 +242,11 @@ block — code against the agreed signature and use a fake in tests.
   paths are `/admin/…`. Auth/transition paths are `/sign-in`, `/register`, `/verify-email`, `/mfa`, … (UI
   foundation owns them). Navigation with wouter `<Link>` / `useLocation`; **never** build URLs with
   `window.location`, never use in-page `href="#…"` anchors (the preview build uses hash routing).
+- Features never import each other. To appear inside another feature's page, contribute through the
+  registry in `routes.tsx`: `orderTabs` (rendered by the orders feature on the order detail page, receives
+  `{ orderId, area }`), `customerTabs` (rendered by the identity feature on the console customer detail
+  page, receives `{ customerId }`) and `widgets` (dashboard cards). Hosts import `ORDER_TABS`,
+  `CUSTOMER_TABS`, `WIDGETS` from `@/app/registry`.
 - Data: `const trpc = useTRPC(); useQuery(trpc.orders.list.queryOptions(input))`,
   `useMutation(trpc.orders.create.mutationOptions())`; show `errorMessage(error)` from `@/lib/trpc`.
   Raw uploads/downloads use `sessionFetch` + `apiUrl` from `@/lib`. Never read or store tokens.
