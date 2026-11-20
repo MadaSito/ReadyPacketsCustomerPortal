@@ -17,6 +17,7 @@ import { createOrdersModule } from "../orders/index.js";
 import * as ordersSchema from "../orders/schema.js";
 import { copyExact, inPrivateWorkspace } from "./custody.js";
 import { buildPlan, type PortableInputRecord } from "./importPlanning.js";
+import { projectedOrder } from "./importShapes.js";
 import { createPortableModule } from "./index.js";
 import * as portableSchema from "./schema.js";
 import { PORTABLE_EXPORT_JOB, PORTABLE_IMPORT_JOB, PORTABLE_RETENTION_JOB } from "./transferPolicy.js";
@@ -28,6 +29,11 @@ const AUTH_MARKER = "source-password-hash-must-not-travel";
 const PDF = examplePdf();
 const PASSPHRASE = randomBytes(26).toString("base64url");
 const FILE_HASH = createHash("sha256").update(PDF).digest("hex");
+const OFFERING_SNAPSHOT = {
+  packetNumber: 2, tier: "Standard" as const, outcome: "Documented findings",
+  timeline: "Five business days", deliverables: [{ title: "Summary", detail: "Reviewed findings and next steps" }],
+};
+const OFFERING_PRICE = { subtotalMinor: 2500, discountMinor: 375, discountLabel: "Fixture bundle discount", totalMinor: 2125 };
 
 async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const result: T[] = [];
@@ -101,9 +107,9 @@ describe("portable transfer across isolated MySQL installations", () => {
     const order = await sourceDb.db.transaction((tx) => source.services.orders.importOrder({
       importId: ulid(), sourceInstallationId: "synthetic-source-fixture", sourceOrderPublicId: ulid(),
       targetOwnerUserId: sourceCustomer.userId, projectName: "Synthetic order", statusKey: "submitted",
-      totalMinor: 2500, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
+      ...OFFERING_PRICE, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
       lineItems: [{ sourcePublicId: ulid(), productPublicId: null, productVersion: null, name: "Fixture line",
-        description: "", features: [], unitPriceMinor: 2500, currency: "USD", quantity: 1, lineTotalMinor: 2500 }],
+        description: "", features: [], ...OFFERING_SNAPSHOT, unitPriceMinor: 2500, currency: "USD", quantity: 1, lineTotalMinor: 2500 }],
       statusHistory: [{ sourcePublicId: ulid(), fromStatus: null, toStatus: "submitted", actorRole: "system",
         reasonCode: "SOURCE_FIXTURE", occurredAt: CREATED }],
     }, tx));
@@ -146,7 +152,16 @@ describe("portable transfer across isolated MySQL installations", () => {
       try {
         const report = await pkg.verify();
         expect(report.ok).toBe(true);
-        const recordData = JSON.stringify(await collect(pkg.allRecords()));
+        const records = await collect(pkg.allRecords());
+        expect(records.find((entry) => entry.type === "orders")?.record).toMatchObject({
+          subtotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
+          discount: { amountMinor: OFFERING_PRICE.discountMinor, currency: "USD" },
+          discountLabel: OFFERING_PRICE.discountLabel, total: { amountMinor: OFFERING_PRICE.totalMinor, currency: "USD" },
+        });
+        expect(records.find((entry) => entry.type === "order-items")?.record).toMatchObject({
+          ...OFFERING_SNAPSHOT, tier: "standard", lineTotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
+        });
+        const recordData = JSON.stringify(records);
         expect(recordData).not.toContain(AUTH_MARKER);
         expect(recordData).not.toContain(PASSPHRASE);
         expect(recordData).not.toMatch(/password|mfa|session|storageKey/i);
@@ -217,7 +232,9 @@ describe("portable transfer across isolated MySQL installations", () => {
     const imported = await target.services.identity.getUserByPublicId(sourceCustomer.publicId);
     expect(imported).toMatchObject({ email: CUSTOMER_EMAIL, status: "pending_activation", role: "customer", hasPassword: false, emailVerified: false, createdAt: CREATED });
     const [order] = await targetDb.db.select().from(ordersSchema.orders);
-    expect(order).toMatchObject({ lockState: "imported_read_only", ownerUserId: imported?.id, totalMinor: 2500, submittedAt: CREATED, createdAt: CREATED });
+    expect(order).toMatchObject({ lockState: "imported_read_only", ownerUserId: imported?.id, ...OFFERING_PRICE, submittedAt: CREATED, createdAt: CREATED });
+    const [line] = await targetDb.db.select().from(ordersSchema.orderLineItems);
+    expect(line).toMatchObject({ orderId: order?.id, ...OFFERING_SNAPSHOT, lineTotalMinor: OFFERING_PRICE.subtotalMinor });
     const [file] = await targetDb.db.select().from(filesSchema.orderFiles);
     expect(file).toMatchObject({ ownerUserId: imported?.id, orderId: order?.id, sha256: FILE_HASH, createdAt: CREATED });
     if (!file || !order) throw new Error("missing target records");
@@ -310,7 +327,8 @@ describe("portable transfer across isolated MySQL installations", () => {
     const orderId = ulid();
     const amount = (amountMinor: number) => ({ amountMinor, currency: "USD" });
     const customer = { publicId: customerId, email: "unique.preflight@example.test", preferredName: "Plan fixture", createdAt: null };
-    const order = { publicId: orderId, customerPublicId: customerId, status: "submitted", total: amount(2500),
+    const order = { publicId: orderId, customerPublicId: customerId, status: "submitted",
+      subtotal: amount(2500), discount: amount(0), total: amount(2500),
       projectName: "Fixture", orderNumber: "RP-42", currency: "USD", createdAt: CREATED.toISOString() };
     const item = { publicId: ulid(), orderPublicId: orderId, name: "Fixture", sku: "item", quantity: 2, unitPrice: amount(1250), lineTotal: amount(2500) };
     const run = (records: PortableInputRecord[]) => buildPlan(target.deps, {
@@ -322,6 +340,11 @@ describe("portable transfer across isolated MySQL installations", () => {
       { type: "order-items", record: { ...item, lineTotal: amount(2200) } },
     ]);
     expect(wrongMath.summary.samples).toContainEqual(expect.objectContaining({ reason: "PORTABLE_IMPORT_LINE_TOTAL_MISMATCH" }));
+    const wrongDiscount = await run([
+      { type: "customers", record: customer }, { type: "orders", record: { ...order, discount: amount(375) } },
+      { type: "order-items", record: item },
+    ]);
+    expect(wrongDiscount.summary.samples).toContainEqual(expect.objectContaining({ reason: "PORTABLE_IMPORT_TOTAL_MISMATCH" }));
     const unknownStatus = await run([
       { type: "customers", record: customer }, { type: "orders", record: { ...order, status: "unrecognized" } },
       { type: "order-items", record: item },
@@ -334,5 +357,18 @@ describe("portable transfer across isolated MySQL installations", () => {
     expect(duplicate.summary.counts.conflicts).toBe(2);
     expect(duplicate.summary.samples.every((sample) => sample.reason === "PORTABLE_DUPLICATE_CUSTOMER_IDENTIFIERS")).toBe(true);
     expect(await targetDb.db.select().from(ordersSchema.orders)).toHaveLength(1);
+  });
+
+  it("does not invent a packet number for an older record that only carried a tier token", () => {
+    const money = { amountMinor: 2500, currency: "USD" };
+    const order = { publicId: ulid(), projectName: "Legacy fixture", status: "submitted", orderNumber: "RP-42",
+      currency: "USD", subtotal: money, discount: { ...money, amountMinor: 0 }, total: money, createdAt: CREATED.toISOString() };
+    const line = { publicId: ulid(), name: "Legacy item", sku: "legacy-item", quantity: 1, unitPrice: money, lineTotal: money,
+      tier: "standard" };
+    const projected = projectedOrder(order, [line], []);
+    expect(projected).toMatchObject({ discountLabel: null, lineItems: [{ tier: null }] });
+    expect(projected.lineItems[0]?.packetNumber).toBeUndefined();
+    expect(() => projectedOrder(order, [{ ...line, packetNumber: 2, tier: "unrecognized" }], []))
+      .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
   });
 });

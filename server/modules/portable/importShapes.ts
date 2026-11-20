@@ -1,8 +1,13 @@
+import { OrderItemRecord, OrderRecord } from "../../../portable/src/index.js";
 import type { FileCategory } from "../files/index.js";
 import { validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { nameSchema } from "../identity/normalize.js";
+import type { ImportOrderInput } from "../orders/index.js";
 import type { JsonRecord, PortableInputRecord } from "./importPlanning.js";
+
+const discountLabelSchema = OrderRecord.shape.discountLabel;
+const itemSnapshotSchema = OrderItemRecord.pick({ packetNumber: true, outcome: true, timeline: true, deliverables: true });
 
 export function customerName(record: JsonRecord) {
   const supplied = [record.preferredName, [record.firstName, record.middleName, record.lastName, record.suffix]
@@ -55,13 +60,28 @@ export function stringField(value: unknown): string {
   return value;
 }
 
+function targetTier(value: unknown, packetNumber: number | null | undefined) {
+  // Older archives may carry a generic tier token but no packet number. Do not infer packet identity.
+  if (packetNumber === null || packetNumber === undefined) return null;
+  switch (value) {
+    case "basic": return "Basic";
+    case "standard": return "Standard";
+    case "premium": return "Premium";
+    default: throw invalidTarget();
+  }
+}
+
 export function projectedOrder(order: JsonRecord, items: JsonRecord[], history: JsonRecord[]) {
   const currency = stringField(order.currency);
   const projectName = stringField(order.projectName).trim();
   if (!/^[A-Z]{3}$/.test(currency) || projectName.length < 1 || projectName.length > 160 ||
     items.length > 200 || history.length > 500) throw invalidTarget();
+  const discountLabel = discountLabelSchema.safeParse(order.discountLabel);
+  if (!discountLabel.success) throw invalidTarget();
   return {
     projectName, statusKey: stringField(order.status), totalMinor: targetMoney(order.total, currency), currency,
+    subtotalMinor: targetMoney(order.subtotal, currency), discountMinor: targetMoney(order.discount, currency),
+    discountLabel: discountLabel.data ?? null,
     sourceReference: stringField(order.orderNumber), createdAt: targetDate(order.createdAt),
     // heldUnknown must not control application state, amounts, access, or execution. It remains inert.
     submittedAt: order.submittedAt ? targetDate(order.submittedAt) : null,
@@ -70,9 +90,14 @@ export function projectedOrder(order: JsonRecord, items: JsonRecord[], history: 
       const quantity = numberField(record, "quantity");
       if (name.length > 160 || quantity < 1 || quantity > 10_000) throw invalidTarget();
       const sku = stringField(record.sku);
+      const snapshot = itemSnapshotSchema.safeParse({
+        packetNumber: record.packetNumber, outcome: record.outcome, timeline: record.timeline, deliverables: record.deliverables,
+      });
+      if (!snapshot.success) throw invalidTarget();
       return {
         sourcePublicId: record.publicId, productPublicId: ULID_PATTERN.test(sku) ? sku : null, productVersion: null,
         name, description: "", features: [], quantity, currency,
+        ...snapshot.data, tier: targetTier(record.tier, snapshot.data.packetNumber),
         unitPriceMinor: targetMoney(record.unitPrice, currency), lineTotalMinor: targetMoney(record.lineTotal, currency),
       };
     }),
@@ -85,7 +110,8 @@ export function projectedOrder(order: JsonRecord, items: JsonRecord[], history: 
         occurredAt: targetDate(record.occurredAt),
       };
     }),
-  };
+  } satisfies Pick<ImportOrderInput, "projectName" | "statusKey" | "totalMinor" | "currency" | "subtotalMinor" |
+    "discountMinor" | "discountLabel" | "sourceReference" | "createdAt" | "submittedAt" | "lineItems" | "statusHistory">;
 }
 
 export function selectLiveVersions(records: PortableInputRecord[]) {

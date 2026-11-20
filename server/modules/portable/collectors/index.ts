@@ -10,6 +10,9 @@ import { PACKAGE_LIMITS, TRANSFER_MAX_OBJECTS, TRANSFER_MAX_RECORDS, type Export
 
 const ORDERS_PAGE = 100;
 const MAX_METADATA = 16 * 1024 * 1024;
+const PORTABLE_TIER = {
+  Basic: "basic", Standard: "standard", Premium: "premium",
+} as const satisfies Record<NonNullable<PortableOrder["lineItems"][number]["tier"]>, string>;
 const time = (value: Date | null) => value?.toISOString() ?? null;
 const actor = (role: string) => ({
   kind: (role === "admin" || role === "staff" || role === "customer" ? role : "system") as UserRole | "system",
@@ -74,8 +77,9 @@ export async function collectAndWriteExport(
         emit("orders", {
           publicId: order.publicId, customerPublicId: ownerPublicId, orderNumber: order.reference,
           projectName: order.projectName, status: order.statusKey, paymentStatus: "unknown", paymentRequirement: null,
-          currency: order.currency, subtotal: { amountMinor: order.totalMinor, currency: order.currency },
-          discount: { amountMinor: 0, currency: order.currency }, total: { amountMinor: order.totalMinor, currency: order.currency },
+          currency: order.currency, subtotal: { amountMinor: order.subtotalMinor, currency: order.currency },
+          discount: { amountMinor: order.discountMinor, currency: order.currency }, discountLabel: order.discountLabel,
+          total: { amountMinor: order.totalMinor, currency: order.currency },
           isTestOrder: false, lock: { readOnly: order.lockState !== "none", reasonCode: null },
           completionPercent: null, internalNotes: null, dueAt: null, deliveredAt: null, closedAt: null,
           createdAt: order.createdAt.toISOString(), updatedAt: order.updatedAt.toISOString(), submittedAt: time(order.submittedAt),
@@ -87,7 +91,9 @@ export async function collectAndWriteExport(
         });
         for (const [position, item] of order.lineItems.entries()) emit("order-items", {
           publicId: item.publicId, orderPublicId: order.publicId, position,
-          sku: item.productPublicId ?? "historical-item", name: item.name, tier: null, quantity: item.quantity,
+          sku: item.productPublicId ?? "historical-item", name: item.name, quantity: item.quantity,
+          tier: item.tier === null ? null : PORTABLE_TIER[item.tier], packetNumber: item.packetNumber,
+          outcome: item.outcome, timeline: item.timeline, deliverables: item.deliverables,
           unitPrice: { amountMinor: item.unitPriceMinor, currency: item.currency },
           lineTotal: { amountMinor: item.lineTotalMinor, currency: item.currency },
           heldUnknown: { description: item.description, features: item.features, sourceProductVersion: item.productVersion },
