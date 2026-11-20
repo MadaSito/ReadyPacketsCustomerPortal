@@ -54,8 +54,8 @@ async function loadOrder(db: DbOrTx, key: OrderKey, forUpdate: boolean) {
 }
 
 /** Current, accepted, unrevoked grant for (order, user) — or null. */
-export async function currentGrant(db: DbOrTx, orderId: number, userId: number, now: Date) {
-  const [grant] = await db
+export async function currentGrant(db: DbOrTx, orderId: number, userId: number, now: Date, locking = false) {
+  const query = db
     .select({ id: orderGrants.id, role: orderGrants.role })
     .from(orderGrants)
     .where(
@@ -67,6 +67,8 @@ export async function currentGrant(db: DbOrTx, orderId: number, userId: number, 
       ),
     )
     .limit(1);
+  // A locking read sees the latest committed grant state even under REPEATABLE READ snapshots.
+  const [grant] = locking ? await query.for("share") : await query;
   return grant ?? null;
 }
 
@@ -138,7 +140,7 @@ export function createOrderPolicy(deps: PolicyDeps) {
     } else if (row.ownerUserId === principal.userId) {
       accessRole = "owner";
     } else {
-      const grant = await currentGrant(db, row.id, principal.userId, deps.clock.now());
+      const grant = await currentGrant(db, row.id, principal.userId, deps.clock.now(), options.forUpdate === true && options.tx !== undefined);
       if (grant) accessRole = grant.role;
     }
     if (!accessRole) {
