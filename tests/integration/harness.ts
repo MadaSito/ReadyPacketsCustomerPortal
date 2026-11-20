@@ -7,7 +7,7 @@
  * Mail is read the way an operator would: development mail capture is enabled, the durable job queue is
  * drained, and captured messages are opened through the mail engine (which audits the view).
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
@@ -65,9 +65,18 @@ export interface BrowserOptions {
   address?: string;
 }
 
-export async function createSystem(overrides: Partial<AppConfig> = {}): Promise<System> {
+export interface SystemOptions {
+  /** Serve a minimal SPA shell (index.html with the CSP nonce placeholder) so HTML navigations reach the shell handler and its CSP hooks. */
+  spaShell?: boolean;
+}
+
+export async function createSystem(overrides: Partial<AppConfig> = {}, options: SystemOptions = {}): Promise<System> {
   const t = await createTestDb();
   const storageDir = await mkdtemp(join(tmpdir(), "rp-integration-"));
+  const webDir = options.spaShell ? await mkdtemp(join(tmpdir(), "rp-integration-web-")) : undefined;
+  if (webDir) {
+    await writeFile(join(webDir, "index.html"), '<!doctype html><html lang="en"><head><title>ReadyPackets</title><script nonce="__CSP_NONCE__" type="module" src="/assets/app.js"></script></head><body><div id="root"></div></body></html>');
+  }
   // Supertest connects from loopback; treating it as the trusted reverse proxy lets each simulated browser
   // present its own client address (X-Forwarded-For), as it would behind the production proxy.
   const config = testConfig({ databaseUrl: t.url, storageDir, trustedProxies: ["127.0.0.1/32", "::1/128", "::ffff:127.0.0.1/128"], ...overrides });
@@ -79,7 +88,7 @@ export async function createSystem(overrides: Partial<AppConfig> = {}): Promise<
   for (const category of ["auth_high_risk", "user_login", "form_submission", "api", "expensive", "standard_browsing"]) {
     await services.settings.set(`http.rate_limit.${category}`, { maxRequests: 100_000, windowSeconds: 60 });
   }
-  const app = createApp(services);
+  const app = createApp(services, webDir ? { staticDir: webDir } : {});
   const http = request(app);
   const engine = engineFor(services.jobs)!;
   const mail = mailEngineFor(services.mailer)!;
@@ -126,6 +135,7 @@ export async function createSystem(overrides: Partial<AppConfig> = {}): Promise<
       await container.close();
       await t.cleanup();
       await rm(storageDir, { recursive: true, force: true });
+      if (webDir) await rm(webDir, { recursive: true, force: true });
     },
   };
 }

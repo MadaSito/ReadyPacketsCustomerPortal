@@ -4,7 +4,7 @@
  * provider that has not passed a check is labelled "not yet verified" — the UI never implies an unconfigured or
  * unverified integration works.
  */
-import { CheckCircle2, CircleDashed, CircleSlash, AlertTriangle, XCircle } from "lucide-react";
+import { ArrowLeft, CheckCircle2, CircleDashed, CircleSlash, AlertTriangle, XCircle } from "lucide-react";
 import { Link } from "wouter";
 import { errorMessage, type useTRPCClient } from "@/lib/trpc";
 import { Badge, Breadcrumbs, StepUpCancelledError, useStepUp, useToast, type Tone } from "@/ui";
@@ -60,12 +60,16 @@ export const INTEGRATION_PATHS = {
   egress: "/admin/integrations/egress",
 } as const;
 
+/** Sub-page header crumbs: an explicit back link (mobile-friendly) plus the breadcrumb trail. */
 export function IntegrationsCrumbs({ current }: { current: string }) {
-  return <Breadcrumbs items={[{ label: "Integrations", href: INTEGRATION_PATHS.overview }, { label: current }]} />;
-}
-
-export function InlineLink({ href, children }: { href: string; children: string }) {
-  return <Link href={href} className="font-semibold text-action underline-offset-4 hover:underline focus-visible:underline">{children}</Link>;
+  return (
+    <div className="flex flex-col gap-1">
+      <Link href={INTEGRATION_PATHS.overview} className="inline-flex min-h-11 w-fit items-center gap-1 text-sm font-semibold text-action underline-offset-4 hover:underline focus-visible:underline">
+        <ArrowLeft className="size-4" aria-hidden />Back to Integrations
+      </Link>
+      <Breadcrumbs items={[{ label: "Integrations", href: INTEGRATION_PATHS.overview }, { label: current }]} />
+    </div>
+  );
 }
 
 /**

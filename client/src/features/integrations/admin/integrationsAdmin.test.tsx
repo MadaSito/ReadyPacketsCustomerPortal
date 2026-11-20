@@ -136,6 +136,8 @@ describe("SMTP settings", () => {
       "integrations.admin.smtp.update": () => smtpConfig,
     });
     expect(await screen.findByRole("heading", { level: 1, name: "E-mail (SMTP)" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Back to Integrations" })).toHaveAttribute("href", "/admin/integrations");
+    expect(container.querySelectorAll("h1")).toHaveLength(1);
     const password = await screen.findByLabelText(/^Password/);
     expect(password).toHaveValue("");
     expect(password).toHaveAttribute("type", "password");
