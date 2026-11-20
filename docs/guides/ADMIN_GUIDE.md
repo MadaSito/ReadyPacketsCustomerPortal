@@ -91,11 +91,13 @@ All of these are audited. You never see a user's existing password or codes.
 
 ## Catalog, matrix import and bundle rule
 
-- **Catalog** (`/admin/catalog`, `catalog.manage`) — **Available**. Create and edit product groups and products.
-  - Packet groups carry a group key (`packet-1` … `packet-6`) and packet number (`1`–`6`). Packet products carry a packet
-    number, **Tier** (**Basic**, **Standard** or **Premium**), **Outcome**, **Timeline** and structured **Deliverables**
-    (`title` and `detail`). Non-packet products leave packet number and tier unset.
-  - Editing a product's name, price, outcome, timeline or deliverables writes a new, immutable product version; existing
+- **Catalog** (`/admin/catalog`, `catalog.manage`) — **Available**. Create and edit product groups and products:
+  - **Group dialog**: **Packet number** (*"Only for packet groups. Leave empty for other groups."*) and **Group key**
+    (*"Optional import key, e.g. packet-1."*). Packet group cards show a **Packet N** badge.
+  - **Product dialog**: **Tier** (**Basic**, **Standard** or **Premium** — shown and required for packet groups),
+    **Outcome**, **Timeline** and **Deliverables** (*"One per line as: Title | detail. When set, the features list is the
+    deliverable titles."*). Non-packet products leave packet number and tier unset.
+  - Editing a product's name, price, outcome, timeline or deliverables publishes a new, immutable product version; existing
     orders keep the snapshot they were placed under.
   - For packet products, the server enforces quantity `1` and at most one tier per packet in a single order.
 - **Importing the Master Offerings Matrix** (`ops:catalog-import`, command line) — [ADR 0022](../adr/0022-offerings-matrix-as-catalog-data.md):
@@ -109,13 +111,15 @@ All of these are audited. You never see a user's existing password or codes.
   - **Packet 7 ("The All-In")** is not a catalog product — it is how multi-packet bundle orders are represented, governed
     by the bundle rule below. **Packet 8** is recorded under `reserved` in the data file as unlisted and is not imported
     (if ever authorized, an administrator can add a product manually in **Catalog**).
-- **Bundle rule** (`orders.bundle_rule` in **Settings** `/admin/settings`, step-up, audited):
-  - Controls automatic multi-packet bundle pricing: `enabled`, `requiredPacketNumbers` (set to `[1, 2, 3, 4, 5, 6]` by the
-    matrix import), `discountPercent` (`15` for the Master Bundle) and `label` (for example `The All-In (Master Bundle)`).
-  - Disabled by default on a blank installation until imported or enabled by an administrator.
+- **Bundle discount** (**Bundle discount** card → **Edit bundle discount** at the top of `/admin/catalog`, setting key
+  `orders.bundle_rule`, audited as `catalog.bundle_rule.changed` and `platform.setting.changed`):
+  - Dialog fields: **Apply the bundle discount**, **Required packets** (comma-separated, set to `1, 2, 3, 4, 5, 6` by the
+    matrix import), **Discount (%)** (`15` for the Master Bundle) and **Label** (for example `The All-In (Master Bundle)`).
+  - Off by default on a blank installation until imported or enabled by an administrator.
   - When enabled and an order contains every required packet (at any combination of **Basic**, **Standard** or **Premium**
-    tiers), the server computes the discount (`total = subtotal - discount`) and snapshots the subtotal, discount and
-    discount label on the order. The browser never sends prices or discount amounts.
+    tiers), the server applies the percentage discount (rounded half up) to the order subtotal (`total = subtotal - discount`)
+    and snapshots **Subtotal**, the discount **Label** and **Total** on the order. Existing orders keep their amounts, and
+    the browser never sends prices or discount amounts.
 - **Workflows** (`/admin/workflows`, `workflows.manage`) — **Available**. View and publish versioned order workflows.
   Orders stay bound to the version they started with.
 
@@ -287,25 +291,28 @@ Until they land:
 
 ## Production pipeline (Phase I and Phase II webhooks)
 
-**Available** — **Production pipeline** under **Integrations** (`integrations.manage`, step-up to change settings) and the
-console-only **Production** tab on `/admin/orders/:orderId` (`orders.production.trigger`). Off by default; no live URL,
-credential or canon version ships with the portal ([ADR 0023](../adr/0023-production-pipeline-webhooks.md)).
+**Available** — **Production pipeline** (`/admin/integrations/production`, `integrations.manage`, step-up to save settings)
+and the console-only **Production** tab on `/admin/orders/:orderId/production` (`orders.production.trigger`). Off by default;
+no live URL, credential or canon version ships with the portal ([ADR 0023](../adr/0023-production-pipeline-webhooks.md)).
 
 ### Configuring the production pipeline
 
 1. **Allow outbound egress**: on **Outbound connections** (`/admin/integrations/egress`), add an allow-list rule for your
    webhook receiver host with purpose `webhook`. Destinations must use `https://`, pass pinned DNS resolution, and
    redirects are refused.
-2. **Configure Production pipeline settings** (step-up, audited as `integration.production.settings.changed`):
-   - **Phase I (P101) URL** and **Phase II (P201) URL** (`https://` only). Webhook URLs embed secret tokens and are stored
-     encrypted — the console returns only the host and the last 4 characters.
-   - **Authentication header** (optional): header name and encrypted secret value.
+2. **Pipeline settings** on `/admin/integrations/production` (step-up on **Save settings**, audited as
+   `integration.production.settings.changed`):
+   - **Enable production pipeline webhooks** switch.
    - **Canon version** (required before enabling, for example `ReadyPackets_Production_v2.0`; no default).
+   - **Request timeout (seconds)** (default `10`, maximum `30`).
    - **Run mode** (default `production`, pattern `^[a-z][a-z0-9_]{0,31}$`).
-   - **Timeout** (default 10 seconds, maximum 30 seconds).
-   - **Enabled** switch.
-3. **Test destination**: runs a dry-run validation of the configured URLs against the egress policy and DNS without
-   sending any webhook payload.
+   - **Phase I (P101) webhook URL** and **Phase II (P201) webhook URL** (`https://` only). Webhook URLs embed secret tokens
+     and are stored encrypted — the page shows only the host and last 4 characters, with **Remove saved Phase I (P101)
+     webhook URL** / **Remove saved Phase II (P201) webhook URL** controls.
+   - **Authorization header name** and **Authorization header value** (optional; value is write-only encrypted, with
+     **Remove saved authorization header value**).
+3. **Destination allowlist check**: choose **Test Phase I (P101) destination** and **Test Phase II (P201) destination** to
+   dry-run the configured URLs against the egress policy and DNS without sending any webhook payload.
 
 ### Starting Phase I (P101), starting Phase II (P201) and re-sending
 
@@ -316,20 +323,24 @@ Key administrator controls and guarantees:
   orders send that packet number (`"1"`–`"6"`) and tier; multi-packet orders send `packet = "7"` and `tier = "Mixed"`.
   `bundle_scope_manifest` is sent as an escaped JSON string (`"{\"packet_1\":\"Premium\"}"`), and `order_scope_mode` is
   never sent. Contradictory combinations are refused before anything is queued (`integration.production.dispatch.refused`).
-- **Start Phase I (`P101`)**: writes an encrypted outbox record in the same database transaction and delivers it via the
-  background job worker with `Idempotency-Key`, `X-ReadyPackets-Delivery` and correlation headers.
-- **Start Phase II (`P201`)**: enabled only after `P101` for the same order reaches `delivered`, and requires explicit
-  operator confirmation that the Phase I final artifacts exist in the production environment (the portal receives no
-  inbound completion callback). `P201` copies the exact `customer_id`, `order_id` and `run_mode` recorded on the
-  delivered `P101` so a later reference change cannot split a run.
-- **Retries, personal-data clearing and dispatch monitor**: network errors, `429` and `5xx` responses retry with bounded
-  backoff; other `4xx` responses stop immediately. The encrypted personal-data payload (`client_name`, `client_email`) is
-  cleared from the outbox row as soon as the dispatch reaches a final state. Filter dispatches across all orders on
-  **Production pipeline** by phase, state (`queued`, `sending`, `delivered`, `failed`, `dead`), order reference and date.
+- **Start Phase I** (**Phase I intake (P101)**): writes an encrypted outbox record in the same database transaction and
+  delivers it via the background job worker with `Idempotency-Key`, `X-ReadyPackets-Delivery` and correlation headers.
+- **Start Phase II** (**Phase II start (P201)**): enabled only after Phase I (`P101`) for the same order reaches
+  **Delivered**, and requires checking **"I confirm the Phase I final output artifacts exist for this order ID"** (the
+  portal receives no inbound completion callback). `P201` copies the exact `customer_id`, `order_id` and `run_mode`
+  recorded on the delivered `P101` so a later reference change cannot split a run.
+- **Retries, personal-data clearing and Production dispatches**: network errors, `429` and `5xx` responses retry with
+  bounded backoff; other `4xx` responses stop immediately. The encrypted personal-data payload (`client_name`,
+  `client_email`) is cleared from the outbox row as soon as the dispatch reaches a final state. Under **Production
+  dispatches** on `/admin/integrations/production`, filter across orders by **Order reference**, **Phase** (**All phases**,
+  **Phase I intake (P101)**, **Phase II start (P201)**), **State** (**All states**, **Queued**, **Sending**, **Delivered**,
+  **Failed (retrying)**, **Dead-lettered**), **From date** and **To date**, and open the correlated audit trail directly.
 - **Re-sending (Administrator + step-up)**: at most one delivered `P101` and one delivered `P201` are allowed per order
-  by default. Re-sending requires an **Administrator**, fresh **step-up verification** and a recorded reason
-  (`integration.production.dispatch.resent`). Audit events never contain webhook URLs, auth headers, client names or
-  client emails.
+  by default. Administrators can choose **Re-send Phase I** or **Re-send Phase II** on the order's **Production** tab,
+  enter a **Reason for re-send** of at least 8 characters (plus **"I confirm the Phase I final output artifacts exist for
+  this order ID"** for Phase II), and choose **Confirm Phase I re-send** / **Confirm Phase II re-send** with fresh step-up
+  verification (`integration.production.dispatch.resent`). Audit events never contain webhook URLs, auth headers, client
+  names or client emails.
 
 ## Microsoft Clarity and PostHog
 

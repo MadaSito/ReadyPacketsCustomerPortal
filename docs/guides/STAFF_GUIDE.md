@@ -70,11 +70,12 @@ Staff cannot manage staff accounts, catalog imports or bundle rules, settings, t
 - **List**: filter by status, customer, date range and reference prefix.
 - **Detail**: the same tabs as the customer view (**Overview**, **Activity**, **Notes**, **Sharing**, **Files**), plus
   internal notes, full history, sharing grants and the console-only **Production** tab.
-- **Packets and bundle pricing**: packet line items show their snapshotted **Packet** (`1`–`6`), **Tier** (**Basic**,
-  **Standard** or **Premium**), **Outcome**, **Timeline** and **Deliverables**. Each order holds at most one tier per
-  packet (quantity `1`). Multi-packet orders (`2`–`6` packets) are bundle orders; when all six packets (`1`–`6`) are in
-  one order and the administrator-managed bundle rule is enabled, the server applies the **15% bundle discount** and
-  displays the subtotal, discount and total on the order. Catalog imports and bundle-rule edits are administrator tasks
+- **Packets and bundle pricing**: packet line items show their snapshotted **Tier** (**Basic**, **Standard** or
+  **Premium**), **Timeline**, **Outcome** and an expandable **N deliverables** disclosure per item. Each order holds at
+  most one tier per packet (quantity `1`). Multi-packet orders (`2`–`6` packets) are bundle orders; when every required
+  packet (`1`–`6`) is in one order and **Bundle discount** is enabled, the server applies the **15% bundle discount**
+  (rounded half up) and displays **Subtotal**, the bundle **Label** and **Total** on the order. Catalog imports and
+  **Edit bundle discount** are administrator tasks
   ([Admin guide — Catalog, matrix import and bundle rule](./ADMIN_GUIDE.md#catalog-matrix-import-and-bundle-rule)).
 - **Notes**: choose **Visible to** → **Customer and staff** or **Staff only (internal)**. Internal notes are never shown
   to customers.
@@ -89,38 +90,43 @@ Staff cannot manage staff accounts, catalog imports or bundle rules, settings, t
 
 ## Starting Phase I and Phase II (production pipeline)
 
-**Available when enabled by an administrator** — the console-only **Production** tab on `/admin/orders/:orderId`
+**Available when enabled by an administrator** — the console-only **Production** tab on `/admin/orders/:orderId/production`
 (`orders.production.trigger`). Customers never see this tab.
 
-Both Phase I (`P101`) and Phase II (`P201`) are **manual** operator actions ([ADR 0023](../adr/0023-production-pipeline-webhooks.md)):
+Both **Phase I intake (P101)** and **Phase II start (P201)** are **manual** operator actions
+([ADR 0023](../adr/0023-production-pipeline-webhooks.md)):
 
 - **Which orders are eligible**: the order must contain at least one packet product (`1`–`6`) and **no non-packet items**.
-  Orders with zero packets or mixed with non-packet catalog items are refused before anything is queued.
+  Orders with zero packets or mixed with non-packet catalog items show **Order cannot be sent to Phase I** and cannot be
+  queued.
 - **Step 1 — Preview and Start Phase I (`P101`)**:
-  1. Open `/admin/orders/:orderId` → **Production** and inspect the **Payload preview**. Client name and email are masked
-     in the staff preview; the actual `P101` payload sends `customer_id` (customer reference), `order_id` (order
-     reference), `packet` and `tier` (that packet and tier for a single-packet order, or `"7"` and `"Mixed"` when more
-     than one packet is in the order), `bundle_scope_manifest` (escaped JSON string of `packet_<n>` → tier),
-     `canon_version`, `run_mode`, `client_name`, `client_email` and an optional `release_status` label
-     (`^[A-Za-z0-9_.-]{0,120}$`, blank by default). `order_scope_mode` is never sent.
-  2. Enter an optional **Release status** label only if instructed for a tracked run, then select **Start Phase I**.
-  3. Watch the Phase I state move from `queued` / `sending` to `delivered`. **Delivered** means the production webhook
-     endpoint accepted the request — the portal receives no automatic callback when Phase I finishes downstream.
+  1. Open `/admin/orders/:orderId` → **Production** and inspect **Phase I (P101) payload preview** under **Phase I intake
+     (P101)**. Client name and email are masked in this preview for staff; the server sends the order owner's canonical
+     contact details along with `customer_id` (customer reference), `order_id` (order reference), `packet` and `tier`
+     (that packet and tier for a single-packet order, or `"7"` and `"Mixed"` when more than one packet is in the order),
+     `bundle_scope_manifest` (escaped JSON string of `packet_<n>` → tier), `canon_version`, `run_mode` and an optional
+     `release_status` (`^[A-Za-z0-9_.-]{0,120}$`, blank by default). `order_scope_mode` is never sent.
+  2. Enter an optional **Release status label** only if instructed for a tracked run, choose **Start Phase I**, and confirm
+     **Start Phase I** in the **Start Phase I (P101)?** dialog.
+  3. Watch the Phase I status badge move from **Queued** / **Sending** to **Delivered**. **Delivered** means the production
+     webhook endpoint accepted the request — the portal receives no automatic callback when Phase I finishes downstream.
 - **Step 2 — Verify Phase I artifacts, then Start Phase II (`P201`)**:
-  1. **Never trigger Phase II solely because Phase I shows `delivered`.** First confirm in the production output folder
-     for the same `customer_id` and `order_id` that the expected **Phase I final artifacts** exist (for example, in
+  1. **Never trigger Phase II solely because Phase I shows `Delivered`.** First confirm in the production output folder
+     for the same `customer_id` and `order_id` that the expected **Phase I final output artifacts** exist (for example, in
      `Final_Merge`: `Phase1A_Merged.txt`, `Phase1B_Adjudication.json`, `Phase1B_DeepResearch_Evidence.txt` and
      `PhaseI_InterviewGuidance.txt`).
-  2. Return to the order's **Production** tab, tick the confirmation checkbox confirming that the Phase I artifacts exist,
-     and select **Start Phase II**.
+  2. Return to **Phase II start (P201)** on the order's **Production** tab, inspect **Phase II (P201) payload preview**,
+     tick **"I confirm the Phase I final output artifacts exist for this order ID"**, choose **Start Phase II**, and
+     confirm **Start Phase II** in the **Start Phase II (P201)?** dialog.
   3. The portal automatically sends the exact `customer_id`, `order_id` and `run_mode` recorded on the delivered `P101`
      dispatch — never recomputing them — so a later customer or order reference change cannot split the run. Allow
      downstream phases (Phase III / IV) to continue automatically.
-- **Failures and re-sending**:
-  - Network errors, `429` and `5xx` responses are retried automatically with backoff; other `4xx` responses stop
-    immediately and show a safe HTTP status summary in the order's dispatch history.
-  - At most one delivered `P101` and one delivered `P201` are allowed per order. If a phase genuinely needs to be
-    **re-sent**, escalate to an **Administrator** (re-sending requires administrator step-up verification and a reason).
+- **Dispatch history, failures and re-sending**:
+  - Network errors, `429` and `5xx` responses retry automatically (**Failed (retrying)** → **Dead-lettered** if exhausted);
+    other `4xx` responses stop immediately and show a safe HTTP status summary under **Dispatch history**.
+  - Staff never see **Re-send Phase I** or **Re-send Phase II** buttons. At most one delivered `P101` and one delivered
+    `P201` are allowed per order; if a phase genuinely needs to be re-sent, escalate to an **Administrator** (re-sending
+    requires a **Reason for re-send** of at least 8 characters and administrator step-up verification).
 
 ## Order files
 
