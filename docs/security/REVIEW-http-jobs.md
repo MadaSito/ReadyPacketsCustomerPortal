@@ -101,6 +101,12 @@ code-read only (no tests added or run). Severity summary: **1 Medium, 3 Info.**
 - Fix: add `totp_failures` (and `totp_locked_until`) to `assurance_accounts`, incremented under the existing account lock and
   reset on success; after e.g. 10 consecutive failures require a passkey or recovery code (or apply an exponential delay),
   notify the user via `engagement.notify`, and audit `auth.totp.locked`. Recovery codes (128-bit random) need no such limit.
+- **Status: fixed in `a695b89`** (re-verified by code-read; tests not re-run by this reviewer). `totp_failures` /
+  `totp_locked_until` are updated inside the locked transaction; wrong and replayed codes both count; from failure 10 the delay
+  doubles from 30 s up to 1 h; at 50 the authenticator is refused until replaced; success clears the count. `auth.totp.locked`
+  plus an in-app notification are written in the same transaction at 10 and at 50. Failure paths return `null` inside the
+  transaction (`factors.ts` challenge / step-up / recovery-reissue), so the increment commits rather than rolling back.
+  Proofs refused during a cooldown are not counted (cannot extend the lock). The owner reports 20/20 targeted MySQL tests.
 
 ### A-2..A-4 (Info)
 - A-2: authenticator data backup flags (BE/BS, `credentialDeviceType`, `credentialBackedUp`) are neither stored nor used
