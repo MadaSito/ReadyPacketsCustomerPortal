@@ -5,7 +5,7 @@
 import type { Tone } from "@/ui";
 
 export type ProductionPhase = "P101" | "P201";
-export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead";
+export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
 export type ProductionSettingsState =
   | "disabled"
   | "not_configured"
@@ -154,6 +154,7 @@ export const DISPATCH_STATE_META: Record<ProductionDispatchState, { label: strin
   delivered: { label: "Delivered", tone: "success" },
   failed: { label: "Failed (retrying)", tone: "warning" },
   dead: { label: "Dead-lettered", tone: "danger" },
+  unknown: { label: "Outcome unknown", tone: "warning" },
 };
 
 export const SETTINGS_STATE_META: Record<ProductionSettingsState, { label: string; tone: Tone }> = {

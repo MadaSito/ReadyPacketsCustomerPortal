@@ -21,7 +21,7 @@
  *  - Controlled server-classified `resendReason` codes and never-secret, never-PII durable audit attributes
  */
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gte, inArray, like, lte, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, like, lte, or, type SQL } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
@@ -70,13 +70,18 @@ import {
 export const PRODUCTION_DELIVERY_JOB = "integrations.production.deliver" as const;
 export const PRODUCTION_RECONCILE_JOB = "integrations.production.reconcile" as const;
 export const PRODUCTION_MAX_ATTEMPTS = 5 as const;
-/** Extra grace beyond `timeoutMs` before an interrupted `sending` row is reconciled to `failed` and `payload_enc` cleared. */
+/** Extra grace beyond `timeoutMs` before an interrupted `sending` row is eligible for job-fenced reconciliation. */
 export const PRODUCTION_SENDING_GRACE_MS = 30_000 as const;
-/** Maximum age (15 minutes) before an unclaimed/orphaned `queued` row is reconciled to `failed` and `payload_enc` cleared. */
+/** Minimum age (15 minutes) before a non-expired `queued` row is checked for orphaned job-ledger state. */
 export const PRODUCTION_STALE_QUEUED_MS = 900_000 as const;
+/** Bounded maximum outbox TTL (24 hours) after which a queued dispatch cancels its job under fence and scrubs `payload_enc`. */
+export const PRODUCTION_DISPATCH_MAX_TTL_MS = 86_400_000 as const;
+
+const RECONCILE_BATCH_SIZE = 100;
+const MAX_RECONCILE_BATCHES = 10;
 
 export type ProductionPhase = "P101" | "P201";
-export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead";
+export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
 export type ProductionValidationIssue = PayloadValidationIssue;
 export type ControlledResendReason =
   | "OPERATOR_RETRY_AFTER_INTERRUPTION"
@@ -282,9 +287,12 @@ export function fixedDispatchSummary(
       return "Canceled before delivery because destination or authentication settings changed.";
     case "PRODUCTION_DELIVERY_INTERRUPTED":
     case "PRODUCTION_AMBIGUOUS_IN_FLIGHT":
-      return "Delivery attempt was interrupted before completion; verify downstream state before re-sending.";
+    case "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN":
+      return "Delivery outcome is unknown after an interrupted or expired attempt; verify downstream state before re-sending.";
     case "PRODUCTION_QUEUE_STALLED":
-      return "Queued dispatch timed out before worker pickup; payload cleared.";
+      return "Queued dispatch was orphaned before worker pickup; payload cleared.";
+    case "PRODUCTION_DELIVERY_EXPIRED":
+      return "Queued dispatch expired before delivery; payload cleared.";
     case "ORDER_LOCKED":
       return "Canceled before delivery because the order is locked or under legal hold.";
     case "ORDER_CANCELED":
@@ -306,6 +314,9 @@ export function fixedDispatchSummary(
       return "Canceled before delivery because stored payload integrity verification failed.";
     default: {
       const safeCode = /^[A-Z0-9_]{2,64}$/.test(reasonCode) ? reasonCode : "PRODUCTION_DELIVERY_FAILED";
+      if (state === "unknown") {
+        return `Delivery outcome is unknown (${safeCode}); verify downstream state before re-sending.`;
+      }
       if (state === "dead") {
         return `Outbound transport or policy check failed (${safeCode}); retry budget exhausted.`;
       }
@@ -321,9 +332,12 @@ function classifyResendReasonCode(
   latestPhaseRow: Pick<DispatchRow, "state" | "lastReasonCode">,
 ): ControlledResendReason {
   if (
+    latestPhaseRow.state === "unknown" ||
     latestPhaseRow.lastReasonCode === "PRODUCTION_DELIVERY_INTERRUPTED" ||
     latestPhaseRow.lastReasonCode === "PRODUCTION_AMBIGUOUS_IN_FLIGHT" ||
-    latestPhaseRow.lastReasonCode === "PRODUCTION_QUEUE_STALLED"
+    latestPhaseRow.lastReasonCode === "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN" ||
+    latestPhaseRow.lastReasonCode === "PRODUCTION_QUEUE_STALLED" ||
+    latestPhaseRow.lastReasonCode === "PRODUCTION_DELIVERY_EXPIRED"
   ) {
     return "OPERATOR_RETRY_AFTER_INTERRUPTION";
   }
@@ -342,15 +356,10 @@ function escapeLikePrefix(raw: string): string {
 
 type DispatchRow = typeof integrationProductionDispatches.$inferSelect;
 
-function isRowStale(row: Pick<DispatchRow, "state" | "updatedAt">, now: Date, timeoutMs: number): boolean {
-  const ageMs = now.getTime() - row.updatedAt.getTime();
-  if (row.state === "sending") {
-    return ageMs >= timeoutMs + PRODUCTION_SENDING_GRACE_MS;
+class CandidateMovedRollback extends Error {
+  constructor() {
+    super("CANDIDATE_MOVED_ROLLBACK");
   }
-  if (row.state === "queued") {
-    return ageMs >= PRODUCTION_STALE_QUEUED_MS;
-  }
-  return false;
 }
 
 function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
@@ -436,6 +445,18 @@ export function createProductionWebhookService(
     return identity;
   }
 
+  function requireJobAdmin() {
+    const jobAdmin = deps.services.jobAdmin;
+    if (!jobAdmin) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "JOB_ADMIN_SERVICE_UNAVAILABLE",
+        "Background job administration service is not initialized.",
+      );
+    }
+    return jobAdmin;
+  }
+
   function computeDestinationFingerprint(
     phase: ProductionPhase,
     params: {
@@ -493,68 +514,323 @@ export function createProductionWebhookService(
     };
   }
 
-  async function reconcileStaleDispatchesInTx(
-    tx: Tx,
-    options: { orderId?: number; now: Date; timeoutMs: number; correlationId?: string },
-  ): Promise<number> {
-    const predicates: SQL[] = [inArray(integrationProductionDispatches.state, ["sending", "queued"])];
-    if (options.orderId !== undefined) {
-      predicates.push(eq(integrationProductionDispatches.orderId, options.orderId));
-    }
+  type ReconcileCandidate = Pick<
+    DispatchRow,
+    "id" | "publicId" | "state" | "version" | "jobPublicId" | "updatedAt" | "expiresAt" | "correlationId"
+  >;
 
-    const candidates = await tx
-      .select()
-      .from(integrationProductionDispatches)
-      .where(and(...predicates))
-      .orderBy(asc(integrationProductionDispatches.id))
-      .for("update")
-      .limit(200);
+  async function reconcileSingleCandidate(
+    candidate: ReconcileCandidate,
+    correlationIdOverride?: string,
+    allowRetryOnMove = true,
+  ): Promise<boolean> {
+    const jobAdmin = requireJobAdmin();
+    try {
+      return await deps.db.transaction(async (tx) => {
+        const txNow = deps.clock.now();
+        const shouldCancelQueued =
+          candidate.state === "queued" && candidate.expiresAt.getTime() <= txNow.getTime();
+
+        // PW-02: Lock `job_runs` FIRST via published JobsModule port before locking dispatch row.
+        const disposition = await jobAdmin.reconcileOutboxJob(candidate.jobPublicId, tx, {
+          cancelQueued: shouldCancelQueued,
+        });
+        if (disposition.state === "running_live" || disposition.state === "queued_live") {
+          return false;
+        }
+
+        const [locked] = await tx
+          .select()
+          .from(integrationProductionDispatches)
+          .where(eq(integrationProductionDispatches.id, candidate.id))
+          .for("update")
+          .limit(1);
+
+        if (
+          !locked ||
+          locked.state !== candidate.state ||
+          locked.version !== candidate.version ||
+          locked.jobPublicId !== candidate.jobPublicId ||
+          (shouldCancelQueued && locked.expiresAt.getTime() > txNow.getTime())
+        ) {
+          throw new CandidateMovedRollback();
+        }
+
+        const uncertain =
+          locked.state === "sending" ||
+          locked.attemptCount > 0 ||
+          disposition.state === "settled_unknown" ||
+          (disposition.state === "terminal" && disposition.jobState === "unknown");
+        const nextState: ProductionDispatchState = uncertain ? "unknown" : "failed";
+        const reasonCode =
+          locked.state === "sending"
+            ? "PRODUCTION_DELIVERY_INTERRUPTED"
+            : uncertain
+              ? "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN"
+              : shouldCancelQueued
+                ? "PRODUCTION_DELIVERY_EXPIRED"
+                : "PRODUCTION_QUEUE_STALLED";
+        const summary = fixedDispatchSummary(reasonCode, locked.httpStatus, nextState);
+
+        await tx
+          .update(integrationProductionDispatches)
+          .set({
+            state: nextState,
+            payloadEnc: null,
+            activeFencingToken: 0,
+            lastReasonCode: reasonCode,
+            responseSummary: summary,
+            finalizedAt: txNow,
+            updatedAt: txNow,
+            version: locked.version + 1,
+          })
+          .where(
+            and(
+              eq(integrationProductionDispatches.id, locked.id),
+              eq(integrationProductionDispatches.version, locked.version),
+            ),
+          );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.production.dispatch.failed",
+            action: "reconcile",
+            outcome: uncertain ? "unknown" : "failed",
+            severity: "WARN",
+            provider: "production_webhook",
+            reasonCode,
+            correlationId: correlationIdOverride ?? locked.correlationId,
+            actor: JOB_AUDIT_ACTOR,
+            resource: { type: "integration_production_dispatch", publicId: locked.publicId },
+            attributes: buildSafeDispatchAuditAttributes(locked, {
+              retryable: false,
+              reconciled: true,
+              delivery_uncertain: uncertain,
+            }),
+          },
+          tx,
+        );
+
+        return true;
+      });
+    } catch (err) {
+      if (err instanceof CandidateMovedRollback) {
+        if (!allowRetryOnMove) {
+          return false;
+        }
+        const [fresh] = await deps.db
+          .select({
+            id: integrationProductionDispatches.id,
+            publicId: integrationProductionDispatches.publicId,
+            state: integrationProductionDispatches.state,
+            version: integrationProductionDispatches.version,
+            jobPublicId: integrationProductionDispatches.jobPublicId,
+            updatedAt: integrationProductionDispatches.updatedAt,
+            expiresAt: integrationProductionDispatches.expiresAt,
+            correlationId: integrationProductionDispatches.correlationId,
+          })
+          .from(integrationProductionDispatches)
+          .where(eq(integrationProductionDispatches.id, candidate.id))
+          .limit(1);
+        if (fresh && (fresh.state === "sending" || fresh.state === "queued")) {
+          return reconcileSingleCandidate(fresh, correlationIdOverride, false);
+        }
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Job-fenced outbox reconciliation (PW-02):
+   *  - Applies staleness/expiry predicates in SQL BEFORE `LIMIT` with keyset pagination so fresh or healthy
+   *    live rows never starve stale or expired rows.
+   *  - Verifies job-ledger ownership via `jobAdmin.reconcileOutboxJob` (`job_runs` -> `integration_production_dispatches`).
+   *  - Never marks live `queued_live` or `running_live` dispatches failed by age alone.
+   */
+  async function reconcileStaleDispatches(options: {
+    orderPublicId?: string;
+    correlationId?: string;
+    beforeBatch?: () => Promise<void>;
+    verifyCallerBeforeMutate?: () => Promise<void>;
+  } = {}): Promise<number> {
+    const cfg = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG);
+    const now = deps.clock.now();
+    const sendingCutoff = new Date(now.getTime() - (cfg.timeoutMs + PRODUCTION_SENDING_GRACE_MS));
+    const queuedOrphanCutoff = new Date(now.getTime() - PRODUCTION_STALE_QUEUED_MS);
+
+    let callerVerified = false;
+    const ensureCallerVerified = async () => {
+      if (callerVerified || !options.verifyCallerBeforeMutate) return;
+      await options.verifyCallerBeforeMutate();
+      callerVerified = true;
+    };
 
     let reconciledCount = 0;
-    for (const row of candidates) {
-      if (!isRowStale(row, options.now, options.timeoutMs)) {
-        continue;
+
+    // Pass 1: Stale `sending` candidates (`updated_at <= sendingCutoff` evaluated in SQL BEFORE `LIMIT`).
+    {
+      let cursorTime: Date | null = null;
+      let cursorId = 0;
+      for (let batch = 0; batch < MAX_RECONCILE_BATCHES; batch += 1) {
+        if (options.beforeBatch) await options.beforeBatch();
+        const predicates: SQL[] = [
+          eq(integrationProductionDispatches.state, "sending"),
+          lte(integrationProductionDispatches.updatedAt, sendingCutoff),
+        ];
+        if (options.orderPublicId !== undefined) {
+          predicates.push(eq(integrationProductionDispatches.orderPublicId, options.orderPublicId));
+        }
+        if (cursorTime !== null) {
+          predicates.push(
+            or(
+              gt(integrationProductionDispatches.updatedAt, cursorTime),
+              and(
+                eq(integrationProductionDispatches.updatedAt, cursorTime),
+                gt(integrationProductionDispatches.id, cursorId),
+              ),
+            )!,
+          );
+        }
+
+        const batchRows = await deps.db
+          .select({
+            id: integrationProductionDispatches.id,
+            publicId: integrationProductionDispatches.publicId,
+            state: integrationProductionDispatches.state,
+            version: integrationProductionDispatches.version,
+            jobPublicId: integrationProductionDispatches.jobPublicId,
+            updatedAt: integrationProductionDispatches.updatedAt,
+            expiresAt: integrationProductionDispatches.expiresAt,
+            correlationId: integrationProductionDispatches.correlationId,
+          })
+          .from(integrationProductionDispatches)
+          .where(and(...predicates))
+          .orderBy(asc(integrationProductionDispatches.updatedAt), asc(integrationProductionDispatches.id))
+          .limit(RECONCILE_BATCH_SIZE);
+
+        if (batchRows.length === 0) break;
+        await ensureCallerVerified();
+        for (const candidate of batchRows) {
+          cursorTime = candidate.updatedAt;
+          cursorId = candidate.id;
+          if (await reconcileSingleCandidate(candidate, options.correlationId)) {
+            reconciledCount += 1;
+          }
+        }
+        if (batchRows.length < RECONCILE_BATCH_SIZE) break;
       }
+    }
 
-      const wasSending = row.state === "sending";
-      const reasonCode = wasSending ? "PRODUCTION_DELIVERY_INTERRUPTED" : "PRODUCTION_QUEUE_STALLED";
-      const summary = fixedDispatchSummary(reasonCode, row.httpStatus, "failed");
+    // Pass 2: Expired `queued` candidates (`expires_at <= now` evaluated in SQL BEFORE `LIMIT`, fenced cancellation).
+    {
+      let cursorExpiry: Date | null = null;
+      let cursorId = 0;
+      for (let batch = 0; batch < MAX_RECONCILE_BATCHES; batch += 1) {
+        if (options.beforeBatch) await options.beforeBatch();
+        const predicates: SQL[] = [
+          eq(integrationProductionDispatches.state, "queued"),
+          lte(integrationProductionDispatches.expiresAt, now),
+        ];
+        if (options.orderPublicId !== undefined) {
+          predicates.push(eq(integrationProductionDispatches.orderPublicId, options.orderPublicId));
+        }
+        if (cursorExpiry !== null) {
+          predicates.push(
+            or(
+              gt(integrationProductionDispatches.expiresAt, cursorExpiry),
+              and(
+                eq(integrationProductionDispatches.expiresAt, cursorExpiry),
+                gt(integrationProductionDispatches.id, cursorId),
+              ),
+            )!,
+          );
+        }
 
-      await tx
-        .update(integrationProductionDispatches)
-        .set({
-          state: "failed",
-          payloadEnc: null,
-          lastReasonCode: reasonCode,
-          responseSummary: summary,
-          finalizedAt: options.now,
-          updatedAt: options.now,
-          version: row.version + 1,
-        })
-        .where(eq(integrationProductionDispatches.id, row.id));
+        const batchRows = await deps.db
+          .select({
+            id: integrationProductionDispatches.id,
+            publicId: integrationProductionDispatches.publicId,
+            state: integrationProductionDispatches.state,
+            version: integrationProductionDispatches.version,
+            jobPublicId: integrationProductionDispatches.jobPublicId,
+            updatedAt: integrationProductionDispatches.updatedAt,
+            expiresAt: integrationProductionDispatches.expiresAt,
+            correlationId: integrationProductionDispatches.correlationId,
+          })
+          .from(integrationProductionDispatches)
+          .where(and(...predicates))
+          .orderBy(asc(integrationProductionDispatches.expiresAt), asc(integrationProductionDispatches.id))
+          .limit(RECONCILE_BATCH_SIZE);
 
-      await deps.audit.record(
-        {
-          category: "integration",
-          eventName: "integration.production.dispatch.failed",
-          action: "reconcile",
-          outcome: "failed",
-          severity: "WARN",
-          provider: "production_webhook",
-          reasonCode,
-          correlationId: options.correlationId ?? row.correlationId,
-          actor: JOB_AUDIT_ACTOR,
-          resource: { type: "integration_production_dispatch", publicId: row.publicId },
-          attributes: buildSafeDispatchAuditAttributes(row, {
-            retryable: false,
-            reconciled: true,
-            delivery_uncertain: wasSending,
-          }),
-        },
-        tx,
-      );
+        if (batchRows.length === 0) break;
+        await ensureCallerVerified();
+        for (const candidate of batchRows) {
+          cursorExpiry = candidate.expiresAt;
+          cursorId = candidate.id;
+          if (await reconcileSingleCandidate(candidate, options.correlationId)) {
+            reconciledCount += 1;
+          }
+        }
+        if (batchRows.length < RECONCILE_BATCH_SIZE) break;
+      }
+    }
 
-      reconciledCount += 1;
+    // Pass 3: Non-expired aged `queued` candidates (`updated_at <= queuedOrphanCutoff` evaluated in SQL BEFORE `LIMIT`;
+    // healthy `queued_live` jobs are left untouched, while orphaned rows whose jobs terminated/vanished are cleaned up).
+    {
+      let cursorTime: Date | null = null;
+      let cursorId = 0;
+      for (let batch = 0; batch < MAX_RECONCILE_BATCHES; batch += 1) {
+        if (options.beforeBatch) await options.beforeBatch();
+        const predicates: SQL[] = [
+          eq(integrationProductionDispatches.state, "queued"),
+          gt(integrationProductionDispatches.expiresAt, now),
+          lte(integrationProductionDispatches.updatedAt, queuedOrphanCutoff),
+        ];
+        if (options.orderPublicId !== undefined) {
+          predicates.push(eq(integrationProductionDispatches.orderPublicId, options.orderPublicId));
+        }
+        if (cursorTime !== null) {
+          predicates.push(
+            or(
+              gt(integrationProductionDispatches.updatedAt, cursorTime),
+              and(
+                eq(integrationProductionDispatches.updatedAt, cursorTime),
+                gt(integrationProductionDispatches.id, cursorId),
+              ),
+            )!,
+          );
+        }
+
+        const batchRows = await deps.db
+          .select({
+            id: integrationProductionDispatches.id,
+            publicId: integrationProductionDispatches.publicId,
+            state: integrationProductionDispatches.state,
+            version: integrationProductionDispatches.version,
+            jobPublicId: integrationProductionDispatches.jobPublicId,
+            updatedAt: integrationProductionDispatches.updatedAt,
+            expiresAt: integrationProductionDispatches.expiresAt,
+            correlationId: integrationProductionDispatches.correlationId,
+          })
+          .from(integrationProductionDispatches)
+          .where(and(...predicates))
+          .orderBy(asc(integrationProductionDispatches.updatedAt), asc(integrationProductionDispatches.id))
+          .limit(RECONCILE_BATCH_SIZE);
+
+        if (batchRows.length === 0) break;
+        await ensureCallerVerified();
+        for (const candidate of batchRows) {
+          cursorTime = candidate.updatedAt;
+          cursorId = candidate.id;
+          if (await reconcileSingleCandidate(candidate, options.correlationId)) {
+            reconciledCount += 1;
+          }
+        }
+        if (batchRows.length < RECONCILE_BATCH_SIZE) break;
+      }
     }
 
     return reconciledCount;
@@ -749,6 +1025,18 @@ export function createProductionWebhookService(
     const payloadSha256 = sha256Hex(payloadJson);
     const payloadEnc = deps.crypto.encrypt(payloadJson, dispatchPayloadAad(publicId));
     const correlationId = getRequestContext()?.correlationId ?? ulid();
+    const expiresAt = new Date(now.getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS);
+
+    const { jobId } = await deps.jobs.enqueue(
+      PRODUCTION_DELIVERY_JOB,
+      { dispatchId: publicId },
+      {
+        idempotencyKey: publicId,
+        maxAttempts: PRODUCTION_MAX_ATTEMPTS,
+        correlationId,
+      },
+      tx,
+    );
 
     await tx.insert(integrationProductionDispatches).values({
       publicId,
@@ -757,6 +1045,9 @@ export function createProductionWebhookService(
       orderReference: params.orderReference,
       expectedOwnerUserId: params.expectedOwnerUserId,
       destinationFingerprint: params.destinationFingerprint,
+      jobPublicId: jobId,
+      activeFencingToken: 0,
+      expiresAt,
       phase: params.phase,
       state: "queued",
       attemptCount: 0,
@@ -785,17 +1076,6 @@ export function createProductionWebhookService(
       createdAt: now,
       updatedAt: now,
     });
-
-    await deps.jobs.enqueue(
-      PRODUCTION_DELIVERY_JOB,
-      { dispatchId: publicId },
-      {
-        idempotencyKey: publicId,
-        maxAttempts: PRODUCTION_MAX_ATTEMPTS,
-        correlationId,
-      },
-      tx,
-    );
 
     const reqAttrs: Record<string, SafeAttributeValue> = {
       phase: params.phase,
@@ -846,37 +1126,59 @@ export function createProductionWebhookService(
     correlationId: string,
     severity: "WARN" | "ERROR" = "WARN",
     extraAttrs?: Record<string, string | number | boolean | null>,
-  ): Promise<void> {
-    const summary = fixedDispatchSummary(reasonCode, row.httpStatus, "failed");
+  ): Promise<"failed" | "unknown"> {
+    const uncertain = row.attemptCount > 0 || extraAttrs?.delivery_uncertain === true;
+    const nextState: "failed" | "unknown" = uncertain ? "unknown" : "failed";
+    const summary = fixedDispatchSummary(reasonCode, row.httpStatus, nextState);
     await tx
       .update(integrationProductionDispatches)
       .set({
-        state: "failed",
+        state: nextState,
         payloadEnc: null,
+        activeFencingToken: 0,
         lastReasonCode: reasonCode,
         responseSummary: summary,
         finalizedAt: now,
         updatedAt: now,
         version: row.version + 1,
       })
-      .where(eq(integrationProductionDispatches.id, row.id));
+      .where(
+        and(
+          eq(integrationProductionDispatches.id, row.id),
+          eq(integrationProductionDispatches.version, row.version),
+        ),
+      );
 
     await deps.audit.record(
       {
         category: "integration",
         eventName: "integration.production.dispatch.failed",
         action: "deliver",
-        outcome: "failed",
+        outcome: nextState,
         severity,
         provider: "production_webhook",
         reasonCode,
         correlationId,
         actor: JOB_AUDIT_ACTOR,
         resource: { type: "integration_production_dispatch", publicId: row.publicId },
-        attributes: buildSafeDispatchAuditAttributes(row, { retryable: false, ...extraAttrs }),
+        attributes: buildSafeDispatchAuditAttributes(row, {
+          retryable: false,
+          delivery_uncertain: uncertain,
+          ...extraAttrs,
+        }),
       },
       tx,
     );
+    return nextState;
+  }
+
+  function terminalDecision(
+    nextState: "failed" | "unknown",
+    reasonCode: string,
+  ): { kind: "terminal_failed"; reasonCode: string } | { kind: "terminal_unknown"; reasonCode: string } {
+    return nextState === "unknown"
+      ? { kind: "terminal_unknown", reasonCode }
+      : { kind: "terminal_failed", reasonCode };
   }
 
   /* ------------------------------------------------- Background Delivery Job Handler */
@@ -884,12 +1186,17 @@ export function createProductionWebhookService(
   type ClaimDecision =
     | { kind: "canceled"; reasonCode: string }
     | { kind: "already_completed" }
+    | { kind: "already_unknown"; reasonCode: string }
     | { kind: "already_failed"; reasonCode: string }
     | { kind: "ambiguous_sending" }
+    | { kind: "terminal_unknown"; reasonCode: string }
     | { kind: "terminal_failed"; reasonCode: string }
     | {
         kind: "ready";
         row: DispatchRow;
+        claimedVersion: number;
+        claimedAttempt: number;
+        claimedFencingToken: number;
         targetUrl: string;
         authHeaderName: string;
         authHeaderValue: string | null;
@@ -903,7 +1210,7 @@ export function createProductionWebhookService(
       return { outcome: "canceled", reasonCode: "INVALID_DISPATCH_ID" };
     }
 
-    // Phase 1: Fenced DB transaction to validate destination fingerprint, order eligibility, and claim `queued -> sending`.
+    // Phase 1: Fenced DB transaction to validate job binding, destination fingerprint, order eligibility, and claim `queued -> sending`.
     const decision = await deps.db.transaction(async (tx): Promise<ClaimDecision> => {
       await job.assertStillOwned(tx);
 
@@ -917,8 +1224,14 @@ export function createProductionWebhookService(
       if (!row) {
         return { kind: "canceled", reasonCode: "PRODUCTION_DISPATCH_NOT_FOUND" };
       }
+      if (row.jobPublicId !== job.jobId) {
+        return { kind: "canceled", reasonCode: "PRODUCTION_JOB_SUPERSEDED" };
+      }
       if (row.state === "delivered") {
         return { kind: "already_completed" };
+      }
+      if (row.state === "unknown") {
+        return { kind: "already_unknown", reasonCode: row.lastReasonCode ?? "PRODUCTION_DELIVERY_INTERRUPTED" };
       }
       if (row.state === "failed" || row.state === "dead") {
         return { kind: "already_failed", reasonCode: row.lastReasonCode ?? "PRODUCTION_ALREADY_FINAL" };
@@ -927,7 +1240,7 @@ export function createProductionWebhookService(
       const now = deps.clock.now();
       if (row.state === "sending") {
         // PW-02: Never auto-replay a preexisting ambiguous `sending` marker; immediately scrub `payloadEnc`
-        // and finalize the dispatch to `failed` so operator re-send is never permanently blocked.
+        // and finalize the dispatch to `unknown` so operator re-send requires explicit verification + step-up.
         await failTerminalBeforeSendInTx(
           tx,
           row,
@@ -939,10 +1252,26 @@ export function createProductionWebhookService(
         );
         return { kind: "ambiguous_sending" };
       }
+      if (row.state !== "queued") {
+        return { kind: "canceled", reasonCode: "PRODUCTION_UNEXPECTED_STATE" };
+      }
+      if (row.expiresAt.getTime() <= now.getTime()) {
+        const expiryReason =
+          row.attemptCount > 0 ? "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN" : "PRODUCTION_DELIVERY_EXPIRED";
+        const st = await failTerminalBeforeSendInTx(tx, row, now, expiryReason, job.correlationId);
+        return terminalDecision(st, expiryReason);
+      }
 
       if (!row.payloadEnc) {
-        await failTerminalBeforeSendInTx(tx, row, now, "PRODUCTION_PAYLOAD_MISSING", job.correlationId, "ERROR");
-        return { kind: "terminal_failed", reasonCode: "PRODUCTION_PAYLOAD_MISSING" };
+        const st = await failTerminalBeforeSendInTx(
+          tx,
+          row,
+          now,
+          "PRODUCTION_PAYLOAD_MISSING",
+          job.correlationId,
+          "ERROR",
+        );
+        return terminalDecision(st, "PRODUCTION_PAYLOAD_MISSING");
       }
 
       const prodState = await readProductionState(tx);
@@ -954,8 +1283,8 @@ export function createProductionWebhookService(
           : null;
 
       if (!prodState.enabled) {
-        await failTerminalBeforeSendInTx(tx, row, now, "PRODUCTION_NOT_CONFIGURED", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "PRODUCTION_NOT_CONFIGURED" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "PRODUCTION_NOT_CONFIGURED", job.correlationId);
+        return terminalDecision(st, "PRODUCTION_NOT_CONFIGURED");
       }
 
       // PW-04: Pin dispatch to the exact destination, auth header, and canon/runMode authorized at queue time.
@@ -972,8 +1301,8 @@ export function createProductionWebhookService(
           currentFpWhenIncomplete !== row.destinationFingerprint
             ? "DESTINATION_CHANGED"
             : "PRODUCTION_NOT_CONFIGURED";
-        await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId);
-        return { kind: "terminal_failed", reasonCode };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId);
+        return terminalDecision(st, reasonCode);
       }
 
       const currentFingerprint = computeDestinationFingerprint(phase, {
@@ -984,8 +1313,8 @@ export function createProductionWebhookService(
         runMode: prodState.cfg.runMode,
       });
       if (currentFingerprint !== row.destinationFingerprint) {
-        await failTerminalBeforeSendInTx(tx, row, now, "DESTINATION_CHANGED", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "DESTINATION_CHANGED" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "DESTINATION_CHANGED", job.correlationId);
+        return terminalDecision(st, "DESTINATION_CHANGED");
       }
 
       // PW-03: Re-validate current order existence, legal-hold/lock state, cancellation, owner binding, and scope BEFORE send.
@@ -993,25 +1322,25 @@ export function createProductionWebhookService(
       const identity = requireIdentity();
       const scope = await orders.getProductionScope(row.orderId, { tx });
       if (!scope) {
-        await failTerminalBeforeSendInTx(tx, row, now, "ORDER_NOT_FOUND", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "ORDER_NOT_FOUND" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_NOT_FOUND", job.correlationId);
+        return terminalDecision(st, "ORDER_NOT_FOUND");
       }
       if (isOrderLockedForProduction(scope.lockState)) {
-        await failTerminalBeforeSendInTx(tx, row, now, "ORDER_LOCKED", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "ORDER_LOCKED" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_LOCKED", job.correlationId);
+        return terminalDecision(st, "ORDER_LOCKED");
       }
       if (isOrderCanceledStatus(scope.statusKey)) {
-        await failTerminalBeforeSendInTx(tx, row, now, "ORDER_CANCELED", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "ORDER_CANCELED" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_CANCELED", job.correlationId);
+        return terminalDecision(st, "ORDER_CANCELED");
       }
       if (scope.ownerUserId !== row.expectedOwnerUserId) {
-        await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_CHANGED", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "ORDER_OWNER_CHANGED" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_CHANGED", job.correlationId);
+        return terminalDecision(st, "ORDER_OWNER_CHANGED");
       }
       const owner = await identity.getUser(scope.ownerUserId, { tx });
       if (!owner || owner.status !== "active") {
-        await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_INACTIVE", job.correlationId);
-        return { kind: "terminal_failed", reasonCode: "ORDER_OWNER_INACTIVE" };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_OWNER_INACTIVE", job.correlationId);
+        return terminalDecision(st, "ORDER_OWNER_INACTIVE");
       }
       if (phase === "P101") {
         const liveP101 = buildP101Payload({
@@ -1033,8 +1362,8 @@ export function createProductionWebhookService(
           liveP101.payload.tier === row.tier &&
           liveP101.payload.bundle_scope_manifest === row.bundleScopeManifest;
         if (!scopeUnchanged) {
-          await failTerminalBeforeSendInTx(tx, row, now, "ORDER_SCOPE_CHANGED", job.correlationId);
-          return { kind: "terminal_failed", reasonCode: "ORDER_SCOPE_CHANGED" };
+          const st = await failTerminalBeforeSendInTx(tx, row, now, "ORDER_SCOPE_CHANGED", job.correlationId);
+          return terminalDecision(st, "ORDER_SCOPE_CHANGED");
         }
       }
 
@@ -1042,7 +1371,7 @@ export function createProductionWebhookService(
       try {
         payloadJson = deps.crypto.decrypt(row.payloadEnc, dispatchPayloadAad(row.publicId));
       } catch {
-        await failTerminalBeforeSendInTx(
+        const st = await failTerminalBeforeSendInTx(
           tx,
           row,
           now,
@@ -1050,7 +1379,7 @@ export function createProductionWebhookService(
           job.correlationId,
           "ERROR",
         );
-        return { kind: "terminal_failed", reasonCode: "PRODUCTION_PAYLOAD_DECRYPT_FAILED" };
+        return terminalDecision(st, "PRODUCTION_PAYLOAD_DECRYPT_FAILED");
       }
 
       // Defense-in-depth: verify SHA-256 and canonical payload schema before any network socket opens.
@@ -1073,23 +1402,44 @@ export function createProductionWebhookService(
       }
       if (!integrityOk || !schemaOk) {
         const reasonCode = !integrityOk ? "PRODUCTION_PAYLOAD_HASH_MISMATCH" : "PRODUCTION_PAYLOAD_INVALID";
-        await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId, "ERROR");
-        return { kind: "terminal_failed", reasonCode };
+        const st = await failTerminalBeforeSendInTx(tx, row, now, reasonCode, job.correlationId, "ERROR");
+        return terminalDecision(st, reasonCode);
       }
+
+      const claimedVersion = row.version + 1;
+      const claimedAttempt = job.attempt;
+      const claimedFencingToken = job.fencingToken;
 
       await tx
         .update(integrationProductionDispatches)
         .set({
           state: "sending",
-          attemptCount: job.attempt,
+          attemptCount: claimedAttempt,
+          activeFencingToken: claimedFencingToken,
           updatedAt: now,
-          version: row.version + 1,
+          version: claimedVersion,
         })
-        .where(eq(integrationProductionDispatches.id, row.id));
+        .where(
+          and(
+            eq(integrationProductionDispatches.id, row.id),
+            eq(integrationProductionDispatches.state, "queued"),
+            eq(integrationProductionDispatches.version, row.version),
+            eq(integrationProductionDispatches.jobPublicId, job.jobId),
+          ),
+        );
 
       return {
         kind: "ready",
-        row: { ...row, state: "sending", attemptCount: job.attempt, version: row.version + 1 },
+        row: {
+          ...row,
+          state: "sending",
+          attemptCount: claimedAttempt,
+          activeFencingToken: claimedFencingToken,
+          version: claimedVersion,
+        },
+        claimedVersion,
+        claimedAttempt,
+        claimedFencingToken,
         targetUrl,
         authHeaderName: prodState.cfg.authHeaderName,
         authHeaderValue,
@@ -1103,6 +1453,13 @@ export function createProductionWebhookService(
     }
     if (decision.kind === "already_completed") {
       return { outcome: "completed" };
+    }
+    if (decision.kind === "already_unknown") {
+      return { outcome: "unknown", reasonCode: decision.reasonCode };
+    }
+    if (decision.kind === "terminal_unknown") {
+      await checks.recordOutcome("production", "failed", decision.reasonCode);
+      return { outcome: "unknown", reasonCode: decision.reasonCode };
     }
     if (decision.kind === "already_failed" || decision.kind === "terminal_failed") {
       if (decision.kind === "terminal_failed") {
@@ -1201,7 +1558,7 @@ export function createProductionWebhookService(
       }
     }
 
-    // Phase 3: Fenced finalization transaction.
+    // Phase 3: Claim-fenced finalization transaction (`job_runs` FIRST via `assertStillOwned(tx)`, dispatch SECOND).
     const result = await deps.db.transaction(async (tx): Promise<JobResult> => {
       await job.assertStillOwned(tx);
 
@@ -1215,9 +1572,26 @@ export function createProductionWebhookService(
       if (!locked) {
         return { outcome: "canceled", reasonCode: "PRODUCTION_DISPATCH_NOT_FOUND" };
       }
-      if (locked.state === "delivered") {
-        return { outcome: "completed" };
+      if (
+        locked.state !== "sending" ||
+        locked.version !== decision.claimedVersion ||
+        locked.attemptCount !== decision.claimedAttempt ||
+        locked.activeFencingToken !== decision.claimedFencingToken ||
+        locked.jobPublicId !== job.jobId
+      ) {
+        // PW-02: Refuse to overwrite a dispatch whose state, version, attempt, fencing token, or job binding
+        // moved since claim (e.g. reconciled terminal row).
+        return { outcome: "unknown", reasonCode: "PRODUCTION_FENCE_SUPERSEDED" };
       }
+
+      const claimFenceWhere = and(
+        eq(integrationProductionDispatches.id, locked.id),
+        eq(integrationProductionDispatches.state, "sending"),
+        eq(integrationProductionDispatches.version, decision.claimedVersion),
+        eq(integrationProductionDispatches.attemptCount, decision.claimedAttempt),
+        eq(integrationProductionDispatches.activeFencingToken, decision.claimedFencingToken),
+        eq(integrationProductionDispatches.jobPublicId, job.jobId),
+      );
 
       const now = deps.clock.now();
       if (attemptOutcome.kind === "delivered") {
@@ -1227,6 +1601,7 @@ export function createProductionWebhookService(
           .set({
             state: "delivered",
             payloadEnc: null,
+            activeFencingToken: 0,
             httpStatus: attemptOutcome.httpStatus,
             responseSummary: summary,
             lastReasonCode: "PRODUCTION_DELIVERED",
@@ -1235,7 +1610,7 @@ export function createProductionWebhookService(
             updatedAt: now,
             version: locked.version + 1,
           })
-          .where(eq(integrationProductionDispatches.id, locked.id));
+          .where(claimFenceWhere);
 
         await deps.audit.record(
           {
@@ -1267,6 +1642,7 @@ export function createProductionWebhookService(
           .set({
             state: "dead",
             payloadEnc: null,
+            activeFencingToken: 0,
             httpStatus: attemptOutcome.httpStatus,
             responseSummary: summary,
             lastReasonCode: attemptOutcome.reasonCode,
@@ -1274,7 +1650,7 @@ export function createProductionWebhookService(
             updatedAt: now,
             version: locked.version + 1,
           })
-          .where(eq(integrationProductionDispatches.id, locked.id));
+          .where(claimFenceWhere);
 
         await deps.audit.record(
           {
@@ -1303,19 +1679,67 @@ export function createProductionWebhookService(
       }
 
       if (attemptOutcome.retryable) {
+        // PW-02: Never transition back to `queued` if `payloadEnc` was cleared or the bounded TTL expired.
+        if (!locked.payloadEnc || locked.expiresAt.getTime() <= now.getTime()) {
+          const reasonCode = !locked.payloadEnc
+            ? "PRODUCTION_PAYLOAD_MISSING"
+            : "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN";
+          const summary = fixedDispatchSummary(reasonCode, attemptOutcome.httpStatus, "unknown");
+          await tx
+            .update(integrationProductionDispatches)
+            .set({
+              state: "unknown",
+              payloadEnc: null,
+              activeFencingToken: 0,
+              httpStatus: attemptOutcome.httpStatus,
+              responseSummary: summary,
+              lastReasonCode: reasonCode,
+              finalizedAt: now,
+              updatedAt: now,
+              version: locked.version + 1,
+            })
+            .where(claimFenceWhere);
+
+          await deps.audit.record(
+            {
+              category: "integration",
+              eventName: "integration.production.dispatch.failed",
+              action: "deliver",
+              outcome: "unknown",
+              severity: "WARN",
+              provider: "production_webhook",
+              reasonCode,
+              correlationId: job.correlationId,
+              actor: JOB_AUDIT_ACTOR,
+              resource: { type: "integration_production_dispatch", publicId: locked.publicId },
+              attributes: buildSafeDispatchAuditAttributes(
+                {
+                  ...locked,
+                  httpStatus: attemptOutcome.httpStatus,
+                  attemptCount: job.attempt,
+                },
+                { retryable: false, delivery_uncertain: true },
+              ),
+            },
+            tx,
+          );
+          return { outcome: "unknown", reasonCode };
+        }
+
         // Put row back to `queued` with `payloadEnc` intact for the bounded retry window.
         const summary = fixedDispatchSummary(attemptOutcome.reasonCode, attemptOutcome.httpStatus, "queued");
         await tx
           .update(integrationProductionDispatches)
           .set({
             state: "queued",
+            activeFencingToken: 0,
             httpStatus: attemptOutcome.httpStatus,
             responseSummary: summary,
             lastReasonCode: attemptOutcome.reasonCode,
             updatedAt: now,
             version: locked.version + 1,
           })
-          .where(eq(integrationProductionDispatches.id, locked.id));
+          .where(claimFenceWhere);
 
         await deps.audit.record(
           {
@@ -1350,6 +1774,7 @@ export function createProductionWebhookService(
         .set({
           state: "failed",
           payloadEnc: null,
+          activeFencingToken: 0,
           httpStatus: attemptOutcome.httpStatus,
           responseSummary: summary,
           lastReasonCode: attemptOutcome.reasonCode,
@@ -1357,7 +1782,7 @@ export function createProductionWebhookService(
           updatedAt: now,
           version: locked.version + 1,
         })
-        .where(eq(integrationProductionDispatches.id, locked.id));
+        .where(claimFenceWhere);
 
       await deps.audit.record(
         {
@@ -1387,7 +1812,7 @@ export function createProductionWebhookService(
 
     if (result.outcome === "completed") {
       await checks.recordOutcome("production", "succeeded", "PRODUCTION_DELIVERED");
-    } else if (result.outcome === "failed") {
+    } else if (result.outcome === "failed" || result.outcome === "unknown") {
       await checks.recordOutcome("production", "failed", result.reasonCode);
     }
 
@@ -1395,14 +1820,10 @@ export function createProductionWebhookService(
   }
 
   async function handleReconcileJob(job: ClaimedJob<Record<string, never>>): Promise<JobResult> {
-    await deps.db.transaction(async (tx) => {
-      await job.assertStillOwned(tx);
-      const cfg = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx);
-      await reconcileStaleDispatchesInTx(tx, {
-        now: deps.clock.now(),
-        timeoutMs: cfg.timeoutMs,
-        correlationId: job.correlationId,
-      });
+    await job.assertStillOwned();
+    await reconcileStaleDispatches({
+      correlationId: job.correlationId,
+      beforeBatch: () => job.assertStillOwned(),
     });
     return { outcome: "completed" };
   }
@@ -1423,6 +1844,28 @@ export function createProductionWebhookService(
     everyMs: 60_000,
     payload: {},
   });
+
+  async function verifyOrderTriggerCaller(principal: SessionPrincipal, orderPublicId: string): Promise<void> {
+    const orders = requireOrders();
+    await deps.db.transaction(async (tx) => {
+      await orders.assertCanReadOrder(principal, orderPublicId, { tx });
+      await assertProductionTriggerInTx(deps, principal, tx);
+    });
+  }
+
+  async function verifyOrderResendCaller(principal: SessionPrincipal, orderPublicId: string): Promise<void> {
+    const orders = requireOrders();
+    await deps.db.transaction(async (tx) => {
+      await orders.assertCanReadOrder(principal, orderPublicId, { tx });
+      await assertProductionResendInTx(deps, principal, tx);
+    });
+  }
+
+  async function verifyAdminCaller(principal: SessionPrincipal): Promise<void> {
+    await deps.db.transaction(async (tx) => {
+      await assertProductionTriggerInTx(deps, principal, tx);
+    });
+  }
 
   return {
     getSettings: loadSettingsView,
@@ -1661,6 +2104,10 @@ export function createProductionWebhookService(
     async previewOrder(principal, input): Promise<ProductionOrderPreview> {
       assertProductionTriggerPreflight(principal);
       const orders = requireOrders();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, input.orderPublicId),
+      });
 
       return deps.db.transaction(async (tx) => {
         // PW-05: Order check before Identity actor check.
@@ -1668,11 +2115,6 @@ export function createProductionWebhookService(
         await assertProductionTriggerInTx(deps, principal, tx);
 
         const candidate = await evaluateP101CandidateInTx(tx, access.id, input.releaseStatus);
-        await reconcileStaleDispatchesInTx(tx, {
-          orderId: access.id,
-          now: deps.clock.now(),
-          timeoutMs: candidate.prodState.cfg.timeoutMs,
-        });
 
         const existingRows = await tx
           .select()
@@ -1767,6 +2209,10 @@ export function createProductionWebhookService(
     async requestP101(principal, input): Promise<ProductionDispatchItem> {
       assertProductionTriggerPreflight(principal);
       const orders = requireOrders();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, input.orderPublicId),
+      });
 
       const outcome = await deps.db.transaction(
         async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
@@ -1778,11 +2224,6 @@ export function createProductionWebhookService(
           await assertProductionTriggerInTx(deps, principal, tx);
 
           const candidate = await evaluateP101CandidateInTx(tx, access.id, input.releaseStatus);
-          await reconcileStaleDispatchesInTx(tx, {
-            orderId: access.id,
-            now: deps.clock.now(),
-            timeoutMs: candidate.prodState.cfg.timeoutMs,
-          });
 
           if (!candidate.featureEnabled || !candidate.featureConfigured || !candidate.prodState.p101Secret) {
             await recordRefusedAuditInTx(tx, {
@@ -1905,6 +2346,10 @@ export function createProductionWebhookService(
       assertProductionTriggerPreflight(principal);
       const orders = requireOrders();
       const identity = requireIdentity();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, input.orderPublicId),
+      });
 
       const outcome = await deps.db.transaction(
         async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
@@ -1922,12 +2367,6 @@ export function createProductionWebhookService(
           if (!scope) {
             throw notFound("ORDER_NOT_FOUND");
           }
-
-          await reconcileStaleDispatchesInTx(tx, {
-            orderId: access.id,
-            now: deps.clock.now(),
-            timeoutMs: prodState.cfg.timeoutMs,
-          });
 
           if (isOrderLockedForProduction(scope.lockState)) {
             await recordRefusedAuditInTx(tx, {
@@ -2117,6 +2556,13 @@ export function createProductionWebhookService(
 
       const orders = requireOrders();
       const identity = requireIdentity();
+      // PW-02: Reconcile any stale/expired `sending`/`queued` rows via job-fenced reconciliation before opening
+      // the order transaction so interrupted attempts never permanently block administrative re-send.
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderResendCaller(principal, input.orderPublicId),
+      });
+
       const outcome = await deps.db.transaction(
         async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
           // PW-05: Lock order row FOR UPDATE FIRST, then lock/revalidate Identity actor + post-lock step-up SECOND.
@@ -2125,15 +2571,6 @@ export function createProductionWebhookService(
             forUpdate: true,
           });
           await assertProductionResendInTx(deps, principal, tx);
-
-          const cfgForReconcile = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx);
-          // PW-02: Reconcile any stale `sending`/`queued` rows before checking in-progress state so expired
-          // interrupted attempts never permanently block administrative re-send.
-          await reconcileStaleDispatchesInTx(tx, {
-            orderId: access.id,
-            now: deps.clock.now(),
-            timeoutMs: cfgForReconcile.timeoutMs,
-          });
 
           const existingRows = await tx
             .select()
@@ -2405,18 +2842,15 @@ export function createProductionWebhookService(
     async orderHistory(principal, input): Promise<{ items: ProductionDispatchItem[] }> {
       assertProductionTriggerPreflight(principal);
       const orders = requireOrders();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, input.orderPublicId),
+      });
 
       return deps.db.transaction(async (tx) => {
         // PW-05: Order check before Identity actor check.
         const access = await orders.assertCanReadOrder(principal, input.orderPublicId, { tx });
         await assertProductionTriggerInTx(deps, principal, tx);
-
-        const cfg = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx);
-        await reconcileStaleDispatchesInTx(tx, {
-          orderId: access.id,
-          now: deps.clock.now(),
-          timeoutMs: cfg.timeoutMs,
-        });
 
         const rows = await tx
           .select()
@@ -2439,15 +2873,12 @@ export function createProductionWebhookService(
       if (principal.role !== "admin") {
         throw forbidden("ADMIN_REQUIRED");
       }
+      await reconcileStaleDispatches({
+        verifyCallerBeforeMutate: () => verifyAdminCaller(principal),
+      });
 
       return deps.db.transaction(async (tx) => {
         await assertProductionTriggerInTx(deps, principal, tx);
-
-        const cfg = await readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx);
-        await reconcileStaleDispatchesInTx(tx, {
-          now: deps.clock.now(),
-          timeoutMs: cfg.timeoutMs,
-        });
 
         const conditions: SQL[] = [];
         if (input.phase) {

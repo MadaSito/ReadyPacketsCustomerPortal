@@ -156,13 +156,19 @@ function ConsoleOrderProductionPanel({ orderId }: { orderId: string }) {
   const canResendP101 =
     isAdmin &&
     featureEnabled &&
-    (p101.alreadyDelivered || p101.activeState === "dead" || p101.activeState === "failed");
+    (p101.alreadyDelivered ||
+      p101.activeState === "dead" ||
+      p101.activeState === "failed" ||
+      p101.activeState === "unknown");
 
   const canResendP201 =
     isAdmin &&
     featureEnabled &&
     p201.p101Delivered &&
-    (p201.alreadyDelivered || p201.activeState === "dead" || p201.activeState === "failed");
+    (p201.alreadyDelivered ||
+      p201.activeState === "dead" ||
+      p201.activeState === "failed" ||
+      p201.activeState === "unknown");
 
   const executeStartPhase = async (phase: ProductionPhase) => {
     setActionError(undefined);
@@ -567,6 +573,10 @@ function ConsoleOrderProductionPanel({ orderId }: { orderId: string }) {
         description="Re-sending creates a new audited dispatch and requires administrator multi-factor verification."
       >
         <form onSubmit={(e) => void onSubmitResend(e)} noValidate className="flex flex-col gap-4">
+          <Callout tone="warning">
+            Verify downstream workflow executions and output folders before re-sending. A re-send issues a new idempotency key and may duplicate work if an earlier uncertain or delivered request already ran.
+          </Callout>
+
           {resendError ? (
             <Callout tone="danger" live="assertive">
               {resendError}

@@ -34,6 +34,7 @@ const {
     broken: false,
     emptyDispatches: false,
     p101Delivered: false,
+    p101Unknown: false,
     p201Delivered: false,
     ineligibleOrder: false,
     staffViewer: true,
@@ -114,13 +115,23 @@ vi.mock("@/lib/trpc", () => {
     finalizedAt: occurredAt,
   };
 
+  const unknownDispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMU",
+    state: "unknown",
+    httpStatus: null,
+    responseSummary: "Interrupted during delivery — verify downstream before re-sending.",
+    lastReasonCode: "PRODUCTION_DELIVERY_INTERRUPTED",
+    deliveredAt: null,
+  };
+
   const makePreview = (): ProductionOrderPreview => ({
     featureEnabled: !mockState.unconfigured,
     featureConfigured: !mockState.unconfigured,
     p101: {
-      eligible: !mockState.p101Delivered && !mockState.ineligibleOrder,
+      eligible: !mockState.p101Delivered && !mockState.p101Unknown && !mockState.ineligibleOrder,
       alreadyDelivered: mockState.p101Delivered,
-      activeState: null,
+      activeState: mockState.p101Unknown ? "unknown" : null,
       validationErrors: mockState.ineligibleOrder
         ? [{ code: "NON_PACKET_ITEMS", message: "Orders containing non-packet line items cannot be sent to P101." }]
         : [],
@@ -178,7 +189,11 @@ vi.mock("@/lib/trpc", () => {
       pathKey: () => ["integrations", "production", "order"],
       preview: endpoint("order.preview", () => makePreview()),
       history: endpoint("order.history", () => ({
-        items: mockState.p101Delivered ? [sampleDispatch] : [],
+        items: mockState.p101Unknown
+          ? [unknownDispatch]
+          : mockState.p101Delivered
+            ? [sampleDispatch]
+            : [],
       })),
       requestP101: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: requestP101 }) },
       requestP201: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: requestP201 }) },
@@ -187,7 +202,13 @@ vi.mock("@/lib/trpc", () => {
     admin: {
       listDispatches: endpoint("admin.listDispatches", (input: unknown) => {
         listDispatchesSpy(input);
-        return { items: mockState.emptyDispatches ? [] : [sampleDispatch] };
+        return {
+          items: mockState.emptyDispatches
+            ? []
+            : mockState.p101Unknown
+              ? [unknownDispatch]
+              : [sampleDispatch],
+        };
       }),
     },
   };
@@ -239,6 +260,7 @@ beforeEach(() => {
   mockState.broken = false;
   mockState.emptyDispatches = false;
   mockState.p101Delivered = false;
+  mockState.p101Unknown = false;
   mockState.p201Delivered = false;
   mockState.ineligibleOrder = false;
   mockState.staffViewer = true;
@@ -525,5 +547,48 @@ describe("Production pipeline webhooks UI", () => {
     expect(await screen.findByRole("button", { name: /try again|retry/i })).toBeTruthy();
     expect(screen.queryByText("No production dispatches for this order")).toBeNull();
     expect(screen.queryByText("private database detail")).toBeNull();
+  });
+
+  it("renders Outcome unknown badge, keeps P201 blocked, and shows verify-downstream-first warning on admin re-send (PW-02)", async () => {
+    mockState.p101Unknown = true;
+    mockState.staffViewer = false;
+
+    const orderView = renderUi(
+      <OrderProductionTab orderId={orderPublicId} area="console" />,
+      {
+        path: `/admin/orders/${orderPublicId}/production`,
+        api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+      },
+    );
+
+    expect((await screen.findAllByText("Outcome unknown")).length).toBeGreaterThanOrEqual(1);
+    expect(
+      (screen.getByRole("button", { name: "Start Phase II" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    const resendP101Btn = screen.getByRole("button", { name: "Re-send Phase I" });
+    await expectNoAxeViolations(orderView.container);
+    fireEvent.click(resendP101Btn);
+
+    const dialog = await screen.findByRole("dialog", { name: "Re-send Phase I intake (P101)" });
+    expect(
+      within(dialog).getByText(
+        /Verify downstream workflow executions and output folders before re-sending/i,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /issues a new idempotency key and may duplicate work if an earlier uncertain or delivered request already ran/i,
+      ),
+    ).toBeTruthy();
+    await expectNoAxeViolations(orderView.container);
+    orderView.unmount();
+
+    const adminPage = renderUi(<ProductionPipelinePage />, {
+      path: "/admin/integrations/production",
+      api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+    });
+    expect(await screen.findByText("Outcome unknown")).toBeTruthy();
+    await expectNoAxeViolations(adminPage.container);
   });
 });

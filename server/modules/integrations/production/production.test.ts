@@ -27,12 +27,17 @@ import type { OrderAccessView, OrderLockState, OrderProductionScope } from "../.
 import { createConfigTransfer } from "../../platform/configTransfer.js";
 import { platformSettings } from "../../platform/schema.js";
 import { createSettingsStore } from "../../platform/settingsStore.js";
+import { createAuditEmitter } from "../../audit/emitter.js";
+import { createAuditModule } from "../../audit/index.js";
+import { createJobsModule, type OutboxJobDisposition } from "../../jobs/index.js";
+import { createJobQueue } from "../../jobs/queue.js";
 import { STEP_UP_MAX_AGE_MS } from "../../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import {
   createIntegrationsModule,
   PRODUCTION_DELIVERY_JOB,
+  PRODUCTION_DISPATCH_MAX_TTL_MS,
   PRODUCTION_MAX_ATTEMPTS,
   PRODUCTION_RECONCILE_JOB,
   PRODUCTION_SENDING_GRACE_MS,
@@ -43,10 +48,7 @@ import {
 } from "../index.js";
 import { integrationsRouter } from "../router.js";
 import {
-  integrationEgressAllowlist,
   integrationProductionDispatches,
-  integrationProviderChecks,
-  integrationWebhookEvents,
 } from "../schema.js";
 import {
   INTEGRATIONS_PRODUCTION_AUTH_VALUE,
@@ -131,15 +133,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
   }) => Promise<EgressFetchResponse>;
 
   beforeAll(async () => {
-    tdb = await createTestDb({
-      schema: {
-        platformSettings,
-        integrationEgressAllowlist,
-        integrationProviderChecks,
-        integrationWebhookEvents,
-        integrationProductionDispatches,
-      },
-    });
+    tdb = await createTestDb();
   });
 
   afterAll(async () => {
@@ -259,6 +253,26 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
         return null;
       }),
     } as never;
+
+    targetHarness.services.jobAdmin = {
+      reconcileOutboxJob: vi.fn(
+        async (
+          jobPublicId: string,
+          _tx: Tx,
+          options?: { cancelQueued?: boolean },
+        ): Promise<OutboxJobDisposition> => {
+          const idx = targetHarness.jobs.enqueued.findIndex((j) => j.jobId === jobPublicId);
+          if (idx >= 0) {
+            if (options?.cancelQueued) {
+              targetHarness.jobs.enqueued.splice(idx, 1);
+              return { state: "canceled_queued" };
+            }
+            return { state: "queued_live" };
+          }
+          return { state: "missing" };
+        },
+      ),
+    } as never;
   }
 
   beforeEach(async () => {
@@ -269,6 +283,12 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       await conn.query("DELETE FROM integration_provider_checks");
       await conn.query("DELETE FROM integration_webhook_events");
       await conn.query("DELETE FROM platform_settings");
+      await conn.query("DELETE FROM job_attempts");
+      await conn.query("DELETE FROM job_runs");
+      await conn.query("DELETE FROM job_maintenance");
+      await conn.query("DELETE FROM audit_chain");
+      await conn.query("DELETE FROM audit_chain_head");
+      await conn.query("DELETE FROM audit_events");
     } finally {
       conn.release();
     }
@@ -749,6 +769,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     const dispatch = await staffCaller.production.order.requestP101({ orderPublicId });
 
     const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+    const enqueuedJobId = h.jobs.enqueued[0]!.jobId;
     h.jobs.enqueued = []; // manually drive attempts 1..5 to test exact attempt progression
 
     nextHttpHandler = async () => ({
@@ -759,7 +780,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
 
     for (let attempt = 1; attempt < PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
       const res = await handler({
-        jobId: "job_retry_test",
+        jobId: enqueuedJobId,
         type: PRODUCTION_DELIVERY_JOB,
         payload: { dispatchId: dispatch.publicId } as never,
         attempt,
@@ -785,7 +806,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
 
     // Attempt 5 exhausts retries -> transitions to `dead`, clears `payloadEnc`, returns `retryable: false`!
     const finalRes = await handler({
-      jobId: "job_retry_test",
+      jobId: enqueuedJobId,
       type: PRODUCTION_DELIVERY_JOB,
       payload: { dispatchId: dispatch.publicId } as never,
       attempt: PRODUCTION_MAX_ATTEMPTS,
@@ -850,14 +871,15 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(h.audit.events.some((e) => e.eventName === "integration.production.dispatch.resent")).toBe(true);
 
     // Simulate a crashed worker leaving `sending` in DB -> handler MUST NOT auto-replay (`outcome: "unknown"`)
-    // AND MUST immediately scrub `payloadEnc` + mark terminal `failed` so resend is never blocked forever (PW-02)!
+    // AND MUST immediately scrub `payloadEnc` + mark terminal `unknown` so resend is never blocked forever (PW-02)!
+    const resentJobId = h.jobs.enqueued[0]!.jobId;
     await tdb.db
       .update(integrationProductionDispatches)
       .set({ state: "sending" })
       .where(eq(integrationProductionDispatches.publicId, resent.publicId));
     const beforeCalls = httpCalls.length;
     const ambiguousRes = await handler({
-      jobId: "job_ambiguous",
+      jobId: resentJobId,
       type: PRODUCTION_DELIVERY_JOB,
       payload: { dispatchId: resent.publicId } as never,
       attempt: 2,
@@ -876,7 +898,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       .select()
       .from(integrationProductionDispatches)
       .where(eq(integrationProductionDispatches.publicId, resent.publicId));
-    expect(scrubbedAmbiguous?.state).toBe("failed");
+    expect(scrubbedAmbiguous?.state).toBe("unknown");
     expect(scrubbedAmbiguous?.payloadEnc).toBeNull();
     expect(scrubbedAmbiguous?.lastReasonCode).toBe("PRODUCTION_AMBIGUOUS_IN_FLIGHT");
   });
@@ -1100,13 +1122,14 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       .select()
       .from(integrationProductionDispatches)
       .where(eq(integrationProductionDispatches.publicId, dSend.publicId));
-    expect(reconciledSend?.state).toBe("failed");
+    expect(reconciledSend?.state).toBe("unknown");
     expect(reconciledSend?.payloadEnc).toBeNull();
     expect(reconciledSend?.lastReasonCode).toBe("PRODUCTION_DELIVERY_INTERRUPTED");
     expect(
       h.audit.events.some(
         (e) =>
           e.eventName === "integration.production.dispatch.failed" &&
+          e.outcome === "unknown" &&
           e.reasonCode === "PRODUCTION_DELIVERY_INTERRUPTED" &&
           e.attributes?.reconciled === true &&
           e.attributes?.delivery_uncertain === true,
@@ -1400,5 +1423,627 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(exported.document).not.toContain("wh_live_super_secret_token_value");
     expect(exported.document).not.toContain(INTEGRATIONS_PRODUCTION_P101_URL.key);
     expect(exported.document).not.toContain(INTEGRATIONS_PRODUCTION_AUTH_VALUE.key);
+  });
+
+  it("fences reconciliation via job ledger, filters stale candidates in SQL before LIMIT, protects live queued/sending jobs, preserves unknown outcome on prior attempts, and blocks stale finalize from overwriting reconciled/resent rows (PW-02)", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(admin);
+
+    type LedgerEntry = {
+      state: "queued" | "running" | "completed" | "failed" | "canceled" | "unknown";
+      leaseUntilMs: number | null;
+    };
+    const jobLedger = new Map<string, LedgerEntry>();
+    const origEnqueue = h.jobs.enqueue.bind(h.jobs);
+    vi.spyOn(h.jobs, "enqueue").mockImplementation(async (type, payload, options) => {
+      const res = await origEnqueue(type, payload, options);
+      if (!jobLedger.has(res.jobId)) {
+        jobLedger.set(res.jobId, { state: "queued", leaseUntilMs: null });
+      }
+      return res;
+    });
+
+    const reconcileSpy = vi.fn(
+      async (
+        jobPublicId: string,
+        _tx: Tx,
+        options?: { cancelQueued?: boolean },
+      ): Promise<OutboxJobDisposition> => {
+        const entry = jobLedger.get(jobPublicId);
+        if (!entry) return { state: "missing" };
+        if (entry.state === "running") {
+          if (entry.leaseUntilMs !== null && entry.leaseUntilMs > h.clock.now().getTime()) {
+            return { state: "running_live" };
+          }
+          entry.state = "unknown";
+          entry.leaseUntilMs = null;
+          return { state: "settled_unknown" };
+        }
+        if (entry.state === "queued") {
+          if (!options?.cancelQueued) return { state: "queued_live" };
+          entry.state = "canceled";
+          return { state: "canceled_queued" };
+        }
+        return { state: "terminal", jobState: entry.state };
+      },
+    );
+    h.services.jobAdmin = { reconcileOutboxJob: reconcileSpy } as never;
+
+    const deliveryHandler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+    const reconcileHandler = h.jobs.handlers.get(PRODUCTION_RECONCILE_JOB)!;
+    const runReconcileTick = () =>
+      reconcileHandler({
+        jobId: "job_reconcile_tick",
+        type: PRODUCTION_RECONCILE_JOB,
+        payload: {} as never,
+        attempt: 1,
+        fencingToken: 1,
+        correlationId: "corr_reconcile_tick",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+
+    // ── Part A: Fake-clock live `queued` (`queued_live`) vs TTL expiry (`attemptCount === 0` vs `attemptCount > 0`) ──
+    const oZero = seedOrderAndCustomer({
+      orderId: 901,
+      orderPublicId: "01JORDER000000000000000901",
+      reference: "ORD-PW02-ZERO-901",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+    const oAttempted = seedOrderAndCustomer({
+      orderId: 902,
+      orderPublicId: "01JORDER000000000000000902",
+      reference: "ORD-PW02-ATTEMPTED-902",
+      packets: [{ packetNumber: 2, tier: "Premium" }],
+    });
+
+    const staffCaller = createCaller(staff);
+    const dZero = await staffCaller.production.order.requestP101({ orderPublicId: oZero.orderPublicId });
+    const dAttempted = await staffCaller.production.order.requestP101({ orderPublicId: oAttempted.orderPublicId });
+    const attemptedJobId = h.jobs.enqueued.find(
+      (j) => (j.payload as { dispatchId?: string })?.dispatchId === dAttempted.publicId,
+    )!.jobId;
+
+    // Run attempt 1 on `dAttempted` returning HTTP 503 -> returns to `queued` with `attemptCount = 1`, retry still live in `jobLedger`
+    nextHttpHandler = async () => ({
+      status: 503,
+      headers: {},
+      body: Buffer.from("temporary 503", "utf8"),
+    });
+    const attempt1Res = await deliveryHandler({
+      jobId: attemptedJobId,
+      type: PRODUCTION_DELIVERY_JOB,
+      payload: { dispatchId: dAttempted.publicId } as never,
+      attempt: 1,
+      fencingToken: 1,
+      correlationId: "corr_attempt1_503",
+      signal: new AbortController().signal,
+      assertStillOwned: async () => {},
+    });
+    expect(attempt1Res).toEqual({
+      outcome: "failed",
+      reasonCode: "PRODUCTION_HTTP_5XX",
+      retryable: true,
+    });
+
+    // Advance FakeClock 2h 15m (well past `PRODUCTION_STALE_QUEUED_MS` = 15m, well before 24h `expiresAt`!)
+    h.clock.advance(PRODUCTION_STALE_QUEUED_MS + 2 * 60 * 60_000);
+    await runReconcileTick();
+
+    // Healthy live `queued` dispatches MUST NOT be marked failed!
+    const [liveZero] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dZero.publicId));
+    const [liveAttempted] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dAttempted.publicId));
+    expect(liveZero?.state).toBe("queued");
+    expect(liveZero?.payloadEnc).toBeTruthy();
+    expect(liveAttempted?.state).toBe("queued");
+    expect(liveAttempted?.attemptCount).toBe(1);
+    expect(liveAttempted?.payloadEnc).toBeTruthy();
+
+    // Advance FakeClock past `PRODUCTION_DISPATCH_MAX_TTL_MS` (24h total) -> fenced `cancelQueued: true`!
+    h.clock.advance(PRODUCTION_DISPATCH_MAX_TTL_MS);
+    await runReconcileTick();
+
+    const [expiredZero] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dZero.publicId));
+    const [expiredAttempted] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dAttempted.publicId));
+
+    // `attemptCount === 0` -> safely `failed` (`PRODUCTION_DELIVERY_EXPIRED`)
+    expect(expiredZero?.state).toBe("failed");
+    expect(expiredZero?.lastReasonCode).toBe("PRODUCTION_DELIVERY_EXPIRED");
+    expect(expiredZero?.payloadEnc).toBeNull();
+
+    // `attemptCount > 0` -> conservatively `unknown` (`PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN`, `outcome: "unknown"`, `delivery_uncertain: true`)
+    expect(expiredAttempted?.state).toBe("unknown");
+    expect(expiredAttempted?.lastReasonCode).toBe("PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN");
+    expect(expiredAttempted?.payloadEnc).toBeNull();
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.failed" &&
+          e.outcome === "unknown" &&
+          e.reasonCode === "PRODUCTION_PRIOR_ATTEMPT_UNCERTAIN" &&
+          e.attributes?.delivery_uncertain === true,
+      ),
+    ).toBe(true);
+
+    // ── Part B: SQL staleness predicate BEFORE `LIMIT` (zero starvation behind >200 fresh rows) ──
+    const baseNow = h.clock.now();
+    const freshBatch = Array.from({ length: 205 }, (_, idx) => {
+      const n = idx + 1;
+      const jobId = `job_fresh_${String(n).padStart(4, "0")}`;
+      jobLedger.set(jobId, {
+        state: n % 2 === 0 ? "queued" : "running",
+        leaseUntilMs: n % 2 === 0 ? null : baseNow.getTime() + 120_000,
+      });
+      return {
+        publicId: `01JFRESH00000000000000${String(n).padStart(4, "0")}`,
+        orderId: 2000 + n,
+        orderPublicId: `01JFRORD00000000000000${String(n).padStart(4, "0")}`,
+        orderReference: `ORD-FRESH-${n}`,
+        expectedOwnerUserId: 2500 + n,
+        destinationFingerprint: "a".repeat(64),
+        jobPublicId: jobId,
+        activeFencingToken: n % 2 === 0 ? 0 : 1,
+        expiresAt: new Date(baseNow.getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS),
+        phase: "P101" as const,
+        state: n % 2 === 0 ? ("queued" as const) : ("sending" as const),
+        attemptCount: n % 2 === 0 ? 0 : 1,
+        idempotencyKey: `idem-fresh-${n}`,
+        payloadSha256: "b".repeat(64),
+        payloadEnc: "enc_fresh_payload",
+        sentCustomerId: "RP-FRESH01",
+        sentOrderId: `ORD-FRESH-${n}`,
+        sentRunMode: "production",
+        packet: "1",
+        tier: "Standard",
+        requestedByUserId: 2,
+        correlationId: `corr_fresh_${n}`,
+        version: 1,
+        createdAt: baseNow,
+        updatedAt: baseNow,
+      };
+    });
+    await tdb.db.insert(integrationProductionDispatches).values(freshBatch);
+
+    const staleSendJobId = "job_behind_stale_send";
+    jobLedger.set(staleSendJobId, { state: "running", leaseUntilMs: baseNow.getTime() - 5_000 });
+    const staleExpJobId = "job_behind_expired_queue";
+    jobLedger.set(staleExpJobId, { state: "queued", leaseUntilMs: null });
+
+    const staleBehindPubSend = "01JBEHINDSEND0000000000001";
+    const staleBehindPubExp = "01JBEHINDEXP00000000000002";
+    await tdb.db.insert(integrationProductionDispatches).values([
+      {
+        publicId: staleBehindPubSend,
+        orderId: 2991,
+        orderPublicId: "01JBEHINDORD00000000002991",
+        orderReference: "ORD-BEHIND-SEND-2991",
+        expectedOwnerUserId: 3491,
+        destinationFingerprint: "a".repeat(64),
+        jobPublicId: staleSendJobId,
+        activeFencingToken: 3,
+        expiresAt: new Date(baseNow.getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS),
+        phase: "P101",
+        state: "sending",
+        attemptCount: 1,
+        idempotencyKey: "idem-behind-send-2991",
+        payloadSha256: "b".repeat(64),
+        payloadEnc: "enc_stale_behind_send",
+        sentCustomerId: "RP-BEHIND1",
+        sentOrderId: "ORD-BEHIND-SEND-2991",
+        sentRunMode: "production",
+        packet: "1",
+        tier: "Standard",
+        requestedByUserId: 2,
+        correlationId: "corr_behind_send_2991",
+        version: 2,
+        createdAt: new Date(baseNow.getTime() - 120_000),
+        updatedAt: new Date(baseNow.getTime() - 120_000),
+      },
+      {
+        publicId: staleBehindPubExp,
+        orderId: 2992,
+        orderPublicId: "01JBEHINDORD00000000002992",
+        orderReference: "ORD-BEHIND-EXP-2992",
+        expectedOwnerUserId: 3492,
+        destinationFingerprint: "a".repeat(64),
+        jobPublicId: staleExpJobId,
+        activeFencingToken: 0,
+        expiresAt: new Date(baseNow.getTime() - 1_000),
+        phase: "P101",
+        state: "queued",
+        attemptCount: 0,
+        idempotencyKey: "idem-behind-exp-2992",
+        payloadSha256: "b".repeat(64),
+        payloadEnc: "enc_stale_behind_exp",
+        sentCustomerId: "RP-BEHIND2",
+        sentOrderId: "ORD-BEHIND-EXP-2992",
+        sentRunMode: "production",
+        packet: "1",
+        tier: "Standard",
+        requestedByUserId: 2,
+        correlationId: "corr_behind_exp_2992",
+        version: 1,
+        createdAt: new Date(baseNow.getTime() - PRODUCTION_DISPATCH_MAX_TTL_MS - 1_000),
+        updatedAt: baseNow, // fresh updatedAt, expired expiresAt -> caught by Pass 3!
+      },
+    ]);
+
+    reconcileSpy.mockClear();
+    await runReconcileTick();
+
+    // SQL filtered out all 205 fresh rows BEFORE `LIMIT` -> `reconcileOutboxJob` was called ONLY for the 2 stale rows!
+    expect(reconcileSpy).toHaveBeenCalledTimes(2);
+
+    const [reconciledBehindSend] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, staleBehindPubSend));
+    const [reconciledBehindExp] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, staleBehindPubExp));
+    expect(reconciledBehindSend?.state).toBe("unknown");
+    expect(reconciledBehindSend?.payloadEnc).toBeNull();
+    expect(reconciledBehindExp?.state).toBe("failed");
+    expect(reconciledBehindExp?.lastReasonCode).toBe("PRODUCTION_DELIVERY_EXPIRED");
+    expect(reconciledBehindExp?.payloadEnc).toBeNull();
+
+    // Clean up the 205 synthetic fresh rows before Part C
+    for (const row of freshBatch) {
+      jobLedger.delete(row.jobPublicId);
+    }
+    const conn = await tdb.pool.getConnection();
+    try {
+      await conn.query("DELETE FROM integration_production_dispatches WHERE order_id >= 2000 AND order_id <= 2300");
+    } finally {
+      conn.release();
+    }
+
+    // ── Part C: Active `sending` (`running_live`) untouched + Reaper-versus-Finalize race (503 & 200) + P201 blocked on `unknown` ──
+    const oRace503 = seedOrderAndCustomer({
+      orderId: 903,
+      orderPublicId: "01JORDER000000000000000903",
+      reference: "ORD-PW02-RACE503-903",
+      packets: [{ packetNumber: 3, tier: "Standard" }],
+    });
+    const oRace200 = seedOrderAndCustomer({
+      orderId: 904,
+      orderPublicId: "01JORDER000000000000000904",
+      reference: "ORD-PW02-RACE200-904",
+      packets: [{ packetNumber: 4, tier: "Premium" }],
+    });
+
+    const dRace503 = await staffCaller.production.order.requestP101({ orderPublicId: oRace503.orderPublicId });
+    const dRace200 = await staffCaller.production.order.requestP101({ orderPublicId: oRace200.orderPublicId });
+    const job503Id = h.jobs.enqueued.find(
+      (j) => (j.payload as { dispatchId?: string })?.dispatchId === dRace503.publicId,
+    )!.jobId;
+    const job200Id = h.jobs.enqueued.find(
+      (j) => (j.payload as { dispatchId?: string })?.dispatchId === dRace200.publicId,
+    )!.jobId;
+
+    let entered503!: () => void;
+    let release503!: (resp: EgressFetchResponse) => void;
+    const entered503Promise = new Promise<void>((resolve) => {
+      entered503 = resolve;
+    });
+    const gate503Promise = new Promise<EgressFetchResponse>((resolve) => {
+      release503 = resolve;
+    });
+
+    let entered200!: () => void;
+    let release200!: (resp: EgressFetchResponse) => void;
+    const entered200Promise = new Promise<void>((resolve) => {
+      entered200 = resolve;
+    });
+    const gate200Promise = new Promise<EgressFetchResponse>((resolve) => {
+      release200 = resolve;
+    });
+
+    nextHttpHandler = async ({ headers }) => {
+      if (headers?.["Idempotency-Key"] === dRace503.idempotencyKey) {
+        entered503();
+        return gate503Promise;
+      }
+      entered200();
+      return gate200Promise;
+    };
+
+    // Both jobs hold a 120s worker lease
+    const leaseStartMs = h.clock.now().getTime();
+    jobLedger.set(job503Id, { state: "running", leaseUntilMs: leaseStartMs + 120_000 });
+    jobLedger.set(job200Id, { state: "running", leaseUntilMs: leaseStartMs + 120_000 });
+
+    const inFlight503 = deliveryHandler({
+      jobId: job503Id,
+      type: PRODUCTION_DELIVERY_JOB,
+      payload: { dispatchId: dRace503.publicId } as never,
+      attempt: 1,
+      fencingToken: 7,
+      correlationId: "corr_race_503",
+      signal: new AbortController().signal,
+      assertStillOwned: async () => {},
+    });
+    const inFlight200 = deliveryHandler({
+      jobId: job200Id,
+      type: PRODUCTION_DELIVERY_JOB,
+      payload: { dispatchId: dRace200.publicId } as never,
+      attempt: 1,
+      fencingToken: 8,
+      correlationId: "corr_race_200",
+      signal: new AbortController().signal,
+      assertStillOwned: async () => {},
+    });
+
+    await Promise.all([entered503Promise, entered200Promise]);
+
+    // Advance 47s (past `timeoutMs + PRODUCTION_SENDING_GRACE_MS` = 42s, while 120s worker lease is STILL LIVE!)
+    h.clock.advance(12_000 + PRODUCTION_SENDING_GRACE_MS + 5_000);
+    await runReconcileTick();
+
+    const [stillLive503] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dRace503.publicId));
+    expect(stillLive503?.state).toBe("sending");
+    expect(stillLive503?.activeFencingToken).toBe(7);
+    expect(stillLive503?.payloadEnc).toBeTruthy();
+
+    // Advance another 90s so the 120s worker lease expires -> reaper settles both dispatches to `unknown`!
+    h.clock.advance(90_000);
+    await runReconcileTick();
+
+    const [reaped503] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dRace503.publicId));
+    const [reaped200] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dRace200.publicId));
+    expect(reaped503?.state).toBe("unknown");
+    expect(reaped503?.payloadEnc).toBeNull();
+    expect(reaped503?.activeFencingToken).toBe(0);
+    expect(reaped200?.state).toBe("unknown");
+    expect(reaped200?.payloadEnc).toBeNull();
+
+    // P201 remains strictly delivered-only when P101 is `unknown`!
+    const previewUnknown = await staffCaller.production.order.preview({ orderPublicId: oRace503.orderPublicId });
+    expect(previewUnknown.p201.eligible).toBe(false);
+    await expect(
+      staffCaller.production.order.requestP201({
+        orderPublicId: oRace503.orderPublicId,
+        phase1ArtifactsConfirmed: true,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+
+    // Operator queues a fresh resend on `oRace503` BEFORE stale worker `inFlight503` finishes!
+    const stepUpAdminNow = makeStepUpAdmin(h);
+    const dResentAfterReap = await createCaller(stepUpAdminNow).production.order.resend({
+      orderPublicId: oRace503.orderPublicId,
+      phase: "P101",
+      reason: "Verified downstream pipeline has no record of interrupted run",
+    });
+    expect(dResentAfterReap.state).toBe("queued");
+    expect(dResentAfterReap.resendReason).toBe("OPERATOR_RETRY_AFTER_INTERRUPTION");
+
+    // Stale workers finally return HTTP 503 (retryable!) and HTTP 200 (delivered!)
+    release503({
+      status: 503,
+      headers: {},
+      body: Buffer.from("late 503 from wedged socket", "utf8"),
+    });
+    release200({
+      status: 200,
+      headers: {},
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+
+    const [res503, res200] = await Promise.all([inFlight503, inFlight200]);
+    expect(res503).toEqual({
+      outcome: "unknown",
+      reasonCode: "PRODUCTION_FENCE_SUPERSEDED",
+    });
+    expect(res200).toEqual({
+      outcome: "unknown",
+      reasonCode: "PRODUCTION_FENCE_SUPERSEDED",
+    });
+
+    // Claim fence prevented stale workers from setting `queued` with `payloadEnc=null` OR flipping `unknown` to `delivered`!
+    const [afterLate503] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dRace503.publicId));
+    const [afterLate200] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dRace200.publicId));
+    const [intactResend] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dResentAfterReap.publicId));
+
+    expect(afterLate503?.state).toBe("unknown");
+    expect(afterLate503?.payloadEnc).toBeNull();
+    expect(afterLate200?.state).toBe("unknown");
+    expect(afterLate200?.payloadEnc).toBeNull();
+    expect(intactResend?.state).toBe("queued");
+    expect(intactResend?.payloadEnc).toBeTruthy();
+
+    // Also verify `admin.listDispatches` supports filtering by `"unknown"` state
+    const unknownList = await createCaller(stepUpAdminNow).production.admin.listDispatches({ state: "unknown" });
+    const unknownIds = new Set(unknownList.items.map((item) => item.publicId));
+    expect(unknownIds.has(dRace503.publicId)).toBe(true);
+    expect(unknownIds.has(dRace200.publicId)).toBe(true);
+  });
+
+  it("integrates with real JobsModule.reconcileOutboxJob and rolls back job cancellation if dispatch state moves before lock (PW-02)", async () => {
+    const realHarness = createTestDeps();
+    wireMockServices(realHarness, tdb.db);
+    realHarness.deps.audit = createAuditEmitter(realHarness.deps);
+    realHarness.deps.settings = createSettingsStore({
+      db: tdb.db,
+      crypto: realHarness.deps.crypto,
+      clock: realHarness.clock,
+      audit: realHarness.deps.audit,
+      logger: realHarness.deps.logger,
+    });
+    const realAuditCenter = createAuditModule(realHarness.deps);
+    realHarness.deps.jobs = createJobQueue(realHarness.deps);
+    const realJobAdmin = createJobsModule(realHarness.deps);
+    realHarness.services.jobAdmin = realJobAdmin;
+
+    const realMod = createIntegrationsModule(realHarness.deps, {
+      egress: {
+        dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+        httpsRequester: async () => ({
+          status: 200,
+          headers: {},
+          body: Buffer.from('{"ok":true}', "utf8"),
+        }),
+      },
+    });
+    realHarness.services.integrations = realMod;
+
+    const admin = makeStepUpAdmin(realHarness);
+    const staff = makeStaff(realHarness);
+    const realCaller = (session: SessionPrincipal | null) =>
+      integrationsRouter.createCaller({
+        request: newRequestContext("test"),
+        session,
+        services: realHarness.services,
+        transport: { issue: () => {}, clear: () => {} },
+      });
+
+    await realMod.egress.createAllowlistRule(admin, {
+      purpose: "webhook",
+      matchType: "host",
+      pattern: "hooks.production.example.test",
+      port: 443,
+      protocol: "https:",
+      allowPrivateAddress: false,
+      enabled: true,
+      justification: "Real JobsModule outbox reconciliation test",
+    });
+    await realMod.production.updateSettings(admin, {
+      enabled: true,
+      p101Url: P101_TEST_URL,
+      p201Url: P201_TEST_URL,
+      canonVersion: "v3.0",
+    });
+
+    const oMoved = seedOrderAndCustomer({
+      orderId: 951,
+      orderPublicId: "01JORDER000000000000000951",
+      reference: "ORD-REAL-MOVED-951",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+    const dMoved = await runWithRequestContext(newRequestContext("test"), () =>
+      realCaller(staff).production.order.requestP101({ orderPublicId: oMoved.orderPublicId }),
+    );
+
+    const [createdRow] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dMoved.publicId));
+    expect(createdRow?.jobPublicId).toBeTruthy();
+
+    // Advance past `PRODUCTION_STALE_QUEUED_MS` -> real `reconcileOutboxJob` reports `queued_live`, dispatch stays `queued`
+    realHarness.clock.advance(PRODUCTION_STALE_QUEUED_MS + 60_000);
+    const histLive = await realCaller(staff).production.order.history({ orderPublicId: oMoved.orderPublicId });
+    expect(histLive.items[0]?.state).toBe("queued");
+
+    // Advance past `PRODUCTION_DISPATCH_MAX_TTL_MS` AND simulate concurrent delivery changing dispatch `state`/`version`
+    // right before `reconcileSingleCandidate` locks the dispatch row -> outer `tx` MUST roll back `cancelQueued`!
+    realHarness.clock.advance(PRODUCTION_DISPATCH_MAX_TTL_MS + 1_000);
+    const origReconcile = realJobAdmin.reconcileOutboxJob.bind(realJobAdmin);
+    let injectedConcurrentMove = false;
+    realHarness.services.jobAdmin = {
+      ...realJobAdmin,
+      reconcileOutboxJob: async (jobPublicId, tx, options) => {
+        const res = await origReconcile(jobPublicId, tx, options);
+        if (!injectedConcurrentMove && jobPublicId === createdRow!.jobPublicId) {
+          injectedConcurrentMove = true;
+          // Separate pool connection commits `delivered` before `reconcileSingleCandidate` locks dispatch
+          await tdb.db
+            .update(integrationProductionDispatches)
+            .set({
+              state: "delivered",
+              payloadEnc: null,
+              version: createdRow!.version + 1,
+              deliveredAt: realHarness.clock.now(),
+              updatedAt: realHarness.clock.now(),
+            })
+            .where(eq(integrationProductionDispatches.publicId, dMoved.publicId));
+        }
+        return res;
+      },
+    };
+
+    const histAfterRace = await realCaller(staff).production.order.history({ orderPublicId: oMoved.orderPublicId });
+    expect(injectedConcurrentMove).toBe(true);
+    expect(histAfterRace.items[0]?.state).toBe("delivered");
+
+    // Outer `tx` rollback undid `cancelQueued` inside `job_runs` AND `audit_events` -> job is STILL `queued_live` and zero `job.canceled` committed!
+    const postRollbackDisposition = await tdb.db.transaction((tx) =>
+      origReconcile(createdRow!.jobPublicId, tx),
+    );
+    expect(postRollbackDisposition).toEqual({ state: "queued_live" });
+    await realAuditCenter.sealPending();
+    const auditAfterRollback = await realAuditCenter.readEventsAfter(null, 100);
+    expect(auditAfterRollback.events.filter((e) => e.event_name === "job.canceled")).toHaveLength(0);
+
+    // Restore unwrapped `realJobAdmin`, enqueue a second dispatch, advance past TTL, and verify clean fenced cancellation
+    realHarness.services.jobAdmin = realJobAdmin;
+    const oExpire = seedOrderAndCustomer({
+      orderId: 952,
+      orderPublicId: "01JORDER000000000000000952",
+      reference: "ORD-REAL-EXPIRE-952",
+      packets: [{ packetNumber: 2, tier: "Premium" }],
+    });
+    const dExpire = await runWithRequestContext(newRequestContext("test"), () =>
+      realCaller(staff).production.order.requestP101({ orderPublicId: oExpire.orderPublicId }),
+    );
+    const [expireCreated] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dExpire.publicId));
+
+    realHarness.clock.advance(PRODUCTION_DISPATCH_MAX_TTL_MS + 1_000);
+    const histExpired = await realCaller(staff).production.order.history({ orderPublicId: oExpire.orderPublicId });
+    expect(histExpired.items[0]?.state).toBe("failed");
+    expect(histExpired.items[0]?.lastReasonCode).toBe("PRODUCTION_DELIVERY_EXPIRED");
+
+    const postExpireDisposition = await tdb.db.transaction((tx) =>
+      origReconcile(expireCreated!.jobPublicId, tx),
+    );
+    expect(postExpireDisposition).toEqual({ state: "terminal", jobState: "canceled" });
+    await realAuditCenter.sealPending();
+    const auditAfterExpire = await realAuditCenter.readEventsAfter(null, 100);
+    expect(
+      auditAfterExpire.events.some(
+        (e) => e.event_name === "job.canceled" && e.job_id === expireCreated!.jobPublicId,
+      ),
+    ).toBe(true);
+    expect(
+      auditAfterExpire.events.some(
+        (e) =>
+          e.event_name === "integration.production.dispatch.failed" &&
+          e.reason_code === "PRODUCTION_DELIVERY_EXPIRED",
+      ),
+    ).toBe(true);
   });
 });

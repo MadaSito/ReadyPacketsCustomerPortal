@@ -85,7 +85,7 @@ const checkEgressTargetSchema = z.strictObject({
 });
 
 const productionPhaseSchema = z.enum(["P101", "P201"]);
-const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead"]);
+const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead", "unknown"]);
 
 const updateProductionSettingsSchema = z.strictObject({
   enabled: z.boolean(),

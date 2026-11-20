@@ -7,7 +7,7 @@
  *  - `integration_webhook_events`         : Durable authenticated webhook inbox for idempotent delivery handling.
  *  - `integration_production_dispatches`  : Outbound P101/P201 production webhook outbox & delivery audit state.
  */
-import { boolean, char, index, int, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { bigint, boolean, char, index, int, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 import { createdAtColumn, idColumn, publicIdColumn, refColumn, updatedAtColumn, utcDateTime, versionColumn } from "../../db/columns.js";
 
 export const integrationEgressAllowlist = mysqlTable(
@@ -86,8 +86,14 @@ export const integrationProductionDispatches = mysqlTable(
     expectedOwnerUserId: refColumn("expected_owner_user_id").notNull(),
     /** Keyed HMAC-SHA-256 fingerprint of authorized destination/auth/config; worker cancels with DESTINATION_CHANGED on drift (PW-04). */
     destinationFingerprint: char("destination_fingerprint", { length: 64 }).notNull(),
+    /** Linked job ledger identifier (`job_runs.public_id`) used to fence reconciliation against live worker ownership (PW-02). */
+    jobPublicId: varchar("job_public_id", { length: 36 }).notNull(),
+    /** Monotonic `ClaimedJob.fencingToken` recorded on `queued -> sending` claim and required on finalization (PW-02). */
+    activeFencingToken: bigint("active_fencing_token", { mode: "number", unsigned: true }).notNull().default(0),
+    /** Bounded outbox retention deadline (`created_at + 24h`); expired queued rows cancel their job under fence and scrub `payload_enc` (PW-02). */
+    expiresAt: utcDateTime("expires_at").notNull(),
     phase: varchar("phase", { length: 8 }).notNull(), // "P101" | "P201"
-    state: varchar("state", { length: 16 }).notNull(), // "queued" | "sending" | "delivered" | "failed" | "dead"
+    state: varchar("state", { length: 16 }).notNull(), // "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown"
     attemptCount: int("attempt_count", { unsigned: true }).notNull().default(0),
     idempotencyKey: varchar("idempotency_key", { length: 96 }).notNull(),
     payloadSha256: char("payload_sha256", { length: 64 }).notNull(),
@@ -122,7 +128,11 @@ export const integrationProductionDispatches = mysqlTable(
   (table) => [
     uniqueIndex("uq_prod_dispatch_idempotency").on(table.idempotencyKey),
     index("idx_prod_dispatch_order_phase").on(table.orderId, table.phase, table.createdAt),
+    index("idx_prod_dispatch_order_pub").on(table.orderPublicId, table.state),
     index("idx_prod_dispatch_state_created").on(table.state, table.createdAt),
+    index("idx_prod_dispatch_state_updated").on(table.state, table.updatedAt, table.id),
+    index("idx_prod_dispatch_state_expiry").on(table.state, table.expiresAt, table.id),
+    index("idx_prod_dispatch_job").on(table.jobPublicId),
     index("idx_prod_dispatch_order_ref").on(table.orderReference, table.createdAt),
   ],
 );

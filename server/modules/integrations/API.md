@@ -88,7 +88,7 @@ export interface ProviderStatus {
 - Implements `P101` (Order Creation / SharePoint folder tree initialization) and `P201` (Trigger Production Run) per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
 - Ships disabled (`feature.integrations.production = false`) with empty `canonVersion` (`""`); stores `p101_url`, `p201_url`, and `auth_value` via `defineSecret` (`exportable: false`, `FieldCrypto` AES-256-GCM — excluded from generic Platform settings exports) and returns only masked `{ host, last4 }` / `authHeaderValueConfigured` views.
 - Enforces `egress.fetchPinned(..., "webhook", { requireAllowlistRule: true, publicAddressesOnly: true })` (HTTPS-only, mandatory enabled `"webhook"` allowlist rule, public-only DNS answers in the same evaluation as socket pinning, zero redirects, discarded 8 KiB response read with fixed server-generated `responseSummary` only).
-- Pins each dispatch to `expected_owner_user_id` and a keyed HMAC-SHA-256 `destination_fingerprint` at queue time (`DESTINATION_CHANGED` cancels on URL/auth/config drift), revalidates order lock/hold/cancellation/owner/scope immediately before send, encrypts retry payload bodies (`payload_enc`) only during the active retry window, scrubs `payload_enc = NULL` on `delivered` / `failed` / `dead` and via bounded stale reconciliation (`integrations.production.reconcile`), and records only controlled `resendReason` codes.
+- Pins each dispatch to `expected_owner_user_id`, a keyed HMAC-SHA-256 `destination_fingerprint` (`DESTINATION_CHANGED` cancels on URL/auth/config drift), `job_public_id`, `active_fencing_token`, and bounded 24h `expires_at` (`PRODUCTION_DISPATCH_MAX_TTL_MS`). Revalidates order lock/hold/cancellation/owner/scope immediately before send, encrypts retry payload bodies (`payload_enc`) only during the active retry window, scrubs `payload_enc = NULL` on terminal `delivered` / `failed` / `dead` / `unknown` states, fences stale reconciliation against live worker ownership via `services.jobAdmin.reconcileOutboxJob` (`integrations.production.reconcile`), fences worker finalization on matching `(state = "sending", version, attemptCount, activeFencingToken, jobPublicId)` (`PRODUCTION_FENCE_SUPERSEDED`), and records only controlled `resendReason` codes.
 
 ---
 
@@ -122,7 +122,7 @@ All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require 
 - **`production.order.requestP201`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, phase1ArtifactsConfirmed }` -> `ProductionDispatchItem`
 - **`production.order.resend`** (`mutation`, `admin` + `orders.production.trigger` + step-up) -> input `{ orderPublicId, phase: "P101" | "P201", reason, releaseStatus?, phase1ArtifactsConfirmed? }` -> `ProductionDispatchItem` (`resendReason` holds controlled code only)
 - **`production.order.history`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId }` -> `{ items: ProductionDispatchItem[] }`
-- **`production.admin.listDispatches`** (`query`, `admin` + `orders.production.trigger`) -> input `{ phase?, state?, orderReference?, fromDate?, toDate?, limit? }` -> `{ items: ProductionDispatchItem[] }`
+- **`production.admin.listDispatches`** (`query`, `admin` + `orders.production.trigger`) -> input `{ phase?, state?: "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown", orderReference?, fromDate?, toDate?, limit? }` -> `{ items: ProductionDispatchItem[] }`
 
 ---
 

@@ -646,6 +646,7 @@ export default function ProductionPipelinePage() {
                     { value: "delivered", label: DISPATCH_STATE_META.delivered.label },
                     { value: "failed", label: DISPATCH_STATE_META.failed.label },
                     { value: "dead", label: DISPATCH_STATE_META.dead.label },
+                    { value: "unknown", label: DISPATCH_STATE_META.unknown.label },
                   ]}
                 />
               </Field>
