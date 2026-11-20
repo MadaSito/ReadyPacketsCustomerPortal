@@ -1,0 +1,241 @@
+/**
+ * Sign-in presentation: public read model + validated image uploads. Owner: platform engineer.
+ */
+import { createHash } from "node:crypto";
+import type { Readable } from "node:stream";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { notFound, validation } from "../../core/errors.js";
+import { getRequestContext } from "../../core/requestContext.js";
+import type { AuditEmitter, Clock, Db, ObjectStorage, SettingsStore } from "../../core/types.js";
+import type { PublicPresentation, PublicSlide } from "./index.js";
+import { validateImage, MAX_IMAGE_BYTES } from "./imageValidation.js";
+import { platformPresentationImages } from "./schema.js";
+import {
+  BRAND_IMAGE_ALLOWLIST,
+  PRESENTATION_ANNOUNCEMENT,
+  PRESENTATION_SLIDES,
+  PRESENTATION_SLIDESHOW,
+  PRESENTATION_SUPPORT_TEXT,
+  ULID_PATTERN,
+  type Slide,
+} from "./settings.js";
+import { readSetting } from "./settingsRegistry.js";
+
+export const PRESENTATION_IMAGE_ROUTE = "/api/platform/presentation/images";
+export const MAX_UPLOADED_IMAGES = 50;
+
+export interface PresentationDeps {
+  db: Db;
+  clock: Clock;
+  audit: AuditEmitter;
+  settings: SettingsStore;
+  storage: ObjectStorage;
+}
+
+export interface PresentationImageSummary {
+  id: string;
+  source: "brand" | "upload";
+  path: string;
+  width: number;
+  height: number;
+  byteSize?: number;
+  createdAt?: Date;
+}
+
+export function createPresentationService(deps: PresentationDeps) {
+  const { db, clock, audit, settings, storage } = deps;
+
+  async function activeUploads(ids: readonly string[]): Promise<Set<string>> {
+    if (ids.length === 0) return new Set();
+    const rows = await db
+      .select({ publicId: platformPresentationImages.publicId })
+      .from(platformPresentationImages)
+      .where(and(inArray(platformPresentationImages.publicId, [...ids]), isNull(platformPresentationImages.deletedAt)));
+    return new Set(rows.map((row) => row.publicId));
+  }
+
+  function imagePath(image: NonNullable<Slide["image"]>): string {
+    return image.source === "brand" ? BRAND_IMAGE_ALLOWLIST[image.id].path : `${PRESENTATION_IMAGE_ROUTE}/${image.id}`;
+  }
+
+  /** Extra validation for the slides setting: every uploaded image must exist. */
+  async function assertSlidesReferenceKnownImages(slides: Slide[]): Promise<void> {
+    const uploads = slides.flatMap((slide) => (slide.image?.source === "upload" ? [slide.image.id] : []));
+    const known = await activeUploads(uploads);
+    if (uploads.some((id) => !known.has(id))) {
+      throw validation("UNKNOWN_IMAGE", "One of the selected images is no longer available.");
+    }
+  }
+
+  async function publicPresentation(): Promise<PublicPresentation & { slideshow: { autoAdvance: boolean; intervalSeconds: number } }> {
+    const [slides, slideshow, supportText, announcement] = await Promise.all([
+      readSetting(settings, PRESENTATION_SLIDES),
+      readSetting(settings, PRESENTATION_SLIDESHOW),
+      readSetting(settings, PRESENTATION_SUPPORT_TEXT),
+      readSetting(settings, PRESENTATION_ANNOUNCEMENT),
+    ]);
+    const known = await activeUploads(slides.flatMap((s) => (s.image?.source === "upload" ? [s.image.id] : [])));
+    const out: PublicSlide[] = slides.map((slide) => ({
+      id: slide.id,
+      title: slide.title,
+      body: slide.body,
+      // An image that was removed after publication is silently dropped, never replaced by a remote URL.
+      image:
+        slide.image && (slide.image.source === "brand" || known.has(slide.image.id))
+          ? { id: slide.image.id, alt: slide.image.alt, url: imagePath(slide.image) }
+          : null,
+    }));
+    return {
+      slides: out,
+      slideshow,
+      supportText,
+      announcement: announcement.enabled ? { text: announcement.text, tone: announcement.tone } : null,
+    };
+  }
+
+  async function listImages(): Promise<PresentationImageSummary[]> {
+    const brand = Object.entries(BRAND_IMAGE_ALLOWLIST).map(([id, value]) => ({
+      id,
+      source: "brand" as const,
+      path: value.path,
+      width: value.width,
+      height: value.height,
+    }));
+    const uploads = await db
+      .select()
+      .from(platformPresentationImages)
+      .where(isNull(platformPresentationImages.deletedAt))
+      .orderBy(desc(platformPresentationImages.id))
+      .limit(MAX_UPLOADED_IMAGES);
+    return [
+      ...brand,
+      ...uploads.map((row) => ({
+        id: row.publicId,
+        source: "upload" as const,
+        path: `${PRESENTATION_IMAGE_ROUTE}/${row.publicId}`,
+        width: row.width,
+        height: row.height,
+        byteSize: row.byteSize,
+        createdAt: row.createdAt,
+      })),
+    ];
+  }
+
+  /** Caller must have verified admin + fresh step-up. Bytes are validated and metadata-stripped first. */
+  async function uploadImage(bytes: Buffer): Promise<PresentationImageSummary> {
+    if (bytes.length > MAX_IMAGE_BYTES) throw validation("IMAGE_TOO_LARGE", "Images must be 2 MB or smaller.");
+    const result = validateImage(bytes);
+    if (!result.ok) {
+      await audit.record({
+        category: "file",
+        eventName: "platform.presentation.image.refused",
+        action: "upload",
+        outcome: "refused",
+        severity: "WARN",
+        reasonCode: `IMAGE_${result.reason}`,
+        resource: { type: "presentation_image" },
+      });
+      throw validation(`IMAGE_${result.reason}`, "Please upload a PNG, JPEG or WebP image between 16 and 4096 pixels on each side, up to 2 MB.");
+    }
+    const active = await db
+      .select({ id: platformPresentationImages.id })
+      .from(platformPresentationImages)
+      .where(isNull(platformPresentationImages.deletedAt))
+      .limit(MAX_UPLOADED_IMAGES + 1);
+    if (active.length >= MAX_UPLOADED_IMAGES) throw validation("IMAGE_LIMIT_REACHED", "Remove an unused image before uploading another.");
+
+    const sha256 = createHash("sha256").update(result.bytes).digest("hex");
+    const key = storage.newKey("files");
+    await storage.put(key, result.bytes, { maxBytes: MAX_IMAGE_BYTES });
+    const actorUserId = getRequestContext()?.actor?.userId ?? null;
+    try {
+      const publicId = await db.transaction(async (tx) => {
+        const [inserted] = await tx
+          .insert(platformPresentationImages)
+          .values({
+            storageKey: key,
+            mimeType: result.mime,
+            byteSize: result.bytes.length,
+            sha256,
+            width: result.width,
+            height: result.height,
+            uploadedByUserId: actorUserId,
+            createdAt: clock.now(),
+          })
+          .$returningId();
+        const [row] = await tx
+          .select({ publicId: platformPresentationImages.publicId })
+          .from(platformPresentationImages)
+          .where(eq(platformPresentationImages.id, inserted!.id));
+        await audit.record(
+          {
+            category: "file",
+            eventName: "platform.presentation.image.uploaded",
+            action: "upload",
+            outcome: "completed",
+            resource: { type: "presentation_image", publicId: row!.publicId },
+            safeCounts: { bytes: result.bytes.length, width: result.width, height: result.height },
+            attributes: { mime_type: result.mime },
+          },
+          tx,
+        );
+        return row!.publicId;
+      });
+      return {
+        id: publicId,
+        source: "upload",
+        path: `${PRESENTATION_IMAGE_ROUTE}/${publicId}`,
+        width: result.width,
+        height: result.height,
+        byteSize: result.bytes.length,
+        createdAt: clock.now(),
+      };
+    } catch (error) {
+      // No orphaned object when the durable record (or its audit) failed.
+      await storage.delete(key).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function deleteImage(publicId: string): Promise<void> {
+    if (!ULID_PATTERN.test(publicId)) throw notFound();
+    const slides = await readSetting(settings, PRESENTATION_SLIDES);
+    if (slides.some((slide) => slide.image?.source === "upload" && slide.image.id === publicId)) {
+      throw validation("IMAGE_IN_USE", "This image is used by a slide. Remove it from the slideshow first.");
+    }
+    await db.transaction(async (tx) => {
+      const [row] = await tx
+        .select()
+        .from(platformPresentationImages)
+        .where(and(eq(platformPresentationImages.publicId, publicId), isNull(platformPresentationImages.deletedAt)))
+        .for("update");
+      if (!row) throw notFound();
+      await tx.update(platformPresentationImages).set({ deletedAt: clock.now() }).where(eq(platformPresentationImages.id, row.id));
+      await audit.record(
+        {
+          category: "file",
+          eventName: "platform.presentation.image.deleted",
+          action: "delete",
+          outcome: "completed",
+          resource: { type: "presentation_image", publicId },
+        },
+        tx,
+      );
+    });
+  }
+
+  /** Public read of an uploaded image. Only non-deleted uploads; unknown ids are NOT_FOUND. */
+  async function openImage(publicId: string): Promise<{ stream: Readable; mimeType: string; size: number; sha256: string }> {
+    if (!ULID_PATTERN.test(publicId)) throw notFound();
+    const [row] = await db
+      .select()
+      .from(platformPresentationImages)
+      .where(and(eq(platformPresentationImages.publicId, publicId), isNull(platformPresentationImages.deletedAt)))
+      .limit(1);
+    if (!row) throw notFound();
+    return { stream: await storage.get(row.storageKey), mimeType: row.mimeType, size: row.byteSize, sha256: row.sha256 };
+  }
+
+  return { publicPresentation, listImages, uploadImage, deleteImage, openImage, assertSlidesReferenceKnownImages };
+}
+export type PresentationService = ReturnType<typeof createPresentationService>;
