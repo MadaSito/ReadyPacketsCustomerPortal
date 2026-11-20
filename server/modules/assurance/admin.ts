@@ -26,6 +26,7 @@ export function createCredentialAdmin(deps: ModuleDeps) {
 
   async function scope<T>(
     actor: SessionPrincipal, customerId: string, work: (tx: Tx, target: IdentityUser) => Promise<T>,
+    preflight?: (candidate: IdentityUser) => Promise<void>,
   ): Promise<T> {
     try {
       authorize(actor);
@@ -35,6 +36,7 @@ export function createCredentialAdmin(deps: ModuleDeps) {
       // This lookup only establishes lock order. Re-read the target authoritatively under lock.
       const candidate = await identity.getUserByPublicId(customerId);
       if (!candidate || (candidate.role === "admin" && actor.role !== "admin")) throw notFound("USER_NOT_FOUND");
+      if (preflight) await preflight(candidate);
       return await deps.db.transaction(async (tx) => {
         // Two admins acting on one another must not acquire user locks in opposite order.
         if (actor.userId < candidate.id) await assertCurrent(deps, actor, tx);
@@ -59,14 +61,12 @@ export function createCredentialAdmin(deps: ModuleDeps) {
 
   return {
     async administerCredential(actor: SessionPrincipal, input: AdminCredentialInput): Promise<{ ok: true; temporaryPassword?: string }> {
+      function requireVerifiedAddress(target: IdentityUser) {
+        if (!target.emailVerified) throw conflict("TARGET_EMAIL_UNVERIFIED", "Set-password email requires a verified address.");
+      }
       return scope(actor, input.customerId, async (tx, target) => {
         const identity = deps.services.identity;
-        if (input.mode === "email_link") {
-          if (!target.emailVerified) throw conflict("TARGET_EMAIL_UNVERIFIED", "Set-password email requires a verified address.");
-          if (!(await deps.services.integrations.smtp.getReadiness()).ready) {
-            throw new DomainError("NOT_CONFIGURED", "SMTP_NOT_READY", "Set-password email is unavailable. Configure email delivery or use a temporary password.");
-          }
-        }
+        if (input.mode === "email_link") requireVerifiedAddress(target);
         await identity.sessions.revokeAllForUser(target.id, { reason: "ADMIN_CREDENTIAL_CHANGE", tx });
         let generatedPassword: string | undefined;
         if (input.mode === "email_link") {
@@ -89,7 +89,14 @@ export function createCredentialAdmin(deps: ModuleDeps) {
           link: "/account/security", skipEmail: input.mode === "email_link",
         }, tx);
         return generatedPassword ? { ...ok, temporaryPassword: generatedPassword } : ok;
-      });
+      }, input.mode === "email_link" ? async (target) => {
+        requireVerifiedAddress(target);
+        // The settings lookup can borrow its own pooled connection. Do not hold a
+        // transaction during this advisory check; target eligibility is rechecked under lock.
+        if (!(await deps.services.integrations.smtp.getReadiness()).ready) {
+          throw new DomainError("NOT_CONFIGURED", "SMTP_NOT_READY", "Set-password email is unavailable. Configure email delivery or use a temporary password.");
+        }
+      } : undefined);
     },
     async resetMfa(actor: SessionPrincipal, customerId: string) {
       return scope(actor, customerId, async (tx, target) => {
