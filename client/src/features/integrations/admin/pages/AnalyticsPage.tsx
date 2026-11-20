@@ -171,12 +171,13 @@ export default function AnalyticsPage() {
 
 export const ENABLE_CONFIRM_TEXT = "ENABLE ANALYTICS";
 
-/** INT-01 residual risk, stated plainly. Clarity runs vendor script on the origin; PostHog receives page views sent by portal code (no vendor script). */
+/** INT-01 residual risk, stated plainly (docs/adr/0021-analytics-origin-residual.md). Clarity runs vendor script on the origin; PostHog receives page views sent by portal code (no vendor script). */
 function OriginRiskText() {
   return (
     <>
-      <p>Vendor scripts run on this portal's origin on the Privacy and Terms pages only. Microsoft Clarity's script cannot read the session cookie, but it could make requests with a visitor's session if that visitor signs in from another tab. PostHog runs no vendor script here; the portal itself sends anonymous page views to it.</p>
-      <p className="mt-2">Prefer running analytics on your public marketing site. Leave these off unless your organisation has accepted this risk.</p>
+      <p>Vendor scripts run on this portal's origin on the Privacy and Terms pages only. They cannot read the session cookie, but if a visitor who consented signs in from another tab, the script could make requests — reads and ordinary changes — as that visitor. Actions that need re-authentication remain protected.</p>
+      <p className="mt-2">Prefer running analytics on the public marketing site; leave these off unless your organisation has accepted this risk.</p>
+      <p className="mt-2 text-muted">PostHog runs no vendor script here: the portal itself sends anonymous page views to it. Microsoft Clarity does load its script.</p>
     </>
   );
 }

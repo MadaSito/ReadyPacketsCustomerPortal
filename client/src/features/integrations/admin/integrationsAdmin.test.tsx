@@ -189,7 +189,8 @@ describe("Analytics settings", () => {
     expect(screen.getByText("/admin")).toBeInTheDocument();
     const warning = screen.getByText("Security risk: analytics runs on the portal's own origin");
     expect(warning.compareDocumentPosition(screen.getByRole("switch", { name: /Enable Microsoft Clarity/ })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getAllByText(/Leave these off unless your organisation has accepted this risk/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/leave these off unless your organisation has accepted this risk/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/could make requests — reads and ordinary changes — as that visitor/)).toBeInTheDocument();
     await expectNoAxeViolations(container);
 
     await userEvent.type(screen.getByLabelText(/Clarity project ID/), "bad id!");
@@ -212,7 +213,7 @@ describe("Analytics settings", () => {
 
     // Switching a vendor on needs a typed risk acknowledgement before anything reaches the server (INT-01).
     const confirm = await screen.findByRole("alertdialog", { name: "Enable analytics on the portal origin?" });
-    expect(within(confirm).getByText(/could make requests with a visitor's session/)).toBeInTheDocument();
+    expect(within(confirm).getByText(/reads and ordinary changes — as that visitor\. Actions that need re-authentication remain protected\./)).toBeInTheDocument();
     const accept = within(confirm).getByRole("button", { name: "Accept risk and enable" });
     expect(accept).toBeDisabled();
     await expectNoAxeViolations(document.body);
