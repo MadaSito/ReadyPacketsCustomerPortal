@@ -16,13 +16,21 @@ export function registerAuditHttpRoutes(router: Router, services: Services): voi
     if (!ULID_PATTERN.test(exportId)) throw notFound("AUDIT_EXPORT_NOT_FOUND");
     // openExportDownload re-checks capability + requester scope and writes the durable "downloaded" audit row first.
     const file = await services.auditCenter.openExportDownload(principal, exportId);
+    let outcome: "completed" | "failed" | "unknown" = "unknown";
     try {
       await sendPrivateDownload(res, file);
+      if (res.writableFinished) outcome = "completed";
     } catch (error) {
-      if (!res.headersSent && !res.destroyed) throw error;
+      if (!res.headersSent && !res.destroyed) {
+        outcome = "failed";
+        throw error;
+      }
       res.destroy();
     } finally {
       file.stream.destroy();
+      await services.auditCenter
+        .recordDownloadResult(principal, exportId, outcome)
+        .catch(() => services.logger.error("Audit export download outcome could not be recorded", { reason_code: "AUDIT_UNAVAILABLE" }));
     }
   });
 }

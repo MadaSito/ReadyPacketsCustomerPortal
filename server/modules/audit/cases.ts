@@ -4,7 +4,8 @@ import { conflict, notFound, validation } from "../../core/errors.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal } from "../../core/types.js";
 import { neutraliseControl } from "../../observability/redact.js";
-import { actorOf, assertAuditCapability, type AuditCtx } from "./access.js";
+import { actorOf, assertActorCurrent, assertAuditCapability, type AuditCtx } from "./access.js";
+import { lockGate, retentionGateReady } from "./retention.js";
 import type { AuditEnvelope } from "./envelope.js";
 import { auditQuerySchema, compileQuery, type AuditQuery } from "./query.js";
 import { rowToEnvelope } from "./rows.js";
@@ -191,6 +192,7 @@ export async function createCase(ctx: AuditCtx, principal: SessionPrincipal, inp
   if (!title) throw validation("TITLE_REQUIRED", "Give the case a title.");
   const publicId = ulid(ctx.deps.clock.now().getTime());
   await ctx.deps.db.transaction(async (tx) => {
+    await assertActorCurrent(ctx, principal, tx, "audit.cases.manage");
     await tx.insert(auditCases).values({ publicId, titleEnc: ctx.deps.crypto.encrypt(title, titleAad(publicId)), severity: input.severity, createdBy: principal.userId });
     await ctx.deps.audit.record(
       { category: "security", eventName: "audit.case.created", action: "create", outcome: "completed", actor: actorOf(principal), resource: { type: "audit_case", publicId }, attributes: { severity: input.severity } },
@@ -203,7 +205,11 @@ export async function createCase(ctx: AuditCtx, principal: SessionPrincipal, inp
 
 export async function updateCaseStatus(ctx: AuditCtx, principal: SessionPrincipal, id: string, status: CaseStatus): Promise<void> {
   assertAuditCapability(ctx, principal, "audit.cases.manage");
+  await retentionGateReady(ctx);
   await ctx.deps.db.transaction(async (tx) => {
+    // Reopening a case newly protects its events from retention: serialise with deletion.
+    await lockGate(tx, "share");
+    await assertActorCurrent(ctx, principal, tx, "audit.cases.manage");
     const row = await loadCase(ctx, id, true, tx);
     if (row.status === status) return;
     await tx.update(auditCases).set({ status, closedAt: status === "closed" ? ctx.deps.clock.now() : null }).where(eq(auditCases.id, row.id));
@@ -219,7 +225,10 @@ export async function attachEvents(ctx: AuditCtx, principal: SessionPrincipal, i
   const unique = [...new Set(eventIds)].filter((e) => ULID_PATTERN.test(e)).slice(0, 50);
   if (unique.length === 0) throw validation("EVENTS_REQUIRED", "Choose at least one event to attach.");
   let attached = 0;
+  await retentionGateReady(ctx);
   await ctx.deps.db.transaction(async (tx) => {
+    await lockGate(tx, "share");
+    await assertActorCurrent(ctx, principal, tx, "audit.cases.manage");
     const row = await loadCase(ctx, id, true, tx);
     if (row.status === "closed") throw conflict("CASE_CLOSED", "Reopen the case before attaching events.");
     const existing = await tx.select({ eventId: auditEvents.eventId }).from(auditEvents).where(inArray(auditEvents.eventId, unique));
@@ -245,6 +254,7 @@ export async function addCaseNote(ctx: AuditCtx, principal: SessionPrincipal, id
   if (!text) throw validation("NOTE_REQUIRED", "Write a note before saving.");
   const publicId = ulid(ctx.deps.clock.now().getTime());
   await ctx.deps.db.transaction(async (tx) => {
+    await assertActorCurrent(ctx, principal, tx, "audit.cases.manage");
     const row = await loadCase(ctx, id, true, tx);
     await tx.insert(auditCaseNotes).values({ publicId, caseId: row.id, authorUserId: principal.userId, bodyEnc: ctx.deps.crypto.encrypt(text, noteAad(publicId)), createdAt: ctx.deps.clock.now() });
     await tx.update(auditCases).set({ updatedAt: ctx.deps.clock.now() }).where(eq(auditCases.id, row.id));

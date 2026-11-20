@@ -29,7 +29,7 @@
  *   and re-sign; independent immutable retention (SIEM copy, exported checkpoints) is the mitigation.
  */
 import { createHash, createHmac, createPrivateKey, createPublicKey, hkdfSync, sign as edSign, verify as edVerify, type KeyObject } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, max, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, max, sql } from "drizzle-orm";
 import { ulid } from "../../core/ids.js";
 import type { Clock, Db, DbOrTx, Logger } from "../../core/types.js";
 import { canonicalBytes, type AuditEnvelope } from "./envelope.js";
@@ -46,6 +46,8 @@ export interface ChainKeys {
   keyRef: string;
   genesis: string;
   link(seq: number, prevHash: string, digest: string): string;
+  /** Retention receipt MAC (domain-separated from links). */
+  tombstone(seq: number, eventId: string, digest: string, runId: string): string;
   signingKey: KeyObject;
   publicKeyB64: string;
   signingKeyRef: string;
@@ -65,6 +67,7 @@ export function deriveChainKeys(auditChainKey: string, installationId: string): 
     keyRef: mac("key-ref").slice(0, 16),
     genesis: mac(`${CHAIN_VERSION}|genesis|${installationId}`),
     link: (seq, prevHash, digest) => mac(`${CHAIN_VERSION}|${seq}|${prevHash}|${digest}`),
+    tombstone: (seq, eventId, digest, runId) => mac(`rp.audit.tombstone/1|${seq}|${eventId}|${digest}|${runId}`),
     signingKey,
     publicKeyB64,
     signingKeyRef: createHash("sha256").update(publicKeyB64).digest("hex").slice(0, 16),
@@ -130,8 +133,17 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
   async function ensureHead(db: DbOrTx): Promise<void> {
     await db
       .insert(auditChainHead)
-      .values({ id: HEAD_ID, headSeq: 0, headHash: keys.genesis, scanWatermark: 0, watermarkCandidateId: 0 })
+      .values({ id: HEAD_ID, headSeq: 0, headHash: keys.genesis, keyRef: keys.keyRef, scanWatermark: 0, watermarkCandidateId: 0 })
       .onDuplicateKeyUpdate({ set: { id: sql`id` } });
+  }
+
+  /** Refuse to extend or sign a chain built under a different key (mixed HMAC rows would be irreversible). */
+  function assertKeyIdentity(head: typeof auditChainHead.$inferSelect): void {
+    const mismatch = (head.keyRef !== null && head.keyRef !== keys.keyRef) || (head.headSeq === 0 && head.headHash !== keys.genesis);
+    if (mismatch) {
+      log.error("audit chain key identity mismatch; sealing and checkpoints refused", { reason_code: "CHAIN_KEY_MISMATCH" });
+      throw new ChainKeyMismatchError();
+    }
   }
 
   async function sealOnce(fullScan: boolean): Promise<{ sealed: number; headSeq: number; more: boolean }> {
@@ -139,6 +151,16 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
     return deps.db.transaction(async (tx) => {
       const [head] = await tx.select().from(auditChainHead).where(eq(auditChainHead.id, HEAD_ID)).for("update");
       if (!head) throw new Error("audit chain head missing");
+      assertKeyIdentity(head);
+      if (head.keyRef === null) {
+        // Legacy head without a key binding: bind only if the latest sealed row was produced by this key.
+        const [last] = await tx.select({ keyRef: auditChain.keyRef }).from(auditChain).where(eq(auditChain.seq, head.headSeq));
+        if (head.headSeq > 0 && last?.keyRef !== keys.keyRef) {
+          log.error("audit chain key identity mismatch; sealing refused", { reason_code: "CHAIN_KEY_MISMATCH" });
+          throw new ChainKeyMismatchError();
+        }
+        await tx.update(auditChainHead).set({ keyRef: keys.keyRef }).where(eq(auditChainHead.id, HEAD_ID));
+      }
       const floor = fullScan ? 0 : head.scanWatermark;
       const candidates = await tx
         .select({ event: auditEvents })
@@ -189,9 +211,10 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
     });
   }
 
-  async function headRow() {
-    await ensureHead(deps.db);
-    const [head] = await deps.db.select().from(auditChainHead).where(eq(auditChainHead.id, HEAD_ID));
+  async function headRow(db: DbOrTx = deps.db) {
+    // Never upsert inside a caller's transaction (it would need an X lock while callers hold S).
+    if (db === deps.db) await ensureHead(db);
+    const [head] = await db.select().from(auditChainHead).where(eq(auditChainHead.id, HEAD_ID));
     if (!head) throw new Error("audit chain head missing");
     return head;
   }
@@ -236,7 +259,8 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
           .from(auditChain)
           .leftJoin(auditEvents, eq(auditEvents.id, auditChain.eventRowId))
           .leftJoin(auditTombstones, eq(auditTombstones.seq, auditChain.seq))
-          .where(gte(auditChain.seq, expectedSeq))
+          // Bounded to the head sampled at the start: rows sealed concurrently are not part of this verification.
+          .where(and(gte(auditChain.seq, expectedSeq), lte(auditChain.seq, head.headSeq)))
           .orderBy(asc(auditChain.seq))
           .limit(Math.min(500, maxEvents - checked));
         if (page.length === 0) break;
@@ -262,7 +286,12 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
               fail(chain.seq, chain.eventId, "DIGEST_MISMATCH");
               break outer;
             }
-          } else if (tomb && tomb.eventId === chain.eventId && tomb.eventDigest === chain.eventDigest) {
+          } else if (
+            tomb &&
+            tomb.eventId === chain.eventId &&
+            tomb.eventDigest === chain.eventDigest &&
+            tomb.receipt === keys.tombstone(chain.seq, chain.eventId, chain.eventDigest, tomb.retentionRunId)
+          ) {
             pruned += 1;
           } else {
             fail(chain.seq, chain.eventId, "EVENT_MISSING");
@@ -284,6 +313,8 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
       // Signed checkpoints: signature valid, and the chain row at that seq still carries the checkpointed hash.
       let checkpointsVerified = 0;
       if (!firstBreak) {
+        // NOT bounded to the sampled head: a checkpoint past it is either from concurrent sealing (its chain row
+        // exists — chain rows are never deleted) or evidence of head rewind/truncation (row missing ⇒ mismatch).
         const checkpoints = await deps.db.select().from(auditCheckpoints).orderBy(desc(auditCheckpoints.seq)).limit(50);
         for (const cp of checkpoints) {
           const message = checkpointMessage(cp.installationRef, cp.seq, cp.headHash, cp.signedAt);
@@ -333,7 +364,8 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
     },
 
     async createCheckpoint(reason, db = deps.db) {
-      const head = await headRow();
+      const head = await headRow(db);
+      assertKeyIdentity(head);
       const signedAt = new Date(Math.floor(deps.clock.now().getTime()));
       const signature = edSign(null, Buffer.from(checkpointMessage(deps.installationId, head.headSeq, head.headHash, signedAt)), keys.signingKey).toString("base64");
       const publicId = ulid(signedAt.getTime());
@@ -381,4 +413,11 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
 export async function chainRowsFor(db: DbOrTx, eventRowIds: number[]) {
   if (eventRowIds.length === 0) return [];
   return db.select().from(auditChain).where(inArray(auditChain.eventRowId, eventRowIds));
+}
+
+export class ChainKeyMismatchError extends Error {
+  constructor() {
+    super("CHAIN_KEY_MISMATCH");
+    this.name = "ChainKeyMismatchError";
+  }
 }

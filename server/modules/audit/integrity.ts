@@ -1,7 +1,8 @@
 /** Integrity administration: status, verify, checkpoints. Owner: audit engineer. */
 import { desc } from "drizzle-orm";
 import type { SessionPrincipal } from "../../core/types.js";
-import { actorOf, assertAuditCapability, type AuditCtx } from "./access.js";
+import { actorOf, assertActorCurrent, assertAuditCapability, type AuditCtx } from "./access.js";
+import { lockGate } from "./retention.js";
 import { HORIZON_MS, type ChainVerification } from "./chain.js";
 import { isDurableAuditEmitter } from "./emitter.js";
 import { integrityCounts } from "./search.js";
@@ -86,17 +87,27 @@ export async function listCheckpoints(ctx: AuditCtx, principal: SessionPrincipal
 }
 
 export async function createCheckpointAsAdmin(ctx: AuditCtx, principal: SessionPrincipal) {
-  assertAuditCapability(ctx, principal, "audit.read");
+  // Signing is a privileged integrity action: requires the step-up retention-management capability.
+  assertAuditCapability(ctx, principal, "audit.retention.manage");
   await ctx.chain.sealPending();
-  const cp = await ctx.chain.createCheckpoint("manual");
-  await ctx.deps.audit.record({
-    category: "security",
-    eventName: "audit.checkpoint.created",
-    action: "create",
-    outcome: "completed",
-    actor: actorOf(principal),
-    resource: { type: "audit_checkpoint", publicId: cp.publicId },
-    attributes: { checkpoint_seq: cp.seq },
+  return ctx.deps.db.transaction(async (tx) => {
+    // Hold the head steady while it is read, signed and the checkpoint + its audit row commit together.
+    // Gate first (uniform lock order: chain head, then user row).
+    await lockGate(tx, "share");
+    await assertActorCurrent(ctx, principal, tx, "audit.retention.manage");
+    const cp = await ctx.chain.createCheckpoint("manual", tx);
+    await ctx.deps.audit.record(
+      {
+        category: "security",
+        eventName: "audit.checkpoint.created",
+        action: "create",
+        outcome: "completed",
+        actor: actorOf(principal),
+        resource: { type: "audit_checkpoint", publicId: cp.publicId },
+        attributes: { checkpoint_seq: cp.seq },
+      },
+      tx,
+    );
+    return cp;
   });
-  return cp;
 }

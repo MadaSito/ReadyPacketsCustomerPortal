@@ -96,13 +96,35 @@ export interface Group {
   terms: (Term | Group)[];
 }
 
-export const groupSchema: z.ZodType<Group> = z.lazy(() =>
-  z.strictObject({
-    kind: z.literal("group"),
-    op: z.enum(["and", "or"]),
-    terms: z.array(z.union([groupSchema, fieldTermSchema, attributeTermSchema])).min(1).max(MAX_TERMS),
-  }),
-);
+/** Hard cap on total JSON nodes in `where`, checked iteratively BEFORE schema parsing (no recursion). */
+export const MAX_WHERE_NODES = 400;
+
+function boundedShape(value: unknown): boolean {
+  const stack: { v: unknown; d: number }[] = [{ v: value, d: 0 }];
+  let nodes = 0;
+  while (stack.length > 0) {
+    const { v, d } = stack.pop()!;
+    nodes += 1;
+    // Group nesting MAX_DEPTH → JSON depth ≤ MAX_DEPTH*2 (group → terms array) + term object + `in` array.
+    if (nodes > MAX_WHERE_NODES || d > MAX_DEPTH * 2 + 2) return false;
+    if (Array.isArray(v)) for (const item of v) stack.push({ v: item, d: d + 1 });
+    else if (v !== null && typeof v === "object") for (const item of Object.values(v)) stack.push({ v: item, d: d + 1 });
+  }
+  return true;
+}
+
+const leafSchema = z.union([fieldTermSchema, attributeTermSchema]);
+type AnySchema = z.ZodType<Term | Group>;
+function groupAt(level: number): z.ZodType<Group> {
+  // Depth-specific, non-recursive: the deepest level accepts only leaf terms.
+  const member: AnySchema = level >= MAX_DEPTH ? leafSchema : z.union([groupAt(level + 1), fieldTermSchema, attributeTermSchema]);
+  return z.strictObject({ kind: z.literal("group"), op: z.enum(["and", "or"]), terms: z.array(member).min(1).max(MAX_TERMS) });
+}
+
+export const groupSchema: z.ZodType<Group> = z
+  .unknown()
+  .refine(boundedShape, { message: `Filters are limited to ${MAX_DEPTH} nested levels and ${MAX_TERMS} conditions.` })
+  .pipe(groupAt(1)) as unknown as z.ZodType<Group>;
 
 export const auditQuerySchema = z.strictObject({
   from: z.iso.datetime({ offset: true }),

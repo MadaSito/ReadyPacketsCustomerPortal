@@ -124,6 +124,8 @@ export const auditChainHead = mysqlTable("audit_chain_head", {
   id: tinyint("id", { unsigned: true }).primaryKey(),
   headSeq: bigint("head_seq", { mode: "number", unsigned: true }).notNull().default(0),
   headHash: char("head_hash", { length: 64 }).notNull(),
+  /** Identity of the HMAC key that built this chain. Appends/checkpoints refuse to run under a different key. */
+  keyRef: char("key_ref", { length: 16 }),
   /** All event rows with id <= watermark are sealed (or were rolled back). Advanced conservatively. */
   scanWatermark: bigint("scan_watermark", { mode: "number", unsigned: true }).notNull().default(0),
   /** Max event row id observed at `watermark_candidate_at`; promoted to the watermark once older than the horizon. */
@@ -168,6 +170,8 @@ export const auditTombstones = mysqlTable(
     occurredAt: utcDateTime("occurred_at").notNull(),
     retentionRunId: char("retention_run_id", { length: 26 }).notNull(),
     removedAt: utcDateTime("removed_at").notNull(),
+    /** HMAC (chain key, domain "rp.audit.tombstone/1") over seq|event_id|digest|run_id: a DB-only actor cannot mint one. */
+    receipt: char("receipt", { length: 64 }).notNull(),
   },
   (t) => [uniqueIndex("ux_audit_tomb_event").on(t.eventId), uniqueIndex("ux_audit_tomb_seq").on(t.seq)],
 );

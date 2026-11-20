@@ -5,11 +5,11 @@
  */
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lte, sql } from "drizzle-orm";
 import { conflict, notFound } from "../../core/errors.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import type { ClaimedJob, JobResult, SessionPrincipal } from "../../core/types.js";
-import { actorOf, assertAuditCapability, type AuditCtx } from "./access.js";
+import { actorOf, assertActorCurrent, assertAuditCapability, type AuditCtx } from "./access.js";
 import { AUDIT_SCHEMA_VERSION } from "./envelope.js";
 import { CONTENT_TYPES, csvHeader, encodeRecord, exportRecord, type ExportFormat, type ExportProfile } from "./formats.js";
 import { afterCursor, compileQuery, encodeCursor, ORDER_NEWEST_FIRST, type AuditQuery } from "./query.js";
@@ -54,7 +54,11 @@ export interface ExportManifest {
   sha256: string;
   truncated: boolean;
   max_rows: number;
+  /** Evidence snapshot: only events sealed at or below this chain seq and occurred at or before `snapshot_cutoff`. */
   chain_head_seq: number;
+  snapshot_cutoff: string;
+  /** Retention may remove events inside the snapshot while the job runs; such rows are simply absent (never altered). */
+  completeness: "complete" | "truncated";
   installation_ref: string;
   generated_at: string;
   order: "occurred_at desc, event_id desc";
@@ -97,6 +101,7 @@ export async function requestExport(
   compileQuery(input.query);
   const publicId = ulid(ctx.deps.clock.now().getTime());
   await ctx.deps.db.transaction(async (tx) => {
+    await assertActorCurrent(ctx, principal, tx, "audit.export");
     const active = await tx
       .select({ id: auditExports.id })
       .from(auditExports)
@@ -133,7 +138,15 @@ export async function listExports(ctx: AuditCtx, principal: SessionPrincipal): P
 }
 
 /** Streams pages of the query as encoded lines; stops at MAX_EXPORT_ROWS. */
-async function* encodedRows(ctx: AuditCtx, query: AuditQuery, format: ExportFormat, profile: ExportProfile, state: { rows: number; truncated: boolean }, job?: ClaimedJob<unknown>) {
+async function* encodedRows(
+  ctx: AuditCtx,
+  query: AuditQuery,
+  format: ExportFormat,
+  profile: ExportProfile,
+  state: { rows: number; truncated: boolean },
+  snapshot: { headSeq: number; cutoff: Date },
+  job?: ClaimedJob<unknown>,
+) {
   const compiled = compileQuery(query);
   if (format === "csv") yield csvHeader(profile);
   let cursor: string | null = null;
@@ -142,8 +155,8 @@ async function* encodedRows(ctx: AuditCtx, query: AuditQuery, format: ExportForm
     const rows = await ctx.deps.db
       .select({ event: auditEvents, seq: auditChain.seq })
       .from(auditEvents)
-      .leftJoin(auditChain, eq(auditChain.eventRowId, auditEvents.id))
-      .where(and(compiled.where, afterCursor(cursor)))
+      .innerJoin(auditChain, eq(auditChain.eventRowId, auditEvents.id))
+      .where(and(compiled.where, afterCursor(cursor), lte(auditChain.seq, snapshot.headSeq), lte(auditEvents.occurredAt, snapshot.cutoff)))
       .orderBy(...ORDER_NEWEST_FIRST)
       .limit(PAGE);
     let chunk = "";
@@ -169,17 +182,37 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
   if (!row) return { outcome: "failed", reasonCode: "EXPORT_NOT_FOUND", retryable: false };
   if (row.status === "completed") return { outcome: "completed" };
   if (row.status === "failed" || row.status === "canceled") return { outcome: "canceled", reasonCode: "EXPORT_ALREADY_FINAL" };
-  await ctx.deps.db.update(auditExports).set({ status: "running" }).where(eq(auditExports.id, row.id));
   const stored = row.query as StoredQuery;
   const format = row.format as ExportFormat;
+  // Zero trust: re-derive the requester's CURRENT standing; never trust the stored id + an assumed role.
+  const requester = await ctx.deps.services.identity.getUser(row.requestedBy);
+  if (!requester || requester.role !== "admin" || requester.status !== "active") {
+    await ctx.deps.db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      await tx.update(auditExports).set({ status: "canceled", reasonCode: "EXPORT_REQUESTER_INELIGIBLE", completedAt: ctx.deps.clock.now() }).where(eq(auditExports.id, row.id));
+      await ctx.deps.audit.record(
+        { category: "security", eventName: "audit.export.failed", action: "export", outcome: "canceled", reasonCode: "EXPORT_REQUESTER_INELIGIBLE", actor: { role: "system" }, resource: { type: "audit_export", publicId: exportId }, correlationId: exportId, jobId: job.jobId },
+        tx,
+      );
+    });
+    return { outcome: "canceled", reasonCode: "EXPORT_REQUESTER_INELIGIBLE" };
+  }
+  const actor = { userId: requester.id, role: requester.role };
+  // Fix the evidence set before scanning: seal what is pending, then pin head seq + time cutoff.
+  await ctx.chain.sealPending();
+  const startHead = await ctx.chain.head();
+  const snapshot = { headSeq: startHead.headSeq, cutoff: ctx.deps.clock.now() };
+  await ctx.deps.db.transaction(async (tx) => {
+    await job.assertStillOwned(tx);
+    await tx.update(auditExports).set({ status: "running" }).where(eq(auditExports.id, row.id));
+  });
   const key = ctx.deps.storage.newKey("exports");
   const state = { rows: 0, truncated: false };
-  const actor = { userId: row.requestedBy, role: "admin" as const };
   try {
     const hash = createHash("sha256");
     const source = Readable.from(
       (async function* () {
-        for await (const chunk of encodedRows(ctx, stored.query, format, stored.profile, state, job)) {
+        for await (const chunk of encodedRows(ctx, stored.query, format, stored.profile, state, snapshot, job)) {
           const buf = Buffer.from(chunk, "utf8");
           hash.update(buf);
           yield buf;
@@ -187,8 +220,6 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
       })(),
     );
     const info = await ctx.deps.storage.put(key, source, { maxBytes: MAX_EXPORT_BYTES });
-    await job.assertStillOwned();
-    const head = await ctx.chain.head();
     const manifest: ExportManifest = {
       manifest_version: "rp.audit.export/1",
       export_id: exportId,
@@ -201,13 +232,16 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
       sha256: info.sha256 || hash.digest("hex"),
       truncated: state.truncated,
       max_rows: MAX_EXPORT_ROWS,
-      chain_head_seq: head.headSeq,
+      chain_head_seq: snapshot.headSeq,
+      snapshot_cutoff: snapshot.cutoff.toISOString(),
+      completeness: state.truncated ? "truncated" : "complete",
       installation_ref: ctx.deps.config.installationId,
       generated_at: ctx.deps.clock.now().toISOString(),
       order: "occurred_at desc, event_id desc",
     };
     try {
       await ctx.deps.db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
         await tx
           .update(auditExports)
           .set({
@@ -249,6 +283,7 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
     ctx.deps.logger.error("audit export failed", { export_id: exportId, reason_code: reasonCode, error });
     try {
       await ctx.deps.db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
         await tx.update(auditExports).set({ status: reasonCode === "EXPORT_CANCELED" ? "canceled" : "failed", reasonCode, completedAt: ctx.deps.clock.now() }).where(eq(auditExports.id, row.id));
         await ctx.deps.audit.record(
           { category: "security", eventName: "audit.export.failed", action: "export", outcome: reasonCode === "EXPORT_CANCELED" ? "canceled" : "failed", reasonCode, actor, resource: { type: "audit_export", publicId: exportId }, correlationId: exportId, jobId: job.jobId },
@@ -275,14 +310,36 @@ export async function openExportDownload(
   if (!row || row.requestedBy !== principal.userId) throw notFound("AUDIT_EXPORT_NOT_FOUND");
   if (row.status !== "completed" || !row.objectKey) throw conflict("EXPORT_NOT_READY", "This export is not ready to download.");
   if (row.expiresAt && row.expiresAt.getTime() <= ctx.deps.clock.now().getTime()) throw conflict("EXPORT_EXPIRED", "This export has expired. Please request a new one.");
-  await ctx.deps.db.transaction(async (tx) => {
-    await tx.update(auditExports).set({ downloadCount: sql`${auditExports.downloadCount} + 1` }).where(eq(auditExports.id, row.id));
-    await ctx.deps.audit.record(
-      { category: "security", eventName: "audit.export.downloaded", action: "download", outcome: "completed", severity: "WARN", actor: actorOf(principal), resource: { type: "audit_export", publicId: exportId }, correlationId: exportId, attributes: { export_sha256: row.sha256 } },
-      tx,
-    );
-  });
+  // Open the object first so a missing object never produces an "attempted" row for bytes that cannot exist.
   const stream = await ctx.deps.storage.get(row.objectKey);
+  try {
+    // Durable ATTEMPT before any byte is sent; the truthful result is recorded by recordDownloadResult.
+    await ctx.deps.db.transaction(async (tx) => {
+      await tx.update(auditExports).set({ downloadCount: sql`${auditExports.downloadCount} + 1` }).where(eq(auditExports.id, row.id));
+      await ctx.deps.audit.record(
+        { category: "security", eventName: "audit.export.download_attempted", action: "download", outcome: "attempted", severity: "WARN", actor: actorOf(principal), resource: { type: "audit_export", publicId: exportId }, correlationId: exportId, attributes: { export_sha256: row.sha256 } },
+        tx,
+      );
+    });
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
   const ext = row.format === "jsonl" ? "jsonl" : row.format === "csv" ? "csv" : "cef.txt";
   return { stream, filename: `audit-export-${exportId}.${ext}`, contentType: CONTENT_TYPES[row.format as ExportFormat], size: row.byteSize ?? 0 };
+}
+
+/** Truthful post-transfer result: completed only when the stream finished; otherwise failed/unknown. */
+export async function recordDownloadResult(ctx: AuditCtx, principal: SessionPrincipal, exportId: string, outcome: "completed" | "failed" | "unknown"): Promise<void> {
+  await ctx.deps.audit.record({
+    category: "security",
+    eventName: "audit.export.downloaded",
+    action: "download",
+    outcome,
+    severity: outcome === "completed" ? "WARN" : "ERROR",
+    reasonCode: outcome === "completed" ? undefined : outcome === "failed" ? "DOWNLOAD_FAILED" : "DOWNLOAD_INTERRUPTED",
+    actor: actorOf(principal),
+    resource: { type: "audit_export", publicId: exportId },
+    correlationId: exportId,
+  });
 }

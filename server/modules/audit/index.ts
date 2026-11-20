@@ -50,6 +50,7 @@ export interface AuditModule extends ModuleLifecycle {
   requestExport: Tail<typeof exportsSvc.requestExport>;
   listExports: Tail<typeof exportsSvc.listExports>;
   openExportDownload: Tail<typeof exportsSvc.openExportDownload>;
+  recordDownloadResult: Tail<typeof exportsSvc.recordDownloadResult>;
   integrityStatus: Tail<typeof integrity.integrityStatus>;
   verifyIntegrity: Tail<typeof integrity.verifyIntegrity>;
   listCheckpoints: Tail<typeof integrity.listCheckpoints>;
@@ -116,6 +117,7 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
     requestExport: bind(ctx, exportsSvc.requestExport),
     listExports: bind(ctx, exportsSvc.listExports),
     openExportDownload: bind(ctx, exportsSvc.openExportDownload),
+    recordDownloadResult: bind(ctx, exportsSvc.recordDownloadResult),
     integrityStatus: bind(ctx, integrity.integrityStatus),
     verifyIntegrity: bind(ctx, integrity.verifyIntegrity),
     listCheckpoints: bind(ctx, integrity.listCheckpoints),

@@ -27,6 +27,7 @@ const PATTERNS: readonly { name: string; re: RegExp }[] = [
   { name: "long-token", re: /\b[A-Za-z0-9+/_-]{40,}={0,2}/g },
 ];
 
+// eslint-disable-next-line no-control-regex -- deliberately matching control characters to neutralise them
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u2028\u2029]/g;
 const NEWLINES = /[\r\n\t]/g;
 

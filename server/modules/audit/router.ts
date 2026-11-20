@@ -77,7 +77,7 @@ export const auditRouter = router({
     checkpoints: read.query(({ ctx }) => ctx.services.auditCenter.listCheckpoints(ctx.session)),
     verify: read.meta({ rateLimit: "expensive" }).input(z.strictObject({ fromSeq: z.number().int().min(1).optional(), maxEvents: z.number().int().min(1).max(1_000_000).optional() }))
       .mutation(({ ctx, input }) => ctx.services.auditCenter.verifyIntegrity(ctx.session, input)),
-    createCheckpoint: read.mutation(({ ctx }) => ctx.services.auditCenter.createCheckpoint(ctx.session)),
+    createCheckpoint: retentionCap.mutation(({ ctx }) => ctx.services.auditCenter.createCheckpoint(ctx.session)),
   }),
 
   retention: router({

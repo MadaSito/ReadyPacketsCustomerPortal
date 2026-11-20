@@ -94,6 +94,7 @@ describe("log injection", () => {
   it("neutralises CR/LF/U+2028/ESC so a value cannot forge a second line", () => {
     const evil = "ok\r\n{\"severity_text\":\"INFO\",\"body\":\"forged\"}\u2028\u001b[31m";
     const n = neutraliseControl(evil);
+    // eslint-disable-next-line no-control-regex -- asserting control characters are gone
     expect(n).not.toMatch(/[\r\n\u2028\u001b]/);
     const line = buildLogLine(cfg, "info", evil, {}, { field: evil });
     expect(line.split("\n")).toHaveLength(1);
