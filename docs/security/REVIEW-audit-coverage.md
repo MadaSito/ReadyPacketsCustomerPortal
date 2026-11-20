@@ -230,22 +230,22 @@ the delete statement (retention.ts:201–226).
 
 | ID | Location | Gap | Concrete fix |
 |---|---|---|---|
-| I-1 | identity/auth.ts:536–538 | `CURRENT_PASSWORD_INCORRECT` is thrown inside the tx, so nothing is recorded (online guessing of the current password is invisible) | Wrap the `changePassword` transaction. On a `DomainError` with that reason, record `auth.password.change_denied` (security, denied, WARN, reasonCode) **after** rollback, outside the tx |
-| I-2 | identity/auth.ts:326 (verifyEmail), :454 (resetPassword), activateAccount | Invalid, expired or reused link is thrown inside the tx and not recorded | Same pattern: record `auth.token.rejected` with attribute `purpose` ∈ {verify_email, password_reset, activation} and reason `LINK_INVALID` outside the tx. Never include the token |
-| I-3 | identity/auth.ts:58–61 | Login and high-risk throttle refusals are not recorded | Use `note()` on `auth.rate_limited` (security, denied, reasonCode `RATE_LIMITED`, attribute `category`), sampled like `http.origin.denied` |
-| I-4 | identity/admin.ts:236,256 | Admin reads of customer PII (`admin.customer.searched/viewed`) are `note()` only | Make both durable `record()` (outside a tx is fine), awaited before returning data, so the read fails closed when audit is unavailable |
-| I-5 | identity/auth.ts:297 | In-tx race (`locked.passwordHash !== user.passwordHash`) throws badCredentials unrecorded | Low: record `auth.login.failed` reason `CREDENTIAL_CHANGED_CONCURRENTLY` after rollback |
-| A-1 | assurance/policy.ts:40–45 | MFA/step-up throttle refusals are not recorded | `note()` on `auth.rate_limited` (attribute `category: "auth_high_risk"`), sampled |
-| H-1 | trpc/trpc.ts:171–180 | Generic tRPC rate-limit refusal leaves no trace | Sampled `note()` on `http.rate_limited` with attribute `procedure` (a path template, not input) |
-| F-1 | files/index.ts:367–388 | Object-level write denials (`enforceVisibility`, order write check) throw inside `currentTx` and are not recorded | Catch outside the tx and record `file.access.denied` (security, denied) like orders `policy.deny()` |
-| F-2 | files/index.ts:386 | `file.visibility.changed` has no from/to; a no-op delete still records `completed` | Add `from_visibility`/`to_visibility` (snake_case). Skip or record `outcome: "refused"`, reason `ALREADY_REMOVED`, for the no-op |
+| I-1 (**fixed: 41dbec0, auth.ts:621**) | identity/auth.ts:536–538 | `CURRENT_PASSWORD_INCORRECT` is thrown inside the tx, so nothing is recorded (online guessing of the current password is invisible) | Wrap the `changePassword` transaction. On a `DomainError` with that reason, record `auth.password.change_denied` (security, denied, WARN, reasonCode) **after** rollback, outside the tx |
+| I-2 (**fixed: 41dbec0, auth.ts:101 `auth.token.rejected` {purpose}**) | identity/auth.ts:326 (verifyEmail), :454 (resetPassword), activateAccount | Invalid, expired or reused link is thrown inside the tx and not recorded | Same pattern: record `auth.token.rejected` with attribute `purpose` ∈ {verify_email, password_reset, activation} and reason `LINK_INVALID` outside the tx. Never include the token |
+| I-3 (**fixed: 41dbec0, sampled note**) | identity/auth.ts:58–61 | Login and high-risk throttle refusals are not recorded | Use `note()` on `auth.rate_limited` (security, denied, reasonCode `RATE_LIMITED`, attribute `category`), sampled like `http.origin.denied` |
+| I-4 (**fixed: 41dbec0, admin.ts:239,259 awaited record()**) | identity/admin.ts:236,256 | Admin reads of customer PII (`admin.customer.searched/viewed`) are `note()` only | Make both durable `record()` (outside a tx is fine), awaited before returning data, so the read fails closed when audit is unavailable |
+| I-5 (**fixed: 41dbec0, auth.ts:371**) | identity/auth.ts:297 | In-tx race (`locked.passwordHash !== user.passwordHash`) throws badCredentials unrecorded | Low: record `auth.login.failed` reason `CREDENTIAL_CHANGED_CONCURRENTLY` after rollback |
+| A-1 (**fixed: 73083d1, policy.ts sampled note**) | assurance/policy.ts:40–45 | MFA/step-up throttle refusals are not recorded | `note()` on `auth.rate_limited` (attribute `category: "auth_high_risk"`), sampled |
+| H-1 (**fixed: 6182f08, http/app.ts:320 sampled note**) | trpc/trpc.ts:171–180 | Generic tRPC rate-limit refusal leaves no trace | Sampled `note()` on `http.rate_limited` with attribute `procedure` (a path template, not input) |
+| F-1 (**fixed: 25f4ead, files/index.ts:370**) | files/index.ts:367–388 | Object-level write denials (`enforceVisibility`, order write check) throw inside `currentTx` and are not recorded | Catch outside the tx and record `file.access.denied` (security, denied) like orders `policy.deny()` |
+| F-2 (**fixed: 25f4ead, index.ts:402–406**) | files/index.ts:386 | `file.visibility.changed` has no from/to; a no-op delete still records `completed` | Add `from_visibility`/`to_visibility` (snake_case). Skip or record `outcome: "refused"`, reason `ALREADY_REMOVED`, for the no-op |
 | J-1 (**fixed b0b80be**, verified by reading mail.ts:169) | jobs/mail.ts:62–70 | `mailAudit` hard-codes `action: "transition"`, including `job.mail.capture.viewed` (a read of mail content) | Take `action` as a parameter; use `read` for capture view |
-| O-1 | orders/orderService.ts:628,749 and others | camelCase attribute keys | Now normalised by the envelope; switch to snake_case at the source. `previous_reference`/`new_reference` are local-only by design |
+| O-1 (**fixed: fc45501, snake_case at source**) | orders/orderService.ts:628,749 and others | camelCase attribute keys | Now normalised by the envelope; switch to snake_case at the source. `previous_reference`/`new_reference` are local-only by design |
 | C-1 | compliance/invoicesService.ts:148, intakeService.ts:99, policiesService.ts:120, actorAuth.ts:55 | Service-level capability and remediation denials throw `forbidden()` with no audit; only tRPC-level denials are recorded | Add a `deny(actor, reasonCode, resource)` helper recording `authz.compliance.denied` (security, denied) outside any tx |
 | C-2 | compliance/invoicesService.ts:1066–1080, 1279–1289 | Financial refusals (payment on a voided/unissued invoice, currency mismatch, over-refund) are not recorded | Record `invoice.payment.refused` / `invoice.refund.refused` (business, refused, reasonCode) after rollback |
 | E-1 | engagement (working tree) | Re-check after the owner reports done | Check denial coverage on ticket reply/close by non-owners, and snake_case keys |
-| S-1 | siem consumer of `readEventsAfter` | Must use the new `pruned`/`missing` counts | Advance the cursor on empty batches when `nextCursor` changed. On `missing > 0`, record a durable `siem.audit.loss_detected` (WARN, reasonCode `AUDIT_EVENTS_MISSING`) |
-| B-1 | backup/index.ts:2030 | Retention run request: the owner should confirm `backup.retention.executed` is written in the same tx as each deletion, before the object delete. Not verified by me | Confirm, or move the record before the delete |
+| S-1 (**fixed: 727a0cf, siem/index.ts:1774 durable `siem.audit.loss_detected`**) | siem consumer of `readEventsAfter` | Must use the new `pruned`/`missing` counts | Advance the cursor on empty batches when `nextCursor` changed. On `missing > 0`, record a durable `siem.audit.loss_detected` (WARN, reasonCode `AUDIT_EVENTS_MISSING`) |
+| B-1 (**closed: confirmed by reading index.ts:1419–1452 — record in tx before archive update; storage delete after commit**) | backup/index.ts:2030 | Retention run request: the owner should confirm `backup.retention.executed` is written in the same tx as each deletion, before the object delete. Not verified by me | Confirm, or move the record before the delete |
 
 ## Logging checks
 
@@ -265,6 +265,10 @@ the delete statement (retention.ts:201–226).
 5. The audit envelope stores `correlation_id`/`parent_correlation_id`/`job_id`. SIEM projection keeps `correlation_id` in `ExternalAuditEvent`, and the SIEM test event sets it from the request (siem/index.ts:1015).
 
 Not verified: end-to-end correlation through a live SMTP or SIEM receiver (no network in tests).
+
+## Re-check status (2026-11-20)
+
+Fixes above were verified by reading the cited lines at the listed commit; the owners report their module tests pass (I did not re-run them). Still open: C-1, C-2 (compliance), E-1 (engagement re-check pending owner's done report). Web-initiated restore was removed from the backup tRPC surface by integrator decision; restore audit coverage now belongs to the operator CLI (scripts/ops/restore/**) and is not re-reviewed here.
 
 ## Not verified / limitations
 
