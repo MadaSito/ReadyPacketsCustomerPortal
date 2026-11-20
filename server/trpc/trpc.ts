@@ -18,6 +18,7 @@ import superjson from "superjson";
 import { ZodError } from "zod";
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../shared/capabilities.js";
 import { DomainError, type DomainErrorCode } from "../core/errors.js";
+import { getRequestContext } from "../core/requestContext.js";
 import type { RateLimitCategory, RequestContext, SessionPrincipal, SessionTransport } from "../core/types.js";
 import type { Services } from "../container.js";
 
@@ -62,13 +63,38 @@ export interface SafeErrorData {
   requestId: string;
 }
 
+/**
+ * Maps a Zod issue to a fixed sentence. Custom messages written by module owners in their schemas are fixed
+ * strings by convention (never interpolated input) and are passed through when they look like plain prose.
+ */
+function safeIssueMessage(issue: ZodError["issues"][number]): string {
+  switch (issue.code) {
+    case "too_small":
+      return "This value is too short or too small.";
+    case "too_big":
+      return "This value is too long or too large.";
+    case "invalid_type":
+      return "This field is required or has the wrong type.";
+    case "invalid_format":
+      return "This value is not in the expected format.";
+    case "unrecognized_keys":
+      return "Unexpected fields were provided.";
+    case "invalid_value":
+      return "This value is not one of the allowed options.";
+    case "custom":
+      return /^[\w .,;:'()\-–—/]{1,160}$/.test(issue.message) ? issue.message : "This value is not valid.";
+    default:
+      return "This value is not valid.";
+  }
+}
+
 const t = initTRPC
   .context<TrpcContext>()
   .meta<ProcedureMeta>()
   .create({
     transformer: superjson,
     errorFormatter({ shape, error, ctx }) {
-      const requestId = ctx?.request.requestId ?? "unknown";
+      const requestId = ctx?.request.requestId ?? getRequestContext()?.requestId ?? "unknown";
       let safe: SafeErrorData;
       const cause = error.cause;
       if (cause instanceof DomainError) {
@@ -80,10 +106,14 @@ const t = initTRPC
           requestId,
         };
       } else if (cause instanceof ZodError) {
-        const fieldErrors: Record<string, string[]> = {};
-        for (const issue of cause.issues) {
-          const key = issue.path.join(".") || "_";
-          (fieldErrors[key] ??= []).push(issue.message);
+        // Null-prototype accumulator + fixed sentences: never echo user input, schema internals or
+        // prototype property names back to the browser.
+        const fieldErrors: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+        for (const issue of cause.issues.slice(0, 50)) {
+          const key = issue.path.filter((part) => typeof part === "string" || typeof part === "number").join(".").slice(0, 120) || "_";
+          const messages = (fieldErrors[key] ??= []);
+          const message = safeIssueMessage(issue);
+          if (!messages.includes(message) && messages.length < 5) messages.push(message);
         }
         safe = {
           domainCode: "BAD_INPUT",
