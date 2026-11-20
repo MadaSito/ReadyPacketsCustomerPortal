@@ -159,6 +159,8 @@ html:not(.dark) {
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
     background-color: var(--color-surface-soft);
+    /* Sticky 4rem top bar: keep focused/scrolled-to targets clear of it (WCAG 2.4.11 Focus Not Obscured). */
+    scroll-padding-top: 5rem;
   }
   body {
     margin: 0;

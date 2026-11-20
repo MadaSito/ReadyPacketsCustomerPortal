@@ -68,7 +68,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
 
       {/* Bottom navigation (phones) */}
       {nav.length > 0 ? (
-        <nav aria-label="Primary" className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] md:hidden">
+        <nav aria-label="Quick navigation" className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] md:hidden">
           <ul className={cn("grid", GRID_COLS[primary.length + (overflow.length ? 1 : 0)])}>
             {primary.map((item) => (
               <li key={item.href}>

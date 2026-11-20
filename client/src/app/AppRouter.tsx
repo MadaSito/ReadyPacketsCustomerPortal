@@ -3,7 +3,7 @@
  * RouteGate (guard → shell → lazy page → focus/title/announce). Unknown paths render the 404 page inside the
  * shell that matches the visitor's session.
  */
-import { Suspense, useEffect, useRef, type ComponentType, type ReactNode } from "react";
+import { Suspense, useEffect, useRef, useSyncExternalStore, type ComponentType, type ReactNode } from "react";
 import { Redirect, Route, Router, Switch, useLocation } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
 import { ALL_ROUTES } from "./registry";
@@ -137,9 +137,37 @@ export function AppRoutes({ routes = ALL_ROUTES }: { routes?: readonly RouteDef[
   );
 }
 
+/**
+ * Preview hash routing. wouter's hash hook keeps any `?query` typed inside the hash as part of the path
+ * (`#/reset-password?token=…` would not match). Split it: path from the hash, search from the hash query
+ * when present, otherwise from the real query string (where wouter's own navigate puts it).
+ */
+export function splitHash(hash: string, search: string): { path: string; search: string } {
+  const raw = hash.replace(/^#?\/?/, "");
+  const q = raw.indexOf("?");
+  return { path: `/${q >= 0 ? raw.slice(0, q) : raw}`, search: q >= 0 ? raw.slice(q + 1) : search.replace(/^\?/, "") };
+}
+const subscribeUrl = (cb: () => void) => {
+  window.addEventListener("hashchange", cb);
+  window.addEventListener("popstate", cb);
+  return () => {
+    window.removeEventListener("hashchange", cb);
+    window.removeEventListener("popstate", cb);
+  };
+};
+function usePreviewLocation(): [string, ReturnType<typeof useHashLocation>[1]] {
+  const [, navigate] = useHashLocation();
+  const path = useSyncExternalStore(subscribeUrl, () => splitHash(window.location.hash, window.location.search).path);
+  return [path, navigate];
+}
+usePreviewLocation.hrefs = (href: string) => `#${href}`;
+usePreviewLocation.searchHook = function usePreviewSearch(): string {
+  return useSyncExternalStore(subscribeUrl, () => splitHash(window.location.hash, window.location.search).search);
+};
+
 export function AppRouter() {
   return (
-    <Router hook={RUNTIME.preview ? useHashLocation : undefined}>
+    <Router hook={RUNTIME.preview ? usePreviewLocation : undefined}>
       <AppRoutes />
     </Router>
   );

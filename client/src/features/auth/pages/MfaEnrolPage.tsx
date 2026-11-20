@@ -1,5 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuthApi } from "@/lib/authApi";
 import { clearRecoveryBatch, stageRecoveryBatch, useRecoveryBatch } from "@/lib/recoveryBatch";
 import { useSession } from "@/lib/session";
@@ -19,18 +18,37 @@ export default function MfaEnrolPage() {
   const { me } = useSession();
   const proceed = useContinueAfterAuth();
   const batch = useRecoveryBatch();
-  const begin = useMutation({ mutationFn: () => api.beginTotpEnrollment() });
+  // The TOTP seed lives ONLY in this component's state (never in the TanStack query/mutation caches) and is
+  // dropped on confirmation and unmount.
+  type Setup = Awaited<ReturnType<typeof api.beginTotpEnrollment>>;
+  const [setup, setSetup] = useState<Setup | null>(null);
+  const [beginError, setBeginError] = useState<unknown>(null);
+  const mounted = useRef(true);
   const started = useRef(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const errorRef = useFocusOnError(error);
 
+  const start = useCallback(() => {
+    setBeginError(null);
+    api.beginTotpEnrollment().then(
+      (value) => mounted.current && setSetup(value),
+      (err: unknown) => mounted.current && setBeginError(err),
+    );
+  }, [api]);
+
   useEffect(() => {
-    if (started.current) return;
-    started.current = true;
-    begin.mutate();
-  }, [begin]);
+    mounted.current = true;
+    if (!started.current) {
+      started.current = true;
+      start();
+    }
+    return () => {
+      mounted.current = false;
+      setSetup(null);
+    };
+  }, [start]);
 
   const confirm = async (event: FormEvent) => {
     event.preventDefault();
@@ -44,6 +62,7 @@ export default function MfaEnrolPage() {
     try {
       const result = await api.confirmTotpEnrollment({ code: cleaned });
       setCode("");
+      setSetup(null);
       if (result.recoveryCodes && result.recoverySetId) {
         // Stage first: a session refresh may redirect to /mfa/recovery-codes, which shows the same batch.
         stageRecoveryBatch({ recoveryCodes: result.recoveryCodes, recoverySetId: result.recoverySetId });
@@ -74,9 +93,9 @@ export default function MfaEnrolPage() {
 
   return (
     <AuthLayout wide title="Set up two-step verification" description="ReadyPackets requires an authenticator app (such as 1Password, Microsoft Authenticator or Google Authenticator) for every account.">
-      {begin.isError ? (
-        <ErrorState error={begin.error} title="We couldn't start setup" onRetry={() => begin.mutate()} />
-      ) : !begin.data ? (
+      {beginError ? (
+        <ErrorState error={beginError} title="We couldn't start setup" onRetry={start} />
+      ) : !setup ? (
         <div role="status" aria-label="Preparing setup" className="grid gap-6 sm:grid-cols-[12rem_1fr]">
           <Skeleton className="size-48" />
           <Skeleton lines={4} />
@@ -85,7 +104,7 @@ export default function MfaEnrolPage() {
         <div className="grid gap-8 sm:grid-cols-[13rem_minmax(0,1fr)]">
           <div className="flex flex-col items-center gap-2">
             <div className="rounded-xl bg-white p-3 shadow-[var(--shadow-card)]">
-              <img src={begin.data.qrDataUrl} alt="QR code to add ReadyPackets to your authenticator app" className="size-44" />
+              <img src={setup.qrDataUrl} alt="QR code to add ReadyPackets to your authenticator app" className="size-44" />
             </div>
           </div>
           <div className="flex min-w-0 flex-col gap-5">
@@ -97,8 +116,8 @@ export default function MfaEnrolPage() {
             <div>
               <p className="text-sm font-medium text-ink">Setup key</p>
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                <code className="rounded-md bg-surface-sunken px-3 py-2 font-mono text-sm break-all text-ink">{groupKey(begin.data.secret)}</code>
-                <CopyButton value={begin.data.secret} label="Copy setup key" />
+                <code className="rounded-md bg-surface-sunken px-3 py-2 font-mono text-sm break-all text-ink">{groupKey(setup.secret)}</code>
+                <CopyButton value={setup.secret} label="Copy setup key" />
               </div>
             </div>
             <FormError message={error} focusRef={errorRef} />

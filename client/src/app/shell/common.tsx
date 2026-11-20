@@ -134,8 +134,8 @@ export function SkipLink() {
         // Hash routing (preview) must not treat this as navigation.
         event.preventDefault();
         const main = document.getElementById("main");
-        main?.focus();
-        main?.scrollIntoView();
+        main?.focus({ preventScroll: true });
+        main?.scrollIntoView({ block: "start" });
       }}
     >
       Skip to main content

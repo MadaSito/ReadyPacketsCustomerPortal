@@ -41,6 +41,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const dismiss = useCallback((id: number) => {
     clearTimeout(timers.current.get(id));
     timers.current.delete(id);
+    holds.current.delete(id);
     setItems((list) => list.filter((t) => t.id !== id));
   }, []);
 
@@ -63,6 +64,23 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [schedule],
   );
 
+  /** Pause auto-dismiss while the toast is hovered OR focused (WCAG 2.2.1); resume only when neither holds. */
+  const holds = useRef(new Map<number, { hover: boolean; focus: boolean }>());
+  const hold = useCallback(
+    (t: ToastItem, kind: "hover" | "focus", on: boolean) => {
+      const state = { hover: false, focus: false, ...holds.current.get(t.id) };
+      state[kind] = on;
+      holds.current.set(t.id, state);
+      clearTimeout(timers.current.get(t.id));
+      timers.current.delete(t.id);
+      if (!state.hover && !state.focus) {
+        holds.current.delete(t.id);
+        schedule(t.id, t.duration);
+      }
+    },
+    [schedule],
+  );
+
   const api = useMemo(() => ({ show, dismiss }), [show, dismiss]);
   const render = (assertive: boolean) =>
     items
@@ -70,9 +88,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       .map((t) => (
         <div
           key={t.id}
-          onMouseEnter={() => clearTimeout(timers.current.get(t.id))}
-          onMouseLeave={() => schedule(t.id, t.duration)}
-          onFocus={() => clearTimeout(timers.current.get(t.id))}
+          onMouseEnter={() => hold(t, "hover", true)}
+          onMouseLeave={() => hold(t, "hover", false)}
+          onFocus={() => hold(t, "focus", true)}
+          onBlur={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) hold(t, "focus", false);
+          }}
           className="pointer-events-auto flex w-full overflow-hidden rounded-[var(--radius-card)] border border-line bg-surface text-ink shadow-[var(--shadow-raised)] motion-safe:animate-fade-in rp-forced-border"
         >
           <span aria-hidden="true" className={cn("w-1.5 shrink-0", toneBar[t.tone])} />

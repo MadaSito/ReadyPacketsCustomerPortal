@@ -69,11 +69,14 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
   if (rows && rows.length === 0) return <>{empty ?? <EmptyState title="Nothing here yet" description="When there are items, they will appear here." />}</>;
   const list = rows ?? [];
   const primary = columns.find((c) => c.primary) ?? columns[0];
+  const sortable = onSortChange ? columns.filter((c) => c.sortable) : [];
 
   return (
     <div className={cn("min-w-0", className)} aria-busy={loading || undefined}>
       {/* Desktop / tablet table */}
-      <div className="hidden overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface shadow-[var(--shadow-card)] md:block rp-forced-border">
+      {/* Focusable so keyboard users can scroll a wide table horizontally (WCAG 2.1.1; axe scrollable-region-focusable). */}
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
+      <div tabIndex={0} role="region" aria-label={`${caption} table`} className="hidden overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface shadow-[var(--shadow-card)] md:block rp-forced-border">
         <table className="w-full border-collapse text-left text-sm">
           <caption className={cn(showCaption ? "px-4 py-3 text-left text-sm font-semibold text-ink" : "sr-only")}>{caption}</caption>
           <thead className="bg-surface-soft">
@@ -120,6 +123,37 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
           </tbody>
         </table>
       </div>
+
+      {/* Mobile sort controls: same sort state as the desktop headers. */}
+      {sortable.length > 0 && onSortChange ? (
+        <div className="mb-3 flex items-end gap-2 md:hidden">
+          <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-ink">
+            Sort by
+            <select
+              value={sort && sortable.some((c) => c.key === sort.key) ? sort.key : ""}
+              onChange={(e) => e.target.value && onSortChange({ key: e.target.value, direction: sort?.direction ?? "asc" })}
+              className="min-h-11 w-full rounded-[var(--radius-control)] border border-control-border bg-surface px-3 text-[0.9375rem] text-ink"
+            >
+              {!sort || !sortable.some((c) => c.key === sort.key) ? <option value="">Default order</option> : null}
+              {sortable.map((c) => (
+                <option key={c.key} value={c.key}>
+                  {c.header}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={!sort}
+            onClick={() => sort && onSortChange({ key: sort.key, direction: sort.direction === "asc" ? "desc" : "asc" })}
+            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-[var(--radius-control)] border border-control-border bg-surface px-3 text-sm font-medium text-ink disabled:opacity-50"
+          >
+            <SortIcon active={Boolean(sort)} direction={sort?.direction} />
+            {sort?.direction === "desc" ? "Descending" : "Ascending"}
+            <span className="sr-only">, activate to reverse the order</span>
+          </button>
+        </div>
+      ) : null}
 
       {/* Mobile stacked cards */}
       <ul aria-label={caption} className="flex flex-col gap-3 md:hidden">

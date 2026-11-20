@@ -12,18 +12,33 @@ import { cn } from "./cn";
  * Controlled overlays have no Radix Trigger to return focus to, so remember the element that was focused
  * when the overlay opened and restore it on close (WCAG 2.4.3).
  */
+function currentUrl(): string {
+  return `${window.location.pathname}${window.location.search}${window.location.hash}`;
+}
+
 function useReturnFocus(open: boolean | undefined) {
   const previous = useRef<HTMLElement | null>(null);
+  const openedAt = useRef<string | null>(null);
   useLayoutEffect(() => {
-    if (open && document.activeElement instanceof HTMLElement && document.activeElement !== document.body) previous.current = document.activeElement;
+    if (open && document.activeElement instanceof HTMLElement && document.activeElement !== document.body) {
+      previous.current = document.activeElement;
+      openedAt.current = currentUrl();
+    }
   }, [open]);
   return (event: Event) => {
     const target = previous.current;
+    const navigated = openedAt.current !== null && openedAt.current !== currentUrl();
+    previous.current = null;
+    openedAt.current = null;
+    // Closed because the user navigated (e.g. a link in a nav drawer): route focus management owns focus now.
+    if (navigated) {
+      event.preventDefault();
+      return;
+    }
     if (target && target.isConnected) {
       event.preventDefault();
       target.focus();
     }
-    previous.current = null;
   };
 }
 
@@ -74,7 +89,7 @@ export function Dialog({ open, onOpenChange, trigger, title, description, childr
         >
           <div className="flex items-start justify-between gap-3 px-5 pt-5 pb-2">
             <div className="min-w-0">
-              <RDialog.Title className="text-lg font-semibold text-ink">{title}</RDialog.Title>
+          <RDialog.Title className="text-lg font-semibold text-ink">{title}</RDialog.Title>
               {description ? <RDialog.Description className="mt-1 text-sm text-body">{description}</RDialog.Description> : <RDialog.Description className="sr-only">Dialog</RDialog.Description>}
             </div>
             {dismissible ? (
@@ -140,7 +155,7 @@ export function ConfirmDialog({ open, onOpenChange, title, description, children
         <RDialog.Content
           role="alertdialog"
           onCloseAutoFocus={onCloseAutoFocus}
-          className="fixed inset-x-3 top-1/2 z-50 mx-auto w-auto max-w-md -translate-y-1/2 rounded-2xl border border-line bg-surface p-5 shadow-[var(--shadow-raised)] outline-none sm:w-full rp-forced-border"
+          className="fixed inset-x-3 top-1/2 z-50 mx-auto flex max-h-[90dvh] w-auto max-w-md -translate-y-1/2 flex-col rounded-2xl border border-line bg-surface shadow-[var(--shadow-raised)] outline-none sm:w-full rp-forced-border"
           onOpenAutoFocus={(e) => {
             if (destructive) {
               e.preventDefault();
@@ -148,6 +163,7 @@ export function ConfirmDialog({ open, onOpenChange, title, description, children
             }
           }}
         >
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pt-5 pb-1">
           <RDialog.Title className="text-lg font-semibold text-ink">{title}</RDialog.Title>
           {description ? <RDialog.Description className="mt-2 text-sm text-body">{description}</RDialog.Description> : <RDialog.Description className="sr-only">Please confirm</RDialog.Description>}
           {children ? <div className="mt-3 text-sm text-body">{children}</div> : null}
@@ -166,7 +182,8 @@ export function ConfirmDialog({ open, onOpenChange, title, description, children
               />
             </div>
           ) : null}
-          <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          </div>
+          <div className="flex shrink-0 flex-col-reverse gap-2 border-t border-line px-5 py-4 sm:flex-row sm:justify-end">
             <RDialog.Close asChild>
               <Button variant="secondary" data-cancel disabled={busy}>
                 {cancelLabel}
