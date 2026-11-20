@@ -1,5 +1,111 @@
 /**
  * Siem module — Drizzle MySQL tables. Owner: siem module engineer.
- * Use the helpers in server/db/columns.ts. Table names are prefixed by domain where ambiguous.
  */
-export {};
+import { bigint, boolean, index, int, json, mysqlTable, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import type { AuditCategory } from "../../core/types.js";
+import {
+  createdAtColumn,
+  idColumn,
+  publicIdColumn,
+  refColumn,
+  updatedAtColumn,
+  utcDateTime,
+  versionColumn,
+} from "../../db/columns.js";
+import type { ExternalAuditEvent } from "./types.js";
+
+export const siemDestinations = mysqlTable(
+  "siem_destinations",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    name: varchar("name", { length: 120 }).notNull(),
+    enabled: boolean("enabled").notNull().default(false),
+    format: varchar("format", { length: 24 }).notNull(),
+    host: varchar("host", { length: 255 }).notNull(),
+    port: int("port", { unsigned: true }).notNull().default(6514),
+    otlpPath: varchar("otlp_path", { length: 255 }),
+    allowPrivateNetwork: boolean("allow_private_network").notNull().default(false),
+    facility: int("facility", { unsigned: true }).notNull().default(16),
+    appName: varchar("app_name", { length: 48 }).notNull().default("readypackets"),
+    hostnameOverride: varchar("hostname_override", { length: 255 }),
+    enterpriseNumber: int("enterprise_number", { unsigned: true }),
+    sdIdName: varchar("sd_id_name", { length: 16 }).notNull().default("rp"),
+    includeBom: boolean("include_bom").notNull().default(true),
+    maxMessageBytes: int("max_message_bytes", { unsigned: true }).notNull().default(8192),
+    connectTimeoutMs: int("connect_timeout_ms", { unsigned: true }).notNull().default(5000),
+    writeTimeoutMs: int("write_timeout_ms", { unsigned: true }).notNull().default(10000),
+    minSeverity: varchar("min_severity", { length: 16 }).notNull().default("INFO"),
+    categoriesJson: json("categories_json").$type<AuditCategory[]>().notNull(),
+    authHeaderName: varchar("auth_header_name", { length: 64 }),
+    hasCustomCa: boolean("has_custom_ca").notNull().default(false),
+    hasClientCert: boolean("has_client_cert").notNull().default(false),
+    hasClientKey: boolean("has_client_key").notNull().default(false),
+    hasAuthSecret: boolean("has_auth_secret").notNull().default(false),
+    caCertExpiresAt: utcDateTime("ca_cert_expires_at"),
+    clientCertExpiresAt: utcDateTime("client_cert_expires_at"),
+    secretUpdatedAt: utcDateTime("secret_updated_at"),
+    auditCursor: varchar("audit_cursor", { length: 255 }),
+    lastProjectedSeq: bigint("last_projected_seq", { mode: "number", unsigned: true }).notNull().default(0),
+    circuitState: varchar("circuit_state", { length: 16 }).notNull().default("closed"),
+    consecutiveFailures: int("consecutive_failures", { unsigned: true }).notNull().default(0),
+    circuitOpenUntil: utcDateTime("circuit_open_until"),
+    lastAttemptAt: utcDateTime("last_attempt_at"),
+    lastSuccessAt: utcDateTime("last_success_at"),
+    lastFailureAt: utcDateTime("last_failure_at"),
+    lastFailureReason: varchar("last_failure_reason", { length: 64 }),
+    deliveredCount: bigint("delivered_count", { mode: "number", unsigned: true }).notNull().default(0),
+    failedAttemptCount: bigint("failed_attempt_count", { mode: "number", unsigned: true }).notNull().default(0),
+    deadLetteredCount: bigint("dead_lettered_count", { mode: "number", unsigned: true }).notNull().default(0),
+    lastTestAt: utcDateTime("last_test_at"),
+    lastTestOutcome: varchar("last_test_outcome", { length: 16 }),
+    lastTestReason: varchar("last_test_reason", { length: 64 }),
+    receiptConfirmation: varchar("receipt_confirmation", { length: 24 }).notNull().default("none"),
+    leaseOwnerJobId: varchar("lease_owner_job_id", { length: 64 }),
+    leaseExpiresAt: utcDateTime("lease_expires_at"),
+    lastFencingToken: bigint("last_fencing_token", { mode: "number", unsigned: true }).notNull().default(0),
+    createdByUserId: refColumn("created_by_user_id"),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("siem_destinations_name_uq").on(table.name),
+    index("siem_destinations_enabled_idx").on(table.enabled),
+  ],
+);
+
+export const siemOutbox = mysqlTable(
+  "siem_outbox",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    destinationId: refColumn("destination_id").notNull(),
+    destinationVersion: int("destination_version", { unsigned: true }).notNull(),
+    eventId: varchar("event_id", { length: 64 }).notNull(),
+    chainSeq: bigint("chain_seq", { mode: "number", unsigned: true }),
+    eventOccurredAt: utcDateTime("event_occurred_at").notNull(),
+    category: varchar("category", { length: 32 }).notNull(),
+    severity: varchar("severity", { length: 16 }).notNull(),
+    eventName: varchar("event_name", { length: 96 }).notNull(),
+    projectedJson: json("projected_json").$type<ExternalAuditEvent>().notNull(),
+    state: varchar("state", { length: 16 }).notNull().default("queued"),
+    attempts: int("attempts", { unsigned: true }).notNull().default(0),
+    maxAttempts: int("max_attempts", { unsigned: true }).notNull().default(8),
+    nextAttemptAt: utcDateTime("next_attempt_at").notNull(),
+    lastAttemptAt: utcDateTime("last_attempt_at"),
+    lastReasonCode: varchar("last_reason_code", { length: 64 }),
+    deadLetteredAt: utcDateTime("dead_lettered_at"),
+    correlationId: varchar("correlation_id", { length: 64 }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("siem_outbox_dest_event_uq").on(table.destinationId, table.eventId),
+    index("siem_outbox_ready_idx").on(table.destinationId, table.state, table.nextAttemptAt, table.id),
+    index("siem_outbox_state_age_idx").on(table.state, table.createdAt, table.id),
+  ],
+);
+
+export type SiemDestinationRow = typeof siemDestinations.$inferSelect;
+export type SiemOutboxRow = typeof siemOutbox.$inferSelect;
