@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0D1B2A" />
+    <meta name="description" content="ReadyPackets customer portal. Sign in to manage your orders, files, messages and invoices." />
+    <!-- Runtime wiring is data, never inline script (strict CSP). Empty in production builds. -->
+    <meta name="rp-api-base" content="%VITE_RP_API_BASE%" />
+    <meta name="rp-runtime" content="%VITE_RP_RUNTIME%" />
+    <title>ReadyPackets Customer Portal</title>
+    <link rel="icon" href="./favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="./brand/readypackets-approved-icon-light-192.png" />
+    <link rel="preload" href="./fonts/inter-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="./fonts/inter-600.woff2" as="font" type="font/woff2" crossorigin />
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>The ReadyPackets customer portal requires JavaScript.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

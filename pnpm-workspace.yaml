@@ -1,0 +1,4 @@
+# Only these reviewed packages may execute install/build scripts (supply-chain control).
+allowBuilds:
+  argon2: true
+  esbuild: true

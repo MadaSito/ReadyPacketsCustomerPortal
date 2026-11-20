@@ -1,0 +1,38 @@
+/** Feature registry. Owner: integrator (/root). One line per feature; features never import each other. */
+import type { FeatureRoutes } from "@/lib/routes";
+import { authFeature } from "@/features/auth/routes";
+import { dashboardFeature } from "@/features/dashboard/routes";
+import { identityFeature } from "@/features/identity/routes";
+import { assuranceFeature } from "@/features/assurance/routes";
+import { ordersFeature } from "@/features/orders/routes";
+import { filesFeature } from "@/features/files/routes";
+import { engagementFeature } from "@/features/engagement/routes";
+import { complianceFeature } from "@/features/compliance/routes";
+import { auditFeature } from "@/features/audit/routes";
+import { siemFeature } from "@/features/siem/routes";
+import { platformFeature } from "@/features/platform/routes";
+import { jobsFeature } from "@/features/jobs/routes";
+import { portableFeature } from "@/features/portable/routes";
+import { backupFeature } from "@/features/backup/routes";
+import { integrationsFeature } from "@/features/integrations/routes";
+
+export const FEATURES: readonly FeatureRoutes[] = [
+  authFeature,
+  dashboardFeature,
+  identityFeature,
+  assuranceFeature,
+  ordersFeature,
+  filesFeature,
+  engagementFeature,
+  complianceFeature,
+  auditFeature,
+  siemFeature,
+  platformFeature,
+  jobsFeature,
+  portableFeature,
+  backupFeature,
+  integrationsFeature,
+];
+
+export const ALL_ROUTES = FEATURES.flatMap((feature) => feature.routes);
+export const ALL_NAV = FEATURES.flatMap((feature) => feature.nav ?? []).sort((a, b) => a.order - b.order);
