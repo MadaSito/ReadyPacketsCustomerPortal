@@ -1160,4 +1160,131 @@ describe("integrations module — DB-backed integration suite", () => {
       await singlePool.end();
     }
   });
+
+  it("rejects seeded or restored SMTP port-25 settings in persisted schema parse and pre-dial, opening zero sockets", async () => {
+    const admin = makeStepUpAdmin(h);
+    const dnsLookupSpy = vi.fn(async () => [{ address: "93.184.216.34", family: 4 as const }]);
+    const transportSpy = vi.fn(() => ({
+      sendMail: async () => ({ accepted: ["ops@readypackets.example"], rejected: [] }),
+      close: () => {},
+    }));
+
+    // 1. Seed a port-25 `integrations.smtp.config` row directly into `platform_settings` (simulating DB restore/manual SQL)
+    const seededSettings = createSettingsStore({
+      db: tdb.db,
+      clock: h.clock,
+      logger: h.deps.logger,
+      crypto: h.deps.crypto,
+      audit: h.audit,
+    });
+    await withTestRequest(
+      async () => {
+        await seededSettings.setFeature("integrations.smtp", true);
+        await seededSettings.updateSecret("integrations.smtp.password", "restored-smtp-secret");
+      },
+      admin,
+    );
+    await h.deps.db.insert(platformSettings).values({
+      settingKey: "integrations.smtp.config",
+      kind: "value",
+      valueJson: {
+        host: "smtp.public-mail.example",
+        port: 25,
+        tlsMode: "starttls",
+        username: "apikey",
+        fromAddress: "no-reply@readypackets.example",
+        fromName: "ReadyPackets",
+        replyToAddress: "",
+      },
+      version: 1,
+    });
+    seededSettings.invalidate();
+
+    const seededMod = createIntegrationsModule(
+      { ...h.deps, settings: seededSettings },
+      {
+        egress: { dnsLookup: dnsLookupSpy },
+        smtpTransportFactory: transportSpy,
+      },
+    );
+
+    const seededHealth = await seededMod.health();
+    expect(seededHealth.find((c) => c.component === "mail.smtp")?.state).toBe("not_configured");
+    expect((await seededMod.smtp.getConfig()).configured).toBe(false);
+
+    const seededSend = await seededMod.smtp.send({
+      to: "ops@readypackets.example",
+      subject: "Port 25 Seed Check",
+      text: "Must never dial.",
+      html: "<p>Must never dial.</p>",
+      signal: new AbortController().signal,
+    });
+    expect(seededSend).toEqual({ outcome: "not_configured" });
+
+    await expect(
+      withTestRequest(
+        () => seededMod.smtp.sendTestMessage(admin, { toAddress: "ops@readypackets.example" }),
+        admin,
+      ),
+    ).rejects.toMatchObject({
+      code: "NOT_CONFIGURED",
+      reasonCode: "SMTP_NOT_CONFIGURED",
+    });
+
+    expect(dnsLookupSpy).not.toHaveBeenCalled();
+    expect(transportSpy).not.toHaveBeenCalled();
+
+    // 2. Pre-dial defense-in-depth: even if a custom SettingsStore bypasses schema parse and returns `port: 25`,
+    // `send()` and `sendTestMessage()` fail closed with `SMTP_PORT_25_FORBIDDEN` (`failing` health) and open zero sockets.
+    const unvalidatedPort25Settings = {
+      ...seededSettings,
+      async get<T>(key: string, parse: (raw: unknown) => T, fallback: T, tx?: Tx): Promise<T> {
+        if (key === "integrations.smtp.config") {
+          return {
+            host: "smtp.public-mail.example",
+            port: 25,
+            tlsMode: "starttls",
+            username: "apikey",
+            fromAddress: "no-reply@readypackets.example",
+            fromName: "ReadyPackets",
+            replyToAddress: "",
+          } as unknown as T;
+        }
+        return seededSettings.get(key, parse, fallback, tx);
+      },
+    };
+
+    const bypassMod = createIntegrationsModule(
+      { ...h.deps, settings: unvalidatedPort25Settings },
+      {
+        egress: { dnsLookup: dnsLookupSpy },
+        smtpTransportFactory: transportSpy,
+      },
+    );
+
+    const bypassSend = await bypassMod.smtp.send({
+      to: "ops@readypackets.example",
+      subject: "Bypass Pre-Dial Check",
+      text: "Must fail closed before DNS or socket.",
+      html: "<p>Must fail closed before DNS or socket.</p>",
+      signal: new AbortController().signal,
+    });
+    expect(bypassSend).toEqual({ outcome: "rejected", retryable: false });
+
+    const bypassHealth = await bypassMod.health();
+    expect(bypassHealth.find((c) => c.component === "mail.smtp")?.state).toBe("failing");
+
+    await expect(
+      withTestRequest(
+        () => bypassMod.smtp.sendTestMessage(admin, { toAddress: "ops@readypackets.example" }),
+        admin,
+      ),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "SMTP_PORT_25_FORBIDDEN",
+    });
+
+    expect(dnsLookupSpy).not.toHaveBeenCalled();
+    expect(transportSpy).not.toHaveBeenCalled();
+  });
 });

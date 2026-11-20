@@ -153,6 +153,7 @@ function isCompleteSmtpConfig(cfg: SmtpConfigSetting, hasPassword: boolean): boo
     cfg.host.trim().length > 0 &&
     cfg.port >= 1 &&
     cfg.port <= 65535 &&
+    cfg.port !== 25 &&
     cfg.username.trim().length > 0 &&
     hasPassword &&
     safeEmailAddressSchema.safeParse(cfg.fromAddress).success
@@ -162,8 +163,16 @@ function isCompleteSmtpConfig(cfg: SmtpConfigSetting, hasPassword: boolean): boo
 function deriveSmtpState(
   enabled: boolean,
   configured: boolean,
+  port: number,
   check: Awaited<ReturnType<ProviderChecksStore["get"]>>,
 ): { state: ProviderState; verified: boolean; summary: string } {
+  if (port === 25) {
+    return {
+      state: "failing",
+      verified: false,
+      summary: "Plaintext SMTP port 25 is forbidden; configure TLS on port 587 or 465.",
+    };
+  }
   if (!configured) {
     return {
       state: "not_configured",
@@ -257,6 +266,8 @@ export function createSmtpService(
     cfg: SmtpConfigSetting,
     password: string,
   ): Promise<{ pinned: PinnedEgressTarget; options: SmtpTransportConnectionOptions }> {
+    // Defense-in-depth: refuse port 25 or invalid TLS framing immediately before dialing even if settings were seeded/restored directly.
+    precheckSmtpPortAndTls(cfg.port, cfg.tlsMode);
     const protocol = cfg.tlsMode === "implicit" ? "smtps:" : "smtp:";
     const pinned = await egress.assertAllowed({ host: cfg.host, port: cfg.port, protocol }, "smtp");
     const options: SmtpTransportConnectionOptions = {
@@ -289,7 +300,7 @@ export function createSmtpService(
       checks.get("smtp"),
     ]);
     const configured = isCompleteSmtpConfig(cfg, passwordConfigured);
-    const derived = deriveSmtpState(enabled, configured, check);
+    const derived = deriveSmtpState(enabled, configured, cfg.port, check);
     return {
       enabled,
       configured,
@@ -457,6 +468,7 @@ export function createSmtpService(
       const { cfg, password } = await deps.db.transaction(async (tx) => {
         await assertIntegrationsManageInTx(deps, principal, tx);
         const storedCfg = await readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG, tx);
+        precheckSmtpPortAndTls(storedCfg.port, storedCfg.tlsMode);
         const storedPassword = await readSecret(deps.settings, INTEGRATIONS_SMTP_PASSWORD, tx);
         if (!storedPassword || !isCompleteSmtpConfig(storedCfg, true)) {
           throw new DomainError(
@@ -576,6 +588,11 @@ export function createSmtpService(
         readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG),
         readSecret(deps.settings, INTEGRATIONS_SMTP_PASSWORD),
       ]);
+
+      if (cfg.port === 25) {
+        await checks.recordOutcome("smtp", "failed", "SMTP_PORT_25_FORBIDDEN").catch(() => {});
+        return { outcome: "rejected", retryable: false };
+      }
 
       if (!enabled || !password || !isCompleteSmtpConfig(cfg, true)) {
         return { outcome: "not_configured" };

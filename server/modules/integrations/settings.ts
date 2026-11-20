@@ -108,7 +108,12 @@ export const safeEmailAddressSchema = z
 
 export const smtpConfigSettingSchema = z.strictObject({
   host: z.string().trim().max(253),
-  port: z.number().int().min(1).max(65535),
+  port: z
+    .number()
+    .int()
+    .min(1)
+    .max(65535)
+    .refine((p) => p !== 25, "Plaintext SMTP port 25 is forbidden."),
   tlsMode: z.enum(["starttls", "implicit"]),
   username: z.string().trim().max(254),
   fromAddress: z.string().trim().max(254),

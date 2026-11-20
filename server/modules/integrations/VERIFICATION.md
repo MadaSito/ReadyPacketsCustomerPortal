@@ -25,13 +25,15 @@ Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/fe
    - Validates **every** A/AAAA record returned by DNS so dual-record rebinding (`[public, 127.0.0.1]`) fails closed.
    - `createPinnedLookup(pinned)` handles both scalar `(ip, family)` and Node 22 `autoSelectFamily` `{ all: true }` `LookupAddress[]` callbacks without touching OS DNS; `https.request` sets `family: pinned.family` and `autoSelectFamily: false`.
    - Enforces a 5 s DNS lookup deadline (`EGRESS_DNS_TIMEOUT`), a total wall-clock HTTP request deadline (`EGRESS_TIMEOUT`), and refuses all HTTP `3xx` redirects (`EGRESS_REDIRECT_REFUSED`).
-2. **SMTP Pre-I/O Actor Authorization & Durable Attempt Audit (`smtp.ts`)**:
+2. **SMTP Pre-I/O Actor Authorization, Durable Attempt Audit & Persisted/Pre-Dial Port-25 Refusal (`settings.ts`, `smtp.ts`)**:
+   - `smtpConfigSettingSchema` rejects `port === 25` during persisted-setting parse (`not_configured` health), `isCompleteSmtpConfig` requires `cfg.port !== 25`, and `buildPinnedTransportOptions` / `send` / `sendTestMessage` enforce `precheckSmtpPortAndTls` (`SMTP_PORT_25_FORBIDDEN`, `failing` health) immediately before dialing so even directly seeded or restored port-25 DB settings never open a DNS lookup or socket.
    - `sendTestMessage` runs a short DB transaction **before** revealing secrets or opening network sockets: re-validates the actor via `identity.sessions.assertCurrent(principal, tx)`, reads SMTP config/secret inside `tx`, and writes a durable `integration.smtp.test_attempted` (`outcome: "attempted"`) audit event. Revoked sessions or unavailable audit stores abort with zero outbound SMTP connection attempts and zero DB locks held across network I/O.
    - Outbox `send()` distinguishes pre-connection errors (`retryable: true`) from post-connection drops without an SMTP status code (`outcome: "unknown"`) so mail workers never auto-duplicate ambiguous deliveries.
-3. **Synchronous Analytics JS-Realm Isolation & Clean URL Gate (`consent.tsx`)**:
+3. **Synchronous Analytics JS-Realm Quarantine (`INT-01`) & Clean URL Gate (`consent.tsx`, `client/src/lib/realmTaint.ts`)**:
+   - Clarity and PostHog remain disabled by default.
    - Refuses to render or mount Clarity/PostHog whenever `window.location.search !== ""` or `window.location.hash !== ""` so query/fragment tokens on legal URLs can never be read by vendor code.
    - Sets `data-clarity-mask="true"` on `document.documentElement` before mounting the Clarity script tag.
-   - Synchronously wraps `history.pushState`/`replaceState`, registers capture-phase `popstate`/`hashchange` listeners (`stopImmediatePropagation()`), and subscribes to `ME_QUERY_KEY` in the TanStack Query cache so leaving clean `/privacy`|`/terms` or authenticating aborts SPA route commits **before** any private DOM node can be rendered/committed into a Clarity-tainted realm, triggering a full-document navigation instead.
+   - Calls `markRealmTainted("clarity")` **synchronously immediately before** appending the `<script>` tag and `markRealmTainted("posthog")` **synchronously immediately before** sending `fetch(...)`. App-root `<RealmTaintBoundary>` and `<TaintedRouteGate>` (`client/src/app/RealmTaint.tsx`) refuse to render any non-public or authenticated DOM in a tainted realm and trigger a full-document navigation (`requestCleanRealm`) instead.
 4. **Stripe Hard-Disabled Scaffold (`stripe.ts`, `http.ts`)**:
    - Hard-disabled behind `STRIPE_LEDGER_MUTATION_ENABLED = false as const`. `isOnlinePaymentConfigured()` always returns `false`; `updateConfig({ enabled: true })` fails with `STRIPE_NOT_AVAILABLE_IN_RELEASE`.
    - Signed webhooks verify `Stripe-Signature` over raw bytes, normalize client IP rate-limit keys via `rateLimitAddress(req.ip)`, record inert `ignored` rows + audit notes with `ledgerMutated: false`, and never invoke ledger booking.
@@ -50,6 +52,6 @@ scripts/dev/lint.sh server/modules/integrations client/src/features/integrations
 scripts/dev/test.sh server/modules/integrations/integrations.test.ts client/src/features/integrations/consent.test.tsx client/src/features/integrations/admin/integrationsAdmin.test.tsx
 ```
 
-- `server/modules/integrations/integrations.test.ts` — **9/9 passing**
-- `client/src/features/integrations/consent.test.tsx` — **3/3 passing** (including `MutationObserver` zero-private-DOM-commit proof & `axe-core` WCAG AA check)
+- `server/modules/integrations/integrations.test.ts` — **10/10 passing** (including seeded DB + pre-dial port-25 zero-socket regression)
+- `client/src/features/integrations/consent.test.tsx` — **5/5 passing** (including `markRealmTainted` pre-script/pre-fetch ordering, `RealmTaintBoundary` + `TaintedRouteGate` `MutationObserver` zero-private-DOM-commit proof, & `axe-core` WCAG AA check)
 - `client/src/features/integrations/admin/integrationsAdmin.test.tsx` — **7/7 passing**

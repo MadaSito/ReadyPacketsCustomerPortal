@@ -2,7 +2,7 @@
  * Consent-Gated Public-Route Analytics Banner & Loader (`AnalyticsConsentSlot`, `useAnalyticsConsent`).
  *
  * Security & privacy guarantees:
- *  1. Renders and loads NOTHING unless at least one analytics provider is admin-enabled.
+ *  1. Renders and loads NOTHING unless at least one analytics provider is admin-enabled (disabled by default).
  *  2. Strictly restricted to exact non-sensitive public routes (`/privacy`, `/terms`), clean URLs with
  *     EMPTY query string and EMPTY hash (`location.search === "" && location.hash === ""`), non-preview
  *     path routing (`!RUNTIME.preview`), and unauthenticated visitors (`session.view.status === "anonymous"`).
@@ -14,16 +14,27 @@
  *     HTML or script snippets).
  *  5. PostHog uses direct, credential-less `fetch` (`$process_person_profile: false`, ephemeral per-view ID)
  *     so zero PostHog SDK code executes in the portal JS realm.
- *  6. Synchronous JS-Realm Isolation Boundary: once the Clarity tag mounts in the current document,
- *     `history.pushState` / `history.replaceState`, capture-phase `popstate` / `hashchange`, and the
- *     session query cache are synchronously gated so NO private route or authenticated DOM child can
- *     EVER be committed into a Clarity-tainted JS realm — non-public navigations abort SPA routing
- *     before route state updates and perform a full-document navigation into a fresh untainted realm.
+ *  6. Synchronous JS-Realm Quarantine (INT-01) + Pre-History URL Guard:
+ *     - Calls `markRealmTainted("clarity")` / `markRealmTainted("posthog")` from `@/lib/realmTaint`
+ *       SYNCHRONOUSLY on the line immediately BEFORE appending the Clarity `<script>` element or sending
+ *       the PostHog `fetch` request.
+ *     - Installs a preventive `history.pushState`/`replaceState` + capture-phase `popstate`/`hashchange`
+ *       guard before arming vendor code so non-public paths or `?search`/`#hash` tokens NEVER mutate
+ *       `window.location` in the tainted realm; instead, Clarity globals/scripts are torn down and
+ *       `requestCleanRealm(...)` navigates the document into a fresh untainted realm.
+ *     - App-root `<RealmTaintBoundary>` + `<TaintedRouteGate>` (`@/app/RealmTaint`) enforce render-phase
+ *       DOM quarantine across session transitions and routes.
  */
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useLocation } from "wouter";
-import { ME_QUERY_KEY } from "@/lib/authApi";
+import {
+  __resetRealmTaintForTests,
+  cleanRealmPath,
+  isRealmTainted,
+  markRealmTainted,
+  requestCleanRealm,
+} from "@/lib/realmTaint";
 import { RUNTIME } from "@/lib/runtime";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
@@ -86,11 +97,13 @@ function isSafeHttpsOriginClient(value: string | null | undefined): value is str
   }
 }
 
-/* ------------------------------ In-memory consent + synchronous JS-realm taint guard */
+/* ------------------------------ In-memory consent + preventive pre-history guard */
 
 let currentDecision: AnalyticsConsentDecision = "undecided";
-let clarityTaintedCurrentRealm = false;
-let realmQuarantined = false;
+let consentHistoryGuardArmed = false;
+let historyWrappersInstalled = false;
+let origPushState: History["pushState"] | null = null;
+let origReplaceState: History["replaceState"] | null = null;
 const listeners = new Set<() => void>();
 
 function emitChange(): void {
@@ -106,20 +119,8 @@ function getConsentSnapshot(): AnalyticsConsentDecision {
   return currentDecision;
 }
 
-type RealmPurgeHandler = (targetUrl?: string) => void;
-let customRealmPurgeHandler: RealmPurgeHandler | null = null;
-
-/** Test hook allowing jsdom specs to observe synchronous JS-realm purge / hard navigations. */
-export function __setAnalyticsTestHooks(hooks: { onRealmPurge?: RealmPurgeHandler | null }): void {
-  customRealmPurgeHandler = hooks.onRealmPurge ?? null;
-}
-
 export function isAnalyticsRealmTainted(): boolean {
-  return clarityTaintedCurrentRealm;
-}
-
-export function isAnalyticsRealmQuarantined(): boolean {
-  return realmQuarantined;
+  return isRealmTainted();
 }
 
 function teardownClarityGlobalsAndScript(): void {
@@ -139,37 +140,9 @@ function teardownClarityGlobalsAndScript(): void {
   }
 }
 
-function quarantineAndHardNavigate(targetHref?: string): void {
-  if (!clarityTaintedCurrentRealm && !realmQuarantined) return;
-  clarityTaintedCurrentRealm = false;
-  realmQuarantined = true;
-  teardownClarityGlobalsAndScript();
-  emitChange();
-
-  if (customRealmPurgeHandler) {
-    customRealmPurgeHandler(targetHref);
-    return;
-  }
-  if (typeof window !== "undefined") {
-    try {
-      if (targetHref && targetHref !== window.location.href) {
-        window.location.assign(targetHref);
-      } else {
-        window.location.reload();
-      }
-    } catch {
-      // jsdom does not implement document navigation; `customRealmPurgeHandler` records it in tests.
-    }
-  }
-}
-
-let realmGuardsInstalled = false;
-let origPushState: History["pushState"] | null = null;
-let origReplaceState: History["replaceState"] | null = null;
-
-function installSynchronousRealmGuards(): void {
-  if (realmGuardsInstalled || typeof window === "undefined") return;
-  realmGuardsInstalled = true;
+function ensurePreventiveHistoryGuardsInstalled(): void {
+  if (historyWrappersInstalled || typeof window === "undefined") return;
+  historyWrappersInstalled = true;
 
   origPushState = window.history.pushState.bind(window.history);
   origReplaceState = window.history.replaceState.bind(window.history);
@@ -180,7 +153,7 @@ function installSynchronousRealmGuards(): void {
     unused: string,
     url?: string | URL | null,
   ): void => {
-    if (clarityTaintedCurrentRealm || realmQuarantined) {
+    if (consentHistoryGuardArmed && isRealmTainted()) {
       let resolved: URL | null;
       try {
         resolved = new URL(
@@ -190,16 +163,20 @@ function installSynchronousRealmGuards(): void {
       } catch {
         resolved = null;
       }
+
       const staysOnCleanPublicLegal =
-        !realmQuarantined &&
         resolved !== null &&
         resolved.origin === window.location.origin &&
         isCleanEligibleUrl(resolved);
 
       if (!staysOnCleanPublicLegal) {
-        // Synchronously block `history.pushState`/`replaceState` BEFORE wouter updates route state,
-        // preventing any non-public component from ever rendering or committing in this tainted realm.
-        quarantineAndHardNavigate(resolved?.href ?? window.location.href);
+        // Prevent non-public pathnames or `?search`/`#hash` tokens from EVER entering `window.location`
+        // inside a vendor-tainted JS realm; tear down vendor globals and hard-navigate to a clean realm.
+        consentHistoryGuardArmed = false;
+        teardownClarityGlobalsAndScript();
+        const targetPath = cleanRealmPath(resolved?.pathname ?? window.location.pathname);
+        const mode = isEligibleAnalyticsPath(targetPath) ? "replace" : "assign";
+        requestCleanRealm(mode, targetPath);
         return;
       }
     }
@@ -213,36 +190,37 @@ function installSynchronousRealmGuards(): void {
     guardHistoryMutation(origReplaceState!, data, unused, url);
   };
 
-  // Capture-phase listeners run BEFORE wouter's bubble/default listeners on Back/Forward or hash edits.
   const onCaptureUrlMutation = (event: Event): void => {
-    if (!clarityTaintedCurrentRealm && !realmQuarantined) return;
-    if (realmQuarantined || !isWindowAtCleanEligiblePath()) {
+    if (!consentHistoryGuardArmed || !isRealmTainted()) return;
+    if (!isWindowAtCleanEligiblePath()) {
       event.stopImmediatePropagation();
-      quarantineAndHardNavigate(window.location.href);
+      consentHistoryGuardArmed = false;
+      teardownClarityGlobalsAndScript();
+      const targetPath = cleanRealmPath(window.location.pathname);
+      requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
     }
   };
   window.addEventListener("popstate", onCaptureUrlMutation, { capture: true });
   window.addEventListener("hashchange", onCaptureUrlMutation, { capture: true });
 }
 
-// Install capture-phase listeners immediately on module evaluation so they precede router listeners.
-installSynchronousRealmGuards();
-
 /** Resets volatile consent & realm-taint state (used by tests). */
 export function resetAnalyticsConsentForTests(): void {
   currentDecision = "undecided";
-  clarityTaintedCurrentRealm = false;
-  realmQuarantined = false;
-  customRealmPurgeHandler = null;
+  consentHistoryGuardArmed = false;
   teardownClarityGlobalsAndScript();
+  __resetRealmTaintForTests();
   emitChange();
 }
 
 export function setAnalyticsConsent(next: AnalyticsConsentDecision): void {
   const prev = currentDecision;
   currentDecision = next;
-  if (prev === "granted" && next !== "granted" && clarityTaintedCurrentRealm) {
-    quarantineAndHardNavigate(typeof window !== "undefined" ? window.location.href : undefined);
+  if (prev === "granted" && next !== "granted" && isRealmTainted()) {
+    consentHistoryGuardArmed = false;
+    teardownClarityGlobalsAndScript();
+    emitChange();
+    requestCleanRealm("replace", typeof window !== "undefined" ? window.location.pathname : "/privacy");
     return;
   }
   emitChange();
@@ -285,10 +263,15 @@ export function useAnalyticsConsent() {
 function mountClarityTag(projectId: string, pathname: string): void {
   if (typeof document === "undefined" || !CLARITY_ID_PATTERN.test(projectId)) return;
   if (!isWindowAtCleanEligiblePath(pathname)) return;
-  installSynchronousRealmGuards();
 
   const existing = document.querySelector('script[data-rp-clarity="true"]');
   if (existing) return;
+
+  ensurePreventiveHistoryGuardsInstalled();
+  consentHistoryGuardArmed = true;
+
+  // Enforce strict client-side Clarity masking on the document root before loading the vendor tag.
+  document.documentElement.setAttribute("data-clarity-mask", "true");
 
   const win = window as Window & {
     clarity?: ((...args: unknown[]) => void) & { q?: unknown[][] };
@@ -300,15 +283,14 @@ function mountClarityTag(projectId: string, pathname: string): void {
     win.clarity = fn;
   }
 
-  // Enforce strict client-side Clarity masking on the document root before loading the vendor tag.
-  document.documentElement.setAttribute("data-clarity-mask", "true");
-
   const script = document.createElement("script");
   script.async = true;
   script.src = `https://www.clarity.ms/tag/${encodeURIComponent(projectId)}`;
   script.setAttribute("data-rp-clarity", "true");
   script.referrerPolicy = "no-referrer";
-  clarityTaintedCurrentRealm = true;
+
+  // INT-01: Synchronously mark the JS realm tainted on the exact line immediately BEFORE appending `<script>`.
+  markRealmTainted("clarity");
   document.head.appendChild(script);
 }
 
@@ -317,11 +299,16 @@ function sendMinimalPostHogPageview(host: string, key: string, pathname: string)
   if (!isWindowAtCleanEligiblePath(pathname)) return;
   if (typeof fetch !== "function") return;
 
+  ensurePreventiveHistoryGuardsInstalled();
+  consentHistoryGuardArmed = true;
+
   const distinctId =
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `ephemeral_${Math.random().toString(36).slice(2, 12)}`;
 
+  // INT-01: Synchronously mark the JS realm tainted on the exact line immediately BEFORE sending `fetch()`.
+  markRealmTainted("posthog");
   void fetch(`${host}/capture/`, {
     method: "POST",
     mode: "cors",
@@ -353,33 +340,12 @@ export interface AnalyticsConsentSlotProps {
 
 export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotProps = {}) {
   const [pathname] = useLocation();
-  const queryClient = useQueryClient();
   const session = useSession();
   const trpc = useTRPC();
   const { decision, grant, deny, reset } = useAnalyticsConsent();
 
   const cleanEligibleRoute = isEligibleAnalyticsPath(pathname) && isWindowAtCleanEligiblePath(pathname);
   const isAnonymousVisitor = session.view.status === "anonymous";
-
-  // Synchronously watch `ME_QUERY_KEY` in the query cache so any transition out of anonymous state
-  // while Clarity tainted the realm quarantines & reloads BEFORE React commits authenticated UI.
-  useEffect(() => {
-    return queryClient.getQueryCache().subscribe((event) => {
-      if (!clarityTaintedCurrentRealm) return;
-      if (
-        Array.isArray(event.query.queryKey) &&
-        event.query.queryKey[0] === ME_QUERY_KEY[0] &&
-        event.query.state.data !== undefined
-      ) {
-        quarantineAndHardNavigate(typeof window !== "undefined" ? window.location.href : undefined);
-      }
-    });
-  }, [queryClient]);
-
-  // Synchronous render-phase fallback if custom router hooks or session state diverge while tainted.
-  if (clarityTaintedCurrentRealm && (!cleanEligibleRoute || !isAnonymousVisitor)) {
-    quarantineAndHardNavigate(typeof window !== "undefined" ? window.location.href : undefined);
-  }
 
   const configQuery = useQuery({
     ...trpc.integrations.publicAnalyticsConfig.queryOptions(),
@@ -405,9 +371,6 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
   useEffect(() => {
     if (!cleanEligibleRoute || !isAnonymousVisitor || !anyProviderActive || decision !== "granted") {
       lastCapturedPathRef.current = null;
-      if (clarityTaintedCurrentRealm && !clarityReady) {
-        quarantineAndHardNavigate(typeof window !== "undefined" ? window.location.href : undefined);
-      }
       return;
     }
 
@@ -432,7 +395,7 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
     posthogReady,
   ]);
 
-  if (!cleanEligibleRoute || !isAnonymousVisitor || !anyProviderActive || realmQuarantined) {
+  if (!cleanEligibleRoute || !isAnonymousVisitor || !anyProviderActive) {
     return null;
   }
 
