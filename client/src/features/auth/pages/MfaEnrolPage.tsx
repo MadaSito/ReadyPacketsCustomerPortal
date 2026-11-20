@@ -38,17 +38,22 @@ export default function MfaEnrolPage() {
     );
   }, [api]);
 
+  // Start enrolment only while the session still asks for it. Once confirmation staged a recovery batch, or the
+  // session no longer lists `enroll_mfa` (TOTP is set), a remount must not call beginTotpEnrollment again —
+  // the server refuses it (TRANSITION_NOT_PERMITTED).
+  const enrolPending = me ? me.pendingSteps.includes("enroll_mfa") : null;
   useEffect(() => {
     mounted.current = true;
-    if (!started.current) {
-      started.current = true;
-      start();
-    }
     return () => {
       mounted.current = false;
       setSetup(null);
     };
-  }, [start]);
+  }, []);
+  useEffect(() => {
+    if (started.current || batch || enrolPending !== true) return;
+    started.current = true;
+    start();
+  }, [batch, enrolPending, start]);
 
   const confirm = async (event: FormEvent) => {
     event.preventDefault();

@@ -57,7 +57,7 @@ describe("auth screens — accessibility (axe, WCAG 2.2 A/AA rules; contrast cov
     await screen.findByRole("radiogroup");
     await expectNoAxeViolations(a.container);
     a.unmount();
-    const b = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
+    const b = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api: { ...api, me: async () => remediationMe("enroll_mfa") } });
     await screen.findByText("JBSW Y3DP EHPK 3PXP");
     await expectNoAxeViolations(b.container);
   });
@@ -171,10 +171,14 @@ describe("MFA", () => {
     clearRecoveryBatch();
     const acknowledgeRecoveryCodes = vi.fn(async (_: { recoverySetId: string }) => ({ ok: true as const }));
     const codes = ["AAAAA-BBBBB", "CCCCC-DDDDD"];
+    let step: MeResult["nextStep"] = "enroll_mfa";
     const api = fakeAuthApi({
-      me: async () => remediationMe("acknowledge_recovery_codes"),
+      me: async () => remediationMe(step),
       beginTotpEnrollment: async () => ({ secret: "JBSWY3DPEHPK3PXP", otpauthUri: "otpauth://totp/x", qrDataUrl: "data:image/png;base64,iVBORw0KGgo=" }),
-      confirmTotpEnrollment: async () => ({ recoveryCodes: codes, recoverySetId: "set-1" }),
+      confirmTotpEnrollment: async () => {
+        step = "acknowledge_recovery_codes";
+        return { recoveryCodes: codes, recoverySetId: "set-1" };
+      },
       acknowledgeRecoveryCodes,
     });
     const { location } = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
@@ -191,6 +195,38 @@ describe("MFA", () => {
     });
     expect(acknowledgeRecoveryCodes).toHaveBeenCalledWith({ recoverySetId: "set-1" });
     await waitFor(() => expect(location.history?.at(-1)).toBe("/"));
+  });
+
+  it("never calls beginTotpEnrollment again after confirmation (remount with a staged batch or TOTP already set)", async () => {
+    clearRecoveryBatch();
+    let step: MeResult["nextStep"] = "enroll_mfa";
+    const beginTotpEnrollment = vi.fn(async () => ({ secret: "JBSWY3DPEHPK3PXP", otpauthUri: "otpauth://totp/x", qrDataUrl: "data:image/png;base64,iVBORw0KGgo=" }));
+    const api = fakeAuthApi({
+      me: async () => remediationMe(step),
+      beginTotpEnrollment,
+      confirmTotpEnrollment: async () => {
+        step = "acknowledge_recovery_codes";
+        return { recoveryCodes: ["AAAAA-BBBBB"], recoverySetId: "set-1" };
+      },
+    });
+    const first = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
+    await screen.findByAltText(/qr code/i);
+    type(/6-digit code/i, "123456");
+    fireEvent.click(screen.getByRole("button", { name: /verify and continue/i }));
+    await screen.findByRole("list", { name: /recovery codes/i });
+    first.unmount();
+    // Remount (as after the session refresh) while the batch is staged.
+    const second = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
+    await screen.findByRole("list", { name: /recovery codes/i });
+    second.unmount();
+    // Batch gone, but the session says TOTP is already set.
+    clearRecoveryBatch();
+    const third = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    third.unmount();
+    expect(beginTotpEnrollment).toHaveBeenCalledTimes(1);
   });
 
   it("recovery-codes page without a staged batch asks to verify for a reissue", async () => {
