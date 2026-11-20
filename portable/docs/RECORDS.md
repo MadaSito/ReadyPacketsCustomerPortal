@@ -45,6 +45,7 @@ File `records/orders.jsonl` · schema `schemas/v3/records/orders.schema.json`
 | `currency` | yes | string |
 | `subtotal` | yes | money |
 | `discount` | yes | money |
+| `discountLabel` | no | string ≤120 \| null |
 | `total` | yes | money |
 | `isTestOrder` | yes | boolean |
 | `lock` | yes | object \| null |
@@ -69,6 +70,10 @@ File `records/order-items.jsonl` · schema `schemas/v3/records/order-items.schem
 | `sku` | yes | string |
 | `name` | yes | string ≤255 |
 | `tier` | yes | string \| null |
+| `packetNumber` | no | integer \| null |
+| `outcome` | no | string ≤1000 |
+| `timeline` | no | string ≤120 |
+| `deliverables` | no | array of object |
 | `quantity` | yes | integer |
 | `unitPrice` | yes | money |
 | `lineTotal` | yes | money |

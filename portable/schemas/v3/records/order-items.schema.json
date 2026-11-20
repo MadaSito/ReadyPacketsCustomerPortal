@@ -48,6 +48,52 @@
         }
       ]
     },
+    "packetNumber": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 1000
+    },
+    "timeline": {
+      "type": "string",
+      "minLength": 0,
+      "maxLength": 120
+    },
+    "deliverables": {
+      "maxItems": 100,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 0,
+            "maxLength": 2000
+          }
+        },
+        "required": [
+          "title",
+          "detail"
+        ],
+        "additionalProperties": false
+      }
+    },
     "quantity": {
       "type": "integer",
       "minimum": 1,

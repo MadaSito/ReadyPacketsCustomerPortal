@@ -69,6 +69,8 @@ export const OrderRecord = z.strictObject({
   currency: Currency,
   subtotal: Money,
   discount: Money,
+  /** Customer-visible reason for `discount` (e.g. the bundle label); null = none / unknown. Optional in 3.0. */
+  discountLabel: text(120).nullable().optional(),
   total: Money,
   isTestOrder: z.boolean(),
   /** Read-only lock state; null = unknown (legacy). Importers default to read-only regardless. */
@@ -92,6 +94,11 @@ export const OrderItemRecord = z.strictObject({
   sku: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
   name: text(255, 1),
   tier: Token.nullable(),
+  /** Offering snapshot at order time (catalog packet number, outcome, timeline, deliverables). Optional in 3.0. */
+  packetNumber: z.int().min(1).max(255).nullable().optional(),
+  outcome: text(1000).optional(),
+  timeline: text(120).optional(),
+  deliverables: z.array(z.strictObject({ title: text(255, 1), detail: text(2000) })).max(100).optional(),
   quantity: z.int().min(1).max(1_000_000),
   unitPrice: Money,
   lineTotal: Money,
