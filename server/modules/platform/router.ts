@@ -40,12 +40,16 @@ export const platformRouter = router({
         }),
       update: manage
         .input(z.strictObject({ key: settingKey, value: z.json(), expectedVersion: version }))
-        .mutation(({ ctx, input }) => impl(ctx.services).updateSetting(input.key, input.value, input.expectedVersion)),
+        .mutation(({ ctx, input }) => {
+          const platform = impl(ctx.services);
+          return platform.updateSetting(input.key, input.value, input.expectedVersion, platform.actorGuard(ctx.session));
+        }),
       setSecret: manage
         .input(z.strictObject({ key: settingKey, value: z.string().min(1).max(16384).nullable(), expectedVersion: version }))
         .mutation(async ({ ctx, input }) => {
-          const store = impl(ctx.services).settingsAdmin();
-          await store.updateSecret(input.key, input.value, { expectedVersion: input.expectedVersion });
+          const platform = impl(ctx.services);
+          const store = platform.settingsAdmin();
+          await store.updateSecret(input.key, input.value, { expectedVersion: input.expectedVersion, guard: platform.actorGuard(ctx.session) });
           return store.describeOne(input.key);
         }),
     }),
@@ -54,8 +58,12 @@ export const platformRouter = router({
       set: manage
         .input(z.strictObject({ key: settingKey.refine((k) => k.startsWith("feature."), "must be a feature flag"), enabled: z.boolean(), expectedVersion: version }))
         .mutation(async ({ ctx, input }) => {
-          const store = impl(ctx.services).settingsAdmin();
-          await store.setFeature(input.key.slice("feature.".length), input.enabled, { expectedVersion: input.expectedVersion });
+          const platform = impl(ctx.services);
+          const store = platform.settingsAdmin();
+          await store.setFeature(input.key.slice("feature.".length), input.enabled, {
+            expectedVersion: input.expectedVersion,
+            guard: platform.actorGuard(ctx.session),
+          });
           return store.describeOne(input.key);
         }),
     }),
@@ -70,7 +78,8 @@ export const platformRouter = router({
       deleteImage: manage
         .input(z.strictObject({ id: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/) }))
         .mutation(async ({ ctx, input }) => {
-          await impl(ctx.services).presentationService.deleteImage(input.id);
+          const platform = impl(ctx.services);
+          await platform.presentationService.deleteImage(input.id, platform.actorGuard(ctx.session));
           return { ok: true as const };
         }),
     }),
@@ -86,7 +95,10 @@ export const platformRouter = router({
       importApply: manage
         .input(z.strictObject({ document: documentText, passphrase, expectedPreviewDigest: z.string().regex(/^[0-9a-f]{64}$/) }))
         .meta({ rateLimit: "expensive" })
-        .mutation(({ ctx, input }) => impl(ctx.services).configTransfer().apply(input.document, input.expectedPreviewDigest, input.passphrase)),
+        .mutation(({ ctx, input }) => {
+          const platform = impl(ctx.services);
+          return platform.configTransfer().apply(input.document, input.expectedPreviewDigest, platform.actorGuard(ctx.session), input.passphrase);
+        }),
     }),
   }),
 });

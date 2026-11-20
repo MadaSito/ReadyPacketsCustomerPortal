@@ -6,10 +6,11 @@ import type { Readable } from "node:stream";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
 import { notFound, validation } from "../../core/errors.js";
 import { getRequestContext } from "../../core/requestContext.js";
-import type { AuditEmitter, Clock, Db, ObjectStorage, SettingsStore } from "../../core/types.js";
+import type { AuditEmitter, Clock, Db, ObjectStorage, SettingsStore, Tx } from "../../core/types.js";
+import type { ActorGuard } from "./actorGuard.js";
 import type { PublicPresentation, PublicSlide } from "./index.js";
 import { validateImage, MAX_IMAGE_BYTES } from "./imageValidation.js";
-import { platformPresentationImages } from "./schema.js";
+import { platformPresentationImages, platformSettings } from "./schema.js";
 import {
   BRAND_IMAGE_ALLOWLIST,
   PRESENTATION_ANNOUNCEMENT,
@@ -45,12 +46,14 @@ export interface PresentationImageSummary {
 export function createPresentationService(deps: PresentationDeps) {
   const { db, clock, audit, settings, storage } = deps;
 
-  async function activeUploads(ids: readonly string[]): Promise<Set<string>> {
+  /** With `tx` the rows are share-locked so a concurrent delete waits for the referencing write. */
+  async function activeUploads(ids: readonly string[], tx?: Tx): Promise<Set<string>> {
     if (ids.length === 0) return new Set();
-    const rows = await db
+    const query = (tx ?? db)
       .select({ publicId: platformPresentationImages.publicId })
       .from(platformPresentationImages)
-      .where(and(inArray(platformPresentationImages.publicId, [...ids]), isNull(platformPresentationImages.deletedAt)));
+      .where(and(inArray(platformPresentationImages.publicId, [...new Set(ids)].sort()), isNull(platformPresentationImages.deletedAt)));
+    const rows = tx ? await query.for("share") : await query;
     return new Set(rows.map((row) => row.publicId));
   }
 
@@ -59,9 +62,9 @@ export function createPresentationService(deps: PresentationDeps) {
   }
 
   /** Extra validation for the slides setting: every uploaded image must exist. */
-  async function assertSlidesReferenceKnownImages(slides: Slide[]): Promise<void> {
+  async function assertSlidesReferenceKnownImages(slides: Slide[], tx?: Tx): Promise<void> {
     const uploads = slides.flatMap((slide) => (slide.image?.source === "upload" ? [slide.image.id] : []));
-    const known = await activeUploads(uploads);
+    const known = await activeUploads(uploads, tx);
     if (uploads.some((id) => !known.has(id))) {
       throw validation("UNKNOWN_IMAGE", "One of the selected images is no longer available.");
     }
@@ -122,7 +125,7 @@ export function createPresentationService(deps: PresentationDeps) {
   }
 
   /** Caller must have verified admin + fresh step-up. Bytes are validated and metadata-stripped first. */
-  async function uploadImage(bytes: Buffer): Promise<PresentationImageSummary> {
+  async function uploadImage(bytes: Buffer, guard: ActorGuard): Promise<PresentationImageSummary> {
     if (bytes.length > MAX_IMAGE_BYTES) throw validation("IMAGE_TOO_LARGE", "Images must be 2 MB or smaller.");
     const result = validateImage(bytes);
     if (!result.ok) {
@@ -150,6 +153,7 @@ export function createPresentationService(deps: PresentationDeps) {
     const actorUserId = getRequestContext()?.actor?.userId ?? null;
     try {
       const publicId = await db.transaction(async (tx) => {
+        await guard(tx);
         const [inserted] = await tx
           .insert(platformPresentationImages)
           .values({
@@ -197,20 +201,23 @@ export function createPresentationService(deps: PresentationDeps) {
     }
   }
 
-  async function deleteImage(publicId: string): Promise<void> {
+  async function deleteImage(publicId: string, guard: ActorGuard): Promise<void> {
     if (!ULID_PATTERN.test(publicId)) throw notFound();
-    const slides = await readSetting(settings, PRESENTATION_SLIDES);
-    if (slides.some((slide) => slide.image?.source === "upload" && slide.image.id === publicId)) {
-      throw validation("IMAGE_IN_USE", "This image is used by a slide. Remove it from the slideshow first.");
-    }
     await db.transaction(async (tx) => {
+      await guard(tx);
+      // Lock order: slides setting row, then the image row (same order as a slides update).
+      await tx.select({ id: platformSettings.id }).from(platformSettings).where(eq(platformSettings.settingKey, PRESENTATION_SLIDES.key)).for("update");
+      const slides = await readSetting(settings, PRESENTATION_SLIDES, tx);
+      if (slides.some((slide) => slide.image?.source === "upload" && slide.image.id === publicId)) {
+        throw validation("IMAGE_IN_USE", "This image is used by a slide. Remove it from the slideshow first.");
+      }
       const [row] = await tx
         .select()
         .from(platformPresentationImages)
         .where(and(eq(platformPresentationImages.publicId, publicId), isNull(platformPresentationImages.deletedAt)))
         .for("update");
       if (!row) throw notFound();
-      await tx.update(platformPresentationImages).set({ deletedAt: clock.now() }).where(eq(platformPresentationImages.id, row.id));
+      // Durable audit first, then the (soft) delete — both in this transaction.
       await audit.record(
         {
           category: "file",
@@ -221,6 +228,7 @@ export function createPresentationService(deps: PresentationDeps) {
         },
         tx,
       );
+      await tx.update(platformPresentationImages).set({ deletedAt: clock.now() }).where(eq(platformPresentationImages.id, row.id));
     });
   }
 

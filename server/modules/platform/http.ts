@@ -48,7 +48,8 @@ export function registerPlatformHttpRoutes(router: Router, services: Services): 
     const type = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
     if (!ACCEPTED_TYPES.has(type)) throw validation("IMAGE_UNSUPPORTED_TYPE", "Please upload a PNG, JPEG or WebP image.");
     const body = await readBoundedBody(req, MAX_IMAGE_BYTES);
-    const image = await impl(services).presentationService.uploadImage(body);
+    const platform = impl(services);
+    const image = await platform.presentationService.uploadImage(body, platform.actorGuard(session));
     res.status(201).setHeader("Cache-Control", "no-store").json(image);
   });
 

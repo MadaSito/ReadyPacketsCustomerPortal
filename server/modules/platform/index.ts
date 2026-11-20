@@ -3,7 +3,6 @@
  * Other modules import TYPES and the pure declaration helpers from here and reach the instance through
  * `deps.services.platform` at call time.
  */
-import type { ModuleDeps } from "../../container.js";
 import type { HealthState, ModuleHealth, ModuleLifecycle } from "../../core/types.js";
 
 export {

@@ -11,6 +11,7 @@
  *  - Import is two-phase: preview (dry-run diff + digest bound to the document AND the current setting
  *    versions) then apply with that digest; any concurrent change or invalid value refuses the whole import.
  */
+import type { ActorGuard } from "./actorGuard.js";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { DomainError, validation } from "../../core/errors.js";
@@ -98,6 +99,8 @@ export interface ConfigTransferDeps {
   settings: PlatformSettingsStore;
   installationId: string;
   releaseRef: string;
+  /** Cross-record validation run under the setting's row lock (e.g. slides reference existing images). */
+  afterLock?: (key: string, value: unknown, tx: Tx) => Promise<void>;
 }
 
 export interface ImportChange {
@@ -340,7 +343,7 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
     });
   }
 
-  async function apply(raw: string, expectedDigest: string, passphrase?: string): Promise<ImportPreview> {
+  async function apply(raw: string, expectedDigest: string, guard: ActorGuard, passphrase?: string): Promise<ImportPreview> {
     try {
       const result = await plan(raw, passphrase);
       if (result.preview.digest !== expectedDigest) {
@@ -349,9 +352,16 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
       if (result.preview.rejected.length > 0) {
         throw validation("IMPORT_HAS_REJECTIONS", "The file contains settings that cannot be imported. Nothing was changed.");
       }
+      // Deterministic lock order: actor (users → sessions) first, then settings rows by key.
+      const values = [...result.values].sort((a, b) => (a.key < b.key ? -1 : 1));
+      const secrets = [...result.secretWrites].sort((a, b) => (a.key < b.key ? -1 : 1));
       await db.transaction(async (tx: Tx) => {
-        for (const item of result.values) await settings.update(item.key, item.value, { expectedVersion: item.version, tx });
-        for (const item of result.secretWrites) await settings.updateSecret(item.key, item.value, { expectedVersion: item.version, tx });
+        await guard(tx);
+        for (const item of values) {
+          const check = deps.afterLock;
+          await settings.update(item.key, item.value, { expectedVersion: item.version, tx, ...(check ? { afterLock: (t: Tx) => check(item.key, item.value, t) } : {}) });
+        }
+        for (const item of secrets) await settings.updateSecret(item.key, item.value, { expectedVersion: item.version, tx });
         await audit.record(
           {
             category: "admin",

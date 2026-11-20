@@ -144,7 +144,7 @@ describe("SettingsStore", () => {
     // Different keyring ⇒ UNKNOWN_KEY
     const other = createFieldCrypto({
       ...h.config,
-      dataKeyring: { current: "zz", keys: { zz: Buffer.alloc(32, 9).map((b, i) => (b * 7 + i * 13) % 256).toString("base64") } },
+      dataKeyring: { current: "zz", keys: { zz: Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 13 + 63) % 256)).toString("base64") } },
     });
     const otherStore = createSettingsStore({ db: t.db, clock: h.clock, logger: silentLogger, crypto: other, audit: h.audit });
     const err = await otherStore.getSecret(TOKEN.key).catch((e: unknown) => e);

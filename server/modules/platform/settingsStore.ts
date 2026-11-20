@@ -50,6 +50,10 @@ export interface WriteOptions {
   /** Optimistic concurrency; omit only for internal writes that legitimately overwrite. */
   expectedVersion?: number;
   tx?: Tx;
+  /** Runs FIRST inside the transaction (actor re-validation; locks users → sessions before settings). */
+  guard?: (tx: Tx) => Promise<void>;
+  /** Runs after the setting row is locked, before the write (cross-record checks under lock). */
+  afterLock?: (tx: Tx) => Promise<void>;
 }
 
 export interface PlatformSettingsStore extends SettingsStore {
@@ -134,11 +138,13 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
   ): Promise<number> {
     const actorUserId = getRequestContext()?.actor?.userId ?? null;
     const run = async (tx: Tx): Promise<number> => {
+      if (options.guard) await options.guard(tx);
       const [current] = await tx.select().from(platformSettings).where(eq(platformSettings.settingKey, def.key)).limit(1).for("update");
       const currentVersion = current?.version ?? 0;
       if (options.expectedVersion !== undefined && options.expectedVersion !== currentVersion) {
         throw conflict("VERSION_MISMATCH", "This setting was changed by someone else. Reload and try again.");
       }
+      if (options.afterLock) await options.afterLock(tx);
       const nextVersion = currentVersion + 1;
       if (current) {
         await tx

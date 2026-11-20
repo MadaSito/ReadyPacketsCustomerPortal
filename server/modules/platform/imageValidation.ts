@@ -113,7 +113,7 @@ function validateJpeg(input: Buffer): ImageValidation {
 }
 
 function validateWebp(input: Buffer): ImageValidation {
-  if (input.length < 30) return { ok: false, reason: "MALFORMED" };
+  if (input.length < 25) return { ok: false, reason: "MALFORMED" };
   const riffSize = input.readUInt32LE(4);
   if (riffSize + 8 !== input.length) return { ok: false, reason: "MALFORMED" };
   let offset = 12;

@@ -2,9 +2,11 @@
  * Platform module factory: schema contract, health aggregation, setup state, presentation and
  * configuration transfer. Owner: platform engineer.
  */
+import { createActorGuard, type ActorGuard } from "./actorGuard.js";
+import type { Capability } from "../../../shared/capabilities.js";
 import { sql } from "drizzle-orm";
 import { DomainError, validation } from "../../core/errors.js";
-import { HEALTH_STATES, type HealthState, type ModuleHealth, type ModuleLifecycle } from "../../core/types.js";
+import { HEALTH_STATES, type HealthState, type ModuleHealth, type ModuleLifecycle, type SessionPrincipal, type Tx } from "../../core/types.js";
 import type { ModuleDeps } from "../../container.js";
 import type { PlatformFieldCrypto } from "../../security/fieldCrypto.js";
 import { createConfigTransfer, type ConfigTransfer } from "./configTransfer.js";
@@ -39,7 +41,9 @@ export interface PlatformInternals {
   /** Admin settings operations (require the database-backed store). */
   settingsAdmin(): PlatformSettingsStore;
   /** Validated update incl. cross-record checks (e.g. slideshow images exist). */
-  updateSetting(key: string, value: unknown, expectedVersion: number): Promise<SettingView>;
+  updateSetting(key: string, value: unknown, expectedVersion: number, guard: ActorGuard): Promise<SettingView>;
+  /** In-transaction re-validation of the acting administrator (see actorGuard.ts). */
+  actorGuard(principal: SessionPrincipal, capability?: Capability): ActorGuard;
   presentationService: PresentationService;
   configTransfer(): ConfigTransfer;
 }
@@ -321,15 +325,18 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     ];
   }
 
-  async function updateSetting(key: string, value: unknown, expectedVersion: number): Promise<SettingView> {
+  /** Slides may only reference uploads that exist; checked under the slides row lock with share locks on images. */
+  async function slidesAfterLock(key: string, value: unknown, tx: Tx): Promise<void> {
+    if (key !== PRESENTATION_SLIDES.key) return;
+    const parsed = slidesSchema.safeParse(value);
+    if (parsed.success) await presentationService.assertSlidesReferenceKnownImages(parsed.data, tx);
+  }
+
+  async function updateSetting(key: string, value: unknown, expectedVersion: number, guard: ActorGuard): Promise<SettingView> {
     const store = settingsAdmin();
     const def = getSettingDefinition(key);
     if (!def) throw validation("UNKNOWN_SETTING", "That setting does not exist.");
-    if (def.key === PRESENTATION_SLIDES.key) {
-      const parsed = slidesSchema.safeParse(value);
-      if (parsed.success) await presentationService.assertSlidesReferenceKnownImages(parsed.data);
-    }
-    await store.update(key, value, { expectedVersion });
+    await store.update(key, value, { expectedVersion, guard, afterLock: (tx) => slidesAfterLock(key, value, tx) });
     return store.describeOne(key);
   }
 
@@ -372,9 +379,18 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     },
     settingsAdmin,
     updateSetting,
+    actorGuard: (principal, capability) => createActorGuard(deps.services, clock, principal, capability),
     presentationService,
     configTransfer: () =>
-      createConfigTransfer({ db, clock, audit, settings: settingsAdmin(), installationId: config.installationId, releaseRef: config.releaseRef }),
+      createConfigTransfer({
+        db,
+        clock,
+        audit,
+        settings: settingsAdmin(),
+        installationId: config.installationId,
+        releaseRef: config.releaseRef,
+        afterLock: slidesAfterLock,
+      }),
   };
   return self;
 }
