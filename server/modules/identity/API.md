@@ -30,15 +30,17 @@ getUser(userId: number, opts?: { tx?: DbOrTx; forUpdate?: boolean }): Promise<Us
 getUserByPublicId(publicId: string, opts?: { tx?: DbOrTx; forUpdate?: boolean }): Promise<UserView | null>;
 // forUpdate requires tx (SELECT … FOR UPDATE — serial admin locks).
 
-verifyPassword(userId: number, password: string): Promise<boolean>;   // constant-ish timing, transparent Argon2id rehash
+verifyPassword(userId: number, password: string, opts?: { tx?: Tx }): Promise<boolean>;   // constant-ish timing, transparent Argon2id rehash
 setPassword(userId: number, password: string, opts: {
   mustChange: boolean; tx?: Tx;
   revokeSessions?: { exceptSessionId?: string; reason: string };   // omitted = no revocation
 }): Promise<void>;   // enforces policy (throws DomainError VALIDATION/PASSWORD_*); retires all outstanding reset/set-password tokens
 generateTemporaryPassword(): string;            // policy-compliant, 20 chars from an unambiguous alphabet
 issueAdminSetPasswordLink(userId: number, opts: { tx: Tx }): Promise<{ previewLink?: string }>;
-// retires prior tokens, makes the old password unusable (hash cleared), queues `auth.admin_set_password` mail in tx.
-// The password the user chooses through the link is their own, so must_change is cleared when they use it.
+// retires prior tokens, makes the old password unusable (hash cleared), sets must_change, queues
+// `auth.admin_set_password` mail in tx. Redeeming the link is the user-chosen change and clears must_change
+// (integrator decision). Callers revoke sessions themselves first (lock order users → sessions → tokens).
+hasActiveAdministrator(): Promise<boolean>;     // ≥1 user role=admin status=active
 
 sessions: {
   markMfaVerified(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;  // sets mfaVerifiedAt + rotates
@@ -48,7 +50,9 @@ sessions: {
   revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx }): Promise<number>;
   /** Locks users row FOR UPDATE, then the session row FOR UPDATE; throws UNAUTHENTICATED SESSION_NOT_CURRENT if
    *  revoked/expired/user not active. Use at the start of authenticated credential mutators. */
-  assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<void>;
+  assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<{ pendingSteps: TransitionStep[] }>;
+  // also rejects if the persisted role or csrfSecret differs from the principal (in-flight rotation/role change);
+  // returns pendingSteps re-derived inside tx (assurance.getAssuranceState(userId, tx)).
   /** Service-internal (workers): current state of a session by PUBLIC id, without its token. */
   getState(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{
     sessionId: string; userId: number; userPublicId: string; role: UserRole; userStatus: UserStatus;
@@ -60,7 +64,8 @@ sessions: {
 
 transitions: {
   /** Ordered pending steps from identity state + services.assurance.getAssuranceState(userId). */
-  derive(userId: number, session?: { mfaVerifiedAt: Date | null }): Promise<TransitionStep[]>;
+  derive(userId: number, session?: { mfaVerifiedAt: Date | null; tx?: DbOrTx }): Promise<TransitionStep[]>;
+  // calls services.assurance.getAssuranceState(userId, tx)
 };
 
 createPendingCustomer(input: {
