@@ -1,0 +1,295 @@
+{
+  "$id": "https://schemas.readypackets.example/catalog/offerings-1.schema.json",
+  "title": "ReadyPackets offerings document (readypackets.offerings/1)",
+  "description": "Generated from scripts/ops/catalog/offerings.ts. Cross-field rules (key formats per packet, tier order, includesTier chaining, bundle references) are enforced by the loader.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "readypackets.offerings/1"
+    },
+    "matrixVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$"
+    },
+    "currency": {
+      "type": "string",
+      "const": "USD"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    },
+    "packets": {
+      "minItems": 1,
+      "maxItems": 6,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "packetNumber": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 6
+          },
+          "groupKey": {
+            "type": "string",
+            "pattern": "^packet-[1-6]$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+          },
+          "tiers": {
+            "minItems": 3,
+            "maxItems": 3,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "tier": {
+                  "type": "string",
+                  "enum": [
+                    "Basic",
+                    "Standard",
+                    "Premium"
+                  ]
+                },
+                "productKey": {
+                  "type": "string",
+                  "pattern": "^packet-[1-6]-(basic|standard|premium)$"
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160,
+                  "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+                },
+                "priceMinor": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 100000000
+                },
+                "outcome": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1000,
+                  "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+                },
+                "timeline": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120,
+                  "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+                },
+                "includesTier": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "enum": [
+                        "Basic",
+                        "Standard"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "deliverables": {
+                  "minItems": 1,
+                  "maxItems": 50,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+                      },
+                      "detail": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000,
+                        "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+                      }
+                    },
+                    "required": [
+                      "title",
+                      "detail"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "tier",
+                "productKey",
+                "name",
+                "priceMinor",
+                "outcome",
+                "timeline",
+                "includesTier",
+                "deliverables"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "packetNumber",
+          "groupKey",
+          "name",
+          "tiers"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "properties": {
+        "packetNumber": {
+          "type": "number",
+          "const": 7
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+        },
+        "tierLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+        },
+        "requiredPacketNumbers": {
+          "minItems": 1,
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 6
+          }
+        },
+        "discountPercent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "pricingNote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+        },
+        "timeline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+        },
+        "points": {
+          "minItems": 1,
+          "maxItems": 10,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000,
+                "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+              }
+            },
+            "required": [
+              "title",
+              "detail"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "packetNumber",
+        "name",
+        "tierLabel",
+        "requiredPacketNumbers",
+        "discountPercent",
+        "pricingNote",
+        "outcome",
+        "timeline",
+        "points"
+      ],
+      "additionalProperties": false
+    },
+    "reserved": {
+      "maxItems": 5,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "packetNumber": {
+            "type": "integer",
+            "minimum": 7,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+          },
+          "listed": {
+            "type": "boolean",
+            "const": false
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "^\\S(?:[^\\p{Cc}*\\\\`]*\\S)?$"
+          }
+        },
+        "required": [
+          "packetNumber",
+          "name",
+          "listed",
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "matrixVersion",
+    "currency",
+    "source",
+    "packets",
+    "bundle",
+    "reserved"
+  ],
+  "additionalProperties": false
+}

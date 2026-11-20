@@ -1,0 +1,735 @@
+{
+  "schema": "readypackets.offerings/1",
+  "matrixVersion": "3.0",
+  "currency": "USD",
+  "source": "docs/source-specs/increment-02/PRODUCT_MATRIX_v3.0.md",
+  "packets": [
+    {
+      "packetNumber": 1,
+      "groupKey": "packet-1",
+      "name": "Idea & IP Protection",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-1-basic",
+          "name": "Idea & IP Protection — Basic",
+          "priceMinor": 45000,
+          "outcome": "A clear, organized invention summary that turns an idea into something concrete and ready to move forward.",
+          "timeline": "48-72 hours",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "20–50 Minute Intake Session",
+              "detail": "A dedicated architectural review to extract your core concept. We move beyond surface-level ideas to identify the specific mechanical or digital logic that makes your invention unique."
+            },
+            {
+              "title": "Core Invention Architecture (5–8 pages)",
+              "detail": "A highly structured translation of your raw idea into a professional engineering format. We define the exact components, the mechanical flow, and the intended outcome without marketing fluff. This is the foundational blueprint required before any real development begins."
+            },
+            {
+              "title": "1 Simple Logic Figure (Line Diagram)",
+              "detail": "A clean visual representation of the core mechanism. This diagram strips away aesthetic noise to show exactly how the primary components interact, serving as the first visual proof of concept for potential partners."
+            },
+            {
+              "title": "Core Feature List + Alternatives",
+              "detail": "A definitive list of primary functions and potential variations. We document not just what the product does, but the specific \"alternative embodiments\" that could achieve the same result, widening the scope of your initial definition."
+            },
+            {
+              "title": "Basic Friction Analysis",
+              "detail": "An initial stress-test of your concept against the laws of physics and basic logic. We identify the single most likely failure point (e.g., battery drain, material limits) before you spend capital building it, saving you from expensive pivots later."
+            },
+            {
+              "title": "Filing Checklist + Next Steps",
+              "detail": "A prioritized roadmap for protecting your IP. We provide a clear, sequential list of actions required to move from this architectural draft to a formal provisional patent filing."
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-1-standard",
+          "name": "Idea & IP Protection — Standard",
+          "priceMinor": 135000,
+          "outcome": "A structured, defensible invention packet suitable for patent discussions, partners, or next-stage development.",
+          "timeline": "4 - 6 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Full Inventor Packet (8–14 pages)",
+              "detail": "Expanded technical documentation ready for deeper review. This dossier includes detailed system logic, user flow descriptions, and mechanical constraints required for a patent attorney to begin their work."
+            },
+            {
+              "title": "1–3 Complex Figures",
+              "detail": "Detailed system and flow diagrams illustrating the mechanism. These visuals map the complete operational loop of the invention, providing a \"visual truth\" that complements the written architecture."
+            },
+            {
+              "title": "\"Teaching-Away\" Argument",
+              "detail": "The critical narrative required to prove your invention is truly novel. We analyze how current industry standards attempt to solve your problem and explicitly document why those standard methods fail. By proving your solution \"teaches away\" from the norm, we establish the foundation for a strong patent claim."
+            },
+            {
+              "title": "Residual Risk Matrix",
+              "detail": "A comprehensive grid detailing secondary risks (supply chain, user adoption, regulatory) to ensure you are building a viable business, not just a gadget. We identify the operational hurdles that often kill great inventions after the engineering is done."
+            },
+            {
+              "title": "Alternative Embodiments (A-B-C Options)",
+              "detail": "We map out multiple ways to physically build your invention to achieve the same result. By documenting these alternatives early, you widen your \"defensive moat,\" preventing competitors from easily designing around your primary idea."
+            },
+            {
+              "title": "Light Prior-Art Scan (Standard)",
+              "detail": "A targeted keyword search of existing patents to identify obvious roadblocks early. We highlight existing solutions that closely mirror your concept, allowing you to pivot your design before paying expensive legal fees."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-1-premium",
+          "name": "Idea & IP Protection — Premium",
+          "priceMinor": 245000,
+          "outcome": "A polished, attorney-ready invention package designed to maximize protection options and reduce future rework.",
+          "timeline": "7 - 10 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "Attorney-Ready Patent Dossier (15+ pages)",
+              "detail": "A rigorous structural appendix designed to hand directly to counsel. This document uses the specific language and structure required for patent filings, minimizing the billable hours your attorney needs to spend rewriting your idea."
+            },
+            {
+              "title": "1–5 High-Fidelity Diagrams",
+              "detail": "Clean, consistent Mermaid.js logic visualizations. These diagrams provide an indisputable map of the invention's logic, suitable for inclusion in formal patent applications or investor due diligence rooms."
+            },
+            {
+              "title": "Preliminary FTO (Freedom-To-Operate) Analysis",
+              "detail": "A deep-dive assessment designed to determine if you can legally commercialize your product without infringing on active patents. We map your specific mechanisms against the \"minefield\" of the current intellectual property landscape to minimize the risk of catastrophic litigation."
+            },
+            {
+              "title": "Claim-Theme Map",
+              "detail": "We translate your engineering mechanics into the specific, strategic language that patent attorneys use to draft claims. This bridges the gap between the \"inventor's vision\" and the \"lawyer's reality,\" saving you thousands of dollars in billable hours when you officially file."
+            },
+            {
+              "title": "Strategic Pivot Recommendations",
+              "detail": "If our logic audits detect a fatal flaw in your design, we do not simply reject the idea. We provide actionable, physics-based pivot strategies to rescue the core intent of your invention using alternative, viable mechanisms."
+            },
+            {
+              "title": "Deep “Teaching-Away” Analysis",
+              "detail": "Advanced forensic argumentation for non-obviousness. We construct a multi-layered narrative that proactively defends your invention against potential \"obviousness\" rejections by the patent office."
+            },
+            {
+              "title": "Two Revision Rounds",
+              "detail": "Iterative refinement to ensure the dossier is bulletproof. We work with you to fine-tune the technical language and visual diagrams until they perfectly represent your vision."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "packetNumber": 2,
+      "groupKey": "packet-2",
+      "name": "Business Foundation",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-2-basic",
+          "name": "Business Foundation — Basic",
+          "priceMinor": 150000,
+          "outcome": "A clean, executable 30-day roadmap that eliminates launch-phase uncertainty.",
+          "timeline": "48-72 hours",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "Comprehensive Intake Session",
+              "detail": "Deep-dive into your business goals and constraints. We identify the specific market gap you intend to fill and the operational resources available to you."
+            },
+            {
+              "title": "Core Business Concept Map (5–8 pages)",
+              "detail": "A structural definition of your business logic. We outline the primary revenue streams, cost centers, and operational mechanics required to launch."
+            },
+            {
+              "title": "Core Value Proposition Architecture",
+              "detail": "Defining the exact problem you solve and the unique value you provide. We strip away generic marketing language to identify the specific \"pain killer\" your business offers to the market."
+            },
+            {
+              "title": "Target Audience Avatar",
+              "detail": "A data-driven profile of your ideal market segment. We define exactly who your first customer is, where they live online, and what psychological triggers drive their purchasing decisions."
+            },
+            {
+              "title": "Basic Logic Stress Test",
+              "detail": "A brutal audit of your core business assumptions. We test whether your proposed solution actually solves the stated problem, or if it creates a new, more expensive problem for the customer/client."
+            },
+            {
+              "title": "30-Day Prioritized Action Roadmap",
+              "detail": "A sequenced checklist to eliminate paralysis. We provide a step-by-step plan for the immediate actions required to move from \"concept\" to \"active project.\""
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-2-standard",
+          "name": "Business Foundation — Standard",
+          "priceMinor": 350000,
+          "outcome": "A deeper plan that structures your build, launch, and early operations with professional confidence.",
+          "timeline": "3 - 5 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Comprehensive Foundation Dossier (8–14 pages)",
+              "detail": "Expanded strategic documentation. This serves as the internal operating manual for the founder, covering all key aspects of the business launch."
+            },
+            {
+              "title": "MVP Scope (Minimum Viable Product)",
+              "detail": "We ruthlessly cut \"nice-to-have\" features to define the absolute minimum product required to enter the market and start generating revenue. This prevents \"feature creep\" and preserves your initial capital."
+            },
+            {
+              "title": "Basic Go-To-Market (GTM) Strategy",
+              "detail": "Initial pricing and sales channel definition. We identify the most efficient path to your first 100 customers, focusing on low-cost, high-impact channels."
+            },
+            {
+              "title": "Corporate Governance & Formation Roadmap",
+              "detail": "We provide a clear roadmap and template documents for establishing your legal entity (LLC or C-Corp). This ensures your foundational structure is investor-ready from day one."
+            },
+            {
+              "title": "Competitor Friction Analysis",
+              "detail": "Identifying where competitors are weak and where you can win. We analyze the market leaders to find the specific gaps in their service that you can exploit."
+            },
+            {
+              "title": "90-Day Strategic Execution Roadmap",
+              "detail": "A quarter-long plan for build and launch. We map out the critical milestones for your first three months to ensure sustained momentum."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-2-premium",
+          "name": "Business Foundation — Premium",
+          "priceMinor": 700000,
+          "outcome": "A robust, long-range strategic dossier providing the modeling and capital alignment needed to execute and scale.",
+          "timeline": "5 - 7 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "Investor-Grade Foundation Dossier (15+ pages)",
+              "detail": "High-status documentation ready for stakeholder review. This comprehensive guide serves as the primary diligence document for partners, co-founders, and early investors."
+            },
+            {
+              "title": "Unit Economics Audit",
+              "detail": "The foundational math of your business broken down to a single transaction. We calculate your exact cost to acquire a customer (CAC) against their lifetime value (LTV) to prove to investors that the business is mathematically capable of scaling."
+            },
+            {
+              "title": "Competitive Positioning & Differentiation Matrix",
+              "detail": "A visual grid of your market standing. We plot your business against key competitors to visually demonstrate your unique value proposition."
+            },
+            {
+              "title": "Scalable Team & Operations Planning Framework",
+              "detail": "A blueprint for hiring and delegation. We identify the key roles you need to fill in the first 12 months to transition from \"Founder-led\" to \"Team-led.\""
+            },
+            {
+              "title": "Investor-Readiness & Capital Alignment",
+              "detail": "Positioning your company for angel or VC investment. We define the specific metrics and milestones you need to hit to unlock institutional capital."
+            },
+            {
+              "title": "12-Month Phased Strategic Dossier",
+              "detail": "A full year-one operational plan. This detailed timeline maps revenue targets, product releases, and hiring gates for the entire first year."
+            },
+            {
+              "title": "Two Revision Rounds",
+              "detail": "In-depth refinement of the unit economics and strategy. We stress-test the financial assumptions with you to ensure they hold up to investor scrutiny."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "packetNumber": 3,
+      "groupKey": "packet-3",
+      "name": "Business Plans",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-3-basic",
+          "name": "Business Plans — Basic",
+          "priceMinor": 91000,
+          "outcome": "A professional, structured funding narrative designed to capture lender interest and provide clarity on your financial mission.",
+          "timeline": "48-72 hours",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "Comprehensive Narrative Intake",
+              "detail": "Extracting the core story of the business. We interview you to uncover the emotional and logical hooks that will drive your funding narrative."
+            },
+            {
+              "title": "Narrative Architecture (5–8 pages)",
+              "detail": "The core story of your business designed specifically for lenders or early grant applications. We structure your vision into a professional format that communicates competence and realistic market understanding."
+            },
+            {
+              "title": "Executive Summary Tailored to Funding Goals",
+              "detail": "A high-impact opening statement optimized for review. This summary is engineered to grab the attention of a loan officer or grant reviewer in the first 60 seconds."
+            },
+            {
+              "title": "Core Mission, Vision, & Value Prop Architecture",
+              "detail": "Defining the \"Soul\" of the company. We articulate the deeper purpose behind your business to build emotional resonance with stakeholders."
+            },
+            {
+              "title": "1-Year Pro-Forma Financial Summary",
+              "detail": "High-level revenue and expense projection. We map out the expected cash flow for the first 12 months to demonstrate financial solvency."
+            },
+            {
+              "title": "Basic Marketing & Sales Strategy Logic",
+              "detail": "How you will acquire your first customers. We outline the primary channels and tactics you will use to generate initial revenue."
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-3-standard",
+          "name": "Business Plans — Standard",
+          "priceMinor": 280000,
+          "outcome": "A high-status investor-ready architecture that demonstrates market viability and financial strategy to secure growth capital.",
+          "timeline": "3 - 5 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Growth-Stage Business Plan (8–14 pages)",
+              "detail": "A detailed plan for scaling operations. This document goes beyond the launch to explain how the business captures market share in years 2 and 3."
+            },
+            {
+              "title": "Comprehensive Market & Competitive Analysis",
+              "detail": "Deep research into your industry landscape. We provide data-driven evidence of the market opportunity and the weaknesses of incumbent players."
+            },
+            {
+              "title": "SWOT & Risk Mitigation Framework",
+              "detail": "Analysis of Strengths, Weaknesses, Opportunities, and Threats. We don't just list risks; we provide actionable mitigation strategies for each one."
+            },
+            {
+              "title": "Operations & Implementation Roadmap",
+              "detail": "How the plan translates to daily action. We define the specific operational steps required to execute the growth strategy."
+            },
+            {
+              "title": "Detailed Unit Economics Analysis",
+              "detail": "Breakeven analysis per unit sold. We prove the profitability of your core transaction model to validate the business case."
+            },
+            {
+              "title": "5-Year Pro-Forma Forecast",
+              "detail": "A detailed, line-by-line financial projection spanning 60 months. We map your expected revenue, operational burn rate, and capital expenditures to demonstrate exactly when the company will reach profitability."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-3-premium",
+          "name": "Business Plans — Premium",
+          "priceMinor": 500000,
+          "outcome": "A full-spectrum institutional capital package designed for angel, VC, and institutional stakeholders.",
+          "timeline": "5 - 7 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "60+ Page Strategic Business Dossier",
+              "detail": "The definitive \"Black Book\" of your business. This comprehensive volume covers every aspect of your strategy, operations, and financial planning in exhaustive detail."
+            },
+            {
+              "title": "Full-Spectrum Capital Package (15+ pages)",
+              "detail": "Dedicated investment materials. A concise, high-impact summary designed specifically for the due diligence phase of venture capital fundraising."
+            },
+            {
+              "title": "In-Depth Industry Data & Benchmarking",
+              "detail": "Grounding projections in real-world metrics. We compare your financial model against industry standards to prove your assumptions are realistic and achievable."
+            },
+            {
+              "title": "Investor Narrative & Valuation Logic",
+              "detail": "The strategic story justifying your current valuation and future capital requirements. This narrative connects your operational metrics to your funding ask, ensuring alignment with institutional expectations."
+            },
+            {
+              "title": "Executive Summary Tailored for VC/Institutional Review",
+              "detail": "Optimized for high-level decision makers. A punchy, data-rich summary that communicates the investment opportunity in language VCs understand."
+            },
+            {
+              "title": "Two Revision Rounds",
+              "detail": "Fine-tuning the narrative for maximum impact. We work with you to sharpen the language and polish the financial logic until it is ready for the boardroom."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "packetNumber": 4,
+      "groupKey": "packet-4",
+      "name": "Operating Design",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-4-basic",
+          "name": "Operating Design — Basic",
+          "priceMinor": 120000,
+          "outcome": "Clarified core operations and a 30-day roadmap ready for immediate team execution.",
+          "timeline": "1 - 4 business days",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "Tactical Process Intake & Gap Identification",
+              "detail": "We audit your current daily operations to find where time and capital are \"leaking.\" We identify the specific manual tasks and communication bottlenecks that are preventing your business from scaling efficiently."
+            },
+            {
+              "title": "Core Workflow Map (5–8 pages)",
+              "detail": "Visualizing the current state of operations. We create a clear diagram of how work moves through your company, highlighting friction points."
+            },
+            {
+              "title": "Core Workflow Architecture (Mermaid.js Diagrams)",
+              "detail": "Logic maps of key processes. We translate your workflow into code-based diagrams that are easy to update and share with your team."
+            },
+            {
+              "title": "Primary SOP (Standard Operating Procedure) Framework",
+              "detail": "The \"How-To\" guide for your most critical business process. We document the exact steps required to execute your core task consistently."
+            },
+            {
+              "title": "Tech-Stack Logic Audit (Basic)",
+              "detail": "Identifying software bottlenecks. We review your current software tools to ensure they are necessary and integrated."
+            },
+            {
+              "title": "30-Day Efficiency Roadmap",
+              "detail": "Prioritized fixes for immediate gain. A checklist of low-hanging fruit to immediately improve your team's productivity."
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-4-standard",
+          "name": "Operating Design — Standard",
+          "priceMinor": 171500,
+          "outcome": "Integrated workflows and optimized tech-stack logic that significantly reduces operational friction.",
+          "timeline": "3 - 6 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Integrated Operations Dossier (8–14 pages)",
+              "detail": "Detailed operational documentation. A comprehensive manual that defines how the different parts of your business interact."
+            },
+            {
+              "title": "Detailed Functional Process Mapping",
+              "detail": "Mapping every step of the value chain. We visualize the end-to-end journey of your product or service, from order to delivery."
+            },
+            {
+              "title": "Workflow Optimization & Bottleneck Remediation",
+              "detail": "Engineering solutions to speed up work. We propose specific process changes to eliminate delays and reduce error rates."
+            },
+            {
+              "title": "Integrated Tech-Stack Implementation Priority List",
+              "detail": "A plan for software consolidation. We identify which tools to keep, which to cut, and how to connect them for automated data flow."
+            },
+            {
+              "title": "Department-Level SOP Design",
+              "detail": "Expanding SOPs to specific business units. We create tailored operating procedures for sales, marketing, and fulfillment teams."
+            },
+            {
+              "title": "One-Hour Operational Implementation Call",
+              "detail": "Handover strategy session. We walk you through the new operating system to ensure you understand how to deploy it."
+            },
+            {
+              "title": "Tech-Stack Logic Audit (Advanced)",
+              "detail": "A forensic review of the software tools you use to run your business. We ensure your platforms communicate properly, eliminate redundant subscriptions, and design an architecture that automates repetitive administrative labor."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-4-premium",
+          "name": "Operating Design — Premium",
+          "priceMinor": 245000,
+          "outcome": "A robust, end-to-end operating system designed to scale the business with minimal founder dependency.",
+          "timeline": "5 - 7 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "End-to-End Operating System (15+ pages)",
+              "detail": "The complete manual for running the company. This \"OS\" allows the business to function efficiently even when the founder is not present."
+            },
+            {
+              "title": "End-to-End Operational Analysis (Stakeholder Logic)",
+              "detail": "We analyze how humans (employees, vendors, clients) interact with your automated systems. We map out the exact points of frustration where users abandon your process, and design specific operational pivots to ensure seamless execution."
+            },
+            {
+              "title": "Complete Workflow & Custom SOP Library Design",
+              "detail": "A full suite of operational protocols. We build a comprehensive library of SOPs covering every major function of the business."
+            },
+            {
+              "title": "Implementation Checklists & Management Templates",
+              "detail": "Tools for managers to enforce the system. We provide the checklists and scorecards your managers need to ensure team compliance."
+            },
+            {
+              "title": "6-Month Phased Operational Scaling Roadmap",
+              "detail": "A detailed plan for hiring, training, and delegating as your business grows. We map the operational evolution required to support your growth targets."
+            },
+            {
+              "title": "Two-Hour Senior Architect Strategy Session",
+              "detail": "Deep-dive implementation support. A dedicated session to customize the deployment of the new operating system to your specific team culture."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "packetNumber": 5,
+      "groupKey": "packet-5",
+      "name": "Execution & Partnerships",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-5-basic",
+          "name": "Execution & Partnerships — Basic",
+          "priceMinor": 77000,
+          "outcome": "A professional bid packet that eliminates scope creep and allows projects to move forward with documented confidence.",
+          "timeline": "48-72 hours",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "20–50 min Intake Session",
+              "detail": "Defining the partnership goals. We determine exactly what you need from a partner and what you are willing to offer in return."
+            },
+            {
+              "title": "Partnership Strategy Outline (5–8 pages)",
+              "detail": "A framework for negotiation. We outline the key terms and deal structures that will protect your interests."
+            },
+            {
+              "title": "Strategic Project Scope Definition",
+              "detail": "A tightly defined document outlining exactly what you will deliver, for what price, and on what timeline. This eliminates scope creep and sets clear boundaries for the engagement."
+            },
+            {
+              "title": "Standardized Bid/Proposal Architecture",
+              "detail": "A template for professional bidding. We provide a clean, high-status format for submitting proposals to potential clients."
+            },
+            {
+              "title": "Budget Framework for Pricing Clarity",
+              "detail": "Ensuring financial transparency. We structure your pricing to make it easy for the client to say yes while protecting your margins."
+            },
+            {
+              "title": "High-Level Project Execution Timeline",
+              "detail": "Visualizing the project phases. A clear roadmap showing the client exactly when milestones will be achieved."
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-5-standard",
+          "name": "Execution & Partnerships — Standard",
+          "priceMinor": 199500,
+          "outcome": "A structured decision-ready packet that speeds up client approvals and significantly reduces project financial risk.",
+          "timeline": "3 - 5 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Strategic Execution Dossier (8–14 pages)",
+              "detail": "Detailed execution planning. A comprehensive manual for managing the project from kickoff to closeout."
+            },
+            {
+              "title": "Detailed Milestone & Deliverable Mapping",
+              "detail": "Breaking the project into payable chunks. We define specific deliverables for each payment milestone to ensure cash flow positivity."
+            },
+            {
+              "title": "Full Budget & Material Allowance Structure",
+              "detail": "Detailed financial controls. We map out every line item of cost to prevent budget overruns."
+            },
+            {
+              "title": "Vendor Comparison Matrix",
+              "detail": "An apples-to-apples, data-driven grid comparing your potential manufacturing or software partners. We strip away the marketing claims to evaluate them purely on cost, latency, reliability, and security, allowing you to make emotionless executive decisions."
+            },
+            {
+              "title": "Bid Scope Architecture",
+              "detail": "Advanced scoping to prevent creep. We create rigorous definitions of \"Out of Scope\" work to protect you from unpaid labor."
+            },
+            {
+              "title": "Editable Bid Packet Source Files",
+              "detail": "Giving the client control over future bids. We provide the native files so you can reuse this successful proposal architecture for future clients."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-5-premium",
+          "name": "Execution & Partnerships — Premium",
+          "priceMinor": 455000,
+          "outcome": "A robust governance package designed for complex, high-stakes projects requiring institutional-level decision-making.",
+          "timeline": "5 - 7 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "Investor-Grade Execution Package (15+ pages)",
+              "detail": "High-status documentation for stakeholders. A comprehensive execution plan designed to reassure institutional partners of your capability."
+            },
+            {
+              "title": "Partnership Governance Framework",
+              "detail": "The structural rules for managing external entities. We define the exact metrics (SLAs), communication protocols, and exit clauses required to control a CDMO or high-level strategic partner without losing your intellectual property."
+            },
+            {
+              "title": "Supply Chain De-Risking Strategy",
+              "detail": "A plan to identify and mitigate potential failures in your manufacturing or supply chain. We map out alternative vendors and contingency plans."
+            },
+            {
+              "title": "End-to-End Multi-Phase Bid Package Creation",
+              "detail": "Complex bidding architecture. We structure large-scale proposals into manageable phases to reduce client risk and accelerate approval."
+            },
+            {
+              "title": "Advanced Change-Order & Risk Planning Framework",
+              "detail": "Protocols for managing project changes. We define the exact process for approving and billing for changes to the original scope."
+            },
+            {
+              "title": "Structural Contract Template (Non-Binding)",
+              "detail": "A starting point for legal agreements. We provide a solid structural template for your final contract (to be reviewed by counsel)."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "packetNumber": 6,
+      "groupKey": "packet-6",
+      "name": "Launch & Revenue Ready",
+      "tiers": [
+        {
+          "tier": "Basic",
+          "productKey": "packet-6-basic",
+          "name": "Launch & Revenue Ready — Basic",
+          "priceMinor": 91000,
+          "outcome": "A professional, ready-to-launch digital presence designed to convert visitors into documented leads immediately.",
+          "timeline": "5 - 7 business days",
+          "includesTier": null,
+          "deliverables": [
+            {
+              "title": "Strategic Launch Kickoff & Discovery",
+              "detail": "Defining the launch goals. We identify your primary conversion metrics and target audience behavior."
+            },
+            {
+              "title": "Launch Sequence Outline (5–8 pages)",
+              "detail": "A step-by-step plan for Day 1. We map out the exact sequence of events required to take your product live."
+            },
+            {
+              "title": "One-Page Custom Framer Website",
+              "detail": "A high-conversion landing page for your product or service. A visually stunning, fast-loading site designed to capture attention."
+            },
+            {
+              "title": "High-Conversion Lead Capture Architecture",
+              "detail": "A system designed to turn website traffic into paying customers. We integrate forms and calls-to-action that drive user engagement."
+            },
+            {
+              "title": "Domain Mapping & Primary SEO Setup",
+              "detail": "Basic technical foundation. We ensure your site is visible to search engines and connected to your custom domain."
+            },
+            {
+              "title": "Basic Go-Live Checklist",
+              "detail": "Ensuring nothing is missed at launch. A final quality assurance list to prevent launch-day errors."
+            }
+          ]
+        },
+        {
+          "tier": "Standard",
+          "productKey": "packet-6-standard",
+          "name": "Launch & Revenue Ready — Standard",
+          "priceMinor": 196000,
+          "outcome": "A comprehensive digital build blueprint for your storefront.",
+          "timeline": "7 - 10 business days",
+          "includesTier": "Basic",
+          "deliverables": [
+            {
+              "title": "Comprehensive Deployment Dossier (8–14 pages)",
+              "detail": "Full documentation of the digital build. A manual explaining how your website works and how to manage it."
+            },
+            {
+              "title": "Up to 5-Page Integrated Framer Site",
+              "detail": "An expanded website with pages for your product, pricing, and contact information. A complete digital footprint for your brand."
+            },
+            {
+              "title": "Full Brand Messaging & Professional Copywriting",
+              "detail": "High-status text for the site. We write compelling copy that communicates your unique value proposition clearly."
+            },
+            {
+              "title": "Lead Routing & Basic CRM Integration",
+              "detail": "Automating the sales funnel. We connect your website to a CRM to automatically organize incoming leads."
+            },
+            {
+              "title": "Integrated Site Analytics & Tracking",
+              "detail": "Measuring success from Day 1. We set up the tools you need to track visitor behavior and conversion rates."
+            },
+            {
+              "title": "Digital Build Logic",
+              "detail": "The architectural blueprint for your digital storefront or application. We define the exact user flow, integration points, and hosting requirements necessary to capture revenue on Day 1."
+            }
+          ]
+        },
+        {
+          "tier": "Premium",
+          "productKey": "packet-6-premium",
+          "name": "Launch & Revenue Ready — Premium",
+          "priceMinor": 325500,
+          "outcome": "A high-performance revenue engine ready for scale, featuring advanced integrations and professional-grade performance tuning.",
+          "timeline": "10 - 14 business days",
+          "includesTier": "Standard",
+          "deliverables": [
+            {
+              "title": "End-to-End Launch System (15+ pages)",
+              "detail": "The complete manual for the digital business. A comprehensive guide to managing your online revenue engine."
+            },
+            {
+              "title": "Payment Gateway or Membership Integration",
+              "detail": "The technical setup to accept credit cards or run a subscription service directly on your site. We ensure you can take money from Day 1."
+            },
+            {
+              "title": "Advanced SEO & Performance Optimization",
+              "detail": "Tuning for speed and search ranking. We optimize the site’s code and structure for maximum visibility and performance."
+            },
+            {
+              "title": "Content Management System (Blog/Portfolio)",
+              "detail": "Tools for ongoing content updates. We build a system that allows you to easily add new products or articles without coding."
+            },
+            {
+              "title": "One-Time Deployment Protocol",
+              "detail": "We define the exact sequence of events required to push your product live to the public. We explicitly map the handover of all digital keys, credentials, and codebases, ensuring you have 100% independent control of your revenue engine post-launch."
+            },
+            {
+              "title": "Day-1 Crisis Mitigation Plan",
+              "detail": "Protocols for handling launch-day failures. A contingency plan for technical issues or traffic spikes."
+            },
+            {
+              "title": "60-Day Post-Launch Technical Guidance",
+              "detail": "Extended support window. We remain available to troubleshoot and optimize the site for two months after launch."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "bundle": {
+    "packetNumber": 7,
+    "name": "The All-In (Master Bundle)",
+    "tierLabel": "The Premium Vault",
+    "requiredPacketNumbers": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "discountPercent": 15,
+    "pricingNote": "Pricing customized based on required Tier selections",
+    "outcome": "The Complete Enterprise Architecture. A polished, fully-functional business professionally vetted, documented, and built from the ground up for maximum market velocity.",
+    "timeline": "30–45 Business Days",
+    "points": [
+      {
+        "title": "The Model",
+        "detail": "Commit to the full journey from Idea to Launch. You can mix and match Basic, Standard, and Premium tiers across Packets 1 through 6 based on your specific needs."
+      },
+      {
+        "title": "The Advantage",
+        "detail": "When you commit to a full 6-Packet bundle, we apply a flat 15% discount to your total project cost."
+      },
+      {
+        "title": "The Deliverable",
+        "detail": "This transforms a raw concept into a fully audited, legally defended, and operationally scalable enterprise vehicle. Includes priority intake and direct alignment of your IP strategy with your 5-year financial models."
+      }
+    ]
+  },
+  "reserved": [
+    {
+      "packetNumber": 8,
+      "name": "Capital & Valuation Services",
+      "listed": false,
+      "reason": "Reserved and unlisted in matrix v3.0. Kept for reference only: no tiers, prices or deliverables, and never loaded into the catalog."
+    }
+  ]
+}
