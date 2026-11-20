@@ -24,6 +24,7 @@ describe("assurance: isolated transactional model", () => {
   let h: TestHarness;
   const issue = vi.fn();
   const notify = vi.fn();
+  const smtpReadiness = vi.fn();
   const markMfaVerified = vi.fn(() => Promise.resolve({
     token: randomBytes(32).toString("base64url"),
     csrfToken: randomBytes(32).toString("base64url"), absoluteExpiresAt: h.clock.now(),
@@ -74,11 +75,13 @@ describe("assurance: isolated transactional model", () => {
     h = createTestDeps({ db: db.db });
     h.services.assurance = createAssuranceModule(h.deps);
     h.services.engagement = { notify } as unknown as Services["engagement"];
+    smtpReadiness.mockResolvedValue({ ready: true });
+    h.services.integrations = { smtp: { getReadiness: smtpReadiness } } as unknown as Services["integrations"];
     async function findUser(where: ReturnType<typeof eq>, opts?: { tx?: DbOrTx; forUpdate?: boolean }) {
       const query = (opts?.tx ?? db.db).select().from(users).where(where).limit(1);
       const [row] = await (opts?.forUpdate ? query.for("update") : query);
       if (!row) return null;
-      return { ...row, email: h.deps.crypto.decrypt(row.emailEnc, `users.email:${row.publicId}`) };
+      return { ...row, email: h.deps.crypto.decrypt(row.emailEnc, `users.email:${row.publicId}`), emailVerified: !!row.emailVerifiedAt };
     }
     h.services.identity = {
       getUser: (id: number, opts?: { tx?: DbOrTx; forUpdate?: boolean }) => findUser(eq(users.id, id), opts),
@@ -188,6 +191,33 @@ describe("assurance: isolated transactional model", () => {
     await expect(h.services.assurance.verifySecondFactor(account.userId, factor)).resolves.toBe(true);
   });
 
+  it("invalidates the old recovery batch on regeneration and binds explicit acknowledgment to the new batch", async () => {
+    const { account, ack, recovery } = await enroll();
+    await caller(ack).acknowledgeRecoveryCodes({ recoverySetId: recovery.recoverySetId! });
+    const full = { ...account, state: "full" as const, pendingSteps: [], stepUpAt: h.clock.now() };
+    const batch = await caller(full).regenerateRecoveryCodes();
+    expect(batch.recoveryCodes).toHaveLength(10);
+    expect(batch.recoverySetId).not.toBe(recovery.recoverySetId);
+    await expect(h.services.assurance.verifySecondFactor(account.userId, {
+      method: "recovery_code", code: recovery.recoveryCodes![0]!,
+    })).resolves.toBe(false);
+    await expect(caller(ack).acknowledgeRecoveryCodes({ recoverySetId: recovery.recoverySetId! })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(caller(ack).acknowledgeRecoveryCodes({ recoverySetId: batch.recoverySetId })).resolves.toEqual({ ok: true });
+  });
+
+  it("cleans expired pending TOTP and challenges without affecting active biometric credentials", async () => {
+    const actor = await fixture({ stepUpAt: h.clock.now() });
+    await caller(actor).beginTotpEnrollment();
+    await caller(actor).beginPasskeyRegistration();
+    h.clock.advance(10 * 60_000);
+    await h.jobs.enqueue("assurance.prune_ceremonies", {});
+    const [result] = await h.jobs.runAll();
+    expect(result?.outcome).toBe("completed");
+    const [row] = await db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, actor.userId));
+    expect(row?.pendingTotpSecretEnc).toBeNull();
+    await expect(db.db.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, actor.userId))).resolves.toEqual([]);
+  });
+
   it("rotates a successful sign-in challenge and step-up, and rejects password failures without consuming the factor", async () => {
     const { account, recovery } = await enroll();
     const challenge = { ...account, pendingSteps: ["mfa_challenge"] as const };
@@ -259,6 +289,36 @@ describe("assurance: isolated transactional model", () => {
     expect(notify).not.toHaveBeenCalled();
   });
 
+  it("refuses email reset while SMTP is unavailable without locking the target out", async () => {
+    smtpReadiness.mockResolvedValue({ ready: false });
+    const target = await fixture();
+    const actor = await fixture({ role: "admin", stepUpAt: h.clock.now() });
+    await expect(caller(actor).admin.setCredential({ customerId: target.userPublicId, mode: "email_link" }))
+      .rejects.toMatchObject({ cause: { reasonCode: "SMTP_NOT_READY" } });
+    const [updated] = await db.db.select().from(users).where(eq(users.id, target.userId));
+    expect(updated?.mustChangePassword).toBe(false);
+    expect(updated?.passwordHash).toBeTruthy();
+    const [session] = await db.db.select().from(userSessions).where(eq(userSessions.publicId, target.sessionId));
+    expect(session?.revokedAt).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("refuses email reset for an unverified address without altering credentials or sessions", async () => {
+    const target = await fixture();
+    const actor = await fixture({ role: "admin", stepUpAt: h.clock.now() });
+    await db.db.update(users).set({ emailVerifiedAt: null }).where(eq(users.id, target.userId));
+    const [before] = await db.db.select().from(users).where(eq(users.id, target.userId));
+    await expect(caller(actor).admin.setCredential({ customerId: target.userPublicId, mode: "email_link" }))
+      .rejects.toMatchObject({ cause: { reasonCode: "TARGET_EMAIL_UNVERIFIED" } });
+    const [updated] = await db.db.select().from(users).where(eq(users.id, target.userId));
+    expect(updated?.mustChangePassword).toBe(false);
+    expect(updated?.passwordHash).toBe(before?.passwordHash);
+    const [session] = await db.db.select().from(userSessions).where(eq(userSessions.publicId, target.sessionId));
+    expect(session?.revokedAt).toBeNull();
+    expect(smtpReadiness).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it("resets MFA, makes the target re-enroll, and prevents a revoked principal from writing a new factor", async () => {
     const { account, recovery } = await enroll();
     const actor = await fixture({ role: "admin", stepUpAt: h.clock.now() });
@@ -287,8 +347,11 @@ describe("assurance: isolated transactional model", () => {
   });
 
   it("supports a signed WebAuthn registration and authentication, binding origin, purpose, TTL and monotonic counters", async () => {
-    const actor = await fixture({ stepUpAt: h.clock.now() });
+    const { account, ack, recovery } = await enroll();
+    await caller(ack).acknowledgeRecoveryCodes({ recoverySetId: recovery.recoverySetId! });
+    const actor: SessionPrincipal = { ...account, state: "full", pendingSteps: [], stepUpAt: h.clock.now() };
     const full = caller(actor);
+    await expect(full.disableTotp()).rejects.toMatchObject({ code: "CONFLICT" });
     const device = syntheticAuthenticator(h.config.canonicalOrigin);
     const { challengeId, options } = await full.beginPasskeyRegistration();
     await expect(full.finishPasskeyRegistration({ challengeId, response: device.registration(options.challenge), name: "Synthetic key" }))
@@ -297,6 +360,7 @@ describe("assurance: isolated transactional model", () => {
     expect(key?.name).toBe("Synthetic key");
     const other = caller(await fixture({ stepUpAt: h.clock.now() }));
     await expect(other.removePasskey({ publicId: key!.publicId })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(full.disableTotp()).resolves.toEqual({ ok: true });
     await expect(full.removePasskey({ publicId: key!.publicId })).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(full.renamePasskey({ publicId: key!.publicId, name: "Security key" })).resolves.toEqual({ ok: true });
 
@@ -309,6 +373,9 @@ describe("assurance: isolated transactional model", () => {
       return full.stepUp({ password, factor: { method: "passkey", challengeId: proof.id, response: device.authentication(proof.challenge, counter, origin) } });
     }
     const first = await optionsForStepUp();
+    await expect(full.stepUp({ password, factor: { method: "passkey", challengeId: first.id, response: {
+      ...device.authentication(first.challenge, 2), clientExtensionResults: { unexpected: true },
+    } } })).rejects.toMatchObject({ code: "BAD_REQUEST" });
     // A verification challenge can be consumed for its matching purpose only.
     const challengeCaller = caller({ ...actor, state: "remediation", pendingSteps: ["mfa_challenge"] });
     await expect(challengeCaller.challenge({

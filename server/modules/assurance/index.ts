@@ -6,7 +6,7 @@ import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleLifecycle, Tx } from "../../core/types.js";
 import { createCredentialAdmin } from "./admin.js";
 import { createFactorService } from "./factors.js";
-import { clearFactors, getState, pruneChallenges } from "./store.js";
+import { clearFactors, getState, pruneChallenges, prunePendingTotp } from "./store.js";
 
 export type { SecondFactorInput } from "./input.js";
 export type AssuranceState = Awaited<ReturnType<typeof getState>>;
@@ -16,12 +16,19 @@ export interface AssuranceModule extends ModuleLifecycle, ReturnType<typeof crea
 }
 
 export function createAssuranceModule(deps: ModuleDeps): AssuranceModule {
-  deps.jobs.register("assurance.prune_challenges", async (job) => {
+  deps.jobs.register("assurance.prune_ceremonies", async (job) => {
     job.signal.throwIfAborted();
-    await job.assertStillOwned();
-    return { outcome: "completed", safeCounts: { challenges: await pruneChallenges(deps) } };
-  });
-  deps.jobs.registerSchedule({ name: "assurance.prune_challenges", type: "assurance.prune_challenges", everyMs: 15 * 60_000 });
+    const now = deps.clock.now();
+    const safeCounts = await deps.db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      // Keep the same factor-account → challenge lock order as live credential operations.
+      const expiredTotpSetups = await prunePendingTotp(tx, now);
+      const expiredPasskeyChallenges = await pruneChallenges(tx, now);
+      return { expiredTotpSetups, expiredPasskeyChallenges };
+    });
+    return { outcome: "completed", safeCounts };
+  }, { retrySafe: true });
+  deps.jobs.registerSchedule({ name: "assurance.prune_ceremonies", type: "assurance.prune_ceremonies", everyMs: 15 * 60_000 });
   return {
     ...createFactorService(deps),
     ...createCredentialAdmin(deps),

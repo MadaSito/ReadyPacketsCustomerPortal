@@ -16,7 +16,10 @@ export const assuranceAccounts = mysqlTable("assurance_accounts", {
   recoveryAcknowledgedAt: utcDateTime("recovery_acknowledged_at"),
   createdAt: createdAtColumn(),
   updatedAt: updatedAtColumn(),
-}, (t) => [uniqueIndex("uq_assurance_accounts_user").on(t.userId)]);
+}, (t) => [
+  uniqueIndex("uq_assurance_accounts_user").on(t.userId),
+  index("ix_assurance_pending_totp_expiry").on(t.pendingTotpExpiresAt),
+]);
 
 export const assuranceRecoveryCodes = mysqlTable("assurance_recovery_codes", {
   id: idColumn(),

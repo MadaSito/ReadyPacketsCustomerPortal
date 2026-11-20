@@ -10,7 +10,8 @@ const envelope = {
   id: b64(1400), rawId: b64(1400), type: z.literal("public-key"),
   authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
   // The RP requests no extensions and makes no authorization decisions from extension output.
-  clientExtensionResults: z.strictObject({}),
+  clientExtensionResults: z.custom<object>((value) =>
+    value !== null && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0),
 };
 export const registrationResponse = z.strictObject({
   ...envelope,
@@ -20,7 +21,7 @@ export const registrationResponse = z.strictObject({
     authenticatorData: b64(8192).optional(),
     publicKey: b64(8192).optional(),
     publicKeyAlgorithm: z.number().int().min(-65_536).max(65_536).optional(),
-    transports: z.array(z.enum(["usb", "nfc", "ble", "internal", "hybrid", "smart-card", "cable"])).max(8).optional(),
+    transports: z.array(z.string().regex(/^[a-z-]{1,32}$/)).max(8).optional(),
   }),
 });
 export const authenticationResponse = z.strictObject({

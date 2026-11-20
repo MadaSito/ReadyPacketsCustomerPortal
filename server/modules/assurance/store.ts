@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { and, asc, count, eq, isNull, lt } from "drizzle-orm";
+import { and, asc, count, eq, isNull, lte, sql } from "drizzle-orm";
 import { Secret, TOTP } from "otpauth";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
@@ -41,11 +41,10 @@ export function getPasskeys(db: DbOrTx, userId: number) {
 export async function getState(db: DbOrTx, userId: number) {
   const [account] = await db.select({
     secretEnc: assuranceAccounts.totpSecretEnc, acknowledgedAt: assuranceAccounts.recoveryAcknowledgedAt,
+    passkeyCount: sql<number>`(select count(*) from ${assurancePasskeys}
+      where ${assurancePasskeys.userId} = ${assuranceAccounts.userId})`.mapWith(Number),
   }).from(assuranceAccounts).where(eq(assuranceAccounts.userId, userId)).limit(1);
-  const [passkeys] = account
-    ? await db.select({ total: count() }).from(assurancePasskeys).where(eq(assurancePasskeys.userId, userId))
-    : [];
-  const passkeyCount = passkeys?.total ?? 0;
+  const passkeyCount = account?.passkeyCount ?? 0;
   const totpEnrolled = !!account?.secretEnc;
   return {
     mfaEnrolled: totpEnrolled || passkeyCount > 0, totpEnrolled, passkeyCount,
@@ -60,8 +59,10 @@ export async function recoveryCount(db: DbOrTx, userId: number): Promise<number>
 }
 
 export function recoveryHash(deps: ModuleDeps, userId: number, input: string): string | null {
-  const normalized = input.replaceAll("-", "").toUpperCase();
-  if (!/^[0-9A-F]{32}$/.test(normalized)) return null;
+  if (input.length < 32 || input.length > 40) return null;
+  const candidate = input.trim().toUpperCase();
+  if (!/^(?:[0-9A-F]{32}|[0-9A-F]{8}(?:-[0-9A-F]{8}){3})$/.test(candidate)) return null;
+  const normalized = candidate.replaceAll("-", "");
   return deps.crypto.hashToken(`assurance-recovery:${userId}:${normalized}`);
 }
 
@@ -95,7 +96,14 @@ export async function clearFactors(tx: Tx, userId: number, now: Date): Promise<v
   }).where(eq(assuranceAccounts.id, account.id));
 }
 
-export async function pruneChallenges(deps: ModuleDeps): Promise<number> {
-  const [result] = await deps.db.delete(assuranceChallenges).where(lt(assuranceChallenges.expiresAt, deps.clock.now())).limit(500);
+export async function pruneChallenges(tx: Tx, now: Date): Promise<number> {
+  const [result] = await tx.delete(assuranceChallenges).where(lte(assuranceChallenges.expiresAt, now)).limit(500);
+  return result.affectedRows;
+}
+
+export async function prunePendingTotp(tx: Tx, now: Date): Promise<number> {
+  const [result] = await tx.update(assuranceAccounts).set({
+    pendingTotpSecretEnc: null, pendingTotpExpiresAt: null, pendingTotpSessionId: null, updatedAt: now,
+  }).where(lte(assuranceAccounts.pendingTotpExpiresAt, now)).limit(500);
   return result.affectedRows;
 }

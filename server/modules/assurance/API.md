@@ -30,10 +30,12 @@ This module owns enrolled factors, pending authenticator setup, WebAuthn ceremon
 | `admin.setCredential` | `{ customerId, mode: "email_link" \| "generate_temporary" }` or `{ customerId, mode: "enter_temporary", password }` → `{ ok: true, temporaryPassword?: string }` | full + `customers.credentials.administer` + fresh step-up |
 | `admin.resetMfa` | `{ customerId }` → `{ ok: true }` | same administration gate |
 
-`SecondFactorInput` is `{ method: "totp" | "recovery_code", code }` or `{ method: "passkey", challengeId, response: AuthenticationResponseJSON }`. Passkey options are SimpleWebAuthn JSON for `optionsJSON`. Passwordless sign-in is not on this API. No raw HTTP routes, feature flags, or administrator settings keys.
+`SecondFactorInput` is `{ method: "totp" | "recovery_code", code }` or `{ method: "passkey", challengeId, response: AuthenticationResponseJSON }`. Passkey options are SimpleWebAuthn JSON for `optionsJSON`. A recovery-code batch is not retrievable through a read procedure. The browser may hand it off to the acknowledgment screen in memory only, outside of durable storage and the query cache.
+
+Admin email mode requires a verified address and passing `services.integrations.smtp.getReadiness()`; readiness is a preflight rather than proof of connectivity or delivery. It queues the set-password email, clears the previous password hash, revokes sessions, and marks the account for a password change in one transaction. Link redemption sets the user’s chosen password and clears the flag. The two temporary-password modes revoke sessions and require the user to choose their own password after satisfying MFA at the next sign-in. The administrator receives plaintext only in the generated-password response, never in an email-link response. Passwordless sign-in is not on this API. No raw HTTP routes, feature flags, administrator settings keys, or standalone health component.
 
 ## Audit, jobs and notifications
 
 Security events: `auth.totp.{enrollment_started,enrollment_denied,enrolled,replaced,disabled,replay_denied}`, `auth.recovery_code.redeemed`, `auth.recovery_codes.{acknowledged,regenerated,reissued,reissue_denied}`, `auth.mfa.{verified,challenge_denied}`, `auth.step_up.{verified,denied}`, `auth.passkey.{registered,registration_denied,manage_denied,renamed,removed,counter_regression}` and `admin.credentials.denied`. Admin-category events: `admin.credentials.{set_link_queued,temporary_generated,temporary_set,mfa_reset}`. Notifications contain fixed, secret-free text. Identity owns the `auth.admin_set_password` mail template and token redemption.
 
-`assurance.prune_challenges` is a bounded expiry cleanup job scheduled every 15 minutes. Expiration is enforced synchronously regardless of job availability.
+`assurance.prune_ceremonies` removes expired WebAuthn challenges and clears expired staged TOTP secrets in bounded batches every 15 minutes. Expiration is enforced synchronously regardless of job availability.

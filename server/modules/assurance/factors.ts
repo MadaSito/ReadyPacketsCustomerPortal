@@ -13,7 +13,8 @@ import {
   TOTP_TTL_MS, type AssuranceAccount,
 } from "./store.js";
 
-type EventOptions = Pick<AuditEventInput, "outcome" | "reasonCode" | "severity">;
+type EventOptions = Partial<Pick<AuditEventInput, "action" | "outcome" | "reasonCode" | "severity">>;
+type AuditActor = Pick<SessionPrincipal, "userId" | "userPublicId" | "role">;
 interface AuthenticationBinding {
   sessionId?: string;
   purpose?: passkeys.AuthenticationPurpose;
@@ -23,9 +24,9 @@ const clearedPending = { pendingTotpSecretEnc: null, pendingTotpExpiresAt: null,
 const ok = { ok: true } as const;
 
 export function createFactorService(deps: ModuleDeps) {
-  async function record(eventName: string, tx: Tx | undefined, actor?: SessionPrincipal, options?: EventOptions, passkeyId?: string) {
+  async function record(eventName: string, tx: Tx | undefined, actor?: AuditActor, options?: EventOptions, passkeyId?: string) {
     await deps.audit.record({
-      category: "security", eventName, action: "authenticate", outcome: options?.outcome ?? "completed",
+      category: "security", eventName, action: options?.action ?? "authenticate", outcome: options?.outcome ?? "completed",
       severity: options?.severity, reasonCode: options?.reasonCode,
       ...(actor && { actor: { userId: actor.userId, role: actor.role } }),
       ...(passkeyId ? { resource: { type: "passkey", publicId: passkeyId } }
@@ -50,7 +51,7 @@ export function createFactorService(deps: ModuleDeps) {
 
   async function proof(
     tx: Tx, account: AssuranceAccount, input: SecondFactorInput, binding: AuthenticationBinding,
-    actor?: SessionPrincipal,
+    actor?: AuditActor,
   ): Promise<boolean> {
     const now = deps.clock.now();
     if (input.method === "totp") {
@@ -110,7 +111,7 @@ export function createFactorService(deps: ModuleDeps) {
         const subject = await deps.services.identity.getUser(userId, { tx, forUpdate: true });
         if (subject?.status !== "active" || subject.authSource !== "local") return false;
         const account = await lockAccount(tx, userId, deps.clock.now());
-        return proof(tx, account, input, binding);
+        return proof(tx, account, input, binding, { userId, userPublicId: subject.publicId, role: subject.role });
       });
     },
     async beginTotpEnrollment(actor: SessionPrincipal) {
@@ -135,7 +136,7 @@ export function createFactorService(deps: ModuleDeps) {
             pendingTotpSecretEnc: deps.crypto.encrypt(secret, secretAad(account, true)),
             pendingTotpExpiresAt: new Date(+now + TOTP_TTL_MS), pendingTotpSessionId: actor.sessionId, updatedAt: now,
           }).where(eq(assuranceAccounts.id, account.id));
-          await record("auth.totp.enrollment_started", tx, actor);
+          await record("auth.totp.enrollment_started", tx, actor, { action: "create" });
         }
         return { secret, otpauthUri, qrDataUrl };
       });
@@ -162,7 +163,7 @@ export function createFactorService(deps: ModuleDeps) {
         const recovery = account.recoverySetId
           ? { recoveryCodes: null, recoverySetId: null }
           : await replaceRecoveryCodes(deps, tx, account, now);
-        await record(account.totpSecretEnc ? "auth.totp.replaced" : "auth.totp.enrolled", tx, actor);
+        await record(account.totpSecretEnc ? "auth.totp.replaced" : "auth.totp.enrolled", tx, actor, { action: "update" });
         const issued = isFull(actor) ? undefined : await deps.services.identity.sessions.markMfaVerified(actor.sessionId, { tx });
         return { data: recovery, issued };
       });
@@ -176,7 +177,7 @@ export function createFactorService(deps: ModuleDeps) {
           throw conflict("RECOVERY_SET_CHANGED", "This recovery-code set has changed. Start a new recovery-code setup.");
         if (!account.recoveryAcknowledgedAt) {
           await tx.update(assuranceAccounts).set({ recoveryAcknowledgedAt: now, updatedAt: now }).where(eq(assuranceAccounts.id, account.id));
-          await record("auth.recovery_codes.acknowledged", tx, actor);
+          await record("auth.recovery_codes.acknowledged", tx, actor, { action: "transition" });
         }
         return ok;
       });
@@ -190,7 +191,7 @@ export function createFactorService(deps: ModuleDeps) {
           return null;
         }
         const batch = await replaceRecoveryCodes(deps, tx, account, now);
-        await record("auth.recovery_codes.reissued", tx, actor);
+        await record("auth.recovery_codes.reissued", tx, actor, { action: "update" });
         return batch;
       });
       if (!result) throw badProof();
@@ -202,7 +203,7 @@ export function createFactorService(deps: ModuleDeps) {
       return actorTx(actor, async (tx, account, now) => {
         requireFresh(actor, now);
         const batch = await replaceRecoveryCodes(deps, tx, account, now);
-        await record("auth.recovery_codes.regenerated", tx, actor);
+        await record("auth.recovery_codes.regenerated", tx, actor, { action: "update" });
         return batch;
       });
     },
@@ -230,12 +231,10 @@ export function createFactorService(deps: ModuleDeps) {
     async stepUp(actor: SessionPrincipal, password: string, factor: SecondFactorInput) {
       requireFull(actor);
       await throttle(deps, actor.userId);
-      if (!await deps.services.identity.verifyPassword(actor.userId, password)) {
-        await denied("auth.step_up.denied", actor);
-        throw badProof();
-      }
       const issued = await actorTx(actor, async (tx, account) => {
-        if (!await proof(tx, account, factor, { sessionId: actor.sessionId, purpose: "step_up" }, actor)) {
+        // Verify the currently locked credential, not a password read before a competing reset.
+        if (!await deps.services.identity.verifyPassword(actor.userId, password, { tx }) ||
+            !await proof(tx, account, factor, { sessionId: actor.sessionId, purpose: "step_up" }, actor)) {
           await denied("auth.step_up.denied", actor, tx);
           return null;
         }
@@ -254,7 +253,7 @@ export function createFactorService(deps: ModuleDeps) {
         await tx.update(assuranceAccounts).set({
           ...clearedPending, totpSecretEnc: null, lastTotpStep: null, updatedAt: now,
         }).where(eq(assuranceAccounts.id, account.id));
-        await record("auth.totp.disabled", tx, actor);
+        await record("auth.totp.disabled", tx, actor, { action: "delete" });
         return ok;
       });
     },
@@ -281,7 +280,7 @@ export function createFactorService(deps: ModuleDeps) {
       const publicId = await actorTx(actor, async (tx, _account, now) => {
         requireFresh(actor, now);
         const id = await passkeys.finishRegistration(deps, tx, actor, challengeId, response, name);
-        if (id) await record("auth.passkey.registered", tx, actor, undefined, id);
+        if (id) await record("auth.passkey.registered", tx, actor, { action: "create" }, id);
         else await denied("auth.passkey.registration_denied", actor, tx);
         return id;
       });
@@ -300,7 +299,7 @@ export function createFactorService(deps: ModuleDeps) {
         await tx.update(assurancePasskeys).set({
           nameEnc: deps.crypto.encrypt(name, `assurance_passkeys.name_enc:${publicId}`), updatedAt: now,
         }).where(eq(assurancePasskeys.id, key.id));
-        await record("auth.passkey.renamed", tx, actor, undefined, publicId);
+        await record("auth.passkey.renamed", tx, actor, { action: "update" }, publicId);
         return true;
       });
       if (!result) throw notFound("PASSKEY_NOT_FOUND");
@@ -319,7 +318,7 @@ export function createFactorService(deps: ModuleDeps) {
         if (keys.length < 2 && !account.totpSecretEnc)
           throw conflict("LAST_STRONG_FACTOR", "Register another passkey or authenticator app before removing this passkey.");
         await tx.delete(assurancePasskeys).where(eq(assurancePasskeys.id, key.id));
-        await record("auth.passkey.removed", tx, actor, undefined, publicId);
+        await record("auth.passkey.removed", tx, actor, { action: "delete" }, publicId);
         return true;
       });
       if (!result) throw notFound("PASSKEY_NOT_FOUND");

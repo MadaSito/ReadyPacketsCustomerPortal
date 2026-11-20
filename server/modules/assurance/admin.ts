@@ -1,6 +1,6 @@
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
-import { conflict, forbidden, notFound } from "../../core/errors.js";
+import { conflict, DomainError, forbidden, notFound } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import type { AdminCredentialInput } from "./input.js";
 import { assertCurrent, requireFresh, throttle } from "./policy.js";
@@ -49,9 +49,8 @@ export function createCredentialAdmin(deps: ModuleDeps) {
         return work(tx, target);
       });
     } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && "reasonCode" in error
-        && typeof error.reasonCode === "string"
-        && (error.code === "NOT_FOUND" || error.code === "FORBIDDEN" || error.code === "STEP_UP_REQUIRED" || error.code === "CONFLICT")) {
+      if (error instanceof DomainError
+        && ["NOT_FOUND", "FORBIDDEN", "STEP_UP_REQUIRED", "CONFLICT", "NOT_CONFIGURED"].includes(error.code)) {
         await deny(actor, error.reasonCode, customerId);
       }
       throw error;
@@ -62,6 +61,12 @@ export function createCredentialAdmin(deps: ModuleDeps) {
     async administerCredential(actor: SessionPrincipal, input: AdminCredentialInput): Promise<{ ok: true; temporaryPassword?: string }> {
       return scope(actor, input.customerId, async (tx, target) => {
         const identity = deps.services.identity;
+        if (input.mode === "email_link") {
+          if (!target.emailVerified) throw conflict("TARGET_EMAIL_UNVERIFIED", "Set-password email requires a verified address.");
+          if (!(await deps.services.integrations.smtp.getReadiness()).ready) {
+            throw new DomainError("NOT_CONFIGURED", "SMTP_NOT_READY", "Set-password email is unavailable. Configure email delivery or use a temporary password.");
+          }
+        }
         await identity.sessions.revokeAllForUser(target.id, { reason: "ADMIN_CREDENTIAL_CHANGE", tx });
         let generatedPassword: string | undefined;
         if (input.mode === "email_link") {
