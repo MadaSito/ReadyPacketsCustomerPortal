@@ -15,6 +15,7 @@ import {
   mysqlEnum,
   mysqlTable,
   text,
+  tinyint,
   uniqueIndex,
   varchar,
   char,
@@ -38,6 +39,13 @@ export const GRANT_ROLES = ["viewer", "contributor"] as const;
 export const GRANT_STATUSES = ["pending", "active", "declined", "revoked"] as const;
 export const NOTE_VISIBILITIES = ["customer", "internal"] as const;
 export const ORDER_ORIGINS = ["portal", "import"] as const;
+/** Packet tiers (Master Offerings Matrix v3.0). A product with a tier is a packet product. */
+export const PACKET_TIERS = ["Basic", "Standard", "Premium"] as const;
+export type PacketTier = (typeof PACKET_TIERS)[number];
+export interface Deliverable {
+  title: string;
+  detail: string;
+}
 
 /* ------------------------------------------------------------------ catalog */
 
@@ -46,6 +54,10 @@ export const catalogGroups = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
+    /** Stable import key (e.g. "packet-1"); null for groups created by hand. */
+    groupKey: varchar("group_key", { length: 64 }),
+    /** Set for packet groups only. */
+    packetNumber: tinyint("packet_number", { unsigned: true }),
     name: varchar("name", { length: 120 }).notNull(),
     description: varchar("description", { length: 1000 }).notNull().default(""),
     sortOrder: int("sort_order").notNull().default(0),
@@ -54,7 +66,11 @@ export const catalogGroups = mysqlTable(
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
   },
-  (t) => [index("catalog_groups_sort_idx").on(t.active, t.sortOrder)],
+  (t) => [
+    index("catalog_groups_sort_idx").on(t.active, t.sortOrder),
+    uniqueIndex("catalog_groups_group_key_uq").on(t.groupKey),
+    uniqueIndex("catalog_groups_packet_number_uq").on(t.packetNumber),
+  ],
 );
 
 export const catalogProducts = mysqlTable(
@@ -65,6 +81,9 @@ export const catalogProducts = mysqlTable(
     groupId: refColumn("group_id").notNull(),
     /** Stable admin-chosen key, unique (lowercase slug). */
     productKey: varchar("product_key", { length: 64 }).notNull(),
+    /** Packet products: both set (and equal to the group's packet number); otherwise both null. */
+    packetNumber: tinyint("packet_number", { unsigned: true }),
+    tier: mysqlEnum("tier", PACKET_TIERS),
     currentVersionId: refColumn("current_version_id"),
     sortOrder: int("sort_order").notNull().default(0),
     active: boolean("active").notNull().default(true),
@@ -74,6 +93,7 @@ export const catalogProducts = mysqlTable(
   },
   (t) => [
     uniqueIndex("catalog_products_key_uq").on(t.productKey),
+    uniqueIndex("catalog_products_packet_tier_uq").on(t.packetNumber, t.tier),
     index("catalog_products_group_idx").on(t.groupId, t.active, t.sortOrder),
   ],
 );
@@ -89,6 +109,9 @@ export const catalogProductVersions = mysqlTable(
     name: varchar("name", { length: 160 }).notNull(),
     description: varchar("description", { length: 2000 }).notNull().default(""),
     features: json("features").$type<string[]>().notNull(),
+    outcome: varchar("outcome", { length: 1000 }).notNull().default(""),
+    timeline: varchar("timeline", { length: 120 }).notNull().default(""),
+    deliverables: json("deliverables").$type<Deliverable[]>().notNull(),
     priceMinor: amountMinorColumn("price_minor").notNull(),
     currency: currencyColumn().notNull(),
     createdByUserId: refColumn("created_by_user_id").references(() => users.id),
@@ -147,6 +170,10 @@ export const orders = mysqlTable(
     lockState: mysqlEnum("lock_state", ORDER_LOCK_STATES).notNull().default("none"),
     lockReasonCode: varchar("lock_reason_code", { length: 48 }),
     lockedAt: utcDateTime("locked_at"),
+    /** totalMinor = subtotalMinor - discountMinor (server-computed; the client never sends amounts). */
+    subtotalMinor: amountMinorColumn("subtotal_minor").notNull(),
+    discountMinor: amountMinorColumn("discount_minor").notNull().default(0),
+    discountLabel: varchar("discount_label", { length: 120 }),
     totalMinor: amountMinorColumn("total_minor").notNull(),
     currency: currencyColumn().notNull(),
     origin: mysqlEnum("origin", ORDER_ORIGINS).notNull().default("portal"),
@@ -181,6 +208,11 @@ export const orderLineItems = mysqlTable(
     name: varchar("name", { length: 160 }).notNull(),
     description: varchar("description", { length: 2000 }).notNull().default(""),
     features: json("features").$type<string[]>().notNull(),
+    packetNumber: tinyint("packet_number", { unsigned: true }),
+    tier: mysqlEnum("tier", PACKET_TIERS),
+    outcome: varchar("outcome", { length: 1000 }).notNull().default(""),
+    timeline: varchar("timeline", { length: 120 }).notNull().default(""),
+    deliverables: json("deliverables").$type<Deliverable[]>().notNull(),
     unitPriceMinor: amountMinorColumn("unit_price_minor").notNull(),
     currency: currencyColumn().notNull(),
     quantity: int("quantity", { unsigned: true }).notNull(),

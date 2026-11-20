@@ -1,7 +1,8 @@
 /** Public types of the orders module (imported by other modules through ./index.js). */
 import type { DbOrTx, Tx } from "../../core/types.js";
-import type { ORDER_LOCK_STATES, GRANT_ROLES, GRANT_STATUSES, NOTE_VISIBILITIES } from "./schema.js";
+import type { Deliverable, PacketTier, ORDER_LOCK_STATES, GRANT_ROLES, GRANT_STATUSES, NOTE_VISIBILITIES } from "./schema.js";
 import type { WorkflowDefinition } from "./workflowTypes.js";
+import type { BundleQuote } from "./pricing.js";
 import type { input as ZodInput } from "zod";
 import type { importOrderInputSchema } from "./portable.js";
 
@@ -72,6 +73,11 @@ export interface PortableLineItem {
   name: string;
   description: string;
   features: string[];
+  packetNumber: number | null;
+  tier: PacketTier | null;
+  outcome: string;
+  timeline: string;
+  deliverables: Deliverable[];
   unitPriceMinor: number;
   currency: string;
   quantity: number;
@@ -103,6 +109,9 @@ export interface PortableOrder {
   statusKey: string;
   workflowKey: string;
   lockState: OrderLockState;
+  subtotalMinor: number;
+  discountMinor: number;
+  discountLabel: string | null;
   totalMinor: number;
   currency: string;
   origin: "portal" | "import";
@@ -133,3 +142,42 @@ export interface OrderSearchHit {
 }
 
 export type { WorkflowDefinition, Tx };
+
+/* ------------------------------------------------------- increment 02 */
+
+export type { Deliverable, PacketTier };
+export type { BundleRule } from "./settings.js";
+export type { BundleQuote };
+export type {
+  CatalogActor,
+  CatalogGroupView,
+  CatalogProductView,
+  CatalogSystemActor,
+  OfferingsImportInput,
+  OfferingsImportResult,
+} from "./catalog.js";
+
+/** Server-computed price of a selection (`orders.quote`); the same figures `orders.create` stores. */
+export interface OrderQuote {
+  currency: string;
+  subtotalMinor: number;
+  discountMinor: number;
+  discountLabel: string | null;
+  totalMinor: number;
+  bundle: BundleQuote | null;
+}
+
+/** Trusted production scope for P101/P201 payloads (`OrdersModule.getProductionScope`). */
+export interface OrderProductionScope {
+  orderId: number;
+  orderPublicId: string;
+  reference: string;
+  ownerUserId: number;
+  statusKey: string;
+  lockState: OrderLockState;
+  origin: "portal" | "import";
+  /** One entry per packet, ascending packet number. */
+  packets: { packetNumber: number; tier: PacketTier }[];
+  /** Line items without a packet number. */
+  otherItemCount: number;
+}

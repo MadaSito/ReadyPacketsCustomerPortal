@@ -5,7 +5,8 @@
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
-import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES } from "./schema.js";
+import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS } from "./schema.js";
+import { bundleRuleSchema } from "./settings.js";
 
 const id = z.string().regex(ULID_PATTERN);
 const nfc = (min: number, max: number) =>
@@ -20,19 +21,32 @@ const cursor = z.string().min(1).max(40).optional();
 const limit = z.number().int().min(1).max(100).optional();
 const currency = z.string().regex(/^[A-Z]{3}$/);
 const priceMinor = z.number().int().min(0).max(100_000_000_000);
+const packetNumber = z.number().int().min(1).max(255);
+const groupKey = z.string().regex(/^[a-z0-9][a-z0-9-]{1,63}$/);
 const productTerms = {
   name: nfc(1, 160),
   description: nfc(0, 2000),
   features: z.array(nfc(1, 200)).max(50),
   priceMinor,
   currency,
+  // Increment 02: omitted on update = keep current. features = deliverable titles when deliverables are non-empty.
+  outcome: nfc(0, 1000).optional(),
+  timeline: nfc(0, 120).optional(),
+  deliverables: z.array(z.strictObject({ title: nfc(1, 200), detail: nfc(0, 2000) })).max(100).optional(),
+  packetNumber: packetNumber.nullable().optional(),
+  tier: z.enum(PACKET_TIERS).nullable().optional(),
 };
+const groupPlacement = { groupKey: groupKey.nullable().optional(), packetNumber: packetNumber.nullable().optional() };
+const orderItems = z
+  .array(z.strictObject({ productPublicId: id, quantity: z.number().int().min(1).max(1000) }))
+  .min(1)
+  .max(50);
 
 const catalogAdmin = router({
   list: adminProcedure.use(requireCapability("catalog.manage")).query(({ ctx }) => ctx.services.orders.catalog.listAll()),
   createGroup: adminProcedure
     .use(requireCapability("catalog.manage"))
-    .input(z.strictObject({ name: nfc(1, 120), description: nfc(0, 1000), sortOrder: z.number().int().min(0).max(10_000), active: z.boolean() }))
+    .input(z.strictObject({ name: nfc(1, 120), description: nfc(0, 1000), sortOrder: z.number().int().min(0).max(10_000), active: z.boolean(), ...groupPlacement }))
     .mutation(({ ctx, input }) => ctx.services.orders.catalog.createGroup(ctx.session, input)),
   updateGroup: adminProcedure
     .use(requireCapability("catalog.manage"))
@@ -44,6 +58,7 @@ const catalogAdmin = router({
         description: nfc(0, 1000),
         sortOrder: z.number().int().min(0).max(10_000),
         active: z.boolean(),
+        ...groupPlacement,
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.catalog.updateGroup(ctx.session, input)),
@@ -72,6 +87,11 @@ const catalogAdmin = router({
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.catalog.updateProduct(ctx.session, input)),
+  bundleRule: adminProcedure.use(requireCapability("catalog.manage")).query(({ ctx }) => ctx.services.orders.catalog.getBundleRule()),
+  updateBundleRule: adminProcedure
+    .use(requireCapability("catalog.manage"))
+    .input(z.strictObject({ rule: bundleRuleSchema }))
+    .mutation(({ ctx, input }) => ctx.services.orders.catalog.updateBundleRule(ctx.session, input.rule)),
 });
 
 const workflowsAdmin = router({
@@ -105,6 +125,8 @@ export const ordersRouter = router({
   catalog: router({
     list: protectedProcedure.query(({ ctx }) => ctx.services.orders.catalog.listActive()),
   }),
+  /** Server price of a selection (packet rules + bundle discount); same validation as create, writes nothing. */
+  quote: protectedProcedure.input(z.strictObject({ items: orderItems })).query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
   list: protectedProcedure
     .input(z.strictObject({ cursor, limit, status: statusKey.optional() }))
     .query(({ ctx, input }) => ctx.services.orders.orders.list(ctx.session, input)),
@@ -116,10 +138,7 @@ export const ordersRouter = router({
     .input(
       z.strictObject({
         projectName: nfc(1, 160),
-        items: z
-          .array(z.strictObject({ productPublicId: id, quantity: z.number().int().min(1).max(1000) }))
-          .min(1)
-          .max(50),
+        items: orderItems,
         note: nfc(1, 5000).optional(),
         idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
       }),

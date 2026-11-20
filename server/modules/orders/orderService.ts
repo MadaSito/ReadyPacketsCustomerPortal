@@ -17,7 +17,9 @@ import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { compliancePort, engagementPort, filesPort, identityPort } from "./ports.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
-import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderSummary, NoteVisibility } from "./types.js";
+import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionScope, OrderQuote, OrderSummary, NoteVisibility } from "./types.js";
+import type { PacketTier } from "./schema.js";
+import { priceOrder } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
@@ -261,8 +263,8 @@ export function createOrderService(deps: OrderServiceDeps) {
           const workflow = await workflows.ensureDefault(tx);
           const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
           const currency = lineItems[0]!.currency;
-          const totalMinor = lineItems.reduce((sum, item) => sum + item.lineTotalMinor, 0);
-          if (!Number.isSafeInteger(totalMinor)) throw validation("AMOUNT_TOO_LARGE", "The order total is too large.");
+          const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+          const totalMinor = pricing.totalMinor;
           const reference = await allocateReference(tx, prefix, now);
           const publicId = ulid(now.getTime());
           const initial = initialState(workflow.definition);
@@ -273,6 +275,9 @@ export function createOrderService(deps: OrderServiceDeps) {
             projectName: input.projectName,
             workflowVersionId: workflow.versionId,
             statusKey: initial.key,
+            subtotalMinor: pricing.subtotalMinor,
+            discountMinor: pricing.discountMinor,
+            discountLabel: pricing.discountLabel,
             totalMinor,
             currency,
             origin: "portal",
@@ -295,6 +300,11 @@ export function createOrderService(deps: OrderServiceDeps) {
               name: item.name,
               description: item.description,
               features: item.features,
+              packetNumber: item.packetNumber,
+              tier: item.tier,
+              outcome: item.outcome,
+              timeline: item.timeline,
+              deliverables: item.deliverables,
               unitPriceMinor: item.unitPriceMinor,
               currency: item.currency,
               quantity: item.quantity,
@@ -324,8 +334,8 @@ export function createOrderService(deps: OrderServiceDeps) {
               outcome: "completed",
               actor: actorOf(principal),
               resource: { type: "order", publicId },
-              attributes: { currency, total_minor: totalMinor, on_behalf: ownerUserId !== principal.userId, workflow_version: workflow.versionNumber },
-              safeCounts: { line_items: lineItems.length },
+              attributes: { currency, total_minor: totalMinor, discount_minor: pricing.discountMinor, on_behalf: ownerUserId !== principal.userId, workflow_version: workflow.versionNumber },
+              safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
             },
             tx,
           );
@@ -459,6 +469,9 @@ export function createOrderService(deps: OrderServiceDeps) {
         statusKind: state?.kind ?? "active",
         lockState: order.lockState,
         origin: order.origin,
+        subtotalMinor: order.subtotalMinor,
+        discountMinor: order.discountMinor,
+        discountLabel: order.discountLabel,
         totalMinor: order.totalMinor,
         currency: order.currency,
         version: order.version,
@@ -476,6 +489,11 @@ export function createOrderService(deps: OrderServiceDeps) {
           name: item.name,
           description: item.description,
           features: item.features,
+          packetNumber: item.packetNumber,
+          tier: item.tier,
+          outcome: item.outcome,
+          timeline: item.timeline,
+          deliverables: item.deliverables ?? [],
           unitPriceMinor: item.unitPriceMinor,
           currency: item.currency,
           quantity: item.quantity,
@@ -924,6 +942,61 @@ export function createOrderService(deps: OrderServiceDeps) {
         .limit(max);
       const items = await toListItems(rows, principal, false);
       return items.map((item) => ({ publicId: item.publicId, reference: item.reference, projectName: item.projectName, statusLabel: item.statusLabel, updatedAt: item.updatedAt }));
+    },
+
+    /** Server price of a selection (same validation and figures as create); writes nothing. */
+    async quote(principal: SessionPrincipal, input: { items: { productPublicId: string; quantity: number }[] }): Promise<OrderQuote> {
+      if (principal.state !== "full") throw ORDER_NOT_FOUND();
+      return snapshot(async (tx) => {
+        const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
+        const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+        return {
+          currency: lineItems[0]!.currency,
+          subtotalMinor: pricing.subtotalMinor,
+          discountMinor: pricing.discountMinor,
+          discountLabel: pricing.discountLabel,
+          totalMinor: pricing.totalMinor,
+          bundle: pricing.bundle,
+        };
+      });
+    },
+
+    /** Trusted (caller already authorised): packet scope for production webhooks. Uses the caller's tx; no locks. */
+    async getProductionScope(orderId: number, opts: { tx?: DbOrTx } = {}): Promise<OrderProductionScope | null> {
+      const db = opts.tx ?? deps.db;
+      const [order] = await db
+        .select({
+          id: orders.id,
+          publicId: orders.publicId,
+          reference: orders.reference,
+          ownerUserId: orders.ownerUserId,
+          statusKey: orders.statusKey,
+          lockState: orders.lockState,
+          origin: orders.origin,
+        })
+        .from(orders)
+        .where(eq(orders.id, orderId))
+        .limit(1);
+      if (!order) return null;
+      const items = await db
+        .select({ packetNumber: orderLineItems.packetNumber, tier: orderLineItems.tier })
+        .from(orderLineItems)
+        .where(eq(orderLineItems.orderId, orderId))
+        .limit(500);
+      const packets = items
+        .filter((item): item is { packetNumber: number; tier: PacketTier } => item.packetNumber !== null && item.tier !== null)
+        .sort((a, b) => a.packetNumber - b.packetNumber);
+      return {
+        orderId: order.id,
+        orderPublicId: order.publicId,
+        reference: order.reference,
+        ownerUserId: order.ownerUserId,
+        statusKey: order.statusKey,
+        lockState: order.lockState,
+        origin: order.origin,
+        packets,
+        otherItemCount: items.length - packets.length,
+      };
     },
 
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {

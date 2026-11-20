@@ -22,6 +22,7 @@ import {
   orderStatusHistory,
   orderWorkflows,
   orderWorkflowVersions,
+  PACKET_TIERS,
 } from "./schema.js";
 import { ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { ImportOrderInput, PortableOrder, PortableSelection } from "./types.js";
@@ -55,6 +56,10 @@ export const importOrderInputSchema = z.strictObject({
   targetOwnerUserId: z.number().int().positive(),
   projectName: text(160, 1),
   statusKey: z.string().min(1).max(64),
+  /** Optional (v3): absent = totalMinor, i.e. no discount. totalMinor must equal subtotalMinor - discountMinor. */
+  subtotalMinor: money.optional(),
+  discountMinor: money.optional(),
+  discountLabel: text(120).nullable().optional(),
   totalMinor: money,
   currency: z.string().length(3),
   createdAt: z.date(),
@@ -68,6 +73,11 @@ export const importOrderInputSchema = z.strictObject({
         name: text(160, 1),
         description: text(2000),
         features: z.array(text(200)).max(50),
+        packetNumber: z.number().int().min(1).max(255).nullable().optional(),
+        tier: z.enum(PACKET_TIERS).nullable().optional(),
+        outcome: text(1000).optional(),
+        timeline: text(120).optional(),
+        deliverables: z.array(z.strictObject({ title: text(200, 1), detail: text(2000) })).max(100).optional(),
         unitPriceMinor: money,
         currency: z.string().length(3),
         quantity: z.number().int().min(1).max(10_000),
@@ -138,7 +148,14 @@ export function preflightImportOrder(raw: unknown): { ok: true; input: ImportOrd
     sum += item.lineTotalMinor;
     if (!Number.isSafeInteger(sum)) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
   }
-  if (input.lineItems.length > 0 && sum !== input.totalMinor) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  const subtotal = input.subtotalMinor ?? input.totalMinor + (input.discountMinor ?? 0);
+  const discount = input.discountMinor ?? 0;
+  if (discount < 0 || discount > subtotal || subtotal - discount !== input.totalMinor)
+    return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  if (input.lineItems.length > 0 && sum !== subtotal) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  for (const [index, item] of input.lineItems.entries())
+    if ((item.packetNumber ?? null) === null !== ((item.tier ?? null) === null))
+      return { ok: false, reasonCode: "IMPORT_ORDER_INVALID", paths: [`lineItems.${index}.tier`] };
   return { ok: true, input };
 }
 
@@ -240,6 +257,9 @@ export function createPortableHooks(deps: PortableDeps) {
           statusKey: order.statusKey,
           workflowKey,
           lockState: order.lockState,
+          subtotalMinor: order.subtotalMinor,
+          discountMinor: order.discountMinor,
+          discountLabel: order.discountLabel,
           totalMinor: order.totalMinor,
           currency: order.currency,
           origin: order.origin,
@@ -255,6 +275,11 @@ export function createPortableHooks(deps: PortableDeps) {
               name: i.name,
               description: i.description,
               features: i.features,
+              packetNumber: i.packetNumber,
+              tier: i.tier,
+              outcome: i.outcome,
+              timeline: i.timeline,
+              deliverables: i.deliverables ?? [],
               unitPriceMinor: i.unitPriceMinor,
               currency: i.currency,
               quantity: i.quantity,
@@ -322,6 +347,9 @@ export function createPortableHooks(deps: PortableDeps) {
         lockState,
         lockReasonCode: input.editable ? null : "IMPORTED",
         lockedAt: input.editable ? null : now,
+        subtotalMinor: input.subtotalMinor ?? input.totalMinor + (input.discountMinor ?? 0),
+        discountMinor: input.discountMinor ?? 0,
+        discountLabel: input.discountLabel ?? null,
         totalMinor: input.totalMinor,
         currency: input.currency,
         origin: "import",
@@ -349,6 +377,11 @@ export function createPortableHooks(deps: PortableDeps) {
             name: item.name,
             description: item.description,
             features: item.features,
+            packetNumber: item.packetNumber ?? null,
+            tier: item.tier ?? null,
+            outcome: item.outcome ?? "",
+            timeline: item.timeline ?? "",
+            deliverables: item.deliverables ?? [],
             unitPriceMinor: item.unitPriceMinor,
             currency: item.currency,
             quantity: item.quantity,

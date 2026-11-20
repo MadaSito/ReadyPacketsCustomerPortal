@@ -23,6 +23,7 @@ import type {
   OrderWriteKind,
   PortableOrder,
   PortableSelection,
+  OrderProductionScope,
 } from "./types.js";
 import { createWorkflowService, type WorkflowService } from "./workflows.js";
 
@@ -39,6 +40,8 @@ export interface OrdersModule extends ModuleLifecycle {
   /** Trusted lookup for jobs/collectors that already authorised. */
   /** `forUpdate` (requires tx) locks the order row — use it before acting on lockState (e.g. retention purge). */
   getOrderRefById(orderId: number, tx?: DbOrTx, options?: { forUpdate?: boolean }): Promise<OrderRef | null>;
+  /** Trusted packet scope for P101/P201 (caller authorises first). Runs in the caller's tx when given; no locks. */
+  getProductionScope(orderId: number, opts?: { tx?: DbOrTx }): Promise<OrderProductionScope | null>;
   searchOrders(principal: SessionPrincipal, query: string, limit?: number): Promise<OrderSearchHit[]>;
 
   /* ---- portable hooks ---- */
@@ -62,7 +65,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   registerOrderMailTemplates(deps.mailer);
   const policy = createOrderPolicy({ db: deps.db, clock: deps.clock, audit: deps.audit });
   const actorCheck = createActorCheck(deps.services, deps.clock);
-  const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
+  const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, settings: deps.settings, actorCheck });
   const workflows = createWorkflowService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
   const orders = createOrderService({ ...deps, policy, catalog, workflows });
   const sharing = createSharingService({ ...deps, policy });
@@ -76,6 +79,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     listAccessibleOrderIds: policy.listAccessibleOrderIds,
     getOrderSummary: orders.getOrderSummary,
     getOrderRefById: orders.getOrderRefById,
+    getProductionScope: orders.getProductionScope,
     searchOrders: orders.searchOrders,
     portableOrders: portable.portableOrders,
     importOrder: portable.importOrder,
