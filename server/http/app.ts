@@ -21,7 +21,7 @@ import { HEADER_CSRF } from "../../shared/sessionTransportHeaders.js";
 import type { Services } from "../container.js";
 import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
-import type { RateLimitCategory } from "../core/types.js";
+import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
@@ -122,16 +122,18 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   const anonymousKey = Buffer.from(config.tokenHashKey, "base64");
   const admission = createEdgeAdmission(anonymousKey);
   const currentAddress = () => rateLimitAddress(getRequestContext()?.ipAddress);
-  function denyBrowserRequest(reason: "ORIGIN_NOT_ALLOWED" | "CSRF_INVALID"): never {
-    const origin = reason === "ORIGIN_NOT_ALLOWED";
-    if (admission.shouldNote(currentAddress(), services.clock.now().getTime(), origin ? 1 : 2)) {
+  function noteDenial(kind: 1 | 2 | 4, event: Pick<AuditEventInput, "eventName" | "reasonCode" | "attributes">): void {
+    if (admission.shouldNote(currentAddress(), services.clock.now().getTime(), kind)) {
       try {
         services.audit.note({
-          eventName: origin ? "http.origin.denied" : "http.csrf.denied",
-          category: "security", action: "request", outcome: "denied", severity: "WARN", reasonCode: reason,
+          ...event, category: "security", action: "request", outcome: "denied", severity: "WARN",
         });
       } catch { /* A failed best-effort audit note cannot affect the denial. */ }
     }
+  }
+  function denyBrowserRequest(reason: "ORIGIN_NOT_ALLOWED" | "CSRF_INVALID"): never {
+    const origin = reason === "ORIGIN_NOT_ALLOWED";
+    noteDenial(origin ? 1 : 2, { eventName: origin ? "http.origin.denied" : "http.csrf.denied", reasonCode: reason });
     throw new DomainError("FORBIDDEN", reason, origin
       ? "This request did not come from the portal origin."
       : "Your security token is no longer valid. Reload the page and try again.");
@@ -311,6 +313,13 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   app.use(TRPC_PATH, createExpressMiddleware({
     router,
     createContext: ({ req }) => createTrpcContext(services, req),
+    onError({ error, path }) {
+      const cause = error.cause;
+      if (cause instanceof DomainError && cause.code === "RATE_LIMITED" && path &&
+          Object.hasOwn(router._def.procedures, path)) {
+        noteDenial(4, { eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: path } });
+      }
+    },
     maxBatchSize: MAX_BATCH_SIZE,
     maxBodySize: JSON_LIMIT_BYTES,
     allowMethodOverride: false,

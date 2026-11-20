@@ -301,6 +301,25 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     expect(big.body.error.json.data.safe.reasonCode).toBe("BATCH_TOO_LARGE");
     await h.http.get("/api/trpc/open,scarce").set("Host", HOST).expect(400);
   });
+
+  it("samples procedure rate denials even when the HTTP batch contains a success", async () => {
+    const h = harness();
+    h.services.rateLimiter = {
+      consume: async (category, subject) => category === "auth_high_risk" && subject === `s:${a.sessionId}`
+        ? { allowed: false, retryAfterSeconds: 24 } : { allowed: true, retryAfterSeconds: 0 },
+    };
+    const cookie = requestCookies(h.config, TOKEN_A, csrfA);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await h.http.get("/api/trpc/open,scarce?batch=1").set("Host", HOST)
+        .set("Cookie", cookie).expect(207).expect("Retry-After", "24");
+      expect(result.body[0].result.data.json.authenticated).toBe(true);
+      expect(result.body[1].error.json.data.safe.reasonCode).toBe("RATE_LIMITED");
+    }
+    expect(h.audit.events).toHaveLength(0);
+    expect(h.audit.notes).toEqual([expect.objectContaining({
+      eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: "scarce" },
+    })]);
+  });
 });
 
 describe("HTTP edge: isolated preview controls", () => {

@@ -26,7 +26,7 @@ export function createEdgeAdmission(root: Buffer) {
       }
       return 0;
     },
-    shouldNote(address: string, now: number, kind: 1 | 2): boolean {
+    shouldNote(address: string, now: number, kind: 1 | 2 | 4): boolean {
       const slot = indexFor(address);
       if (now < noteStarts[slot]! || now - noteStarts[slot]! >= NOTE_WINDOW_MS) {
         noteStarts[slot] = now;
