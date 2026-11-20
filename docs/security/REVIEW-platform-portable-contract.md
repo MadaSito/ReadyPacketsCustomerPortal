@@ -31,3 +31,38 @@ Reviewed the platform module, environment and field crypto, and the independent 
 
 - **Existing tests:** `scripts/dev/test.sh server/modules/platform/fieldCrypto.test.ts` passed 17 tests; `scripts/dev/test.sh portable/tests/tamper.test.ts` passed 25 tests. Findings above are supported by static paths, not newly written reproductions.
 - **Limits:** No browser work, live attack testing, production verification, concurrency fault injection, or fresh-install end-to-end testing was done. The platform and contract owners received their findings; remediation remains with the respective code owners.
+
+## Re-review · 2026-11-20
+
+Independently inspected portable remediation `23b3aba` and platform remediation `208f124`. Ten of the original twelve findings are closed at those revisions. P1 and C7 remain open in part. “Closed” refers to the original finding, not to broader assurance of the component.
+
+### Platform findings
+
+- **P1 · Open in part:** The singleton slides-row lock now serializes quota admission and normal soft deletion triggers object cleanup. The image suite passed, including cleanup on audit rollback. The ambiguous-commit path still treats an ordinary non-locking lookup that sees no row as proof of absence, even if the first connection's transaction is still resolving (`server/modules/platform/presentation.ts:200–209`). Retain staged bytes on ambiguous outcomes until reconciliation can prove no durable reference. The sweep (`:279–289`) has no caller in reviewed server code and repeatedly selects only the newest soft-deleted rows, without a completion marker or advancing cursor; add a scheduled, durable and fair retry mechanism.
+- **P2 · Closed:** `server/modules/platform/configTransfer.ts:80–102` uses asynchronous scrypt with one active operation and up to four queued derivations. The config-transfer suite passed its round-trip and wrong-passphrase cases; the queue bound and event-loop behavior were checked by inspection, not a load test. A separate compatibility note appears below.
+- **P3 · Closed:** `server/modules/platform/reencrypt.ts` locks the batch checkpoint and performs CAS writes, checkpoint advance, and audit in one transaction. The re-encryption suite passed audit rollback and concurrent runner checks.
+- **P4 · Closed for the reported parser defects:** The image suite passed checks for metadata between JPEG scans and after EOI, plus the required still WebP frame and RIFF rebuild (`server/modules/platform/imageValidation.ts`). Full pixel decode and re-encoding are still outside this structural validation.
+- **P5 · Closed:** Export now receives a live actor guard, checks it before reading settings, and checks it again in the transaction containing the export audit without holding that transaction across scrypt (`server/modules/platform/configTransfer.ts:151–215`). The config-transfer test exercises guard refusal and absence of successful audit; it also confirms default secret export is now opt-in.
+
+### Portable findings
+
+- **C1 · Closed:** The aggregate KDF ceilings are checked before derivation in `portable/src/crypto/envelope.ts`; the tamper suite confirms rejection of aggregate out-of-budget parameters, and the round-trip suite confirms the normal writer profile still works.
+- **C2 · Closed:** `portable/src/reader.ts` rejects repeated names and noncanonical extension/record paths before evidence reads. The CLI/policy suite passed duplicate/noncanonical inventory coverage.
+- **C3 · Closed for regenerated exports:** `portable/src/legacy/adapter.ts:148–155` uses a fixed epoch instead of the export timestamp for record IDs; the legacy test compares IDs across distinct generated dates. A prior deployment of the old derivation, if any, would still need explicit reconciliation of old IDs.
+- **C4 · Closed:** The CLI documents archive verification failure separately from local I/O, reports unsupported-only requirements as exit 4, and writes verified v3 members verbatim, including held extensions. Inspection and the CLI/policy suite confirm the new status and extraction behavior. Legacy extraction is explicitly labeled as reconstruction.
+- **C5 · Closed:** The reader rejects overly deep optional extension JSON, and the exclusion walker fails closed at its own traversal cap. The CLI/policy suite passed the over-depth extension check.
+- **C6 · Closed:** The reader hashes header, MAC, and body bytes from the same authentication/decryption pass (`portable/src/reader.ts:66–95`); tamper and round-trip tests compare that digest with the ciphertext digest. This does not guarantee immutability of the caller's source path.
+- **C7 · Open in part:** The legacy suite passed basic limit refusal, and the adapter now checks top-level input counts and estimates file sizes before decoding. `portable/src/legacy/adapter.ts:31–47,138–144,281–309` still does not apply `maxRecordsPerType` to expanded normalized record types or include converted metadata in `maxTotalUncompressed`. Apply bounded accounting to every normalized record type and both metadata and objects, and cover nested-only and metadata-only input in tests.
+
+### Bootstrap and additional observations
+
+- **First-admin command:** The host-only `scripts/ops/create-admin.ts` now exists in the working tree. It checks migration compatibility and delegates account creation and audit to transactional identity provisioning, with password change and MFA enrollment required. The identity suite passed concurrent bootstrap, refusal with an existing active admin, rollback on audit failure, and enrollment checks. The missing implementation is resolved in the worktree, but inclusion in the release and an end-to-end CLI run were not verified.
+- **Bootstrap password file · Low, open at review:** `scripts/ops/create-admin.ts:50–53` directly reads the supplied path without enforcing the documented restrictive permissions, owner, regular-file type, or size limits. Use a bounded descriptor-based secret reader that checks the actual opened file, preserves password whitespace apart from the final newline, and does not log the path or content.
+- **Legacy file handle · Low, open at review:** The successful legacy return at `portable/src/reader.ts:57–62` bypasses the explicit close at `:92` and the error handler. The passing legacy suite emitted Node file-descriptor garbage collection warnings. Close the source handle on all exit paths.
+- **Config document compatibility · Follow-up:** `server/modules/platform/configTransfer.ts:235–238` rejects the different salts written by the former secret export path without changing the format version. If those exports were distributed, support them through the same bounded async KDF or version the new format and provide migration guidance. No deployed historical exports were verified.
+
+### Independent test results
+
+- **Portable, 63 passed:** `tamper.test.ts` (27), `roundtrip.test.ts` (8), `legacy.test.ts` (12), and `cli-policy.test.ts` (16).
+- **Platform and identity, 68 passed:** `configTransfer.example.test.ts` (8), `presentation.example.test.ts` (14), `reencrypt.example.test.ts` (5), and `identity.test.ts` (41).
+- **Scope:** Each of the eight test files ran separately through `scripts/dev/test.sh`. No production behavior, ambiguous commit fault injection, or end-to-end invocation of the bootstrap CLI was verified.
