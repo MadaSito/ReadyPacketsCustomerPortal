@@ -60,6 +60,24 @@ describe("config: strict validation", () => {
     }
   });
 
+  it("accepts a random key whose base64 text happens to spell a short template token", () => {
+    // 3 bytes -> 4 base64 characters: these keys contain "todo", "XXXX" and "DuMmY" by construction.
+    const spelling = (text: string, seed: number) => {
+      const bytes = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 11 + seed * 37) % 256));
+      Buffer.from(text, "base64").copy(bytes, 3);
+      return bytes.toString("base64");
+    };
+    const keys = { RP_INDEX_KEY: spelling("todo", 21), RP_PSEUDONYM_KEY: spelling("XXXX", 22), RP_AUDIT_CHAIN_KEY: spelling("DuMmYA==", 23) };
+    expect(keys.RP_INDEX_KEY).toContain("todo");
+    expect(keys.RP_PSEUDONYM_KEY).toContain("XXXX");
+    expect(keys.RP_AUDIT_CHAIN_KEY).toContain("DuMmY");
+    expect(problemsOf(prodEnv(keys)).filter((issue) => issue.includes("placeholder"))).toEqual([]);
+    // Templates are still refused: by the word screen when not a well-formed key, by entropy otherwise.
+    const templates = problemsOf(prodEnv({ RP_INDEX_KEY: "todo-set-this-key", RP_PSEUDONYM_KEY: `${"x".repeat(43)}=` }));
+    expect(templates).toContain("RP_INDEX_KEY: looks like a placeholder value");
+    expect(templates).toContain("RP_PSEUDONYM_KEY: key has too little entropy");
+  });
+
   it("refuses weak, placeholder, malformed and duplicated keys without echoing them", () => {
     const weak = Buffer.alloc(32, 7).toString("base64");
     const issues = problemsOf(prodEnv({ RP_INDEX_KEY: weak, RP_PSEUDONYM_KEY: "change-me-placeholder-value-0000000000000000", RP_TOKEN_HASH_KEY: key(6) }));

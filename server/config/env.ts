@@ -221,6 +221,17 @@ export class ConfigError extends Error {
 
 /** Values that betray an unedited template or a well-known example. Compared case-insensitively. */
 const PLACEHOLDER = /(change.?me|placeholder|replace.?me|your[-_ ]|example|dummy|sample|todo|xxxx|<[^>]*>|\$\{)/i;
+/**
+ * The same screen without its short tokens. Random base64 spells "todo", "xxxx" or "dummy" (in any letter
+ * case) in about one key in 13,000, which would refuse a correctly generated key. Values that already are
+ * well-formed 32-byte keys with enough distinct bytes are therefore screened with the long words only;
+ * low-entropy templates such as a run of "x" still fail the key entropy rule.
+ */
+const PLACEHOLDER_IN_RANDOM_KEY = /(change.?me|placeholder|replace.?me|your[-_ ]|example|sample)/i;
+
+function looksLikePlaceholderKey(value: string): boolean {
+  return (base64Key32.safeParse(value).success ? PLACEHOLDER_IN_RANDOM_KEY : PLACEHOLDER).test(value);
+}
 const WEAK_DB_PASSWORDS = new Set(["password", "passw0rd", "root", "mysql", "admin", "secret", "readypackets", "rp_dev_local_only", "123456", "12345678"]);
 
 function list(value: string | undefined): string[] {
@@ -320,7 +331,7 @@ function evaluate(env: Env, options: LoadOptions): Evaluation {
   // Placeholder screening on raw secret text (before schema checks, which would not explain why).
   for (const name of ["RP_INDEX_KEY", "RP_INDEX_KEY_PREVIOUS", "RP_PSEUDONYM_KEY", "RP_TOKEN_HASH_KEY", "RP_AUDIT_CHAIN_KEY"]) {
     const value = secrets[name];
-    if (value !== undefined && PLACEHOLDER.test(value)) err(name, "looks like a placeholder value");
+    if (value !== undefined && looksLikePlaceholderKey(value)) err(name, "looks like a placeholder value");
   }
 
   const parsed = configSchema.safeParse(candidate);
