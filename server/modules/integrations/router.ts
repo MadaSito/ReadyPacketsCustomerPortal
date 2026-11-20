@@ -2,10 +2,12 @@
  * Integrations module — tRPC router (mounted at `trpc.integrations.*`). Owner: integrations module engineer.
  */
 import { z } from "zod";
-import { adminProcedure, publicProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { EGRESS_PROTOCOLS, EGRESS_PURPOSES } from "./egress.js";
 
 const manageProcedure = adminProcedure.use(requireCapability("integrations.manage"));
+const productionTriggerProcedure = staffProcedure.use(requireCapability("orders.production.trigger"));
+const productionResendProcedure = adminProcedure.use(requireCapability("orders.production.trigger"));
 
 const ulidParamSchema = z.string().trim().min(10).max(64);
 
@@ -82,6 +84,60 @@ const checkEgressTargetSchema = z.strictObject({
   purpose: z.enum(EGRESS_PURPOSES),
 });
 
+const productionPhaseSchema = z.enum(["P101", "P201"]);
+const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead"]);
+
+const updateProductionSettingsSchema = z.strictObject({
+  enabled: z.boolean(),
+  p101Url: z.string().trim().max(2048).nullable().optional(),
+  p201Url: z.string().trim().max(2048).nullable().optional(),
+  authHeaderName: z.string().trim().max(64).optional(),
+  authHeaderValue: z.string().max(1024).nullable().optional(),
+  canonVersion: z.string().trim().max(64),
+  runMode: z.string().trim().max(32).optional(),
+  timeoutMs: z.number().int().min(1000).max(30000).optional(),
+});
+
+const testProductionDestinationSchema = z.strictObject({
+  phase: productionPhaseSchema,
+});
+
+const previewProductionOrderSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  releaseStatus: z.string().trim().max(120).optional(),
+});
+
+const requestP101Schema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  releaseStatus: z.string().trim().max(120).optional(),
+});
+
+const requestP201Schema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  phase1ArtifactsConfirmed: z.boolean(),
+});
+
+const resendProductionSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  phase: productionPhaseSchema,
+  reason: z.string().trim().min(3).max(280),
+  releaseStatus: z.string().trim().max(120).optional(),
+  phase1ArtifactsConfirmed: z.boolean().optional(),
+});
+
+const productionOrderHistorySchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+});
+
+const listProductionDispatchesSchema = z.strictObject({
+  phase: productionPhaseSchema.optional(),
+  state: productionDispatchStateSchema.optional(),
+  orderReference: z.string().trim().max(64).optional(),
+  fromDate: z.date().optional(),
+  toDate: z.date().optional(),
+  limit: z.number().int().min(1).max(200).optional(),
+});
+
 export const integrationsRouter = router({
   /** Public, minimal safe analytics configuration (`{ clarity: { enabled, projectId }, posthog: { enabled, key, host } }`). */
   publicAnalyticsConfig: publicProcedure.query(({ ctx }) => ctx.services.integrations.analytics.getPublicConfig()),
@@ -144,6 +200,43 @@ export const integrationsRouter = router({
         .meta({ rateLimit: "expensive" })
         .input(checkEgressTargetSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.egress.checkTarget(ctx.session, input)),
+    }),
+  }),
+
+  production: router({
+    settings: router({
+      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.production.getSettings()),
+      update: manageProcedure
+        .input(updateProductionSettingsSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.updateSettings(ctx.session, input)),
+      test: manageProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(testProductionDestinationSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.testDestination(ctx.session, input)),
+    }),
+
+    order: router({
+      preview: productionTriggerProcedure
+        .input(previewProductionOrderSchema)
+        .query(({ ctx, input }) => ctx.services.integrations.production.previewOrder(ctx.session, input)),
+      requestP101: productionTriggerProcedure
+        .input(requestP101Schema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP101(ctx.session, input)),
+      requestP201: productionTriggerProcedure
+        .input(requestP201Schema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP201(ctx.session, input)),
+      resend: productionResendProcedure
+        .input(resendProductionSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.resend(ctx.session, input)),
+      history: productionTriggerProcedure
+        .input(productionOrderHistorySchema)
+        .query(({ ctx, input }) => ctx.services.integrations.production.orderHistory(ctx.session, input)),
+    }),
+
+    admin: router({
+      listDispatches: adminProcedure
+        .input(listProductionDispatchesSchema.optional())
+        .query(({ ctx, input }) => ctx.services.integrations.production.listDispatches(ctx.session, input)),
     }),
   }),
 });

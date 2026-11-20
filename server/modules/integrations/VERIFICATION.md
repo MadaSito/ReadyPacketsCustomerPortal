@@ -15,6 +15,7 @@ Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/fe
 | Stripe Payment Webhooks (`stripe.ts`, `http.ts`) | **DISABLED SCAFFOLD** (`STRIPE_LEDGER_MUTATION_ENABLED = false as const`) — online checkout unavailable; webhook verifies `Stripe-Signature` HMAC-SHA256 + durably logs inert received event (`status = "ignored"`, `ledgerMutated: false`) with zero compliance ledger mutation | MariaDB integration + Express HTTP tested (`checkout.session.completed`, `payment_intent.succeeded`, `charge.refunded` proven to leave ledger unchanged; IPv6 `/64` rate-limit key folding verified) |
 | SAML 2.0 SSO (`scaffolds.ts`) | **DISABLED SCAFFOLD** (`Not available in this release — local sign-in with MFA is the only active method`) — non-active metadata planning + mandatory security requirements note; no assertion processing | MariaDB integration + admin UI tested |
 | SharePoint / Microsoft 365 Sync (`scaffolds.ts`) | **DISABLED SCAFFOLD** — read-only target status and architecture requirements | MariaDB integration + admin UI tested |
+| Outbound Production Pipeline Webhooks (`production/**`, `egress.ts`, `settings.ts`, `schema.ts`) | Active (OFF by default; no default `canonVersion`) — `P101` & `P201` HTTPS JSON webhooks with mandatory allowlist + public-only single-DNS-eval socket pinning, `FieldCrypto` secret/outbox encryption, `retrySafe: false` lease-fenced worker, and PII-redacted previews/logs | Pure spec row-by-row unit suite (`payload.test.ts`), MariaDB + strict egress + 1-connection pool suite (`production.test.ts`), and client UI + `axe-core` suite (`production.test.tsx`). External n8n/SharePoint endpoints are not exercised live in CI |
 
 ---
 
@@ -38,7 +39,13 @@ Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/fe
 4. **Stripe Hard-Disabled Scaffold (`stripe.ts`, `http.ts`)**:
    - Hard-disabled behind `STRIPE_LEDGER_MUTATION_ENABLED = false as const`. `isOnlinePaymentConfigured()` always returns `false`; `updateConfig({ enabled: true })` fails with `STRIPE_NOT_AVAILABLE_IN_RELEASE`.
    - Signed webhooks verify `Stripe-Signature` over raw bytes, normalize client IP rate-limit keys via `rateLimitAddress(req.ip)`, record inert `ignored` rows + audit notes with `ledgerMutated: false`, and never invoke ledger booking.
-5. **Cross-Model Transaction & Zero-Trust Invariants**:
+5. **Outbound Production Webhooks (`production/**`, `egress.ts`)**:
+   - `egress.fetchPinned(..., { requireAllowlistRule: true, publicAddressesOnly: true })` evaluates the mandatory `"webhook"` allowlist rule and verifies that **every** resolved DNS record is globally public inside the exact same `evaluateTarget` call that produces the `PinnedEgressTarget` bound to the TLS socket (`autoSelectFamily: false`), preventing split-DNS TOCTOU rebinding.
+   - `settings.test` performs dry-run URL + allowlist + public-DNS validation with zero HTTP requests and never projects `normalizedUrl` or secret URL paths/queries.
+   - `p101_url`, `p201_url`, and `auth_value` use `defineSecret` (`FieldCrypto` AES-256-GCM); `payload_enc` is encrypted with AAD `integration_production_dispatches.payload:<publicId>` while queued/retrying and set to `NULL` upon terminal `delivered`/`dead`/`failed`.
+   - `P201` requires a `delivered` `P101` on the same order and reuses `client_id`, `order_id`, `packet`, `packet_tier`, `canon_version`, and `run_mode` verbatim from the delivered `P101` snapshot; `triggered_by` carries the actor's opaque `userPublicId`.
+   - `integrations.production.deliver` is registered with `retrySafe: false` and `maxAttempts: 5`, checks `ctx.assertStillOwned(tx)` before writing state transitions, never auto-replays a preexisting `sending` row (`PRODUCTION_AMBIGUOUS_IN_FLIGHT_DELIVERY`), and requires `admin` + fresh MFA step-up for manual `resend`.
+6. **Cross-Model Transaction & Zero-Trust Invariants**:
    - All `db.transaction(...)` blocks pass `tx` to `settings`, `audit.record(..., tx)`, and `identity.sessions.assertCurrent(principal, tx)` — verified non-deadlocking on a `connectionLimit: 1` MySQL pool.
    - `deleteAllowlistRule` writes its durable `integration.egress.rule_deleted` audit record inside the same transaction **before** executing `DELETE`, and rolls back fail-closed if audit persistence fails.
 
@@ -48,11 +55,19 @@ Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/fe
 
 ```bash
 source scripts/dev/env.sh
-scripts/dev/tc.sh
+scripts/dev/tc.sh server/modules/integrations client/src/features/integrations
 scripts/dev/lint.sh server/modules/integrations client/src/features/integrations/consent.tsx client/src/features/integrations/consent.test.tsx client/src/features/integrations/routes.tsx
-scripts/dev/test.sh server/modules/integrations/integrations.test.ts client/src/features/integrations/consent.test.tsx client/src/features/integrations/admin/integrationsAdmin.test.tsx
+scripts/dev/test.sh server/modules/integrations/production/payload.test.ts
+scripts/dev/test.sh server/modules/integrations/production/production.test.ts
+scripts/dev/test.sh server/modules/integrations/integrations.test.ts
+scripts/dev/test.sh client/src/features/integrations/consent.test.tsx
+scripts/dev/test.sh client/src/features/integrations/admin/integrationsAdmin.test.tsx
+scripts/dev/test.sh client/src/features/integrations/production/production.test.tsx
 ```
 
+- `server/modules/integrations/production/payload.test.ts` — **8/8 passing** (row-by-row P101 & P201 spec payloads, multi-packet CSV alignment, calendar rollover, non-packet refusal, role-based PII & URL masking)
+- `server/modules/integrations/production/production.test.ts` — **8/8 passing** (FieldCrypto secret encryption, dry-run `settings.test` zero-HTTP/zero-`normalizedUrl`, strict allowlist + public-only single-DNS-eval pinning, P101 -> P201 verbatim identity reuse, `payload_enc` clearing on terminal states, 5xx retry -> dead-letter at attempt 5, preexisting `sending` refusal, 3xx/4xx non-retryable failure, admin+step-up `resend`, in-tx session revocation, and 1-connection pool safety)
 - `server/modules/integrations/integrations.test.ts` — **10/10 passing** (including seeded DB + pre-dial port-25 zero-socket regression)
-- `client/src/features/integrations/consent.test.tsx` — **5/5 passing** (including `markRealmTainted` pre-script/pre-fetch ordering, `RealmTaintBoundary` + `TaintedRouteGate` `MutationObserver` zero-private-DOM-commit proof, & `axe-core` WCAG AA check)
-- `client/src/features/integrations/admin/integrationsAdmin.test.tsx` — **7/7 passing**
+- `client/src/features/integrations/consent.test.tsx` — **5/5 passing** (including `markRealmTainted` pre-script/pre-fetch ordering, `RealmTaintBoundary` + `TaintedRouteGate` `MutationObserver` zero-private-DOM-commit proof, `routes.tsx` wiring, & `axe-core` WCAG AA check)
+- `client/src/features/integrations/admin/integrationsAdmin.test.tsx` — **8/8 passing**
+- `client/src/features/integrations/production/production.test.tsx` — **6/6 passing**

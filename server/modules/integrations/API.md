@@ -37,6 +37,7 @@ export interface PinnedEgressTarget {
 - Refuses private RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), RFC 4193 ULA (`fc00::/7`), CGNAT (`100.64/10`), and non-default ports **unless** an explicit administrator allowlist rule (`integration_egress_allowlist`) matches `(purpose, protocol, port, host/ip/cidr)` and has `allowPrivateAddress = true` when the resolved IP is private. Cloud metadata, link-local, multicast, production loopback, and IPv4-transition IPv6 addresses can **never** be allowlisted.
 - `createPinnedLookup(pinned)` supports both scalar `(address, family)` callbacks and Node >=20 `autoSelectFamily` `{ all: true }` `LookupAddress[]` callbacks without touching OS DNS.
 - Enforces a 5 s DNS lookup deadline (`EGRESS_DNS_TIMEOUT`), a total wall-clock HTTP request deadline (`EGRESS_TIMEOUT`), and refuses all HTTP `3xx` redirects (`EGRESS_REDIRECT_REFUSED`).
+- Supports `requireAllowlistRule?: boolean` (`EGRESS_ALLOWLIST_REQUIRED`) and `publicAddressesOnly?: boolean` (`EGRESS_NON_PUBLIC_ADDRESS_BLOCKED`) inside the single `evaluateTarget` / `fetchPinned` evaluation that returns the actual `PinnedEgressTarget` dial pin (`resolvedAddresses?: readonly string[]`), eliminating any split DNS check-vs-connect TOCTOU window.
 
 ### 1.2 Provider Registry & Health (`services.integrations.providers`)
 
@@ -82,6 +83,13 @@ export interface ProviderStatus {
 - **`sharepoint` (DISABLED SCAFFOLD)**:
   - Read-only status (`availableInRelease: false`, `state: "disabled"`, `summary`, `targetRequirements: readonly string[]`).
 
+### 1.6 Outbound Production Pipeline Webhooks (`services.integrations.production`)
+
+- Implements `P101` (Order Creation / SharePoint folder tree initialization) and `P201` (Trigger Production Run) per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
+- Ships disabled (`feature.integrations.production = false`) with empty `canonVersion` (`""`); stores `p101_url`, `p201_url`, and `auth_value` via `defineSecret` (`FieldCrypto` AES-256-GCM) and returns only masked `{ configured, host, last4 }` / `authSecretConfigured` views.
+- Enforces `egress.fetchPinned(..., { requireAllowlistRule: true, publicAddressesOnly: true })` (HTTPS-only, mandatory enabled `"webhook"` allowlist rule, public-only DNS answers in the same evaluation as socket pinning, zero redirects, 64 KiB response cap).
+- Persists outbox rows in `integration_production_dispatches`, encrypts retry payload bodies (`payload_enc`) while `queued` / `sending` / retryable `failed`, clears `payload_enc = NULL` on terminal `delivered` / `dead` / `failed`, and processes deliveries via `integrations.production.deliver` (`retrySafe: false`, `maxAttempts: 5`, lease-fenced via `ctx.assertStillOwned(tx)`).
+
 ---
 
 ## 2. Exact tRPC Procedures & Return Types (`trpc.integrations.*`)
@@ -106,6 +114,15 @@ All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require 
 - **`admin.egress.update`** (`mutation`, step-up) -> input `{ publicId, expectedVersion, port?, allowPrivateAddress?, enabled?, justification? }` -> `EgressAllowlistRuleView`
 - **`admin.egress.remove`** (`mutation`, step-up) -> input `{ publicId }` -> `void`
 - **`admin.egress.check`** (`mutation`, step-up, `expensive` rate limit) -> input `{ target, purpose }` -> `{ allowed: boolean; pinned?: PinnedEgressTarget; reasonCode?: string; safeMessage: string }`
+- **`production.settings.get`** (`query`, `admin` + `integrations.manage`) -> `ProductionSettingsView`
+- **`production.settings.update`** (`mutation`, `admin` + `integrations.manage` + step-up) -> input `{ enabled, canonVersion, runMode, timeoutMs, p101Url?, p201Url?, authHeaderName, authValue? }` -> `ProductionSettingsView`
+- **`production.settings.test`** (`mutation`, `admin` + `integrations.manage` + step-up, `expensive` rate limit) -> input `{ phase: "P101" | "P201", candidateUrl? }` -> `ProductionEndpointTestResult` (dry-run URL + allowlist + public-DNS check; never sends HTTP or projects `normalizedUrl`)
+- **`production.order.preview`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, phase, releaseStatus?, priority?, notes? }` -> `ProductionOrderPreviewView` (`client_name` / `client_email` masked for `staff`, unmasked for `admin`)
+- **`production.order.requestP101`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus?, notes? }` -> `ProductionDispatchView`
+- **`production.order.requestP201`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, priority?, notes? }` -> `ProductionDispatchView`
+- **`production.order.resend`** (`mutation`, `admin` + step-up) -> input `{ dispatchPublicId }` -> `ProductionDispatchView`
+- **`production.order.history`** (`query`, `staff` + `orders.read`) -> input `{ orderPublicId }` -> `{ items: ProductionDispatchView[] }`
+- **`production.admin.listDispatches`** (`query`, `admin` + `integrations.manage`) -> input `{ phase?, state?, orderReference?, cursor?, limit? }` -> `{ items: ProductionDispatchView[]; nextCursor: string | null }`
 
 ---
 
@@ -125,8 +142,9 @@ All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require 
   - `integration.stripe.updated`, `integration.stripe.enable_refused`, `integration.stripe.webhook.received_disabled`, `integration.stripe.webhook.rejected`
   - `integration.saml.scaffold_updated`, `integration.saml.enable_refused`
   - `integration.egress.rule_created`, `integration.egress.rule_updated`, `integration.egress.rule_deleted`, `integration.egress.denied`, `integration.egress.checked`
-- **Health components**: `mail.smtp`, `integrations.clarity`, `integrations.posthog`, `integrations.stripe`, `integrations.saml`, `integrations.sharepoint`
-- **Tables**: `integration_egress_allowlist`, `integration_provider_checks`, `integration_webhook_events`
+  - `integration.production.settings.changed`, `integration.production.dispatch.requested`, `integration.production.dispatch.delivered`, `integration.production.dispatch.failed`, `integration.production.dispatch.dead`, `integration.production.dispatch.resent`, `integration.production.dispatch.refused`
+- **Health components**: `mail.smtp`, `integrations.clarity`, `integrations.posthog`, `integrations.stripe`, `integrations.saml`, `integrations.sharepoint`, `integrations.production`
+- **Tables**: `integration_egress_allowlist`, `integration_provider_checks`, `integration_webhook_events`, `integration_production_dispatches`
 - **Client exports**:
-  - `integrationsFeature` (`client/src/features/integrations/routes.tsx` — spreads `integrationsAdminRoutes` + `integrationsAdminNav` from `./admin/index.ts`)
+  - `integrationsFeature` (`client/src/features/integrations/routes.tsx` — spreads `integrationsAdminRoutes`, `productionAdminRoutes`, `integrationsAdminNav`, `productionAdminNav`, and `productionOrderTabs`)
   - `AnalyticsConsentSlot`, `useAnalyticsConsent`, `ANALYTICS_CONSENT_COPY` (`client/src/features/integrations/consent.tsx`)

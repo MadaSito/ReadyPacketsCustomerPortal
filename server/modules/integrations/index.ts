@@ -61,6 +61,26 @@ import {
   type StripeWebhookResult,
   type UpdateStripeConfigInput,
 } from "./stripe.js";
+import {
+  createProductionWebhookService,
+  PRODUCTION_DELIVERY_JOB,
+  PRODUCTION_MAX_ATTEMPTS,
+  type ListProductionDispatchesInput,
+  type MaskedWebhookUrlView,
+  type P101Payload,
+  type P201Payload,
+  type ProductionDispatchItem,
+  type ProductionDispatchState,
+  type ProductionDryRunResult,
+  type ProductionOrderPreview,
+  type ProductionPhase,
+  type ProductionSettingsView,
+  type ProductionWebhookService,
+  type RequestP101Input,
+  type RequestP201Input,
+  type ResendProductionInput,
+  type UpdateProductionSettingsInput,
+} from "./production/index.js";
 
 // Ensure all `integrations.*` settings/secrets/flags register on module import.
 import "./settings.js";
@@ -69,6 +89,8 @@ export {
   createPinnedLookup,
   EGRESS_PROTOCOLS,
   EGRESS_PURPOSES,
+  PRODUCTION_DELIVERY_JOB,
+  PRODUCTION_MAX_ATTEMPTS,
   SAML_RELEASE_BANNER,
   STRIPE_LEDGER_MUTATION_ENABLED,
   STRIPE_RELEASE_BANNER,
@@ -85,9 +107,23 @@ export {
   type EgressProtocol,
   type EgressPurpose,
   type EgressTargetInput,
+  type ListProductionDispatchesInput,
+  type MaskedWebhookUrlView,
+  type P101Payload,
+  type P201Payload,
   type PinnedEgressTarget,
+  type ProductionDispatchItem,
+  type ProductionDispatchState,
+  type ProductionDryRunResult,
+  type ProductionOrderPreview,
+  type ProductionPhase,
+  type ProductionSettingsView,
+  type ProductionWebhookService,
   type ProviderState,
   type PublicAnalyticsConfig,
+  type RequestP101Input,
+  type RequestP201Input,
+  type ResendProductionInput,
   type ResolveEgressInput,
   type SamlScaffoldView,
   type ScaffoldsService,
@@ -104,6 +140,7 @@ export {
   type StripeWebhookResult,
   type UpdateAnalyticsConfigInput,
   type UpdateEgressRuleInput,
+  type UpdateProductionSettingsInput,
   type UpdateSamlScaffoldInput,
   type UpdateSmtpConfigInput,
   type UpdateStripeConfigInput,
@@ -140,6 +177,7 @@ export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
   analytics: AnalyticsService;
   stripe: StripeService;
   scaffolds: ScaffoldsService;
+  production: ProductionWebhookService;
   /** Convenience hook consumed by `server/http` CSP middleware (`services.integrations.analyticsCsp(pathname)`). */
   analyticsCsp(pathname: string): Promise<AnalyticsCspPolicy | null>;
 }
@@ -154,6 +192,7 @@ export function createIntegrationsModule(
   const analytics = createAnalyticsService(deps);
   const stripe = createStripeService(deps, checks);
   const scaffolds = createScaffoldsService(deps);
+  const production = createProductionWebhookService(deps, egress, checks);
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
     const [smtpView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
@@ -272,12 +311,17 @@ export function createIntegrationsModule(
     analytics,
     stripe,
     scaffolds,
+    production,
     analyticsCsp: (pathname) => analytics.analyticsCsp(pathname),
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
-      const statuses = await buildAllStatuses();
-      return statuses.map((p): ModuleHealth => {
+      const [statuses, prodView, prodCheck] = await Promise.all([
+        buildAllStatuses(),
+        production.getSettings(),
+        checks.get("production"),
+      ]);
+      const base = statuses.map((p): ModuleHealth => {
         const component = p.key === "smtp" ? "mail.smtp" : `integrations.${p.key}`;
         return {
           component,
@@ -286,6 +330,26 @@ export function createIntegrationsModule(
           checkedAt,
         };
       });
+      const prodVerified = Boolean(prodCheck?.verifiedAt && prodCheck.lastOutcome === "succeeded");
+      const prodState: HealthState =
+        prodView.state === "disabled"
+          ? "disabled"
+          : prodView.state === "not_configured"
+            ? "not_configured"
+            : prodView.state === "failing"
+              ? "failing"
+              : prodView.state === "degraded"
+                ? "degraded"
+                : prodVerified
+                  ? "ok"
+                  : "degraded";
+      base.push({
+        component: "integrations.production",
+        state: prodState,
+        summary: prodView.summary,
+        checkedAt,
+      });
+      return base;
     },
   };
 }

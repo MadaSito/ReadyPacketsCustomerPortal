@@ -7,6 +7,7 @@
 import { z } from "zod";
 import type { SettingsStore, Tx } from "../../core/types.js";
 import { defineFeatureFlag, defineSecret, defineSetting, type FeatureFlagDefinition } from "../platform/index.js";
+import { precheckHost } from "./ipPolicy.js";
 
 /* ----------------------------------------------------- analytics constants & validators */
 
@@ -183,6 +184,71 @@ export const DEFAULT_SAML_SCAFFOLD: SamlScaffoldSetting = {
   nameIdFormat: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
 };
 
+const FORBIDDEN_CUSTOM_WEBHOOK_HEADERS = new Set([
+  "host",
+  "content-length",
+  "content-type",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "upgrade",
+  "te",
+  "trailer",
+  "proxy-authorization",
+  "cookie",
+  "idempotency-key",
+  "x-readypackets-delivery",
+  "x-correlation-id",
+]);
+
+export function isValidProductionAuthHeaderName(value: string): boolean {
+  if (value === "") return true;
+  if (!/^[A-Za-z][A-Za-z0-9-]{1,63}$/.test(value)) return false;
+  return !FORBIDDEN_CUSTOM_WEBHOOK_HEADERS.has(value.toLowerCase());
+}
+
+export function isValidProductionWebhookUrl(value: string): boolean {
+  if (!hasNoHeaderInjection(value) || value.length < 10 || value.length > 2048) return false;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:") return false;
+    if (parsed.username !== "" || parsed.password !== "" || parsed.hash !== "") return false;
+    const hostCheck = precheckHost(parsed.hostname);
+    return hostCheck.ok;
+  } catch {
+    return false;
+  }
+}
+
+export const productionConfigSettingSchema = z.strictObject({
+  canonVersion: z
+    .string()
+    .trim()
+    .max(64)
+    .refine(
+      (v) => v === "" || (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(v) && hasNoHeaderInjection(v)),
+      "Enter a valid canon version string.",
+    ),
+  runMode: z
+    .string()
+    .trim()
+    .refine((v) => /^[a-z][a-z0-9_]{0,31}$/.test(v), "Run mode must match ^[a-z][a-z0-9_]{0,31}$."),
+  timeoutMs: z.number().int().min(1_000).max(30_000),
+  authHeaderName: z
+    .string()
+    .trim()
+    .max(64)
+    .refine(isValidProductionAuthHeaderName, "Enter a permitted custom HTTP header name."),
+});
+export type ProductionConfigSetting = z.infer<typeof productionConfigSettingSchema>;
+
+export const DEFAULT_PRODUCTION_CONFIG: ProductionConfigSetting = {
+  canonVersion: "",
+  runMode: "production",
+  timeoutMs: 10_000,
+  authHeaderName: "",
+};
+
 /* ----------------------------------------------------- Platform setting registrations */
 
 export const INTEGRATIONS_SMTP_FLAG = defineFeatureFlag({
@@ -336,6 +402,62 @@ export const INTEGRATIONS_SAML_SCAFFOLD = defineSetting({
   schema: samlScaffoldSettingSchema,
   default: DEFAULT_SAML_SCAFFOLD,
   sensitivity: "internal",
+});
+
+export const INTEGRATIONS_PRODUCTION_FLAG = defineFeatureFlag({
+  flag: "integrations.production",
+  owner: "integrations",
+  group: "integrations",
+  label: "Production webhooks (P101 & P201)",
+  description: "Enable operator-triggered outbound P101/P201 production webhook dispatches to allowlisted HTTPS endpoints.",
+});
+
+export const INTEGRATIONS_PRODUCTION_CONFIG = defineSetting({
+  key: "integrations.production.config",
+  owner: "integrations",
+  group: "integrations",
+  label: "Production webhook parameters",
+  description: "Non-secret canon version, run mode, request timeout, and optional custom auth header name.",
+  schema: productionConfigSettingSchema,
+  default: DEFAULT_PRODUCTION_CONFIG,
+  sensitivity: "internal",
+});
+
+export const INTEGRATIONS_PRODUCTION_P101_URL = defineSecret({
+  key: "integrations.production.p101_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase I (P101) webhook destination URL",
+  description: "Encrypted HTTPS webhook destination URL for Phase I (P101) production dispatches.",
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P101 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
+export const INTEGRATIONS_PRODUCTION_P201_URL = defineSecret({
+  key: "integrations.production.p201_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase II (P201) webhook destination URL",
+  description: "Encrypted HTTPS webhook destination URL for Phase II (P201) production dispatches.",
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P201 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
+export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
+  key: "integrations.production.auth_value",
+  owner: "integrations",
+  group: "integrations",
+  label: "Production webhook authentication header value",
+  description: "Encrypted shared secret or bearer value sent on P101/P201 requests when an auth header name is configured.",
+  schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid authentication header characters."),
 });
 
 /**

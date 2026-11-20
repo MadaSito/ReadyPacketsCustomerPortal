@@ -343,13 +343,18 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
     }
   });
 
-  it("spreads integrationsAdminRoutes and integrationsAdminNav into integrationsFeature", () => {
+  it("spreads integrationsAdminRoutes, productionAdminRoutes, nav, and orderTabs into integrationsFeature", () => {
     expect(integrationsFeature.routes.map((r) => r.path)).toEqual([
       "/admin/integrations",
       "/admin/integrations/smtp",
       "/admin/integrations/analytics",
       "/admin/integrations/egress",
+      "/admin/integrations/production",
     ]);
-    expect(integrationsFeature.nav?.map((n) => n.href)).toEqual(["/admin/integrations"]);
+    expect(integrationsFeature.nav?.map((n) => n.href)).toEqual([
+      "/admin/integrations",
+      "/admin/integrations/production",
+    ]);
+    expect(integrationsFeature.orderTabs?.map((t) => t.key)).toEqual(["production"]);
   });
 });

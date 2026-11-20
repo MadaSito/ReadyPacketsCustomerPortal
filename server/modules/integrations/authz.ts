@@ -66,3 +66,94 @@ export async function assertIntegrationsManageInTx(
     }
   }
 }
+
+export function assertProductionTriggerPreflight(principal: SessionPrincipal): void {
+  if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (!roleHasCapability(principal.role, "orders.production.trigger")) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+}
+
+export async function assertProductionTriggerInTx(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  tx: Tx,
+): Promise<void> {
+  assertProductionTriggerPreflight(principal);
+
+  const assertCurrent = deps.services.identity?.sessions?.assertCurrent;
+  if (typeof assertCurrent === "function") {
+    const current = await assertCurrent(principal, tx);
+    if (current.pendingSteps.length > 0) {
+      throw new DomainError(
+        "REMEDIATION_REQUIRED",
+        "ACCOUNT_STEP_PENDING",
+        "Please finish securing your account to continue.",
+      );
+    }
+    if (!roleHasCapability(current.role, "orders.production.trigger")) {
+      throw forbidden("CAPABILITY_NOT_GRANTED");
+    }
+  }
+}
+
+export function assertProductionResendPreflight(principal: SessionPrincipal, now: Date): void {
+  if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (principal.role !== "admin" || !roleHasCapability(principal.role, "orders.production.trigger")) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+  if (!hasFreshStepUp(principal, now)) {
+    throw new DomainError(
+      "STEP_UP_REQUIRED",
+      "STEP_UP_REQUIRED",
+      "Please confirm your password and authentication code to re-send a production webhook.",
+      { capability: "orders.production.trigger" },
+    );
+  }
+}
+
+export async function assertProductionResendInTx(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  tx: Tx,
+): Promise<void> {
+  const now = deps.clock.now();
+  assertProductionResendPreflight(principal, now);
+
+  const assertCurrent = deps.services.identity?.sessions?.assertCurrent;
+  if (typeof assertCurrent === "function") {
+    const current = await assertCurrent(principal, tx);
+    if (current.pendingSteps.length > 0) {
+      throw new DomainError(
+        "REMEDIATION_REQUIRED",
+        "ACCOUNT_STEP_PENDING",
+        "Please finish securing your account to continue.",
+      );
+    }
+    if (current.role !== "admin" || !roleHasCapability(current.role, "orders.production.trigger")) {
+      throw forbidden("CAPABILITY_NOT_GRANTED");
+    }
+    const stepUpAge = current.stepUpAt ? now.getTime() - current.stepUpAt.getTime() : -1;
+    if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
+      throw new DomainError(
+        "STEP_UP_REQUIRED",
+        "STEP_UP_REQUIRED",
+        "Please confirm your password and authentication code to re-send a production webhook.",
+        { capability: "orders.production.trigger" },
+      );
+    }
+  }
+}
+

@@ -55,6 +55,7 @@ export interface PinnedEgressTarget {
   protocol: EgressProtocol;
   address: string;
   family: 4 | 6;
+  resolvedAddresses?: readonly string[];
   servername?: string;
   normalizedUrl?: string;
   allowlistRulePublicId?: string;
@@ -65,6 +66,8 @@ export interface ResolveEgressInput {
   purpose: EgressPurpose;
   allowedSchemes?: readonly string[];
   allowApprovedPrivate?: boolean;
+  requireAllowlistRule?: boolean;
+  publicAddressesOnly?: boolean;
 }
 
 export interface EgressFetchOptions {
@@ -74,6 +77,8 @@ export interface EgressFetchOptions {
   timeoutMs?: number;
   maxResponseBytes?: number;
   signal?: AbortSignal;
+  requireAllowlistRule?: boolean;
+  publicAddressesOnly?: boolean;
 }
 
 export interface EgressFetchResponse {
@@ -557,7 +562,12 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
   async function evaluateTarget(
     target: EgressTargetInput,
     purpose: EgressPurpose,
-    extra?: { allowedSchemes?: readonly string[]; allowApprovedPrivate?: boolean },
+    extra?: {
+      allowedSchemes?: readonly string[];
+      allowApprovedPrivate?: boolean;
+      requireAllowlistRule?: boolean;
+      publicAddressesOnly?: boolean;
+    },
   ): Promise<PinnedEgressTarget> {
     if (!EGRESS_PURPOSES.includes(purpose)) {
       throw validation("INVALID_EGRESS_PURPOSE", "Unknown outbound egress purpose.");
@@ -724,6 +734,14 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     // Load explicit administrator allowlist rules for this purpose
     const rules = await loadEnabledRulesForPurpose(purpose);
     const matchingRule = findMatchingRule(rules, protocol, port, hostCheck.normalizedHost, resolvedIps);
+    if (extra?.requireAllowlistRule === true && !matchingRule) {
+      recordDenialNote(purpose, "EGRESS_ALLOWLIST_REQUIRED");
+      throw new DomainError(
+        "FORBIDDEN",
+        "EGRESS_ALLOWLIST_REQUIRED",
+        "Outbound destination must match an enabled administrator egress allowlist rule.",
+      );
+    }
     const siemApprovedPrivate = purpose === "siem" && extra?.allowApprovedPrivate === true;
 
     // 2. Validate protocol & port against default policy unless authorized by matching allowlist rule (or SIEM approved destination)
@@ -747,6 +765,14 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
 
     // 3. Validate EVERY resolved IP (prevents round-robin mixed public + private DNS bypass)
     for (const ip of resolvedIps) {
+      if (extra?.publicAddressesOnly === true && ip.classification !== "PUBLIC") {
+        recordDenialNote(purpose, "EGRESS_NON_PUBLIC_ADDRESS_BLOCKED");
+        throw new DomainError(
+          "FORBIDDEN",
+          "EGRESS_NON_PUBLIC_ADDRESS_BLOCKED",
+          "Outbound destination must resolve exclusively to public routable addresses.",
+        );
+      }
       if (ip.classification === "LOOPBACK") {
         // Non-production only (prod already rejected above): still requires explicit private allowlist rule or SIEM approved flag
         const allowedLoopback = Boolean((matchingRule && matchingRule.allowPrivateAddress) || siemApprovedPrivate);
@@ -778,6 +804,7 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       protocol,
       address: primary.normalized,
       family: primary.family,
+      resolvedAddresses: resolvedIps.map((ip) => ip.normalized),
       servername: hostCheck.kind === "dns" ? hostCheck.normalizedHost : undefined,
       normalizedUrl,
       allowlistRulePublicId: matchingRule?.publicId,
@@ -793,11 +820,17 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       return evaluateTarget(input.url, input.purpose, {
         allowedSchemes: input.allowedSchemes,
         allowApprovedPrivate: input.allowApprovedPrivate,
+        requireAllowlistRule: input.requireAllowlistRule,
+        publicAddressesOnly: input.publicAddressesOnly,
       });
     },
 
     async fetchPinned(url, purpose, fetchOptions = {}) {
-      const pinned = await evaluateTarget(url, purpose, { allowedSchemes: ["https:"] });
+      const pinned = await evaluateTarget(url, purpose, {
+        allowedSchemes: ["https:"],
+        requireAllowlistRule: fetchOptions.requireAllowlistRule,
+        publicAddressesOnly: fetchOptions.publicAddressesOnly,
+      });
       const parsedUrl = new URL(pinned.normalizedUrl ?? String(url));
       const resp = await requester(pinned, parsedUrl, {
         method: fetchOptions.method ?? "GET",
