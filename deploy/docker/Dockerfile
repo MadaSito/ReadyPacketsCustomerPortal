@@ -4,7 +4,7 @@
 # The build recipe mirrors deploy/lib.sh (frozen lockfile, hoisted production tree, no demo seed).
 # Base images are pinned by multi-architecture index digest; Dependabot proposes updates.
 
-FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS build
+FROM node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS build
 ENV CI=true \
     npm_config_update_notifier=false \
     npm_config_fund=false
@@ -28,7 +28,7 @@ RUN pnpm build \
          -a -f data/catalog/readypackets-offerings-v3.0.json -a -f data/catalog/offerings.schema.json \
     && chmod -R go-w package.json node_modules dist migrations data/catalog
 
-FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS runtime
+FROM node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS runtime
 # openssl is used once by init-secrets.sh. The package managers are removed: nothing is installed at run time.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl ca-certificates \
