@@ -19,7 +19,7 @@ export const jobsRouter = router({
     detail: read.input(idInput).query(({ ctx, input }) => ctx.services.jobAdmin.detail(ctx.session, input.publicId)),
     cancel: manage.input(idInput).mutation(({ ctx, input }) => ctx.services.jobAdmin.cancel(ctx.session, input.publicId)),
     retry: manage.input(idInput).mutation(({ ctx, input }) => ctx.services.jobAdmin.retry(ctx.session, input.publicId)),
-    acknowledgeUnknown: maintenanceManage.input(idInput).mutation(({ ctx, input }) =>
+    acknowledgeUnknown: maintenanceManage.input(z.strictObject({ publicId, confirmation: z.literal("RECONCILED") })).mutation(({ ctx, input }) =>
       ctx.services.jobAdmin.acknowledgeUnknown(ctx.session, input.publicId)),
     schedules: read.query(({ ctx }) => ctx.services.jobAdmin.schedules(ctx.session)),
     listMail: read.input(z.strictObject({ ...page, state: z.enum(MAIL_STATES).optional() }))

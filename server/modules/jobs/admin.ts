@@ -133,7 +133,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
       const { id, ...publicJob } = job;
       const attempts = await db.select({
         attempt: jobAttempts.attempt, state: jobAttempts.state, reasonCode: jobAttempts.reasonCode,
-        startedAt: jobAttempts.startedAt, finishedAt: jobAttempts.finishedAt,
+        startedAt: jobAttempts.startedAt, finishedAt: jobAttempts.finishedAt, safeCounts: jobAttempts.safeCounts,
       }).from(jobAttempts).where(eq(jobAttempts.jobId, id)).orderBy(desc(jobAttempts.attempt)).limit(50);
       return { ...publicJob, attempts };
     },

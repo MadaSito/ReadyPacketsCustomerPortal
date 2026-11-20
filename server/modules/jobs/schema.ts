@@ -36,7 +36,8 @@ export const jobRuns = mysqlTable("job_runs", {
   uniqueIndex("job_runs_schedule_slot_uq").on(t.scheduleName, t.scheduleSlot),
   index("job_runs_ready_ix").on(t.state, t.runAt, t.id),
   index("job_runs_stale_ix").on(t.state, t.leaseUntil, t.id),
-  index("job_runs_type_ix").on(t.type, t.id),
+  index("job_runs_type_ix").on(t.type, t.publicId),
+  index("job_runs_state_public_ix").on(t.state, t.publicId),
 ]);
 
 export const jobAttempts = mysqlTable("job_attempts", {
@@ -74,7 +75,7 @@ export const mailOutbox = mysqlTable("mail_outbox", {
   updatedAt: updatedAtColumn(),
 }, (t) => [
   uniqueIndex("mail_outbox_key_uq").on(t.idempotencyHash),
-  index("mail_outbox_state_ix").on(t.state, t.id),
+  index("mail_outbox_state_ix").on(t.state, t.publicId),
   index("mail_outbox_expiry_ix").on(t.expiresAt, t.id),
   index("mail_outbox_job_ix").on(t.jobPublicId),
 ]);

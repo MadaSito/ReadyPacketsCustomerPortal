@@ -71,11 +71,12 @@ export async function gateDraining(tx: Tx, mode: "share" | "update" = "share"): 
 
 export function jobAudit(
   deps: QueueDeps, tx: Tx, job: Pick<JobRow, "publicId" | "correlationId">,
-  eventName: string, outcome: AuditOutcome, reasonCode?: string, system = false,
+  eventName: string, outcome: AuditOutcome, reasonCode?: string, system = false, counts?: Record<string, number>,
 ): Promise<void> {
   return deps.audit.record({
     category: "job", eventName, outcome, reasonCode, action: "transition",
     resource: { type: "job", publicId: job.publicId }, jobId: job.publicId, correlationId: job.correlationId,
+    safeCounts: counts,
     ...(system ? { actor: { role: "system" } } : {}),
   }, tx);
 }
@@ -89,8 +90,8 @@ function workerContext<T>(deps: QueueDeps, job: Pick<JobRow, "correlationId">, f
 
 function safeCounts(counts: Record<string, number> | undefined): Record<string, number> | undefined {
   if (!counts) return undefined;
-  return Object.fromEntries(Object.entries(counts).slice(0, 20).filter(([key, value]) =>
-    /^[a-zA-Z][a-zA-Z0-9_]{0,49}$/.test(key) && Number.isSafeInteger(value) && value >= 0));
+  return Object.fromEntries(Object.entries(counts).slice(0, 16).filter(([key, value]) =>
+    /^[a-z][a-z0-9_]{0,39}$/.test(key) && Number.isSafeInteger(value) && value >= 0));
 }
 
 const engines = new WeakMap<JobQueue, JobEngine>();
@@ -259,7 +260,8 @@ export class JobEngine implements JobQueue {
       if (!owned) claim.controller.abort();
     } catch {
       claim.controller.abort();
-      this.deps.logger.warn("job heartbeat unavailable", { component: "jobs.queue" });
+      workerContext(this.deps, claim.job, () =>
+        this.deps.logger.warn("job heartbeat unavailable", { component: "jobs.queue", jobId: claim.job.jobId }));
     }
   }
 
@@ -357,7 +359,7 @@ export class JobEngine implements JobQueue {
     if (row.type === "jobs.mail.deliver" && !queued) await this.#settleInterruptedMail(tx, row, now);
     if (outcome !== "interrupted") {
       const event = ({ completed: "job.completed", failed: "job.failed", canceled: "job.canceled", unknown: "job.unknown" })[outcome];
-      await jobAudit(deps, tx, row, event, outcome, reasonCode, true);
+      await jobAudit(deps, tx, row, event, outcome, reasonCode, true, counts);
     } else {
       await jobAudit(deps, tx, row, state === "unknown" ? "job.unknown" : "job.failed",
         state === "unknown" ? "unknown" : "failed", reasonCode, true);

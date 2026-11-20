@@ -1,21 +1,25 @@
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
+import { createCallerFactory } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
+import { createAuditEmitter } from "../audit/emitter.js";
+import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import { createJobQueue, createMailer, engineFor, LEASE_MS } from "./queue.js";
+import { jobsRouter } from "./router.js";
 import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox } from "./schema.js";
 import { startWorker } from "./worker.js";
 
 let t: TestDb;
 beforeAll(async () => {
-  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, mailOutbox, mailAttempts } });
+  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, mailOutbox, mailAttempts, auditEvents } });
 });
 afterAll(async () => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [jobAttempts, mailAttempts, mailOutbox, jobRuns, jobMaintenance]) await t.db.delete(table);
+  for (const table of [jobAttempts, mailAttempts, mailOutbox, jobRuns, jobMaintenance, auditEvents]) await t.db.delete(table);
 });
 
 const done = async () => ({ outcome: "completed" as const });
@@ -141,6 +145,27 @@ describe("MySQL durable job leases", () => {
     expect(await t.db.select().from(jobAttempts)).toHaveLength(0);
   });
 
+  it("writes canonically correlated audit rows, and rolls the audit row back with its caller", async () => {
+    const h = createTestDeps({ db: t.db });
+    const jobs = createJobQueue({ ...h.deps, audit: createAuditEmitter(h.deps) });
+    const engine = engineFor(jobs)!;
+    jobs.register("test.audit", done);
+    await expect(t.db.transaction(async (tx) => {
+      await jobs.enqueue("test.audit", null, { correlationId: "rollback_workflow" }, tx);
+      throw new Error("caller refused");
+    })).rejects.toThrow("caller refused");
+    expect(await t.db.select().from(auditEvents)).toHaveLength(0);
+    const { jobId } = await jobs.enqueue("test.audit", null, { correlationId: "workflow_persisted" });
+    await engine.execute((await engine.claim())!);
+    const events = await t.db.select().from(auditEvents).where(eq(auditEvents.correlationId, "workflow_persisted"));
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventName: "job.enqueued", jobId, durability: "durable" }),
+      expect.objectContaining({ eventName: "job.claimed", jobId, actorRole: "system", origin: "worker" }),
+      expect.objectContaining({ eventName: "job.completed", jobId, actorRole: "system", origin: "worker" }),
+    ]));
+    expect(events).toHaveLength(3);
+  });
+
   it("rejects wrong roles, remediation sessions, missing or future step-up, and bad pagination", async () => {
     const f = fixture();
     await expect(f.admin.list(fakePrincipal({ role: "staff" }), {})).rejects.toMatchObject({ code: "FORBIDDEN" });
@@ -150,6 +175,34 @@ describe("MySQL durable job leases", () => {
     await expect(f.admin.capture(future, "not-a-public-id")).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
     await expect(f.admin.list(f.operator, { limit: 101 })).rejects.toMatchObject({ reasonCode: "INVALID_PAGE_LIMIT" });
     expect(f.h.audit.named("job.admin.denied")).toHaveLength(4);
+  });
+
+  it("enforces router validation and keeps the public maintenance response free of operational details", async () => {
+    const f = fixture();
+    f.h.services.jobAdmin = { ...f.admin, startWorker: async () => { throw new Error("unexpected worker start"); } };
+    const caller = createCallerFactory(jobsRouter);
+    const publicContext = {
+      services: f.h.services, request: newRequestContext("test"),
+      transport: { issue: () => {}, clear: () => {} },
+    };
+    await expect(caller({ ...publicContext, session: null }).admin.list({})).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller({ ...publicContext, session: f.operator }).admin.detail({ publicId: "invalid" }))
+      .rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
+    expect(await caller({ ...publicContext, session: null }).maintenanceBanner()).toEqual({
+      active: true, message: "Maintenance is in progress. Some operations are temporarily unavailable.",
+    });
+  });
+
+  it("permits one manual attempt after exhausted retryable failure, without resetting the fence", async () => {
+    const f = fixture();
+    f.jobs.register("test.rejected", async () => ({ outcome: "failed", reasonCode: "REJECTED", retryable: true }));
+    const { jobId } = await f.jobs.enqueue("test.rejected", null, { maxAttempts: 1 });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({ state: "failed", allowRetry: true, attempt: 1 });
+    await f.admin.retry(f.operator, jobId);
+    const retried = (await f.engine.claim())!;
+    expect(retried.job).toMatchObject({ jobId, attempt: 2, fencingToken: 2 });
   });
 
   it("single-fires a slot across schedulers and skips missed slots after drain", async () => {
@@ -193,6 +246,32 @@ describe("MySQL durable job leases", () => {
     } finally {
       release.resolve();
       await worker.stop();
+    }
+  });
+
+  it("refuses to confirm shutdown and marks still-unsettled work unknown", async () => {
+    const f = fixture();
+    const started = latch();
+    const release = latch();
+    const returned = latch();
+    let signal: AbortSignal | undefined;
+    f.jobs.register("test.stubborn", async (job) => {
+      signal = job.signal;
+      started.resolve();
+      await release.promise;
+      returned.resolve();
+      return { outcome: "completed" };
+    });
+    const { jobId } = await f.jobs.enqueue("test.stubborn", null);
+    const worker = startWorker(f.engine, { grace: 20, abort: 100 });
+    try {
+      await started.promise;
+      await expect(worker.stop()).rejects.toMatchObject({ reasonCode: "WORKER_STOP_UNPROVED" });
+      expect(signal?.aborted).toBe(true);
+      expect(await f.admin.detail(f.operator, jobId)).toMatchObject({ state: "unknown" });
+    } finally {
+      release.resolve();
+      await returned.promise;
     }
   });
 });
@@ -259,6 +338,36 @@ describe("MySQL transactional mail outbox", () => {
     expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
     expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
     await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+  });
+
+  it("fences a late SMTP success after reaping an interrupted provider call", async () => {
+    const f = fixture();
+    const entered = latch();
+    const release = latch();
+    f.mail.registerDelivery({
+      findRecipient: async () => ({ email: "current@example.test", status: "active" }),
+      send: async () => {
+        entered.resolve();
+        await release.promise;
+        return { outcome: "accepted" };
+      },
+    });
+    f.mailer.registerTemplate({ key: "test.mail", vars: ["link", "name"], subject: () => "Test", text: () => "Testing" });
+    await f.mailer.enqueue(input);
+    const active = (await f.engine.claim())!;
+    const execution = f.engine.execute(active);
+    try {
+      await entered.promise;
+      f.h.clock.advance(LEASE_MS + 1);
+      expect(await f.engine.reap()).toBe(1);
+    } finally {
+      release.resolve();
+      await execution;
+    }
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(active.job.signal.aborted).toBe(true);
+    expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
+    expect((await f.admin.mailDetail(f.operator, row!.publicId)).attempts[0]?.state).toBe("unknown");
   });
 
   it("allows an explicit capture in test, encrypts it, and denies expired data", async () => {

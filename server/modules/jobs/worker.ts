@@ -14,7 +14,7 @@ const CONCURRENCY = 2;
 const GRACE_MS = 12_000;
 const ABORT_SETTLE_MS = 3_000;
 
-export function startWorker(engine: JobEngine): WorkerHandle {
+export function startWorker(engine: JobEngine, stopWindows = { grace: GRACE_MS, abort: ABORT_SETTLE_MS }): WorkerHandle {
   const { clock, logger } = engine.deps;
   let stopping = false;
   let inFlightTick: Promise<void> | undefined;
@@ -60,7 +60,9 @@ export function startWorker(engine: JobEngine): WorkerHandle {
       const run = engine.execute(claim).catch(() => {
         claim.controller.abort();
         unresolved.add(claim);
-        logger.error("job disposition unavailable", { component: "jobs.queue" });
+        logger.error("job disposition unavailable", {
+          component: "jobs.queue", jobId: claim.job.jobId, correlationId: claim.job.correlationId,
+        });
       }).finally(() => active.delete(claim));
       active.set(claim, run);
     }
@@ -99,9 +101,9 @@ export function startWorker(engine: JobEngine): WorkerHandle {
     stopping = true;
     clearInterval(pollTimer);
     try {
-      if (!await settled(GRACE_MS)) {
+      if (!await settled(stopWindows.grace)) {
         for (const claim of active.keys()) claim.controller.abort();
-        await settled(ABORT_SETTLE_MS);
+        await settled(stopWindows.abort);
       }
     } finally {
       clearInterval(heartbeatTimer);
@@ -113,7 +115,7 @@ export function startWorker(engine: JobEngine): WorkerHandle {
         Promise.all(interrupted.map(async (claim) => {
           try { return await engine.interrupt(claim); } catch { return false; }
         })).then((results) => results.every(Boolean)),
-        delay(ABORT_SETTLE_MS, false, { signal: timer.signal }),
+        delay(stopWindows.abort, false, { signal: timer.signal }),
       ]);
       if (!confirmed || unconfirmed || active.size > 0 || inFlightTick || inFlightHeartbeat) {
         throw new DomainError("UNKNOWN_OUTCOME", "WORKER_STOP_UNPROVED", "The worker could not confirm that all work stopped.");
