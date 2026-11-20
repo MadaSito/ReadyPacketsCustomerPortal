@@ -24,14 +24,19 @@ import { newRequestContext, runWithRequestContext } from "../../../core/requestC
 import type { Db, SessionPrincipal, Tx } from "../../../core/types.js";
 import type { UserView } from "../../identity/index.js";
 import type { OrderAccessView, OrderLockState, OrderProductionScope } from "../../orders/types.js";
+import { createConfigTransfer } from "../../platform/configTransfer.js";
 import { platformSettings } from "../../platform/schema.js";
 import { createSettingsStore } from "../../platform/settingsStore.js";
+import { STEP_UP_MAX_AGE_MS } from "../../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import {
   createIntegrationsModule,
   PRODUCTION_DELIVERY_JOB,
   PRODUCTION_MAX_ATTEMPTS,
+  PRODUCTION_RECONCILE_JOB,
+  PRODUCTION_SENDING_GRACE_MS,
+  PRODUCTION_STALE_QUEUED_MS,
   type EgressFetchResponse,
   type IntegrationsModule,
   type PinnedEgressTarget,
@@ -43,6 +48,10 @@ import {
   integrationProviderChecks,
   integrationWebhookEvents,
 } from "../schema.js";
+import {
+  INTEGRATIONS_PRODUCTION_AUTH_VALUE,
+  INTEGRATIONS_PRODUCTION_P101_URL,
+} from "../settings.js";
 
 const P101_TEST_URL = "https://hooks.production.example.test/webhooks/p101-secret-9876";
 const P201_TEST_URL = "https://hooks.production.example.test/webhooks/p201-secret-4321";
@@ -412,11 +421,17 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(serializedDb).not.toContain(P201_TEST_URL);
     expect(serializedDb).not.toContain("wh_live_super_secret_token_value");
 
-    // Verify audit never carries URLs or auth header secret
+    // Verify audit never carries URLs, auth header secret, OR auth_header_name (PW-07)
     const settingsAudit = h.audit.events.find(
       (e) => e.eventName === "integration.production.settings.changed",
     );
     expect(settingsAudit).toBeDefined();
+    expect(settingsAudit?.attributes).toMatchObject({
+      auth_header_configured: true,
+      auth_header_value_configured: true,
+    });
+    expect("auth_header_name" in (settingsAudit?.attributes ?? {})).toBe(false);
+    expect(JSON.stringify(settingsAudit)).not.toContain("X-Webhook-Token");
     expect(JSON.stringify(settingsAudit)).not.toContain("p101-secret");
     expect(JSON.stringify(settingsAudit)).not.toContain("wh_live_super_secret_token_value");
   });
@@ -506,7 +521,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     await expect(customerCaller.production.order.history({ orderPublicId })).rejects.toThrow(TRPCError);
     await expect(customerCaller.production.settings.get()).rejects.toThrow(TRPCError);
 
-    // Staff sees masked client_name and client_email
+    // Staff sees masked client_name and client_email, and omitted releaseStatus defaults to "" (PW-08)
     const staffCaller = createCaller(staff);
     const staffPreview = await staffCaller.production.order.preview({ orderPublicId });
     expect(staffPreview.p101.eligible).toBe(true);
@@ -515,6 +530,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(staffPreview.p101.payload?.client_email).toBe("a***@acme.example.test");
     expect(staffPreview.p101.payload?.packet).toBe("7");
     expect(staffPreview.p101.payload?.tier).toBe("Mixed");
+    expect(staffPreview.p101.payload?.release_status).toBe("");
 
     // Admin sees unmasked client_name and client_email
     const adminCaller = createCaller(admin);
@@ -591,7 +607,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     nextHttpHandler = async () => ({
       status: 200,
       headers: { "content-type": "application/json" },
-      body: Buffer.from(`{"ok":true,"note":"${"X".repeat(260)}\\u0007\\n"}`, "utf8"),
+      body: Buffer.from('{"ok":true,"receiver_secret":"REMOTE_ECHO_SECRET_999","ssn":"000-11-2222"}', "utf8"),
     });
 
     const jobResults = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
@@ -625,15 +641,16 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     });
     expect("order_scope_mode" in sentP101Json).toBe(false);
 
-    // After delivery, payload_enc MUST be cleared (NULL) and responseSummary sanitized + capped to 200 chars!
+    // PW-01: After delivery, payload_enc MUST be cleared (NULL) and responseSummary MUST be fixed local status ONLY!
     const [deliveredDbRow] = await tdb.db
       .select()
       .from(integrationProductionDispatches)
       .where(eq(integrationProductionDispatches.publicId, queuedP101.publicId));
     expect(deliveredDbRow?.state).toBe("delivered");
     expect(deliveredDbRow?.payloadEnc).toBeNull();
-    expect(deliveredDbRow?.responseSummary?.length).toBe(200);
-    expect(deliveredDbRow?.responseSummary).not.toContain("\u0007");
+    expect(deliveredDbRow?.responseSummary).toBe("HTTP 200 — Accepted by production pipeline.");
+    expect(JSON.stringify(deliveredDbRow)).not.toContain("REMOTE_ECHO_SECRET_999");
+    expect(JSON.stringify(deliveredDbRow)).not.toContain("000-11-2222");
 
     // Duplicate P101 request is refused
     await expect(staffCaller.production.order.requestP101({ orderPublicId })).rejects.toThrow(TRPCError);
@@ -823,13 +840,17 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     const resent = await createCaller(admin).production.order.resend({
       orderPublicId,
       phase: "P101",
-      reason: "Downstream recovered after maintenance",
+      reason: "Downstream recovered after maintenance — contact jane.secret@example.test",
     });
     expect(resent.publicId).not.toBe(dispatch.publicId);
-    expect(resent.resendReason).toBe("Downstream recovered after maintenance");
+    // PW-07: Only controlled code is stored/projected/audited; raw operator prose is NEVER stored!
+    expect(resent.resendReason).toBe("OPERATOR_RETRY_AFTER_DEAD_LETTER");
+    expect(JSON.stringify(resent)).not.toContain("jane.secret@example.test");
+    expect(JSON.stringify(h.audit.events)).not.toContain("jane.secret@example.test");
     expect(h.audit.events.some((e) => e.eventName === "integration.production.dispatch.resent")).toBe(true);
 
-    // Simulate a crashed worker leaving `sending` in DB -> handler MUST NOT auto-replay (`outcome: "unknown"`)!
+    // Simulate a crashed worker leaving `sending` in DB -> handler MUST NOT auto-replay (`outcome: "unknown"`)
+    // AND MUST immediately scrub `payloadEnc` + mark terminal `failed` so resend is never blocked forever (PW-02)!
     await tdb.db
       .update(integrationProductionDispatches)
       .set({ state: "sending" })
@@ -850,6 +871,14 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       reasonCode: "PRODUCTION_AMBIGUOUS_IN_FLIGHT",
     });
     expect(httpCalls).toHaveLength(beforeCalls);
+
+    const [scrubbedAmbiguous] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, resent.publicId));
+    expect(scrubbedAmbiguous?.state).toBe("failed");
+    expect(scrubbedAmbiguous?.payloadEnc).toBeNull();
+    expect(scrubbedAmbiguous?.lastReasonCode).toBe("PRODUCTION_AMBIGUOUS_IN_FLIGHT");
   });
 
   it("aborts mutations when session is revoked in-tx and never deadlocks on a 1-connection pool", async () => {
@@ -979,12 +1008,12 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(row1?.state).toBe("failed");
     expect(row1?.payloadEnc).toBeNull();
 
-    // 2. 422 response -> immediate non-retryable `PRODUCTION_HTTP_4XX` + `payload_enc = NULL`
+    // 2. 422 response -> immediate non-retryable `PRODUCTION_HTTP_4XX` + `payload_enc = NULL` + zero remote body stored (PW-01)
     const d2 = await staffCaller.production.order.requestP101({ orderPublicId: o2.orderPublicId });
     nextHttpHandler = async () => ({
       status: 422,
       headers: {},
-      body: Buffer.from("invalid canon_version", "utf8"),
+      body: Buffer.from("invalid canon_version; debug_token=SECRET_422_TOKEN; client=alice@secret.test", "utf8"),
     });
     const [r2] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
     expect(r2).toEqual({
@@ -999,6 +1028,9 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     expect(row2?.state).toBe("failed");
     expect(row2?.payloadEnc).toBeNull();
     expect(row2?.httpStatus).toBe(422);
+    expect(row2?.responseSummary).toBe("HTTP 422 — Rejected by production pipeline (client error; not retried).");
+    expect(JSON.stringify(row2)).not.toContain("SECRET_422_TOKEN");
+    expect(JSON.stringify(row2)).not.toContain("alice@secret.test");
 
     // 3. Admin dispatch log filters by orderReference prefix and state; staff is forbidden
     await expect(staffCaller.production.admin.listDispatches({})).rejects.toThrow(TRPCError);
@@ -1009,5 +1041,364 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     });
     expect(filtered.items).toHaveLength(1);
     expect(filtered.items[0]?.publicId).toBe(d2.publicId);
+    expect(filtered.items[0]?.responseSummary).toBe(
+      "HTTP 422 — Rejected by production pipeline (client error; not retried).",
+    );
+  });
+
+  it("reconciles interrupted sending and stalled queued dispatches on bounded timeouts, scrubs payload_enc, and unblocks resend without auto-replay (PW-02)", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(admin);
+
+    // Verify background reconciliation schedule is registered
+    expect(h.jobs.schedules.some((s) => s.type === PRODUCTION_RECONCILE_JOB && s.everyMs === 60_000)).toBe(true);
+
+    // 1. Orphaned `sending` row where worker crashed mid-flight (`payloadEnc != null`, job vanished because `retrySafe: false`)
+    const oSend = seedOrderAndCustomer({
+      orderId: 601,
+      orderPublicId: "01JORDER000000000000000601",
+      reference: "ORD-STALE-SEND-601",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+    const staffCaller = createCaller(staff);
+    const dSend = await staffCaller.production.order.requestP101({ orderPublicId: oSend.orderPublicId });
+    h.jobs.enqueued = []; // simulate reaped `retrySafe: false` worker job
+
+    await tdb.db
+      .update(integrationProductionDispatches)
+      .set({ state: "sending", attemptCount: 1, updatedAt: h.clock.now() })
+      .where(eq(integrationProductionDispatches.publicId, dSend.publicId));
+
+    // Before timeout (`timeoutMs` = 12_000 + grace 30_000 = 42_000ms), resend is still refused as in-progress
+    h.clock.advance(10_000);
+    await expect(
+      createCaller(makeStepUpAdmin(h)).production.order.resend({
+        orderPublicId: oSend.orderPublicId,
+        phase: "P101",
+        reason: "Checking before timeout expires",
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+
+    // Advance past `timeoutMs + PRODUCTION_SENDING_GRACE_MS` and run background `PRODUCTION_RECONCILE_JOB`
+    h.clock.advance(12_000 + PRODUCTION_SENDING_GRACE_MS + 1_000);
+    const reconcileHandler = h.jobs.handlers.get(PRODUCTION_RECONCILE_JOB)!;
+    const recRes = await reconcileHandler({
+      jobId: "job_reconcile_1",
+      type: PRODUCTION_RECONCILE_JOB,
+      payload: {} as never,
+      attempt: 1,
+      fencingToken: 1,
+      correlationId: "corr_reconcile_1",
+      signal: new AbortController().signal,
+      assertStillOwned: async () => {},
+    });
+    expect(recRes).toEqual({ outcome: "completed" });
+    expect(httpCalls).toHaveLength(0); // NEVER auto-replays HTTP!
+
+    const [reconciledSend] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dSend.publicId));
+    expect(reconciledSend?.state).toBe("failed");
+    expect(reconciledSend?.payloadEnc).toBeNull();
+    expect(reconciledSend?.lastReasonCode).toBe("PRODUCTION_DELIVERY_INTERRUPTED");
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.failed" &&
+          e.reasonCode === "PRODUCTION_DELIVERY_INTERRUPTED" &&
+          e.attributes?.reconciled === true &&
+          e.attributes?.delivery_uncertain === true,
+      ),
+    ).toBe(true);
+
+    // Admin with fresh step-up can now resend — never permanently blocked!
+    const freshAdmin = makeStepUpAdmin(h);
+    const unblockedResend = await createCaller(freshAdmin).production.order.resend({
+      orderPublicId: oSend.orderPublicId,
+      phase: "P101",
+      reason: "Confirmed downstream did not receive interrupted run",
+    });
+    expect(unblockedResend.state).toBe("queued");
+    expect(unblockedResend.resendReason).toBe("OPERATOR_RETRY_AFTER_INTERRUPTION");
+
+    // 2. Orphaned `queued` row past `PRODUCTION_STALE_QUEUED_MS` is also scrubbed on synchronous `resend` / `history`
+    const oQueue = seedOrderAndCustomer({
+      orderId: 602,
+      orderPublicId: "01JORDER000000000000000602",
+      reference: "ORD-STALE-QUEUE-602",
+      packets: [{ packetNumber: 4, tier: "Premium" }],
+    });
+    const dQueue = await staffCaller.production.order.requestP101({ orderPublicId: oQueue.orderPublicId });
+    h.jobs.enqueued = [];
+
+    h.clock.advance(PRODUCTION_STALE_QUEUED_MS + 5_000);
+    const histAfterStall = await staffCaller.production.order.history({ orderPublicId: oQueue.orderPublicId });
+    expect(histAfterStall.items[0]?.state).toBe("failed");
+    expect(histAfterStall.items[0]?.lastReasonCode).toBe("PRODUCTION_QUEUE_STALLED");
+
+    const [reconciledQueue] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dQueue.publicId));
+    expect(reconciledQueue?.payloadEnc).toBeNull();
+  });
+
+  it("pins dispatches to their authorized destination fingerprint and cancels queued/retried sends on URL or auth drift (PW-04)", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(admin);
+
+    dnsAnswers["new-hooks.production.example.test"] = [{ address: "93.184.216.35", family: 4 }];
+    await mod.egress.createAllowlistRule(admin, {
+      purpose: "webhook",
+      matchType: "host",
+      pattern: "new-hooks.production.example.test",
+      port: 443,
+      protocol: "https:",
+      allowPrivateAddress: false,
+      justification: "Secondary production webhook receiver",
+    });
+
+    // 1. Changing P101 URL via `settings.update` after queueing cancels queued dispatch with DESTINATION_CHANGED
+    const o1 = seedOrderAndCustomer({
+      orderId: 701,
+      orderPublicId: "01JORDER000000000000000701",
+      reference: "ORD-DEST-URL-701",
+      packets: [{ packetNumber: 2, tier: "Basic" }],
+    });
+    const staffCaller = createCaller(staff);
+    const dUrl = await staffCaller.production.order.requestP101({ orderPublicId: o1.orderPublicId });
+
+    await mod.production.updateSettings(admin, {
+      enabled: true,
+      p101Url: "https://new-hooks.production.example.test/webhooks/p101-rotated-0001",
+      canonVersion: "v3.0",
+      runMode: "production",
+    });
+
+    const [resUrl] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(resUrl).toEqual({
+      outcome: "failed",
+      reasonCode: "DESTINATION_CHANGED",
+      retryable: false,
+    });
+    expect(httpCalls).toHaveLength(0); // ZERO HTTP calls to the new endpoint!
+
+    const [rowUrl] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dUrl.publicId));
+    expect(rowUrl?.state).toBe("failed");
+    expect(rowUrl?.payloadEnc).toBeNull();
+    expect(rowUrl?.lastReasonCode).toBe("DESTINATION_CHANGED");
+
+    // 2. Direct secret mutation via generic `deps.settings.setSecret` (bypassing `integrations.production.settings.update`)
+    // ALSO triggers DESTINATION_CHANGED before any network call!
+    const o2 = seedOrderAndCustomer({
+      orderId: 702,
+      orderPublicId: "01JORDER000000000000000702",
+      reference: "ORD-DEST-AUTH-702",
+      packets: [{ packetNumber: 3, tier: "Standard" }],
+    });
+    const dAuth = await staffCaller.production.order.requestP101({ orderPublicId: o2.orderPublicId });
+
+    await h.deps.settings.setSecret(INTEGRATIONS_PRODUCTION_AUTH_VALUE.key, "wh_rotated_via_platform_secret_store");
+
+    const [resAuth] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(resAuth).toEqual({
+      outcome: "failed",
+      reasonCode: "DESTINATION_CHANGED",
+      retryable: false,
+    });
+    expect(httpCalls).toHaveLength(0);
+
+    const [rowAuth] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, dAuth.publicId));
+    expect(rowAuth?.state).toBe("failed");
+    expect(rowAuth?.payloadEnc).toBeNull();
+    expect(rowAuth?.lastReasonCode).toBe("DESTINATION_CHANGED");
+
+    // Also verify `destinationFingerprint` is internal-only and never projected to API callers
+    const history = await staffCaller.production.order.history({ orderPublicId: o2.orderPublicId });
+    expect("destinationFingerprint" in (history.items[0] ?? {})).toBe(false);
+  });
+
+  it("revalidates order legal hold, owner reassignment, and cancellation in worker immediately before send and clears payload_enc (PW-03)", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(admin);
+    const staffCaller = createCaller(staff);
+
+    // 1. Legal hold applied after queueing -> `ORDER_LOCKED`, zero HTTP, `payload_enc = NULL`
+    const oHold = seedOrderAndCustomer({
+      orderId: 801,
+      orderPublicId: "01JORDER000000000000000801",
+      reference: "ORD-HOLD-801",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+    const dHold = await staffCaller.production.order.requestP101({ orderPublicId: oHold.orderPublicId });
+    mockOrders.get(oHold.orderPublicId)!.scope.lockState = "legal_hold";
+
+    // 2. Order reassigned to a different customer after queueing -> `ORDER_OWNER_CHANGED`, zero HTTP, `payload_enc = NULL`
+    const oReassign = seedOrderAndCustomer({
+      orderId: 802,
+      orderPublicId: "01JORDER000000000000000802",
+      reference: "ORD-REASSIGN-802",
+      packets: [{ packetNumber: 2, tier: "Standard" }],
+    });
+    const dReassign = await staffCaller.production.order.requestP101({ orderPublicId: oReassign.orderPublicId });
+    mockUsers.set(9999, {
+      ...mockUsers.get(oReassign.ownerUserId)!,
+      id: 9999,
+      publicId: "01JUSER0000000000000009999",
+      email: "other.owner@client.example.test",
+    });
+    mockOrders.get(oReassign.orderPublicId)!.scope.ownerUserId = 9999;
+
+    // 3. Order canceled after queueing -> `ORDER_CANCELED`, zero HTTP, `payload_enc = NULL`
+    const oCancel = seedOrderAndCustomer({
+      orderId: 803,
+      orderPublicId: "01JORDER000000000000000803",
+      reference: "ORD-CANCEL-803",
+      packets: [{ packetNumber: 5, tier: "Premium" }],
+    });
+    const dCancel = await staffCaller.production.order.requestP101({ orderPublicId: oCancel.orderPublicId });
+    mockOrders.get(oCancel.orderPublicId)!.scope.statusKey = "canceled";
+
+    const results = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(results).toEqual([
+      { outcome: "failed", reasonCode: "ORDER_LOCKED", retryable: false },
+      { outcome: "failed", reasonCode: "ORDER_OWNER_CHANGED", retryable: false },
+      { outcome: "failed", reasonCode: "ORDER_CANCELED", retryable: false },
+    ]);
+    expect(httpCalls).toHaveLength(0);
+
+    for (const [pubId, expectedCode] of [
+      [dHold.publicId, "ORDER_LOCKED"],
+      [dReassign.publicId, "ORDER_OWNER_CHANGED"],
+      [dCancel.publicId, "ORDER_CANCELED"],
+    ] as const) {
+      const [row] = await tdb.db
+        .select()
+        .from(integrationProductionDispatches)
+        .where(eq(integrationProductionDispatches.publicId, pubId));
+      expect(row?.state).toBe("failed");
+      expect(row?.payloadEnc).toBeNull();
+      expect(row?.lastReasonCode).toBe(expectedCode);
+    }
+  });
+
+  it("acquires order lock before identity lock, fails closed when identity is absent, and rechecks step-up freshness post-lock (PW-05 & PW-06)", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(admin);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 901,
+      orderPublicId: "01JORDER000000000000000901",
+      reference: "ORD-LOCK-ORDER-901",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+
+    // 1. Verify lock acquisition order: `orders.assertCanReadOrder(..., { forUpdate: true })` BEFORE `identity.sessions.assertCurrent`
+    const lockEvents: string[] = [];
+    vi.mocked(h.services.orders.assertCanReadOrder).mockImplementation(async (principal, pubId, opts) => {
+      lockEvents.push(opts?.forUpdate ? "orders:forUpdate" : "orders:read");
+      const entry = mockOrders.get(pubId);
+      if (!entry) throw new DomainError("NOT_FOUND", "ORDER_NOT_FOUND", "Order not found.");
+      return {
+        ...entry.access,
+        accessRole: principal.role === "admin" ? "admin" : "staff",
+      };
+    });
+    vi.mocked(h.services.identity.sessions.assertCurrent).mockImplementation(async (principal) => {
+      lockEvents.push("identity:assertCurrent");
+      return {
+        pendingSteps: [...principal.pendingSteps],
+        role: principal.role,
+        stepUpAt: principal.stepUpAt,
+        mfaVerifiedAt: principal.mfaVerifiedAt,
+      };
+    });
+
+    const d1 = await mod.production.requestP101(staff, { orderPublicId });
+    expect(lockEvents).toEqual(["orders:forUpdate", "identity:assertCurrent"]);
+
+    // Fail delivery so we can also test `resend` lock order and post-lock step-up expiry
+    nextHttpHandler = async () => ({ status: 422, headers: {}, body: Buffer.from("bad", "utf8") });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(d1.phase).toBe("P101");
+
+    // 2. Post-lock clock step-up expiry: preflight passes, lock wait advances clock past STEP_UP_MAX_AGE_MS -> STEP_UP_REQUIRED!
+    lockEvents.length = 0;
+    const stepUpAdmin = makeStepUpAdmin(h);
+    vi.mocked(h.services.identity.sessions.assertCurrent).mockImplementationOnce(async (principal) => {
+      lockEvents.push("identity:assertCurrent");
+      h.clock.advance(STEP_UP_MAX_AGE_MS + 1_000);
+      return {
+        pendingSteps: [...principal.pendingSteps],
+        role: principal.role,
+        stepUpAt: principal.stepUpAt,
+        mfaVerifiedAt: principal.mfaVerifiedAt,
+      };
+    });
+    await expect(
+      mod.production.resend(stepUpAdmin, {
+        orderPublicId,
+        phase: "P101",
+        reason: "Testing post-lock step-up window",
+      }),
+    ).rejects.toMatchObject({ code: "STEP_UP_REQUIRED", reasonCode: "STEP_UP_REQUIRED" });
+    expect(lockEvents).toEqual(["orders:forUpdate", "identity:assertCurrent"]);
+
+    // 3. Fail-closed `ACTOR_UNVERIFIABLE` when `services.identity` is missing
+    const savedIdentity = h.services.identity;
+    (h.services as unknown as { identity: unknown }).identity = undefined;
+    try {
+      await expect(mod.production.requestP101(staff, { orderPublicId })).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        reasonCode: "ACTOR_UNVERIFIABLE",
+      });
+    } finally {
+      h.services.identity = savedIdentity;
+    }
+  });
+
+  it("excludes production webhook URLs and auth header value from generic Platform settings exports and rejects forged imports (Decision #6)", async () => {
+    const admin = makeStepUpAdmin(h);
+    await configureEnabledProduction(admin);
+
+    const platformStore = createSettingsStore({
+      db: tdb.db,
+      crypto: h.deps.crypto,
+      clock: h.clock,
+      audit: h.audit,
+      logger: h.deps.logger,
+    });
+    const transfer = createConfigTransfer({
+      db: tdb.db,
+      clock: h.clock,
+      audit: h.audit,
+      settings: platformStore,
+      installationId: "inst_test_01",
+      releaseRef: "2026.11.20",
+    });
+
+    // Export WITH `includeSecrets: true` -> zero production webhook secrets may appear in counts or serialized document!
+    const passphrase = "correct-horse-battery-staple-export-key";
+    const exported = await transfer.exportDocument(
+      { includeSecrets: true, passphrase },
+      async () => {},
+    );
+    expect(exported.counts.secrets).toBe(0);
+    expect(exported.document).not.toContain(P101_TEST_URL);
+    expect(exported.document).not.toContain(P201_TEST_URL);
+    expect(exported.document).not.toContain("wh_live_super_secret_token_value");
+    expect(exported.document).not.toContain(INTEGRATIONS_PRODUCTION_P101_URL.key);
+    expect(exported.document).not.toContain(INTEGRATIONS_PRODUCTION_AUTH_VALUE.key);
   });
 });

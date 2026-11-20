@@ -1,17 +1,31 @@
 /**
- * Zero-trust authorization helper for privileged `integrations.manage` mutations.
+ * Zero-trust authorization helper for privileged `integrations` mutations.
  *
  * Enforces BOTH:
  *  1. Immediate pre-check on the verified `SessionPrincipal` (full session, capability, fresh step-up).
- *  2. Authoritative in-transaction re-validation via `services.identity.sessions.assertCurrent(principal, tx)`
- *     when the identity service is present — locking the actor's user + session rows FOR UPDATE so a
- *     revoked session, suspended admin, demoted role, or expired step-up cannot complete a write.
+ *  2. Fail-closed authoritative in-transaction re-validation via `services.identity.sessions.assertCurrent(principal, tx)`
+ *     — locking the actor's user + session rows FOR UPDATE so a revoked session, suspended actor, demoted role,
+ *     or expired step-up cannot complete a write. Refuses with `ACTOR_UNVERIFIABLE` if the Identity API is absent,
+ *     and computes persisted step-up freshness AFTER `assertCurrent` resolves its locks (PW-06).
+ *
+ * Lock-order note (PW-05 / BUILD_CONTRACT):
+ *  Mutations on an existing order MUST acquire the order-only lock FIRST (`orders.assertCanReadOrder(..., { tx, forUpdate: true })`)
+ *  before calling `assertProductionTriggerInTx` / `assertProductionResendInTx`.
  */
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { STEP_UP_MAX_AGE_MS, hasFreshStepUp } from "../../trpc/trpc.js";
+
+function requireAssertCurrent(deps: ModuleDeps) {
+  const sessions = deps.services.identity?.sessions;
+  const assertCurrent = sessions?.assertCurrent;
+  if (typeof assertCurrent !== "function") {
+    throw forbidden("ACTOR_UNVERIFIABLE");
+  }
+  return { sessions: sessions!, assertCurrent };
+}
 
 export function assertIntegrationsManagePreflight(principal: SessionPrincipal, now: Date): void {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
@@ -39,31 +53,30 @@ export async function assertIntegrationsManageInTx(
   principal: SessionPrincipal,
   tx: Tx,
 ): Promise<void> {
-  const now = deps.clock.now();
-  assertIntegrationsManagePreflight(principal, now);
+  assertIntegrationsManagePreflight(principal, deps.clock.now());
 
-  const assertCurrent = deps.services.identity?.sessions?.assertCurrent;
-  if (typeof assertCurrent === "function") {
-    const current = await assertCurrent(principal, tx);
-    if (current.pendingSteps.length > 0) {
-      throw new DomainError(
-        "REMEDIATION_REQUIRED",
-        "ACCOUNT_STEP_PENDING",
-        "Please finish securing your account to continue.",
-      );
-    }
-    if (!roleHasCapability(current.role, "integrations.manage")) {
-      throw forbidden("CAPABILITY_NOT_GRANTED");
-    }
-    const stepUpAge = current.stepUpAt ? now.getTime() - current.stepUpAt.getTime() : -1;
-    if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
-      throw new DomainError(
-        "STEP_UP_REQUIRED",
-        "STEP_UP_REQUIRED",
-        "Please confirm your password and authentication code to continue.",
-        { capability: "integrations.manage" },
-      );
-    }
+  const { sessions, assertCurrent } = requireAssertCurrent(deps);
+  const current = await assertCurrent.call(sessions, principal, tx);
+  const postLockNow = deps.clock.now();
+
+  if (current.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (current.role !== principal.role || !roleHasCapability(current.role, "integrations.manage")) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+  const stepUpAge = current.stepUpAt ? postLockNow.getTime() - current.stepUpAt.getTime() : -1;
+  if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
+    throw new DomainError(
+      "STEP_UP_REQUIRED",
+      "STEP_UP_REQUIRED",
+      "Please confirm your password and authentication code to continue.",
+      { capability: "integrations.manage" },
+    );
   }
 }
 
@@ -87,19 +100,17 @@ export async function assertProductionTriggerInTx(
 ): Promise<void> {
   assertProductionTriggerPreflight(principal);
 
-  const assertCurrent = deps.services.identity?.sessions?.assertCurrent;
-  if (typeof assertCurrent === "function") {
-    const current = await assertCurrent(principal, tx);
-    if (current.pendingSteps.length > 0) {
-      throw new DomainError(
-        "REMEDIATION_REQUIRED",
-        "ACCOUNT_STEP_PENDING",
-        "Please finish securing your account to continue.",
-      );
-    }
-    if (!roleHasCapability(current.role, "orders.production.trigger")) {
-      throw forbidden("CAPABILITY_NOT_GRANTED");
-    }
+  const { sessions, assertCurrent } = requireAssertCurrent(deps);
+  const current = await assertCurrent.call(sessions, principal, tx);
+  if (current.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (current.role !== principal.role || !roleHasCapability(current.role, "orders.production.trigger")) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
   }
 }
 
@@ -129,31 +140,33 @@ export async function assertProductionResendInTx(
   principal: SessionPrincipal,
   tx: Tx,
 ): Promise<void> {
-  const now = deps.clock.now();
-  assertProductionResendPreflight(principal, now);
+  assertProductionResendPreflight(principal, deps.clock.now());
 
-  const assertCurrent = deps.services.identity?.sessions?.assertCurrent;
-  if (typeof assertCurrent === "function") {
-    const current = await assertCurrent(principal, tx);
-    if (current.pendingSteps.length > 0) {
-      throw new DomainError(
-        "REMEDIATION_REQUIRED",
-        "ACCOUNT_STEP_PENDING",
-        "Please finish securing your account to continue.",
-      );
-    }
-    if (current.role !== "admin" || !roleHasCapability(current.role, "orders.production.trigger")) {
-      throw forbidden("CAPABILITY_NOT_GRANTED");
-    }
-    const stepUpAge = current.stepUpAt ? now.getTime() - current.stepUpAt.getTime() : -1;
-    if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
-      throw new DomainError(
-        "STEP_UP_REQUIRED",
-        "STEP_UP_REQUIRED",
-        "Please confirm your password and authentication code to re-send a production webhook.",
-        { capability: "orders.production.trigger" },
-      );
-    }
+  const { sessions, assertCurrent } = requireAssertCurrent(deps);
+  const current = await assertCurrent.call(sessions, principal, tx);
+  const postLockNow = deps.clock.now();
+
+  if (current.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (
+    current.role !== principal.role ||
+    current.role !== "admin" ||
+    !roleHasCapability(current.role, "orders.production.trigger")
+  ) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+  const stepUpAge = current.stepUpAt ? postLockNow.getTime() - current.stepUpAt.getTime() : -1;
+  if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
+    throw new DomainError(
+      "STEP_UP_REQUIRED",
+      "STEP_UP_REQUIRED",
+      "Please confirm your password and authentication code to re-send a production webhook.",
+      { capability: "orders.production.trigger" },
+    );
   }
 }
-

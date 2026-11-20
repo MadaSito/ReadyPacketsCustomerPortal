@@ -82,6 +82,10 @@ export const integrationProductionDispatches = mysqlTable(
     orderId: refColumn("order_id").notNull(),
     orderPublicId: char("order_public_id", { length: 26 }).notNull(),
     orderReference: varchar("order_reference", { length: 64 }).notNull(),
+    /** Order owner bound at queue time; worker refuses delivery if ownership changes before send (PW-03). */
+    expectedOwnerUserId: refColumn("expected_owner_user_id").notNull(),
+    /** Keyed HMAC-SHA-256 fingerprint of authorized destination/auth/config; worker cancels with DESTINATION_CHANGED on drift (PW-04). */
+    destinationFingerprint: char("destination_fingerprint", { length: 64 }).notNull(),
     phase: varchar("phase", { length: 8 }).notNull(), // "P101" | "P201"
     state: varchar("state", { length: 16 }).notNull(), // "queued" | "sending" | "delivered" | "failed" | "dead"
     attemptCount: int("attempt_count", { unsigned: true }).notNull().default(0),
@@ -98,12 +102,13 @@ export const integrationProductionDispatches = mysqlTable(
     tier: varchar("tier", { length: 16 }),
     bundleScopeManifest: varchar("bundle_scope_manifest", { length: 512 }),
     releaseStatus: varchar("release_status", { length: 120 }),
-    /** Safe delivery outcome metadata (never raw body or secrets). */
+    /** Fixed server-generated delivery status summary only; NEVER stores or reflects receiver response text (PW-01). */
     httpStatus: int("http_status", { unsigned: true }),
     responseSummary: varchar("response_summary", { length: 200 }),
     lastReasonCode: varchar("last_reason_code", { length: 64 }),
     isResend: boolean("is_resend").notNull().default(false),
-    resendReason: varchar("resend_reason", { length: 280 }),
+    /** Controlled server-classified resend reason code only; NEVER stores raw operator prose (PW-07). */
+    resendReason: varchar("resend_reason", { length: 64 }),
     phase1ArtifactsConfirmed: boolean("phase1_artifacts_confirmed").notNull().default(false),
     requestedByUserId: refColumn("requested_by_user_id"),
     requestedByPublicId: varchar("requested_by_public_id", { length: 26 }),

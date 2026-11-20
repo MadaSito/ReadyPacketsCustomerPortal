@@ -429,6 +429,7 @@ export const INTEGRATIONS_PRODUCTION_P101_URL = defineSecret({
   group: "integrations",
   label: "Phase I (P101) webhook destination URL",
   description: "Encrypted HTTPS webhook destination URL for Phase I (P101) production dispatches.",
+  exportable: false,
   schema: z
     .string()
     .trim()
@@ -443,6 +444,7 @@ export const INTEGRATIONS_PRODUCTION_P201_URL = defineSecret({
   group: "integrations",
   label: "Phase II (P201) webhook destination URL",
   description: "Encrypted HTTPS webhook destination URL for Phase II (P201) production dispatches.",
+  exportable: false,
   schema: z
     .string()
     .trim()
@@ -457,6 +459,7 @@ export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
   group: "integrations",
   label: "Production webhook authentication header value",
   description: "Encrypted shared secret or bearer value sent on P101/P201 requests when an auth header name is configured.",
+  exportable: false,
   schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid authentication header characters."),
 });
 

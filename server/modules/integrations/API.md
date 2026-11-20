@@ -86,9 +86,9 @@ export interface ProviderStatus {
 ### 1.6 Outbound Production Pipeline Webhooks (`services.integrations.production`)
 
 - Implements `P101` (Order Creation / SharePoint folder tree initialization) and `P201` (Trigger Production Run) per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
-- Ships disabled (`feature.integrations.production = false`) with empty `canonVersion` (`""`); stores `p101_url`, `p201_url`, and `auth_value` via `defineSecret` (`FieldCrypto` AES-256-GCM) and returns only masked `{ configured, host, last4 }` / `authSecretConfigured` views.
-- Enforces `egress.fetchPinned(..., { requireAllowlistRule: true, publicAddressesOnly: true })` (HTTPS-only, mandatory enabled `"webhook"` allowlist rule, public-only DNS answers in the same evaluation as socket pinning, zero redirects, 64 KiB response cap).
-- Persists outbox rows in `integration_production_dispatches`, encrypts retry payload bodies (`payload_enc`) while `queued` / `sending` / retryable `failed`, clears `payload_enc = NULL` on terminal `delivered` / `dead` / `failed`, and processes deliveries via `integrations.production.deliver` (`retrySafe: false`, `maxAttempts: 5`, lease-fenced via `ctx.assertStillOwned(tx)`).
+- Ships disabled (`feature.integrations.production = false`) with empty `canonVersion` (`""`); stores `p101_url`, `p201_url`, and `auth_value` via `defineSecret` (`exportable: false`, `FieldCrypto` AES-256-GCM — excluded from generic Platform settings exports) and returns only masked `{ host, last4 }` / `authHeaderValueConfigured` views.
+- Enforces `egress.fetchPinned(..., "webhook", { requireAllowlistRule: true, publicAddressesOnly: true })` (HTTPS-only, mandatory enabled `"webhook"` allowlist rule, public-only DNS answers in the same evaluation as socket pinning, zero redirects, discarded 8 KiB response read with fixed server-generated `responseSummary` only).
+- Pins each dispatch to `expected_owner_user_id` and a keyed HMAC-SHA-256 `destination_fingerprint` at queue time (`DESTINATION_CHANGED` cancels on URL/auth/config drift), revalidates order lock/hold/cancellation/owner/scope immediately before send, encrypts retry payload bodies (`payload_enc`) only during the active retry window, scrubs `payload_enc = NULL` on `delivered` / `failed` / `dead` and via bounded stale reconciliation (`integrations.production.reconcile`), and records only controlled `resendReason` codes.
 
 ---
 
@@ -115,14 +115,14 @@ All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require 
 - **`admin.egress.remove`** (`mutation`, step-up) -> input `{ publicId }` -> `void`
 - **`admin.egress.check`** (`mutation`, step-up, `expensive` rate limit) -> input `{ target, purpose }` -> `{ allowed: boolean; pinned?: PinnedEgressTarget; reasonCode?: string; safeMessage: string }`
 - **`production.settings.get`** (`query`, `admin` + `integrations.manage`) -> `ProductionSettingsView`
-- **`production.settings.update`** (`mutation`, `admin` + `integrations.manage` + step-up) -> input `{ enabled, canonVersion, runMode, timeoutMs, p101Url?, p201Url?, authHeaderName, authValue? }` -> `ProductionSettingsView`
-- **`production.settings.test`** (`mutation`, `admin` + `integrations.manage` + step-up, `expensive` rate limit) -> input `{ phase: "P101" | "P201", candidateUrl? }` -> `ProductionEndpointTestResult` (dry-run URL + allowlist + public-DNS check; never sends HTTP or projects `normalizedUrl`)
-- **`production.order.preview`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, phase, releaseStatus?, priority?, notes? }` -> `ProductionOrderPreviewView` (`client_name` / `client_email` masked for `staff`, unmasked for `admin`)
-- **`production.order.requestP101`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus?, notes? }` -> `ProductionDispatchView`
-- **`production.order.requestP201`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, priority?, notes? }` -> `ProductionDispatchView`
-- **`production.order.resend`** (`mutation`, `admin` + step-up) -> input `{ dispatchPublicId }` -> `ProductionDispatchView`
-- **`production.order.history`** (`query`, `staff` + `orders.read`) -> input `{ orderPublicId }` -> `{ items: ProductionDispatchView[] }`
-- **`production.admin.listDispatches`** (`query`, `admin` + `integrations.manage`) -> input `{ phase?, state?, orderReference?, cursor?, limit? }` -> `{ items: ProductionDispatchView[]; nextCursor: string | null }`
+- **`production.settings.update`** (`mutation`, `admin` + `integrations.manage` + step-up) -> input `{ enabled, canonVersion, runMode?, timeoutMs?, p101Url?, p201Url?, authHeaderName?, authHeaderValue? }` -> `ProductionSettingsView`
+- **`production.settings.test`** (`mutation`, `admin` + `integrations.manage` + step-up, `expensive` rate limit) -> input `{ phase: "P101" | "P201" }` -> `ProductionDryRunResult` (dry-run URL + allowlist + public-DNS check; never sends HTTP or projects `normalizedUrl`)
+- **`production.order.preview`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus? }` -> `ProductionOrderPreview` (`client_name` / `client_email` masked for `staff`, unmasked for `admin`; `release_status` defaults to `""`)
+- **`production.order.requestP101`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus? }` -> `ProductionDispatchItem`
+- **`production.order.requestP201`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, phase1ArtifactsConfirmed }` -> `ProductionDispatchItem`
+- **`production.order.resend`** (`mutation`, `admin` + `orders.production.trigger` + step-up) -> input `{ orderPublicId, phase: "P101" | "P201", reason, releaseStatus?, phase1ArtifactsConfirmed? }` -> `ProductionDispatchItem` (`resendReason` holds controlled code only)
+- **`production.order.history`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId }` -> `{ items: ProductionDispatchItem[] }`
+- **`production.admin.listDispatches`** (`query`, `admin` + `orders.production.trigger`) -> input `{ phase?, state?, orderReference?, fromDate?, toDate?, limit? }` -> `{ items: ProductionDispatchItem[] }`
 
 ---
 

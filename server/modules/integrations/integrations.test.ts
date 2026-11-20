@@ -204,6 +204,14 @@ describe("integrations module — DB-backed integration suite", () => {
     });
     h.deps.settings = realSettings;
     h.services.settings = realSettings;
+    (h.services as unknown as { identity: unknown }).identity = {
+      sessions: {
+        assertCurrent: async (p: SessionPrincipal, tx?: Tx) => {
+          expect(tx).toBeDefined();
+          return p;
+        },
+      },
+    };
 
     mod = createIntegrationsModule(h.deps, {
       egress: {
@@ -1006,7 +1014,24 @@ describe("integrations module — DB-backed integration suite", () => {
       ).rejects.toBeInstanceOf(TRPCError);
     }
 
-    // 2. Cross-Model Review Rule #2: In-tx actor revocation (`identity.sessions.assertCurrent(principal, tx)`)
+    // 2. Cross-Model Review Rule #2 + PW-06: Fail-closed when `identity` is absent AND when actor revoked in-tx
+    (h.services as unknown as { identity: unknown }).identity = undefined;
+    await expect(
+      withTestRequest(
+        () =>
+          mod.egress.createAllowlistRule(validAdmin, {
+            purpose: "siem",
+            matchType: "host",
+            pattern: "siem.internal.corp.example",
+            port: 6514,
+            protocol: "tls:",
+            allowPrivateAddress: true,
+            justification: "Must fail closed when identity.sessions.assertCurrent is absent",
+          }),
+        validAdmin,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", reasonCode: "ACTOR_UNVERIFIABLE" });
+
     const assertCurrentSpy = vi.fn(async (_p: SessionPrincipal, tx?: Tx) => {
       expect(tx).toBeDefined();
       throw forbidden("SESSION_REVOKED_MID_REQUEST");
@@ -1118,6 +1143,14 @@ describe("integrations module — DB-backed integration suite", () => {
       });
       singleHarness.deps.settings = singleSettings;
       singleHarness.services.settings = singleSettings;
+      (singleHarness.services as unknown as { identity: unknown }).identity = {
+        sessions: {
+          assertCurrent: async (p: SessionPrincipal, tx?: Tx) => {
+            expect(tx).toBeDefined();
+            return p;
+          },
+        },
+      };
 
       const singleMod = createIntegrationsModule(singleHarness.deps, {
         egress: { dnsLookup: async () => [{ address: "93.184.216.34", family: 4 }] },
