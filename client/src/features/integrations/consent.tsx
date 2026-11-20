@@ -14,16 +14,18 @@
  *     HTML or script snippets).
  *  5. PostHog uses direct, credential-less `fetch` (`$process_person_profile: false`, ephemeral per-view ID)
  *     so zero PostHog SDK code executes in the portal JS realm.
- *  6. Synchronous JS-Realm Quarantine (INT-01) + Pre-History URL Guard:
+ *  6. Synchronous JS-Realm Quarantine (INT-01) + Pre-History Guard:
  *     - Calls `markRealmTainted("clarity")` / `markRealmTainted("posthog")` from `@/lib/realmTaint`
  *       SYNCHRONOUSLY on the line immediately BEFORE appending the Clarity `<script>` element or sending
  *       the PostHog `fetch` request.
- *     - Installs a preventive `history.pushState`/`replaceState` + capture-phase `popstate`/`hashchange`
- *       guard before arming vendor code so non-public paths or `?search`/`#hash` tokens NEVER mutate
- *       `window.location` in the tainted realm; instead, Clarity globals/scripts are torn down and
- *       `requestCleanRealm(...)` navigates the document into a fresh untainted realm.
+ *     - Wraps `history.pushState`/`replaceState` (staying armed for the lifetime of the tainted document,
+ *       including after the first blocked call while async document replacement is in flight) so SPA
+ *       history calls to non-public paths or `?search`/`#hash` URLs are refused before `pushState` mutates
+ *       `window.location`. Browser-driven `popstate`/`hashchange` events occur after the browser updates
+ *       the URL; capture-phase listeners stop router propagation and immediately request a clean realm.
  *     - App-root `<RealmTaintBoundary>` + `<TaintedRouteGate>` (`@/app/RealmTaint`) enforce render-phase
- *       DOM quarantine across session transitions and routes.
+ *       React DOM quarantine; same-origin script/API authority in a vendor-loaded document remains an
+ *       acknowledged residual outside the DOM interlock.
  */
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
@@ -101,6 +103,7 @@ function isSafeHttpsOriginClient(value: string | null | undefined): value is str
 
 let currentDecision: AnalyticsConsentDecision = "undecided";
 let consentHistoryGuardArmed = false;
+let realmLeavingPending = false;
 let historyWrappersInstalled = false;
 let origPushState: History["pushState"] | null = null;
 let origReplaceState: History["replaceState"] | null = null;
@@ -165,14 +168,16 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
       }
 
       const staysOnCleanPublicLegal =
+        !realmLeavingPending &&
         resolved !== null &&
         resolved.origin === window.location.origin &&
         isCleanEligibleUrl(resolved);
 
       if (!staysOnCleanPublicLegal) {
-        // Prevent non-public pathnames or `?search`/`#hash` tokens from EVER entering `window.location`
-        // inside a vendor-tainted JS realm; tear down vendor globals and hard-navigate to a clean realm.
-        consentHistoryGuardArmed = false;
+        // Intercept programmatic `history.pushState`/`replaceState` before mutating `window.location`.
+        // Keep `consentHistoryGuardArmed` + `realmLeavingPending` latched so subsequent history calls
+        // in the dying document are also blocked while async full-document navigation completes.
+        realmLeavingPending = true;
         teardownClarityGlobalsAndScript();
         const targetPath = cleanRealmPath(resolved?.pathname ?? window.location.pathname);
         const mode = isEligibleAnalyticsPath(targetPath) ? "replace" : "assign";
@@ -190,11 +195,13 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
     guardHistoryMutation(origReplaceState!, data, unused, url);
   };
 
+  // Note: browser `popstate`/`hashchange` fires after the browser updates `window.location`;
+  // stop router propagation and immediately request a full-document navigation into a clean realm.
   const onCaptureUrlMutation = (event: Event): void => {
     if (!consentHistoryGuardArmed || !isRealmTainted()) return;
-    if (!isWindowAtCleanEligiblePath()) {
+    if (realmLeavingPending || !isWindowAtCleanEligiblePath()) {
       event.stopImmediatePropagation();
-      consentHistoryGuardArmed = false;
+      realmLeavingPending = true;
       teardownClarityGlobalsAndScript();
       const targetPath = cleanRealmPath(window.location.pathname);
       requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
@@ -208,6 +215,7 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
 export function resetAnalyticsConsentForTests(): void {
   currentDecision = "undecided";
   consentHistoryGuardArmed = false;
+  realmLeavingPending = false;
   teardownClarityGlobalsAndScript();
   __resetRealmTaintForTests();
   emitChange();
@@ -217,7 +225,8 @@ export function setAnalyticsConsent(next: AnalyticsConsentDecision): void {
   const prev = currentDecision;
   currentDecision = next;
   if (prev === "granted" && next !== "granted" && isRealmTainted()) {
-    consentHistoryGuardArmed = false;
+    // Keep history guard armed until the full-document reload replaces this tainted realm.
+    realmLeavingPending = true;
     teardownClarityGlobalsAndScript();
     emitChange();
     requestCleanRealm("replace", typeof window !== "undefined" ? window.location.pathname : "/privacy");

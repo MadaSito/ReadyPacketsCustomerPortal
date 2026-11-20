@@ -295,6 +295,13 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
       expect(screen.queryByTestId("private-orders-secret")).toBeNull();
       expect(leakedPrivateNodes).toEqual([]);
       expect(hardNavCalls).toEqual([["assign", "/orders"]]);
+
+      // Subsequent history attempts in the dying document remain blocked while async reload is pending
+      window.history.pushState(null, "", "/sign-in?token=SECOND_SECRET#frag2");
+      expect(window.location.pathname).toBe("/terms");
+      expect(window.location.search).toBe("");
+      expect(window.location.hash).toBe("");
+      expect(hardNavCalls).toEqual([["assign", "/orders"]]);
     } finally {
       observer.disconnect();
       unmount();
