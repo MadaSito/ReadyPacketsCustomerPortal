@@ -65,7 +65,10 @@ sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>   # drained, backed-up, 
 sudo bash deploy/uninstall.sh                             # deactivates; never deletes data or keys
 ```
 
-A Docker Compose profile is in `deploy/docker/`. Operator tools are in `scripts/ops/`:
+For evaluation and testing on any host name there is a self-contained Docker Compose stack with a one-command
+server setup: see [`deploy/docker/README.md`](deploy/docker/README.md)
+(`sudo bash deploy/docker/install-vps.sh --domain <host> --acme-email <email>`). It has no backups or rollback.
+Operator tools are in `scripts/ops/`:
 `keys/` (generate, rotate, doctor), `backup/` (run and verify encrypted backups), `restore/` (isolated restore drill),
 `install/` (VPS install, upgrade and rollback helpers), `migrate.ts`, `create-admin.ts` and `seed-demo.ts`.
 Read [Install on Ubuntu 24.04](docs/operations/INSTALL.md) and [release gates](deploy/VERIFICATION.md) first.

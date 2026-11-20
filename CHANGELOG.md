@@ -7,6 +7,13 @@ procedure.
 
 ## [Unreleased]
 
+### Added
+
+- Docker Compose stack for evaluation and testing on any host name (`deploy/docker/`): digest-pinned image
+  build, generated secrets in volumes, MySQL 8.4 with required TLS and least-privilege accounts, Caddy with
+  automatic certificates, a one-command server setup (`install-vps.sh`) and an operator wrapper
+  (`rp-docker.sh`). The `container` workflow builds and exercises the stack end to end.
+
 ## [0.1.0] - Unreleased
 
 ### Added

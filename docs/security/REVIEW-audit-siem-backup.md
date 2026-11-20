@@ -96,6 +96,8 @@ The active Nginx template rejects unknown authorities and TLS handshakes, overwr
 
 The optional Docker and alternate Nginx files are explicitly unsupported by the native kit (`deploy/README.md:5`). Do not treat them as equivalent: `deploy/docker/docker-compose.yml:34–35` puts the root database password in the health-check client's arguments, and the migration container invokes `tsx` (`docker-compose.yml:80`) after the image prunes development dependencies (`deploy/docker/Dockerfile:21`; `package.json:72`). Keep the profile out of production and use a non-secret-bearing health check and a compiled migration entry point before qualifying it separately.
 
+> Note added 2026-11-20: the Docker draft described above was removed. `deploy/docker/` now holds a different evaluation stack (credential-free health check, secrets as files in volumes) that this review did not cover; see `deploy/docker/README.md`.
+
 ## SIEM re-review (assurance_engineer)
 
 2026-11-20. Re-reviewed remediation `727a0cf` against the four high and five medium groups above. Independent wrapper runs passed: `scripts/dev/test.sh server/modules/siem/siem.test.ts` (14/14, including its MySQL and local receiver regressions) and `scripts/dev/test.sh server/modules/siem/rfc5424.test.ts` (9/9). Residual findings below are supported by code inspection, not verified against a production collector.

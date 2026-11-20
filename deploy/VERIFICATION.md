@@ -1,6 +1,6 @@
 # Native Ubuntu deployment verification
 
-Scope: the native single-node install, upgrade, and deactivation for `my.readypackets.com`. The Docker draft and duplicate archive installer were removed; the alternate legacy Nginx example is not covered.
+Scope: the native single-node install, upgrade, and deactivation for `my.readypackets.com`. The earlier Docker draft and duplicate archive installer were removed; the alternate legacy Nginx example is not covered. The evaluation Docker Compose stack in `deploy/docker/` is verified separately by `.github/workflows/container.yml` (see `deploy/docker/README.md`, "How it is verified") and is outside this document.
 
 ## Completed static checks
 
