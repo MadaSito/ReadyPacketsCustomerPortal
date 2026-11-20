@@ -1,0 +1,111 @@
+                  ReadyPackets P101 Production Webhook Logic
+                Corrected version - no order_scope_mode field is used because that field does not exist in
+                                                P5_MASTER_STATE.
+
+1. Production Rule
+P101 is the canonical order metadata intake. It must receive a payload whose top-level packet, top-level tier, and
+bundle_scope_manifest do not contradict each other. There is no separate order_scope_mode column, so production
+scope is inferred from packet, tier, and bundle_scope_manifest.
+Critical correction: never send packet = 7 and tier = Mixed for a single Packet 1 Premium order. Packet 7 / Mixed is reserved for
+multi-packet bundle selections whose bundle_scope_manifest lists the selected packets.
+
+2. Required P101 Payload Fields
+    Field                        Required      Production meaning
+
+    customer_id                  Yes           Customer identifier used to create/search the master order key.
+
+    order_id                     Yes           Order identifier used to create/search the master order key.
+
+    packet                       Yes           Single packet number for a single-packet order; use 7 only for multi-packet/mixed
+                                               bundle orders.
+
+    tier                         Yes           Basic, Standard, Premium, or Mixed. Mixed should pair with packet 7 only.
+
+    canon_version                Yes           Production canon/version label, for example ReadyPackets_Production_v2.0.
+
+    run_mode                     Yes           production for production runs.
+
+    client_name                  Recommende    Client display name for records/artifacts.
+                                 d
+
+    client_email                 Recommende    Client email for records/artifacts.
+                                 d
+
+    release_status               Optional      Can be blank at intake unless a controlled status is intentionally required.
+
+    bundle_scope_manifest        Yes           JSON string identifying selected packet/tier combinations. This replaces any need for
+                                               order_scope_mode.
+
+
+3. Valid Payload Patterns
+A. Single Packet 1 Premium - top-level packet/tier match the manifest exactly.
+            {
+                "customer_id": "RP-CUST-000008",
+                "order_id": "RP-C000008-2608-5E4A2D",
+                "packet": "1",
+                "tier": "Premium",
+                "canon_version": "ReadyPackets_Production_v2.0",
+                "run_mode": "production",
+                "client_name": "John Wick",
+                "client_email": "test2@readypackets.com",
+                "release_status": "",
+                "bundle_scope_manifest": "{\"packet_1\":\"Premium\"}"
+            }
+
+B. Packet 1 Premium plus Packet 2 Basic - this is a multi-packet selection, so top-level packet/tier become 7/Mixed and the
+selected work is defined by the manifest.
+            {
+                "customer_id": "RP-CUST-000008",
+                "order_id": "RP-C000008-2608-5E4A2D",
+                "packet": "7",
+                "tier": "Mixed",
+                "canon_version": "ReadyPackets_Production_v2.0",
+                "run_mode": "production",
+                "client_name": "John Wick",
+                "client_email": "test2@readypackets.com",
+                "release_status": "",
+             "bundle_scope_manifest": "{\"packet_1\":\"Premium\",\"packet_2\":\"Basic\"}"
+         }
+
+
+4. Invalid Payloads to Block Before P101
+    Invalid combination                                    Why it is invalid
+
+    packet = 7, tier = Mixed, bundle_scope_manifest =      Contradiction. Top-level says mixed/multi-packet, but manifest says single
+    {"packet_1":"Premium"}                                 Packet 1 Premium.
+
+    packet = 1, tier = Premium, bundle_scope_manifest =    Contradiction. Top-level packet/tier do not match selected packet in
+    {"packet_2":"Basic"}                                   manifest.
+
+    packet = 7, tier = Premium                             Packet 7 should not pair with a normal tier. Packet 7 should pair with
+                                                           Mixed.
+
+    packet = 1, tier = Mixed                               Single packet should not use Mixed tier. Mixed is for bundle/multi-packet
+                                                           selections.
+
+    bundle_scope_manifest missing or invalid JSON string   Phase III cannot reliably determine selected deliverables.
+
+
+5. Phase II Payload Rule
+Phase II can still be started with the minimal payload below, because Phase II should read canonical packet/tier/manifest
+metadata from P5_MASTER_STATE created by P101. Phase II does not need order_scope_mode.
+         {
+             "customer_id": "RP-CUST-000008",
+             "order_id": "RP-C000008-2608-5E4A2D",
+             "run_mode": "production"
+         }
+
+
+6. P205 to P300 Handoff Check
+P205 should hand P300 the same canonical metadata stored in P5_MASTER_STATE: packet, tier, canon_version, run_mode,
+and bundle_scope_manifest. Do not add order_scope_mode. If P205 sends packet 7 / Mixed with a single-packet manifest,
+P300/P301 will correctly route to the wrong/empty branch.
+
+7. Production Acceptance Rules
+- Single-packet order: packet is the actual packet number and tier is the actual tier; bundle_scope_manifest contains exactly
+that same packet/tier.
+- Multi-packet partial order: packet = 7, tier = Mixed, and bundle_scope_manifest lists every selected packet/tier pair.
+- No order_scope_mode field is used or expected.
+- The payload generator must reject contradictory packet/tier/manifest combinations before calling P101.
+- P300/P301 should never be expected to fix contradictory order metadata; it should only consume valid canonical metadata.
+

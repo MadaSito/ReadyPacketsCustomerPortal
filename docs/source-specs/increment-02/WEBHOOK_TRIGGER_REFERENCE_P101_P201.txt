@@ -1,0 +1,247 @@
+             ReadyPackets Webhook Trigger Reference
+                            Phase I Start Webhook (P101) and Phase II Start Webhook (P201)
+
+
+Purpose
+This document defines the exact trigger payload information for the ReadyPackets Phase I and Phase II manual
+webhooks using the supplied Packet 7, mixed-tier, multi-packet example. It is limited to the parameters shown below and
+does not define any additional packets, tiers, scenarios, or webhook fields.
+Controlling rule: the Phase II payload must reuse the same customer_id, order_id, and run_mode used in the Phase
+I payload for the same order. A mismatch creates a different order path or fails to continue the intended run.
+
+
+Quick Sequence
+      Step     Action                          Payload / Scenario                          Do not proceed until
+
+      1        Trigger Phase I start.          P101 Phase I webhook payload.               Phase I final artifacts exist for the same
+                                                                                           order_id.
+
+      2        Trigger Phase II start.         P201 Phase II webhook payload using the     Phase II and downstream phases are
+                                               same customer_id, order_id, and run_mode.   allowed to continue automatically.
+
+
+For the example in this document, the order_id is dev-phasei-v11-test-028. If a new test run is created, update the
+order_id consistently in both P101 and P201. Do not update one payload without updating the other.
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                            Page 1 of 7
+Phase I Webhook - P101
+Use this payload to create/start the Phase I order. The payload below is the exact supplied example for
+dev-phasei-v11-test-028.
+{
+    "customer_id": "dev-001",
+    "order_id": "dev-phasei-v11-test-028",
+    "packet": "7",
+    "tier": "Mixed",
+    "canon_version": "ReadyPackets_Production_v2.0",
+    "run_mode": "production",
+    "client_name": "ReadyPackets Dev Test",
+    "client_email": "dev@test.local",
+    "release_status": "test_v2_p1_standard_p2_basic_zero_start_after_p104_p105_patch",
+    "order_scope_mode": "multi_packet_partial",
+    "bundle_scope_manifest": "{\"packet_1\":\"Standard\",\"packet_2\":\"Basic\"}"
+}
+
+
+Phase I Parameter Detail
+ Parameter             Exact value in example                  Purpose in this trigger                    Operational rule
+
+ customer_id           dev-001                                 Customer/account identifier used to        Must match the P201 customer_id for
+                                                               group the order.                           the same run.
+
+ order_id              dev-phasei-v11-test-028                 Unique order/run identifier for this       Must be identical in P101 and P201.
+                                                               specific test order.                       For a fresh run, change this value in
+                                                                                                          both payloads.
+
+ packet                7                                       Packet selection value supplied for this   For this documented trigger, keep as
+                                                               run.                                       string "7". Do not convert to number
+                                                                                                          unless the scenario is explicitly
+                                                                                                          changed to expect a number.
+
+ tier                  Mixed                                   Top-level tier label supplied for a        Use this exact value for the supplied
+                                                               payload where included packet tiers        Packet 7 mixed-tier example.
+                                                               are not all the same.
+
+ canon_version         ReadyPackets_Production_v2.0            Canon/version identifier used by the       Use the exact production canon value
+                                                               production workflow.                       unless a new canon version is
+                                                                                                          intentionally released.
+
+ run_mode              production                              Run mode used by routing/model             Must match P201 run_mode. For this
+                                                               profile logic.                             workflow, use production.
+
+ client_name           ReadyPackets Dev Test                   Client display/name value supplied to      Replace only when creating a real
+                                                               the order.                                 client-specific run.
+
+ client_email          dev@test.local                          Client email/contact value supplied to     Replace only when creating a real
+                                                               the order.                                 client-specific run.
+
+ release_status        test_v2_p1_standard_p2_basic_zero_      Operator/debug release label included      Use as a tracking label. Do not rely on
+                       start_after_p104_p105_patch             with the order.                            this field to replace packet/tier/scope
+                                                                                                          fields.
+
+ order_scope_mode      multi_packet_partial                    Scope mode indicating this run is a        For this Packet 7 example, keep
+                                                               partial multi-packet bundle rather than    multi_packet_partial.
+                                                               a single flat packet.
+
+ bundle_scope_manif    {"packet_1":"Standard","packet_2":"Ba   Defines which component packets and        Must be passed as a JSON string
+ est                   sic"} as an escaped JSON string         tiers are included in the Packet 7         inside the outer JSON. Do not paste it
+                                                               mixed run.                                 as a raw nested object.
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                                  Page 2 of 7
+Packet 7 / Multi-Packet Detail From the Supplied Payload
+The supplied Phase I payload expresses Packet 7 as a mixed-tier, multi-packet partial order. The fields work together and
+should be treated as a coordinated set for this example.
+
+     Field group                  Configured value                          Meaning for this trigger
+
+     packet + tier                packet = "7"; tier = "Mixed"              The outer order is Packet 7 and is labeled Mixed because
+                                                                            the included packet tiers are defined individually in the
+                                                                            bundle_scope_manifest.
+
+     order_scope_mode             multi_packet_partial                      The order is not documenting a complete all-packet bundle. It
+                                                                            is a multi-packet partial selection.
+
+     bundle_scope_manifest        {"packet_1":"Standard","packet_2":"Basi   This run includes packet_1 as Standard and packet_2 as
+                                  c"}                                       Basic.
+
+
+
+Important formatting rule for bundle_scope_manifest
+Inside the outer JSON, bundle_scope_manifest is not a nested JSON object. It is an escaped JSON string. This is why the
+value contains backslashes before the quotation marks around packet_1, Standard, packet_2, and Basic.
+"bundle_scope_manifest": "{\"packet_1\":\"Standard\",\"packet_2\":\"Basic\"}"
+
+
+Wrong format to avoid
+Do not send bundle_scope_manifest as a raw object unless the receiving scenario has been explicitly rebuilt to
+expect a nested object.
+"bundle_scope_manifest": {"packet_1":"Standard","packet_2":"Basic"}
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                              Page 3 of 7
+Phase II Webhook - P201
+Use this payload only after Phase I for the same order has completed and the Phase I output artifacts exist. The Phase II
+payload is intentionally much simpler and must match the Phase I identity fields.
+{
+    "customer_id": "dev-001",
+    "order_id": "dev-phasei-v11-test-028",
+    "run_mode": "production"
+}
+
+
+Phase II Parameter Detail
+Parameter              Exact value in example             Purpose in this trigger                    Operational rule
+
+customer_id            dev-001                            Identifies the same customer/account       Must match P101 customer_id exactly.
+                                                          used in Phase I.
+
+order_id               dev-phasei-v11-test-028            Identifies the exact order whose Phase I   Must match P101 order_id exactly. Do
+                                                          artifacts should be advanced into Phase    not use an older order_id such as 026
+                                                          II.                                        when the Phase I run is 028.
+
+run_mode               production                         Maintains the same execution profile       Must match P101 run_mode exactly.
+                                                          used by the Phase I order.
+
+
+Phase II Start Rule
+Trigger P201 only after the Phase I folder for the same order contains the expected Phase I final artifacts. The known
+Phase I artifact set for the passing workflow was four files in Final_Merge: Phase1A_Merged.txt,
+Phase1B_Adjudication.json, Phase1B_DeepResearch_Evidence.txt, and PhaseI_InterviewGuidance.txt.
+Do not send P201 just because P101 ran. Send P201 after the Phase I outputs exist for the same customer_id and
+order_id.
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                           Page 4 of 7
+Copy/Paste Payloads
+P101 - Phase I start payload
+{
+    "customer_id": "dev-001",
+    "order_id": "dev-phasei-v11-test-028",
+    "packet": "7",
+    "tier": "Mixed",
+    "canon_version": "ReadyPackets_Production_v2.0",
+    "run_mode": "production",
+    "client_name": "ReadyPackets Dev Test",
+    "client_email": "dev@test.local",
+    "release_status": "test_v2_p1_standard_p2_basic_zero_start_after_p104_p105_patch",
+    "order_scope_mode": "multi_packet_partial",
+    "bundle_scope_manifest": "{\"packet_1\":\"Standard\",\"packet_2\":\"Basic\"}"
+}
+
+
+P201 - Phase II start payload
+{
+    "customer_id": "dev-001",
+    "order_id": "dev-phasei-v11-test-028",
+    "run_mode": "production"
+}
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                    Page 5 of 7
+Pre-Trigger and Post-Trigger Checklist
+  Checkpoint                   Required verification
+
+  Before P101                  Confirm the order_id is the new intended run ID. For this document: dev-phasei-v11-test-028.
+
+  Before P101                  Confirm packet = "7", tier = "Mixed", order_scope_mode = "multi_packet_partial", and bundle_scope_manifest
+                               is an escaped JSON string.
+
+  After P101                   Confirm Phase I output artifacts exist for the same order_id before starting Phase II.
+
+  Before P201                  Confirm customer_id, order_id, and run_mode exactly match the P101 payload.
+
+  After P201                   Let downstream scenarios continue automatically. Do not manually trigger later phases unless debugging
+                               requires it.
+
+  Failure prevention           Do not mix order IDs across phases. Do not use 026 in P201 if P101 used 028.
+
+
+
+
+Minimal pass indication for this trigger chain
+A clean run should produce Phase I artifacts, advance through Phase II automatically after P201, create downstream
+Phase III/Phase IV outputs, and leave no active PENDING_RETRY row in P5_DLQ for the same order_id. This document
+does not define downstream payload contracts; it only documents the Phase I and Phase II trigger parameters supplied
+above.
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                            Page 6 of 7
+Field Editing Rules for Future Runs
+   Use case                     What to change                                    What must stay aligned
+
+   New test order               Change order_id in P101 and P201.                 Both payloads must use the exact same new order_id.
+
+   Different dev customer       Change customer_id in P101 and P201.              Both payloads must use the exact same customer_id.
+
+   Real client run              Change client_name and client_email in P101.      Do not change packet/tier/scope fields unless the
+                                                                                  product selection actually changes.
+
+   Same Packet 7 mixed          Keep packet, tier, order_scope_mode, and          Do not remove escaping from bundle_scope_manifest.
+   partial bundle               bundle_scope_manifest as documented.
+
+   Different packet or bundle   This document does not define that. Confirm the   Do not infer unsupported values from this PDF.
+   composition                  correct values before changing packet, tier,
+                                order_scope_mode, or bundle_scope_manifest.
+
+
+
+End of document.
+
+
+
+
+ReadyPackets Webhook Trigger Reference - P101 Phase I / P201 Phase II                                                              Page 7 of 7
+

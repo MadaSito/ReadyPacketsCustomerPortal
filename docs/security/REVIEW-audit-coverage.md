@@ -115,6 +115,12 @@ The queue lifecycle records `job.enqueued|claimed|completed|failed…` through `
 
 J-1 fixed in b0b80be.
 
+Update (7978414): routine first-attempt successes of scheduled (recurring) jobs are no longer written to the
+audit chain; they go to the operational log with the job's correlation id. Failures, retries, operator
+actions and every non-scheduled job (for example mail) are still audited as described above. This removed
+the steady stream of scheduler rows that dominated the audit trail on an idle system and carried no
+security meaning.
+
 ### platform (owner: platform_engineer)
 
 | Mutation | Event(s) | Dur. | Verified |
