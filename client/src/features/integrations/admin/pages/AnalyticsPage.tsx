@@ -5,7 +5,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
-import { Badge, Button, Callout, Card, CodeBlock, ErrorState, Field, Input, KeyValueList, PageHeader, Select, Skeleton, Switch } from "@/ui";
+import { Badge, Button, Callout, Card, CodeBlock, ConfirmDialog, ErrorState, Field, Input, KeyValueList, PageHeader, Select, Skeleton, Switch } from "@/ui";
 import { ANALYTICS_CONSENT_COPY } from "../../consent";
 import { CLARITY_PROJECT_ID, IntegrationsCrumbs, POSTHOG_PROJECT_KEY, ProviderStatusBadge, usePrivilegedAction, type ProviderRow } from "../shared";
 
@@ -51,23 +51,38 @@ export default function AnalyticsPage() {
   const data = config.data;
   const hosts = data ? [...data.posthog.cloudHosts, ...data.posthog.allowedSelfHostedOrigins] : [];
 
+  const [confirming, setConfirming] = useState(false);
+
+  /** Saves through step-up. Resolves true when saved; throws (after showing the error) so a ConfirmDialog stays open. */
+  const save = async (): Promise<boolean> => {
+    if (!form) return false;
+    try {
+      const done = await run(() => update.mutateAsync({
+        clarityEnabled: form.clarityEnabled, clarityProjectId: form.clarityProjectId.trim(),
+        posthogEnabled: form.posthogEnabled, posthogProjectKey: form.posthogProjectKey.trim(), posthogHost: form.posthogHost,
+      }), "Analytics settings saved", "Changing analytics needs verification.");
+      if (done === undefined) return false;
+      await config.refetch();
+      setDraft(undefined);
+      return true;
+    } catch (err) {
+      setErrors({ form: safeError(err)?.safeMessage ?? "The settings were not saved." });
+      throw err;
+    }
+  };
+
   const onSave = async (event: FormEvent) => {
     event.preventDefault();
     if (!form || !data) return;
     const found = validateAnalytics(form, hosts);
     setErrors(found);
     if (Object.keys(found).length) return;
-    try {
-      const done = await run(() => update.mutateAsync({
-        clarityEnabled: form.clarityEnabled, clarityProjectId: form.clarityProjectId.trim(),
-        posthogEnabled: form.posthogEnabled, posthogProjectKey: form.posthogProjectKey.trim(), posthogHost: form.posthogHost,
-      }), "Analytics settings saved", "Changing analytics needs verification.");
-      if (done === undefined) return;
-      await config.refetch();
-      setDraft(undefined);
-    } catch (err) {
-      setErrors({ form: safeError(err)?.safeMessage ?? "The settings were not saved." });
+    // Switching a vendor on (off → on) needs an explicit risk acknowledgement before step-up (INT-01).
+    if ((form.clarityEnabled && !data.clarity.enabled) || (form.posthogEnabled && !data.posthog.enabled)) {
+      setConfirming(true);
+      return;
     }
+    await save().catch(() => undefined);
   };
 
   const previewProvider = form?.clarityEnabled && form.posthogEnabled ? "Microsoft Clarity and PostHog" : form?.posthogEnabled ? "PostHog" : "Microsoft Clarity";
@@ -80,12 +95,13 @@ export default function AnalyticsPage() {
         <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-3">
           <form noValidate onSubmit={(e) => void onSave(e)} className="flex min-w-0 flex-col gap-6 lg:col-span-2" aria-label="Analytics settings">
             {errors.form ? <Callout tone="danger" live="assertive">{errors.form}</Callout> : null}
+            <OriginRiskWarning />
             <Card as="section" title="Microsoft Clarity" actions={<StatusFor row={status("clarity")} />} description={status("clarity")?.summary}>
               <div className="flex flex-col gap-4">
                 <Field label="Clarity project ID" hint="6–32 letters and digits. This is a public identifier, not a secret." error={errors.clarityProjectId}>
                   <Input value={form.clarityProjectId} onChange={(e) => set("clarityProjectId", e.target.value)} autoComplete="off" spellCheck={false} maxLength={32} />
                 </Field>
-                <Switch label="Enable Microsoft Clarity" description="Loads only after consent, only on the allowlisted legal pages (which contain no forms). Keep masking at Strict or Balanced in your Clarity project." checked={form.clarityEnabled} onCheckedChange={(v) => set("clarityEnabled", v)} />
+                <Switch label="Enable Microsoft Clarity" description="Loads only after consent, only on the Privacy and Terms pages, with the whole page masked from recordings." checked={form.clarityEnabled} onCheckedChange={(v) => set("clarityEnabled", v)} />
               </div>
             </Card>
             <Card as="section" title="PostHog" actions={<StatusFor row={status("posthog")} />} description={status("posthog")?.summary}>
@@ -143,7 +159,33 @@ export default function AnalyticsPage() {
           </div>
         </div>
       )}
+      <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive confirmLabel="Accept risk and enable" confirmText={ENABLE_CONFIRM_TEXT}
+        title="Enable analytics on the portal origin?"
+        description="You will be asked to verify your identity next. This change is recorded in the audit log."
+        onConfirm={async () => { const saved = await save(); if (!saved) throw new Error("not saved"); }}>
+        <OriginRiskText />
+      </ConfirmDialog>
     </>
+  );
+}
+
+export const ENABLE_CONFIRM_TEXT = "ENABLE ANALYTICS";
+
+/** INT-01 residual risk, stated plainly. Clarity runs vendor script on the origin; PostHog receives page views sent by portal code (no vendor script). */
+function OriginRiskText() {
+  return (
+    <>
+      <p>Vendor scripts run on this portal's origin on the Privacy and Terms pages only. Microsoft Clarity's script cannot read the session cookie, but it could make requests with a visitor's session if that visitor signs in from another tab. PostHog runs no vendor script here; the portal itself sends anonymous page views to it.</p>
+      <p className="mt-2">Prefer running analytics on your public marketing site. Leave these off unless your organisation has accepted this risk.</p>
+    </>
+  );
+}
+
+function OriginRiskWarning() {
+  return (
+    <Callout tone="warning" title="Security risk: analytics runs on the portal's own origin">
+      <OriginRiskText />
+    </Callout>
   );
 }
 

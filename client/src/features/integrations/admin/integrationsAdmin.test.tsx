@@ -9,7 +9,7 @@ import type { MeResult } from "@/lib/authApi";
 import { TRPCProvider } from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { integrationsAdminNav, integrationsAdminRoutes } from "./index";
-import AnalyticsPage from "./pages/AnalyticsPage";
+import AnalyticsPage, { ENABLE_CONFIRM_TEXT } from "./pages/AnalyticsPage";
 import EgressPage from "./pages/EgressPage";
 import IntegrationsOverviewPage from "./pages/IntegrationsOverviewPage";
 import SmtpPage from "./pages/SmtpPage";
@@ -187,6 +187,9 @@ describe("Analytics settings", () => {
     expect(await screen.findByText("Optional public-page analytics")).toBeInTheDocument();
     expect(screen.getByText("/privacy")).toBeInTheDocument();
     expect(screen.getByText("/admin")).toBeInTheDocument();
+    const warning = screen.getByText("Security risk: analytics runs on the portal's own origin");
+    expect(warning.compareDocumentPosition(screen.getByRole("switch", { name: /Enable Microsoft Clarity/ })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByText(/Leave these off unless your organisation has accepted this risk/).length).toBeGreaterThan(0);
     await expectNoAxeViolations(container);
 
     await userEvent.type(screen.getByLabelText(/Clarity project ID/), "bad id!");
@@ -206,10 +209,38 @@ describe("Analytics settings", () => {
     await userEvent.type(screen.getByLabelText(/Project API key/), "phc_abcdefghijkl1234");
     expect(screen.getByText(/May we enable Microsoft Clarity and PostHog/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Save analytics settings" }));
+
+    // Switching a vendor on needs a typed risk acknowledgement before anything reaches the server (INT-01).
+    const confirm = await screen.findByRole("alertdialog", { name: "Enable analytics on the portal origin?" });
+    expect(within(confirm).getByText(/could make requests with a visitor's session/)).toBeInTheDocument();
+    const accept = within(confirm).getByRole("button", { name: "Accept risk and enable" });
+    expect(accept).toBeDisabled();
+    await expectNoAxeViolations(document.body);
+    await userEvent.type(within(confirm).getByLabelText(/to confirm/), "enable");
+    expect(accept).toBeDisabled();
+    expect(calls.some((c) => c.path === "integrations.admin.analytics.update")).toBe(false);
+    await userEvent.clear(within(confirm).getByLabelText(/to confirm/));
+    await userEvent.type(within(confirm).getByLabelText(/to confirm/), ENABLE_CONFIRM_TEXT);
+    await userEvent.click(accept);
     await waitFor(() => expect(calls.some((c) => c.path === "integrations.admin.analytics.update")).toBe(true));
     expect(calls.find((c) => c.path === "integrations.admin.analytics.update")!.input).toEqual({
       clarityEnabled: true, clarityProjectId: "abc123xyz", posthogEnabled: true, posthogProjectKey: "phc_abcdefghijkl1234", posthogHost: "https://us.i.posthog.com",
     });
+  });
+});
+
+describe("Analytics risk acknowledgement", () => {
+  it("does not ask again when vendors are already on or being switched off", async () => {
+    const enabled = { ...analyticsConfig, clarity: { enabled: true, configured: true, projectId: "abc123xyz" } };
+    const { calls } = renderPage(<AnalyticsPage />, {
+      "integrations.admin.analytics.get": () => enabled,
+      "integrations.admin.providers": () => providers,
+      "integrations.admin.analytics.update": () => analyticsConfig,
+    });
+    await userEvent.click(await screen.findByRole("switch", { name: /Enable Microsoft Clarity/ }));
+    await userEvent.click(screen.getByRole("button", { name: "Save analytics settings" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "integrations.admin.analytics.update")?.input).toMatchObject({ clarityEnabled: false }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });
 
