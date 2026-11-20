@@ -17,6 +17,10 @@ export interface PortableLimits {
   kdfMaxP: number;
   /** Lowest scrypt N a reader accepts (2^14). Writers default to 2^17. */
   kdfMinN: number;
+  /** Aggregate scrypt memory ceiling (128·N·r·p bytes) for header-supplied parameters. Raise only for trusted operators. */
+  kdfMaxMemoryBytes: number;
+  /** Aggregate scrypt work ceiling (N·r·p). Default allows 2× the writer default. */
+  kdfMaxWork: number;
   /** Legacy v1/v2 envelopes (single JSON document) — source limit was 192 MiB. */
   maxLegacyPackageBytes: number;
 }
@@ -39,6 +43,8 @@ export const DEFAULT_LIMITS: Readonly<PortableLimits> = Object.freeze({
   kdfMaxR: 16,
   kdfMaxP: 4,
   kdfMinN: 2 ** 14,
+  kdfMaxMemoryBytes: 256 * MiB,
+  kdfMaxWork: 2 ** 21,
   maxLegacyPackageBytes: 192 * MiB,
 });
 

@@ -77,7 +77,8 @@ export async function deriveKeys(passphrase: string | Uint8Array, kdf: EnvelopeH
 
 export function checkKdfParams(kdf: { N: number; r: number; p: number }, limits: PortableLimits): void {
   const powerOfTwo = (kdf.N & (kdf.N - 1)) === 0;
-  if (!powerOfTwo || kdf.N < limits.kdfMinN || kdf.N > limits.kdfMaxN || kdf.r > limits.kdfMaxR || kdf.p > limits.kdfMaxP) {
+  if (!powerOfTwo || kdf.N < limits.kdfMinN || kdf.N > limits.kdfMaxN || kdf.r > limits.kdfMaxR || kdf.p > limits.kdfMaxP ||
+    kdf.r < 1 || kdf.p < 1 || 128 * kdf.N * kdf.r * kdf.p > limits.kdfMaxMemoryBytes || kdf.N * kdf.r * kdf.p > limits.kdfMaxWork) {
     throw new PortableError("KDF_PARAMS_REJECTED", "Key derivation parameters are outside the accepted range.");
   }
 }
@@ -178,6 +179,8 @@ export interface OpenedEnvelope {
   headerBytes: Buffer;
   keys: DerivedKeys;
   bodyOffset: number;
+  /** The exact 32 MAC bytes read after the header (part of the ciphertext hash). */
+  mac: Buffer;
 }
 
 /** Parse + authenticate the header (constant-time MAC compare). Wrong passphrase ⇒ PASSPHRASE_REJECTED. */
@@ -203,7 +206,7 @@ export async function openEnvelopeHeader(fh: FileHandle, passphrase: string | Ui
   if (!timingSafeEqual(mac, headerMac(keys.macKey, headerBytes))) {
     throw new PortableError("PASSPHRASE_REJECTED", "The passphrase is incorrect or the package header was altered.");
   }
-  return { header, headerBytes, keys, bodyOffset: 12 + hlen + 32 };
+  return { header, headerBytes, keys, bodyOffset: 12 + hlen + 32, mac };
 }
 
 /**
@@ -216,6 +219,8 @@ export async function decryptBody(
   fileSize: number,
   sink: (plain: Buffer) => Promise<void>,
   maxPlainBytes: number,
+  /** Receives every ciphertext byte read after the header MAC, in file order (single-pass hashing). */
+  onCiphertext?: (bytes: Buffer) => void,
 ): Promise<number> {
   const headerHash = createHash("sha256").update(opened.headerBytes).digest();
   let pos = opened.bodyOffset;
@@ -229,6 +234,8 @@ export async function decryptBody(
     if (len > opened.header.chunkSize) throw new PortableError("CHUNK_AUTH_FAILED", "A package chunk has an invalid length.");
     const body = await readExact(fh, pos + 4, len + TAG_BYTES);
     if (body.length < len + TAG_BYTES) throw new PortableError("TRUNCATED", "The package ends inside a chunk.");
+    onCiphertext?.(lenBuf);
+    onCiphertext?.(body);
     pos += 4 + len + TAG_BYTES;
     const isLast = pos === fileSize;
     // Try with the final flag implied by position; an attacker cannot forge either flag.

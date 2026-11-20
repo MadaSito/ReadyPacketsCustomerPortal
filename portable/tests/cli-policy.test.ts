@@ -106,11 +106,15 @@ describe("verifier CLI", () => {
     expect(await runCli(["extract", file, dest, "--passphrase-file", passFile], t.io)).toBe(EXIT.OK);
     expect((await readdir(path.join(dest, "objects"))).sort()).toEqual([OBJECT_SHA]);
     expect((await readFile(path.join(dest, "objects", OBJECT_SHA))).equals(OBJECT_BYTES)).toBe(true);
-    const man = JSON.parse(await readFile(path.join(dest, "manifest.json"), "utf8")) as { records: Array<{ type: string; count: number }> };
+    const man = JSON.parse(await readFile(path.join(dest, "manifest.json"), "utf8")) as { records: Array<{ type: string; count: number; file: string; sha256: string; bytes: number }> };
     for (const r of man.records) {
-      const lines = (await readFile(path.join(dest, "records", `${r.type}.jsonl`), "utf8")).split("\n").filter(Boolean);
-      expect(lines.length, r.type).toBe(r.count);
+      const data = await readFile(path.join(dest, r.file));
+      expect(data.toString().split("\n").filter(Boolean).length, r.type).toBe(r.count);
+      expect(createHash("sha256").update(data).digest("hex"), r.type).toBe(r.sha256); // verbatim bytes
+      expect(data.length).toBe(r.bytes);
     }
+    const info = JSON.parse(await readFile(path.join(dest, "extraction-info.json"), "utf8")) as { mode: string };
+    expect(info.mode).toBe("verbatim");
   });
 
   it("refuses to extract into an existing directory or an unverified package", async () => {
@@ -235,5 +239,34 @@ describe("version and unknown-field policy", () => {
     const r3 = await p3.verify();
     await p3.close();
     expect(r3.issues.map((i) => i.code)).toContain("UNSUPPORTED_EXTENSION");
+    expect(await runCli(["verify", req, "--passphrase-file", passFile], io().io)).toBe(EXIT.UNSUPPORTED);
+  });
+
+  it("rejects duplicate or non-canonical extension inventory entries", async () => {
+    const entry = (file: string) => ({ name: "acme-notes", version: "1.0", required: false, file, count: 0, bytes: 0, sha256: "0".repeat(64) });
+    const dup = await variant("dupext.rpkg", (m) =>
+      reinventory([...m, { name: "extensions/acme-notes.jsonl", data: Buffer.from('{"a":1}\n') }], (man) => void (man.extensions as unknown[]).push(entry("extensions/acme-notes.jsonl"), entry("extensions/acme-notes.jsonl"))),
+    );
+    await expect(openPackage({ input: dup, passphrase: PASS })).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
+    const alias = await variant("aliasext.rpkg", (m) =>
+      reinventory([...m, { name: "extensions/other.jsonl", data: Buffer.from('{"a":1}\n') }], (man) => void (man.extensions as unknown[]).push(entry("extensions/other.jsonl"))),
+    );
+    await expect(openPackage({ input: alias, passphrase: PASS })).rejects.toMatchObject({ code: "MANIFEST_INVALID" });
+  });
+
+  it("rejects an optional extension nested beyond the scanning budget (fail closed)", async () => {
+    const deep = "[".repeat(40) + '{"passwordHash":"x"}' + "]".repeat(40);
+    const f = await variant("deepext.rpkg", (m) =>
+      reinventory(
+        reinventory([...m, { name: "extensions/acme-notes.jsonl", data: Buffer.from(deep + "\n") }], (man) =>
+          void (man.extensions as unknown[]).push({ name: "acme-notes", version: "1.0", required: false, file: "extensions/acme-notes.jsonl", count: 0, bytes: 0, sha256: "0".repeat(64) }),
+        ),
+      ),
+    );
+    const pkg = await openPackage({ input: f, passphrase: PASS });
+    const r = await pkg.verify();
+    await pkg.close();
+    expect(r.ok).toBe(false);
+    expect(r.issues.map((i) => i.code)).toContain("RECORD_INVALID");
   });
 });

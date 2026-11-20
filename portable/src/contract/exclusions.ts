@@ -61,7 +61,12 @@ export function isExcludedKey(key: string): boolean {
 export function scanExclusions(value: unknown, max = 5): ExclusionHit[] {
   const hits: ExclusionHit[] = [];
   const walk = (v: unknown, path: string, depth: number): void => {
-    if (hits.length >= max || depth > 64) return;
+    if (hits.length >= max) return;
+    // Fail closed: a branch too deep to scan is treated as a hit, never skipped.
+    if (depth > 64) {
+      hits.push({ path, kind: "key", category: "excessive-depth" });
+      return;
+    }
     if (typeof v === "string") {
       for (const [re, category] of VALUE_PATTERNS) {
         if (re.test(v)) {

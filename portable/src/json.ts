@@ -26,11 +26,23 @@ export function safeJsonParse(text: string): unknown {
   });
 }
 
-export function jsonDepth(value: unknown, depth = 0): number {
-  if (Array.isArray(value)) return value.reduce<number>((m, v) => Math.max(m, jsonDepth(v, depth + 1)), depth + 1);
-  if (value && typeof value === "object")
-    return Object.values(value).reduce<number>((m, v) => Math.max(m, jsonDepth(v, depth + 1)), depth + 1);
-  return depth;
+/**
+ * Maximum nesting depth of a JSON value, computed iteratively (no recursion, so hostile nesting cannot
+ * exhaust the stack). Stops early and returns `stopAbove + 1` once the depth exceeds `stopAbove`.
+ */
+export function jsonDepth(value: unknown, stopAbove = 1024): number {
+  let max = 0;
+  const stack: Array<[unknown, number]> = [[value, 0]];
+  while (stack.length) {
+    const [v, d] = stack.pop()!;
+    if (v && typeof v === "object") {
+      const nd = d + 1;
+      if (nd > max) max = nd;
+      if (max > stopAbove) return stopAbove + 1;
+      for (const child of Array.isArray(v) ? v : Object.values(v)) stack.push([child, nd]);
+    }
+  }
+  return max;
 }
 
 /** True when the string contains C0 control characters or DEL. */

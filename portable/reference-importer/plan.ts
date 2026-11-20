@@ -138,7 +138,7 @@ export async function buildPlan(pkg: PortablePackage, report?: VerificationRepor
   }
 
   const body = {
-    planVersion: PLAN_VERSION,
+    planVersion: PLAN_VERSION as typeof PLAN_VERSION,
     target: "reference-crm-model.v1" as const,
     packageId: r.packageId,
     manifestSha256: r.manifestSha256,

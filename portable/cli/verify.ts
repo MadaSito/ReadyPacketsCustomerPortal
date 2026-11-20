@@ -9,7 +9,9 @@
  * The passphrase is never accepted as a command-line value (it would leak through process listings).
  *
  * Exit codes: 0 verified · 1 verification failed · 2 usage error · 3 passphrase rejected / header tampered ·
- *             4 unsupported format or contract · 5 I/O or archive error.
+ *             4 unsupported format, contract, KDF parameters or required module/extension ·
+ *             5 local I/O error (file missing/unreadable/unwritable). Archive-structure and integrity failures
+ *             (bad entry names, ratio/size limits, digests) are verification failures and return 1.
  */
 import { constants } from "node:fs";
 import { mkdir, open, readFile, stat } from "node:fs/promises";
@@ -43,6 +45,11 @@ function exitFor(code: PortableErrorCode): number {
   if (code === "INPUT_INVALID") return EXIT.USAGE;
   if (code === "IO_ERROR") return EXIT.IO;
   return EXIT.FAILED;
+}
+
+/** A failed report that is failed only because of unsupported required features maps to 4, else 1. */
+function reportExit(r: VerificationReport): number {
+  return r.issues.length > 0 && r.issueCount === r.issues.length && r.issues.every((i) => i.code === "UNSUPPORTED_EXTENSION" || i.code === "UNSUPPORTED_CONTRACT") ? EXIT.UNSUPPORTED : EXIT.FAILED;
 }
 
 function formatReport(r: VerificationReport): string {
@@ -138,12 +145,12 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     const report = await pkg.verify();
     if (command === "verify") {
       io.out(json ? JSON.stringify(report, null, 2) + "\n" : formatReport(report));
-      return report.ok ? EXIT.OK : EXIT.FAILED;
+      return report.ok ? EXIT.OK : reportExit(report);
     }
     if (!report.ok) {
       io.err(formatReport(report));
       io.err("error: refusing to continue with an unverified package\n");
-      return EXIT.FAILED;
+      return reportExit(report);
     }
     if (command === "plan") {
       const plan = await buildPlan(pkg, report);
@@ -163,26 +170,54 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
     await mkdir(dest, { mode: 0o700 });
     await mkdir(path.join(dest, "records"), { mode: 0o700 });
     await mkdir(path.join(dest, "objects"), { mode: 0o700 });
-    await writeNew(path.join(dest, "manifest.json"), canonicalJson(pkg.manifest) + "\n");
-    await writeNew(path.join(dest, "verification-report.json"), JSON.stringify(report, null, 2) + "\n");
-    for (const entry of pkg.manifest.records) {
-      const lines: string[] = [];
-      const fh = await open(path.join(dest, "records", `${entry.type}.jsonl`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try {
-        for await (const rec of pkg.records(entry.type)) {
-          lines.push(canonicalJson(rec) + "\n");
-          if (lines.length >= 1000) await fh.write(lines.splice(0).join(""));
+    const verbatim = pkg.sourceFormat === "v3" && pkg.verbatimEntries && pkg.openVerbatimEntry;
+    if (verbatim) {
+      // v3: every archive entry exactly as sealed and verified (manifest, records, extensions, objects);
+      // the manifest digests in the output therefore describe the output byte-for-byte.
+      for (const name of pkg.verbatimEntries!()) {
+        if (name.startsWith("extensions/")) await mkdir(path.join(dest, "extensions"), { mode: 0o700 }).catch(() => undefined);
+        const target = path.join(dest, ...name.split("/"));
+        await pipeline(await pkg.openVerbatimEntry!(name), createWriteStream(target, { flags: "wx", mode: 0o600 }));
+      }
+    } else {
+      // Legacy: there is no v3 archive; records are RECONSTRUCTED (upgraded in memory). This is declared
+      // in extraction-info.json and the manifest is written under a name that cannot be mistaken for one.
+      await writeNew(path.join(dest, "upgraded-manifest.json"), canonicalJson(pkg.manifest) + "\n");
+      for (const entry of pkg.manifest.records) {
+        const lines: string[] = [];
+        const fh = await open(path.join(dest, "records", `${entry.type}.jsonl`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          for await (const rec of pkg.records(entry.type)) {
+            lines.push(canonicalJson(rec) + "\n");
+            if (lines.length >= 1000) await fh.write(lines.splice(0).join(""));
+          }
+          if (lines.length) await fh.write(lines.join(""));
+        } finally {
+          await fh.close();
         }
-        if (lines.length) await fh.write(lines.join(""));
-      } finally {
-        await fh.close();
+      }
+      for (const o of pkg.listObjects()) {
+        // Name is a validated 64-hex digest — never a source-provided path.
+        await pipeline(await pkg.openObject(o.sha256), createWriteStream(path.join(dest, "objects", o.sha256), { flags: "wx", mode: 0o600 }));
       }
     }
-    for (const o of pkg.listObjects()) {
-      // Name is a validated 64-hex digest — never a source-provided path.
-      const target = path.join(dest, "objects", o.sha256);
-      await pipeline(await pkg.openObject(o.sha256), createWriteStream(target, { flags: "wx", mode: 0o600 }));
-    }
+    await writeNew(
+      path.join(dest, "extraction-info.json"),
+      JSON.stringify(
+        {
+          mode: verbatim ? "verbatim" : "reconstructed-from-legacy",
+          sourceFormat: pkg.sourceFormat,
+          ciphertextSha256: report.ciphertextSha256,
+          sourceManifestSha256: report.manifestSha256,
+          note: verbatim
+            ? "Files are the exact verified archive entries; manifest.json digests apply to them."
+            : "Records were upgraded from a legacy package in memory; upgraded-manifest.json digests do not describe these files. See verification-report.json losses.",
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    await writeNew(path.join(dest, "verification-report.json"), JSON.stringify(report, null, 2) + "\n");
     io.out(`extracted ${pkg.manifest.records.reduce((a, r) => a + r.count, 0)} records and ${pkg.listObjects().length} objects\n`);
     return EXIT.OK;
   } catch (e) {

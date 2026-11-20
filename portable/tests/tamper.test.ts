@@ -130,6 +130,28 @@ describe("ciphertext tamper matrix (detected at open)", () => {
     await expect(openBytes("t-kdf.rpkg", forged)).rejects.toMatchObject({ code: "KDF_PARAMS_REJECTED" });
   });
 
+  it("rejects header KDF parameters whose aggregate memory/work exceeds the ceiling", async () => {
+    const hlen = bytes.readUInt32BE(8);
+    const forge = (kdf: { N: number; r: number; p: number }) => {
+      const header = JSON.parse(bytes.subarray(12, 12 + hlen).toString("utf8")) as { kdf: Record<string, number> };
+      Object.assign(header.kdf, kdf);
+      const json = Buffer.from(canonicalJson(header));
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(json.length);
+      return Buffer.concat([bytes.subarray(0, 8), len, json, bytes.subarray(12 + hlen)]);
+    };
+    // Each parameter is individually within range, but the product is not.
+    await expect(openBytes("t-kdf2.rpkg", forge({ N: 2 ** 20, r: 16, p: 4 }))).rejects.toMatchObject({ code: "KDF_PARAMS_REJECTED" });
+    await expect(openBytes("t-kdf3.rpkg", forge({ N: 2 ** 18, r: 8, p: 2 }))).rejects.toMatchObject({ code: "KDF_PARAMS_REJECTED" });
+  });
+
+  it("reports the hash of exactly the authenticated ciphertext", async () => {
+    const { createHash } = await import("node:crypto");
+    const pkg = await openPackage({ input: file, passphrase: PASS });
+    expect(pkg.ciphertextSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+    await pkg.close();
+  });
+
   it("rejects a non-package file and a symlink path", async () => {
     await expect(openBytes("t-junk.rpkg", Buffer.from("PK\u0003\u0004 not a package"))).rejects.toMatchObject({ code: "UNSUPPORTED_ENVELOPE" });
     const { symlink } = await import("node:fs/promises");

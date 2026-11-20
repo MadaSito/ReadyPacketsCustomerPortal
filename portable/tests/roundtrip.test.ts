@@ -94,7 +94,7 @@ describe("portable v3 round trip", () => {
     for (let i = 0; i < 300; i++) {
       const base = sampleRecords()[1]![1] as Record<string, unknown>;
       const id = `01J${String(i).padStart(23, "0")}`;
-      await w.addRecord("customers", { ...(base as never), publicId: id, email: `c${i}@customer.example.test` });
+      await w.addRecord("customers", { ...base, publicId: id, email: `c${i}@customer.example.test` } as never);
     }
     const res = await w.finalize();
     expect(res.bytes).toBeGreaterThan(1024 * 3);

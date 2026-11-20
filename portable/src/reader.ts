@@ -11,7 +11,8 @@ import os from "node:os";
 import path from "node:path";
 import { Transform, type Readable } from "node:stream";
 import { PortableError, isPortableError } from "./errors.js";
-import { canonicalJson, safeJsonParse } from "./json.js";
+import { canonicalJson, jsonDepth, safeJsonParse } from "./json.js";
+import { MAX_JSON_DEPTH } from "./validate.js";
 import { resolveLimits, type PortableLimits } from "./limits.js";
 import { CONTRACT_MAJOR, CONTRACT_MINOR, ManifestSchema, parseVersion, type Manifest } from "./contract/manifest.js";
 import { RECORD_TYPE_ORDER, referencesOf, type RecordOf, type RecordType } from "./contract/records.js";
@@ -43,19 +44,6 @@ async function openNoFollow(input: string): Promise<FileHandle> {
   }
 }
 
-async function hashHandle(fh: FileHandle, size: number): Promise<string> {
-  const h = createHash("sha256");
-  const buf = Buffer.alloc(1024 * 1024);
-  let pos = 0;
-  while (pos < size) {
-    const { bytesRead } = await fh.read(buf, 0, Math.min(buf.length, size - pos), pos);
-    if (!bytesRead) throw new PortableError("IO_ERROR", "The package changed while being read.");
-    h.update(buf.subarray(0, bytesRead));
-    pos += bytesRead;
-  }
-  return h.digest("hex");
-}
-
 export async function openPackage(opts: OpenPackageOptions): Promise<PortablePackage> {
   const limits = resolveLimits(opts.limits);
   const fh = await openNoFollow(opts.input);
@@ -75,8 +63,9 @@ export async function openPackage(opts: OpenPackageOptions): Promise<PortablePac
     }
     if (!peek.equals(MAGIC)) throw new PortableError("UNSUPPORTED_ENVELOPE", "The file is not a ReadyPackets portable package.");
     if (st.size > limits.maxPackageBytes) throw new PortableError("SIZE_LIMIT", "The package exceeds the configured size limit.");
-    const ciphertextSha256 = await hashHandle(fh, st.size);
     const env = await openEnvelopeHeader(fh, opts.passphrase, limits);
+    // Single pass: the ciphertext hash covers exactly the bytes that were authenticated and decrypted.
+    const cipherHash = createHash("sha256").update(env.headerBytes).update(env.mac);
     spoolDir = await mkdtemp(path.join(opts.workDir ?? os.tmpdir(), "rp-portable-r-"));
     const plainPath = path.join(spoolDir, "archive.zip");
     const out = await open(plainPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -91,6 +80,7 @@ export async function openPackage(opts: OpenPackageOptions): Promise<PortablePac
           pos += plain.length;
         },
         limits.maxPackageBytes,
+        (b) => void cipherHash.update(b),
       );
     } finally {
       await out.close();
@@ -98,6 +88,7 @@ export async function openPackage(opts: OpenPackageOptions): Promise<PortablePac
       env.keys.macKey.fill(0);
     }
     if ((await fh.stat()).size !== st.size) throw new PortableError("IO_ERROR", "The package changed while being read.");
+    const ciphertextSha256 = cipherHash.digest("hex");
     await fh.close();
     // Every byte is authenticated from here on; parsing may begin.
     const zip = await openZip(plainPath, limits);
@@ -161,6 +152,21 @@ class V3Package implements PortablePackage {
       if (!parsed.success) {
         const issue = parsed.error.issues[0];
         throw new PortableError("MANIFEST_INVALID", "The manifest does not match the contract.", { path: issue ? `/${issue.path.map(String).join("/")}` : "" });
+      }
+      const recordTypes = new Set<string>();
+      for (const r of parsed.data.records) {
+        if (recordTypes.has(r.type) || r.file !== `records/${r.type}.jsonl`) throw new PortableError("MANIFEST_INVALID", "The manifest record inventory has duplicate or non-canonical entries.", { path: r.file });
+        recordTypes.add(r.type);
+      }
+      const extNames = new Set<string>();
+      for (const x of parsed.data.extensions) {
+        if (extNames.has(x.name) || x.file !== `extensions/${x.name}.jsonl`) throw new PortableError("MANIFEST_INVALID", "The manifest extension inventory has duplicate or non-canonical entries.", { path: x.file });
+        extNames.add(x.name);
+      }
+      const objectIds = new Set<string>();
+      for (const o of parsed.data.objects) {
+        if (objectIds.has(o.sha256)) throw new PortableError("MANIFEST_INVALID", "The manifest object inventory has duplicate entries.");
+        objectIds.add(o.sha256);
       }
       if (parsed.data.packageId !== headerPackageId) throw new PortableError("MANIFEST_INVALID", "The manifest package id does not match the envelope.");
       if (!newerMinor && canonicalJson(parsed.data) + "\n" !== bytes.toString("utf8")) throw new PortableError("MANIFEST_INVALID", "The manifest is not in canonical form.");
@@ -307,7 +313,10 @@ class V3Package implements PortablePackage {
           count += 1;
           if (bytes > this.limits.maxExtensionBytes) throw new PortableError("SIZE_LIMIT", "An extension exceeds its size limit.");
           try {
-            if (scanExclusions(safeJsonParse(text)).length) add({ code: "EXCLUDED_FIELD", message: "An extension contains a forbidden field or value.", path: x.name, line: count });
+            const value = safeJsonParse(text);
+            // Same nesting budget as records: anything deeper is rejected, never partially scanned.
+            if (jsonDepth(value, MAX_JSON_DEPTH) > MAX_JSON_DEPTH) add({ code: "RECORD_INVALID", message: "An extension line is nested too deeply.", path: x.name, line: count });
+            else if (scanExclusions(value).length) add({ code: "EXCLUDED_FIELD", message: "An extension contains a forbidden field or value.", path: x.name, line: count });
           } catch {
             add({ code: "RECORD_INVALID", message: "An extension line is not valid JSON.", path: x.name, line: count });
           }
@@ -395,6 +404,18 @@ class V3Package implements PortablePackage {
     });
     source.on("error", (e) => check.destroy(e));
     return source.pipe(check);
+  }
+
+  verbatimEntries(): ReadonlyArray<string> {
+    this.assertVerified();
+    return [...this.zip.entries.keys()].sort();
+  }
+
+  async openVerbatimEntry(name: string): Promise<Readable> {
+    this.assertVerified();
+    // Names come from the allowlisted archive inventory only (no caller-supplied paths reach the zip).
+    if (!this.zip.entries.has(name)) throw new PortableError("INPUT_INVALID", "The entry is not in the package.");
+    return openEntryStream(this.zip, name);
   }
 
   async *heldExtension(name: string): AsyncGenerator<string> {

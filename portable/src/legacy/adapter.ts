@@ -24,6 +24,29 @@ const LEGACY_KDF = { N: 2 ** 15, r: 8, p: 1, maxmem: 128 * 1024 * 1024 } as cons
 
 type Loss = VerificationReport["losses"][number];
 
+/** Fixed ULID time component for legacy-derived record ids (2020-01-01T00:00:00Z). */
+export const LEGACY_ID_EPOCH_MS = Date.UTC(2020, 0, 1);
+
+/** Enforce caller limits on the untrusted decrypted payload BEFORE any base64 decode or conversion. */
+function preflightLegacy(raw: unknown, limits: PortableLimits): void {
+  const contents = (raw as { contents?: Record<string, unknown> } | null)?.contents;
+  if (!contents || typeof contents !== "object") return; // shape errors are reported by validation
+  let total = 0;
+  for (const key of ["customers", "orders", "files"] as const) {
+    const list = contents[key];
+    if (!Array.isArray(list)) continue;
+    if (list.length > limits.maxRecordsPerType) throw new PortableError("SIZE_LIMIT", "The legacy package has too many records of one type.", { recordType: key });
+    if (key !== "files") continue;
+    for (const f of list as Array<{ contents?: unknown }>) {
+      const encoded = typeof f?.contents === "string" ? f.contents.length : 0;
+      const decoded = Math.floor((encoded * 3) / 4);
+      if (decoded > limits.maxObjectBytes) throw new PortableError("SIZE_LIMIT", "A legacy file exceeds the object size limit.");
+      total += decoded;
+      if (total > limits.maxTotalUncompressed) throw new PortableError("SIZE_LIMIT", "The legacy package exceeds the total size limit.");
+    }
+  }
+}
+
 /** Categories the v1/v2 formats never carried (architecture §6.1). */
 const FORMAT_LOSSES: Loss[] = [
   { code: "NOT_CARRIED_BILLING", message: "Invoices, payments, refunds and receipts are not in v1/v2; a payment status flag is not payment evidence." },
@@ -94,6 +117,7 @@ export async function openLegacyPackage(bytes: Buffer, passphrase: string | Uint
     throw new PortableError("LEGACY_INVALID", "The legacy payload is not valid JSON.");
   }
   const manifestSha256 = createHash("sha256").update(plain).digest("hex");
+  preflightLegacy(raw, limits);
   return LegacyPackage.build(raw, payloadFormat, limits, manifestSha256, ciphertextSha256);
 }
 
@@ -126,7 +150,9 @@ export function convertLegacyPayload(raw: unknown, payloadFormat: string): Conve
   const sourceRef = parsed.success ? parsed.data.sourceSystemRef : "0".repeat(64);
   const pseudonym = `legacy-${sourceRef.slice(0, 32)}`;
   const t0 = Date.parse(generatedAt);
-  const pid = (kind: string, ref: string) => derivedUlid(`rp-legacy:${sourceRef}:${kind}`, ref, t0);
+  // Ids depend only on the source system ref + the stable per-record legacy ref, never on export time, so
+  // re-exports of the same source records map to the same portable ids (idempotent re-import).
+  const pid = (kind: string, ref: string) => derivedUlid(`rp-legacy:${sourceRef}:${kind}`, ref, LEGACY_ID_EPOCH_MS);
 
   if (!parsed.success) {
     const i = parsed.error.issues[0];

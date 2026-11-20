@@ -6,6 +6,9 @@ import { applyUnknownFieldPolicy } from "./contract/policy.js";
 import type { VerificationIssue } from "./types.js";
 
 /** Validate one decoded record value (shared by v3 reader and legacy adapters). */
+/** Nesting budget for records and extension lines (exclusion scanning covers every level within it). */
+export const MAX_JSON_DEPTH = 32;
+
 export function checkRecord(
   type: RecordType,
   raw: unknown,
@@ -13,7 +16,7 @@ export function checkRecord(
   limits: PortableLimits,
 ): { ok: true; value: Record<string, unknown>; held: number } | { ok: false; issue: VerificationIssue } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, issue: { code: "RECORD_INVALID", message: "A record line is not a JSON object.", recordType: type } };
-  if (jsonDepth(raw) > 32) return { ok: false, issue: { code: "RECORD_INVALID", message: "A record is nested too deeply.", recordType: type } };
+  if (jsonDepth(raw, MAX_JSON_DEPTH) > MAX_JSON_DEPTH) return { ok: false, issue: { code: "RECORD_INVALID", message: "A record is nested too deeply.", recordType: type } };
   const hits = scanExclusions(raw);
   if (hits.length) return { ok: false, issue: { code: "EXCLUDED_FIELD", message: "A record contains a field or value that must never be exported.", recordType: type, path: hits[0]!.path } };
   const { value, held } = applyUnknownFieldPolicy(type, raw as Record<string, unknown>, newerMinor);

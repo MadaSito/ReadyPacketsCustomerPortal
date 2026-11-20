@@ -1,4 +1,5 @@
 /** Synthetic fixtures for portable tests (no real data; *.example.test addresses only). */
+import type { Entry as YauzlEntry } from "yauzl";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -143,7 +144,7 @@ export async function readZipMembers(zipBytes: Buffer): Promise<ZipMember[]> {
     yauzl.fromBuffer(zipBytes, { lazyEntries: true }, (err, zip) => {
       if (err || !zip) return reject(err);
       const out: ZipMember[] = [];
-      zip.on("entry", (e: import("yauzl").Entry) => {
+      zip.on("entry", (e: YauzlEntry) => {
         zip.openReadStream(e, (er, s) => {
           if (er || !s) return reject(er);
           const parts: Buffer[] = [];

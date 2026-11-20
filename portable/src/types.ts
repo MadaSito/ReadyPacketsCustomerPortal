@@ -54,5 +54,11 @@ export interface PortablePackage {
   openObject(sha256: string): Promise<Readable>;
   /** Raw inert lines of an optional, unknown extension (never interpreted). */
   heldExtension(name: string): AsyncIterable<string>;
+  /**
+   * v3 only (after a successful verify): archive entry names, and their exact verified bytes. Legacy
+   * packages have no verbatim v3 archive and do not implement these.
+   */
+  verbatimEntries?(): ReadonlyArray<string>;
+  openVerbatimEntry?(name: string): Promise<Readable>;
   close(): Promise<void>;
 }

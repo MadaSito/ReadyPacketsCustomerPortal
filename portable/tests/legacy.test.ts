@@ -124,6 +124,27 @@ describe("legacy v2 adapter", () => {
     expect(await ids()).toEqual(await ids());
   });
 
+  it("keeps record ids stable across re-exports with a different generatedAt", async () => {
+    const contents = { customers: [customer("c1", "ada@legacy.example.test")], orders: [order("o1", "c1")], files: [] };
+    const ids = async (generatedAt: string) => {
+      const draft = { format: V2, sourceSystemRef: h("legacy-source"), generatedAt, sourceRelease: null, scope: "customer", contents };
+      const pkg = await open(seal(V2E, V2, { ...draft, packageId: h(JSON.stringify(draft)) }));
+      const report = await pkg.verify();
+      expect(report.issues).toEqual([]);
+      const r = (await collect(pkg)).filter((x) => x.type !== "provenance").map((x) => `${x.type}:${String(x.record.publicId)}`);
+      await pkg.close();
+      return r;
+    };
+    expect(await ids("2026-02-01T00:00:00.000Z")).toEqual(await ids("2026-06-30T12:00:00.000Z"));
+  });
+
+  it("enforces caller limits before decoding legacy contents", async () => {
+    const f = path.join(dir, "limits.rptransfer");
+    await writeFile(f, seal(V2E, V2, payload(V2, "order", { customers: [customer("c1", "ada@legacy.example.test")], orders: [order("o1", "c1")], files: [file("f1", "o1")] })));
+    await expect(openPackage({ input: f, passphrase: PASS, limits: { maxObjectBytes: 8 } })).rejects.toMatchObject({ code: "SIZE_LIMIT" });
+    await expect(openPackage({ input: f, passphrase: PASS, limits: { maxTotalUncompressed: 8 } })).rejects.toMatchObject({ code: "SIZE_LIMIT" });
+  });
+
   it("detects a forged legacy packageId", async () => {
     const pkg = await open(seal(V2E, V2, payload(V2, "customer", { customers: [customer("c1", "ada@legacy.example.test")], orders: [], files: [] }, { badId: true })));
     const report = await pkg.verify();
