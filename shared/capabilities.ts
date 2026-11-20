@@ -81,6 +81,7 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "intake.review",
   "invoices.read_all",
   "invoices.record_payment",
+  "invoices.manage",
   "platform.health.read",
 ];
 
