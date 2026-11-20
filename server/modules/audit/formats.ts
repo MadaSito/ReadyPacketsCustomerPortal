@@ -64,7 +64,7 @@ export const CSV_COLUMNS = [
 export function csvCell(value: unknown): string {
   if (value === null || value === undefined) return "";
   let text = typeof value === "object" ? JSON.stringify(value) : String(value);
-  if (/^[=+\-@\t\r\uFF1D\uFF0B\uFF0D\uFF20]/.test(text)) text = `'${text}`;
+  if (/^[ \u00A0]*[=+\-@\t\r\uFF1D\uFF0B\uFF0D\uFF20]/.test(text)) text = `'${text}`;
   if (/[",\r\n]/.test(text) || text !== text.trim()) text = `"${text.replace(/"/g, '""')}"`;
   return text;
 }
