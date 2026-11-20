@@ -308,7 +308,7 @@ export function createPortableHooks(deps: PortableDeps) {
         }
       }
       const referenceReason = reference ? "IMPORTED_SOURCE" : "IMPORTED_GENERATED";
-      reference ??= await allocateReference(tx, await readSetting(deps.settings, ORDER_REFERENCE_PREFIX), now);
+      reference ??= await allocateReference(tx, await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx), now);
 
       const publicId = ulid(now.getTime());
       const lockState = input.editable ? "none" : "imported_read_only";
