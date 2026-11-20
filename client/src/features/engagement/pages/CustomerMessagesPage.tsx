@@ -9,6 +9,7 @@ import {
   DataTable,
   DateTime,
   EmptyState,
+  ErrorState,
   Field,
   FilterBar,
   LoadMore,
@@ -48,20 +49,27 @@ export default function CustomerMessagesPage() {
     }),
   );
 
-  const allRows = threadsQuery.data?.pages.flatMap((p) => p.items) ?? [];
-  const rows = searchFilter
-    ? allRows.filter((row) => {
-        const needle = searchFilter.toLowerCase();
-        return (
-          row.orderReference.toLowerCase().includes(needle) ||
-          row.projectName.toLowerCase().includes(needle) ||
-          row.lastMessagePreview.toLowerCase().includes(needle)
-        );
-      })
-    : allRows;
+  const allRows = threadsQuery.data ? threadsQuery.data.pages.flatMap((p) => p.items) : undefined;
+  const rows =
+    allRows === undefined
+      ? undefined
+      : searchFilter
+        ? allRows.filter((row) => {
+            const needle = searchFilter.toLowerCase();
+            return (
+              row.orderReference.toLowerCase().includes(needle) ||
+              row.projectName.toLowerCase().includes(needle) ||
+              row.lastMessagePreview.toLowerCase().includes(needle)
+            );
+          })
+        : allRows;
 
-  const totalUnread = allRows.reduce((acc, row) => acc + row.unreadCount, 0);
+  const totalUnread = (allRows ?? []).reduce((acc, row) => acc + row.unreadCount, 0);
   const activeCount = (unreadFilter === "unread" ? 1 : 0) + (searchFilter ? 1 : 0);
+  const initialError =
+    !threadsQuery.data && threadsQuery.isError
+      ? (threadsQuery.error ?? new Error("Unable to load conversations."))
+      : undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -110,8 +118,10 @@ export default function CustomerMessagesPage() {
         caption="Order message threads"
         rows={rows}
         loading={threadsQuery.isPending}
-        error={threadsQuery.error}
-        onRetry={() => threadsQuery.refetch()}
+        error={initialError}
+        onRetry={() => {
+          void threadsQuery.refetch();
+        }}
         rowKey={(row) => row.orderPublicId}
         columns={[
           {
@@ -174,11 +184,20 @@ export default function CustomerMessagesPage() {
         }
       />
 
+      {threadsQuery.data && threadsQuery.isError ? (
+        <ErrorState
+          error={threadsQuery.error}
+          onRetry={() => {
+            void threadsQuery.fetchNextPage();
+          }}
+        />
+      ) : null}
+
       <LoadMore
         hasMore={!!threadsQuery.hasNextPage}
         loading={threadsQuery.isFetchingNextPage}
         onLoadMore={() => threadsQuery.fetchNextPage()}
-        summary={rows.length > 0 ? `Showing ${rows.length} conversation${rows.length === 1 ? "" : "s"}` : undefined}
+        summary={rows && rows.length > 0 ? `Showing ${rows.length} conversation${rows.length === 1 ? "" : "s"}` : undefined}
       />
     </div>
   );

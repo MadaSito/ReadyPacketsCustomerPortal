@@ -9,14 +9,13 @@ export default function CustomerEngagementWidget() {
   const unreadMessages = useQuery(trpc.engagement.messages.unreadSummary.queryOptions({}));
   const ticketSummary = useQuery(trpc.engagement.tickets.openSummary.queryOptions({}));
 
-  const loading = unreadMessages.isPending || ticketSummary.isPending;
+  const isError = unreadMessages.isError || ticketSummary.isError;
   const error = unreadMessages.error ?? ticketSummary.error;
+  const ready = unreadMessages.isSuccess && ticketSummary.isSuccess;
 
   return (
     <Card title="Messages & support">
-      {loading ? (
-        <Skeleton lines={3} />
-      ) : error ? (
+      {isError ? (
         <ErrorState
           error={error}
           onRetry={() => {
@@ -24,6 +23,8 @@ export default function CustomerEngagementWidget() {
             void ticketSummary.refetch();
           }}
         />
+      ) : !ready ? (
+        <Skeleton lines={3} />
       ) : (
         <div className="flex flex-col gap-4">
           <div className="flex items-center justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">

@@ -111,11 +111,16 @@ export default function SearchPage() {
           title="Enter a search query"
           description="Type at least 2 characters above to search references and conversations."
         />
-      ) : searchQuery.isPending ? (
+      ) : searchQuery.isError ? (
+        <ErrorState
+          error={searchQuery.error}
+          onRetry={() => {
+            void searchQuery.refetch();
+          }}
+        />
+      ) : !searchQuery.isSuccess || !data ? (
         <Skeleton lines={5} />
-      ) : searchQuery.error ? (
-        <ErrorState error={searchQuery.error} onRetry={() => searchQuery.refetch()} />
-      ) : !data || totalHits === 0 ? (
+      ) : totalHits === 0 ? (
         <EmptyState
           icon={Search}
           title="No matching records"

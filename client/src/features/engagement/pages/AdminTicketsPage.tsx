@@ -10,11 +10,13 @@ import {
   DataTable,
   DateTime,
   EmptyState,
+  ErrorState,
   Field,
   FilterBar,
   LoadMore,
   PageHeader,
   Select,
+  Skeleton,
 } from "@/ui";
 import {
   TICKET_CATEGORY_OPTIONS,
@@ -51,17 +53,20 @@ export default function AdminTicketsPage() {
     ),
   );
 
-  const allItems = listQuery.data?.pages.flatMap((p) => p.items) ?? [];
-  const rows = searchText
-    ? allItems.filter((item) => {
-        const needle = searchText.toLowerCase();
-        return (
-          item.ticketNumber.toLowerCase().includes(needle) ||
-          item.subject.toLowerCase().includes(needle) ||
-          (item.relatedOrderReference?.toLowerCase().includes(needle) ?? false)
-        );
-      })
-    : allItems;
+  const allItems = listQuery.data ? listQuery.data.pages.flatMap((p) => p.items) : undefined;
+  const rows =
+    allItems === undefined
+      ? undefined
+      : searchText
+        ? allItems.filter((item) => {
+            const needle = searchText.toLowerCase();
+            return (
+              item.ticketNumber.toLowerCase().includes(needle) ||
+              item.subject.toLowerCase().includes(needle) ||
+              (item.relatedOrderReference?.toLowerCase().includes(needle) ?? false)
+            );
+          })
+        : allItems;
 
   const activeCount =
     (statusFilter ? 1 : 0) +
@@ -69,6 +74,10 @@ export default function AdminTicketsPage() {
     (categoryFilter ? 1 : 0) +
     (assignmentFilter !== "all" ? 1 : 0) +
     (searchText ? 1 : 0);
+  const initialError =
+    !listQuery.data && listQuery.isError
+      ? (listQuery.error ?? new Error("Unable to load support queue."))
+      : undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -77,7 +86,20 @@ export default function AdminTicketsPage() {
         description="Triage, assign, and respond to customer support tickets."
       />
 
-      {summaryQuery.data ? (
+      {summaryQuery.isPending ? (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3" aria-label="Loading queue summary">
+          <Card><Skeleton lines={2} /></Card>
+          <Card><Skeleton lines={2} /></Card>
+          <Card><Skeleton lines={2} /></Card>
+        </div>
+      ) : summaryQuery.isError && !initialError ? (
+        <ErrorState
+          error={summaryQuery.error}
+          onRetry={() => {
+            void summaryQuery.refetch();
+          }}
+        />
+      ) : summaryQuery.data ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <Card>
             <p className="text-xs font-medium text-muted">Active open</p>
@@ -149,8 +171,11 @@ export default function AdminTicketsPage() {
         caption="Support ticket queue"
         rows={rows}
         loading={listQuery.isPending}
-        error={listQuery.error}
-        onRetry={() => listQuery.refetch()}
+        error={initialError}
+        onRetry={() => {
+          void listQuery.refetch();
+          if (summaryQuery.isError) void summaryQuery.refetch();
+        }}
         rowKey={(row) => row.publicId}
         columns={[
           {
@@ -214,11 +239,20 @@ export default function AdminTicketsPage() {
         }
       />
 
+      {listQuery.data && listQuery.isError ? (
+        <ErrorState
+          error={listQuery.error}
+          onRetry={() => {
+            void listQuery.fetchNextPage();
+          }}
+        />
+      ) : null}
+
       <LoadMore
         hasMore={!!listQuery.hasNextPage}
         loading={listQuery.isFetchingNextPage}
         onLoadMore={() => listQuery.fetchNextPage()}
-        summary={rows.length > 0 ? `Showing ${rows.length} ticket${rows.length === 1 ? "" : "s"}` : undefined}
+        summary={rows && rows.length > 0 ? `Showing ${rows.length} ticket${rows.length === 1 ? "" : "s"}` : undefined}
       />
     </div>
   );

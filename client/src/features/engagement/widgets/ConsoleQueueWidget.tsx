@@ -14,8 +14,9 @@ export default function ConsoleQueueWidget() {
     }),
   );
 
-  const loading = queue.isPending || inbox.isPending;
+  const isError = queue.isError || inbox.isError;
   const error = queue.error ?? inbox.error;
+  const ready = queue.isSuccess && inbox.isSuccess;
 
   return (
     <Card
@@ -26,9 +27,7 @@ export default function ConsoleQueueWidget() {
         </Button>
       }
     >
-      {loading ? (
-        <Skeleton lines={3} />
-      ) : error ? (
+      {isError ? (
         <ErrorState
           error={error}
           onRetry={() => {
@@ -36,6 +35,8 @@ export default function ConsoleQueueWidget() {
             void inbox.refetch();
           }}
         />
+      ) : !ready ? (
+        <Skeleton lines={3} />
       ) : (
         <div className="flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">

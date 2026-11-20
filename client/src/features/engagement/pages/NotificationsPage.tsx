@@ -106,10 +106,16 @@ export default function NotificationsPage() {
         </div>
       </div>
 
-      {listQuery.isPending ? (
+      {!listQuery.data && listQuery.isError ? (
+        <ErrorState
+          error={listQuery.error}
+          onRetry={() => {
+            void listQuery.refetch();
+            void unreadCountQuery.refetch();
+          }}
+        />
+      ) : !listQuery.data ? (
         <Skeleton lines={4} />
-      ) : listQuery.error ? (
-        <ErrorState error={listQuery.error} onRetry={() => listQuery.refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
           icon={Bell}
@@ -171,6 +177,15 @@ export default function NotificationsPage() {
         </ul>
       )}
 
+      {listQuery.data && listQuery.isError ? (
+        <ErrorState
+          error={listQuery.error}
+          onRetry={() => {
+            void listQuery.fetchNextPage();
+          }}
+        />
+      ) : null}
+
       <LoadMore
         hasMore={!!listQuery.hasNextPage}
         loading={listQuery.isFetchingNextPage}
@@ -180,10 +195,15 @@ export default function NotificationsPage() {
     </div>
   );
 
-  const preferencesContent = prefsQuery.isPending ? (
+  const preferencesContent = prefsQuery.isError ? (
+    <ErrorState
+      error={prefsQuery.error}
+      onRetry={() => {
+        void prefsQuery.refetch();
+      }}
+    />
+  ) : !prefsQuery.isSuccess ? (
     <Skeleton lines={5} />
-  ) : prefsQuery.error ? (
-    <ErrorState error={prefsQuery.error} onRetry={() => prefsQuery.refetch()} />
   ) : (
     <Card
       title="Delivery preferences"

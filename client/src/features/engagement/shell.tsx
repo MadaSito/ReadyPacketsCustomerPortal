@@ -70,6 +70,8 @@ export function useNotificationBellData(options: { includeList?: boolean } = {})
     unreadCount: unreadQuery.data?.unreadCount ?? 0,
     items: listQuery.data?.items ?? [],
     isLoading: listQuery.isPending,
+    isSuccess: listQuery.isSuccess,
+    isError: listQuery.isError,
     error: listQuery.error,
     refetch: () => {
       void unreadQuery.refetch();
@@ -89,7 +91,8 @@ export function NotificationBellPopover({ area: _area }: NotificationBellPopover
   const {
     unreadCount,
     items,
-    isLoading,
+    isSuccess,
+    isError,
     error,
     refetch,
     markRead,
@@ -150,10 +153,10 @@ export function NotificationBellPopover({ area: _area }: NotificationBellPopover
           ) : null}
         </div>
 
-        {isLoading ? (
-          <Skeleton lines={4} />
-        ) : error ? (
+        {isError ? (
           <ErrorState error={error} onRetry={refetch} />
+        ) : !isSuccess ? (
+          <Skeleton lines={4} />
         ) : items.length === 0 ? (
           <EmptyState
             icon={Bell}

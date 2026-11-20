@@ -40,8 +40,8 @@ Executed via sandbox scripts (`source scripts/dev/env.sh`):
    - Command: `scripts/dev/lint.sh server/modules/engagement client/src/features/engagement`
    - Result: 0 errors, 0 warnings (verified no `sql.raw`, no browser storage APIs, no raw hex/palette classes, no `dangerouslySetInnerHTML`, React 19 hooks rules clean).
 3. **Integration & Accessibility Tests**:
-   - Command: `scripts/dev/test.sh server/modules/engagement client/src/features/engagement`
-   - Result: **2 test files passed, 16/16 tests passed**:
+   - Command: `scripts/dev/test.sh server/modules/engagement/engagement.test.ts` and `scripts/dev/test.sh client/src/features/engagement/engagement.test.tsx`
+   - Result: **2 test files passed, 17/17 tests passed**:
      - `server/modules/engagement/engagement.test.ts` (**12 tests against real MySQL 8**):
        1. Order messages: owner, contributor write, viewer read-only (`GRANT_READ_ONLY`), grant revocation, staff internal notes invisible to customers, unread counts & read receipts, idempotency.
        2. Negative authz & lock enforcement: cross-tenant `NOT_FOUND` + `authz.engagement.denied` audit, customer internal-note rejection, `staff_only` attachment rejection, `archived`/`cancelled`/`legal_hold` lock enforcement (`ORDER_LOCKED_FOR_MESSAGING`).
@@ -53,11 +53,12 @@ Executed via sandbox scripts (`source scripts/dev/env.sh`):
        8. Unverified MFA step-up session rejection (`MFA_STEP_UP_REQUIRED`) and in-transaction revoked/suspended actor rejection.
        9. Cross-tenant search anti-starvation: 120 matching tokens from another tenant do not starve an authorized user's single matching ticket/message; lowercase reference prefix query matches uppercase-normalized references.
        10. Ticket detail pagination & internal-note metadata isolation: 65 replies paginate cleanly (`50` + `15` via `repliesNextCursor`), `internalOnly` notes do not leak to customer pages, and `internalOnly` replies + `admin.assign` leave customer-visible `updatedAt` and `lastMessageAt` unchanged.
-     - `client/src/features/engagement/engagement.test.tsx` (**4 client test suites with `axe-core` WCAG checks**):
+     - `client/src/features/engagement/engagement.test.tsx` (**5 client test suites with `axe-core` WCAG checks**):
        1. Shell `NotificationBellPopover` + `GlobalSearchBox`: unread count badge, accessible `Drawer` open/mark-read/mark-all-read, `/search?q=...` navigation, zero `axe` violations.
        2. `OrderMessagesTab`: renders `<script>alert("xss")</script>` strictly as inert text (`container.querySelector("script") === null`), sends message with idempotency key, zero `axe` violations.
        3. All 6 customer pages (`/messages`, `/support`, `/support/new`, `/support/:ticketId` including `"Load newer replies"` cursor pagination + close modal, `/notifications`, `/search` with `partial: true` banner) — interactive flows + zero `axe` violations on every page.
        4. All 3 staff/admin pages (`/admin/tickets`, `/admin/tickets/:ticketId` internal notes + triage controls, `/admin/messages`) + both dashboard widgets (`CustomerEngagementWidget`, `ConsoleQueueWidget`) — interactive flows + zero `axe` violations on every surface.
+       5. Honest loading/error/empty states across list/detail pages & widgets (`SupportTicketsPage`, `CustomerMessagesPage`, `NotificationsPage`, `AdminTicketsPage`, `SupportTicketDetailPage`, `CustomerEngagementWidget`): verifies `EmptyState` never renders during pending or failed queries, failed queries render `@/ui` `ErrorState` (`safeMessage`, `Reference: <requestId>`, and `Try again` retry button) with zero `axe` violations, and `EmptyState` renders only after a successful empty response.
 
 ---
 

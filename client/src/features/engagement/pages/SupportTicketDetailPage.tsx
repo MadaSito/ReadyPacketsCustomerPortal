@@ -51,7 +51,8 @@ export default function SupportTicketDetailPage() {
     stamp: number;
     extraReplies: TicketReplyView[];
     nextCursor: string | null;
-  }>({ stamp: 0, extraReplies: [], nextCursor: null });
+    error: unknown;
+  }>({ stamp: 0, extraReplies: [], nextCursor: null, error: null });
   const [loadingMore, setLoadingMore] = useState(false);
 
   const [idemKey, setIdemKey] = useState(() => makeIdempotencyKey("tkt_reply"));
@@ -66,6 +67,7 @@ export default function SupportTicketDetailPage() {
     pagedState.stamp === stamp
       ? pagedState.nextCursor
       : (detailQuery.data?.repliesNextCursor ?? null);
+  const paginationError = pagedState.stamp === stamp ? pagedState.error : null;
 
   const invalidateTicket = () => {
     void queryClient.invalidateQueries({ queryKey: trpc.engagement.tickets.pathKey() });
@@ -84,12 +86,14 @@ export default function SupportTicketDetailPage() {
         stamp,
         extraReplies: [...extraReplies, ...page.replies],
         nextCursor: page.repliesNextCursor,
+        error: null,
       });
     } catch (err) {
-      toast.show({
-        tone: "danger",
-        title: "Could not load more replies",
-        description: errorMessage(err),
+      setPagedState({
+        stamp,
+        extraReplies,
+        nextCursor,
+        error: err,
       });
     } finally {
       setLoadingMore(false);
@@ -154,17 +158,24 @@ export default function SupportTicketDetailPage() {
     });
   };
 
-  if (detailQuery.isPending) {
+  if (detailQuery.isError) {
+    return (
+      <ErrorState
+        error={detailQuery.error}
+        onRetry={() => {
+          void detailQuery.refetch();
+        }}
+      />
+    );
+  }
+
+  if (!detailQuery.isSuccess) {
     return (
       <div className="flex flex-col gap-6">
         <PageHeader title="Loading ticket…" />
         <Skeleton lines={5} />
       </div>
     );
-  }
-
-  if (detailQuery.error || !detailQuery.data) {
-    return <ErrorState error={detailQuery.error} onRetry={() => detailQuery.refetch()} />;
   }
 
   const {
@@ -249,6 +260,17 @@ export default function SupportTicketDetailPage() {
                 </li>
               ))}
             </ol>
+
+            {paginationError ? (
+              <div className="mt-3">
+                <ErrorState
+                  error={paginationError}
+                  onRetry={() => {
+                    void loadMoreReplies();
+                  }}
+                />
+              </div>
+            ) : null}
 
             <LoadMore
               hasMore={nextCursor !== null}

@@ -8,6 +8,7 @@ import {
   DataTable,
   DateTime,
   EmptyState,
+  ErrorState,
   Field,
   FilterBar,
   LoadMore,
@@ -34,19 +35,26 @@ export default function AdminMessagesPage() {
     ),
   );
 
-  const allItems = inboxQuery.data?.pages.flatMap((p) => p.items) ?? [];
-  const rows = searchText
-    ? allItems.filter((item) => {
-        const needle = searchText.toLowerCase();
-        return (
-          item.orderReference.toLowerCase().includes(needle) ||
-          item.body.toLowerCase().includes(needle) ||
-          item.authorDisplayLabel.toLowerCase().includes(needle)
-        );
-      })
-    : allItems;
+  const allItems = inboxQuery.data ? inboxQuery.data.pages.flatMap((p) => p.items) : undefined;
+  const rows =
+    allItems === undefined
+      ? undefined
+      : searchText
+        ? allItems.filter((item) => {
+            const needle = searchText.toLowerCase();
+            return (
+              item.orderReference.toLowerCase().includes(needle) ||
+              item.body.toLowerCase().includes(needle) ||
+              item.authorDisplayLabel.toLowerCase().includes(needle)
+            );
+          })
+        : allItems;
 
   const activeCount = (unreadOnly ? 1 : 0) + (visibility ? 1 : 0) + (searchText ? 1 : 0);
+  const initialError =
+    !inboxQuery.data && inboxQuery.isError
+      ? (inboxQuery.error ?? new Error("Unable to load order messages."))
+      : undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -95,8 +103,10 @@ export default function AdminMessagesPage() {
         caption="Staff order messages inbox"
         rows={rows}
         loading={inboxQuery.isPending}
-        error={inboxQuery.error}
-        onRetry={() => inboxQuery.refetch()}
+        error={initialError}
+        onRetry={() => {
+          void inboxQuery.refetch();
+        }}
         rowKey={(row) => row.publicId}
         columns={[
           {
@@ -164,11 +174,20 @@ export default function AdminMessagesPage() {
         }
       />
 
+      {inboxQuery.data && inboxQuery.isError ? (
+        <ErrorState
+          error={inboxQuery.error}
+          onRetry={() => {
+            void inboxQuery.fetchNextPage();
+          }}
+        />
+      ) : null}
+
       <LoadMore
         hasMore={!!inboxQuery.hasNextPage}
         loading={inboxQuery.isFetchingNextPage}
         onLoadMore={() => inboxQuery.fetchNextPage()}
-        summary={rows.length > 0 ? `Showing ${rows.length} message${rows.length === 1 ? "" : "s"}` : undefined}
+        summary={rows && rows.length > 0 ? `Showing ${rows.length} message${rows.length === 1 ? "" : "s"}` : undefined}
       />
     </div>
   );

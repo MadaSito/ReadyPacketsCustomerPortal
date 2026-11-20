@@ -109,7 +109,19 @@ export default function OrderMessagesTab({ orderId, area }: OrderMessagesSlotPro
     });
   };
 
-  if (listQuery.isPending) {
+  if (!listQuery.data && listQuery.isError) {
+    return (
+      <ErrorState
+        error={listQuery.error}
+        onRetry={() => {
+          void listQuery.refetch();
+          void unreadSummary.refetch();
+        }}
+      />
+    );
+  }
+
+  if (!listQuery.data) {
     return (
       <Card title="Order messages">
         <Skeleton lines={4} />
@@ -117,12 +129,8 @@ export default function OrderMessagesTab({ orderId, area }: OrderMessagesSlotPro
     );
   }
 
-  if (listQuery.error) {
-    return <ErrorState error={listQuery.error} onRetry={() => listQuery.refetch()} />;
-  }
-
   // Pages arrive newest-first from server; present chronologically top-to-bottom.
-  const allMessagesDesc = listQuery.data?.pages.flatMap((p) => p.items) ?? [];
+  const allMessagesDesc = listQuery.data.pages.flatMap((p) => p.items);
   const chronological = [...allMessagesDesc].reverse();
   const unreadCount = unreadSummary.data?.totalUnread ?? 0;
 
@@ -145,6 +153,17 @@ export default function OrderMessagesTab({ orderId, area }: OrderMessagesSlotPro
           ) : undefined
         }
       >
+        {listQuery.isError ? (
+          <div className="mb-3">
+            <ErrorState
+              error={listQuery.error}
+              onRetry={() => {
+                void listQuery.fetchNextPage();
+              }}
+            />
+          </div>
+        ) : null}
+
         <LoadMore
           hasMore={!!listQuery.hasNextPage}
           loading={listQuery.isFetchingNextPage}

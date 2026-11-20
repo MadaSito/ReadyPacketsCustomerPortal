@@ -9,6 +9,7 @@ import {
   DataTable,
   DateTime,
   EmptyState,
+  ErrorState,
   Field,
   FilterBar,
   LoadMore,
@@ -35,19 +36,26 @@ export default function SupportTicketsPage() {
     ),
   );
 
-  const allItems = listQuery.data?.pages.flatMap((p) => p.items) ?? [];
-  const rows = searchText
-    ? allItems.filter((item) => {
-        const needle = searchText.toLowerCase();
-        return (
-          item.ticketNumber.toLowerCase().includes(needle) ||
-          item.subject.toLowerCase().includes(needle) ||
-          (item.relatedOrderReference?.toLowerCase().includes(needle) ?? false)
-        );
-      })
-    : allItems;
+  const allItems = listQuery.data ? listQuery.data.pages.flatMap((p) => p.items) : undefined;
+  const rows =
+    allItems === undefined
+      ? undefined
+      : searchText
+        ? allItems.filter((item) => {
+            const needle = searchText.toLowerCase();
+            return (
+              item.ticketNumber.toLowerCase().includes(needle) ||
+              item.subject.toLowerCase().includes(needle) ||
+              (item.relatedOrderReference?.toLowerCase().includes(needle) ?? false)
+            );
+          })
+        : allItems;
 
   const activeCount = (statusFilter ? 1 : 0) + (searchText ? 1 : 0);
+  const initialError =
+    !listQuery.data && listQuery.isError
+      ? (listQuery.error ?? new Error("Unable to load support tickets."))
+      : undefined;
 
   return (
     <div className="flex flex-col gap-6">
@@ -86,8 +94,10 @@ export default function SupportTicketsPage() {
         caption="Your support tickets"
         rows={rows}
         loading={listQuery.isPending}
-        error={listQuery.error}
-        onRetry={() => listQuery.refetch()}
+        error={initialError}
+        onRetry={() => {
+          void listQuery.refetch();
+        }}
         rowKey={(row) => row.publicId}
         columns={[
           {
@@ -146,11 +156,20 @@ export default function SupportTicketsPage() {
         }
       />
 
+      {listQuery.data && listQuery.isError ? (
+        <ErrorState
+          error={listQuery.error}
+          onRetry={() => {
+            void listQuery.fetchNextPage();
+          }}
+        />
+      ) : null}
+
       <LoadMore
         hasMore={!!listQuery.hasNextPage}
         loading={listQuery.isFetchingNextPage}
         onLoadMore={() => listQuery.fetchNextPage()}
-        summary={rows.length > 0 ? `Showing ${rows.length} ticket${rows.length === 1 ? "" : "s"}` : undefined}
+        summary={rows && rows.length > 0 ? `Showing ${rows.length} ticket${rows.length === 1 ? "" : "s"}` : undefined}
       />
     </div>
   );

@@ -6,8 +6,9 @@ import superjson from "superjson";
 import { describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type { AppRouter } from "@server/trpc/root";
+import type { SafeErrorData } from "@server/trpc/trpc";
 import { fakeAuthApi, createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
-import { TRPCProvider } from "@/lib/trpc";
+import { dropInfiniteDirectionLink, TRPCProvider } from "@/lib/trpc";
 import { GlobalSearchBox, NotificationBellPopover } from "./shell";
 import OrderMessagesTab, { OrderMessagesUnreadBadge } from "./OrderMessagesTab";
 import CustomerMessagesPage from "./pages/CustomerMessagesPage";
@@ -28,6 +29,31 @@ const NOTIF_ID = "01JENG00000000000000000003";
 const STAFF_ID = "01JENG00000000000000000004";
 const CUSTOMER_ID = "01JENG00000000000000000005";
 const FIXED_DATE = new Date("2026-11-20T12:00:00.000Z");
+
+class MockRpcError extends Error {
+  readonly safe: SafeErrorData;
+  readonly httpStatus: number;
+  readonly trpcCode: string;
+
+  constructor(opts: {
+    safeMessage: string;
+    requestId: string;
+    domainCode?: SafeErrorData["domainCode"];
+    reasonCode?: string;
+    httpStatus?: number;
+    trpcCode?: string;
+  }) {
+    super(opts.safeMessage);
+    this.httpStatus = opts.httpStatus ?? 400;
+    this.trpcCode = opts.trpcCode ?? "BAD_REQUEST";
+    this.safe = {
+      domainCode: opts.domainCode ?? "BAD_INPUT",
+      reasonCode: opts.reasonCode ?? "INVALID_INPUT",
+      safeMessage: opts.safeMessage,
+      requestId: opts.requestId,
+    };
+  }
+}
 
 function renderEngagement(
   ui: ReactElement,
@@ -54,6 +80,7 @@ function renderEngagement(
 
   const client = createTRPCClient<AppRouter>({
     links: [
+      dropInfiniteDirectionLink,
       httpBatchLink({
         url: "https://portal.example.test/rpc",
         transformer: superjson,
@@ -68,14 +95,34 @@ function renderEngagement(
             Parameters<typeof superjson.deserialize>[0]
           >;
           const paths = url.pathname.slice("/rpc/".length).split(",");
-          const batch = paths.map((procPath, idx) => {
-            const handler = handlers[procPath];
-            if (!handler) {
-              throw new Error(`Unhandled tRPC procedure in test: ${procPath}`);
-            }
-            const input = data[idx] === undefined ? undefined : superjson.deserialize(data[idx]!);
-            return { result: { data: superjson.serialize(handler(input)) } };
-          });
+          const batch = await Promise.all(
+            paths.map(async (procPath, idx) => {
+              const handler = handlers[procPath];
+              if (!handler) {
+                throw new Error(`Unhandled tRPC procedure in test: ${procPath}`);
+              }
+              const input = data[idx] === undefined ? undefined : superjson.deserialize(data[idx]!);
+              try {
+                const resolved = await handler(input);
+                return { result: { data: superjson.serialize(resolved) } };
+              } catch (err) {
+                if (err instanceof MockRpcError) {
+                  return {
+                    error: superjson.serialize({
+                      code: -32600,
+                      message: err.safe.safeMessage,
+                      data: {
+                        code: err.trpcCode,
+                        httpStatus: err.httpStatus,
+                        safe: err.safe,
+                      },
+                    }),
+                  };
+                }
+                throw err;
+              }
+            }),
+          );
           return Response.json(batch);
         },
       }),
@@ -631,5 +678,223 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
     expect(await screen.findByText("4 active in queue")).toBeInTheDocument();
     await expectNoAxeViolations(widgetsView.container);
     widgetsView.unmount();
+  });
+
+  it("renders ErrorState (safeMessage, requestId, retry) on query failure and never renders EmptyState until a successful empty result on SupportTicketsPage, CustomerMessagesPage, NotificationsPage, and AdminTicketsPage", async () => {
+    const user = userEvent.setup();
+
+    // 1. SupportTicketsPage: pending -> error (no empty state!) -> retry -> empty state
+    let resolveTicketsGate!: () => void;
+    const ticketsGate = new Promise<void>((res) => {
+      resolveTicketsGate = res;
+    });
+    let ticketsAttempt = 0;
+    const ticketsHandler = vi.fn(async () => {
+      ticketsAttempt += 1;
+      if (ticketsAttempt === 1) {
+        await ticketsGate;
+        throw new MockRpcError({
+          safeMessage: "Some of the information provided is not valid.",
+          requestId: "req_tickets_400",
+        });
+      }
+      return { items: [], nextCursor: null };
+    });
+
+    const supportView = renderEngagement(
+      <SupportTicketsPage />,
+      { "engagement.tickets.list": ticketsHandler },
+      { path: "/support" },
+    );
+    // While pending, false empty state must NOT appear
+    expect(screen.queryByText("No support tickets yet")).not.toBeInTheDocument();
+
+    resolveTicketsGate();
+    expect(
+      await screen.findByText("Some of the information provided is not valid."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("req_tickets_400")).toBeInTheDocument();
+    expect(screen.queryByText("No support tickets yet")).not.toBeInTheDocument();
+    await expectNoAxeViolations(supportView.container);
+
+    await user.click(screen.getByRole("button", { name: /Try again/i }));
+    expect(await screen.findByText("No support tickets yet")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Some of the information provided is not valid."),
+    ).not.toBeInTheDocument();
+    expect(ticketsHandler).toHaveBeenCalledTimes(2);
+    supportView.unmount();
+
+    // 2. CustomerMessagesPage: pending -> error (no empty state!) -> retry -> empty state
+    let resolveMessagesGate!: () => void;
+    const messagesGate = new Promise<void>((res) => {
+      resolveMessagesGate = res;
+    });
+    let messagesAttempt = 0;
+    const messagesHandler = vi.fn(async () => {
+      messagesAttempt += 1;
+      if (messagesAttempt === 1) {
+        await messagesGate;
+        throw new MockRpcError({
+          safeMessage: "Unable to load order conversations right now.",
+          requestId: "req_messages_503",
+          domainCode: "UNAVAILABLE",
+          httpStatus: 503,
+          trpcCode: "SERVICE_UNAVAILABLE",
+        });
+      }
+      return { items: [], nextCursor: null };
+    });
+
+    const messagesView = renderEngagement(
+      <CustomerMessagesPage />,
+      { "engagement.messages.threads": messagesHandler },
+      { path: "/messages" },
+    );
+    expect(screen.queryByText("No order conversations yet")).not.toBeInTheDocument();
+
+    resolveMessagesGate();
+    expect(
+      await screen.findByText("Unable to load order conversations right now."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("req_messages_503")).toBeInTheDocument();
+    expect(screen.queryByText("No order conversations yet")).not.toBeInTheDocument();
+    await expectNoAxeViolations(messagesView.container);
+
+    await user.click(screen.getByRole("button", { name: /Try again/i }));
+    expect(await screen.findByText("No order conversations yet")).toBeInTheDocument();
+    expect(messagesHandler).toHaveBeenCalledTimes(2);
+    messagesView.unmount();
+
+    // 3. NotificationsPage: pending -> error (no empty state!) -> retry -> empty state
+    let resolveNotifsGate!: () => void;
+    const notifsGate = new Promise<void>((res) => {
+      resolveNotifsGate = res;
+    });
+    let notifsAttempt = 0;
+    const notifsHandler = vi.fn(async () => {
+      notifsAttempt += 1;
+      if (notifsAttempt === 1) {
+        await notifsGate;
+        throw new MockRpcError({
+          safeMessage: "Notifications feed is temporarily unavailable.",
+          requestId: "req_notifs_503",
+          domainCode: "UNAVAILABLE",
+          httpStatus: 503,
+          trpcCode: "SERVICE_UNAVAILABLE",
+        });
+      }
+      return { items: [], nextCursor: null };
+    });
+
+    const notifsView = renderEngagement(
+      <NotificationsPage />,
+      {
+        "engagement.notifications.list": notifsHandler,
+        "engagement.notifications.unreadCount": () => ({ unreadCount: 0 }),
+        "engagement.notifications.preferences.get": () => ({ items: [] }),
+      },
+      { path: "/notifications" },
+    );
+    expect(screen.queryByText("No notifications yet")).not.toBeInTheDocument();
+
+    resolveNotifsGate();
+    expect(
+      await screen.findByText("Notifications feed is temporarily unavailable."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("req_notifs_503")).toBeInTheDocument();
+    expect(screen.queryByText("No notifications yet")).not.toBeInTheDocument();
+    await expectNoAxeViolations(notifsView.container);
+
+    await user.click(screen.getByRole("button", { name: /Try again/i }));
+    expect(await screen.findByText("No notifications yet")).toBeInTheDocument();
+    expect(notifsHandler).toHaveBeenCalledTimes(2);
+    notifsView.unmount();
+
+    // 4. AdminTicketsPage: pending -> error (no empty state!) -> retry -> empty state
+    let resolveAdminGate!: () => void;
+    const adminGate = new Promise<void>((res) => {
+      resolveAdminGate = res;
+    });
+    let adminAttempt = 0;
+    const adminListHandler = vi.fn(async () => {
+      adminAttempt += 1;
+      if (adminAttempt === 1) {
+        await adminGate;
+        throw new MockRpcError({
+          safeMessage: "Support queue query failed.",
+          requestId: "req_admin_queue_500",
+          domainCode: "INTERNAL",
+          httpStatus: 500,
+          trpcCode: "INTERNAL_SERVER_ERROR",
+        });
+      }
+      return { items: [], nextCursor: null };
+    });
+
+    const adminView = renderEngagement(
+      <AdminTicketsPage />,
+      {
+        "engagement.tickets.admin.queueSummary": () => ({
+          openCount: 0,
+          unassignedCount: 0,
+          assignedToMeCount: 0,
+        }),
+        "engagement.tickets.admin.list": adminListHandler,
+      },
+      { path: "/admin/tickets", role: "staff" },
+    );
+    expect(screen.queryByText("No tickets match the current filters")).not.toBeInTheDocument();
+
+    resolveAdminGate();
+    expect(await screen.findByText("Support queue query failed.")).toBeInTheDocument();
+    expect(screen.getByText("req_admin_queue_500")).toBeInTheDocument();
+    expect(screen.queryByText("No tickets match the current filters")).not.toBeInTheDocument();
+    await expectNoAxeViolations(adminView.container);
+
+    await user.click(screen.getByRole("button", { name: /Try again/i }));
+    expect(await screen.findByText("No tickets match the current filters")).toBeInTheDocument();
+    expect(adminListHandler).toHaveBeenCalledTimes(2);
+    adminView.unmount();
+
+    // 5. Detail page & Widget error states + retry
+    let detailAttempt = 0;
+    const detailView = renderEngagement(
+      <Route path="/support/:ticketId">
+        <SupportTicketDetailPage />
+      </Route>,
+      {
+        "engagement.tickets.get": () => {
+          detailAttempt += 1;
+          throw new MockRpcError({
+            safeMessage: "Ticket could not be loaded.",
+            requestId: "req_detail_500",
+          });
+        },
+      },
+      { path: `/support/${TICKET_ID}` },
+    );
+    expect(await screen.findByText("Ticket could not be loaded.")).toBeInTheDocument();
+    expect(screen.getByText("req_detail_500")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Try again/i }));
+    expect(detailAttempt).toBe(2);
+    detailView.unmount();
+
+    const widgetErrorView = renderEngagement(
+      <CustomerEngagementWidget />,
+      {
+        "engagement.messages.unreadSummary": () => {
+          throw new MockRpcError({
+            safeMessage: "Dashboard summary unavailable.",
+            requestId: "req_widget_503",
+          });
+        },
+        "engagement.tickets.openSummary": () => ({ openCount: 0, awaitingCustomerCount: 0 }),
+      },
+    );
+    expect(await screen.findByText("Dashboard summary unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("req_widget_503")).toBeInTheDocument();
+    expect(screen.queryByText("0 unread")).not.toBeInTheDocument();
+    widgetErrorView.unmount();
   });
 });
