@@ -25,3 +25,4 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0018 | Portable package envelope and import custody | Accepted |
 | 0019 | Audit chain keys and off-host checkpoints | Accepted |
 | 0020 | Release scope: installable web app first; optional integrations disabled | Accepted |
+| 0021 | Analytics on the portal origin: quarantine and accepted residual | Accepted |
