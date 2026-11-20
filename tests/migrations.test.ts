@@ -2,6 +2,7 @@
  * Schema contract: the committed migrations must produce exactly the schema the application code declares.
  * A module that changes its Drizzle schema without `pnpm db:generate` fails here (and in the CI drift check).
  */
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/mysql2";
@@ -9,6 +10,12 @@ import { migrate } from "drizzle-orm/mysql2/migrator";
 import { createTestDb, type TestDb } from "./helpers/testDb.js";
 
 const migrationsFolder = path.resolve(import.meta.dirname, "../migrations");
+const journal = JSON.parse(readFileSync(path.join(migrationsFolder, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
+const statementsOf = (tag: string) =>
+  readFileSync(path.join(migrationsFolder, `${tag}.sql`), "utf8")
+    .split("--> statement-breakpoint")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.replace(/^\s*--.*$/gm, "").trim() !== "");
 
 async function describeSchema(t: TestDb) {
   const [columns] = await t.pool.query(
@@ -70,11 +77,48 @@ describe("migrations", () => {
     try {
       await migrate(drizzle(connection), { migrationsFolder });
       const [rows] = await connection.query("SELECT COUNT(*) AS n FROM `__drizzle_migrations`");
-      expect((rows as { n: number }[])[0]?.n).toBe(1);
+      expect((rows as { n: number }[])[0]?.n).toBe(journal.entries.length);
     } finally {
       connection.release();
     }
   });
+
+  it("0001 upgrades a baseline database that already holds orders and catalog rows", async () => {
+    const upgraded = await createTestDb({ schema: {} });
+    try {
+      const connection = await upgraded.pool.getConnection();
+      try {
+        for (const statement of statementsOf("0000_baseline")) await connection.query(statement);
+        await connection.query("SET FOREIGN_KEY_CHECKS = 0");
+        await connection.query(
+          "INSERT INTO `orders` (`public_id`,`reference`,`owner_user_id`,`project_name`,`workflow_version_id`,`status_key`,`total_minor`,`currency`) VALUES ('01AAAAAAAAAAAAAAAAAAAAAAAA','RP-TEST-000001',1,'Existing order',1,'submitted',2500,'USD')",
+        );
+        await connection.query(
+          "INSERT INTO `catalog_product_versions` (`public_id`,`product_id`,`version_number`,`name`,`features`,`price_minor`,`currency`) VALUES ('01BBBBBBBBBBBBBBBBBBBBBBBB',1,1,'Existing product',JSON_ARRAY('a'),2500,'USD')",
+        );
+        await connection.query(
+          "INSERT INTO `order_line_items` (`public_id`,`order_id`,`name`,`features`,`unit_price_minor`,`currency`,`quantity`,`line_total_minor`) VALUES ('01CCCCCCCCCCCCCCCCCCCCCCCC',1,'Existing item',JSON_ARRAY('a'),2500,'USD',1,2500)",
+        );
+        await connection.query("SET FOREIGN_KEY_CHECKS = 1");
+        for (const statement of statementsOf("0001_offerings_and_production_dispatch")) await connection.query(statement);
+        const [orders] = await connection.query("SELECT `subtotal_minor` AS s, `discount_minor` AS d, `total_minor` AS t, `discount_label` AS l FROM `orders`");
+        expect((orders as { s: number | string; d: number | string; t: number | string; l: string | null }[]).map((r) => [Number(r.s), Number(r.d), Number(r.t), r.l])).toEqual([[2500, 0, 2500, null]]);
+        const [versions] = await connection.query("SELECT JSON_LENGTH(`deliverables`) AS n, `outcome` AS o, `timeline` AS tl FROM `catalog_product_versions`");
+        expect(versions).toEqual([{ n: 0, o: "", tl: "" }]);
+        const [items] = await connection.query("SELECT JSON_LENGTH(`deliverables`) AS n, `packet_number` AS p, `tier` AS t FROM `order_line_items`");
+        expect(items).toEqual([{ n: 0, p: null, t: null }]);
+      } finally {
+        connection.release();
+      }
+      // The upgraded database has exactly the declared shape.
+      const want = await describeSchema(declared);
+      const got = await describeSchema(upgraded);
+      expect(got.columns).toEqual(want.columns);
+      expect(got.indexes).toEqual(want.indexes);
+    } finally {
+      await upgraded.cleanup();
+    }
+  }, 120_000);
 
   it("include the security-relevant columns later code depends on", async () => {
     const [rows] = await migrated.pool.query(

@@ -29,6 +29,8 @@ change. It describes intent and state; it is not a certification or a guarantee.
 
 - `docs/source-specs/MASTER_PROMPT.md` — secure rebuild master prompt
 - `docs/source-specs/ARCHITECTURE.md` — technical architecture (with diagrams in `docs/source-specs/media/`)
+- `docs/source-specs/increment-02/` — Master Offerings Matrix v3.0 and the P101 / P201 production webhook
+  references (the "corrected" P101 logic wins where the two webhook documents differ)
 - `docs/brand/` — brand guide and colour tokens; approved assets in `client/public/brand`, fonts in `client/public/fonts`
 - Previous implementation: GitHub `readypackets/ReadyPackets-SiteSplit` (reference only; its documented defects are not carried over)
 
@@ -59,6 +61,20 @@ docs/              specs, engineering contract, ADRs, runbooks, verification, co
 
 Key rules: see `docs/engineering/BUILD_CONTRACT.md` (ownership, data conventions, authorization, audit,
 errors, client conventions).
+
+## Offerings and production pipeline (increment 02)
+
+- The catalog is owner-controlled data, not code: `data/catalog/readypackets-offerings-v3.0.json` is loaded by
+  the audited `pnpm ops:catalog-import` command (ADR 0022). Packets 1–6 each have Basic / Standard / Premium
+  tiers (18 products); a customer picks at most one tier per packet, quantity one.
+- "Packet 7" is not a product. It is a bundle rule: 15% off when all six packets are in one order, computed
+  on the server and stored on the order as subtotal / discount / total. The rule is an admin setting.
+- Packet 8 is not loaded and is not offered (the master prompt forbids restoring it; the matrix marks it
+  unlisted). Internal-only notes in the matrix are never shown to customers.
+- Production pipeline (ADR 0023): staff start Phase I (P101) and Phase II (P201) by hand from the console
+  order page. The portal posts the exact field set of the reference documents to owner-configured HTTPS
+  endpoints through an outbox with retries. It is disabled until an administrator configures the endpoints
+  and the canon version. There is no inbound callback. See `docs/integrations/PRODUCTION_WEBHOOKS.md`.
 
 ## Deployment profiles
 
