@@ -315,14 +315,20 @@ export function createAuthService(i: AuthInternals) {
       const emailIndex = emailIndexOf(deps.crypto, normalizeEmail(input.email));
       await throttle("auth_high_risk", `reset:${emailIndex}`);
       const slot = Math.floor(deps.clock.now().getTime() / RESEND_MIN_INTERVAL_MS);
-      await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 });
-      await deps.audit.record({
-        category: "security",
-        eventName: "auth.password.reset_requested",
-        action: "request",
-        outcome: "attempted",
-        actor: { role: "anonymous" },
-        resource: { type: "user" },
+      // Durable intake and its audit row commit together (audit failure ⇒ no accepted work).
+      await deps.db.transaction(async (tx) => {
+        await deps.jobs.enqueue<PasswordResetJob>(PASSWORD_RESET_JOB, { emailIndex }, { idempotencyKey: `${emailIndex}:${slot}`, maxAttempts: 3 }, tx);
+        await deps.audit.record(
+          {
+            category: "security",
+            eventName: "auth.password.reset_requested",
+            action: "request",
+            outcome: "attempted",
+            actor: { role: "anonymous" },
+            resource: { type: "user" },
+          },
+          tx,
+        );
       });
       return { accepted: true };
     },
@@ -330,9 +336,13 @@ export function createAuthService(i: AuthInternals) {
     /** Job handler for PASSWORD_RESET_JOB. Pure database work in one transaction ⇒ retry-safe. */
     async dispatchPasswordReset(payload: PasswordResetJob): Promise<"issued" | "ineligible" | "cooldown"> {
       if (!/^[0-9a-f]{64}$/.test(payload.emailIndex)) return "ineligible";
+      // Resolve the id OUTSIDE the transaction, so the transaction's first statement is the locking read of
+      // the users row: under REPEATABLE READ the read view (used by the cooldown query) is then created only
+      // after the lock is held, and therefore sees any token committed by a concurrent dispatch (review ID-03).
+      const [peek] = await deps.db.select({ id: users.id }).from(users).where(eq(users.emailIndex, payload.emailIndex)).limit(1);
       return deps.db.transaction(async (tx) => {
-        const [peek] = await tx.select({ id: users.id }).from(users).where(eq(users.emailIndex, payload.emailIndex)).limit(1);
-        const user = peek ? await repo.byId(peek.id, { tx, forUpdate: true }) : null;
+        const locked = peek ? await repo.byId(peek.id, { tx, forUpdate: true }) : null;
+        const user = locked && locked.emailIndex === payload.emailIndex ? locked : null; // re-validated under lock
         if (!user || user.status !== "active" || user.authSource !== "local") {
           await deps.audit.record(
             {

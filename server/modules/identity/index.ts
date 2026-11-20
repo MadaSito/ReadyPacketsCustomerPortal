@@ -40,7 +40,10 @@ export interface IdentityModule extends ModuleLifecycle {
     rotate(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;
     revoke(sessionId: string, reason: string, opts?: { tx?: Tx }): Promise<void>;
     revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx }): Promise<number>;
-    assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<{ pendingSteps: TransitionStep[] }>;
+    assertCurrent(
+      principal: SessionPrincipal,
+      tx: Tx,
+    ): Promise<{ pendingSteps: TransitionStep[]; role: UserRole; stepUpAt: Date | null; mfaVerifiedAt: Date | null }>;
     getState(sessionId: string, opts?: { tx?: DbOrTx }): Promise<SessionState | null>;
   };
   transitions: {
