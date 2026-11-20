@@ -24,6 +24,13 @@ The runtime review covered Compliance `e400060`, Integrations `3f99849` plus the
 - **COMP-01 (medium), COMP-02 and COMP-03 (low)**: Verified in `e400060`: character/byte limits now align with `MEDIUMTEXT` policy and ciphertext storage; policy length is rechecked after normalization; reserved intake keys are filtered, and the answer validator uses `Object.hasOwn`.
 - **IPv6 transition classification**: Verified in `3f99849`: recognized mapped, compatible, translated, NAT64, 6to4 and Teredo addresses receive an unconditionally denied classification. The documentation prefix identified during review was added to the reserved range check.
 
+## Engagement follow-up
+
+- **ENG-01 (partially resolved in `b097e92`)**: `searchService.ts:217–276,345–413` scopes and deduplicates token candidates before `LIMIT`, and uses bare indexed columns for normalized reference-prefix predicates. `searchService.ts:100–108,151–178` adds MySQL execution-time hints and races asynchronous search work against the remaining budget. The peer deadline stops waiting but does not cancel underlying work; SQL plan selection and execution-time enforcement under load were not verified. The global-search audit write remains outside the search budget (`searchService.ts:493`).
+- **ENG-02 (resolved in `b097e92`)**: `ticketsService.ts:160–228` limits reply rows before decrypting, returns a reply cursor, and caps the status timeline at the latest 100 entries with a truncation indicator. The customer reply predicate still excludes internal notes before applying the page limit.
+- **ENG-03 (resolved for note-only updates in `b097e92`)**: `ticketsService.ts:1109–1128,1426–1435` does not advance the public update/message timestamps for note-only activity with no public status change. Staff assignment preserves the update timestamp; an intentional public status change remains visible.
+- **Targeted verification**: `scripts/dev/test.sh server/modules/engagement/engagement.test.ts` passed all 12 tests, including the two new regression cases for search anti-starvation, reply pagination, and metadata isolation. The independent Compliance rerun passed all seven tests in `server/modules/compliance/compliance.test.ts` at the initial review checkpoint; that suite does not resolve `BILL-01`.
+
 ## Controls reviewed and evidence limits
 
 - **Billing**: Invoice body and ledger detail enforce parent-order read authority. Draft invoices and staff-only payment notes are excluded from the customer view. The manual payment and refund operations lock the invoice, validate currency and check remaining/refundable amounts. These checks do not make provider event reconciliation safe.
