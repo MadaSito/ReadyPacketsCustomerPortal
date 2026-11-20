@@ -20,11 +20,12 @@ Server tests use isolated MySQL databases created with `tests/helpers/testDb.ts`
 | Re-encryption: one transaction per batch holding the checkpoint FOR UPDATE; CAS writes; monotonic checkpoint; audit in the transaction; resumable; audited reset | `reencrypt.example.test.ts` | `automated-test` |
 | Schema contract, health aggregation (timeouts, sanitized peer reports), readiness from platform components only, setupStatus failing closed, setup checklist | `module.example.test.ts` | `automated-test` |
 | Key tooling: generated keys are distinct and accepted by the loader; 0600/0700 files that are never overwritten; output prints paths only; rotate/retire safety; doctor output never includes values | `scripts/ops/keys/lib.test.ts` | `automated-test` |
-| Admin console UI (settings, features, health, setup, presentation, config transfer) with axe checks | — | `not-verified`: UI not delivered in this iteration (see below) |
+| Preview profile needs `RP_PREVIEW_ACKNOWLEDGED=synthetic-data-only` (all NODE_ENVs); refusal on readypackets.com kept; one startup WARN; `preview` on public payloads | `env.test.ts` (ack cases), `module.example.test.ts` ("flags the preview profile…") | `automated-test` |
+| Admin console UI: lazy admin/staff routes; settings (secrets shown only as Configured, write-only secret dialog, client validation, expectedVersion); features (default off, toggle); health (state as text + tone); setup checklist; sign-in page editor (slides with required alt text, images, upload after step-up); config export/import with preview, an authenticity warning and type-to-confirm apply; loading, empty and error states | `client/src/features/platform/platform.test.tsx` (11 cases, axe on every page family) | `automated-test` in jsdom; real-browser responsive layout (320–1920 px) and screen-reader use are `not-verified` |
 
 ## Not done / not verified
 
-- Admin UI in `client/src/features/platform` is not built yet. The server API and tRPC procedures are complete and tested.
+- UI: the raw image upload and the export download (Blob URL) are not covered by automated tests, and the UI has not been tested in a real browser.
 - Images get no full decode/re-encode, so there is no malware or polyglot scan beyond the structural checks. Hardening target: a sandboxed decoder.
 - The concurrent upload-quota race is protected by `FOR UPDATE` on the slides row, but no test runs it under real concurrency.
 - The settings cache is per process, so other nodes may read a value up to 5 s stale. Readers that need consistency pass `tx`.
