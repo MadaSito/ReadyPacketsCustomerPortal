@@ -141,7 +141,9 @@ export function defineSecret(input: {
     description: input.description,
     schema: input.schema ?? defaultSecretSchema,
     sensitivity: "secret",
-    exportable: input.exportable ?? true,
+    // Secrets are NOT exportable unless the owning module opts in explicitly (and even then only into a
+    // passphrase-encrypted export block).
+    exportable: input.exportable ?? false,
   });
 }
 

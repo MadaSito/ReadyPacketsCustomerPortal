@@ -336,7 +336,14 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     const store = settingsAdmin();
     const def = getSettingDefinition(key);
     if (!def) throw validation("UNKNOWN_SETTING", "That setting does not exist.");
-    await store.update(key, value, { expectedVersion, guard, afterLock: (tx) => slidesAfterLock(key, value, tx) });
+    const lockedGuard: ActorGuard =
+      key === PRESENTATION_SLIDES.key
+        ? async (tx) => {
+            await guard(tx);
+            await presentationService.lockSlidesRow(tx);
+          }
+        : guard;
+    await store.update(key, value, { expectedVersion, guard: lockedGuard, afterLock: (tx) => slidesAfterLock(key, value, tx) });
     return store.describeOne(key);
   }
 

@@ -12,7 +12,8 @@
  *    versions) then apply with that digest; any concurrent change or invalid value refuses the whole import.
  */
 import type { ActorGuard } from "./actorGuard.js";
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, scrypt, timingSafeEqual, type ScryptOptions } from "node:crypto";
+import { promisify } from "node:util";
 import { z } from "zod";
 import { DomainError, validation } from "../../core/errors.js";
 import type { AuditEmitter, Clock, Db, Tx } from "../../core/types.js";
@@ -73,9 +74,32 @@ export function canonicalJson(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
 }
 
-function deriveKeys(passphrase: string, salt: Buffer): { encKey: Buffer; macKey: Buffer } {
-  const material = scryptSync(passphrase.normalize("NFC"), salt, 64, { ...SCRYPT, maxmem: 64 * 1024 * 1024 });
-  return { encKey: material.subarray(0, 32), macKey: material.subarray(32, 64) };
+const scryptAsync = promisify(scrypt) as (password: string, salt: Buffer, keylen: number, options: ScryptOptions) => Promise<Buffer>;
+
+/** scrypt is CPU/memory heavy: run it off the event loop with a small concurrency budget and a bounded queue. */
+export const KDF_CONCURRENCY = 1;
+export const KDF_MAX_QUEUE = 4;
+let kdfActive = 0;
+const kdfWaiters: (() => void)[] = [];
+
+async function deriveKeys(passphrase: string, salt: Buffer): Promise<{ encKey: Buffer; macKey: Buffer }> {
+  if (kdfActive >= KDF_CONCURRENCY) {
+    if (kdfWaiters.length >= KDF_MAX_QUEUE) {
+      throw new DomainError("RATE_LIMITED", "KDF_BUSY", "The server is busy with another configuration transfer. Try again shortly.");
+    }
+    // The finishing holder hands its slot directly to us (kdfActive unchanged), so no caller can jump in.
+    await new Promise<void>((resolve) => kdfWaiters.push(resolve));
+  } else {
+    kdfActive += 1;
+  }
+  try {
+    const material = await scryptAsync(passphrase.normalize("NFC"), salt, 64, { ...SCRYPT, maxmem: 64 * 1024 * 1024 });
+    return { encKey: material.subarray(0, 32), macKey: material.subarray(32, 64) };
+  } finally {
+    const next = kdfWaiters.shift();
+    if (next) next();
+    else kdfActive -= 1;
+  }
 }
 
 function assertPassphrase(passphrase: string | undefined): asserts passphrase is string {
@@ -124,8 +148,13 @@ export interface ImportPreview {
 export function createConfigTransfer(deps: ConfigTransferDeps) {
   const { settings, audit, clock, db } = deps;
 
-  async function exportDocument(options: { includeSecrets: boolean; passphrase?: string }): Promise<{ document: string; counts: { settings: number; secrets: number } }> {
+  async function exportDocument(
+    options: { includeSecrets: boolean; passphrase?: string },
+    guard: ActorGuard,
+  ): Promise<{ document: string; counts: { settings: number; secrets: number } }> {
     if (options.includeSecrets || options.passphrase !== undefined) assertPassphrase(options.passphrase);
+    // Re-validate the actor before touching secrets (short transaction; never held across the KDF).
+    await db.transaction(guard);
     const defs = listSettingDefinitions().filter((def) => def.exportable);
     const entries: { key: string; value: z.core.util.JSONType }[] = [];
     const secretValues: { key: string; value: string }[] = [];
@@ -140,7 +169,8 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
       }
     }
     const salt = options.passphrase ? randomBytes(16) : null;
-    const keys = options.passphrase && salt ? deriveKeys(options.passphrase, salt) : null;
+    // ONE derivation per operation: encKey encrypts the secrets block, macKey authenticates the document.
+    const keys = options.passphrase && salt ? await deriveKeys(options.passphrase, salt) : null;
     const header = {
       format: CONFIG_FORMAT,
       formatVersion: CONFIG_FORMAT_VERSION,
@@ -148,40 +178,44 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
       source: { installationId: deps.installationId, releaseRef: deps.releaseRef },
     } as const;
     let secrets: ConfigDocument["secrets"] = null;
-    if (options.includeSecrets && keys) {
-      const secretSalt = randomBytes(16);
-      const secretKeys = deriveKeys(options.passphrase!, secretSalt);
+    if (options.includeSecrets && keys && salt) {
       const iv = randomBytes(12);
-      const cipher = createCipheriv("aes-256-gcm", secretKeys.encKey, iv);
+      const cipher = createCipheriv("aes-256-gcm", keys.encKey, iv);
       cipher.setAAD(Buffer.from(canonicalJson(header)));
       const ciphertext = Buffer.concat([cipher.update(JSON.stringify(secretValues), "utf8"), cipher.final()]);
       secrets = {
-        kdf: { name: "scrypt", N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, salt: secretSalt.toString("base64url") },
+        kdf: { name: "scrypt", N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p, salt: salt.toString("base64url") },
         cipher: "aes-256-gcm",
         iv: iv.toString("base64url"),
         ciphertext: ciphertext.toString("base64url"),
         tag: cipher.getAuthTag().toString("base64url"),
       };
-      secretKeys.encKey.fill(0);
     }
     const body: Body = { ...header, settings: entries, secrets };
     const document: ConfigDocument = { ...body, integrity: integrityFor(body, keys?.macKey ?? null, salt?.toString("base64url") ?? null) };
     keys?.encKey.fill(0);
     keys?.macKey.fill(0);
-    await audit.record({
-      category: "admin",
-      eventName: "platform.config.exported",
-      action: "export",
-      outcome: "completed",
-      severity: options.includeSecrets ? "WARN" : "INFO",
-      resource: { type: "platform_config" },
-      safeCounts: { settings: entries.length, secrets: secretValues.length },
-      attributes: { secrets_included: options.includeSecrets, integrity: document.integrity.alg },
+    // Re-validate again immediately before the durable audit and the response.
+    await db.transaction(async (tx: Tx) => {
+      await guard(tx);
+      await audit.record(
+        {
+          category: "admin",
+          eventName: "platform.config.exported",
+          action: "export",
+          outcome: "completed",
+          severity: options.includeSecrets ? "WARN" : "INFO",
+          resource: { type: "platform_config" },
+          safeCounts: { settings: entries.length, secrets: secretValues.length },
+          attributes: { secrets_included: options.includeSecrets, integrity: document.integrity.alg },
+        },
+        tx,
+      );
     });
     return { document: JSON.stringify(document, null, 2), counts: { settings: entries.length, secrets: secretValues.length } };
   }
 
-  function parse(raw: string, passphrase: string | undefined): { doc: ConfigDocument; secrets: { key: string; value: string }[]; integrity: ImportPreview["integrity"] } {
+  async function parse(raw: string, passphrase: string | undefined): Promise<{ doc: ConfigDocument; secrets: { key: string; value: string }[]; integrity: ImportPreview["integrity"] }> {
     if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > MAX_CONFIG_DOCUMENT_BYTES) {
       throw validation("DOCUMENT_TOO_LARGE", "The configuration file is too large.");
     }
@@ -195,22 +229,25 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
     if (!parsed.success) throw validation("DOCUMENT_MALFORMED", "The configuration file does not match the expected format.");
     const doc = parsed.data;
     const { integrity, ...body } = doc;
-    let macKey: Buffer | null = null;
+    let keys: { encKey: Buffer; macKey: Buffer } | null = null;
     if (integrity.alg === "hmac-sha256") {
       assertPassphrase(passphrase);
       if (!integrity.salt) throw validation("DOCUMENT_MALFORMED", "The configuration file does not match the expected format.");
-      macKey = deriveKeys(passphrase, Buffer.from(integrity.salt, "base64url")).macKey;
+      if (doc.secrets && doc.secrets.kdf.salt !== integrity.salt) {
+        throw validation("DOCUMENT_MALFORMED", "The configuration file does not match the expected format.");
+      }
+      keys = await deriveKeys(passphrase, Buffer.from(integrity.salt, "base64url"));
     } else if (doc.secrets) {
       throw validation("DOCUMENT_MALFORMED", "Encrypted secrets require an authenticated configuration file.");
     }
-    const expected = Buffer.from(integrityFor(body, macKey, integrity.salt).value, "hex");
-    macKey?.fill(0);
+    const expected = Buffer.from(integrityFor(body, keys?.macKey ?? null, integrity.salt).value, "hex");
+    keys?.macKey.fill(0);
     if (!timingSafeEqual(expected, Buffer.from(integrity.value, "hex"))) {
+      keys?.encKey.fill(0);
       throw validation("INTEGRITY_MISMATCH", "The configuration file failed its integrity check (wrong passphrase or modified file).");
     }
     let secrets: { key: string; value: string }[] = [];
-    if (doc.secrets) {
-      const keys = deriveKeys(passphrase!, Buffer.from(doc.secrets.kdf.salt, "base64url"));
+    if (doc.secrets && keys) {
       try {
         const decipher = createDecipheriv("aes-256-gcm", keys.encKey, Buffer.from(doc.secrets.iv, "base64url"));
         decipher.setAAD(Buffer.from(canonicalJson({ format: doc.format, formatVersion: doc.formatVersion, exportedAt: doc.exportedAt, source: doc.source })));
@@ -219,11 +256,9 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
         secrets = secretPayloadSchema.parse(JSON.parse(plain));
       } catch {
         throw validation("INTEGRITY_MISMATCH", "The configuration file failed its integrity check (wrong passphrase or modified file).");
-      } finally {
-        keys.encKey.fill(0);
-        keys.macKey.fill(0);
       }
     }
+    keys?.encKey.fill(0);
     return { doc, secrets, integrity: integrity.alg === "hmac-sha256" ? "authenticated" : "checksum-only" };
   }
 
@@ -234,7 +269,7 @@ export function createConfigTransfer(deps: ConfigTransferDeps) {
   }
 
   async function plan(raw: string, passphrase: string | undefined): Promise<Plan> {
-    const { doc, secrets, integrity } = parse(raw, passphrase);
+    const { doc, secrets, integrity } = await parse(raw, passphrase);
     const changes: ImportChange[] = [];
     const rejected: ImportRejection[] = [];
     const values: Plan["values"] = [];

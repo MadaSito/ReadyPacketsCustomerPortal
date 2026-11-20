@@ -3,7 +3,7 @@
  */
 import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { notFound, validation } from "../../core/errors.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { AuditEmitter, Clock, Db, ObjectStorage, SettingsStore, Tx } from "../../core/types.js";
@@ -140,20 +140,23 @@ export function createPresentationService(deps: PresentationDeps) {
       });
       throw validation(`IMAGE_${result.reason}`, "Please upload a PNG, JPEG or WebP image between 16 and 4096 pixels on each side, up to 2 MB.");
     }
-    const active = await db
-      .select({ id: platformPresentationImages.id })
-      .from(platformPresentationImages)
-      .where(isNull(platformPresentationImages.deletedAt))
-      .limit(MAX_UPLOADED_IMAGES + 1);
-    if (active.length >= MAX_UPLOADED_IMAGES) throw validation("IMAGE_LIMIT_REACHED", "Remove an unused image before uploading another.");
-
     const sha256 = createHash("sha256").update(result.bytes).digest("hex");
     const key = storage.newKey("files");
+    // Storage I/O happens BEFORE the transaction (never hold a connection/locks across it).
     await storage.put(key, result.bytes, { maxBytes: MAX_IMAGE_BYTES });
     const actorUserId = getRequestContext()?.actor?.userId ?? null;
     try {
       const publicId = await db.transaction(async (tx) => {
         await guard(tx);
+        // Quota admission under lock: the slides setting row is the singleton admission lock shared with
+        // slides updates and deletes (lock order: actor → slides row → image rows).
+        await lockSlidesRow(tx);
+        const active = await tx
+          .select({ id: platformPresentationImages.id })
+          .from(platformPresentationImages)
+          .where(isNull(platformPresentationImages.deletedAt))
+          .limit(MAX_UPLOADED_IMAGES + 1);
+        if (active.length >= MAX_UPLOADED_IMAGES) throw validation("IMAGE_LIMIT_REACHED", "Remove an unused image before uploading another.");
         const [inserted] = await tx
           .insert(platformPresentationImages)
           .values({
@@ -195,18 +198,37 @@ export function createPresentationService(deps: PresentationDeps) {
         createdAt: clock.now(),
       };
     } catch (error) {
-      // No orphaned object when the durable record (or its audit) failed.
-      await storage.delete(key).catch(() => undefined);
+      // Remove the staged object only when we can prove no durable row references it (an error raised
+      // around COMMIT is ambiguous: the row and its audit may have committed).
+      const referenced = await db
+        .select({ id: platformPresentationImages.id })
+        .from(platformPresentationImages)
+        .where(eq(platformPresentationImages.storageKey, key))
+        .limit(1)
+        .then((rows) => rows.length > 0, () => true);
+      if (!referenced) await storage.delete(key).catch(() => undefined);
       throw error;
     }
   }
 
+  /**
+   * Singleton admission lock shared by uploads, deletes and slides updates. The row is materialised
+   * (version 0, no value ⇒ default in effect) so FOR UPDATE takes a real record lock, not a gap lock.
+   */
+  async function lockSlidesRow(tx: Tx): Promise<void> {
+    await tx
+      .insert(platformSettings)
+      .ignore()
+      .values({ settingKey: PRESENTATION_SLIDES.key, kind: "value", valueJson: null, version: 0, createdAt: clock.now(), updatedAt: clock.now() });
+    await tx.select({ id: platformSettings.id }).from(platformSettings).where(eq(platformSettings.settingKey, PRESENTATION_SLIDES.key)).for("update");
+  }
+
   async function deleteImage(publicId: string, guard: ActorGuard): Promise<void> {
     if (!ULID_PATTERN.test(publicId)) throw notFound();
-    await db.transaction(async (tx) => {
+    const storageKey = await db.transaction(async (tx) => {
       await guard(tx);
-      // Lock order: slides setting row, then the image row (same order as a slides update).
-      await tx.select({ id: platformSettings.id }).from(platformSettings).where(eq(platformSettings.settingKey, PRESENTATION_SLIDES.key)).for("update");
+      // Lock order: slides setting row, then the image row (same order as uploads and slides updates).
+      await lockSlidesRow(tx);
       const slides = await readSetting(settings, PRESENTATION_SLIDES, tx);
       if (slides.some((slide) => slide.image?.source === "upload" && slide.image.id === publicId)) {
         throw validation("IMAGE_IN_USE", "This image is used by a slide. Remove it from the slideshow first.");
@@ -229,7 +251,42 @@ export function createPresentationService(deps: PresentationDeps) {
         tx,
       );
       await tx.update(platformPresentationImages).set({ deletedAt: clock.now() }).where(eq(platformPresentationImages.id, row.id));
+      return row.storageKey;
     });
+    await collectDeletedObject(storageKey);
+  }
+
+  /**
+   * Garbage-collects the stored bytes of a soft-deleted image, only after re-reading the authoritative row
+   * (deleted_at set) — never on an ambiguous outcome. The row is kept as the durable record. Failures are
+   * retried by purgeDeletedImageObjects().
+   */
+  async function collectDeletedObject(storageKey: string): Promise<boolean> {
+    const [row] = await db
+      .select({ deletedAt: platformPresentationImages.deletedAt })
+      .from(platformPresentationImages)
+      .where(eq(platformPresentationImages.storageKey, storageKey))
+      .limit(1);
+    if (!row?.deletedAt) return false;
+    try {
+      await storage.delete(storageKey);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Bounded sweep for objects whose post-commit collection failed (idempotent; safe to run from a job). */
+  async function purgeDeletedImageObjects(limit = 50): Promise<number> {
+    const rows = await db
+      .select({ storageKey: platformPresentationImages.storageKey })
+      .from(platformPresentationImages)
+      .where(isNotNull(platformPresentationImages.deletedAt))
+      .orderBy(desc(platformPresentationImages.id))
+      .limit(Math.max(1, Math.min(500, limit)));
+    let purged = 0;
+    for (const row of rows) if (await collectDeletedObject(row.storageKey)) purged += 1;
+    return purged;
   }
 
   /** Public read of an uploaded image. Only non-deleted uploads; unknown ids are NOT_FOUND. */
@@ -244,6 +301,6 @@ export function createPresentationService(deps: PresentationDeps) {
     return { stream: await storage.get(row.storageKey), mimeType: row.mimeType, size: row.byteSize, sha256: row.sha256 };
   }
 
-  return { publicPresentation, listImages, uploadImage, deleteImage, openImage, assertSlidesReferenceKnownImages };
+  return { publicPresentation, listImages, uploadImage, deleteImage, openImage, assertSlidesReferenceKnownImages, purgeDeletedImageObjects, lockSlidesRow };
 }
 export type PresentationService = ReturnType<typeof createPresentationService>;

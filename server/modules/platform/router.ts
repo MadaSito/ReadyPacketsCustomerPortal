@@ -87,7 +87,10 @@ export const platformRouter = router({
       export: manage
         .input(z.strictObject({ includeSecrets: z.boolean(), passphrase }))
         .meta({ rateLimit: "expensive" })
-        .mutation(({ ctx, input }) => impl(ctx.services).configTransfer().exportDocument(input)),
+        .mutation(({ ctx, input }) => {
+          const platform = impl(ctx.services);
+          return platform.configTransfer().exportDocument(input, platform.actorGuard(ctx.session));
+        }),
       importPreview: manage
         .input(z.strictObject({ document: documentText, passphrase }))
         .meta({ rateLimit: "expensive" })

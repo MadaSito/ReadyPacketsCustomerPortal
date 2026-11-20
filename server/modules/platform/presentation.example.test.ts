@@ -106,6 +106,56 @@ describe("image validation", () => {
     expect(validateImage(webpLossless(40, 40, { type: "XMP ", data: Buffer.alloc(8) }))).toEqual({ ok: false, reason: "METADATA_NOT_ALLOWED" });
   });
 
+  it("walks the full JPEG marker sequence: metadata between progressive scans and after EOI is removed", () => {
+    const base = jpeg(64, 64, false);
+    const eoi = base.length - 2;
+    const progressive = Buffer.concat([
+      base.subarray(0, eoi),
+      segment(0xe1, Buffer.from("Exif\0\0LATE-GPS-DATA", "latin1")),
+      segment(0xfe, Buffer.from("late comment", "latin1")),
+      segment(0xda, Buffer.from([1, 1, 0, 0, 0x3f, 0])),
+      Buffer.from([0x56, 0xff, 0x00, 0x78, 0xff, 0xd0, 0x9a]),
+      Buffer.from([0xff, 0xd9]),
+      Buffer.from("<html>trailing polyglot</html>"),
+    ]);
+    const result = validateImage(progressive);
+    expect(result).toMatchObject({ ok: true, mime: "image/jpeg" });
+    if (!result.ok) return;
+    const text = result.bytes.toString("latin1");
+    expect(text).not.toContain("LATE-GPS");
+    expect(text).not.toContain("late comment");
+    expect(text).not.toContain("polyglot");
+    expect(result.bytes.subarray(-2)).toEqual(Buffer.from([0xff, 0xd9]));
+    // a second frame header or a scan before any frame is refused
+    expect(validateImage(Buffer.concat([Buffer.from([0xff, 0xd8]), segment(0xda, Buffer.from([1, 1, 0, 0, 0x3f, 0])), Buffer.from([0, 0xff, 0xd9])]))).toEqual({ ok: false, reason: "MALFORMED" });
+  });
+
+  it("requires exactly one still WebP frame and rebuilds the container", () => {
+    const vp8x = (flags: number) => {
+      const d = Buffer.alloc(10);
+      d[0] = flags;
+      d.writeUIntLE(39, 4, 3);
+      d.writeUIntLE(39, 7, 3);
+      return Buffer.concat([Buffer.from("VP8X"), u32le(10), d]);
+    };
+    const riff = (...chunks: Buffer[]) => {
+      const body = Buffer.concat([Buffer.from("WEBP"), ...chunks]);
+      return Buffer.concat([Buffer.from("RIFF"), u32le(body.length), body]);
+    };
+    const frame = webpLossless(40, 40).subarray(12);
+    expect(validateImage(riff(vp8x(0)))).toEqual({ ok: false, reason: "MALFORMED" }); // header only, no frame
+    expect(validateImage(riff(vp8x(0x02), frame))).toEqual({ ok: false, reason: "UNSUPPORTED_TYPE" }); // animated
+    expect(validateImage(riff(frame, frame))).toEqual({ ok: false, reason: "UNSUPPORTED_TYPE" }); // two frames
+    expect(validateImage(riff(frame, Buffer.concat([Buffer.from("ZZZZ"), u32le(2), Buffer.alloc(2)])))).toEqual({ ok: false, reason: "MALFORMED" });
+    const icc = Buffer.concat([Buffer.from("ICCP"), u32le(8), Buffer.from("ICCSECRT")]);
+    const ok = validateImage(riff(vp8x(0x20), icc, frame));
+    expect(ok).toMatchObject({ ok: true, width: 40, height: 40 });
+    if (ok.ok) {
+      expect(ok.bytes.toString("latin1")).not.toContain("ICCSECRT");
+      expect(ok.bytes.readUInt32LE(4) + 8).toBe(ok.bytes.length);
+    }
+  });
+
   it("refuses SVG, HTML, GIF, truncated files, bad dimensions and oversize input", () => {
     expect(validateImage(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'))).toEqual({ ok: false, reason: "UNSUPPORTED_TYPE" });
     expect(validateImage(Buffer.from("<!doctype html><script>x</script>"))).toEqual({ ok: false, reason: "UNSUPPORTED_TYPE" });
