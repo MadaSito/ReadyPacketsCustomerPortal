@@ -79,3 +79,8 @@ I did not run code against MySQL and added no tests, so the race and skew analys
 ### J-1 / jobs H-3, fixed in `4055453` (spot-checked by code-read)
 - Lease bounds now come from the database clock (`UTC_TIMESTAMP(3)` / `TIMESTAMPADD`) in the claim, heartbeat, ownership and reap paths I sampled. Mail capture is now an allowlist: `allowsMailCapture` permits only `development` and `test`. I did not re-run the owner's MySQL tests.
 - **Still open: the `env.ts` part of H-3.** NODE_ENV=production with the preview profile on a non-readypackets host is still allowed. This belongs to the config owner.
+
+### H-3 env part — `86d4ec1`: mitigated + accepted residual (code-read)
+- `env.ts` now refuses the preview profile in every NODE_ENV unless `RP_PREVIEW_ACKNOWLEDGED` is exactly `synthetic-data-only`; readypackets.com origins and aliases remain refused; a stray acknowledgement outside preview warns.
+- `platform/module.ts` logs one startup WARN (`platform.preview_profile.active`) and exposes `preview: true` to the shell for a permanent banner.
+- Accepted residual (ADR 0002): preview with NODE_ENV=production on a non-readypackets host remains the intended hosted-demo configuration, with relaxed host/CORS/framing by design. It now requires a deliberate, exact operator acknowledgement, so the accidental-misconfiguration path in the original finding is closed. Mail capture is independently refused in preview (`4055453`).
