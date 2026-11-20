@@ -32,6 +32,7 @@ change. It describes intent and state; it is not a certification or a guarantee.
 - `docs/source-specs/increment-02/` — Master Offerings Matrix v3.0 and the P101 / P201 production webhook
   references (the "corrected" P101 logic wins where the two webhook documents differ)
 - `docs/brand/` — brand guide and colour tokens; approved assets in `client/public/brand`, fonts in `client/public/fonts`
+- This repository: GitHub `MadaSito/ReadyPacketsCustomerPortal` (private)
 - Previous implementation: GitHub `readypackets/ReadyPackets-SiteSplit` (reference only; its documented defects are not carried over)
 
 ## Technology

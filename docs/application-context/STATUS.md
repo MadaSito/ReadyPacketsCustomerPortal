@@ -123,8 +123,13 @@ Reviewed by a second engineer (not the author): production webhooks, findings PW
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).
-- GitHub: not pushed yet (connection not authorised during session 01). History is local commits plus a copy
-  in the project files; the CI and security workflows have never run.
+- GitHub: pushed to the private repository `MadaSito/ReadyPacketsCustomerPortal` (`main` plus tags). The
+  repository named in the specifications (`readypackets/ReadyPackets-SiteSplit`) was not accessible to the
+  connected account and was not touched. Both workflows (`ci`, `security`) pass on `main` as of commit
+  `d920612`. CodeQL results are gated inside the job because GitHub code scanning is unavailable on this
+  private repository; dependency review is skipped for the same reason (set the repository variable
+  `CODE_SCANNING_ENABLED=true` if the feature becomes available). Branch protection is not configured yet,
+  and actions are not yet pinned by commit SHA.
 
 ## How to continue
 
