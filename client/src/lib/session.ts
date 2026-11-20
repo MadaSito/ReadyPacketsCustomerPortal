@@ -33,6 +33,11 @@ export function useSession() {
     queryFn: () => api.me(),
     staleTime: 30_000,
     retry: (count, error) => !isUnauthenticated(error) && count < 2,
+    // An anonymous visitor's `me` is an error with no data. TanStack refetches errored queries whenever a new
+    // observer mounts, and a refetch with no data resets the status to pending. RouteGate would then show its
+    // loader, unmount the page, and remount it on the next error: an endless loop on any public page that reads
+    // the session. Explicit refreshes (invalidate) still refetch.
+    retryOnMount: false,
   });
   const queryClient = useQueryClient();
   const refresh = useCallback(() => queryClient.invalidateQueries({ queryKey: ME_QUERY_KEY }), [queryClient]);

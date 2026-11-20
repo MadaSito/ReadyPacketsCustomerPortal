@@ -35,6 +35,15 @@ The H-3 preview banner is a permanent, non-dismissible "Preview — synthetic da
 
 The idle timeout reads `me.session.idleTimeoutSeconds` (identity 84d3089), with a 30-minute fallback if the field is missing or invalid. The warning comes 2 minutes before, or at half the limit for very short policies. A warning toast also appears 2 minutes before `absoluteExpiresAt`, which cannot be extended, and the session is re-checked once it passes. Background refetches refresh the server's lastSeenAt, so this client input-idle timer is the signal for human inactivity, and it signs the user out.
 
+**INT-01, realm quarantine (third-party analytics).** `lib/realmTaint.ts` holds a module-memory, one-way taint flag. Integrations call `markRealmTainted("clarity"|"posthog")` synchronously before any vendor script or request. When the realm is tainted:
+- `RealmTaintBoundary` (the app root, above the router and shells) renders only a neutral "Reloading securely…" status for any non-anonymous session. It then calls `location.replace(<pathname>)` once; search and hash are stripped.
+- `TaintedRouteGate` lets only `/privacy` and `/terms` render. Every other location, including sign-in, is left with `location.assign` and never rendered in the tainted realm.
+- `RouteGate` forces the anonymous PublicFrame and drops the idle timer.
+
+`requestCleanRealm` fires at most once per document. `app/realmTaint.test.tsx` uses a MutationObserver over every commit to show that no user name, email or shell navigation is ever committed, and checks the exact navigation calls.
+
+**Session refetch loop (found while testing INT-01).** An anonymous visitor's `me` is an error with no data. TanStack refetched it each time a new observer mounted, and a refetch with no data resets the status to pending. Any public page that reads the session could therefore loop: loader, unmount, remount. The fix is `retryOnMount: false` on the `me` query in `lib/session.ts`, covered by a regression test (exactly one `me` call).
+
 ## Not verified / not done
 
 - No real-browser runs: no Playwright/axe in a browser, no responsive screenshots at 320, 768, 1280 and 1920 px, no 200%/400% zoom or reflow checks, no forced-colors or reduced-motion visual checks.

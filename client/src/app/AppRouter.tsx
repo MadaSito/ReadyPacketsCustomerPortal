@@ -16,6 +16,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import { decideRoute, type SessionView } from "./guard";
 import { SessionIdleTimeout } from "./IdleTimeout";
 import { NotFoundPage, ServiceUnavailablePage } from "./pages";
+import { TaintedRouteGate, useRealmTainted } from "./RealmTaint";
 import { RouteAnnouncerProvider, RouteFocus } from "./RouteFocus";
 import { ConsoleShell } from "./shell/ConsoleShell";
 import { CustomerShell } from "./shell/CustomerShell";
@@ -58,6 +59,7 @@ function useSessionEndNotice(view: SessionView) {
 function RouteGate({ route }: { route: RouteDef }) {
   const [location] = useLocation();
   const { view, me } = useSession();
+  const tainted = useRealmTainted();
   useSessionEndNotice(view);
   const decision = decideRoute(route.access, location, view);
   if (decision.kind === "loading") return <PageLoading />;
@@ -70,8 +72,9 @@ function RouteGate({ route }: { route: RouteDef }) {
       </PublicFrame>
     );
   }
-  const kind = frameFor(route, view);
-  const user = me?.user;
+  // INT-01: a tainted realm only ever shows the anonymous public frame (TaintedRouteGate limits it to /privacy, /terms).
+  const kind = tainted ? "public" : frameFor(route, view);
+  const user = tainted ? undefined : me?.user;
   if (decision.kind === "not-found") {
     return (
       <Frame kind={user ? (user.role === "customer" ? "customer" : "console") : "public"} user={user}>
@@ -83,7 +86,7 @@ function RouteGate({ route }: { route: RouteDef }) {
   const Page = route.component as ComponentType;
   return (
     <Frame kind={kind} user={user}>
-      {view.status === "full" ? <SessionIdleTimeout /> : null}
+      {view.status === "full" && !tainted ? <SessionIdleTimeout /> : null}
       <ErrorBoundary resetKey={location}>
         <Suspense fallback={<PageLoading />}>
           <Page />
@@ -122,6 +125,7 @@ export function routeKey(route: RouteDef): string {
 export function AppRoutes({ routes = ALL_ROUTES }: { routes?: readonly RouteDef[] }) {
   return (
     <RouteAnnouncerProvider>
+      <TaintedRouteGate>
       <Switch>
         {routes.map((route) => (
           <Route key={routeKey(route)} path={route.path}>
@@ -132,6 +136,7 @@ export function AppRoutes({ routes = ALL_ROUTES }: { routes?: readonly RouteDef[
           <FallbackGate />
         </Route>
       </Switch>
+      </TaintedRouteGate>
     </RouteAnnouncerProvider>
   );
 }

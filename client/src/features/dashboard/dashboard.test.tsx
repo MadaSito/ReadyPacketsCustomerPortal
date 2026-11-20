@@ -1,12 +1,17 @@
 import { screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DashboardWidget } from "@/lib/routes";
 import type { MeResult } from "@/lib/authApi";
+import type * as registryModule from "@/app/registry";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { requiredActionsFor } from "./components/RequiredActions";
 import { widgetsFor } from "./components/WidgetGrid";
 import ConsoleOverviewPage from "./pages/ConsoleOverviewPage";
 import CustomerHomePage, { greeting } from "./pages/CustomerHomePage";
+
+// Other features now register customer widgets (engagement 683c794); this suite covers the empty first-order guide,
+// so the registry's widgets are emptied here. Widget filtering itself is covered by the widgetsFor tests.
+vi.mock("@/app/registry", async (original) => ({ ...(await original<typeof registryModule>()), WIDGETS: [] }));
 
 const me = (role: "customer" | "staff" | "admin"): MeResult => ({
   user: { publicId: "u1", role, name: "Avery Example", email: "a@example.test", status: "active" },
