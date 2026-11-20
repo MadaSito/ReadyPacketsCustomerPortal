@@ -9,6 +9,7 @@ import type { Request } from "express";
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../shared/capabilities.js";
 import { DomainError } from "../core/errors.js";
 import type { RequestContext, SessionPrincipal, SessionTransport } from "../core/types.js";
+import { hasFreshStepUp } from "../trpc/trpc.js";
 
 export interface HttpRequestState {
   context: RequestContext;
@@ -45,7 +46,7 @@ export function requireHttpCapability(req: Request, capability: Capability, now:
   if (!roleHasCapability(session.role, capability)) {
     throw new DomainError("FORBIDDEN", "CAPABILITY_NOT_GRANTED", "You do not have permission to perform this action.");
   }
-  if (STEP_UP_CAPABILITIES.has(capability) && !(session.stepUpAt && now.getTime() - session.stepUpAt.getTime() <= stepUpMaxAgeMs)) {
+  if (STEP_UP_CAPABILITIES.has(capability) && !hasFreshStepUp(session, now, stepUpMaxAgeMs)) {
     throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Please confirm your password and authentication code to continue.", { capability });
   }
   return session;

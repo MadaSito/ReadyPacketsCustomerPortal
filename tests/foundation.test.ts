@@ -88,6 +88,10 @@ describe("foundation: procedure guards", () => {
     await expect(caller(admin).reassign()).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
     const stale = fakePrincipal({ role: "admin", stepUpAt: new Date(h.clock.now().getTime() - 11 * 60_000) });
     await expect(caller(stale).reassign()).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
+    const future = fakePrincipal({ role: "admin", stepUpAt: new Date(h.clock.now().getTime() + 60_000) });
+    await expect(caller(future).reassign()).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
+    const invalid = fakePrincipal({ role: "admin", stepUpAt: new Date(Number.NaN) });
+    await expect(caller(invalid).reassign()).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
     const fresh = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
     await expect(caller(fresh).reassign()).resolves.toBe("moved");
   });

@@ -209,7 +209,10 @@ export const staffProcedure = protectedProcedure.use(requireRole(["staff", "admi
 export const adminProcedure = protectedProcedure.use(requireRole(["admin"]));
 
 export function hasFreshStepUp(session: SessionPrincipal, now: Date, maxAgeMs = STEP_UP_MAX_AGE_MS): boolean {
-  return session.stepUpAt !== null && now.getTime() - session.stepUpAt.getTime() <= maxAgeMs;
+  if (!(session.stepUpAt instanceof Date)) return false;
+  const age = now.getTime() - session.stepUpAt.getTime();
+  // Reject invalid dates and timestamps from the future (small skew tolerance only).
+  return Number.isFinite(age) && age >= -5_000 && age <= maxAgeMs;
 }
 
 /**
