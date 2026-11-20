@@ -33,7 +33,7 @@ their owners report done.
 | Attribute keys normalised lower-camelCase → snake_case (`fromStatus` → `from_status`) | Orders, engagement and compliance used camelCase keys, which `ATTRIBUTE_KEY_RE` **silently dropped** (e.g. `order.status.changed` lost `fromStatus/toStatus/workflowVersion`) | 511287f |
 | Secret/PII-shaped keys keep **boolean** values only | Flags such as `password_updated`, `secret_key_updated`, `webhook_secret_updated`, `secrets_included`, `must_change_password`, `allow_private_network` were dropped by the denylist | 511287f |
 | External projection allowlist (`EXTERNAL_ATTRIBUTE_KEYS`) | IDs, references (`previous_reference`/`new_reference`), owner public ids, amounts and slugs no longer leave the host. Booleans and fixed-vocabulary keys still do. Withheld values are counted in `dropped_attributes` | 511287f |
-| Every checkpoint (manual, scheduled, retention) emits `audit.checkpoint.created` with `checkpoint_seq` + `head_link_hmac_sha256` in the same transaction, both externally forwarded | Scheduled and retention checkpoints previously had no event, so nothing carried the head link off-host | this commit |
+| Every checkpoint (manual, scheduled, retention) emits `audit.checkpoint.created` with `checkpoint_seq` + `head_link_hmac_sha256` in the same transaction, both externally forwarded | Scheduled and retention checkpoints previously had no event, so nothing carried the head link off-host | 2cd591a |
 | Forwarder read (`readEventsAfter`) separates authenticated `pruned` from `missing` (no or invalid tombstone, chain gap, head overrun) and reads through retention-only windows | SIEM consumer stalled on retention-only pages and could not tell pruning from loss | 511287f, 0abbc41 |
 
 ## Per-module coverage
@@ -113,7 +113,7 @@ The queue lifecycle records `job.enqueued|claimed|completed|failed…` through `
 `correlationId` (queue.ts:75–80,171). The mail lifecycle records `job.mail.enqueued|sending|captured|expired`
 (mail.ts:133–246).
 
-Gap: J-1 (cosmetic).
+J-1 fixed in b0b80be.
 
 ### platform (owner: platform_engineer)
 
@@ -239,7 +239,7 @@ the delete statement (retention.ts:201–226).
 | H-1 | trpc/trpc.ts:171–180 | Generic tRPC rate-limit refusal leaves no trace | Sampled `note()` on `http.rate_limited` with attribute `procedure` (a path template, not input) |
 | F-1 | files/index.ts:367–388 | Object-level write denials (`enforceVisibility`, order write check) throw inside `currentTx` and are not recorded | Catch outside the tx and record `file.access.denied` (security, denied) like orders `policy.deny()` |
 | F-2 | files/index.ts:386 | `file.visibility.changed` has no from/to; a no-op delete still records `completed` | Add `from_visibility`/`to_visibility` (snake_case). Skip or record `outcome: "refused"`, reason `ALREADY_REMOVED`, for the no-op |
-| J-1 | jobs/mail.ts:62–70 | `mailAudit` hard-codes `action: "transition"`, including `job.mail.capture.viewed` (a read of mail content) | Take `action` as a parameter; use `read` for capture view |
+| J-1 (**fixed b0b80be**, verified by reading mail.ts:169) | jobs/mail.ts:62–70 | `mailAudit` hard-codes `action: "transition"`, including `job.mail.capture.viewed` (a read of mail content) | Take `action` as a parameter; use `read` for capture view |
 | O-1 | orders/orderService.ts:628,749 and others | camelCase attribute keys | Now normalised by the envelope; switch to snake_case at the source. `previous_reference`/`new_reference` are local-only by design |
 | C-1 | compliance/invoicesService.ts:148, intakeService.ts:99, policiesService.ts:120, actorAuth.ts:55 | Service-level capability and remediation denials throw `forbidden()` with no audit; only tRPC-level denials are recorded | Add a `deny(actor, reasonCode, resource)` helper recording `authz.compliance.denied` (security, denied) outside any tx |
 | C-2 | compliance/invoicesService.ts:1066–1080, 1279–1289 | Financial refusals (payment on a voided/unissued invoice, currency mismatch, over-refund) are not recorded | Record `invoice.payment.refused` / `invoice.refund.refused` (business, refused, reasonCode) after rollback |
