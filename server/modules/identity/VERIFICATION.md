@@ -30,5 +30,6 @@ profile cases use production parameters). Fakes: audit, mailer, jobs, rate limit
 | Router: session issuance only via transport (no token in body), `me` requires session, strict input | `identity.test.ts` "router" | automated-test |
 | Ops provisioning: bootstrap admin (active, verified, mustChange, first sign-in ⇒ enroll_mfa, system audit without e-mail), ADMIN_EXISTS refusal, concurrent bootstraps ⇒ one succeeds, demo_seed refused in production, policy/duplicate errors, audit failure ⇒ no account | `identity.test.ts` "provisionLocalAccount (ops scripts)" | automated-test |
 | Uniform timing between registration branches and between reset outcomes | Both registration branches perform hash + one transaction + one mail enqueue + one audit row; the create branch additionally inserts rows. Public reset does identical work for every address (lookup is in the job). Timing has NOT been benchmarked; a small residual difference on registration is possible. | not-verified |
-| Staff management UI, account pages, axe | see `client/src/features/identity` tests when delivered | target |
+| Account, sessions, customers (list, create, detail with role-filtered CUSTOMER_TABS), staff pages; client-side password validation; axe on every page family | `client/src/features/identity/identity.test.tsx` (8 tests, jsdom + axe-core) | automated-test |
+| Real-browser rendering, responsive layout, screen-reader and keyboard walkthrough | not run (contract forbids browsers here) | not-verified |
 | Real browser / assistive technology | not run in this environment | not-verified |

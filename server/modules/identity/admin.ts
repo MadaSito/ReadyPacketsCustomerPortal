@@ -24,6 +24,8 @@ export interface CustomerListItem {
   role: UserRole;
   emailVerified: boolean;
   createdAt: Date;
+  /** Optimistic-concurrency version (pass as expectedVersion to role/reference changes). */
+  version: number;
 }
 
 export interface Page<T> {
@@ -83,6 +85,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
       role: view.role,
       emailVerified: view.emailVerified,
       createdAt: view.createdAt,
+      version: row.version,
     };
   }
 

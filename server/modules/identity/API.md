@@ -89,7 +89,7 @@ createPendingCustomer(input: {
 
 isCustomerRefAvailable(reference: string, tx?: DbOrTx): Promise<boolean>;  // false for current OR retired references
 
-// CustomerListItem = { publicId, customerRef, name, email, status, role, emailVerified, createdAt }
+// CustomerListItem = { publicId, customerRef, name, email, status, role, emailVerified, createdAt, version }
 // status pending_activation, role customer (never admin/staff), NO password/MFA/session material.
 // Throws CONFLICT EMAIL_IN_USE / REFERENCE_IN_USE (incl. retired references) / PUBLIC_ID_IN_USE.
 
