@@ -8,6 +8,7 @@ import {
   TIERS,
   buildOfferingsJsonSchema,
   parseOfferings,
+  resolveDataRoot,
 } from "./offerings.js";
 
 const raw = readFileSync(DEFAULT_OFFERINGS_FILE, "utf8");
@@ -101,6 +102,16 @@ describe("offerings data file (matrix v3.0)", () => {
   it("matches the committed JSON Schema (regenerate: tsx scripts/ops/catalog/export-schema.ts)", () => {
     expect(readFileSync(OFFERINGS_JSON_SCHEMA_FILE, "utf8")).toBe(buildOfferingsJsonSchema());
     expect(raw.endsWith("\n")).toBe(true);
+  });
+
+  it("finds data/catalog from the source layout and from the bundled dist/ops layout", () => {
+    const rel = path.join("data", "catalog", "readypackets-offerings-v3.0.json");
+    const release = "/opt/readypackets/releases/abc123";
+    const has = (p: string) => p === path.join(release, rel);
+    expect(resolveDataRoot(path.join(release, "dist", "ops"), has)).toBe(release);
+    expect(resolveDataRoot(path.join(release, "scripts", "ops", "catalog"), has)).toBe(release);
+    expect(resolveDataRoot("/nowhere/a/b/c", () => false)).toBe("/nowhere");
+    expect(DEFAULT_OFFERINGS_FILE.endsWith(rel)).toBe(true);
   });
 
   it("refuses malformed or inconsistent documents with issue paths", () => {

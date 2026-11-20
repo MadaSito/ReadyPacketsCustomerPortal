@@ -8,15 +8,32 @@
  * Packet 7 is the bundle rule (not a product). Packet 8 is reserved/unlisted and appears ONLY under
  * `reserved` with no deliverables, prices or tiers; the loader never turns it into a catalog entry.
  */
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 export const OFFERINGS_SCHEMA_ID = "readypackets.offerings/1";
-const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-export const DEFAULT_OFFERINGS_FILE = path.join(REPO_ROOT, "data", "catalog", "readypackets-offerings-v3.0.json");
-export const OFFERINGS_JSON_SCHEMA_FILE = path.join(REPO_ROOT, "data", "catalog", "offerings.schema.json");
+const OFFERINGS_FILE_NAME = "readypackets-offerings-v3.0.json";
+
+/**
+ * Root holding data/catalog: three levels up in source (scripts/ops/catalog) but two when bundled into
+ * dist/ops/catalog-import.js. Walks up from this module (at most 4 levels) to the first directory that
+ * contains data/catalog/<file>; falls back to the source layout.
+ */
+export function resolveDataRoot(moduleDir: string, exists: (p: string) => boolean = existsSync): string {
+  let dir = moduleDir;
+  for (let i = 0; i < 4; i++) {
+    dir = path.dirname(dir);
+    if (exists(path.join(dir, "data", "catalog", OFFERINGS_FILE_NAME))) return dir;
+  }
+  return path.resolve(moduleDir, "..", "..", "..");
+}
+
+const DATA_ROOT = resolveDataRoot(path.dirname(fileURLToPath(import.meta.url)));
+export const DEFAULT_OFFERINGS_FILE = path.join(DATA_ROOT, "data", "catalog", OFFERINGS_FILE_NAME);
+export const OFFERINGS_JSON_SCHEMA_FILE = path.join(DATA_ROOT, "data", "catalog", "offerings.schema.json");
 
 export const TIERS = ["Basic", "Standard", "Premium"] as const;
 export type Tier = (typeof TIERS)[number];
