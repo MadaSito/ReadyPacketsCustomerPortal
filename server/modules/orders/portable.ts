@@ -422,8 +422,8 @@ export function createPortableHooks(deps: PortableDeps) {
           importId: input.importId,
           resource: { type: "order", publicId },
           reasonCode: knownStatus ? undefined : "STATUS_UNMAPPED",
-          attributes: { lockState, referenceSource: referenceReason, ownerPublicId: owner.publicId },
-          safeCounts: { lineItems: input.lineItems.length, history: history.length, notes: input.customerNotes?.length ?? 0 },
+          attributes: { lock_state: lockState, reference_source: referenceReason, owner_public_id: owner.publicId },
+          safeCounts: { line_items: input.lineItems.length, history: history.length, notes: input.customerNotes?.length ?? 0 },
         },
         tx,
       );

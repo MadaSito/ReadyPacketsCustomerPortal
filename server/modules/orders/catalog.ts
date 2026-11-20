@@ -257,7 +257,7 @@ export function createCatalogService(deps: CatalogDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "catalog_product", publicId },
-            attributes: { versionNumber: 1, currency: input.currency, priceMinor: input.priceMinor },
+            attributes: { version_number: 1, currency: input.currency, price_minor: input.priceMinor },
           },
           tx,
         );
@@ -314,7 +314,7 @@ export function createCatalogService(deps: CatalogDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "catalog_product", publicId: row.product.publicId },
-            attributes: { versionNumber, termsChanged, active: input.active },
+            attributes: { version_number: versionNumber, terms_changed: termsChanged, active: input.active },
           },
           tx,
         );

@@ -324,8 +324,8 @@ export function createOrderService(deps: OrderServiceDeps) {
               outcome: "completed",
               actor: actorOf(principal),
               resource: { type: "order", publicId },
-              attributes: { currency, totalMinor, onBehalf: ownerUserId !== principal.userId, workflowVersion: workflow.versionNumber },
-              safeCounts: { lineItems: lineItems.length },
+              attributes: { currency, total_minor: totalMinor, on_behalf: ownerUserId !== principal.userId, workflow_version: workflow.versionNumber },
+              safeCounts: { line_items: lineItems.length },
             },
             tx,
           );
@@ -571,7 +571,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "order", publicId: view.publicId },
-            attributes: { visibility, notePublicId: note.publicId },
+            attributes: { visibility, note_public_id: note.publicId },
           },
           tx,
         );
@@ -625,7 +625,7 @@ export function createOrderService(deps: OrderServiceDeps) {
               outcome: "completed",
               actor: actorOf(principal),
               resource: { type: "order", publicId: view.publicId },
-              attributes: { fromStatus: view.statusKey, toStatus: transition.to, workflowVersion: bound.versionNumber },
+              attributes: { from_status: view.statusKey, to_status: transition.to, workflow_version: bound.versionNumber },
             },
             tx,
           );
@@ -707,7 +707,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             reasonCode: input.reasonCode,
             actor: actorOf(principal),
             resource: { type: "order", publicId: view.publicId },
-            attributes: { fromState: view.lockState, toState: input.lockState },
+            attributes: { from_state: view.lockState, to_state: input.lockState },
           },
           tx,
         );
@@ -746,7 +746,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             reasonCode: input.reasonCode,
             actor: actorOf(principal),
             resource: { type: "order", publicId: view.publicId },
-            attributes: { previousReference: view.reference, newReference: reference },
+            attributes: { previous_reference: view.reference, new_reference: reference },
           },
           tx,
         );
@@ -864,8 +864,8 @@ export function createOrderService(deps: OrderServiceDeps) {
               reasonCode: input.reasonCode,
               actor: actorOf(principal),
               resource: { type: "order", publicId: view.publicId },
-              attributes: { fromOwner: view.ownerPublicId, toOwner: target.publicId, operationId: input.operationId },
-              safeCounts: { revokedGrants: live.length },
+              attributes: { from_owner: view.ownerPublicId, to_owner: target.publicId, operation_id: input.operationId },
+              safeCounts: { revoked_grants: live.length },
             },
             tx,
           );

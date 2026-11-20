@@ -335,7 +335,7 @@ describe("locks", () => {
     await mod.orders.setLock(admin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "legal_hold", reasonCode: "LEGAL" });
     await expectError(mod.assertCanWriteOrder(staff.principal, order.publicId, { kind: "message" }), "LOCKED:ORDER_LOCKED");
     await expectError(mod.assertCanWriteOrder(admin.principal, order.publicId, { kind: "status" }), "LOCKED:ORDER_LOCKED");
-    expect(h.audit.named("order.lock.changed").at(-1)).toMatchObject({ attributes: { fromState: "review", toState: "legal_hold" } });
+    expect(h.audit.named("order.lock.changed").at(-1)).toMatchObject({ attributes: { from_state: "review", to_state: "legal_hold" } });
     // legal hold blocks reassignment and reference changes
     view = await mod.assertCanReadOrder(admin.principal, order.publicId);
     await expectError(
@@ -469,7 +469,7 @@ describe("reassignment", () => {
     const grants = await t.db.select().from(orderGrants).where(eq(orderGrants.orderId, view.id));
     expect(grants.every((g) => g.status === "revoked" && g.endReasonCode === "REASSIGNED" && g.liveKey === null)).toBe(true);
     const event = h.audit.named("order.reassigned").at(-1);
-    expect(event).toMatchObject({ attributes: { fromOwner: alice.publicId, toOwner: bob.publicId }, safeCounts: { revokedGrants: 2 } });
+    expect(event).toMatchObject({ attributes: { from_owner: alice.publicId, to_owner: bob.publicId }, safeCounts: { revoked_grants: 2 } });
     // Idempotent replay with the same operation id.
     const replay = await mod.orders.reassign(admin.principal, { orderId: order.publicId, targetCustomerPublicId: bob.publicId, expectedVersion: view.version, operationId, reasonCode: "ACCOUNT_MERGE" });
     expect(replay.replayed).toBe(true);

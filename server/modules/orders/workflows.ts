@@ -188,7 +188,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
             outcome: "completed",
             actor: { userId: principal.userId, role: principal.role },
             resource: { type: "order_workflow", publicId: workflow.publicId },
-            attributes: { versionNumber, makeDefault: input.makeDefault },
+            attributes: { version_number: versionNumber, make_default: input.makeDefault },
             safeCounts: { states: definition.states.length, transitions: definition.transitions.length },
           },
           tx,

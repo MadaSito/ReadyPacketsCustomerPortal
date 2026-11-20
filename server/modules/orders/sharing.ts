@@ -147,7 +147,7 @@ export function createSharingService(deps: SharingDeps) {
               outcome: "completed",
               actor: actorOf(principal),
               resource: { type: "order", publicId: view.publicId },
-              attributes: { grantPublicId: publicId, role: input.role },
+              attributes: { grant_public_id: publicId, role: input.role },
             },
             tx,
           );
@@ -185,7 +185,7 @@ export function createSharingService(deps: SharingDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "order", publicId: view.publicId },
-            attributes: { grantPublicId: grant.publicId, previousStatus: grant.status },
+            attributes: { grant_public_id: grant.publicId, previous_status: grant.status },
           },
           tx,
         );
@@ -271,7 +271,7 @@ export function createSharingService(deps: SharingDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "order", publicId: row.orderPublicId },
-            attributes: { grantPublicId: row.grant.publicId, role: row.grant.role },
+            attributes: { grant_public_id: row.grant.publicId, role: row.grant.role },
           },
           tx,
         );
