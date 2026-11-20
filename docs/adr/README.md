@@ -17,3 +17,11 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0010 | Search-engine indexing boundary between public site and portal | Accepted |
 | 0011 | Consent-gated analytics (Microsoft Clarity, PostHog) | Accepted |
 | 0012 | Toolchain: TypeScript 7 for type checking, TypeScript 6 for lint | Accepted |
+| 0013 | Transaction and lock discipline | Accepted |
+| 0014 | Payments recorded manually; Stripe adapter disabled | Accepted |
+| 0015 | Restore is an operator procedure, never a web action | Accepted |
+| 0016 | Preview profile requires a synthetic-data acknowledgement | Accepted |
+| 0017 | SIEM delivery states what was actually confirmed | Accepted |
+| 0018 | Portable package envelope and import custody | Accepted |
+| 0019 | Audit chain keys and off-host checkpoints | Accepted |
+| 0020 | Release scope: installable web app first; optional integrations disabled | Accepted |
