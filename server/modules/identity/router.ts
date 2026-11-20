@@ -92,11 +92,14 @@ export const identityRouter = router({
   me: sessionProcedure.query(async ({ ctx }) => {
     const user = await ctx.services.identity.getUser(ctx.session.userId);
     if (!user) throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
+    const timing = await ctx.services.identity.sessions.timing(ctx.session.sessionId);
+    if (!timing) throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
     return {
       user: { publicId: user.publicId, role: user.role, name: user.name, email: user.email, customerRef: user.customerRef, status: user.status },
       state: ctx.session.state,
       pendingSteps: [...ctx.session.pendingSteps],
       nextStep: ctx.session.pendingSteps[0] ?? null,
+      session: { idleTimeoutSeconds: timing.idleTimeoutSeconds, absoluteExpiresAt: timing.absoluteExpiresAt.toISOString() },
     };
   }),
 

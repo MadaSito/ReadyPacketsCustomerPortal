@@ -51,6 +51,14 @@ export interface SessionListItem {
 
 const TOKEN_SHAPE = /^[A-Za-z0-9_-]{43}$/;
 const LAST_SEEN_WRITE_INTERVAL_MS = 60 * 1000;
+/**
+ * device_summary marker of a service-internal ops session (openOpsSession). deviceSummary() only ever yields
+ * "<Browser> on <OS>", so no user agent can produce it; the resolver also refuses such rows outright.
+ */
+export const OPS_SESSION_MARKER = "ops:demo_seed";
+const OPS_SESSION_TTL_MS = 10 * 60 * 1000;
+/** Steps an ops session for a not-yet-enrolled demo_seed account may skip (the human enrols at first sign-in). */
+const OPS_WAIVABLE_STEPS: ReadonlySet<TransitionStep> = new Set(["enroll_mfa", "acknowledge_recovery_codes", "change_password"]);
 const csrfAad = (publicId: string) => `user_sessions.csrf:${publicId}`;
 
 export const sessionNotCurrent = () =>
@@ -120,8 +128,94 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
     return tx ? run(tx) : deps.db.transaction(run);
   }
 
+  /** Ops sessions exist only outside production, and only for accounts provisioned by the demo seeder. */
+  function opsSessionAllowed(user: Pick<UserRow, "origin" | "status">): boolean {
+    return deps.config.deploymentProfile !== "production" && user.origin === "demo_seed" && user.status === "active";
+  }
+
   const service = {
     policy,
+
+    /**
+     * Current idle policy plus this session's effective absolute expiry (stored expiry or current policy,
+     * whichever is sooner) — what identity.me reports so the client can warn before expiry.
+     */
+    async timing(sessionId: string, opts: { tx?: DbOrTx } = {}): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null> {
+      const [row] = await db(opts.tx).select().from(userSessions).where(eq(userSessions.publicId, sessionId)).limit(1);
+      if (!row) return null;
+      const p = await policy(opts.tx);
+      return {
+        idleTimeoutSeconds: Math.floor(p.idleMs / 1000),
+        absoluteExpiresAt: new Date(Math.min(row.absoluteExpiresAt.getTime(), row.authenticatedAt.getTime() + p.absoluteMs)),
+      };
+    },
+
+    /**
+     * Service-internal (ops scripts only; never on tRPC/HTTP): a short-lived FULL principal for a
+     * demo_seed account so the seeder can call module services that run sessions.assertCurrent.
+     * Refused in production and for any account not provisioned with reason demo_seed. The bearer token
+     * is never returned (its hash is of a discarded random value) and the resolver refuses ops rows, so
+     * the session cannot be presented over HTTP. Audited `identity.session.ops_opened` in the same tx.
+     * Callers revoke it with sessions.revoke(sessionId, "demo_seed_complete") when done.
+     */
+    async openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal> {
+      if (opts.reason !== "demo_seed") throw new DomainError("FORBIDDEN", "OPS_SESSION_FORBIDDEN", "Ops sessions are not available.");
+      if (deps.config.deploymentProfile === "production") {
+        throw new DomainError("FORBIDDEN", "OPS_SESSION_FORBIDDEN", "Ops sessions are not available in production.");
+      }
+      const run = async (tx: Tx): Promise<SessionPrincipal> => {
+        const [user] = await tx.select().from(users).where(eq(users.id, userId)).limit(1).for("update");
+        if (!user || !opsSessionAllowed(user)) {
+          throw new DomainError("FORBIDDEN", "OPS_SESSION_FORBIDDEN", "Ops sessions are only available for demo accounts.");
+        }
+        const now = deps.clock.now();
+        const csrfSecret = randomToken(32);
+        const publicId = ulid(now.getTime());
+        await tx.insert(userSessions).values({
+          publicId,
+          userId: user.id,
+          tokenHash: deps.crypto.hashToken(randomToken(32)),
+          csrfSecretEnc: deps.crypto.encrypt(csrfSecret, csrfAad(publicId)),
+          authMethod: "local",
+          authenticatedAt: now,
+          lastSeenAt: now,
+          absoluteExpiresAt: new Date(now.getTime() + OPS_SESSION_TTL_MS),
+          mfaVerifiedAt: now,
+          stepUpAt: now,
+          deviceSummary: OPS_SESSION_MARKER,
+        });
+        const pendingSteps = (await transitions.derive(user, { mfaVerifiedAt: now }, tx)).filter((step) => !OPS_WAIVABLE_STEPS.has(step));
+        if (pendingSteps.length > 0) {
+          throw new DomainError("CONFLICT", "OPS_SESSION_NOT_READY", "The demo account is not ready for an ops session.");
+        }
+        await deps.audit.record(
+          {
+            category: "security",
+            eventName: "identity.session.ops_opened",
+            action: "create",
+            outcome: "completed",
+            actor: { role: "system" },
+            resource: { type: "session", publicId },
+            attributes: { reason: opts.reason, user_public_id: user.publicId, ttl_seconds: OPS_SESSION_TTL_MS / 1000 },
+          },
+          tx,
+        );
+        return {
+          sessionId: publicId,
+          userId: user.id,
+          userPublicId: user.publicId,
+          role: user.role,
+          state: "full",
+          pendingSteps: [],
+          authMethod: "local",
+          authenticatedAt: now,
+          mfaVerifiedAt: now,
+          stepUpAt: now,
+          csrfSecret,
+        };
+      };
+      return opts.tx ? run(opts.tx) : deps.db.transaction(run);
+    },
 
     /** Creates a new session row for a freshly authenticated user. Call inside the login transaction. */
     async create(
@@ -216,7 +310,12 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         throw sessionNotCurrent();
       }
       if (secret !== principal.csrfSecret) throw sessionNotCurrent();
-      return { pendingSteps: await transitions.derive(user, row, tx), role: user.role, stepUpAt: row.stepUpAt, mfaVerifiedAt: row.mfaVerifiedAt };
+      let pendingSteps = await transitions.derive(user, row, tx);
+      if (row.deviceSummary === OPS_SESSION_MARKER) {
+        if (!opsSessionAllowed(user)) throw sessionNotCurrent();
+        pendingSteps = pendingSteps.filter((step) => !OPS_WAIVABLE_STEPS.has(step));
+      }
+      return { pendingSteps, role: user.role, stepUpAt: row.stepUpAt, mfaVerifiedAt: row.mfaVerifiedAt };
     },
 
     async listForUser(userId: number, currentSessionId: string): Promise<SessionListItem[]> {
@@ -270,6 +369,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
           .limit(1);
         if (!joined) return null;
         const { session, user } = joined;
+        if (session.deviceSummary === OPS_SESSION_MARKER) return null; // ops sessions never ride HTTP
         const now = deps.clock.now();
         const p = await policy();
         if (!isLive(session, user, now, p)) {

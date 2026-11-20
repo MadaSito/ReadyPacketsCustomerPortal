@@ -50,6 +50,10 @@ export interface IdentityModule extends ModuleLifecycle {
       tx: Tx,
     ): Promise<{ pendingSteps: TransitionStep[]; role: UserRole; stepUpAt: Date | null; mfaVerifiedAt: Date | null }>;
     getState(sessionId: string, opts?: { tx?: DbOrTx }): Promise<SessionState | null>;
+    /** Idle policy + effective absolute expiry for identity.me. */
+    timing(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null>;
+    /** Service-internal (ops scripts only; never on tRPC/HTTP). See API.md "Ops sessions". */
+    openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal>;
   };
   transitions: {
     derive(userId: number, session?: { mfaVerifiedAt: Date | null; tx?: DbOrTx }): Promise<TransitionStep[]>;
@@ -120,6 +124,8 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       revokeAllForUser: sessions.revokeAllForUser,
       assertCurrent: sessions.assertCurrent,
       getState: sessions.getState,
+      timing: sessions.timing,
+      openOpsSession: sessions.openOpsSession,
     },
     transitions: {
       async derive(userId, session) {

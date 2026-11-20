@@ -54,6 +54,10 @@ provisionLocalAccount(input: {
 // (CONFLICT BOOTSTRAP_BUSY if the lock is not obtained in 15 s). demo_seed: FORBIDDEN DEMO_SEED_FORBIDDEN in production.
 
 sessions: {
+  timing(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null>;
+  // current idle policy (identity.session.idle_minutes) + effective absolute expiry = min(stored expiry, authenticatedAt + current absolute policy)
+  // SERVICE-INTERNAL — ops scripts only (scripts/ops/seed-demo.ts); never on tRPC/HTTP. See "Ops sessions".
+  openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal>;
   markMfaVerified(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;  // sets mfaVerifiedAt + rotates
   markStepUp(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;       // sets stepUpAt (+mfaVerifiedAt) + rotates
   rotate(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;
@@ -122,7 +126,7 @@ limitation: no substring search on encrypted names.
 | `requestPasswordReset` | public (`auth_high_risk`) | `{ email }` → `{ accepted: true }` — identical in EVERY profile, never a link. Enqueues job `identity.password_reset.dispatch` `{ emailIndex }` + `attempted` audit in one tx; the retry-safe handler locks the user, checks active + local + 60 s cooldown, issues the token and queues mail |
 | `resetPassword` | public (`auth_high_risk`) | `{ token, password }` → `{ reset: true }` (revokes ALL sessions; user signs in again) |
 | `activateAccount` | public (`auth_high_risk`) | `{ token, password }` → `{ activated: true }` (invitation; verifies e-mail) |
-| `me` (query) | session | → `{ user: { publicId, role, name, email, customerRef, status }, state, pendingSteps, nextStep }` |
+| `me` (query) | session | → `{ user: { publicId, role, name, email, customerRef, status }, state, pendingSteps, nextStep, session: { idleTimeoutSeconds, absoluteExpiresAt /* ISO */ } }` |
 | `resendVerification` | session | → `{ accepted: true, previewLink? }` (throttled; eligibility + 60 s cooldown under the users row lock; preview link is the caller's own) |
 | `changePassword` | session (only when full or nextStep = `change_password`) | `{ currentPassword, newPassword }` → `{ nextStep }` (revokes other sessions, rotates current) |
 | `signOut` | public | → `{ ok: true }` (revokes server-side session if any + transport.clear) |
@@ -167,8 +171,27 @@ admin-initiated set-password) returned to that administrator. Never for `request
 `admin.customer.created|status_changed|reference_changed|invitation_sent` (admin), `admin.staff.created|role_changed` (admin),
 `identity.customer.imported_pending` (portable_transfer).
 
+## Session activity (idle clock)
+Every authenticated request the resolver accepts (background refetches included) refreshes `last_seen_at`, at most
+once per 60 s. The server idle timeout therefore measures inactivity of the client, not of the person; the client's
+own input-idle timer is the "user idle" signal and should sign out / warn on its own (`me.session` gives the policy).
+
+## Ops sessions (demo seeder only)
+`sessions.openOpsSession(userId, { reason: "demo_seed", tx? })` returns a FULL `SessionPrincipal` so the seeder can
+call module services that run `assertCurrent`. Guarantees: FORBIDDEN `OPS_SESSION_FORBIDDEN` in production and for
+any account whose `users.origin` is not `demo_seed` (or inactive); the row carries `device_summary = "ops:demo_seed"`
+(unreachable via `deviceSummary()`), a 10-minute absolute expiry, mfaVerifiedAt/stepUpAt = now; its bearer token is
+never returned (hash of a discarded random value) and the resolver refuses ops rows, so it cannot be used over HTTP.
+`assertCurrent` waives only `enroll_mfa`, `acknowledge_recovery_codes`, `change_password` for such rows (the human
+still enrols at first sign-in), and re-checks profile + origin every call. Audit `identity.session.ops_opened`
+(actor system, attributes { reason, user_public_id, ttl_seconds }) in the same tx. Revoke with
+`sessions.revoke(sessionId, "demo_seed_complete")`.
+
 ## Lock ordering (all modules)
 `users` row(s) → `user_sessions` row(s) → `identity_tokens` → other modules' rows (e.g. assurance account).
+Exception (orders/files, agreed with http_security): order-scoped mutations lock the `orders` row FIRST, then
+`users` → `user_sessions` (via `assertCurrent`) → grants → files. Identity itself never locks an orders row, so the
+two orders cannot interleave into a cycle with identity's own transactions.
 Identity never locks another module's rows. Admin mutations lock the ACTOR and TARGET users rows together in
 ascending `users.id` order (`SELECT … WHERE id IN (…) ORDER BY id FOR UPDATE`), then call `assertCurrent` and
 re-check: no pending steps, persisted role grants the capability, persisted step-up ≤ 10 min for

@@ -624,6 +624,43 @@ describe("identity module (MySQL)", () => {
     });
   });
 
+  describe("ops sessions (demo seeder)", () => {
+    const seed = (email = `seedops${++seq}.${Date.now()}@example.test`) =>
+      db.db.transaction((tx) => identity.provisionLocalAccount({ email, name: "Seed Person", role: "customer", password: PW, mustChangePassword: false }, { tx: tx as Tx, reason: "demo_seed" }));
+
+    it("opens a short-lived FULL principal for a demo_seed account that passes assertCurrent, audited in tx", async () => {
+      build({ deploymentProfile: "preview" });
+      const created = await seed();
+      h.audit.clear();
+      const principal = await identity.sessions.openOpsSession(created.userId, { reason: "demo_seed" });
+      expect(principal).toMatchObject({ userId: created.userId, state: "full", pendingSteps: [], role: "customer" });
+      expect(h.audit.named("identity.session.ops_opened")[0]).toMatchObject({ actor: { role: "system" }, attributes: { reason: "demo_seed", ttl_seconds: 600 } });
+      expect(h.audit.recordedInTx).toEqual([true]);
+      const current = await db.db.transaction((tx) => identity.sessions.assertCurrent(principal, tx as Tx));
+      expect(current.pendingSteps).toEqual([]);
+      const row = (await db.db.select().from(userSessions).where(eq(userSessions.publicId, principal.sessionId)))[0]!;
+      expect(row.absoluteExpiresAt.getTime() - h.clock.now().getTime()).toBe(600_000);
+      // The human still enrols MFA at first sign-in: the waiver applies to the ops session only.
+      expect((await identity.auth.signIn({ email: (await identity.getUser(created.userId))!.email, password: PW }, {})).nextStep).toBe("enroll_mfa");
+      await identity.sessions.revoke(principal.sessionId, "demo_seed_complete");
+      await expect(db.db.transaction((tx) => identity.sessions.assertCurrent(principal, tx as Tx))).rejects.toThrow();
+    });
+
+    it("is refused in production, for non-seed accounts, and can never be resolved over HTTP", async () => {
+      build({ deploymentProfile: "preview" });
+      const created = await seed();
+      const ordinary = await makeUser({ mfa: false });
+      await rejects(identity.sessions.openOpsSession(ordinary.id, { reason: "demo_seed" }), "OPS_SESSION_FORBIDDEN");
+      const principal = await identity.sessions.openOpsSession(created.userId, { reason: "demo_seed" });
+      const row = (await db.db.select().from(userSessions).where(eq(userSessions.publicId, principal.sessionId)))[0]!;
+      expect(row.deviceSummary).toBe("ops:demo_seed");
+      build({ deploymentProfile: "production" });
+      await rejects(identity.sessions.openOpsSession(created.userId, { reason: "demo_seed" }), "OPS_SESSION_FORBIDDEN");
+      // An ops row that survives into a production process is not current there either.
+      await expect(db.db.transaction((tx) => identity.sessions.assertCurrent(principal, tx as Tx))).rejects.toThrow();
+    });
+  });
+
   describe("router", () => {
     const createCaller = createCallerFactory(identityRouter);
     const issued: unknown[] = [];
@@ -644,6 +681,16 @@ describe("identity module (MySQL)", () => {
       expect(JSON.stringify(result)).not.toMatch(/token/i);
       expect(issued).toHaveLength(1);
       await expect(caller(null).me()).rejects.toThrow();
+    });
+
+    it("me reports the idle policy and this session's effective absolute expiry", async () => {
+      h.settings.values.set("identity.session.idle_minutes", 20);
+      const user = await makeUser();
+      const { principal } = await session(user.email);
+      const me = await caller(principal).me();
+      expect(me.session.idleTimeoutSeconds).toBe(1200);
+      const state = await identity.sessions.getState(principal.sessionId);
+      expect(me.session.absoluteExpiresAt).toBe(state!.absoluteExpiresAt.toISOString());
     });
 
     it("rejects unknown input keys (strict schemas)", async () => {
