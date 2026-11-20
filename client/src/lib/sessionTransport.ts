@@ -8,16 +8,21 @@
  *   headers and they are held in this module's memory (lost on reload by design). The server accepts this
  *   transport only when its deployment profile is `preview`.
  */
-import { RUNTIME } from "./runtime";
+import {
+  HEADER_CSRF, HEADER_PREVIEW_CSRF_SET, HEADER_PREVIEW_SESSION, HEADER_PREVIEW_SESSION_SET,
+} from "@shared/sessionTransportHeaders";
+import { apiUrl, RUNTIME } from "./runtime";
 
-export const HEADER_CSRF = "x-rp-csrf";
-export const HEADER_PREVIEW_SESSION = "x-rp-preview-session";
-export const HEADER_PREVIEW_SESSION_SET = "x-rp-preview-session-set";
-export const HEADER_PREVIEW_CSRF_SET = "x-rp-preview-csrf-set";
+export { HEADER_CSRF, HEADER_PREVIEW_CSRF_SET, HEADER_PREVIEW_SESSION, HEADER_PREVIEW_SESSION_SET };
 
 let previewSession: string | null = null;
 let previewCsrf: string | null = null;
+let bootstrap: Promise<void> | null = null;
+let lastBootstrap = 0;
+let revision = 0;
 const listeners = new Set<() => void>();
+const BOOTSTRAP_FRESHNESS_MS = 10 * 60_000;
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /** Notified when the server cleared or replaced the session (so the app can refetch `identity.me`). */
 export function onSessionChanged(listener: () => void): () => void {
@@ -26,9 +31,21 @@ export function onSessionChanged(listener: () => void): () => void {
 }
 
 function readCookie(name: string): string | null {
-  for (const part of document.cookie.split(";")) {
+  let cookie: string;
+  try {
+    cookie = document.cookie;
+  } catch {
+    return null;
+  }
+  for (const part of cookie.split(";")) {
     const [key, ...rest] = part.trim().split("=");
-    if (key === name) return decodeURIComponent(rest.join("="));
+    if (key === name) {
+      try {
+        return decodeURIComponent(rest.join("="));
+      } catch {
+        return null;
+      }
+    }
   }
   return null;
 }
@@ -47,22 +64,66 @@ export function sessionHeaders(): Record<string, string> {
   return headers;
 }
 
+function applyPreviewResponse(response: Response, sentRevision: number): void {
+  if (!RUNTIME.preview || sentRevision !== revision) return;
+  const nextSession = response.headers.get(HEADER_PREVIEW_SESSION_SET);
+  const nextCsrf = response.headers.get(HEADER_PREVIEW_CSRF_SET);
+  if (nextSession !== null) {
+    const changed = (nextSession || null) !== previewSession;
+    previewSession = nextSession || null;
+    previewCsrf = nextCsrf || null;
+    lastBootstrap = previewCsrf ? Date.now() : 0;
+    revision++;
+    if (changed) listeners.forEach((listener) => listener());
+  } else if (nextCsrf !== null) {
+    previewCsrf = nextCsrf || null;
+  }
+}
+
+async function ensureCsrf(): Promise<void> {
+  if (csrfToken() && Date.now() - lastBootstrap < BOOTSTRAP_FRESHNESS_MS) return;
+  if (!bootstrap) {
+    const sentRevision = revision;
+    const headers = new Headers();
+    if (RUNTIME.preview && previewSession) headers.set(HEADER_PREVIEW_SESSION, previewSession);
+    bootstrap = fetch(apiUrl("/api/csrf"), {
+      headers, credentials: RUNTIME.preview ? "omit" : "same-origin", redirect: "error", cache: "no-store",
+    }).then((response) => {
+      if (!response.ok) throw new Error("Your security token could not be initialized. Please try again.");
+      applyPreviewResponse(response, sentRevision);
+      if (!csrfToken()) throw new Error("Your security token could not be initialized. Please check your browser settings.");
+      lastBootstrap = Date.now();
+    }).finally(() => { bootstrap = null; });
+  }
+  await bootstrap;
+}
+
+function assertApiDestination(input: RequestInfo | URL): void {
+  const actual = new URL(input instanceof Request ? input.url : input.toString(), document.baseURI);
+  const api = new URL(apiUrl("/api"), document.baseURI);
+  if (actual.origin !== api.origin || !(actual.pathname === api.pathname || actual.pathname.startsWith(`${api.pathname}/`))) {
+    throw new Error("Authenticated requests must target the portal API.");
+  }
+}
+
 /** fetch wrapper used by tRPC and by feature code for raw endpoints (multipart upload, blob download). */
 export const sessionFetch: typeof fetch = async (input, init) => {
-  const headers = new Headers(init?.headers);
+  assertApiDestination(input);
+  const original = input instanceof Request ? input : undefined;
+  const method = (init?.method ?? original?.method ?? "GET").toUpperCase();
+  const unsafe = !SAFE_METHODS.has(method);
+  if (unsafe) await ensureCsrf();
+  const headers = new Headers(init?.headers ?? original?.headers);
+  headers.delete(HEADER_CSRF);
+  headers.delete(HEADER_PREVIEW_SESSION);
   for (const [key, value] of Object.entries(sessionHeaders())) headers.set(key, value);
-  const response = await fetch(input, { ...init, headers, credentials: RUNTIME.preview ? "omit" : "same-origin" });
-  if (RUNTIME.preview) {
-    const nextSession = response.headers.get(HEADER_PREVIEW_SESSION_SET);
-    const nextCsrf = response.headers.get(HEADER_PREVIEW_CSRF_SET);
-    if (nextSession !== null) {
-      const changed = (nextSession || null) !== previewSession;
-      previewSession = nextSession || null;
-      previewCsrf = nextCsrf || null;
-      if (changed) listeners.forEach((listener) => listener());
-    } else if (nextCsrf !== null) {
-      previewCsrf = nextCsrf || null;
-    }
-  }
+  if (!unsafe) headers.delete(HEADER_CSRF);
+  const sentRevision = revision;
+  const response = await fetch(input, {
+    ...init, headers, credentials: RUNTIME.preview ? "omit" : "same-origin", redirect: "error",
+  });
+  applyPreviewResponse(response, sentRevision);
+  // No automatic mutation retry: a network/authorization error is not proof of no effects.
+  if (unsafe && (response.status === 403 || response.status === 401)) lastBootstrap = 0;
   return response;
 };
