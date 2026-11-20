@@ -33,7 +33,7 @@ The axe runs use the wcag2a/aa, wcag21a/aa, wcag22aa and best-practice tags. col
 
 The H-3 preview banner is a permanent, non-dismissible "Preview — synthetic data only" notice in the public, customer and console frames. It appears when `platform.presentation.preview` is true or the build is the preview runtime (`review.test.tsx`).
 
-The idle timeout reads `me.session.idleTimeoutSeconds` (requested from identity_engineer). Until that field ships, it falls back to 30 minutes. The warning comes 2 minutes before, or at half the limit for very short policies.
+The idle timeout reads `me.session.idleTimeoutSeconds` (identity 84d3089), with a 30-minute fallback if the field is missing or invalid. The warning comes 2 minutes before, or at half the limit for very short policies. A warning toast also appears 2 minutes before `absoluteExpiresAt`, which cannot be extended, and the session is re-checked once it passes. Background refetches refresh the server's lastSeenAt, so this client input-idle timer is the signal for human inactivity, and it signs the user out.
 
 ## Not verified / not done
 
@@ -41,6 +41,5 @@ The idle timeout reads `me.session.idleTimeoutSeconds` (requested from identity_
 - No screen-reader passes (NVDA, JAWS, VoiceOver, TalkBack).
 - Passkey ceremonies were tested only as UI wiring (`@simplewebauthn/browser` is not exercised in jsdom).
 - Service worker: VitePWA is configured by the integrator (navigations NetworkOnly with an offline.html fallback, index.html not precached, /api NetworkOnly). The update prompt and offline behaviour have not been checked in a browser.
-- Idle timeout: the client reads the server policy, but `me.session` is not shipped yet, so the 30-minute fallback is still the one in effect.
 - The analytics consent slot is now provided by integrations (3f99849). It has not been checked in a rendered browser.
 - The production build has not been run by me since the latest commits (it is the integrator's responsibility).

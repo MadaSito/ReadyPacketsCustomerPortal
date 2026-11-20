@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useSignOut } from "@/lib/signOut";
 import { useRefreshSession, useSession } from "@/lib/session";
-import { Button, Dialog } from "@/ui";
+import { Button, Dialog, useToast } from "@/ui";
 
 /** Fallback only, used when identity.me does not (yet) report the server idle policy. */
 export const IDLE_DEFAULTS = { idleMs: 30 * 60_000, warnBeforeMs: 2 * 60_000 } as const;
@@ -20,10 +20,39 @@ export function warnBeforeFor(idleMs: number): number {
   return Math.min(IDLE_DEFAULTS.warnBeforeMs, Math.floor(idleMs / 2));
 }
 
-/** Reads the server policy and renders the warning with it. */
+/** ms until the absolute-expiry warning should show (null = no valid expiry or already past). */
+export function absoluteWarningDelay(absoluteExpiresAt: string | undefined, now: number, warnBeforeMs = IDLE_DEFAULTS.warnBeforeMs): number | null {
+  const at = absoluteExpiresAt ? Date.parse(absoluteExpiresAt) : NaN;
+  if (!Number.isFinite(at) || at <= now) return null;
+  return Math.max(0, at - warnBeforeMs - now);
+}
+
+/**
+ * Reads the server policy (identity.me → session) and renders the idle warning with it. The server's own
+ * idle clock is refreshed by background requests, so this input-idle timer is the human-inactivity signal.
+ * Also warns once before the non-extendable absolute expiry and re-checks the session when it passes.
+ */
 export function SessionIdleTimeout() {
   const { me } = useSession();
+  const toast = useToast();
+  const refresh = useRefreshSession();
   const idleMs = idleLimitMs(me?.session?.idleTimeoutSeconds);
+  const absoluteExpiresAt = me?.session?.absoluteExpiresAt;
+
+  useEffect(() => {
+    const delay = absoluteWarningDelay(absoluteExpiresAt, Date.now());
+    if (delay === null) return;
+    const warn = window.setTimeout(
+      () => toast.show({ tone: "warning", title: "Your session ends soon", description: "For security, sessions have a maximum length. Save your work; you'll need to sign in again shortly.", duration: 0 }),
+      delay,
+    );
+    const end = window.setTimeout(() => void refresh(), Math.max(0, Date.parse(absoluteExpiresAt!) - Date.now()) + 1000);
+    return () => {
+      window.clearTimeout(warn);
+      window.clearTimeout(end);
+    };
+  }, [absoluteExpiresAt, toast, refresh]);
+
   return <IdleTimeout idleMs={idleMs} warnBeforeMs={warnBeforeFor(idleMs)} />;
 }
 

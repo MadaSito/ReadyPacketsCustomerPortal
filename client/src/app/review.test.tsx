@@ -7,7 +7,7 @@ import { contrastRatio } from "@/ui/tokens";
 import { fakeAuthApi, renderUi } from "@/ui/testing";
 import RegisterPage from "@/features/auth/pages/RegisterPage";
 import { previewNavigate, splitHash } from "./AppRouter";
-import { IDLE_DEFAULTS, idleLimitMs, warnBeforeFor } from "./IdleTimeout";
+import { IDLE_DEFAULTS, absoluteWarningDelay, idleLimitMs, warnBeforeFor } from "./IdleTimeout";
 import { PublicFrame } from "./shell/PublicFrame";
 
 vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
@@ -74,6 +74,15 @@ describe("idle timeout follows server policy", () => {
     expect(idleLimitMs(5)).toBe(IDLE_DEFAULTS.idleMs);
     expect(warnBeforeFor(30 * 60_000)).toBe(120_000);
     expect(warnBeforeFor(120_000)).toBe(60_000);
+  });
+
+  it("schedules the absolute-expiry warning 2 minutes before expiry", () => {
+    const now = Date.parse("2026-11-20T12:00:00Z");
+    expect(absoluteWarningDelay("2026-11-20T12:10:00Z", now)).toBe(8 * 60_000);
+    expect(absoluteWarningDelay("2026-11-20T12:01:00Z", now)).toBe(0);
+    expect(absoluteWarningDelay("2026-11-20T11:59:00Z", now)).toBeNull();
+    expect(absoluteWarningDelay("garbage", now)).toBeNull();
+    expect(absoluteWarningDelay(undefined, now)).toBeNull();
   });
 });
 
