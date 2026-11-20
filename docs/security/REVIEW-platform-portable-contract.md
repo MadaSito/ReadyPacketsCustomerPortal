@@ -71,3 +71,11 @@ Independently inspected portable remediation `23b3aba` and platform remediation 
 
 - **C7 · Closed at `4a440d3`:** The legacy adapter now checks every converted record type and accounts for normalized record bytes and distinct object bytes before returning a package. The converted-result check runs after conversion, so it is an acceptance bound, not a bound on peak conversion memory; the envelope and source-file preflight limits still apply earlier. The independent legacy suite passed all 13 tests, including rejection for expanded history and metadata-only input.
 - **Legacy file handle · Closed at `4a440d3`:** The reader now retries short reads and closes the source descriptor before invoking legacy conversion. The same independent rerun emitted no file-descriptor collection warnings. P1 remains the only partly open original finding as of this follow-up.
+
+### Platform and bootstrap follow-up · 2026-11-20
+
+- **P1 · Closed at `fd08088`:** Upload retains staged bytes on an unclassified database error; it no longer infers rollback from a read that might race COMMIT. Post-commit deletion runs a bounded oldest-first sweep of soft-deleted images and persists a success marker. All 16 presentation tests passed, including the simulated unknown error and cleanup retry. The simulation throws in the callback; it does not inject a real lost COMMIT acknowledgement. Unknown-outcome staged objects are left private, and the sweep runs on deletes or explicit invocation, not on a verified schedule. Ensure release migrations include the purge marker and indexes before deploying.
+- **Bootstrap password file · Closed by inspection at `41c9d1c`:** The tracked command checks the opened descriptor for regular-file type, owner, group/other access, and a 1 KiB limit, preserving whitespace other than the final newline. The earlier identity test run covers provisioning, not CLI file handling. No live rollout or full fresh-install CLI run was performed.
+- **Config document compatibility · No released legacy format verified:** The platform owner reports that the dual-salt variant did not ship. The incompatibility remains relevant only if pre-release secret exports were saved for future use. No released legacy document was verified independently.
+
+All twelve original findings are closed at the reviewed commits, within the stated test and deployment limits.
