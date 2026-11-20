@@ -55,7 +55,7 @@ export default function MaintenancePage() {
         </div>
       </Card>
       {blocked ? <Callout title="Maintenance remains on" tone="warning">
-        Wait for running jobs and resolve any uncertain outcomes before reopening the queue.
+        Wait for running jobs and resolve uncertain outcomes before reopening. If an interrupted job has a retry waiting, cancel the retry and reconcile its earlier attempt.
       </Callout> : null}
       <Callout title="Scope of this status" tone="info">
         Queue drained means no running jobs or unresolved outcomes are recorded here. Confirm all other writers and remote systems have stopped before a backup or deployment that requires a full drain.

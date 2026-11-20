@@ -22,6 +22,7 @@ export const jobRuns = mysqlTable("job_runs", {
   maxAttempts: int("max_attempts", { unsigned: true }).notNull(),
   retrySafe: boolean("retry_safe").notNull().default(false),
   allowRetry: boolean("allow_retry").notNull().default(false),
+  interruptionPending: boolean("interruption_pending").notNull().default(false),
   reconciledAt: utcDateTime("reconciled_at"),
   reasonCode: varchar("reason_code", { length: 64 }),
   runAt: utcDateTime("run_at").notNull(),

@@ -29,7 +29,7 @@ type Slot = { name: string; start: Date };
 export type ActiveClaim = { job: ClaimedJob; controller: AbortController };
 
 export const JOB_TYPE = /^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$/;
-const CORRELATION = /^[A-Za-z0-9_-]{1,64}$/;
+const CORRELATION = /^[A-Za-z0-9_.:-]{1,64}$/;
 const SAFE_REASON = /^[A-Z][A-Z0-9_]{0,63}$/;
 export const LEASE_MS = 30_000;
 export const MAINTENANCE_ID = 1;
@@ -347,10 +347,15 @@ export class JobEngine implements JobQueue {
     const { deps } = this;
     const now = deps.clock.now();
     const queued = safeToRetry && row.attempt < row.maxAttempts;
-    const state = queued ? "queued" : outcome === "interrupted" ? "unknown" : outcome;
+    // A later failed/canceled attempt may not establish what happened during an
+    // earlier interrupted one. Only a definitive completion resolves it.
+    const inheritedUnknown = row.interruptionPending && (outcome === "failed" || outcome === "canceled") && !queued;
+    const state = queued ? "queued" : outcome === "interrupted" || inheritedUnknown ? "unknown" : outcome;
     const allowRetry = state === "failed" && safeToRetry;
     await tx.update(jobRuns).set({
-      state, allowRetry, reasonCode: reasonCode ?? null, leaseUntil: null, updatedAt: now,
+      state, allowRetry, reasonCode: inheritedUnknown ? "JOB_PRIOR_ATTEMPT_UNKNOWN" : reasonCode ?? null,
+      interruptionPending: queued && (row.interruptionPending || outcome === "interrupted"),
+      leaseUntil: null, updatedAt: now,
       ...(queued ? { runAt: backoff(now, row.attempt) } : {}),
       ...(state !== "queued" && !allowRetry && state !== "unknown" ? { payloadEnc: null } : {}),
     }).where(eq(jobRuns.id, row.id));
@@ -360,6 +365,7 @@ export class JobEngine implements JobQueue {
     if (outcome !== "interrupted") {
       const event = ({ completed: "job.completed", failed: "job.failed", canceled: "job.canceled", unknown: "job.unknown" })[outcome];
       await jobAudit(deps, tx, row, event, outcome, reasonCode, true, counts);
+      if (inheritedUnknown) await jobAudit(deps, tx, row, "job.unknown", "unknown", "JOB_PRIOR_ATTEMPT_UNKNOWN", true);
     } else {
       await jobAudit(deps, tx, row, state === "unknown" ? "job.unknown" : "job.failed",
         state === "unknown" ? "unknown" : "failed", reasonCode, true);

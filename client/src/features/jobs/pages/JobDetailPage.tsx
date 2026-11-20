@@ -35,11 +35,17 @@ export default function JobDetailPage() {
     setMessage(null);
     const input = { publicId: jobId };
     try {
-      if (action === "cancel") await cancel.mutateAsync(input);
-      if (action === "retry") await retry.mutateAsync(input);
-      if (action === "reconcile") await stepUp.run(() => reconcile.mutateAsync({ ...input, confirmation: "RECONCILED" }),
-        { reason: "Recording job reconciliation requires fresh verification." });
-      setMessage(action === "cancel" ? "The queued job was canceled." : action === "retry" ? "An additional attempt was queued." : "Reconciliation was recorded. The outcome remains unknown.");
+      if (action === "cancel") {
+        const result = await cancel.mutateAsync(input);
+        setMessage(result.state === "unknown" ? "The queued retry was canceled. The earlier outcome remains unknown." : "The queued job was canceled.");
+      } else if (action === "retry") {
+        await retry.mutateAsync(input);
+        setMessage("An additional attempt was queued.");
+      } else {
+        await stepUp.run(() => reconcile.mutateAsync({ ...input, confirmation: "RECONCILED" }),
+          { reason: "Recording job reconciliation requires fresh verification." });
+        setMessage("Reconciliation was recorded. The outcome remains unknown.");
+      }
       void qc.invalidateQueries(trpc.jobs.admin.pathFilter());
     } catch (failure) {
       if (failure instanceof StepUpCancelledError) return;
@@ -58,6 +64,9 @@ export default function JobDetailPage() {
     {job ? <div className="grid min-w-0 gap-5">
       {job.state === "unknown" && !job.reconciledAt ? <Callout title="Outcome unknown" tone="warning">
         Check the affected provider or system for evidence before recording reconciliation. Never replay an uncertain effect.
+      </Callout> : null}
+      {job.state === "queued" && job.interruptionPending ? <Callout title="Earlier attempt interrupted" tone="warning">
+        An idempotent retry is queued. Canceling it stops the retry but does not resolve the earlier outcome.
       </Callout> : null}
       <Card title="Summary">
         <KeyValueList columns={2} items={[

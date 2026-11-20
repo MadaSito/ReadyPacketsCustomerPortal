@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lt, lte, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
@@ -20,6 +20,7 @@ const jobView = {
   publicId: jobRuns.publicId, type: jobRuns.type, state: jobRuns.state, correlationId: jobRuns.correlationId,
   attempt: jobRuns.attempt, maxAttempts: jobRuns.maxAttempts, reasonCode: jobRuns.reasonCode,
   allowRetry: jobRuns.allowRetry, reconciledAt: jobRuns.reconciledAt, runAt: jobRuns.runAt, leaseUntil: jobRuns.leaseUntil,
+  interruptionPending: jobRuns.interruptionPending,
   scheduleName: jobRuns.scheduleName, createdAt: jobRuns.createdAt, updatedAt: jobRuns.updatedAt,
 };
 const mailView = {
@@ -43,6 +44,10 @@ function pageOf<T extends { publicId: string }>(rows: T[], limit: number) {
 
 export function createJobsAdmin(deps: ModuleDeps) {
   const { db, clock } = deps;
+  const unresolved = sql`(
+    (${jobRuns.state} = 'unknown' and ${jobRuns.reconciledAt} is null)
+     or (${jobRuns.state} = 'queued' and ${jobRuns.interruptionPending} = true)
+  )`;
   const mailer = () => {
     const implementation = mailEngineFor(deps.mailer);
     if (!implementation) throw new DomainError("UNAVAILABLE", "MAIL_ADMIN_UNAVAILABLE", "Mail administration is unavailable.");
@@ -75,8 +80,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
   async function drainCounts(executor: Tx | typeof db) {
     const [counts] = await executor.select({
       running: sql<number>`coalesce(sum(${jobRuns.state} = 'running'), 0)`.mapWith(Number),
-      unresolved: sql<number>`coalesce(sum(${jobRuns.state} = 'unknown' and ${jobRuns.reconciledAt} is null), 0)`.mapWith(Number),
-    }).from(jobRuns).where(or(eq(jobRuns.state, "running"), and(eq(jobRuns.state, "unknown"), isNull(jobRuns.reconciledAt))));
+      unresolved: sql<number>`coalesce(sum(${unresolved}), 0)`.mapWith(Number),
+    }).from(jobRuns).where(or(eq(jobRuns.state, "running"), unresolved));
     return counts ?? { running: 0, unresolved: 0 };
   }
 
@@ -144,7 +149,10 @@ export function createJobsAdmin(deps: ModuleDeps) {
         if (!row) throw notFound();
         if (row.state !== "queued") throw conflict("JOB_CANCEL_UNSAFE", "Only jobs that are waiting to run can be canceled.");
         const now = clock.now();
-        await tx.update(jobRuns).set({ state: "canceled", reasonCode: "JOB_CANCELED", payloadEnc: null, updatedAt: now })
+        const uncertain = row.interruptionPending;
+        const state = uncertain ? "unknown" : "canceled";
+        const reasonCode = uncertain ? "JOB_RETRY_CANCELED_UNCERTAIN" : "JOB_CANCELED";
+        await tx.update(jobRuns).set({ state, reasonCode, interruptionPending: false, payloadEnc: null, updatedAt: now })
           .where(eq(jobRuns.id, row.id));
         if (row.type === "jobs.mail.deliver") {
           const [mail] = await tx.select().from(mailOutbox)
@@ -156,7 +164,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
           }
         }
         await jobAudit(deps, tx, row, "job.canceled", "canceled", "JOB_CANCELED");
-        return { publicId: row.publicId, state: "canceled" as const };
+        if (uncertain) await jobAudit(deps, tx, row, "job.unknown", "unknown", reasonCode);
+        return { publicId: row.publicId, state };
       });
     },
     async retry(principal: SessionPrincipal | null, publicId: string) {
@@ -253,7 +262,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
         running: sql<number>`coalesce(sum(${jobRuns.state} = 'running'), 0)`.mapWith(Number),
         stuck: sql<number>`coalesce(sum(${jobRuns.state} = 'running' and ${jobRuns.leaseUntil} <= ${now.toISOString().slice(0, 23).replace("T", " ")}), 0)`.mapWith(Number),
         unknown: sql<number>`coalesce(sum(${jobRuns.state} = 'unknown'), 0)`.mapWith(Number),
-        unresolved: sql<number>`coalesce(sum(${jobRuns.state} = 'unknown' and ${jobRuns.reconciledAt} is null), 0)`.mapWith(Number),
+        unresolved: sql<number>`coalesce(sum(${unresolved}), 0)`.mapWith(Number),
       }).from(jobRuns).where(or(eq(jobRuns.state, "queued"), eq(jobRuns.state, "running"), eq(jobRuns.state, "unknown")));
       const [oldest] = await db.select({ readyAt: jobRuns.runAt }).from(jobRuns).where(and(eq(jobRuns.state, "queued"), lte(jobRuns.runAt, now)))
         .orderBy(asc(jobRuns.runAt)).limit(1);

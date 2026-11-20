@@ -15,7 +15,7 @@
 
 - `jobs.maintenanceBanner`: public-safe `active` boolean and fixed text only.
 - `jobs.admin.list`, `detail`, `schedules`, `listMail`, `mailDetail`, `maintenance`: full administrator plus `jobs.read`.
-- `jobs.admin.cancel`, `retry`, `resend`: full administrator plus `jobs.manage`; queued-only cancellation; retries require safe classification; unknown effects never replay automatically.
+- `jobs.admin.cancel`, `retry`, `resend`: full administrator plus `jobs.manage`; queued-only cancellation; retries require safe classification; unknown effects never replay automatically. Canceling a queued recovery retry stops the retry, not the earlier uncertainty, so that job stays `unknown`.
 - `jobs.admin.setMaintenance`, `acknowledgeUnknown`, `capture`: full administrator and fresh step-up (maintenance and mail capability gates respectively). `acknowledgeUnknown` is an operator attestation after checking the provider independently; it never changes the unknown outcome or authorizes a retry. Capture reads use POST and are audited, only in explicit non-production capture mode, and never present content as delivered.
 - No raw HTTP routes.
 
@@ -26,4 +26,4 @@
 - `jobs.mail.expire`: recurring bounded cleanup of expired encrypted outbox data and development captures. Sensitive payloads default to 30 minutes, other messages to 24 hours; a caller can supply the authoritative expiry up to 72 hours. Captures are readable for at most 15 minutes, and already expired data cannot be read or sent. Physical cleanup is deferred while workers are unavailable or maintenance is active.
 - `jobs.queue` and `jobs.mail`: queue depth/oldest/stuck/unknown health and mail hold/unknown health.
 - Audit namespace: `job.enqueued`, `job.claimed`, `job.completed`, `job.failed`, `job.canceled`, `job.unknown`, `job.retry.queued`, `job.lease.expired`, `job.maintenance.changed`, `job.mail.*`. Events use `category: job` and no payload, recipient or rendered content.
-- The durable maintenance gate is serialized with worker claims and scheduling across processes. Queue `queue_drained` describes this queue only; it is not proof that unregistered web writers, native processes, or external provider work have stopped. Keep maintenance on while claims run or have unknown outcomes that await reconciliation.
+- The durable maintenance gate is serialized with worker claims and scheduling across processes. Queue `queue_drained` describes this queue only; it is not proof that unregistered web writers, native processes, or external provider work have stopped. Keep maintenance on while claims run or have unknown outcomes that await reconciliation, including earlier attempts whose retry is queued.

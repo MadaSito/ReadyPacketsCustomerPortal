@@ -132,6 +132,35 @@ describe("MySQL durable job leases", () => {
     expect(await f.admin.detail(f.operator, a.jobId)).toMatchObject({ state: "unknown", reconciledAt: expect.any(Date) });
   });
 
+  it("preserves uncertainty when an interrupted retry-safe job is canceled or fails after retry", async () => {
+    const f = fixture();
+    f.jobs.register("test.safe", async () => ({ outcome: "failed", retryable: false, reasonCode: "NEW_ATTEMPT_REJECTED" }), { retrySafe: true });
+    const { jobId: canceled } = await f.jobs.enqueue("test.safe", "cancel");
+    const { jobId: failed } = await f.jobs.enqueue("test.safe", "fail");
+    await f.engine.claim();
+    await f.engine.claim();
+    f.h.clock.advance(LEASE_MS + 1);
+    expect(await f.engine.reap()).toBe(2);
+    await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
+    expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 2 });
+    expect(await f.admin.cancel(f.operator, canceled)).toMatchObject({ state: "unknown" });
+    expect(await f.admin.detail(f.operator, canceled)).toMatchObject({ reasonCode: "JOB_RETRY_CANCELED_UNCERTAIN" });
+    await f.admin.cancel(f.operator, failed);
+    await f.admin.acknowledgeUnknown(f.operator, canceled);
+    await f.admin.acknowledgeUnknown(f.operator, failed);
+    await f.admin.setMaintenance(f.operator, { active: false, expectedActive: true });
+    const { jobId } = await f.jobs.enqueue("test.safe", "fails after interruption");
+    await f.engine.claim();
+    f.h.clock.advance(LEASE_MS + 2_000);
+    await f.engine.reap();
+    f.h.clock.advance(2_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({
+      state: "unknown", reasonCode: "JOB_PRIOR_ATTEMPT_UNKNOWN",
+      attempts: [{ state: "failed", reasonCode: "NEW_ATTEMPT_REJECTED" }, { state: "interrupted" }],
+    });
+  });
+
   it("does not persist a privilege-sensitive mutation when durable audit is unavailable", async () => {
     const f = fixture();
     f.jobs.register("test.one", done);

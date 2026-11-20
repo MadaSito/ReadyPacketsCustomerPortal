@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | MySQL durable claims and audit | `jobs.test.ts`: concurrent independent claimers see one claim; attempt and audit transitions; genuine durable emitter writes and rolls back with caller transaction. | automated-test |
 | Leases, fencing and worker origin | `jobs.test.ts`: live heartbeat, expired lease, new fencing token, stale same-transaction durable write refused, worker correlation propagated; late SMTP completion cannot publish over an expired fence. | automated-test |
-| Retry safe/unsafe distinction, drain, unknown | `jobs.test.ts`: explicit retry-safe claim backs off and reclaims; interrupted default jobs go unknown; maintenance blocks claims and reopening while outcomes are unknown; acknowledgement does not enable retry. | automated-test |
+| Retry safe/unsafe distinction, drain, unknown | `jobs.test.ts`: explicit retry-safe claim backs off and reclaims; interrupted default jobs go unknown; maintenance blocks claims and reopening while outcomes are unknown; canceling or failing a later recovery attempt cannot hide earlier uncertainty; acknowledgement does not enable retry. | automated-test |
 | Graceful shutdown | `jobs.test.ts`: cooperative work joins; intentionally non-cooperative handler receives signal, becomes unknown and stop rejects. | automated-test |
 | Scheduler | `jobs.test.ts`: independent schedulers enqueue one slot and skip all missed slots after pause. | automated-test |
 | Enqueue scope and transactions | `jobs.test.ts`: concurrent duplicate enqueue, per-type idempotency, caller transaction rollback and fail-closed audit. | automated-test |
