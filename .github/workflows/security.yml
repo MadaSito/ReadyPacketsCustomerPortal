@@ -41,10 +41,27 @@ jobs:
       - uses: github/codeql-action/analyze@v4 # TODO(pin)
         with:
           category: /language:javascript-typescript
+          output: ${{ runner.temp }}/codeql-sarif
+          # GitHub code scanning accepts uploads only where it is enabled (public repositories, or private
+          # ones with GitHub Code Security). Set the repository variable CODE_SCANNING_ENABLED=true there.
+          # Otherwise the analysis still runs and the two steps below keep and gate the results.
+          upload: ${{ vars.CODE_SCANNING_ENABLED == 'true' && 'always' || 'never' }}
+      - name: Gate on high and critical findings (security-severity >= 7.0)
+        run: node scripts/ci/sarif-gate.mjs "$RUNNER_TEMP/codeql-sarif" 7.0
+      - uses: actions/upload-artifact@v7 # TODO(pin)
+        if: always()
+        with:
+          name: codeql-sarif
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: warn
+          retention-days: 30
 
   dependency-review:
     name: Dependency review
-    if: github.event_name == 'pull_request'
+    # The dependency review API needs the dependency graph: available on public repositories, and on
+    # private ones only with GitHub Code Security. Set the repository variable CODE_SCANNING_ENABLED=true
+    # where it is available; `pnpm audit` below covers known-vulnerable packages in every case.
+    if: github.event_name == 'pull_request' && vars.CODE_SCANNING_ENABLED == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
