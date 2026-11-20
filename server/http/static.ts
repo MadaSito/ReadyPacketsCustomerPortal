@@ -4,7 +4,6 @@ import { basename, dirname, extname, relative, resolve, sep } from "node:path";
 import express, { type Express } from "express";
 import { getHttpState } from "./requestState.js";
 import { isNavigation } from "./edge.js";
-import type { PreviewProfile } from "./previewProfile.js";
 
 const HASHED_ASSET = /^(?:.+\/)?assets\/[^/]+-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/i;
 const NEVER_SPA = /^\/(?:api|assets|brand|fonts|healthz|readyz|\.well-known)(?:\/|$)/i;
@@ -31,7 +30,7 @@ export function assertSeparateStorage(staticDir: string, storageDir: string): vo
   }
 }
 
-export function registerStatic(app: Express, staticDir: string, preview: PreviewProfile, publicPaths: ReadonlySet<string>): void {
+export function registerStatic(app: Express, staticDir: string, publicPaths: ReadonlySet<string>): void {
   const root = resolve(staticDir);
   const serve = express.static(root, {
     cacheControl: false,
@@ -75,10 +74,7 @@ export function registerStatic(app: Express, staticDir: string, preview: Preview
     }
     const { cspNonce, session } = getHttpState(req);
     if (!session && publicPaths.has(req.path)) res.removeHeader("X-Robots-Tag");
-    const relativeAssets = /\b(src|href)=(["'])\.\/((?:assets\/|brand\/|fonts\/|favicon\.|manifest\.)[^"'<>]+)\2/g;
-    // Vite's relative base supports preview deployment under a proxy prefix. Real
-    // path-routed installs anchor the approved shell assets at the canonical root.
-    if (!preview) html = html.replace(relativeAssets, "$1=$2/$3$2");
+    // The standard Vite build already anchors its own assets at the site root.
     html = html.replaceAll("__CSP_NONCE__", cspNonce);
     res.setHeader("Cache-Control", session ? "no-store" : "no-cache");
     res.type("html").send(html);

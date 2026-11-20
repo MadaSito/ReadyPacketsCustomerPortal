@@ -57,6 +57,7 @@ const CATEGORY_PRIORITY: Record<RateLimitCategory, number> = {
 };
 const METHOD_LABELS = new Set(["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"]);
 const WEBHOOK_LIMIT = 256 * 1024;
+const ANALYTICS_CSP_PATHS = new Set(["/privacy", "/terms"]);
 
 function hasCanonicalOrigin(req: Request, origin: string, allowMissingOrigin = false): boolean {
   const site = req.get("Sec-Fetch-Site");
@@ -177,7 +178,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     const nonce = newCspNonce();
     nonceByRequest.set(req, nonce);
     applySecurityHeaders(res, nonce, {
-      https: canonical.protocol === "https:" && (canonicalHost || alias) || req.secure,
+      https: (canonicalHost || alias) && (canonical.protocol === "https:" || req.secure),
       preview,
       noStore: API_PATH.test(req.path) || !accepted || req.path === "/healthz" || req.path === "/readyz",
     });
@@ -328,7 +329,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   if (options.staticDir) {
     app.use(async (req, res, next) => {
       const { session, cspNonce } = getHttpState(req);
-      if (!session && isNavigation(req)) {
+      if (!session && ANALYTICS_CSP_PATHS.has(req.path) && isNavigation(req)) {
         const integrations = services.integrations as (typeof services.integrations & {
           analyticsCsp?: (path: string) => Promise<AnalyticsCspPolicy | null>;
         }) | undefined;
@@ -341,7 +342,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       }
       next();
     });
-    registerStatic(app, options.staticDir, preview, publicPaths);
+    registerStatic(app, options.staticDir, publicPaths);
   }
   app.use(() => { throw notFound(); });
 
