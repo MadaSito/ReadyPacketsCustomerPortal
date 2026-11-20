@@ -64,6 +64,18 @@ export function sessionHeaders(): Record<string, string> {
   return headers;
 }
 
+/** Clears only memory-backed preview credentials and invalidates all earlier transport responses. */
+export function clearPreviewCredentials(): void {
+  if (!RUNTIME.preview) return;
+  const changed = previewSession !== null;
+  previewSession = null;
+  previewCsrf = null;
+  bootstrap = null;
+  lastBootstrap = 0;
+  revision++;
+  if (changed) listeners.forEach((listener) => listener());
+}
+
 function applyPreviewResponse(response: Response, sentRevision: number): void {
   if (!RUNTIME.preview || sentRevision !== revision) return;
   const nextSession = response.headers.get(HEADER_PREVIEW_SESSION_SET);
@@ -86,44 +98,58 @@ async function ensureCsrf(): Promise<void> {
     const sentRevision = revision;
     const headers = new Headers();
     if (RUNTIME.preview && previewSession) headers.set(HEADER_PREVIEW_SESSION, previewSession);
-    bootstrap = fetch(apiUrl("/api/csrf"), {
+    const pending = fetch(apiUrl("/api/csrf"), {
       headers, credentials: RUNTIME.preview ? "omit" : "same-origin", redirect: "error", cache: "no-store",
     }).then((response) => {
-      if (!response.ok) throw new Error("Your security token could not be initialized. Please try again.");
+      if (!response.ok || (RUNTIME.preview && sentRevision !== revision)) {
+        throw new Error("Your security token could not be initialized. Please try again.");
+      }
       applyPreviewResponse(response, sentRevision);
       if (!csrfToken()) throw new Error("Your security token could not be initialized. Please check your browser settings.");
       lastBootstrap = Date.now();
-    }).finally(() => { bootstrap = null; });
+    }).finally(() => { if (bootstrap === pending) bootstrap = null; });
+    bootstrap = pending;
   }
   await bootstrap;
 }
 
-function assertApiDestination(input: RequestInfo | URL): void {
+function assertApiDestination(input: RequestInfo | URL): URL {
   const actual = new URL(input instanceof Request ? input.url : input.toString(), document.baseURI);
   const api = new URL(apiUrl("/api"), document.baseURI);
   if (actual.origin !== api.origin || !(actual.pathname === api.pathname || actual.pathname.startsWith(`${api.pathname}/`))) {
     throw new Error("Authenticated requests must target the portal API.");
   }
+  return actual;
+}
+
+function isIdentitySignOut(target: URL): boolean {
+  const prefix = new URL(apiUrl("/api/trpc/"), document.baseURI).pathname;
+  return target.pathname.startsWith(prefix) &&
+    target.pathname.slice(prefix.length).split(/,|%2C/i).includes("identity.signOut");
 }
 
 /** fetch wrapper used by tRPC and by feature code for raw endpoints (multipart upload, blob download). */
 export const sessionFetch: typeof fetch = async (input, init) => {
-  assertApiDestination(input);
+  const target = assertApiDestination(input);
   const original = input instanceof Request ? input : undefined;
   const method = (init?.method ?? original?.method ?? "GET").toUpperCase();
   const unsafe = !SAFE_METHODS.has(method);
-  if (unsafe) await ensureCsrf();
+  const previewSignOut = RUNTIME.preview && method === "POST" && isIdentitySignOut(target);
+  // The session already carries its bound CSRF token. Do not wait for a bootstrap
+  // when signing out: even a stalled or unavailable API must not retain local auth.
+  if (unsafe && !previewSignOut) await ensureCsrf();
   const headers = new Headers(init?.headers ?? original?.headers);
   headers.delete(HEADER_CSRF);
   headers.delete(HEADER_PREVIEW_SESSION);
   for (const [key, value] of Object.entries(sessionHeaders())) headers.set(key, value);
   if (!unsafe) headers.delete(HEADER_CSRF);
   const sentRevision = revision;
+  if (previewSignOut) clearPreviewCredentials();
   const response = await fetch(input, {
     ...init, headers, credentials: RUNTIME.preview ? "omit" : "same-origin", redirect: "error",
   });
   applyPreviewResponse(response, sentRevision);
   // No automatic mutation retry: a network/authorization error is not proof of no effects.
-  if (unsafe && (response.status === 403 || response.status === 401)) lastBootstrap = 0;
+  if (unsafe && sentRevision === revision && (response.status === 403 || response.status === 401)) lastBootstrap = 0;
   return response;
 };
