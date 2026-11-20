@@ -24,6 +24,8 @@ import type { Services } from "../../server/container.js";
 import { DomainError } from "../../server/core/errors.js";
 import type { SessionPrincipal } from "../../server/core/types.js";
 import { seedOrdersDemo } from "../../server/modules/orders/demoSeed.js";
+import { toImportInput } from "./catalog-import.js";
+import { loadOfferings, OfferingsFileError } from "./catalog/offerings.js";
 import { readSecretFile } from "./lib/secretFile.js";
 
 /* ------------------------------------------------------------------ fixtures */
@@ -37,13 +39,18 @@ export const DEMO_ACCOUNTS: readonly { key: DemoAccountKey; email: string; name:
   { key: "customerB", email: "demo.customer.b@example.com", name: "Blake Example (synthetic customer)", role: "customer" },
 ];
 
-/** Target workflow path per demo order; the seeder walks the service-offered transitions towards it. */
-const DEMO_ORDERS: readonly { key: string; owner: "customerA" | "customerB"; projectName: string; path: readonly string[]; productIndex: number }[] = [
-  { key: "a1", owner: "customerA", projectName: "Demo: Riverside Clinic Packet (synthetic)", path: ["submitted"], productIndex: 0 },
-  { key: "a2", owner: "customerA", projectName: "Demo: Harbor Street Permit Set (synthetic)", path: ["submitted", "in_review"], productIndex: 1 },
-  { key: "a3", owner: "customerA", projectName: "Demo: Maple Court Renewal (synthetic)", path: ["submitted", "in_review", "awaiting_customer"], productIndex: 0 },
-  { key: "a4", owner: "customerA", projectName: "Demo: Oak Lane Annual Filing (synthetic)", path: ["submitted", "in_review", "in_progress", "delivered", "completed"], productIndex: 2 },
-  { key: "b1", owner: "customerB", projectName: "Demo: Summit Plaza Packet (synthetic)", path: ["submitted", "in_review", "in_progress"], productIndex: 1 },
+/**
+ * Target workflow path per demo order; the seeder walks the service-offered transitions towards it.
+ * `productKeys` name packet products of the offerings file; `fallbackIndex` picks a synthetic demo product when
+ * the offerings file is not available. The selections cover the documented production-webhook patterns:
+ * one packet (packet N / its tier), several packets (packet 7 / Mixed) and all six packets (bundle discount).
+ */
+const DEMO_ORDERS: readonly { key: string; owner: "customerA" | "customerB"; projectName: string; path: readonly string[]; productKeys: readonly string[]; fallbackIndex: number }[] = [
+  { key: "a1", owner: "customerA", projectName: "Demo: Smart Valve Invention (synthetic)", path: ["submitted"], productKeys: ["packet-1-premium"], fallbackIndex: 0 },
+  { key: "a2", owner: "customerA", projectName: "Demo: Harbor Street Studio Launch (synthetic)", path: ["submitted", "in_review"], productKeys: ["packet-1-premium", "packet-2-basic"], fallbackIndex: 1 },
+  { key: "a3", owner: "customerA", projectName: "Demo: Maple Court Funding Plan (synthetic)", path: ["submitted", "in_review", "awaiting_customer"], productKeys: ["packet-3-standard"], fallbackIndex: 0 },
+  { key: "a4", owner: "customerA", projectName: "Demo: Oak Lane Full Build (synthetic)", path: ["submitted", "in_review", "in_progress", "delivered", "completed"], productKeys: ["packet-1-basic", "packet-2-basic", "packet-3-basic", "packet-4-basic", "packet-5-basic", "packet-6-basic"], fallbackIndex: 2 },
+  { key: "b1", owner: "customerB", projectName: "Demo: Summit Plaza Operations (synthetic)", path: ["submitted", "in_review", "in_progress"], productKeys: ["packet-4-standard", "packet-6-basic"], fallbackIndex: 1 },
 ];
 
 const DEMO_TICKET_SUBJECT = "Demo: question about my synthetic packet";
@@ -174,11 +181,34 @@ export async function runDemoSeed(services: Services, config: AppConfig, options
 
   try {
     /* ---- 3. catalog ---- */
-    let products: string[] = [];
+    // Preferred: the owner's offerings file, loaded through the same audited upsert as `ops:catalog-import`.
+    // The catalog is product data, not personal data; customers, orders and messages stay synthetic.
+    // Fallback (file missing or invalid): the clearly synthetic demo products.
+    const products: string[] = [];
+    const productsByKey = new Map<string, string>();
     await step("orders.catalog", async () => {
-      const seeded = await seedOrdersDemo(services.orders, await as("admin"));
-      if (seeded.seeded) result.changed.push(`catalog (${seeded.productPublicIds.length} demo products)`);
-      products = (await services.orders.catalog.listActive()).flatMap((group) => group.products.filter((p) => p.active).map((p) => p.publicId));
+      let imported = false;
+      try {
+        const offerings = await loadOfferings();
+        const outcome = await services.orders.catalog.upsertFromOfferings(await as("admin"), toImportInput(offerings), { dryRun: false });
+        imported = true;
+        const touched = outcome.groups.created + outcome.groups.updated + outcome.products.created + outcome.products.versioned;
+        if (touched > 0 || outcome.bundleRule === "created" || outcome.bundleRule === "updated")
+          result.changed.push(`catalog (offerings matrix ${offerings.matrixVersion}: ${outcome.products.created} products added, ${outcome.products.versioned} re-versioned)`);
+      } catch (error) {
+        const missingFile = error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+        if (!(error instanceof OfferingsFileError) && !missingFile) throw error;
+        log.warn("demo seed: offerings file unavailable, using synthetic demo products", { event: "ops.demo_seed.offerings_unavailable" });
+      }
+      if (!imported) {
+        const seeded = await seedOrdersDemo(services.orders, await as("admin"));
+        if (seeded.seeded) result.changed.push(`catalog (${seeded.productPublicIds.length} demo products)`);
+      }
+      for (const group of await services.orders.catalog.listActive())
+        for (const product of group.products.filter((p) => p.active)) {
+          products.push(product.publicId);
+          productsByKey.set(product.productKey, product.publicId);
+        }
     });
 
     /* ---- 4. policy (published, required) + acceptance by each customer ---- */
@@ -216,12 +246,17 @@ export async function runDemoSeed(services: Services, config: AppConfig, options
     if (products.length === 0) {
       skip("orders", "no active catalog products");
     } else {
+      const demoItems = (spec: (typeof DEMO_ORDERS)[number]) => {
+        const packetIds = spec.productKeys.map((key) => productsByKey.get(key));
+        if (packetIds.every((id): id is string => id !== undefined)) return packetIds.map((productPublicId) => ({ productPublicId, quantity: 1 }));
+        return [{ productPublicId: products[spec.fallbackIndex % products.length]!, quantity: 1 }];
+      };
       for (const spec of DEMO_ORDERS) {
         await step(`orders.${spec.key}`, async () => {
           const customer = await as(spec.owner);
           const created = await services.orders.orders.create(customer, {
             projectName: spec.projectName,
-            items: [{ productPublicId: products[spec.productIndex % products.length]!, quantity: 1 }],
+            items: demoItems(spec),
             note: "Synthetic demo order created by the demo seeder.",
             idempotencyKey: SEED_KEY(`order_${spec.key}`),
           });
