@@ -1,0 +1,347 @@
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Route } from "wouter";
+import type * as trpcModule from "@/lib/trpc";
+import { expectNoAxeViolations, renderUi } from "@/ui/testing";
+import AdminCatalogPage, { parseAmountToMinor } from "./pages/AdminCatalogPage";
+import AdminOrdersPage from "./pages/AdminOrdersPage";
+import AdminWorkflowsPage from "./pages/AdminWorkflowsPage";
+import NewOrderPage from "./pages/NewOrderPage";
+import OrderDetailPage from "./pages/OrderDetailPage";
+import AdminOrderDetailPage from "./pages/AdminOrderDetailPage";
+import OrdersListPage from "./pages/OrdersListPage";
+import RecentOrdersWidget from "./RecentOrdersWidget";
+import { newIdempotencyKey } from "./shared";
+
+/** Generic fake of the tRPC/TanStack proxy: every procedure path resolves through `handlers`. */
+const { handlers, calls, session } = vi.hoisted(() => ({
+  handlers: new Map<string, (input: unknown) => unknown>(),
+  calls: [] as { path: string; input: unknown }[],
+  session: { role: "customer" as string },
+}));
+
+function proxy(path: string[]): unknown {
+  const key = path.join(".");
+  const run = async (input: unknown) => {
+    calls.push({ path: key, input });
+    const handler = handlers.get(key);
+    if (!handler) throw new Error(`no handler for ${key}`);
+    return handler(input);
+  };
+  const api = {
+    queryOptions: (input: unknown, opts: Record<string, unknown> = {}) => ({ queryKey: [key, input], queryFn: () => run(input), ...opts }),
+    infiniteQueryOptions: (input: unknown, opts: Record<string, unknown> = {}) => ({
+      queryKey: [key, input, "infinite"],
+      queryFn: ({ pageParam }: { pageParam: unknown }) => run({ ...(input as object), cursor: pageParam ?? undefined }),
+      initialPageParam: null,
+      ...opts,
+    }),
+    mutationOptions: (opts: Record<string, unknown> = {}) => ({ mutationFn: run, ...opts }),
+    queryKey: (input?: unknown) => [key, input],
+    pathKey: () => [key],
+  };
+  return new Proxy(api, { get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : proxy([...path, prop])) });
+}
+
+vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
+vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
+vi.mock("@/app/registry", () => ({
+  ORDER_TABS: [
+    { key: "files", label: "Files", access: "customer", order: 30, component: ({ orderId, area }: { orderId: string; area: string }) => <p>Files tab for {orderId} in {area}</p> },
+    { key: "invoices_admin", label: "Billing (staff)", access: "staff", order: 40, component: () => <p>staff only tab</p> },
+  ],
+}));
+
+const ORDER_ID = "01JTESTORDER0000000000000A";
+const now = new Date("2026-11-20T09:00:00.000Z");
+const listItem = {
+  publicId: ORDER_ID,
+  reference: "RP-2026-000001",
+  projectName: "Synthetic project",
+  statusKey: "submitted",
+  statusLabel: "Submitted",
+  statusTone: "info",
+  lockState: "none",
+  totalMinor: 2500,
+  currency: "USD",
+  accessRole: "owner",
+  createdAt: now,
+  updatedAt: now,
+};
+const detail = {
+  ...listItem,
+  statusKind: "initial",
+  origin: "portal",
+  version: 3,
+  canWrite: true,
+  canShare: true,
+  ownerPublicId: "01JTESTUSER00000000000000A",
+  submittedAt: now,
+  lineItems: [{ publicId: "01JTESTLINE00000000000000A", productPublicId: null, productVersion: 1, name: "Synthetic item", description: "Demo", features: [], unitPriceMinor: 1250, currency: "USD", quantity: 2, lineTotalMinor: 2500 }],
+  notes: [{ publicId: "01JTESTNOTE00000000000000A", visibility: "customer", authorRole: "customer", mine: true, body: "Customer note", createdAt: now }],
+  history: [{ publicId: "01JTESTHIST00000000000000A", fromLabel: null, toLabel: "Submitted", toStatus: "submitted", actorRole: "customer", reasonCode: "CREATED", hasNote: false, occurredAt: now }],
+  transitions: [{ to: "canceled", label: "Canceled", requiresNote: true }],
+};
+const catalog = [
+  {
+    publicId: "01JTESTGROUP000000000000A",
+    name: "Synthetic group",
+    description: "",
+    sortOrder: 0,
+    active: true,
+    rowVersion: 1,
+    products: [
+      { publicId: "01JTESTPROD000000000000A1", productKey: "synthetic-a", groupPublicId: "01JTESTGROUP000000000000A", name: "Synthetic A", description: "First", features: ["One"], priceMinor: 1000, currency: "USD", versionNumber: 1, versionPublicId: "x", sortOrder: 0, active: true, rowVersion: 1 },
+      { publicId: "01JTESTPROD000000000000A2", productKey: "synthetic-b", groupPublicId: "01JTESTGROUP000000000000A", name: "Synthetic B", description: "", features: [], priceMinor: 500, currency: "USD", versionNumber: 2, versionPublicId: "y", sortOrder: 1, active: true, rowVersion: 1 },
+    ],
+  },
+];
+
+beforeEach(() => {
+  handlers.clear();
+  calls.length = 0;
+  session.role = "customer";
+  handlers.set("orders.sharing.myInvitations", () => []);
+});
+
+describe("customer order list", () => {
+  it("renders orders with status badges and no axe violations", async () => {
+    handlers.set("orders.list", () => ({ items: [listItem], nextCursor: null }));
+    const { container } = renderUi(<OrdersListPage />, { path: "/orders" });
+    expect((await screen.findAllByRole("link", { name: "Synthetic project" }))[0]).toHaveAttribute("href", "/orders/" + ORDER_ID);
+    expect(screen.getAllByText("Submitted").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    await expectNoAxeViolations(container);
+  });
+
+  it("shows a guiding empty state and pending invitations that can be accepted", async () => {
+    handlers.set("orders.list", () => ({ items: [], nextCursor: null }));
+    handlers.set("orders.sharing.myInvitations", () => [{ publicId: "01JTESTGRANT0000000000000A", role: "viewer", orderReference: "RP-2026-000009", projectName: "Shared synthetic", expiresAt: now, createdAt: now }]);
+    handlers.set("orders.sharing.respond", () => ({ status: "active" }));
+    const { container } = renderUi(<OrdersListPage />, { path: "/orders" });
+    expect(await screen.findByText("No orders yet")).toBeInTheDocument();
+    await screen.findByText("Shared synthetic");
+    await expectNoAxeViolations(container);
+    await userEvent.setup().click(screen.getByRole("button", { name: /Accept invitation to Shared synthetic/ }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.sharing.respond")?.input).toEqual({ grantId: "01JTESTGRANT0000000000000A", accept: true }));
+  });
+
+  it("shows an error state when the list fails", async () => {
+    handlers.set("orders.list", () => {
+      throw new Error("boom");
+    });
+    renderUi(<OrdersListPage />, { path: "/orders" });
+    expect(await screen.findByRole("button", { name: /try again|retry/i })).toBeInTheDocument();
+  });
+});
+
+describe("new order wizard", () => {
+  it("walks choose → details → review, keeps data on Back, and submits once with an idempotency key", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));
+    const user = userEvent.setup();
+    const { container, location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByText("Synthetic A");
+    await expectNoAxeViolations(container);
+    expect(screen.getByText(/Step 1 of 3: Choose items/).closest("li")).toHaveAttribute("aria-current", "step");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByText("Choose at least one item to continue.")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Details" })).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByText("Enter a project name.")).toBeInTheDocument();
+    await user.type(screen.getByLabelText(/Project name/), "My synthetic project");
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByLabelText("Quantity of Synthetic A")).toHaveValue(2);
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByLabelText(/Project name/)).toHaveValue("My synthetic project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const create = calls.filter((c) => c.path === "orders.create");
+    expect(create).toHaveLength(1);
+    expect(create[0]!.input).toMatchObject({ projectName: "My synthetic project", items: [{ productPublicId: catalog[0]!.products[0]!.publicId, quantity: 2 }] });
+    expect((create[0]!.input as { idempotencyKey: string }).idempotencyKey).toMatch(/^[A-Za-z0-9_-]{16,80}$/);
+  });
+
+  it("explains an empty catalog instead of showing a broken form", async () => {
+    handlers.set("orders.catalog.list", () => []);
+    const { container } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    expect(await screen.findByText("Nothing is available to order yet")).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe("order detail host", () => {
+  const renderDetail = (path: string) =>
+    renderUi(
+      <>
+        <Route path="/orders/:orderId">
+          <OrderDetailPage />
+        </Route>
+        <Route path="/orders/:orderId/:tab">
+          <OrderDetailPage />
+        </Route>
+      </>,
+      { path },
+    );
+
+  it("renders overview, registered customer tabs only, and no axe violations", async () => {
+    handlers.set("orders.get", () => detail);
+    const { container } = renderDetail(`/orders/${ORDER_ID}`);
+    expect(await screen.findByRole("heading", { level: 1, name: "Synthetic project" })).toBeInTheDocument();
+    const tabs = screen.getByRole("tablist", { name: "Order sections" });
+    expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Overview", "Activity", "Sharing", "Files"]);
+    expect(screen.getAllByText("Synthetic item").length).toBeGreaterThan(0);
+    await expectNoAxeViolations(container);
+  });
+
+  it("opens a contributed tab from the URL and passes orderId + area", async () => {
+    handlers.set("orders.get", () => detail);
+    renderDetail(`/orders/${ORDER_ID}/files`);
+    expect(await screen.findByText(`Files tab for ${ORDER_ID} in customer`)).toBeInTheDocument();
+  });
+
+  it("transition requiring a note refuses to submit without one", async () => {
+    handlers.set("orders.get", () => detail);
+    handlers.set("orders.transition", () => ({ version: 4 }));
+    const user = userEvent.setup();
+    renderDetail(`/orders/${ORDER_ID}`);
+    await user.click(await screen.findByRole("button", { name: "Canceled" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Confirm" }));
+    expect(await within(dialog).findByText("A note is required for this change.")).toBeInTheDocument();
+    expect(calls.some((c) => c.path === "orders.transition")).toBe(false);
+    await expectNoAxeViolations(dialog);
+  });
+
+  it("unknown or forbidden orders show one indistinguishable error page", async () => {
+    handlers.set("orders.get", () => {
+      throw new Error("NOT_FOUND");
+    });
+    renderDetail(`/orders/${ORDER_ID}`);
+    expect(await screen.findByRole("heading", { level: 1, name: "Order unavailable" })).toBeInTheDocument();
+  });
+
+  it("sharing tab lists grants and invites with a uniform response", async () => {
+    handlers.set("orders.get", () => detail);
+    handlers.set("orders.sharing.list", () => [{ publicId: "01JTESTGRANT0000000000000B", email: "friend@example.test", role: "viewer", status: "active", acceptedAt: now, endedAt: null, endReasonCode: null, createdAt: now }]);
+    handlers.set("orders.sharing.invite", () => ({ status: "pending" }));
+    const user = userEvent.setup();
+    const { container } = renderDetail(`/orders/${ORDER_ID}/sharing`);
+    expect(await screen.findAllByText("friend@example.test")).not.toHaveLength(0);
+    await expectNoAxeViolations(container);
+    await user.type(screen.getByLabelText(/E-mail address/), "not-an-email");
+    await user.click(screen.getByRole("button", { name: "Send invitation" }));
+    expect(await screen.findByText("Enter a valid e-mail address.")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText(/E-mail address/));
+    await user.type(screen.getByLabelText(/E-mail address/), "someone@example.test");
+    await user.click(screen.getByRole("button", { name: "Send invitation" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.sharing.invite")?.input).toEqual({ orderId: ORDER_ID, email: "someone@example.test", role: "viewer" }));
+  });
+});
+
+describe("console", () => {
+  it("admin order list renders filters and rows without axe violations", async () => {
+    session.role = "staff";
+    handlers.set("orders.admin.list", () => ({ items: [{ ...listItem, ownerName: "Synthetic Customer" }], nextCursor: null }));
+    const { container } = renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
+    expect((await screen.findAllByRole("link", { name: "RP-2026-000001" }))[0]).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);
+    await expectNoAxeViolations(container);
+  });
+
+  it("console detail shows staff tabs and admin actions; reassignment requires typing the reference", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions: [] }));
+    handlers.set("orders.admin.referenceHistory", () => [{ reference: "RP-2026-000001", status: "active", reasonCode: "CREATED", assignedAt: now, retiredAt: null }]);
+    const user = userEvent.setup();
+    const { container } = renderUi(
+      <Route path="/admin/orders/:orderId">
+        <AdminOrderDetailPage />
+      </Route>,
+      { path: `/admin/orders/${ORDER_ID}` },
+    );
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    expect(within(screen.getByRole("tablist")).getByRole("tab", { name: "Billing (staff)" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Reassign to another customer" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeDisabled();
+    await user.type(within(dialog).getByLabelText("Type RP-2026-000001 to confirm"), "RP-2026-000001");
+    expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeEnabled();
+    await expectNoAxeViolations(dialog);
+  });
+
+  it("catalog page explains the empty catalog (no built-in products) without axe violations", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.catalog.list", () => []);
+    const { container } = renderUi(<AdminCatalogPage />, { path: "/admin/catalog" });
+    expect(await screen.findByText("The catalog is empty")).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+
+  it("catalog page lists products and validates price input before saving", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.catalog.list", () => catalog);
+    const user = userEvent.setup();
+    const { container } = renderUi(<AdminCatalogPage />, { path: "/admin/catalog" });
+    expect(await screen.findAllByText("Synthetic A")).not.toHaveLength(0);
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: /Add product to Synthetic group/ }));
+    const dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText(/Product key/), "synthetic-c");
+    await user.type(within(dialog).getByLabelText(/^Name/), "Synthetic C");
+    await user.type(within(dialog).getByLabelText(/^Price/), "12.345");
+    await user.click(within(dialog).getByRole("button", { name: "Save product" }));
+    expect(await within(dialog).findByText("Enter a price such as 125 or 125.50.")).toBeInTheDocument();
+    expect(calls.some((c) => c.path === "orders.admin.catalog.createProduct")).toBe(false);
+  });
+
+  it("workflows page renders states and transitions without axe violations", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.workflows.list", () => [
+      {
+        publicId: "01JTESTWF0000000000000000A",
+        workflowKey: "standard",
+        name: "Standard",
+        isDefault: true,
+        rowVersion: 1,
+        versionNumber: 1,
+        definition: {
+          states: [
+            { key: "submitted", label: "Submitted", customerLabel: "Submitted", kind: "initial", tone: "info" },
+            { key: "completed", label: "Completed", customerLabel: "Completed", kind: "terminal", tone: "success" },
+          ],
+          transitions: [{ from: "submitted", to: "completed", allowedBy: ["staff"], notifyCustomer: true, requiresNote: false }],
+        },
+      },
+    ]);
+    const { container } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    expect((await screen.findAllByText("submitted → completed")).length).toBeGreaterThan(0);
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe("dashboard widget and helpers", () => {
+  it("recent orders widget renders without axe violations", async () => {
+    handlers.set("orders.list", () => ({ items: [listItem], nextCursor: null }));
+    const { container } = renderUi(<RecentOrdersWidget />);
+    expect(await screen.findByRole("link", { name: "Synthetic project" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+
+  it("money parsing is exact and idempotency keys are random and well-formed", () => {
+    expect(parseAmountToMinor("125")).toBe(12500);
+    expect(parseAmountToMinor("125.5")).toBe(12550);
+    expect(parseAmountToMinor("0.07")).toBe(7);
+    expect(parseAmountToMinor("1.005")).toBeNull();
+    expect(parseAmountToMinor("-1")).toBeNull();
+    const a = newIdempotencyKey();
+    expect(a).toMatch(/^[A-Za-z0-9_-]{16,80}$/);
+    expect(newIdempotencyKey()).not.toBe(a);
+  });
+});
