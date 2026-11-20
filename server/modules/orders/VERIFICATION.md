@@ -34,6 +34,13 @@ Evidence classes: **automated-test** (a named test asserts it), **manual-check**
 | Reassignment refuses inactive, non-customer or same-owner targets, non-admin callers and stale versions; refusals are audited | automated-test | … › refuses inactive / non-customer … |
 | Step-up required for reassign/changeReference, at both router and service level | automated-test | … › refuses inactive … ; router guards › … requires fresh step-up |
 | Actor re-validated inside the transaction (suspended admin with a live session is refused) for reassign, changeReference and setLock | automated-test | … › refuses inactive … |
+| O-01: revoked session refused in-tx for lock, reference, reassign, catalog and workflow writes; nothing changes | automated-test (identity session fake mirroring assertCurrent) | orders.test › in-transaction actor currency … › a revoked admin session is refused … |
+| O-01: authority from PERSISTED session (stale persisted step-up, pending steps, demoted role) | automated-test (fake) | … › authority comes from PERSISTED session state … |
+| O-01: customer writes, invite/revoke and invitee respond re-validate the session | automated-test (fake) | … › customer writes and sharing re-validate the session … |
+| O-01: fails closed without identity session API | automated-test | … › fails closed when identity cannot verify the session |
+| O-01: lock order: concurrent accept and reassign do not deadlock (5 rounds) | automated-test (real MySQL; probabilistic, not a proof) | … › concurrent accept and reassign … never deadlock |
+| O-02: detail read uses one snapshot (transfer and new-owner note committed mid-request are not visible to the old owner) | automated-test (real MySQL) | … › detail read uses one snapshot … |
+| O-02: getOrderSummary and sharing.list use the same snapshot; search is same-statement | implemented, not independently tested (no mid-request interleaving test) | — |
 | `getOrderRefById(…, tx, {forUpdate})` locks the row and refuses without a tx | automated-test | … › refuses inactive … |
 | Customer cannot reach admin procedures (tRPC guards) | automated-test | orders.test › router guards |
 | Import: read-only lock, idempotent link, validated owner, preserved money and dates, no notifications, link conflict refused, reference collision ⇒ fresh reference | automated-test | orders.test › portable hooks › imports read-only … |
@@ -51,5 +58,4 @@ Evidence classes: **automated-test** (a named test asserts it), **manual-check**
 ## Known limits
 
 - The one-connection pool test only covers this module's own SQL. Audit, settings and mailer are in-memory fakes, so it cannot catch a second connection used through those adapters. The code passes `tx` to every settings read and high-impact `audit.record` inside a transaction. Denials raised while the caller holds a transaction are queued as a durable `audit.record` and not awaited (otherwise a one-slot pool would deadlock). Such a denial can be lost if the process exits before the write.
-- Actor re-validation checks status, role and role capability. Session revocation is enforced by the session layer, not re-read here.
-- Catalog and workflow admin writes rely on router guards (`adminProcedure` + capability) and are not re-validated against the actor row inside the transaction.
+- Actor re-validation runs against a test fake of `identity.sessions.assertCurrent`; it is exercised against the real identity module only in the integration suite (not owned here).

@@ -9,7 +9,8 @@ import { and, desc, eq, gt, inArray, lte } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { AuditEmitter, Clock, Db, FieldCrypto, Logger, SessionPrincipal, SettingsStore } from "../../core/types.js";
+import type { AuditEmitter, Clock, Db, FieldCrypto, Logger, SessionPrincipal, SettingsStore, Tx } from "../../core/types.js";
+import { createActorCheck } from "./actor.js";
 import type { Services } from "../../container.js";
 import { readSetting } from "../platform/index.js";
 import { ORDER_NOT_FOUND, type OrderPolicy } from "./policy.js";
@@ -44,17 +45,22 @@ const grantNotFound = () => notFound("GRANT_NOT_FOUND");
 
 export function createSharingService(deps: SharingDeps) {
   const indexOf = (email: string) => deps.crypto.blindIndex(email, INVITEE_INDEX_PURPOSE);
+  const actorCheck = createActorCheck(deps.services, deps.clock);
+  /** After the order row lock (canonical order: order → users → session → grants). Staff need orders.manage. */
+  const assertActorCurrent = (principal: SessionPrincipal, tx: Tx, staffSide: boolean) =>
+    actorCheck(principal, tx, staffSide ? "orders.manage" : undefined);
+  const isStaffSide = (role: string) => role === "staff" || role === "admin";
 
   /** Owner, or staff/admin holding orders.manage. Revocation is allowed under locks (it only reduces access). */
-  async function assertCanManage(principal: SessionPrincipal, orderPublicId: string, tx?: Db | Parameters<Parameters<Db["transaction"]>[0]>[0]) {
-    const view = await deps.policy.assertCanReadOrder(principal, orderPublicId, { tx, forUpdate: tx !== undefined });
+  async function assertCanManage(principal: SessionPrincipal, orderPublicId: string, tx?: Tx, forUpdate = tx !== undefined) {
+    const view = await deps.policy.assertCanReadOrder(principal, orderPublicId, { tx, forUpdate });
     if (view.accessRole === "owner") return view;
     if ((view.accessRole === "staff" || view.accessRole === "admin") && roleHasCapability(principal.role, "orders.manage")) return view;
     throw new DomainError("FORBIDDEN", "OWNER_ONLY", "Only the order owner can manage sharing.");
   }
 
-  async function myVerifiedEmailIndex(principal: SessionPrincipal): Promise<string | null> {
-    const user = await identityPort(deps.services).getUser(principal.userId);
+  async function myVerifiedEmailIndex(principal: SessionPrincipal, tx?: Tx): Promise<string | null> {
+    const user = await identityPort(deps.services).getUser(principal.userId, { tx });
     if (!user || user.status !== "active" || user.role !== "customer") return null;
     if ((user as { emailVerified?: boolean }).emailVerified !== true) return null;
     return indexOf(normalizeEmail(user.email));
@@ -62,13 +68,19 @@ export function createSharingService(deps: SharingDeps) {
 
   return {
     async list(principal: SessionPrincipal, orderPublicId: string) {
-      const view = await assertCanManage(principal, orderPublicId);
-      const rows = await deps.db
-        .select()
-        .from(orderGrants)
-        .where(eq(orderGrants.orderId, view.id))
-        .orderBy(desc(orderGrants.id))
-        .limit(100);
+      // Authorization and the grant projection share ONE consistent snapshot (O-02).
+      const rows = await deps.db.transaction(
+        async (tx) => {
+          const view = await assertCanManage(principal, orderPublicId, tx, false);
+          return tx
+            .select()
+            .from(orderGrants)
+            .where(eq(orderGrants.orderId, view.id))
+            .orderBy(desc(orderGrants.id))
+            .limit(100);
+        },
+        { isolationLevel: "repeatable read", withConsistentSnapshot: true },
+      );
       const now = deps.clock.now();
       return rows.map((row) => {
         let email: string | null = null;
@@ -99,6 +111,7 @@ export function createSharingService(deps: SharingDeps) {
       try {
         return await deps.db.transaction(async (tx) => {
           const view = await deps.policy.assertCanWriteOrder(principal, input.orderId, { kind: "sharing", tx, forUpdate: true });
+          await assertActorCurrent(principal, tx, isStaffSide(view.accessRole));
           const owner = await identityPort(deps.services).getUser(view.ownerUserId, { tx });
           if (owner && normalizeEmail(owner.email) === email) throw validation("ALREADY_OWNER", "The owner already has full access to this order.");
           // Expire stale pending invitations first so they do not block a fresh one.
@@ -150,6 +163,7 @@ export function createSharingService(deps: SharingDeps) {
     async revoke(principal: SessionPrincipal, input: { orderId: string; grantId: string }) {
       return deps.db.transaction(async (tx) => {
         const view = await assertCanManage(principal, input.orderId, tx);
+        await assertActorCurrent(principal, tx, isStaffSide(view.accessRole));
         const [grant] = await tx
           .select()
           .from(orderGrants)
@@ -209,13 +223,22 @@ export function createSharingService(deps: SharingDeps) {
       const emailIndex = await myVerifiedEmailIndex(principal);
       if (!emailIndex) throw grantNotFound();
       return deps.db.transaction(async (tx) => {
-        const [row] = await tx
-          .select({ grant: orderGrants, orderPublicId: orders.publicId, ownerUserId: orders.ownerUserId })
-          .from(orderGrants)
-          .innerJoin(orders, eq(orders.id, orderGrants.orderId))
-          .where(eq(orderGrants.publicId, input.grantId))
+        // Canonical lock order: order row, THEN grant row (a join FOR UPDATE could lock the grant first).
+        const [located] = await tx.select({ orderId: orderGrants.orderId }).from(orderGrants).where(eq(orderGrants.publicId, input.grantId)).limit(1);
+        if (!located) throw grantNotFound();
+        const [order] = await tx
+          .select({ orderPublicId: orders.publicId, ownerUserId: orders.ownerUserId })
+          .from(orders)
+          .where(eq(orders.id, located.orderId))
           .limit(1)
           .for("update");
+        const [grant] = await tx
+          .select()
+          .from(orderGrants)
+          .where(and(eq(orderGrants.publicId, input.grantId), eq(orderGrants.orderId, located.orderId)))
+          .limit(1)
+          .for("update");
+        const row = order && grant ? { grant, ...order } : undefined;
         const now = deps.clock.now();
         if (
           !row ||
@@ -226,6 +249,10 @@ export function createSharingService(deps: SharingDeps) {
         ) {
           throw grantNotFound();
         }
+        // Grant + order rows are locked above; now the actor (users → session), then re-derive the verified
+        // e-mail from the locked users row so a just-changed or unverified address cannot accept.
+        await actorCheck(principal, tx);
+        if ((await myVerifiedEmailIndex(principal, tx)) !== emailIndex) throw grantNotFound();
         await tx
           .update(orderGrants)
           .set(

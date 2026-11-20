@@ -5,6 +5,7 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import { createActorCheck } from "./actor.js";
 import { createCatalogService, type CatalogService } from "./catalog.js";
 import { registerOrderMailTemplates } from "./mail.js";
 import { createOrderService, type OrderService } from "./orderService.js";
@@ -60,8 +61,9 @@ export interface OrdersModule extends ModuleLifecycle {
 export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   registerOrderMailTemplates(deps.mailer);
   const policy = createOrderPolicy({ db: deps.db, clock: deps.clock, audit: deps.audit });
-  const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit });
-  const workflows = createWorkflowService({ db: deps.db, clock: deps.clock, audit: deps.audit });
+  const actorCheck = createActorCheck(deps.services, deps.clock);
+  const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
+  const workflows = createWorkflowService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
   const orders = createOrderService({ ...deps, policy, catalog, workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });

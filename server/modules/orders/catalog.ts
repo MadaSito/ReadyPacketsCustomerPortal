@@ -6,6 +6,7 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
+import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, SessionPrincipal, Tx } from "../../core/types.js";
 import { catalogGroups, catalogProducts, catalogProductVersions } from "./schema.js";
 
@@ -13,6 +14,8 @@ export interface CatalogDeps {
   db: Db;
   clock: Clock;
   audit: AuditEmitter;
+  /** In-tx actor re-validation (first statement of every admin write; these writes lock no order row). */
+  actorCheck: ActorCheck;
 }
 
 export interface CatalogProductView {
@@ -168,6 +171,7 @@ export function createCatalogService(deps: CatalogDeps) {
 
     async createGroup(principal: SessionPrincipal, input: { name: string; description: string; sortOrder: number; active: boolean }) {
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "catalog.manage");
         const publicId = ulid(deps.clock.now().getTime());
         await tx.insert(catalogGroups).values({ publicId, ...input });
         await deps.audit.record(
@@ -190,6 +194,7 @@ export function createCatalogService(deps: CatalogDeps) {
       input: { groupId: string; expectedVersion: number; name: string; description: string; sortOrder: number; active: boolean },
     ) {
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "catalog.manage");
         const group = await groupByPublicId(tx, input.groupId);
         if (group.version !== input.expectedVersion)
           throw conflict("STALE_VERSION", "This item was changed by someone else. Reload and try again.");
@@ -225,6 +230,7 @@ export function createCatalogService(deps: CatalogDeps) {
     ) {
       assertCurrency(input.currency);
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "catalog.manage");
         const group = await groupByPublicId(tx, input.groupId);
         const [existing] = await tx
           .select({ id: catalogProducts.id })
@@ -266,6 +272,7 @@ export function createCatalogService(deps: CatalogDeps) {
     ) {
       assertCurrency(input.currency);
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "catalog.manage");
         const [row] = await tx
           .select({ product: catalogProducts, version: catalogProductVersions })
           .from(catalogProducts)

@@ -3,7 +3,8 @@ import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.j
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { seedOrdersDemo } from "./demoSeed.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
-import { insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
+import type { Services } from "../../container.js";
+import { fakeIdentity, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
 
 let t: TestDb;
 let h: TestHarness;
@@ -15,6 +16,8 @@ beforeAll(async () => {
   h = createTestDeps({ db: t.db });
   mod = createOrdersModule(h.deps);
   h.services.orders = mod;
+  // Catalog writes re-validate the actor in-transaction via identity.sessions.assertCurrent.
+  h.services.identity = fakeIdentity(h, t.db) as unknown as Services["identity"];
   admin = await insertUser(h, t.db, { role: "admin", stepUp: true });
 });
 

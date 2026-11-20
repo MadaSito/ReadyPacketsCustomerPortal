@@ -3,7 +3,8 @@
  * reassignment. Every entry point re-checks resource scope through the order policy.
  */
 import { and, asc, desc, eq, gte, inArray, isNotNull, like, lt, lte, or, sql } from "drizzle-orm";
-import { roleHasCapability } from "../../../shared/capabilities.js";
+import { roleHasCapability, type Capability } from "../../../shared/capabilities.js";
+import { createActorCheck } from "./actor.js";
 import { hasFreshStepUp } from "../../trpc/trpc.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
@@ -85,17 +86,20 @@ export function createOrderService(deps: OrderServiceDeps) {
     if (!hasFreshStepUp(principal, deps.clock.now())) throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Please confirm your password and authentication code to continue.");
   }
 
-  /**
-   * Re-validates the ACTOR inside the transaction (not the request-start session snapshot): still active,
-   * same role, role still grants the capability. Called as the FIRST statement of the transaction so the
-   * REPEATABLE READ snapshot is current; the actor row is not locked, so no actor/target lock ordering arises.
-   */
-  async function assertActorCurrent(principal: SessionPrincipal, tx: Tx, capability: Parameters<typeof roleHasCapability>[1]): Promise<void> {
-    const actor = await identityPort(deps.services).getUser(principal.userId, { tx });
-    if (!actor || actor.status !== "active" || actor.role !== principal.role || !roleHasCapability(actor.role, capability)) throw forbidden("ACTOR_NOT_AUTHORIZED");
-  }
+  /** In-tx actor re-validation against PERSISTED session state (see actor.ts for the lock order). */
+  const actorCheck = createActorCheck(deps.services, deps.clock);
+  const assertActorCurrent = (principal: SessionPrincipal, tx: Tx, capability?: Capability) => actorCheck(principal, tx, capability);
 
   const { policy, workflows } = deps;
+
+  /**
+   * Authorization and projection read from ONE consistent snapshot (O-02): a transfer or grant revoke that
+   * commits after the snapshot is invisible to both, so a former owner/grantee can never see post-revocation
+   * data. No row locks. (Not `accessMode: "read only"`: Drizzle renders it with the snapshot clause as invalid
+   * MySQL — "WITH CONSISTENT SNAPSHOT READ ONLY" lacks the required comma.)
+   */
+  const snapshot = <T>(fn: (tx: Tx) => Promise<T>) =>
+    deps.db.transaction(fn, { isolationLevel: "repeatable read", withConsistentSnapshot: true });
 
   const encryptNote = (body: string, publicId: string) => deps.crypto.encrypt(body, `order_notes.body:${publicId}`);
   const decryptNote = (bodyEnc: string, publicId: string) => {
@@ -250,6 +254,9 @@ export function createOrderService(deps: OrderServiceDeps) {
       const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX);
       try {
         return await deps.db.transaction(async (tx) => {
+          // No existing order row is locked here, so the actor check is the first statement.
+          const actor = await assertActorCurrent(principal, tx, "orders.create");
+          if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
           const now = deps.clock.now();
           const workflow = await workflows.ensureDefault(tx);
           const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
@@ -417,20 +424,21 @@ export function createOrderService(deps: OrderServiceDeps) {
 
     /* ------------------------------------------------------------------- get */
     async get(principal: SessionPrincipal, orderPublicId: string, area: "customer" | "console" = "customer") {
-      const view = await policy.assertCanReadOrder(principal, orderPublicId);
+      return snapshot(async (tx) => {
+      const view = await policy.assertCanReadOrder(principal, orderPublicId, { tx });
       const staffSide = view.accessRole === "staff" || view.accessRole === "admin";
       const consoleView = staffSide && area === "console";
-      const [order] = await deps.db.select().from(orders).where(eq(orders.id, view.id)).limit(1);
+      const [order] = await tx.select().from(orders).where(eq(orders.id, view.id)).limit(1);
       if (!order) throw ORDER_NOT_FOUND();
-      const bound = await workflows.byVersionId(deps.db, order.workflowVersionId);
-      const items = await deps.db.select().from(orderLineItems).where(eq(orderLineItems.orderId, view.id)).orderBy(asc(orderLineItems.sortOrder)).limit(500);
-      const notes = await deps.db
+      const bound = await workflows.byVersionId(tx, order.workflowVersionId);
+      const items = await tx.select().from(orderLineItems).where(eq(orderLineItems.orderId, view.id)).orderBy(asc(orderLineItems.sortOrder)).limit(500);
+      const notes = await tx
         .select()
         .from(orderNotes)
         .where(and(eq(orderNotes.orderId, view.id), consoleView ? undefined : eq(orderNotes.visibility, "customer")))
         .orderBy(desc(orderNotes.id))
         .limit(200);
-      const history = await deps.db.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, view.id)).orderBy(desc(orderStatusHistory.id)).limit(200);
+      const history = await tx.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, view.id)).orderBy(desc(orderStatusHistory.id)).limit(200);
       const actor = workflowActor(view);
       const canTransition = actor !== null && policy.writeVerdict(principal, view.accessRole, view.lockState, "status") === null;
       const transitions = canTransition && actor ? transitionsFrom(bound.definition, order.statusKey, actor) : [];
@@ -493,13 +501,15 @@ export function createOrderService(deps: OrderServiceDeps) {
         })),
         transitions: transitions.map((t) => ({ to: t.to, label: label(t.to)!, requiresNote: t.requiresNote })),
       };
+      });
     },
 
     async getOrderSummary(principal: SessionPrincipal, orderPublicId: string): Promise<OrderSummary> {
-      const view = await policy.assertCanReadOrder(principal, orderPublicId);
-      const [order] = await deps.db.select().from(orders).where(eq(orders.id, view.id)).limit(1);
+      return snapshot(async (tx) => {
+      const view = await policy.assertCanReadOrder(principal, orderPublicId, { tx });
+      const [order] = await tx.select().from(orders).where(eq(orders.id, view.id)).limit(1);
       if (!order) throw ORDER_NOT_FOUND();
-      const status = await statusPresentation(order.workflowVersionId, order.statusKey);
+      const status = await statusPresentation(order.workflowVersionId, order.statusKey, tx);
       const staffSide = view.accessRole === "staff" || view.accessRole === "admin";
       return {
         publicId: order.publicId,
@@ -515,12 +525,14 @@ export function createOrderService(deps: OrderServiceDeps) {
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
       };
+      });
     },
 
     /* ---------------------------------------------------------------- update */
     async update(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; projectName: string }) {
       return deps.db.transaction(async (tx) => {
         const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
+        await assertActorCurrent(principal, tx, view.accessRole === "staff" || view.accessRole === "admin" ? "orders.manage" : undefined);
         if (view.version !== input.expectedVersion) throw staleVersion();
         await tx
           .update(orders)
@@ -545,6 +557,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async addNote(principal: SessionPrincipal, input: { orderId: string; body: string; visibility?: NoteVisibility }) {
       const result = await deps.db.transaction(async (tx) => {
         const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
+        await assertActorCurrent(principal, tx, view.accessRole === "staff" || view.accessRole === "admin" ? "orders.manage" : undefined);
         const staffSide = view.accessRole === "staff" || view.accessRole === "admin";
         const visibility: NoteVisibility = staffSide ? (input.visibility ?? "internal") : "customer";
         if (!staffSide && input.visibility === "internal") throw forbidden("STAFF_ONLY");
@@ -576,6 +589,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       try {
         outcome = await deps.db.transaction(async (tx) => {
           const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "status", tx, forUpdate: true });
+          await assertActorCurrent(principal, tx, view.accessRole === "staff" || view.accessRole === "admin" ? "orders.transition" : undefined);
           if (view.version !== input.expectedVersion) throw staleVersion();
           const actor = workflowActor(view);
           const bound = await workflows.byVersionId(tx, view.workflowVersionId);
@@ -652,13 +666,13 @@ export function createOrderService(deps: OrderServiceDeps) {
     /* ----------------------------------------------------------------- locks */
     async setLock(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; lockState: OrderLockState; reasonCode: string }) {
       return deps.db.transaction(async (tx) => {
-        if (principal.role !== "customer") await assertActorCurrent(principal, tx, "orders.manage");
         const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
         const staffSide = view.accessRole === "staff" || view.accessRole === "admin";
         if (!staffSide || !roleHasCapability(principal.role, "orders.manage")) {
           if (!staffSide) throw ORDER_NOT_FOUND();
           throw forbidden("CAPABILITY_NOT_GRANTED");
         }
+        await assertActorCurrent(principal, tx, "orders.manage"); // after the order row lock (canonical order)
         const adminOnly = (state: OrderLockState) => state === "legal_hold" || state === "imported_read_only";
         if ((adminOnly(view.lockState) || adminOnly(input.lockState)) && principal.role !== "admin")
           throw new DomainError("FORBIDDEN", "ADMIN_ONLY", "Only an administrator can change this lock.");
@@ -707,8 +721,8 @@ export function createOrderService(deps: OrderServiceDeps) {
       assertFreshStepUp(principal);
       const reference = normalizeReference(input.newReference);
       return deps.db.transaction(async (tx) => {
-        await assertActorCurrent(principal, tx, "orders.identifiers.change");
         const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
+        await assertActorCurrent(principal, tx, "orders.identifiers.change"); // after the order row lock
         if (view.version !== input.expectedVersion) throw staleVersion();
         if (view.lockState === "legal_hold") throw orderLocked(view.lockState);
         if (reference === view.reference) throw conflict("REFERENCE_UNCHANGED", "That is already the order's reference.");
@@ -793,12 +807,22 @@ export function createOrderService(deps: OrderServiceDeps) {
       let committed: { view: OrderAccessView; toUserId: number; revokedGrants: number };
       try {
         committed = await deps.db.transaction(async (tx) => {
-          await assertActorCurrent(principal, tx, "orders.reassign");
           const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
+          // Canonical order: order row → users rows in ascending id (actor and target) → actor session → grants → files.
+          const identity = identityPort(deps.services);
+          const located = await identity.getUserByPublicId(input.targetCustomerPublicId, { tx });
+          if (!located) throw validation("TARGET_NOT_ELIGIBLE", "Choose an active customer account.");
+          const userIds = [...new Set([principal.userId, located.id])].sort((a, b) => a - b);
+          let target: typeof located | null = null;
+          for (const id of userIds) {
+            const locked = await identity.getUser(id, { tx, forUpdate: true });
+            if (id === located.id) target = locked;
+          }
+          await assertActorCurrent(principal, tx, "orders.reassign");
           if (view.version !== input.expectedVersion) throw staleVersion();
           if (view.lockState === "legal_hold") throw orderLocked(view.lockState);
-          const target = await identityPort(deps.services).getUserByPublicId(input.targetCustomerPublicId, { tx, forUpdate: true });
-          if (!target || target.role !== "customer") throw validation("TARGET_NOT_ELIGIBLE", "Choose an active customer account.");
+          if (!target || target.publicId !== input.targetCustomerPublicId || target.role !== "customer")
+            throw validation("TARGET_NOT_ELIGIBLE", "Choose an active customer account.");
           if (target.status !== "active") throw validation("TARGET_INACTIVE", "The selected customer account is not active.");
           if (target.id === view.ownerUserId) throw conflict("TARGET_IS_OWNER", "That customer already owns this order.");
           const now = deps.clock.now();
@@ -861,15 +885,28 @@ export function createOrderService(deps: OrderServiceDeps) {
       const q = query.normalize("NFC").trim();
       if (q.length < 2 || q.length > 64) return [];
       const max = Math.min(Math.max(limit, 1), 20);
-      const scope = await policy.listAccessibleOrderIds(principal);
-      if (!scope.all && scope.orderIds.length === 0) return [];
+      if (principal.state !== "full" || principal.pendingSteps.length > 0) return [];
+      const staffSide = principal.role !== "customer";
+      if (staffSide && !roleHasCapability(principal.role, "orders.read_all")) return [];
+      const now = deps.clock.now();
+      // Authorization is part of the SAME statement as the match (O-02): no id list is read first.
+      const sharedIds = deps.db
+        .select({ id: orderGrants.orderId })
+        .from(orderGrants)
+        .where(
+          and(
+            eq(orderGrants.granteeUserId, principal.userId),
+            eq(orderGrants.status, "active"),
+            or(sql`${orderGrants.expiresAt} IS NULL`, sql`${orderGrants.expiresAt} > ${now}`),
+          ),
+        );
       const pattern = `%${likeLiteral(q)}%`;
       const rows = await deps.db
         .select()
         .from(orders)
         .where(
           and(
-            scope.all ? undefined : inArray(orders.id, scope.orderIds),
+            staffSide ? undefined : or(eq(orders.ownerUserId, principal.userId), inArray(orders.id, sharedIds)),
             or(like(orders.reference, `${likeLiteral(q.toUpperCase())}%`), like(orders.projectName, pattern)),
           ),
         )

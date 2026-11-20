@@ -5,6 +5,7 @@
 import { and, asc, desc, eq } from "drizzle-orm";
 import { conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
+import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orderWorkflows, orderWorkflowVersions } from "./schema.js";
 import { DEFAULT_WORKFLOW, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
@@ -13,6 +14,8 @@ export interface WorkflowDeps {
   db: Db;
   clock: Clock;
   audit: AuditEmitter;
+  /** In-tx actor re-validation (first statement of every admin write; these writes lock no order row). */
+  actorCheck: ActorCheck;
 }
 
 export interface BoundWorkflow {
@@ -123,6 +126,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
     async create(principal: SessionPrincipal, input: { workflowKey: string; name: string; definition: unknown }) {
       const definition = parseDefinition(input.definition);
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "workflows.manage");
         const [taken] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.workflowKey, input.workflowKey)).limit(1);
         if (taken) throw conflict("WORKFLOW_KEY_TAKEN", "A workflow with that key already exists.");
         const publicId = ulid(deps.clock.now().getTime());
@@ -153,6 +157,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
     ) {
       const definition = parseDefinition(input.definition);
       return deps.db.transaction(async (tx) => {
+        await deps.actorCheck(principal, tx, "workflows.manage");
         const [workflow] = await tx.select().from(orderWorkflows).where(eq(orderWorkflows.publicId, input.workflowId)).limit(1).for("update");
         if (!workflow) throw notFound("WORKFLOW_NOT_FOUND");
         if (workflow.version !== input.expectedVersion)

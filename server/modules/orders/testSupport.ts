@@ -2,6 +2,7 @@
  * Test-only helpers for the orders module (synthetic data; never imported by production code).
  */
 import { eq } from "drizzle-orm";
+import { DomainError } from "../../core/errors.js";
 import { users } from "../identity/schema.js";
 import * as orderTables from "./schema.js";
 import type { Db, SessionPrincipal, Tx } from "../../core/types.js";
@@ -60,14 +61,33 @@ export function fakeIdentity(h: TestHarness, db: Db) {
     customerRef: row.customerRef,
     emailVerified: row.emailVerifiedAt !== null,
   });
+  /** Per-session overrides of the PERSISTED session state (default: live, no pending steps, principal's step-up). */
+  const sessionState = new Map<string, { revoked?: boolean; pendingSteps?: string[]; stepUpAt?: Date | null; role?: UserRole }>();
+  const lockQuery = <T extends { for(mode: "update"): unknown }>(query: T, forUpdate?: boolean) => (forUpdate ? query.for("update") : query);
   return {
-    async getUser(userId: number, opts?: { tx?: Db | Tx }) {
-      const [row] = await (opts?.tx ?? db).select().from(users).where(eq(users.id, userId)).limit(1);
+    sessionState,
+    async getUser(userId: number, opts?: { tx?: Db | Tx; forUpdate?: boolean }) {
+      const [row] = (await lockQuery((opts?.tx ?? db).select().from(users).where(eq(users.id, userId)).limit(1), opts?.forUpdate)) as (typeof users.$inferSelect)[];
       return row ? view(row) : null;
     },
-    async getUserByPublicId(publicId: string, opts?: { tx?: Db | Tx }) {
-      const [row] = await (opts?.tx ?? db).select().from(users).where(eq(users.publicId, publicId)).limit(1);
+    async getUserByPublicId(publicId: string, opts?: { tx?: Db | Tx; forUpdate?: boolean }) {
+      const [row] = (await lockQuery((opts?.tx ?? db).select().from(users).where(eq(users.publicId, publicId)).limit(1), opts?.forUpdate)) as (typeof users.$inferSelect)[];
       return row ? view(row) : null;
+    },
+    /** Mirrors identity.sessions.assertCurrent: locks the users row, rejects stale sessions, returns PERSISTED authority. */
+    sessions: {
+      async assertCurrent(principal: SessionPrincipal, tx: Tx) {
+        const [row] = await tx.select().from(users).where(eq(users.id, principal.userId)).limit(1).for("update");
+        const state = sessionState.get(principal.sessionId) ?? {};
+        if (!row || row.status !== "active" || state.revoked || row.role !== principal.role)
+          throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Please sign in again.");
+        return {
+          pendingSteps: state.pendingSteps ?? [],
+          role: state.role ?? row.role,
+          stepUpAt: state.stepUpAt !== undefined ? state.stepUpAt : principal.stepUpAt,
+          mfaVerifiedAt: null,
+        };
+      },
     },
   };
 }

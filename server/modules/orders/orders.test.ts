@@ -9,6 +9,7 @@ import { createTestDeps, type fakePrincipal, type TestHarness } from "../../../t
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
+import { DEFAULT_WORKFLOW } from "./workflowTypes.js";
 import { orderGrants, orderLineItems, orderReassignments, orders } from "./schema.js";
 import { users } from "../identity/schema.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, idemKey, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
@@ -212,8 +213,14 @@ describe("negative authorization matrix", () => {
 
   it("staff without the capability cannot read; staff without invoices.manage cannot write invoices", async () => {
     expect((await mod.assertCanReadOrder(staff.principal, order.publicId)).accessRole).toBe("staff");
-    await expectError(mod.assertCanWriteOrder(staff.principal, order.publicId, { kind: "invoice" }), "NOT_FOUND:ORDER_NOT_FOUND");
     const set = ROLE_CAPABILITIES.staff as Set<Capability>;
+    // Staff may hold invoices.manage by default; without it, invoice writes are refused.
+    const hadInvoices = set.delete("invoices.manage");
+    try {
+      await expectError(mod.assertCanWriteOrder(staff.principal, order.publicId, { kind: "invoice" }), "NOT_FOUND:ORDER_NOT_FOUND");
+    } finally {
+      if (hadInvoices) set.add("invoices.manage");
+    }
     set.delete("orders.read_all");
     try {
       await expectError(mod.assertCanReadOrder(staff.principal, order.publicId), "NOT_FOUND:ORDER_NOT_FOUND");
@@ -482,12 +489,12 @@ describe("reassignment", () => {
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: staff.publicId, operationId: idemKey() }), "VALIDATION:TARGET_NOT_ELIGIBLE");
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: alice.publicId, operationId: idemKey() }), "CONFLICT:TARGET_IS_OWNER");
     await expectError(mod.orders.reassign(staff.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:CAPABILITY_NOT_GRANTED");
-    // Actor re-validated inside the transaction: a demoted/suspended admin with a still-valid session is refused.
+    // Actor re-validated inside the transaction: a suspended admin whose session snapshot still looks valid is refused.
     const exAdmin = await insertUser(h, t.db, { role: "admin", stepUp: true });
     await t.db.update(users).set({ status: "suspended" }).where(eq(users.id, exAdmin.id));
-    await expectError(mod.orders.reassign(exAdmin.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
-    await expectError(mod.orders.changeReference(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-2", reasonCode: "FIX" }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
-    await expectError(mod.orders.setLock(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "review", reasonCode: "FIX" }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    await expectError(mod.orders.reassign(exAdmin.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "UNAUTHENTICATED:SESSION_NOT_CURRENT");
+    await expectError(mod.orders.changeReference(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-2", reasonCode: "FIX" }), "UNAUTHENTICATED:SESSION_NOT_CURRENT");
+    await expectError(mod.orders.setLock(exAdmin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "review", reasonCode: "FIX" }), "UNAUTHENTICATED:SESSION_NOT_CURRENT");
     // Trusted ref lookup can lock the order row (files retention) and refuses a lock without a transaction.
     await t.db.transaction(async (tx) => {
       expect(await mod.getOrderRefById(view.id, tx, { forUpdate: true })).toMatchObject({ publicId: order.publicId, lockState: "none" });
@@ -498,6 +505,132 @@ describe("reassignment", () => {
     await expectError(mod.orders.changeReference(noStepUp, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-1", reasonCode: "FIX" }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
     await expectError(mod.orders.reassign(admin.principal, { ...base, expectedVersion: view.version + 5, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "CONFLICT:STALE_VERSION");
     expect(h.audit.named("order.reassign.refused").map((e) => e.reasonCode)).toEqual(expect.arrayContaining(["TARGET_INACTIVE", "TARGET_NOT_ELIGIBLE", "TARGET_IS_OWNER"]));
+  });
+});
+
+describe("in-transaction actor currency (O-01) and consistent reads (O-02)", () => {
+  type SessionOverride = { revoked?: boolean; pendingSteps?: string[]; stepUpAt?: Date | null; role?: TestUser["principal"]["role"] };
+  const sessions = () => (h.services.identity as unknown as { sessionState: Map<string, SessionOverride> }).sessionState;
+  const withSession = async (user: TestUser, state: SessionOverride, fn: () => Promise<void>) => {
+    sessions().set(user.principal.sessionId, state);
+    try {
+      await fn();
+    } finally {
+      sessions().delete(user.principal.sessionId);
+    }
+  };
+
+  it("a revoked admin session is refused for lock, reference, reassign, catalog and workflow writes; nothing changes", async () => {
+    const order = await newOrder(alice);
+    const view = await mod.assertCanReadOrder(admin.principal, order.publicId);
+    const before = (await t.db.select().from(orders).where(eq(orders.publicId, order.publicId)))[0]!;
+    await withSession(admin, { revoked: true }, async () => {
+      const stale = "UNAUTHENTICATED:SESSION_NOT_CURRENT";
+      await expectError(mod.orders.setLock(admin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "review", reasonCode: "X" }), stale);
+      await expectError(mod.orders.changeReference(admin.principal, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-O01-1", reasonCode: "X" }), stale);
+      await expectError(mod.orders.reassign(admin.principal, { orderId: order.publicId, targetCustomerPublicId: bob.publicId, expectedVersion: view.version, operationId: idemKey(), reasonCode: "X" }), stale);
+      await expectError(mod.catalog.createGroup(admin.principal, { name: "Revoked group", description: "", sortOrder: 9, active: true }), stale);
+      await expectError(mod.workflows.create(admin.principal, { workflowKey: "revoked-wf", name: "Revoked", definition: DEFAULT_WORKFLOW }), stale);
+    });
+    const after = (await t.db.select().from(orders).where(eq(orders.publicId, order.publicId)))[0]!;
+    expect(after).toMatchObject({ ownerUserId: before.ownerUserId, reference: before.reference, lockState: before.lockState, version: before.version });
+    expect((await mod.catalog.listAll()).some((g) => g.name === "Revoked group")).toBe(false);
+    expect((await mod.workflows.list()).some((w) => w.workflowKey === "revoked-wf")).toBe(false);
+  });
+
+  it("authority comes from PERSISTED session state: stale persisted step-up, pending steps and demoted role are refused", async () => {
+    const order = await newOrder(alice);
+    const view = await mod.assertCanReadOrder(admin.principal, order.publicId);
+    const input = { orderId: order.publicId, targetCustomerPublicId: bob.publicId, expectedVersion: view.version, operationId: idemKey(), reasonCode: "X" };
+    // The request principal claims a fresh step-up, but the persisted session has none.
+    await withSession(admin, { stepUpAt: null }, async () => {
+      await expectError(mod.orders.reassign(admin.principal, input), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+      await expectError(mod.orders.changeReference(admin.principal, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-O01-2", reasonCode: "X" }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+    });
+    await withSession(admin, { pendingSteps: ["mfa_enrol"] }, async () => {
+      await expectError(mod.catalog.createGroup(admin.principal, { name: "Pending group", description: "", sortOrder: 9, active: true }), "REMEDIATION_REQUIRED:ACCOUNT_STEP_PENDING");
+    });
+    await withSession(admin, { role: "staff" }, async () => {
+      await expectError(mod.orders.setLock(admin.principal, { orderId: order.publicId, expectedVersion: view.version, lockState: "review", reasonCode: "X" }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    });
+    await withSession(alice, { pendingSteps: ["password_change"] }, async () => {
+      await expectError(mod.orders.update(alice.principal, { orderId: order.publicId, expectedVersion: view.version, projectName: "Renamed" }), "REMEDIATION_REQUIRED:ACCOUNT_STEP_PENDING");
+    });
+    const [row] = await t.db.select().from(orders).where(eq(orders.publicId, order.publicId));
+    expect(row).toMatchObject({ ownerUserId: alice.id, lockState: "none", projectName: "Synthetic project", version: view.version });
+  });
+
+  it("customer writes and sharing re-validate the session in-transaction (owner and invitee)", async () => {
+    const order = await newOrder(alice);
+    const view = await mod.assertCanReadOrder(alice.principal, order.publicId);
+    const invite = await mod.sharing.invite(alice.principal, { orderId: order.publicId, email: bob.email, role: "viewer" });
+    const stale = "UNAUTHENTICATED:SESSION_NOT_CURRENT";
+    await withSession(alice, { revoked: true }, async () => {
+      await expectError(mod.orders.update(alice.principal, { orderId: order.publicId, expectedVersion: view.version, projectName: "Renamed" }), stale);
+      await expectError(mod.orders.addNote(alice.principal, { orderId: order.publicId, body: "Synthetic note" }), stale);
+      await expectError(mod.sharing.invite(alice.principal, { orderId: order.publicId, email: carol.email, role: "viewer" }), stale);
+      await expectError(mod.sharing.revoke(alice.principal, { orderId: order.publicId, grantId: invite.publicId }), stale);
+      await expectError(newOrder(alice), stale);
+    });
+    await withSession(bob, { revoked: true }, async () => {
+      await expectError(mod.sharing.respond(bob.principal, { grantId: invite.publicId, accept: true }), stale);
+    });
+    const grants = await mod.sharing.list(alice.principal, order.publicId);
+    expect(grants.find((g) => g.publicId === invite.publicId)?.status).toBe("pending");
+    expect(grants.some((g) => g.email === carol.email)).toBe(false);
+  });
+
+  it("fails closed when identity cannot verify the session", async () => {
+    const identity = h.services.identity as unknown as { sessions?: unknown };
+    const saved = identity.sessions;
+    identity.sessions = undefined;
+    try {
+      await expectError(mod.catalog.createGroup(admin.principal, { name: "Unverifiable", description: "", sortOrder: 9, active: true }), "FORBIDDEN:ACTOR_UNVERIFIABLE");
+      await expectError(newOrder(alice), "FORBIDDEN:ACTOR_UNVERIFIABLE");
+    } finally {
+      identity.sessions = saved;
+    }
+  });
+
+  it("detail read uses one snapshot: a transfer committed mid-request never leaks the new owner's data to the old owner", async () => {
+    const order = await newOrder(alice);
+    const view = await mod.assertCanReadOrder(admin.principal, order.publicId);
+    const original = mod.workflows.byVersionId;
+    let injected = false;
+    mod.workflows.byVersionId = async (db, versionId) => {
+      if (!injected) {
+        injected = true;
+        // Runs AFTER authorization inside alice's read: move the order to bob and let bob write a note.
+        await mod.orders.reassign(admin.principal, { orderId: order.publicId, targetCustomerPublicId: bob.publicId, expectedVersion: view.version, operationId: idemKey(), reasonCode: "MOVE" });
+        await mod.orders.addNote(bob.principal, { orderId: order.publicId, body: "Synthetic post-transfer note" });
+      }
+      return original(db, versionId);
+    };
+    try {
+      const detail = await mod.orders.get(alice.principal, order.publicId);
+      expect(injected).toBe(true);
+      expect(detail.notes.map((n) => n.body)).not.toContain("Synthetic post-transfer note");
+      expect(detail.version).toBe(view.version);
+    } finally {
+      mod.workflows.byVersionId = original;
+    }
+    await expectError(mod.orders.get(alice.principal, order.publicId), "NOT_FOUND:ORDER_NOT_FOUND");
+  });
+
+  it("concurrent accept and reassign on the same order never deadlock (order row is locked first by both)", async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const order = await newOrder(alice);
+      const invite = await mod.sharing.invite(alice.principal, { orderId: order.publicId, email: carol.email, role: "viewer" });
+      const view = await mod.assertCanReadOrder(admin.principal, order.publicId);
+      const results = await Promise.allSettled([
+        mod.sharing.respond(carol.principal, { grantId: invite.publicId, accept: true }),
+        mod.orders.reassign(admin.principal, { orderId: order.publicId, targetCustomerPublicId: bob.publicId, expectedVersion: view.version, operationId: idemKey(), reasonCode: "MOVE" }),
+      ]);
+      for (const r of results) if (r.status === "rejected") expect(String((r.reason as Error)?.message ?? r.reason)).not.toMatch(/deadlock/i);
+      expect(results[1]!.status).toBe("fulfilled");
+      // Whatever the interleaving, carol never holds a live grant on the reassigned order.
+      await expectError(mod.assertCanReadOrder(carol.principal, order.publicId), "NOT_FOUND:ORDER_NOT_FOUND");
+    }
   });
 });
 
