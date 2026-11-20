@@ -68,3 +68,14 @@ Jobs:
 
 ## Limitations
 I did not run code against MySQL and added no tests, so the race and skew analysis rests on reading the code. I did not review `fieldCrypto.ts` in depth, the trpc context, or the sessionResolver internals.
+
+## Remediation re-verification
+
+### H-1 / H-2, fixed in `70555c1` (re-verified by code-read; `rateLimitAddress` exercised offline)
+- **H-1 resolved.** `app.ts` now places a process-local pre-gate (`edgeAdmission.ts`) after host validation. The pre-gate is HMAC-slotted with an HKDF subkey (2^16 slots, 120 requests per 10 s) and checks the canonical Origin for unsafe methods and for `/api/csrf`. It runs before the webhook route, the durable limiter, body parsing and session resolution. The durable per-IP and tRPC budgets now also run before `express.json` and `sessionResolver.resolve`. Denials go through `audit.note`, which is a bounded, never-throwing in-memory queue that counts drops. Notes are sampled at one per address slot per minute per kind. Nothing touches the database, looks up credentials or writes a durable audit row before the gate.
+- **H-2 resolved.** In `rateLimiter.ts`, slots are now `HMAC(HKDF(tokenHashKey, "readypackets/http/durable-rate-limit-slot/v1"), category‖0‖normalizedKey)`, so they can no longer be computed offline. `rateLimitAddress` maps IPv6 to its /64 and IPv4-mapped addresses to IPv4, and `normalizeRateLimitKey` also covers `ip:`/`edge:ip:` keys built by other modules. I ran the function on these inputs: `2001:db8:1:2::5:7ad7` and `2001:0db8:0001:0002:ffff::1` both become `2001:db8:1:2::/64`, `::ffff:203.0.113.7` becomes `203.0.113.7`, `fe80::1%eth0` becomes `fe80:0:0:0::/64`, and `2001:db8::` becomes `2001:db8:0:0::/64`. Every spelling of the same /64 gives the same output.
+- **Residual (Info).** A client holding a /48 has 65,536 /64s. It can still create up to about one origin note and one CSRF note per pre-gate slot per minute, which could fill the bounded note queue and drop other best-effort notes. The durable audit chain and the decision to deny are not affected. Optional fix: a global token bucket for `http.*.denied` notes, plus a periodic aggregate "suppressed" count. Separately, honest users who share a pre-gate slot share its 120 requests per 10 s. With HMAC keying, collisions are random and cannot be targeted.
+
+### J-1 / jobs H-3, fixed in `4055453` (spot-checked by code-read)
+- Lease bounds now come from the database clock (`UTC_TIMESTAMP(3)` / `TIMESTAMPADD`) in the claim, heartbeat, ownership and reap paths I sampled. Mail capture is now an allowlist: `allowsMailCapture` permits only `development` and `test`. I did not re-run the owner's MySQL tests.
+- **Still open: the `env.ts` part of H-3.** NODE_ENV=production with the preview profile on a non-readypackets host is still allowed. This belongs to the config owner.
