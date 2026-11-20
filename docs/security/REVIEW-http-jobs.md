@@ -84,3 +84,49 @@ I did not run code against MySQL and added no tests, so the race and skew analys
 - `env.ts` now refuses the preview profile in every NODE_ENV unless `RP_PREVIEW_ACKNOWLEDGED` is exactly `synthetic-data-only`; readypackets.com origins and aliases remain refused; a stray acknowledgement outside preview warns.
 - `platform/module.ts` logs one startup WARN (`platform.preview_profile.active`) and exposes `preview: true` to the shell for a permanent banner.
 - Accepted residual (ADR 0002): preview with NODE_ENV=production on a non-readypackets host remains the intended hosted-demo configuration, with relaxed host/CORS/framing by design. It now requires a deliberate, exact operator acknowledgement, so the accidental-misconfiguration path in the original finding is closed. Mail capture is independently refused in preview (`4055453`).
+
+## Addendum: assurance (WebAuthn + TOTP + recovery codes)
+
+Scope: `server/modules/assurance/{passkeys,factors,store,policy,schema}.ts` (owner assurance_engineer), reviewed at `8c549b3` by
+code-read only (no tests added or run). Severity summary: **1 Medium, 3 Info.**
+
+### A-1 (Medium): no consecutive-failure limit on TOTP; budget-only throttling allows slow online guessing
+- `policy.ts:43-45` throttles every second-factor attempt with the per-account `auth_high_risk` budget, whose default is
+  30 per 300 s (`server/security/rateLimiter.ts` `DEFAULT_BUDGETS`). `factors.ts:57-67` accepts any of 3 steps (`store.ts:82`
+  `window: 1`). `assurance_accounts` (`schema.ts:6-22`) has no failure counter, and nothing escalates, locks or notifies on
+  repeated wrong codes; each denial is only audited (`factors.ts:96-98`).
+- Impact: an attacker who has the password (the precondition for an `mfa_challenge` remediation session) can submit
+  30 codes / 5 min ≈ 8,640/day indefinitely. With p ≈ 3·10⁻⁶ per guess that is ≈ 2.6 % per day and ≈ 54 % over 30 days of
+  sustained guessing. NIST SP 800-63B §5.2.2 requires limiting consecutive failed attempts (≤ 100) for OTP authenticators.
+- Fix: add `totp_failures` (and `totp_locked_until`) to `assurance_accounts`, incremented under the existing account lock and
+  reset on success; after e.g. 10 consecutive failures require a passkey or recovery code (or apply an exponential delay),
+  notify the user via `engagement.notify`, and audit `auth.totp.locked`. Recovery codes (128-bit random) need no such limit.
+
+### A-2..A-4 (Info)
+- A-2: authenticator data backup flags (BE/BS, `credentialDeviceType`, `credentialBackedUp`) are neither stored nor used
+  (`passkeys.ts:96-114`). Synced passkeys are therefore accepted silently; storing the flags would let the audit center
+  and a future policy distinguish device-bound from synced credentials.
+- A-3: `window: 1` accepts the next step; using it advances `lastTotpStep`, so the legitimate user's current-step code is then
+  refused as replay for up to 30 s (`factors.ts:62`). Usability only; consider `window` past-only (−1..0).
+- A-4: `beginRegistration` uses the account e-mail as the WebAuthn `userName` (`factors.ts:274` → `passkeys.ts:76`), which is
+  stored on the authenticator and may be shown on shared devices. Acceptable; a customer reference would disclose less.
+
+### Checked, no issue found
+- Ceremony binding: challenges are hashed, bound to user + session + purpose (unique index), 2-minute TTL, created and taken
+  under the per-account `FOR UPDATE` lock, deleted on take, and the deletion commits even for invalid proofs (callers return
+  `null`/`false` inside the transaction and throw only after commit) — single use holds for challenge, step-up, recovery-reissue
+  and registration.
+- Origin / RP ID: `expectedOrigin` = canonical origin, `expectedRPID` = canonical hostname; `crossOrigin: true` and any
+  `topOrigin` are refused before verification; alias hosts redirect, so no second RP ID exists.
+- User verification `required` in options and enforced (`requireUserVerification: true`) for registration and assertion;
+  attestation `none` with `fmt === "none"` enforced; algorithms limited to ES256/EdDSA/RS256; `excludeCredentials` and a
+  10-key limit re-checked inside the lock; global credential uniqueness by blind index + unique key.
+- Credential lookup is scoped to the session's user; `userHandle`, when present, must equal the user's publicId.
+- Signature counter: verified with the library counter at 0, then a stored counter > 0 requires a strictly greater signed
+  counter; regressions are denied and audited (`auth.passkey.counter_regression`). Counterless (0/0) authenticators work.
+- TOTP replay: the matched step must be strictly greater than `last_totp_step`, updated in the same locked transaction;
+  enrolment binds the pending secret to the session, expires in 10 minutes, and seeds `last_totp_step` on confirmation.
+- Recovery codes: 10 × 128-bit random, stored only as keyed `hashToken` bound to the user id, format-validated before hashing;
+  redemption is a conditional `UPDATE … WHERE used_at IS NULL` with `affectedRows === 1` under the account lock (safe under
+  concurrency); regeneration deletes the old set and resets acknowledgement; use triggers an in-app notification and audit.
+- Step-up verifies the password against the locked current credential, then the factor, in one transaction.
