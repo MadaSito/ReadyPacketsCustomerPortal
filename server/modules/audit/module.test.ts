@@ -306,6 +306,12 @@ describe("audit center (real MySQL, real emitter)", () => {
       expect(cp.seq).toBeGreaterThan(0);
       expect(await countEvents("audit.checkpoint.created")).toBe(1);
       expect((await mod.listCheckpoints(admin))[0]?.id).toBe(cp.publicId);
+      // Off-host custody: the event (as forwarded externally) carries seq + head link of the checkpoint.
+      await mod.sealPending();
+      const batch = await mod.readEventsAfter(null, 1000);
+      const ev = batch.events.find((e) => e.event_name === "audit.checkpoint.created")!;
+      const external = mod.projectForExternal(ev);
+      expect(external.attributes).toMatchObject({ checkpoint_seq: cp.seq, checkpoint_reason: "manual", head_link_hmac_sha256: cp.headHash });
     });
   });
 

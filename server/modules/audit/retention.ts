@@ -12,6 +12,7 @@
  */
 import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { notFound, validation } from "../../core/errors.js";
+import { checkpointWithEvent } from "./integrity.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
 import { AUDIT_CATEGORIES, type AuditCategory, type SessionPrincipal } from "../../core/types.js";
 import { neutraliseControl } from "../../observability/redact.js";
@@ -281,7 +282,7 @@ export async function runRetention(ctx: AuditCtx, options: { dryRun: boolean; re
     const total = Object.values(counts).reduce((a, b) => a + b, 0);
     if (!options.dryRun && total > 0) {
       await ctx.chain.sealPending();
-      checkpointId = (await ctx.chain.createCheckpoint("retention")).publicId;
+      checkpointId = (await checkpointWithEvent(ctx, "retention")).publicId;
     }
   } catch (error) {
     status = "failed";

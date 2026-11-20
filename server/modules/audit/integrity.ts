@@ -1,6 +1,6 @@
 /** Integrity administration: status, verify, checkpoints. Owner: audit engineer. */
 import { desc } from "drizzle-orm";
-import type { SessionPrincipal } from "../../core/types.js";
+import type { AuditEventInput, SessionPrincipal, Tx } from "../../core/types.js";
 import { actorOf, assertActorCurrent, assertAuditCapability, type AuditCtx } from "./access.js";
 import { lockGate } from "./retention.js";
 import { HORIZON_MS, type ChainVerification } from "./chain.js";
@@ -95,19 +95,37 @@ export async function createCheckpointAsAdmin(ctx: AuditCtx, principal: SessionP
     // Gate first (uniform lock order: chain head, then user row).
     await lockGate(tx, "share");
     await assertActorCurrent(ctx, principal, tx, "audit.retention.manage");
-    const cp = await ctx.chain.createCheckpoint("manual", tx);
+    return checkpointWithEvent(ctx, "manual", tx, actorOf(principal));
+  });
+}
+
+/**
+ * Creates a signed checkpoint and, in the SAME transaction, an `audit.checkpoint.created` event carrying the
+ * checkpoint seq and head link (HMAC-SHA256, not secret). The event is forwarded to SIEM (both keys are on the
+ * external allowlist), so an off-host copy of (seq, head link) exists for every checkpoint: compare it with
+ * `audit_checkpoints` / `audit_chain.link_hash` at that seq to detect history rewrite or truncation.
+ */
+export async function checkpointWithEvent(
+  ctx: AuditCtx,
+  reason: "manual" | "scheduled" | "retention",
+  tx?: Tx,
+  actor: NonNullable<AuditEventInput["actor"]> = { role: "system" },
+): Promise<{ publicId: string; seq: number; headHash: string }> {
+  const run = async (db: Tx) => {
+    const cp = await ctx.chain.createCheckpoint(reason, db);
     await ctx.deps.audit.record(
       {
         category: "security",
         eventName: "audit.checkpoint.created",
         action: "create",
         outcome: "completed",
-        actor: actorOf(principal),
+        actor,
         resource: { type: "audit_checkpoint", publicId: cp.publicId },
-        attributes: { checkpoint_seq: cp.seq },
+        attributes: { checkpoint_seq: cp.seq, checkpoint_reason: reason, head_link_hmac_sha256: cp.headHash },
       },
-      tx,
+      db,
     );
     return cp;
-  });
+  };
+  return tx ? run(tx) : ctx.deps.db.transaction(run);
 }

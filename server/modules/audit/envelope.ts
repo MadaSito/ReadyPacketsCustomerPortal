@@ -353,7 +353,10 @@ export const EXTERNAL_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "method", "min_severity", "mode", "next_step", "phase", "previous_status", "priority", "procedure", "profile",
   "protocol", "purpose", "record_type", "role", "scope_kind", "status", "target", "tls_mode", "to_priority", "to_role",
   "to_state", "to_status", "event_type", "derived_invoice_status", "port", "version", "version_number",
-  "revision_number", "workflow_version", "keep_last_count", "max_age_days", "tolerance_seconds",
+  "revision_number", "workflow_version", "keep_last_count", "max_age_days", "tolerance_seconds", "setting_key", "flag",
+  "kind", "template", "bucket", "dimension", "mode_from", "mode_to",
+  // Integrity custody: checkpoint position and head link, export digest (hashes, not secrets).
+  "checkpoint_seq", "checkpoint_reason", "head_link_hmac_sha256", "export_sha256",
 ]);
 
 export function projectForExternal(envelope: AuditEnvelope): ExternalAuditEvent {

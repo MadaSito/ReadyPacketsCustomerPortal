@@ -81,7 +81,7 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
   });
   deps.jobs.register(CHECKPOINT_JOB, async () => {
     await chain.sealPending();
-    const cp = await chain.createCheckpoint("scheduled");
+    const cp = await integrity.checkpointWithEvent(ctx, "scheduled");
     return { outcome: "completed", safeCounts: { seq: cp.seq } };
   });
   deps.jobs.register<{ exportId?: unknown }>(exportsSvc.EXPORT_JOB, (job) => exportsSvc.generateExport(ctx, job));
