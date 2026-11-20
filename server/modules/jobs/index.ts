@@ -1,24 +1,28 @@
-/**
- * Jobs module — public service surface and factory. Owner: jobs module engineer.
- * Other modules import TYPES from here and reach the instance through `deps.services.jobs` at call time.
- */
 import type { ModuleDeps } from "../../container.js";
-import type { ModuleLifecycle } from "../../core/types.js";
+import { DomainError } from "../../core/errors.js";
+import { createJobsAdmin } from "./admin.js";
+import { mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
+import { engineFor, ensureMaintenanceGate } from "./queue.js";
+import { startWorker, type WorkerHandle } from "./worker.js";
 
-export interface WorkerHandle {
-  /** Stops claiming, lets running jobs reach a durable boundary (bounded), then resolves. */
-  stop(): Promise<void>;
-}
+export type { WorkerHandle } from "./worker.js";
+export type JobsModule = ReturnType<typeof createJobsAdmin> & { startWorker(): Promise<WorkerHandle> };
 
-export interface JobsModule extends ModuleLifecycle {
-  /** Starts the claim/heartbeat/scheduler loops for this process. */
-  startWorker(): Promise<WorkerHandle>;
-}
-
-export function createJobsModule(_deps: ModuleDeps): JobsModule {
+export function createJobsModule(deps: ModuleDeps): JobsModule {
+  const mailer = mailEngineFor(deps.mailer);
+  // Call these ports lazily, after the container has attached peer modules.
+  mailer?.registerDelivery({
+    findRecipient: (userId) => deps.services.identity.getUser(userId),
+    send: (message): Promise<SmtpDeliveryResult> => deps.services.integrations.smtp.send(message),
+  });
+  let worker: WorkerHandle | undefined;
   return {
+    ...createJobsAdmin(deps),
     async startWorker() {
-      throw new Error("NOT_IMPLEMENTED: startWorker (jobs engineer)");
+      const engine = engineFor(deps.jobs);
+      if (!engine) throw new DomainError("UNAVAILABLE", "JOB_QUEUE_UNAVAILABLE", "The durable job queue is unavailable.");
+      await ensureMaintenanceGate(deps);
+      return worker ??= startWorker(engine);
     },
   };
 }

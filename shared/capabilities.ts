@@ -48,6 +48,7 @@ export const CAPABILITIES = [
   "integrations.manage",
   "jobs.read",
   "jobs.manage",
+  "jobs.mail.capture",
   "maintenance.manage",
   // portable / backup
   "portable.export",
@@ -98,6 +99,7 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "platform.settings.manage",
   "platform.setup.run",
   "integrations.manage",
+  "jobs.mail.capture",
   "maintenance.manage",
   "portable.export",
   "portable.import",
