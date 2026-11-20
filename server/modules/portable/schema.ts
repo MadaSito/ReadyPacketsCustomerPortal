@@ -40,10 +40,12 @@ export const portableExports = mysqlTable("portable_exports", {
   publicId: publicIdColumn(),
   requestedBy: refColumn("requested_by").notNull(),
   requesterPublicId: char("requester_public_id", { length: 26 }).notNull(),
+  requesterSessionId: varchar("requester_session_id", { length: 128 }).notNull(),
   state: mysqlEnum("state", OPERATION_STATES).notNull().default("running"),
   selection: mysqlEnum("selection", ["all", "customers", "orders"]).notNull(),
   storageKey: varchar("storage_key", { length: 100 }).notNull(),
   packageId: varchar("package_id", { length: 128 }),
+  manifestSha256: char("manifest_sha256", { length: 64 }),
   sha256: char("sha256", { length: 64 }),
   size: refColumn("size"),
   counts: json("counts").$type<PortableCounts>(),
@@ -63,7 +65,10 @@ export const portableImports = mysqlTable("portable_imports", {
   storageKey: varchar("storage_key", { length: 100 }).notNull(),
   inputSha256: char("input_sha256", { length: 64 }),
   inputSize: refColumn("input_size"),
+  encryptedEscrowKey: varchar("encrypted_escrow_key", { length: 350 }),
   packageId: varchar("package_id", { length: 128 }),
+  manifestSha256: char("manifest_sha256", { length: 64 }),
+  sourceSystem: varchar("source_system", { length: 128 }),
   installationId: varchar("installation_id", { length: 63 }).notNull(),
   planDigest: char("plan_digest", { length: 64 }),
   plan: json("plan").$type<PlanSummary>(),
@@ -107,6 +112,8 @@ export const portableImportRecords = mysqlTable("portable_import_records", {
   digest: char("digest", { length: 64 }).notNull(),
   encryptedPayload: mediumtext("encrypted_payload").notNull(),
   receiptAt: utcDateTime("receipt_at"),
+  destinationKey: varchar("destination_key", { length: 100 }),
+  adoptionKey: varchar("adoption_key", { length: 100 }),
 }, (t) => [
   uniqueIndex("portable_import_record_ref_uq").on(t.importId, t.recordType, t.portableId),
   uniqueIndex("portable_import_record_position_uq").on(t.importId, t.position),
@@ -129,6 +136,7 @@ export const portableImportObjects = mysqlTable("portable_import_objects", {
 /** Serializes execution for an exact package without making a passphrase a durable dependency. */
 export const portablePackageReservations = mysqlTable("portable_package_reservations", {
   packageId: varchar("package_id", { length: 128 }).primaryKey(),
+  manifestSha256: char("manifest_sha256", { length: 64 }).notNull(),
   importId: refColumn("import_id"),
 });
 
