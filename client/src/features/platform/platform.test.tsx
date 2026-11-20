@@ -6,7 +6,8 @@ import superjson from "superjson";
 import { describe, expect, it } from "vitest";
 import type { AppRouter } from "@server/trpc/root";
 import { TRPCProvider } from "@/lib/trpc";
-import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
+import type { MeResult } from "@/lib/authApi";
+import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { ImportPreviewView } from "./pages/ConfigTransferPage";
 import FeaturesPage from "./pages/FeaturesPage";
 import HealthPage from "./pages/HealthPage";
@@ -16,6 +17,7 @@ import SetupPage from "./pages/SetupPage";
 import ConfigTransferPage from "./pages/ConfigTransferPage";
 import { editorKind, parseEditorValue } from "./model";
 import { platformFeature } from "./routes";
+import SystemHealthWidget from "./widgets/SystemHealthWidget";
 
 const date = new Date("2026-11-20T12:00:00.000Z");
 type Handler = (input: unknown) => unknown;
@@ -23,7 +25,7 @@ class Refuse {
   constructor(readonly code: string, readonly httpStatus: number) {}
 }
 
-function renderConsole(page: ReactElement, records: Record<string, Handler>, calls: { path: string; input: unknown }[] = []) {
+function renderConsole(page: ReactElement, records: Record<string, Handler>, calls: { path: string; input: unknown }[] = [], role?: "admin" | "staff") {
   const queryClient = createTestQueryClient();
   const client = createTRPCClient<AppRouter>({
     links: [httpBatchLink({
@@ -48,7 +50,9 @@ function renderConsole(page: ReactElement, records: Record<string, Handler>, cal
       },
     })],
   });
-  return renderUi(page, { queryClient, wrapper: (ui) => <TRPCProvider trpcClient={client} queryClient={queryClient}>{ui}</TRPCProvider> });
+  const me = (r: "admin" | "staff"): MeResult => ({ user: { publicId: "u1", role: r, name: "Avery Example", email: "a@example.test", status: "active" }, state: "full", pendingSteps: [], nextStep: null });
+  const api = role ? fakeAuthApi({ me: async () => me(role) }) : undefined;
+  return renderUi(page, { queryClient, ...(api ? { api } : {}), wrapper: (ui) => <TRPCProvider trpcClient={client} queryClient={queryClient}>{ui}</TRPCProvider> });
 }
 
 const view = (over: Record<string, unknown>) => ({
@@ -193,6 +197,45 @@ describe("platform console", () => {
     expect(screen.getByText("Not authenticated")).toBeInTheDocument();
     expect(screen.getAllByText("Not recognised by this version").length).toBeGreaterThan(0);
     await expectNoAxeViolations();
+  });
+
+  it("system health widget: capability-gated console card with counts, setup summary for admins, errors and empty state", async () => {
+    const widget = platformFeature.widgets?.find((w) => w.key === "platform.system_health");
+    expect(widget).toMatchObject({ area: "console", access: "staff", capability: "platform.health.read", span: 4 });
+    const comp = (component: string, state: string) => ({ component, state, summary: "Synthetic.", checkedAt: date });
+    const health = { state: "degraded", checkedAt: date, components: [comp("db", "ok"), comp("keys", "ok"), comp("mail", "degraded"), comp("siem", "not_configured")] };
+    const checklist = [
+      { id: "admin_mfa", state: "complete", summary: "Done.", required: true },
+      { id: "smtp", state: "incomplete", summary: "Configure.", required: false },
+      { id: "backups", state: "not_configured", summary: "Configure.", required: false },
+    ];
+    const calls: { path: string; input: unknown }[] = [];
+    const admin = renderConsole(<SystemHealthWidget />, { "platform.admin.health": () => health, "platform.admin.setupChecklist": () => checklist }, calls, "admin");
+    expect(screen.getByRole("heading", { level: 2, name: "System health" })).toBeInTheDocument();
+    expect(await screen.findByText("Degraded", { selector: "span" })).toBeInTheDocument();
+    expect(await screen.findByText("Required setup complete")).toBeInTheDocument();
+    expect(screen.getByText("2 recommended items open")).toBeInTheDocument();
+    const stat = (label: string) => screen.getByText(label, { selector: "p" }).nextElementSibling?.textContent;
+    expect([stat("Healthy"), stat("Not configured")]).toEqual(["2", "1"]);
+    expect(screen.getByRole("link", { name: "View health" })).toHaveAttribute("href", "/admin/health");
+    expect(screen.getByRole("link", { name: "Setup checklist" })).toHaveAttribute("href", "/admin/setup");
+    expect(screen.getAllByRole("heading")).toHaveLength(1);
+    await expectNoAxeViolations(admin.container);
+    admin.unmount();
+
+    const staffCalls: { path: string; input: unknown }[] = [];
+    const staff = renderConsole(<SystemHealthWidget />, { "platform.admin.health": () => ({ ...health, state: "ok", components: [] }) }, staffCalls, "staff");
+    expect(await screen.findByText("No components have reported health yet.")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Setup checklist" })).toBeNull();
+    expect(staffCalls.map((c) => c.path)).not.toContain("platform.admin.setupChecklist");
+    await expectNoAxeViolations(staff.container);
+    staff.unmount();
+
+    const failed = renderConsole(<SystemHealthWidget />, { "platform.admin.health": () => new Refuse("UNAVAILABLE", 503), "platform.admin.setupChecklist": () => checklist }, [], "admin");
+    expect(await screen.findByRole("button", { name: /try again|retry/i })).toBeInTheDocument();
+    expect(screen.queryByText("Healthy", { selector: "p" })).toBeNull();
+    await expectNoAxeViolations(failed.container);
+    failed.unmount();
   });
 
   it("editor helpers pick a control and validate input", () => {
