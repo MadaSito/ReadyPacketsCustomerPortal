@@ -50,9 +50,12 @@ sessions: {
   revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx }): Promise<number>;
   /** Locks users row FOR UPDATE, then the session row FOR UPDATE; throws UNAUTHENTICATED SESSION_NOT_CURRENT if
    *  revoked/expired/user not active. Use at the start of authenticated credential mutators. */
-  assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<{ pendingSteps: TransitionStep[] }>;
+  assertCurrent(principal: SessionPrincipal, tx: Tx): Promise<{
+    pendingSteps: TransitionStep[]; role: UserRole; stepUpAt: Date | null; mfaVerifiedAt: Date | null;
+  }>;
   // also rejects if the persisted role or csrfSecret differs from the principal (in-flight rotation/role change);
-  // returns pendingSteps re-derived inside tx (assurance.getAssuranceState(userId, tx)).
+  // returns PERSISTED authority re-derived inside tx (assurance.getAssuranceState(userId, tx)). Session-policy
+  // settings are read through `tx` (never a second pool connection while a transaction is held).
   /** Service-internal (workers): current state of a session by PUBLIC id, without its token. */
   getState(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{
     sessionId: string; userId: number; userPublicId: string; role: UserRole; userStatus: UserStatus;
@@ -70,7 +73,12 @@ transitions: {
 
 createPendingCustomer(input: {
   email: string; name: string; customerRef?: string | null; publicId?: string;   // publicId = preserve portable identity
+  createdAt?: Date;                                                                 // preserve archive creation time
 }, opts: { tx: Tx }): Promise<{ userId: number; publicId: string; customerRef: string }>;
+
+isCustomerRefAvailable(reference: string, tx?: DbOrTx): Promise<boolean>;  // false for current OR retired references
+
+// CustomerListItem = { publicId, customerRef, name, email, status, role, emailVerified, createdAt }
 // status pending_activation, role customer (never admin/staff), NO password/MFA/session material.
 // Throws CONFLICT EMAIL_IN_USE / REFERENCE_IN_USE (incl. retired references) / PUBLIC_ID_IN_USE.
 
@@ -100,11 +108,11 @@ limitation: no substring search on encrypted names.
 | `register` | public (`auth_high_risk`) | `{ email, name, password }` → `{ accepted: true, previewLink? }` (uniform, never reveals existence) |
 | `signIn` | public (`user_login`) | `{ email, password }` → `{ nextStep: TransitionStep \| null }` + session issued via transport |
 | `verifyEmail` | public (`auth_high_risk`) | `{ token }` → `{ verified: true }` (rotates the caller's session if present) |
-| `requestPasswordReset` | public (`auth_high_risk`) | `{ email }` → `{ accepted: true, previewLink? }` |
+| `requestPasswordReset` | public (`auth_high_risk`) | `{ email }` → `{ accepted: true }` — identical in EVERY profile, never a link. Enqueues job `identity.password_reset.dispatch` `{ emailIndex }` + `attempted` audit in one tx; the retry-safe handler locks the user, checks active + local + 60 s cooldown, issues the token and queues mail |
 | `resetPassword` | public (`auth_high_risk`) | `{ token, password }` → `{ reset: true }` (revokes ALL sessions; user signs in again) |
 | `activateAccount` | public (`auth_high_risk`) | `{ token, password }` → `{ activated: true }` (invitation; verifies e-mail) |
 | `me` (query) | session | → `{ user: { publicId, role, name, email, customerRef, status }, state, pendingSteps, nextStep }` |
-| `resendVerification` | session | → `{ accepted: true, previewLink? }` (throttled) |
+| `resendVerification` | session | → `{ accepted: true, previewLink? }` (throttled; eligibility + 60 s cooldown under the users row lock; preview link is the caller's own) |
 | `changePassword` | session (only when full or nextStep = `change_password`) | `{ currentPassword, newPassword }` → `{ nextStep }` (revokes other sessions, rotates current) |
 | `signOut` | public | → `{ ok: true }` (revokes server-side session if any + transport.clear) |
 | `profile.update` | protected | `{ name }` → `{ ok }` |
@@ -136,21 +144,34 @@ limitation: no substring search on encrypted names.
 | `auth.password_changed` | — | — | notice |
 
 Tokens: 256-bit random, stored only as `crypto.hashToken`, single-use, newest-only per (user,purpose).
-Preview profile ONLY: `previewLink` is returned in responses so the sandbox demo can proceed without SMTP.
+`previewLink` (relative app path, e.g. `/activate?token=…`) exists ONLY when `deploymentProfile === "preview"`, and only for:
+(a) the verification link in the response to the `register` call that just created that account (and the
+caller's own `resendVerification`), and (b) links created by an authenticated administrator action (invitation,
+admin-initiated set-password) returned to that administrator. Never for `requestPasswordReset`, never in
+`test`/`production` (negative tests in `identity.test.ts`). Mail idempotency key: `identity.token:<tokenId>`.
 
 ## Audit events (category security unless stated)
 `auth.register.requested`, `auth.login.succeeded|failed|refused`, `auth.logout`, `auth.email.verified`,
-`auth.password.reset_requested|reset_completed|changed|set_by_admin`, `auth.session.rotated|revoked|revoked_all`,
+`auth.password.reset_requested` (outcome attempted), `auth.password.reset_dispatch` (system; completed/refused), `auth.password.reset_completed|changed|set_by_admin`, `auth.session.rotated|revoked|revoked_all`,
 `admin.customer.created|status_changed|reference_changed|invitation_sent` (admin), `admin.staff.created|role_changed` (admin),
 `identity.customer.imported_pending` (portable_transfer).
 
 ## Lock ordering (all modules)
-`users` row → `user_sessions` row(s) → `identity_tokens` → other modules' rows (e.g. assurance account).
-Identity never locks another module's rows. Admin flows lock the TARGET users row first.
+`users` row(s) → `user_sessions` row(s) → `identity_tokens` → other modules' rows (e.g. assurance account).
+Identity never locks another module's rows. Admin mutations lock the ACTOR and TARGET users rows together in
+ascending `users.id` order (`SELECT … WHERE id IN (…) ORDER BY id FOR UPDATE`), then call `assertCurrent` and
+re-check: no pending steps, persisted role grants the capability, persisted step-up ≤ 10 min for
+`STEP_UP_CAPABILITIES`. Last-admin checks lock the candidate set (`role=admin AND status=active FOR UPDATE`).
+Password rehash is compare-and-set on the verified hash (`WHERE id AND password_hash = <old> AND status = active`).
 
 ## Settings keys
-`identity.session.idleMinutes` (default 30, 5–240), `identity.session.absoluteHours` (default 12, 1–72),
-`identity.login.maxFailures` (default 10 per 15 min per account).
+`identity.session.idle_minutes` (default 30), `identity.session.absolute_hours` (default 12),
+`identity.registration.enabled` (default true). Sign-in throttling is the rate limiter's `user_login` category
+(keys `acct:<emailIndex>`; the HTTP layer adds the client-address key); other public flows use `auth_high_risk`.
+
+## Jobs
+`identity.password_reset.dispatch` — payload `{ emailIndex }` only (no address, no auth material);
+idempotency key `<emailIndex>:<minute slot>`; `retrySafe: true` (pure DB work + transactional outbox mail).
 
 ## Health
 `identity.sessions` — ok + active session count.
