@@ -9,7 +9,7 @@
  * Session transport is handled in `sessionTransport.ts`; feature code never touches tokens.
  */
 import { QueryClient } from "@tanstack/react-query";
-import { createTRPCClient, httpBatchLink, type TRPCClientErrorLike } from "@trpc/client";
+import { createTRPCClient, httpBatchLink, type TRPCClientErrorLike, type TRPCLink } from "@trpc/client";
 import { createTRPCContext } from "@trpc/tanstack-react-query";
 import superjson from "superjson";
 import type { AppRouter } from "@server/trpc/root";
@@ -36,9 +36,23 @@ export function createQueryClient(): QueryClient {
   });
 }
 
+/**
+ * Infinite queries make the tRPC client add a `direction` field ("forward" | "backward") to the input.
+ * No server procedure declares it, and server inputs are strict (unknown fields are rejected), so it is
+ * removed here, in one place, instead of loosening validation on every paged procedure.
+ */
+export const dropInfiniteDirectionLink: TRPCLink<AppRouter> = () => ({ op, next }) => {
+  const input: unknown = op.input;
+  if (op.type !== "query" || typeof input !== "object" || input === null || Array.isArray(input)) return next(op);
+  const record = input as Record<string, unknown>;
+  if (record.direction !== "forward" && record.direction !== "backward") return next(op);
+  const { direction: _direction, ...rest } = record;
+  return next({ ...op, input: rest });
+};
+
 export function createApiClient() {
   return createTRPCClient<AppRouter>({
-    links: [httpBatchLink({ url: apiUrl("/api/trpc"), transformer: superjson, maxItems: 10, fetch: sessionFetch })],
+    links: [dropInfiniteDirectionLink, httpBatchLink({ url: apiUrl("/api/trpc"), transformer: superjson, maxItems: 10, fetch: sessionFetch })],
   });
 }
 
