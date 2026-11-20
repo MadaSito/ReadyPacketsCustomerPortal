@@ -40,7 +40,9 @@ export default function RecentOrdersWidget() {
                   {order.reference} · updated <DateTime value={order.updatedAt} format="relative" />
                 </span>
               </span>
-              <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
+              <span className="w-fit shrink-0 self-start sm:self-center">
+                <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
+              </span>
             </li>
           ))}
         </ul>
