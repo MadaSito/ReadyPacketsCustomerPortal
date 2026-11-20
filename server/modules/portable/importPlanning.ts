@@ -1,10 +1,11 @@
 import { and, eq } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { validation } from "../../core/errors.js";
+import { customerRefSchema, emailSchema } from "../identity/normalize.js";
 import { canonical, digest } from "./custody.js";
 import { portableMappings, type PlanSummary } from "./schema.js";
 import { TRANSFER_MAX_RECORDS } from "./transferPolicy.js";
-import { customerName, fileCategory, projectedOrder, selectLiveVersions, stringField, targetDate } from "./importShapes.js";
+import { customerCreatedAt, customerName, fileCategory, projectedOrder, selectLiveVersions, stringField, targetDate } from "./importShapes.js";
 
 export type JsonRecord = Record<string, unknown> & { publicId: string };
 export interface PortableInputRecord { type: string; record: JsonRecord }
@@ -45,10 +46,21 @@ export async function buildPlan(deps: ModuleDeps, args: {
   if (args.records.length > TRANSFER_MAX_RECORDS) {
     throw validation("PORTABLE_RECORD_LIMIT", "The package exceeds the installation's transfer record limit.");
   }
+  if (!args.records.length) throw validation("PORTABLE_EMPTY_PACKAGE", "The transfer package does not contain any records.");
   return deps.db.transaction(async (tx) => {
     const { parents, latest, duplicated } = selectLiveVersions(args.records);
     const orderItems = groupChildren(args.records, "order-items");
     const orderHistory = groupChildren(args.records, "order-status-history");
+    const customerFieldCounts = new Map<string, number>();
+    const knownStatuses = new Map<string, boolean>();
+    for (const item of args.records) {
+      if (item.type !== "customers") continue;
+      const email = emailSchema.safeParse(item.record.email);
+      const ref = customerRefSchema.safeParse(item.record.customerNumber);
+      for (const key of [email.success ? `email:${email.data}` : null, ref.success ? `ref:${ref.data}` : null]) {
+        if (key) customerFieldCounts.set(key, (customerFieldCounts.get(key) ?? 0) + 1);
+      }
+    }
     const existing = await tx.select().from(portableMappings)
       .where(eq(portableMappings.packageId, args.packageId)).limit(TRANSFER_MAX_RECORDS + 1);
     if (existing.length > TRANSFER_MAX_RECORDS) throw validation("PORTABLE_RECORD_LIMIT", "The package exceeds the transfer record limit.");
@@ -76,18 +88,27 @@ export async function buildPlan(deps: ModuleDeps, args: {
         step.disposition = "hold";
         step.reason = EVIDENCE_TYPES.has(item.type) ? "PORTABLE_HISTORICAL_EVIDENCE" : "PORTABLE_OPTIONAL_EXTENSION";
       } else if (item.type === "customers") {
-        const email = item.record.email;
-        if (typeof email !== "string") {
+        const email = emailSchema.safeParse(item.record.email);
+        const reference = customerRefSchema.safeParse(item.record.customerNumber);
+        if (!email.success) {
           step.disposition = "conflict";
           step.reason = "PORTABLE_CUSTOMER_EMAIL_REQUIRED";
+        } else if (item.record.customerNumber != null && !reference.success) {
+          step.disposition = "conflict";
+          step.reason = "PORTABLE_CUSTOMER_REF_INVALID";
+        } else if ((customerFieldCounts.get(`email:${email.data}`) ?? 0) > 1 ||
+          (reference.success && (customerFieldCounts.get(`ref:${reference.data}`) ?? 0) > 1)) {
+          step.disposition = "conflict";
+          step.reason = "PORTABLE_DUPLICATE_CUSTOMER_IDENTIFIERS";
         } else {
-          const collision = await deps.services.identity.findUserIdByEmail(email, { tx });
+          const collision = await deps.services.identity.findUserIdByEmail(email.data, { tx });
           const idCollision = await deps.services.identity.getUserByPublicId(item.record.publicId, { tx });
-          if (collision || idCollision) {
+          const refCollision = reference.success && !(await deps.services.identity.isCustomerRefAvailable(reference.data, tx));
+          if (collision || idCollision || refCollision) {
             step.disposition = "conflict";
-            step.reason = collision ? "PORTABLE_EMAIL_COLLISION" : "PORTABLE_PUBLIC_ID_COLLISION";
+            step.reason = collision ? "PORTABLE_EMAIL_COLLISION" : idCollision ? "PORTABLE_PUBLIC_ID_COLLISION" : "PORTABLE_CUSTOMER_REF_COLLISION";
           } else {
-            try { customerName(item.record); targetDate(item.record.createdAt); }
+            try { customerName(item.record); customerCreatedAt(item.record.createdAt); }
             catch { step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_POLICY"; }
           }
         }
@@ -98,8 +119,21 @@ export async function buildPlan(deps: ModuleDeps, args: {
           step.disposition = "conflict";
           step.reason = order ? "PORTABLE_ORDER_PROVENANCE_COLLISION" : "PORTABLE_OWNER_NOT_PLANNED";
         } else {
-          try { projectedOrder(item.record, orderItems.get(item.record.publicId) ?? [], orderHistory.get(item.record.publicId) ?? []); }
+          try {
+            const fields = projectedOrder(item.record, orderItems.get(item.record.publicId) ?? [], orderHistory.get(item.record.publicId) ?? []);
+            const check = deps.services.orders.preflightImportOrder({
+              ...fields, importId: args.packageId, sourceInstallationId: args.sourceSystem, sourceOrderPublicId: item.record.publicId,
+              // A dry run can validate the record shape without allocating a target customer row.
+              targetOwnerUserId: 1, editable: false,
+            });
+            if (!check.ok) { step.disposition = "conflict"; step.reason = `PORTABLE_${check.reasonCode}`; }
+          }
           catch { step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_POLICY"; }
+          if (step.disposition === "create") {
+            const status = stringField(item.record.status);
+            if (!knownStatuses.has(status)) knownStatuses.set(status, await deps.services.orders.isPortableStatusSupported(status, tx));
+            if (!knownStatuses.get(status)) { step.disposition = "conflict"; step.reason = "PORTABLE_ORDER_STATUS_UNSUPPORTED"; }
+          }
         }
       } else if (item.type === "files") {
         if (duplicated.has(item.record.publicId)) {
@@ -109,7 +143,11 @@ export async function buildPlan(deps: ModuleDeps, args: {
         } else if (selected.get(`orders:${String(item.record.orderPublicId)}`)?.disposition !== "create") {
           step.disposition = "conflict"; step.reason = "PORTABLE_FILE_ORDER_NOT_PLANNED";
         } else {
-          try { fileCategory(item.record.category); }
+          try {
+            fileCategory(item.record.category);
+            if (typeof item.record.visibleToCustomer !== "boolean") throw validation("PORTABLE_TARGET_POLICY", "Invalid source visibility.");
+            targetDate(item.record.createdAt);
+          }
           catch { step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_POLICY"; }
         }
       } else if (item.type === "file-versions") {
@@ -120,6 +158,9 @@ export async function buildPlan(deps: ModuleDeps, args: {
           step.disposition = "hold"; step.reason = "PORTABLE_HISTORICAL_FILE";
         } else if (args.filePolicyRefusals?.has(item.record.publicId)) {
           step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_FILE_POLICY";
+        } else {
+          try { targetDate(item.record.createdAt); }
+          catch { step.disposition = "conflict"; step.reason = "PORTABLE_TARGET_POLICY"; }
         }
       } else if ((item.type === "order-items" || item.type === "order-status-history") &&
         selected.get(`orders:${String(item.record.orderPublicId)}`)?.disposition !== "create") {

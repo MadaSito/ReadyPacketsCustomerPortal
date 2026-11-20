@@ -6,7 +6,7 @@ import type { JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { CustodyError, decryptEscrow, digest, matchBytes, readExactObject } from "./custody.js";
 import { type ImportJob, type ImportRow, lockImport, readImport, transition } from "./importLedger.js";
 import { computePlanDigest, groupChildren, type JsonRecord, mappedRecord } from "./importPlanning.js";
-import { customerName, fileCategory, numberField, projectedOrder, stringField, targetDate } from "./importShapes.js";
+import { customerCreatedAt, customerName, fileCategory, numberField, projectedOrder, stringField, targetDate } from "./importShapes.js";
 import {
   portableImportObjects, portableImportRecords, portableMappings, portablePackageReservations,
   type ReconciliationReport,
@@ -181,7 +181,8 @@ export function createImportWorker(deps: ModuleDeps) {
             } else if (entry.recordType === "customers") {
               const customer = await deps.services.identity.createPendingCustomer({
                 email: stringField(entry.record.email), name: customerName(entry.record), publicId: entry.portableId,
-                createdAt: targetDate(entry.record.createdAt),
+                createdAt: customerCreatedAt(entry.record.createdAt),
+                customerRef: typeof entry.record.customerNumber === "string" ? entry.record.customerNumber : null,
               }, { tx });
               await receipt(tx, row, job, entry, { id: customer.userId, publicId: customer.publicId });
             } else if (entry.recordType === "orders") {
@@ -236,6 +237,7 @@ export function createImportWorker(deps: ModuleDeps) {
                 displayName: stringField(entry.record.originalName), category: fileCategory(file.record.category),
                 contentType: stringField(entry.record.mediaType), stagedObject: staging, destinationKey: entry.destinationKey,
                 visibility: file.record.visibleToCustomer === true ? "customer_visible" : "staff_only",
+                createdAt: targetDate(entry.record.createdAt),
               }, tx);
               await receipt(tx, row, job, file, { publicId: adopted.logicalPublicId });
               await receipt(tx, row, job, entry, { publicId: adopted.publicId });
@@ -268,38 +270,56 @@ export function createImportWorker(deps: ModuleDeps) {
       }
       for (const entry of data) {
         job.signal.throwIfAborted();
-        const result = await fenced(job, initial, async (tx, row, principal) => {
+        const checked = await fenced(job, initial, async (tx, row, principal) => {
           const mapping = await readMapping(tx, row, entry.recordType, entry.portableId);
           if (!mapping || mapping.sourceDigest !== entry.digest) return false;
           if (entry.disposition === "hold" || !mapping.localPublicId) return mapping.localPublicId === null && entry.disposition !== "create";
           if (entry.recordType === "customers") {
             const user = await deps.services.identity.getUserByPublicId(mapping.localPublicId, { tx });
+            const sourceDate = customerCreatedAt(entry.record.createdAt);
             return user?.role === "customer" && user.id === mapping.localId &&
-              user.createdAt.getTime() === targetDate(entry.record.createdAt).getTime();
+              (!sourceDate || user.createdAt.getTime() === sourceDate.getTime());
           }
           if (entry.recordType === "orders") {
             const customer = await readMapping(tx, row, "customers", stringField(entry.record.customerPublicId));
             const order = await deps.services.orders.findImportedOrder(expected.sourceSystem, entry.portableId, tx);
+            const source = projectedOrder(entry.record, items.get(entry.portableId) ?? [], history.get(entry.portableId) ?? []);
             return Boolean(order && order.id === mapping.localId && order.publicId === mapping.localPublicId &&
               order.ownerUserId === customer?.localId && order.lockState === "imported_read_only" &&
-              order.createdAt.getTime() === targetDate(entry.record.createdAt).getTime() && order.currency === entry.record.currency);
+              order.createdAt.getTime() === source.createdAt.getTime() && order.currency === source.currency &&
+              order.totalMinor === source.totalMinor && (order.submittedAt?.getTime() ?? null) === (source.submittedAt?.getTime() ?? null));
           }
           if (entry.recordType === "file-versions") {
             const file = ref.get(`files:${stringField(entry.record.filePublicId)}`);
             const order = file ? await readMapping(tx, row, "orders", stringField(file.record.orderPublicId)) : null;
             if (!order?.localPublicId) return false;
-            const opened = await deps.services.files.openForExport(principal, mapping.localPublicId, order.localPublicId);
-            const hash = createHash("sha256");
-            let size = 0;
-            for await (const chunk of opened.stream as AsyncIterable<Buffer>) {
-              size += chunk.length;
-              if (size > numberField(entry.record, "sizeBytes")) throw new CustodyError();
-              hash.update(chunk);
+            const opened = await deps.services.files.openForExport(principal, mapping.localPublicId, order.localPublicId, tx);
+            const visible = opened.file.visibility === "customer_visible";
+            if (opened.file.deletedAt || opened.file.supersededAt || visible !== file?.record.visibleToCustomer ||
+              opened.file.createdAt.getTime() !== targetDate(entry.record.createdAt).getTime()) {
+              opened.stream.destroy();
+              return false;
             }
-            return size === numberField(entry.record, "sizeBytes") && hash.digest("hex") === entry.record.sha256;
+            return opened.stream;
           }
           return true;
         });
+        let result: boolean;
+        if (typeof checked === "boolean") {
+          result = checked;
+        } else {
+          // Hash outside the SQL transaction; final reconciliation still commits under a fresh fence.
+          const hash = createHash("sha256");
+          const expectedSize = numberField(entry.record, "sizeBytes");
+          let size = 0;
+          for await (const chunk of checked as AsyncIterable<Buffer>) {
+            job.signal.throwIfAborted();
+            size += chunk.length;
+            if (size > expectedSize) throw new CustodyError();
+            hash.update(chunk);
+          }
+          result = size === expectedSize && hash.digest("hex") === entry.record.sha256;
+        }
         if (!result) report.discrepancies += 1;
         if (entry.disposition === "link") report.linked += 1;
         if (entry.disposition === "create") report.imported += 1;

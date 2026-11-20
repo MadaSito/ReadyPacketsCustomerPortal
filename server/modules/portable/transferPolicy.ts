@@ -1,5 +1,5 @@
 import type { ModuleDeps } from "../../container.js";
-import type { SessionPrincipal } from "../../core/types.js";
+import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 
@@ -57,6 +57,15 @@ export async function authorizeTransfer(
 export async function assertNotDraining(deps: ModuleDeps) {
   if (await deps.services.jobAdmin.isDraining()) {
     throw new DomainError("MAINTENANCE", "PORTABLE_MAINTENANCE", "New transfers are paused while the system is in maintenance.");
+  }
+}
+
+/** Lock and confirm persisted actor authority before committing a privileged change. */
+export async function assertCurrentTransferActor(deps: ModuleDeps, principal: SessionPrincipal, tx: Tx) {
+  const current = await deps.services.identity.sessions.assertCurrent(principal, tx);
+  if (current.role !== "admin" || !current.mfaVerifiedAt || current.pendingSteps.length) throw forbidden("NO_FULL_SESSION");
+  if (!current.stepUpAt || !principal.stepUpAt || current.stepUpAt < principal.stepUpAt) {
+    throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Confirm your password and authentication code to continue.");
   }
 }
 

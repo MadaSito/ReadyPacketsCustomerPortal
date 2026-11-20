@@ -1,14 +1,16 @@
 import type { FileCategory } from "../files/index.js";
 import { validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
+import { nameSchema } from "../identity/normalize.js";
 import type { JsonRecord, PortableInputRecord } from "./importPlanning.js";
 
 export function customerName(record: JsonRecord) {
   const supplied = [record.preferredName, [record.firstName, record.middleName, record.lastName, record.suffix]
     .filter((part): part is string => typeof part === "string" && Boolean(part.trim())).join(" ")].
     find((part): part is string => typeof part === "string" && Boolean(part.trim()));
-  if (!supplied || supplied.trim().length > 160) throw invalidTarget();
-  return supplied.trim();
+  const valid = nameSchema.safeParse(supplied);
+  if (!valid.success) throw invalidTarget();
+  return valid.data;
 }
 
 export function fileCategory(value: unknown): FileCategory {
@@ -25,6 +27,10 @@ export function targetDate(value: unknown): Date {
   const date = new Date(stringField(value));
   if (!Number.isFinite(date.getTime()) || date.getUTCFullYear() < 1000) throw invalidTarget();
   return date;
+}
+
+export function customerCreatedAt(value: unknown): Date | undefined {
+  return value == null ? undefined : targetDate(value);
 }
 
 export function numberField(record: JsonRecord, field: string) { return integer(record[field]); }

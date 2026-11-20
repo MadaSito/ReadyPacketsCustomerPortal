@@ -73,7 +73,7 @@ export default function Transfers() {
             ? <code className="block max-w-44 break-all text-xs">{row.sha256}</code> : "Not available" },
         ]}
         rowActions={(row) => row.state === "completed" && !row.expired
-          ? <Button variant="secondary" size="sm" leadingIcon={Download} loading={busy === row.exportId}
+          ? <Button variant="secondary" size="sm" leadingIcon={<Download aria-hidden="true" />} loading={busy === row.exportId}
             disabled={busy !== null && busy !== row.exportId} onClick={() => { void download(row.exportId); }}>Download</Button>
           : null}
       />
@@ -86,7 +86,7 @@ export default function Transfers() {
         <FileDropzone label="Choose a transfer package" accept=".rpkg,.rptransfer" maxSize={192 * 1024 * 1024}
           onFiles={(items) => setFile(items[0])} disabled={busy !== null} hint="One file. Maximum 192 MiB; older formats may have lower limits." />
         {file ? <p className="break-all text-sm text-body">Selected: {file.name}</p> : null}
-        <Button leadingIcon={Upload} disabled={!file || busy !== null} loading={busy === "upload"} onClick={() => { void upload(); }}>
+        <Button leadingIcon={<Upload aria-hidden="true" />} disabled={!file || busy !== null} loading={busy === "upload"} onClick={() => { void upload(); }}>
           Upload to quarantine
         </Button>
       </div>

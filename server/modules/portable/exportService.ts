@@ -9,7 +9,7 @@ import { CustodyError, inPrivateWorkspace, matchBytes, readExactObject, storeVal
 import { collectAndWriteExport } from "./collectors/index.js";
 import { portableExports } from "./schema.js";
 import {
-  assertNotDraining, authorizeTransfer, EXPORT_TTL_MS, pageLimit, PORTABLE_EXPORT_JOB, PORTABLE_RETENTION_JOB,
+  assertCurrentTransferActor, assertNotDraining, authorizeTransfer, EXPORT_TTL_MS, pageLimit, PORTABLE_EXPORT_JOB, PORTABLE_RETENTION_JOB,
   type ExportSelection, type PageInput,
 } from "./transferPolicy.js";
 
@@ -32,12 +32,12 @@ async function lockExport(tx: Tx, publicId: string) {
 
 export function createExportService(deps: ModuleDeps) {
   async function recordDownload(principal: SessionPrincipal, exportId: string, packageId: string | null,
-    outcome: "attempted" | "completed" | "failed" | "unknown" | "refused", reasonCode?: string) {
+    outcome: "attempted" | "completed" | "failed" | "unknown" | "refused", reasonCode?: string, tx?: Tx) {
     await deps.audit.record({
       eventName: "portable.export.download", category: "portable_transfer", action: "download", outcome,
       actor: { role: principal.role, userId: principal.userId }, resource: { type: "portable_export", publicId: exportId },
       correlationId: exportId, packageId: packageId ?? undefined, reasonCode,
-    });
+    }, tx);
   }
 
   async function publish(job: ClaimedJob<{ exportId: string }>): Promise<JobResult> {
@@ -90,14 +90,21 @@ export function createExportService(deps: ModuleDeps) {
     )).orderBy(asc(portableExports.expiresAt)).limit(100);
     let removed = 0;
     for (const row of rows) {
-      await job.assertStillOwned();
       // Expiry gates access even before deletion; retries only target this ledger's immutable key.
-      await deps.audit.record({
-        category: "portable_transfer", eventName: "portable.export.expired", action: "delete", outcome: "attempted",
-        actor: { role: "system" }, resource: { type: "portable_export", publicId: row.publicId },
-        correlationId: row.publicId, packageId: row.packageId ?? undefined, jobId: job.jobId,
+      const key = await deps.db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
+        const locked = await lockExport(tx, row.publicId);
+        if (locked.deletedAt || locked.expiresAt > deps.clock.now()) return null;
+        await deps.audit.record({
+          category: "portable_transfer", eventName: "portable.export.expired", action: "delete", outcome: "attempted",
+          actor: { role: "system" }, resource: { type: "portable_export", publicId: locked.publicId },
+          correlationId: locked.publicId, packageId: locked.packageId ?? undefined, jobId: job.jobId,
+        }, tx);
+        return locked.storageKey;
       });
-      await deps.storage.delete(row.storageKey);
+      if (!key) continue;
+      await job.assertStillOwned();
+      await deps.storage.delete(key);
       await deps.db.transaction(async (tx) => {
         await job.assertStillOwned(tx);
         const locked = await lockExport(tx, row.publicId);
@@ -148,6 +155,7 @@ export function createExportService(deps: ModuleDeps) {
       const exportId = ulid(now.getTime());
       const key = deps.storage.newKey("exports");
       await deps.db.transaction(async (tx) => {
+        await assertCurrentTransferActor(deps, principal, tx);
         await tx.insert(portableExports).values({
           publicId: exportId, requestedBy: principal.userId, requesterPublicId: principal.userPublicId,
           requesterSessionId: principal.sessionId,
@@ -164,14 +172,14 @@ export function createExportService(deps: ModuleDeps) {
         const result = await inPrivateWorkspace(async (workspace) => {
           const path = join(workspace, "output.rpkg");
           const compiled = await collectAndWriteExport(deps, principal, selection, { exportId, workspace, path, passphrase, now });
+          if (deps.clock.now().getTime() >= now.getTime() + EXPORT_TTL_MS) {
+            throw conflict("PORTABLE_EXPORT_EXPIRED", "The export request expired before its ciphertext could be stored.");
+          }
           await storeValidated(deps.storage, key, path, { size: compiled.bytes, sha256: compiled.ciphertextSha256 });
           return compiled;
         });
         return await deps.db.transaction(async (tx) => {
-          const account = await deps.services.identity.getUserByPublicId(principal.userPublicId, { tx, forUpdate: true });
-          if (!account || account.id !== principal.userId || account.role !== "admin" || account.status !== "active") {
-            throw notFound("PORTABLE_EXPORT_NOT_AVAILABLE");
-          }
+          await assertCurrentTransferActor(deps, principal, tx);
           const row = await lockExport(tx, exportId);
           if (row.state !== "running" || row.expiresAt <= deps.clock.now()) {
             throw conflict("PORTABLE_EXPORT_NOT_AVAILABLE", "The export request is no longer active.");
@@ -222,7 +230,10 @@ export function createExportService(deps: ModuleDeps) {
         await recordDownload(principal, exportId, null, "refused", "PORTABLE_EXPORT_NOT_FOUND");
         throw notFound("PORTABLE_EXPORT_NOT_FOUND");
       }
-      await recordDownload(principal, exportId, row.packageId, "attempted");
+      await deps.db.transaction(async (tx) => {
+        await assertCurrentTransferActor(deps, principal, tx);
+        await recordDownload(principal, exportId, row.packageId, "attempted", undefined, tx);
+      });
       try {
         const actual = await deps.storage.stat(row.storageKey);
         if (!actual) throw new CustodyError();

@@ -18,7 +18,7 @@ import {
   portableImportObjects, portableImportRecords, portableImports, portableImportSteps, portablePackageReservations,
 } from "./schema.js";
 import {
-  assertNotDraining, authorizeTransfer, PACKAGE_LIMITS, pageLimit, PORTABLE_IMPORT_JOB, REVIEW_TTL_MS,
+  assertCurrentTransferActor, assertNotDraining, authorizeTransfer, PACKAGE_LIMITS, pageLimit, PORTABLE_IMPORT_JOB, REVIEW_TTL_MS,
   TRANSFER_MAX_BYTES, TRANSFER_MAX_OBJECTS, TRANSFER_MAX_RECORDS, type PageInput,
 } from "./transferPolicy.js";
 
@@ -28,15 +28,6 @@ const SAFE_SOURCE = /^[a-zA-Z0-9._:-]{1,128}$/;
 
 function stateConflict() {
   return conflict("PORTABLE_PHASE_MISMATCH", "The import is not ready for that operation.");
-}
-
-function heldExtensions(value: unknown): PortableInputRecord[] {
-  if (!Array.isArray(value)) return [];
-  return (value as unknown[]).map((entry) => {
-    const encoded = canonical(entry);
-    const publicId = digest(encoded);
-    return { type: "optional-extension", record: { publicId, entry } };
-  });
 }
 
 export function createImportService(deps: ModuleDeps) {
@@ -78,6 +69,7 @@ export function createImportService(deps: ModuleDeps) {
       const importId = ulid(now.getTime());
       const storageKey = deps.storage.newKey("quarantine");
       const before = await deps.db.transaction(async (tx) => {
+        await assertCurrentTransferActor(deps, principal, tx);
         await tx.insert(portableImports).values({
           publicId: importId, submittedBy: principal.userId, installationId: deps.config.installationId,
           storageKey, createdAt: now, updatedAt: now,
@@ -99,6 +91,7 @@ export function createImportService(deps: ModuleDeps) {
         throw validation("PORTABLE_UPLOAD_INCOMPLETE", "The transfer upload did not complete. Submit a non-empty package within the upload limit.");
       }
       return deps.db.transaction(async (tx) => {
+        await assertCurrentTransferActor(deps, principal, tx);
         const current = await lockImport(tx, importId);
         const row = await transition(deps, tx, current, "quarantined", { principal }, {
           inputSize: stored.size, inputSha256: stored.sha256,
@@ -114,6 +107,7 @@ export function createImportService(deps: ModuleDeps) {
         throw validation("PORTABLE_PASSPHRASE_LENGTH", "Enter the transfer package passphrase.");
       }
       const { importId } = input;
+      await deps.db.transaction((tx) => assertCurrentTransferActor(deps, principal, tx));
       const admitted = await readImport(deps, importId);
       if (admitted.phase === "planned") return importView(admitted);
       if ((admitted.phase !== "quarantined" && admitted.phase !== "verified") || !admitted.inputSha256 || !admitted.inputSize) {
@@ -129,10 +123,15 @@ export function createImportService(deps: ModuleDeps) {
           try {
             const report = await pkg.verify();
             if (!report.ok) throw validation("PORTABLE_VERIFICATION_REFUSED", "The package failed integrity or compatibility verification.");
+            if (pkg.manifest.dependencyClosure.external.length ||
+              pkg.manifest.compatibility.requiredModules.some((module) => module !== "core")) {
+              throw validation("PORTABLE_UNSUPPORTED_REQUIRED_SCOPE", "This transfer requires records or history beyond the target import contract.");
+            }
             const packageId = pkg.manifest.packageId;
             const manifestSha256 = pkg.manifestSha256;
             const sourceSystem = pkg.manifest.sourceSystem.pseudonym;
-            if (!PACKAGE_ID.test(packageId) || !HEX64.test(manifestSha256) || !SAFE_SOURCE.test(sourceSystem)) {
+            if (!PACKAGE_ID.test(packageId) || !HEX64.test(manifestSha256) || !SAFE_SOURCE.test(sourceSystem) ||
+              pkg.ciphertextSha256 !== inputSha256) {
               throw validation("PORTABLE_PACKAGE_IDENTITY", "The package contains an unsupported identity.");
             }
             const objects = pkg.listObjects();
@@ -148,7 +147,20 @@ export function createImportService(deps: ModuleDeps) {
                 }
                 records.push({ type: entry.type, record });
               }
-              if ("heldExtensions" in report) records.push(...heldExtensions(report.heldExtensions));
+              for (const extension of report.heldExtensions) {
+                let line = 0;
+                for await (const raw of pkg.heldExtension(extension.name)) {
+                  line += 1;
+                  const entry = { name: extension.name, version: extension.version, line, raw };
+                  const encoded = canonical(entry);
+                  payloadBytes += Buffer.byteLength(encoded);
+                  if (records.length >= TRANSFER_MAX_RECORDS || payloadBytes > 16 * 1024 * 1024) {
+                    throw validation("PORTABLE_EXTENSION_LIMIT", "The package exceeds the installation's held-content limit.");
+                  }
+                  records.push({ type: "optional-extension", record: { publicId: digest(encoded), entry } });
+                }
+                if (line !== extension.count) throw new CustodyError();
+              }
               const filePolicyRefusals = new Set<string>();
               const { parents, latest } = selectLiveVersions(records);
               for (const [parentId, version] of latest) {
@@ -173,6 +185,7 @@ export function createImportService(deps: ModuleDeps) {
               }
               const plan = await buildPlan(deps, { inputSha256, packageId, manifestSha256, sourceSystem, records, objects, filePolicyRefusals });
               await deps.db.transaction(async (tx) => {
+                await assertCurrentTransferActor(deps, principal, tx);
                 const row = await lockImport(tx, importId);
                 if (row.phase !== "quarantined" || row.inputSha256 !== inputSha256) throw stateConflict();
                 const escrowKey = newEscrowKey(deps.crypto, importId);
@@ -222,6 +235,7 @@ export function createImportService(deps: ModuleDeps) {
                 if (stored.size !== object.size + 28) throw new CustodyError();
               }
               await deps.db.transaction(async (tx) => {
+                await assertCurrentTransferActor(deps, principal, tx);
                 const row = await lockImport(tx, importId);
                 if (row.phase !== "verified" || row.planDigest !== verified.planDigest) throw stateConflict();
                 await tx.update(portableImportObjects).set({ escrowCipherDigest: stored!.sha256 })
@@ -229,6 +243,7 @@ export function createImportService(deps: ModuleDeps) {
               });
             }
             return deps.db.transaction(async (tx) => {
+              await assertCurrentTransferActor(deps, principal, tx);
               const row = await lockImport(tx, importId);
               const next = await transition(deps, tx, row, "planned", { principal }, {
                 planExpiresAt: new Date(deps.clock.now().getTime() + REVIEW_TTL_MS),
@@ -267,8 +282,7 @@ export function createImportService(deps: ModuleDeps) {
       await authorizeTransfer(deps, principal, "portable.import");
       await assertNotDraining(deps);
       return deps.db.transaction(async (tx) => {
-        const current = await deps.services.identity.sessions.assertCurrent(principal, tx);
-        if (current.pendingSteps.length) throw stateConflict();
+        await assertCurrentTransferActor(deps, principal, tx);
         const row = await lockImport(tx, input.importId);
         if ((row.phase === "approved" || row.phase === "objects-prepared" || row.phase === "records-committed" ||
           row.phase === "finalized" || row.phase === "reconciled" || row.phase === "accepted") &&
@@ -303,6 +317,7 @@ export function createImportService(deps: ModuleDeps) {
     async cancel(principal: SessionPrincipal, importId: string) {
       await authorizeTransfer(deps, principal, "portable.import");
       return deps.db.transaction(async (tx) => {
+        await assertCurrentTransferActor(deps, principal, tx);
         const row = await lockImport(tx, importId);
         if (!["received", "quarantined", "verified", "planned", "canceled"].includes(row.phase)) throw stateConflict();
         return importView(await transition(deps, tx, row, "canceled", { principal, reasonCode: "PORTABLE_CANCELED" }));
@@ -313,8 +328,7 @@ export function createImportService(deps: ModuleDeps) {
       await authorizeTransfer(deps, principal, "portable.import");
       if (input.independentChecks !== true) throw stateConflict();
       return deps.db.transaction(async (tx) => {
-        const current = await deps.services.identity.sessions.assertCurrent(principal, tx);
-        if (current.pendingSteps.length) throw stateConflict();
+        await assertCurrentTransferActor(deps, principal, tx);
         const row = await lockImport(tx, input.importId);
         if (row.phase === "accepted" && row.planDigest === input.planDigest) return importView(row);
         if (row.phase !== "reconciled" || row.planDigest !== input.planDigest || !row.reconciliation ||

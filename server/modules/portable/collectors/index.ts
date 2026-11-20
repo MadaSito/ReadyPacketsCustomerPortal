@@ -4,14 +4,15 @@ import type { SessionPrincipal } from "../../../core/types.js";
 import { notFound, validation } from "../../../core/errors.js";
 import type { PortableOrder } from "../../orders/index.js";
 import type { PortableStoredFile } from "../../files/index.js";
-import { CustodyError, readExactObject } from "../custody.js";
+import type { UserRole } from "../../../../shared/domain.js";
+import { CustodyError } from "../custody.js";
 import { PACKAGE_LIMITS, TRANSFER_MAX_OBJECTS, TRANSFER_MAX_RECORDS, type ExportSelection } from "../transferPolicy.js";
 
 const ORDERS_PAGE = 100;
 const MAX_METADATA = 16 * 1024 * 1024;
 const time = (value: Date | null) => value?.toISOString() ?? null;
 const actor = (role: string) => ({
-  kind: role === "admin" || role === "staff" || role === "customer" ? role : "system" as const,
+  kind: (role === "admin" || role === "staff" || role === "customer" ? role : "system") as UserRole | "system",
   publicId: null,
 });
 
@@ -77,11 +78,10 @@ export async function collectAndWriteExport(
           discount: { amountMinor: 0, currency: order.currency }, total: { amountMinor: order.totalMinor, currency: order.currency },
           isTestOrder: false, lock: { readOnly: order.lockState !== "none", reasonCode: null },
           completionPercent: null, internalNotes: null, dueAt: null, deliveredAt: null, closedAt: null,
-          createdAt: order.createdAt.toISOString(), updatedAt: order.updatedAt.toISOString(),
+          createdAt: order.createdAt.toISOString(), updatedAt: order.updatedAt.toISOString(), submittedAt: time(order.submittedAt),
           heldUnknown: {
             sourceWorkflow: order.workflowKey,
             sourceLock: order.lockState,
-            sourceSubmittedAt: time(order.submittedAt),
             retiredOrderReferences: order.retiredReferences,
           },
         });
@@ -162,7 +162,9 @@ export async function collectAndWriteExport(
       } while (after !== undefined);
     }
     return { files, orders };
-  }, { isolationLevel: "repeatable read", accessMode: "read only", withConsistentSnapshot: true });
+  // InnoDB opens the consistent read view at the first non-locking SELECT.
+  // Drizzle 0.45 joins these transaction characteristics without MySQL's required comma.
+  }, { isolationLevel: "repeatable read", accessMode: "read only" });
 
   const writer = await createPackageWriter({
     output: input.path, workDir: input.workspace, passphrase: input.passphrase, limits: PACKAGE_LIMITS,
@@ -190,18 +192,23 @@ export async function collectAndWriteExport(
   try {
     for (const [type, items] of records) for (const record of items) await writer.addRecord(type, record);
     const objectDigests = new Set<string>();
+    let verifiedSourceBytes = 0;
     for (const file of snapshot.files) {
+      verifiedSourceBytes += file.size;
+      if (verifiedSourceBytes > PACKAGE_LIMITS.maxTotalUncompressed) {
+        throw validation("PORTABLE_EXPORT_LIMIT", "The selected file bytes exceed the transfer limit. Make a smaller selection.");
+      }
       const live = await deps.services.orders.assertCanReadOrder(principal, file.orderPublicId);
       if (live.ownerUserId !== file.ownerUserId || live.ownerPublicId !== file.ownerPublicId) throw new CustodyError();
-      if (objectDigests.has(file.sha256)) {
-        // Even content already represented by another object's digest must be checked against this file's exact source bytes.
-        await readExactObject(deps.storage, { key: file.storageKey, sha256: file.sha256, size: file.size });
-      } else {
-        const opened = await deps.services.files.openForExport(principal, file.publicId, file.orderPublicId);
-        if (opened.file.sha256 !== file.sha256 || opened.file.size !== file.size) { opened.stream.destroy(); throw new CustodyError(); }
-        await writer.addObject({ source: opened.stream, expectedSha256: file.sha256, expectedSize: file.size });
-        objectDigests.add(file.sha256);
+      const opened = await deps.services.files.openForExport(principal, file.publicId, file.orderPublicId);
+      if (opened.file.sha256 !== file.sha256 || opened.file.size !== file.size || opened.file.version !== file.version ||
+        opened.file.supersededAt || opened.file.deletedAt || opened.file.visibility !== file.visibility) {
+        opened.stream.destroy();
+        throw new CustodyError();
       }
+      // The writer verifies every source stream against its snapshot receipt, even when identical hashes deduplicate.
+      await writer.addObject({ source: opened.stream, expectedSha256: file.sha256, expectedSize: file.size });
+      objectDigests.add(file.sha256);
     }
     const finished = await writer.finalize();
     const counts = Object.fromEntries([...records.entries()].map(([type, items]) => [type.replaceAll("-", "_"), items.length]));
