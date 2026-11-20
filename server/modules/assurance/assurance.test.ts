@@ -167,7 +167,22 @@ describe("assurance: isolated transactional model", () => {
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(h.audit.named("auth.totp.replay_denied")).toHaveLength(2);
     h.rateLimiter.blocked.add("auth_high_risk");
-    await expect(h.services.assurance.verifySecondFactor(account.userId, fresh)).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    const blocked = () => h.services.assurance.verifySecondFactor(account.userId, fresh);
+    await expect(blocked()).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    await expect(blocked()).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    const rateLimitNotes = () => h.audit.notes.filter((event) => event.eventName === "auth.rate_limited");
+    expect(rateLimitNotes()).toEqual([{
+      category: "security",
+      eventName: "auth.rate_limited",
+      action: "throttle",
+      outcome: "denied",
+      reasonCode: "RATE_LIMITED",
+      resource: { type: "user", id: account.userId },
+      attributes: { category: "auth_high_risk" },
+    }]);
+    h.clock.advance(10_000);
+    await expect(blocked()).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(rateLimitNotes()).toHaveLength(2);
   });
 
   it("redeems a recovery code exactly once concurrently and notifies only once", async () => {

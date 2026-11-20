@@ -36,10 +36,28 @@ export function badProof(): DomainError {
   return new DomainError("UNAUTHENTICATED", "AUTHENTICATION_PROOF_INVALID", "The authentication information was invalid or already used.");
 }
 
+const RATE_LIMIT_AUDIT_INTERVAL_MS = 10_000;
+const nextRateLimitAudit = new WeakMap<ModuleDeps["audit"], number>();
+
 /** A stable per-account budget prevents bypass by distributing requests across different sessions. */
 export async function throttle(deps: ModuleDeps, userId: number): Promise<void> {
   const key = deps.crypto.blindIndex(String(userId), "assurance-rate-limit");
   const rate = await deps.rateLimiter.consume("auth_high_risk", `a:${key}`);
-  if (!rate.allowed)
+  if (!rate.allowed) {
+    const now = deps.clock.now().getTime();
+    // One sample per emitter per interval, without retaining per-account state.
+    if ((nextRateLimitAudit.get(deps.audit) ?? Number.NEGATIVE_INFINITY) <= now) {
+      nextRateLimitAudit.set(deps.audit, now + RATE_LIMIT_AUDIT_INTERVAL_MS);
+      deps.audit.note({
+        category: "security",
+        eventName: "auth.rate_limited",
+        action: "throttle",
+        outcome: "denied",
+        reasonCode: "RATE_LIMITED",
+        resource: { type: "user", id: userId },
+        attributes: { category: "auth_high_risk" },
+      });
+    }
     throw new DomainError("RATE_LIMITED", "RATE_LIMITED", "Too many attempts. Wait and try again.", { retryAfterSeconds: rate.retryAfterSeconds });
+  }
 }
