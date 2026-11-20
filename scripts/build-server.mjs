@@ -24,6 +24,7 @@ await build({
     migrate: "scripts/ops/migrate.ts",
     "create-admin": "scripts/ops/create-admin.ts",
     "seed-demo": "scripts/ops/seed-demo.ts",
+    "catalog-import": "scripts/ops/catalog-import.ts",
     "run-backup": "scripts/ops/backup/run-backup.ts",
     "verify-backup": "scripts/ops/backup/verify-backup.ts",
     "restore-isolated": "scripts/ops/restore/restore-isolated.ts",

@@ -92,6 +92,7 @@
     "start": "node dist/server/main.js",
     "ops:migrate": "node dist/ops/migrate.js",
     "ops:admin-create": "node dist/ops/create-admin.js",
+    "ops:catalog-import": "node dist/ops/catalog-import.js",
     "typecheck": "node node_modules/typescript7/bin/tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
