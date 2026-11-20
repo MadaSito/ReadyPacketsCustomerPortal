@@ -16,7 +16,7 @@ Server installation, TLS, upgrades and go-live checks are in [Install on Ubuntu 
 - [Customers](#customers)
 - [Staff and administrators](#staff-and-administrators)
 - [Credential administration](#credential-administration)
-- [Catalog and workflows](#catalog-and-workflows)
+- [Catalog, matrix import and bundle rule](#catalog-matrix-import-and-bundle-rule)
 - [Policies, questionnaires and invoices](#policies-questionnaires-and-invoices)
 - [File administration](#file-administration)
 - [Settings and features](#settings-and-features)
@@ -28,6 +28,7 @@ Server installation, TLS, upgrades and go-live checks are in [Install on Ubuntu 
 - [Backups and restore](#backups-and-restore)
 - [Portable transfer](#portable-transfer)
 - [Integrations](#integrations)
+- [Production pipeline (Phase I and Phase II webhooks)](#production-pipeline-phase-i-and-phase-ii-webhooks)
 - [Microsoft Clarity and PostHog](#microsoft-clarity-and-posthog)
 - [Installing as an app (PWA)](#installing-as-an-app-pwa)
 - [Search engines](#search-engines)
@@ -88,26 +89,52 @@ releases an authenticator app blocked after 50 failed codes.
 
 All of these are audited. You never see a user's existing password or codes.
 
-## Catalog and workflows
+## Catalog, matrix import and bundle rule
 
-- **Catalog** (`/admin/catalog`, `catalog.manage`) — **Available**. Create and edit product groups and products. A price
-  or name change creates a new, immutable product version; existing orders keep theirs.
+- **Catalog** (`/admin/catalog`, `catalog.manage`) — **Available**. Create and edit product groups and products.
+  - Packet groups carry a group key (`packet-1` … `packet-6`) and packet number (`1`–`6`). Packet products carry a packet
+    number, **Tier** (**Basic**, **Standard** or **Premium**), **Outcome**, **Timeline** and structured **Deliverables**
+    (`title` and `detail`). Non-packet products leave packet number and tier unset.
+  - Editing a product's name, price, outcome, timeline or deliverables writes a new, immutable product version; existing
+    orders keep the snapshot they were placed under.
+  - For packet products, the server enforces quantity `1` and at most one tier per packet in a single order.
+- **Importing the Master Offerings Matrix** (`ops:catalog-import`, command line) — [ADR 0022](../adr/0022-offerings-matrix-as-catalog-data.md):
+  - Fresh installations start with an empty catalog; no packet names or prices are hardcoded in application code.
+  - Load or update `data/catalog/readypackets-offerings-v3.0.json` (validated against `data/catalog/offerings.schema.json`):
+    - Preview without writing: `pnpm ops:catalog-import --dry-run` (or `--file <path> --dry-run`).
+    - Apply idempotently: `pnpm ops:catalog-import` (or `node dist/ops/catalog-import.js --file <path>` on a deployed host).
+  - The command runs as an audited operator session: it creates missing groups and products by `groupKey` / `productKey`,
+    creates a new product version only when content or price changed, configures the bundle rule below, and prints a
+    summary. It never deletes catalog items and refuses any file that fails schema validation.
+  - **Packet 7 ("The All-In")** is not a catalog product — it is how multi-packet bundle orders are represented, governed
+    by the bundle rule below. **Packet 8** is recorded under `reserved` in the data file as unlisted and is not imported
+    (if ever authorized, an administrator can add a product manually in **Catalog**).
+- **Bundle rule** (`orders.bundle_rule` in **Settings** `/admin/settings`, step-up, audited):
+  - Controls automatic multi-packet bundle pricing: `enabled`, `requiredPacketNumbers` (set to `[1, 2, 3, 4, 5, 6]` by the
+    matrix import), `discountPercent` (`15` for the Master Bundle) and `label` (for example `The All-In (Master Bundle)`).
+  - Disabled by default on a blank installation until imported or enabled by an administrator.
+  - When enabled and an order contains every required packet (at any combination of **Basic**, **Standard** or **Premium**
+    tiers), the server computes the discount (`total = subtotal - discount`) and snapshots the subtotal, discount and
+    discount label on the order. The browser never sends prices or discount amounts.
 - **Workflows** (`/admin/workflows`, `workflows.manage`) — **Available**. View and publish versioned order workflows.
   Orders stay bound to the version they started with.
 
 ## Policies, questionnaires and invoices
 
-**In progress** (working tree, not committed when this guide was written). The server procedures are in
-`server/modules/compliance/API.md`.
+**Available** — `/admin/policies`, `/admin/intake`, `/admin/intake/submissions` and `/admin/invoices` (see
+`server/modules/compliance/API.md`).
 
-- **Policies** (`/admin/policies`, `policies.manage`): write drafts, publish immutable versions (content hash locked),
-  mark a policy as required or as needing a typed signature, and view acceptance evidence. Published versions cannot
-  be edited or deleted.
-- **Questionnaires** (`/admin/intake`, `intake.manage`): build intake questionnaires by default, product or order type,
-  and publish immutable versions. Staff review submissions under **Intake review**.
-- **Invoices** (`/admin/invoices`): create a draft for an order, issue it (sequential number), void an unpaid or
-  fully refunded invoice, and record manual payment or refund evidence. Online card payment is **disabled in this
-  release**.
+- **Policies** (`/admin/policies`, `policies.manage`, step-up to write): write drafts, publish immutable versions
+  (SHA-256 content hash locked), mark a policy as required or as needing a typed signature, and view acceptance evidence.
+  Published versions cannot be edited or deleted. Before enabling the **Production pipeline**, ensure your published
+  customer privacy notice (and `/privacy`) reflects that order metadata, client name and email are sent to the production
+  pipeline when Phase I is started.
+- **Questionnaires** (`/admin/intake`, `intake.manage`): build intake questionnaires scoped by default, catalog item or
+  workflow, and publish immutable versions. Staff review customer submissions under **Intake review**
+  (`/admin/intake/submissions`, `intake.review`).
+- **Invoices** (`/admin/invoices`, `invoices.manage`, step-up to write): create a draft for an order, issue it
+  (sequential number), void an unpaid or fully refunded invoice, and record manual payment or refund evidence with an
+  idempotency key. Online card payment is **disabled in this release**.
 
 ## File administration
 
@@ -258,6 +285,52 @@ Until they land:
   sign-in with MFA is the only method) and SharePoint storage (local encrypted storage is the file backend). These
   refuse activation on the server.
 
+## Production pipeline (Phase I and Phase II webhooks)
+
+**Available** — **Production pipeline** under **Integrations** (`integrations.manage`, step-up to change settings) and the
+console-only **Production** tab on `/admin/orders/:orderId` (`orders.production.trigger`). Off by default; no live URL,
+credential or canon version ships with the portal ([ADR 0023](../adr/0023-production-pipeline-webhooks.md)).
+
+### Configuring the production pipeline
+
+1. **Allow outbound egress**: on **Outbound connections** (`/admin/integrations/egress`), add an allow-list rule for your
+   webhook receiver host with purpose `webhook`. Destinations must use `https://`, pass pinned DNS resolution, and
+   redirects are refused.
+2. **Configure Production pipeline settings** (step-up, audited as `integration.production.settings.changed`):
+   - **Phase I (P101) URL** and **Phase II (P201) URL** (`https://` only). Webhook URLs embed secret tokens and are stored
+     encrypted — the console returns only the host and the last 4 characters.
+   - **Authentication header** (optional): header name and encrypted secret value.
+   - **Canon version** (required before enabling, for example `ReadyPackets_Production_v2.0`; no default).
+   - **Run mode** (default `production`, pattern `^[a-z][a-z0-9_]{0,31}$`).
+   - **Timeout** (default 10 seconds, maximum 30 seconds).
+   - **Enabled** switch.
+3. **Test destination**: runs a dry-run validation of the configured URLs against the egress policy and DNS without
+   sending any webhook payload.
+
+### Starting Phase I (P101), starting Phase II (P201) and re-sending
+
+Day-to-day operator steps are in [Staff guide — Starting Phase I and Phase II](./STAFF_GUIDE.md#starting-phase-i-and-phase-ii-production-pipeline).
+Key administrator controls and guarantees:
+
+- **Eligibility & validation**: only orders containing packet products (and zero non-packet items) can be sent. Single-packet
+  orders send that packet number (`"1"`–`"6"`) and tier; multi-packet orders send `packet = "7"` and `tier = "Mixed"`.
+  `bundle_scope_manifest` is sent as an escaped JSON string (`"{\"packet_1\":\"Premium\"}"`), and `order_scope_mode` is
+  never sent. Contradictory combinations are refused before anything is queued (`integration.production.dispatch.refused`).
+- **Start Phase I (`P101`)**: writes an encrypted outbox record in the same database transaction and delivers it via the
+  background job worker with `Idempotency-Key`, `X-ReadyPackets-Delivery` and correlation headers.
+- **Start Phase II (`P201`)**: enabled only after `P101` for the same order reaches `delivered`, and requires explicit
+  operator confirmation that the Phase I final artifacts exist in the production environment (the portal receives no
+  inbound completion callback). `P201` copies the exact `customer_id`, `order_id` and `run_mode` recorded on the
+  delivered `P101` so a later reference change cannot split a run.
+- **Retries, personal-data clearing and dispatch monitor**: network errors, `429` and `5xx` responses retry with bounded
+  backoff; other `4xx` responses stop immediately. The encrypted personal-data payload (`client_name`, `client_email`) is
+  cleared from the outbox row as soon as the dispatch reaches a final state. Filter dispatches across all orders on
+  **Production pipeline** by phase, state (`queued`, `sending`, `delivered`, `failed`, `dead`), order reference and date.
+- **Re-sending (Administrator + step-up)**: at most one delivered `P101` and one delivered `P201` are allowed per order
+  by default. Re-sending requires an **Administrator**, fresh **step-up verification** and a recorded reason
+  (`integration.production.dispatch.resent`). Audit events never contain webhook URLs, auth headers, client names or
+  client emails.
+
 ## Microsoft Clarity and PostHog
 
 Both are **off by default**, and both are opt-in per visitor. See [ADR 0011](../adr/0011-analytics-consent.md).
@@ -269,12 +342,8 @@ Both are **off by default**, and both are opt-in per visitor. See [ADR 0011](../
      added to **Allowlisted self-hosted PostHog origins** (up to 8).
 2. **Features**: turn on **Microsoft Clarity analytics** and/or **PostHog analytics**.
 3. What visitors see: a consent banner. Analytics load only after the visitor accepts, and only on `/privacy` and
-   `/terms` with no query string or fragment. Sign-in, account, order, file, message, invoice and admin paths are
-   permanently excluded.
-
-Current limitation: no client routes exist for `/privacy` and `/terms` yet (the footer links show
-"Page not found"), so no analytics run even when they are switched on. The consent banner has not been checked in a
-real browser.
+   `/terms` with no query string or fragment (for unauthenticated visitors). Sign-in, account, order, file, message,
+   invoice and admin paths are permanently excluded.
 
 ## Installing as an app (PWA)
 
@@ -299,14 +368,15 @@ The portal is an authenticated application and is intentionally **not indexed**:
 | Area | Status |
 | --- | --- |
 | Customers, staff, credential administration | Available |
-| Orders, catalog, workflows, order files, sharing | Available |
+| Orders, packet catalog (`ops:catalog-import`), bundle rule, workflows, order files, sharing | Available |
 | Settings, features, sign-in page, configuration transfer, health, setup | Available |
 | Audit centre, SIEM forwarding | Available |
 | Jobs, schedules, mail, maintenance | Available |
 | Portable transfer | Available |
-| Backups | Command line and systemd; console pages in progress (uncommitted) |
-| Integrations console (SMTP, analytics, outbound connections) | In progress (uncommitted); use Settings and Features meanwhile |
-| Messages, support tickets, notifications page, search page | Server available; screens in progress (uncommitted) |
-| Policies, intake, invoices (customer, staff and admin screens) | Server available; screens in progress (uncommitted) |
-| `/privacy` and `/terms` pages | No routes yet (footer links show "Page not found") |
-| Stripe payments, SAML SSO, SharePoint | Disabled in this release |
+| Policies, intake questionnaires & review, invoices (manual payment/refund ledger) | Available |
+| Production pipeline (P101 / P201 manual webhooks, outbox & dispatch monitor) | Available (off until configured) |
+| Public `/privacy` and `/terms` draft notices | Available (drafts pending legal review) |
+| Backups | Command line and systemd; console pages available for status/metadata |
+| Integrations console (SMTP, analytics, outbound connections) | Available |
+| Messages, support tickets, notifications, global search | Available |
+| Stripe online payments, SAML SSO, SharePoint | Disabled in this release |

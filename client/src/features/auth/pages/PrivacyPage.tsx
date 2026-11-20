@@ -35,6 +35,27 @@ export default function PrivacyPage() {
         <p>We do not sell your personal information.</p>
       </LegalSection>
 
+      <LegalSection id="recipients" title="Who receives your information">
+        <ul>
+          <li>
+            <strong>Production pipeline (when an order is started):</strong> If our administrators have enabled the {BRAND.companyShortName}{" "}
+            production pipeline and a member of our team starts production on your order, the portal sends order metadata — your customer reference,
+            the order reference, the packets and tiers in the order, and production run settings — together with the order owner&apos;s name and email
+            address over HTTPS to the configured production pipeline so your deliverables can be prepared. Starting Phase II for the same order sends
+            only your customer reference, the order reference and the run mode. While an outbound delivery is queued or retrying, that payload is
+            stored encrypted on our servers and cleared once delivery finishes.
+          </li>
+          <li>
+            <strong>Transactional email (if enabled):</strong> Account invitations, password reset links, and order or billing notifications are sent
+            through the outbound mail server configured by our administrators.
+          </li>
+          <li>
+            <strong>Security monitoring (if enabled):</strong> Pseudonymised security and audit events may be forwarded over TLS to a security
+            monitoring (SIEM) receiver configured by our administrators.
+          </li>
+        </ul>
+      </LegalSection>
+
       <LegalSection id="cookies" title="Cookies">
         <p>The portal sets only the cookies it needs to keep you signed in securely:</p>
         <ul>

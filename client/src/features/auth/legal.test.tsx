@@ -64,6 +64,18 @@ describe("public legal pages", () => {
       expect(document.querySelectorAll("h1")).toHaveLength(1);
     });
   }
+
+  it("/privacy discloses the production pipeline as a recipient of order metadata, client name and email when an order is started", async () => {
+    const { container } = renderUi(<AppRoutes routes={authFeature.routes} />, {
+      path: "/privacy",
+      api: fakeAuthApi({ me: unauth }),
+    });
+    expect(await screen.findByRole("heading", { level: 2, name: "Who receives your information" })).toBeInTheDocument();
+    expect(screen.getByText(/Production pipeline \(when an order is started\):/)).toBeInTheDocument();
+    expect(screen.getByText(/order metadata/i)).toBeInTheDocument();
+    expect(screen.getByText(/order owner's name and email address/i)).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
 });
 
 describe("consent-gated analytics on the legal pages", () => {
