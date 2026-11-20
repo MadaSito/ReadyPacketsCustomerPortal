@@ -2,6 +2,17 @@
 
 Reviewed `ea5da21` against Section D of `docs/engineering/INCREMENT_02_CONTRACT.md` and both webhook references in `docs/source-specs/increment-02/`. The corrected P101 reference takes precedence where the trigger reference includes `order_scope_mode`. Findings below are verified by source inspection unless explicitly labeled a deployment dependency.
 
+## Remediation re-review
+
+Reviewed `645e42a`. **PW-02 remains open; do not enable live delivery.** The other seven findings are closed in the reviewed source, subject to the deployment dependencies below.
+
+- **PW-02 | Open, recovery is not fenced against a live attempt:** The scheduled/on-demand scan applies `LIMIT 200` before the age check and never consults the job ledger (`production/service.ts:496–555`). It can fail a legitimately queued job or an active sender. The worker finalizer only guards missing and delivered rows (`production/service.ts:1204–1224`); an old worker still holding its lease can overwrite the reconciled terminal state, including re-queuing with the payload already cleared. Resend can meanwhile issue a new key. Filter stale candidates before the limit, verify linked job state/ownership, and require matching claim state, version, and attempt before finalization. Preserve a possibly delivered outcome as uncertain and do not automatically replay it.
+- **PW-01 and PW-07 | Closed:** Delivery reads only receiver status, and persists a summary derived from controlled server reason codes; the production response cap is now 8 KiB. Resend persists only the server-classified reason, and the settings audit replaces the auth header name with a Boolean configuration flag.
+- **PW-03 and PW-04 | Closed:** The worker verifies order survival, lock and cancellation state, current owner and active account, and live P101 packet scope before the send. It compares the queue-time keyed destination/auth fingerprint to the live values, including changes made via generic Platform settings. These pre-send checks cannot retract a request already in flight.
+- **PW-05, PW-06, and PW-08 | Closed:** The start/resend transactions take the order lock before persisted actor authorization; missing Identity now fails closed, and step-up age uses a post-lock clock. Omitted P101 `release_status` now defaults to the empty string.
+- **Platform export exclusion | Verified:** The three production secret definitions explicitly set `exportable: false`. The production server test verifies exclusion with generic encrypted secret export requested and rejects import of those keys.
+- **Independent single-file retest:** `server/modules/integrations/production/production.test.ts` (13 passed), `server/modules/integrations/production/payload.test.ts` (8 passed), and `server/modules/integrations/integrations.test.ts` (10 passed), each via `scripts/dev/test.sh`. No live destinations, receiver deduplication, migration, build, or browser behavior was verified.
+
 ## Findings
 
 ### High
