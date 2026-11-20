@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { MeResult, MeUser } from "@/lib/authApi";
 import type { RouteDef } from "@/lib/routes";
@@ -6,7 +6,9 @@ import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { AppRoutes } from "./AppRouter";
 import { ConsoleShell } from "./shell/ConsoleShell";
 import { CustomerShell } from "./shell/CustomerShell";
-import { LEGAL_NAME, PUBLIC_SITE_URL } from "./shell/common";
+import { customerNavLayout, LEGAL_NAME, MAX_PRIMARY_NAV, navPlacement, PUBLIC_SITE_URL, visibleNav } from "./shell/common";
+import { ALL_NAV } from "./registry";
+import type { NavItem } from "@/lib/routes";
 
 vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
 
@@ -84,5 +86,48 @@ describe("AppRoutes guard integration", () => {
   it("unknown path renders the 404 page", async () => {
     renderUi(<AppRoutes routes={ROUTES} />, { path: "/nope", api: fakeAuthApi({ me: unauth }) });
     expect(await screen.findByRole("heading", { name: /page not found/i })).toBeInTheDocument();
+  });
+});
+
+describe("customer nav placement (D1: no top-bar collisions)", () => {
+  const Icon = () => null;
+  const item = (href: string, order: number, extra: Partial<NavItem> = {}): NavItem => ({ label: href, href, icon: Icon, area: "customer", access: "customer", order, ...extra });
+
+  it("derives placement by path, explicit placement wins", () => {
+    expect(navPlacement(item("/orders", 1))).toBe("primary");
+    expect(navPlacement(item("/notifications", 1))).toBe("hidden");
+    expect(navPlacement(item("/account", 1))).toBe("account");
+    expect(navPlacement(item("/account/sessions", 1))).toBe("account");
+    expect(navPlacement(item("/policies", 1))).toBe("account");
+    expect(navPlacement(item("/accounting", 1))).toBe("primary");
+    expect(navPlacement(item("/orders", 1, { placement: "account" }))).toBe("account");
+  });
+
+  it("caps the inline bar and overflows the rest into More, in order", () => {
+    const layout = customerNavLayout(Array.from({ length: 8 }, (_, i) => item(`/p${8 - i}`, 8 - i)));
+    expect(layout.primary.map((i) => i.href)).toEqual(["/p1", "/p2", "/p3", "/p4", "/p5"]);
+    expect(layout.more.map((i) => i.href)).toEqual(["/p6", "/p7", "/p8"]);
+    expect(layout.account.map((i) => i.href)).toEqual(["/account", "/account/security"]);
+  });
+
+  it("real registry: top bar holds only primary items; account entries live in the avatar menu", async () => {
+    const layout = customerNavLayout(visibleNav(ALL_NAV, "customer", "customer"));
+    expect(layout.primary.length).toBeLessThanOrEqual(MAX_PRIMARY_NAV);
+    renderUi(
+      <CustomerShell user={user("customer")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+    );
+    const bar = screen.getByRole("navigation", { name: "Primary" });
+    const labels = [...bar.querySelectorAll("a")].map((a) => a.textContent);
+    for (const banned of ["Notifications", "Your account", "Sessions", "Account security", "Policies"]) expect(labels).not.toContain(banned);
+    expect(bar.querySelectorAll("a").length).toBeLessThanOrEqual(MAX_PRIMARY_NAV);
+    expect(labels).toEqual(expect.arrayContaining(["Home", "Orders"]));
+    for (const a of bar.querySelectorAll("a")) expect(a.className).toContain("whitespace-nowrap");
+    const trigger = screen.getByRole("button", { name: /account menu for avery example/i });
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" });
+    const menu = await screen.findByRole("menu");
+    for (const entry of layout.account) expect(within(menu).getByRole("menuitem", { name: entry.label })).toHaveAttribute("href", entry.href);
+    expect(within(menu).getByRole("menuitem", { name: "Sign out" })).toBeInTheDocument();
   });
 });

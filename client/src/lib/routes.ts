@@ -42,6 +42,15 @@ export interface NavItem {
   capability?: Capability;
   /** Sort order within the area/group (lower first). */
   order: number;
+  /**
+   * Where the customer shell places the entry (the console sidebar lists everything that isn't "hidden").
+   * - "primary": shown in the top bar, the phone bottom bar and the menu drawer.
+   * - "account": shown in the avatar menu and in the drawer's "Your account" section.
+   * - "hidden": routable but not in navigation (for example Notifications, which the bell opens).
+   * When omitted, the shell decides by path: `/account…` and `/policies` → account, `/notifications` → hidden,
+   * everything else → primary. Primary is capped (extra entries go to "More"), so labels can never collide.
+   */
+  placement?: "primary" | "account" | "hidden";
 }
 
 /**

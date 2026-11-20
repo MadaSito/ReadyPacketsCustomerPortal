@@ -1,25 +1,33 @@
 /**
- * Customer shell: sticky top bar (approved lockup, primary nav ≥ lg, notifications, theme, account),
- * bottom navigation on small screens (first 4 items + "More" drawer), footer.
+ * Customer shell: sticky top bar (approved lockup, up to MAX_PRIMARY_NAV primary links ≥ xl plus a "More" menu
+ * for any extra, notifications bell, theme, avatar menu with the account entries), a menu drawer between md and
+ * xl, bottom navigation on phones (first 4 primary + "More" drawer) and the footer. Placement is decided by
+ * `customerNavLayout` (shell-level rule, see `NavItem.placement`), so peers' registrations can't crowd the bar.
  */
-import { Menu } from "lucide-react";
+import { ChevronDown, Menu } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { ALL_NAV } from "@/app/registry";
 import type { MeUser } from "@/lib/authApi";
-import { BrandLogo, Drawer, IconButton } from "@/ui";
+import { BrandLogo, Drawer, DropdownMenu, IconButton } from "@/ui";
 import { cn } from "@/ui/cn";
 import { NotificationSlot } from "../slots";
-import { AccountMenu, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { AccountMenu, customerNavLayout, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
 
 const GRID_COLS: Record<number, string> = { 1: "grid-cols-1", 2: "grid-cols-2", 3: "grid-cols-3", 4: "grid-cols-4", 5: "grid-cols-5" };
 
+const TOP_LINK =
+  "inline-flex min-h-11 shrink-0 items-center gap-2 rounded-[var(--radius-control)] px-3 text-sm font-medium whitespace-nowrap text-body hover:bg-surface-sunken hover:text-ink";
+const TOP_LINK_ACTIVE = "bg-action-soft text-action hover:bg-action-soft hover:text-action";
+
 export function CustomerShell({ user, children }: { user: MeUser; children: ReactNode }) {
-  const nav = visibleNav(ALL_NAV, "customer", user.role);
+  const layout = customerNavLayout(visibleNav(ALL_NAV, "customer", user.role));
+  const nav = [...layout.primary, ...layout.more];
   const active = useActive();
   const [moreOpen, setMoreOpen] = useState(false);
   const primary = nav.slice(0, 4);
-  const overflow = nav.slice(4);
+  const overflow = [...nav.slice(4), ...layout.account];
+  const moreActive = layout.more.some((item) => active(item.href));
 
   return (
     <div className="flex min-h-dvh flex-col bg-surface-soft">
@@ -32,31 +40,53 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
             <BrandLogo label="" className="hidden w-48 sm:inline-flex" />
             <BrandLogo label="" variant="icon" className="h-9 sm:hidden" />
           </Link>
-          <nav aria-label="Primary" className="hidden min-w-0 flex-1 lg:block">
-            <ul className="flex items-center gap-1">
-              {nav.map((item) => (
+          <nav aria-label="Primary" className="hidden min-w-0 flex-1 xl:block">
+            <ul className="flex min-w-0 items-center gap-1">
+              {layout.primary.map((item) => (
                 <li key={item.href}>
                   <Link
                     href={item.href}
                     aria-current={active(item.href) ? "page" : undefined}
                     className={cn(
-                      "inline-flex min-h-11 items-center gap-2 rounded-[var(--radius-control)] px-3 text-sm font-medium text-body hover:bg-surface-sunken hover:text-ink",
-                      active(item.href) && "bg-action-soft text-action hover:bg-action-soft hover:text-action",
+                      TOP_LINK,
+                      active(item.href) && TOP_LINK_ACTIVE,
                     )}
                   >
-                    <item.icon aria-hidden={true} className="size-4" />
+                    <item.icon aria-hidden={true} className="size-4 shrink-0" />
                     {item.label}
                   </Link>
                 </li>
               ))}
+              {layout.more.length ? (
+                <li>
+                  <DropdownMenu
+                    align="start"
+                    trigger={
+                      <button type="button" className={cn(TOP_LINK, moreActive && TOP_LINK_ACTIVE)}>
+                        More
+                        <ChevronDown aria-hidden="true" className="size-4 shrink-0" />
+                      </button>
+                    }
+                    items={layout.more.map((item) => ({
+                      label: item.label,
+                      asChild: (
+                        <Link href={item.href} aria-current={active(item.href) ? "page" : undefined}>
+                          <item.icon aria-hidden={true} />
+                          {item.label}
+                        </Link>
+                      ),
+                    }))}
+                  />
+                </li>
+              ) : null}
             </ul>
           </nav>
-          <div className="ml-auto flex items-center gap-1">
+          <div className="ml-auto flex shrink-0 items-center gap-1">
             <NotificationSlot area="customer" />
             <ThemeToggle />
-            <AccountMenu user={user} area="customer" />
+            <AccountMenu user={user} area="customer" items={layout.account} />
             {nav.length > 0 ? (
-              <IconButton label="Open navigation menu" icon={<Menu />} className="hidden md:inline-flex lg:hidden" onClick={() => setMoreOpen(true)} />
+              <IconButton label="Open navigation menu" icon={<Menu />} className="hidden md:inline-flex xl:hidden" onClick={() => setMoreOpen(true)} />
             ) : null}
           </div>
         </div>
@@ -96,22 +126,32 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       ) : null}
 
       <Drawer open={moreOpen} onOpenChange={setMoreOpen} title="Menu" side="right" width="sm">
-        <nav aria-label="All sections">
-          <ul className="flex flex-col gap-1">
-            {nav.map((item) => (
-              <li key={item.href}>
-                <Link
-                  href={item.href}
-                  onClick={() => setMoreOpen(false)}
-                  aria-current={active(item.href) ? "page" : undefined}
-                  className={cn("flex min-h-11 items-center gap-3 rounded-[var(--radius-control)] px-3 text-[0.9375rem] font-medium text-ink hover:bg-surface-sunken", active(item.href) && "bg-action-soft text-action")}
-                >
-                  <item.icon aria-hidden={true} className="size-5" />
-                  {item.label}
-                </Link>
-              </li>
-            ))}
-          </ul>
+        <nav aria-label="All sections" className="flex flex-col gap-5">
+          {[
+            { heading: null, items: nav },
+            { heading: "Your account", items: layout.account },
+          ].map(({ heading, items }) =>
+            items.length ? (
+              <div key={heading ?? "main"}>
+                {heading ? <h2 className="mb-1 px-3 text-xs font-semibold tracking-wide text-muted uppercase">{heading}</h2> : null}
+                <ul className="flex flex-col gap-1">
+                  {items.map((item) => (
+                    <li key={item.href}>
+                      <Link
+                        href={item.href}
+                        onClick={() => setMoreOpen(false)}
+                        aria-current={active(item.href) ? "page" : undefined}
+                        className={cn("flex min-h-11 items-center gap-3 rounded-[var(--radius-control)] px-3 text-[0.9375rem] font-medium text-ink hover:bg-surface-sunken", active(item.href) && "bg-action-soft text-action")}
+                      >
+                        <item.icon aria-hidden={true} className="size-5 shrink-0" />
+                        {item.label}
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null,
+          )}
         </nav>
       </Drawer>
     </div>

@@ -22,6 +22,52 @@ export function visibleNav(items: readonly NavItem[], area: NavItem["area"], rol
   });
 }
 
+export type NavPlacement = NonNullable<NavItem["placement"]>;
+
+/** Paths that default to the avatar menu rather than the top bar (see `NavItem.placement`). */
+const ACCOUNT_PATHS = ["/account", "/policies"];
+/** Paths that already have a dedicated control in the top bar (the notification bell). */
+const HIDDEN_PATHS = ["/notifications"];
+
+const underAny = (href: string, roots: readonly string[]) => roots.some((root) => href === root || href.startsWith(`${root}/`));
+
+/** Shell-level placement rule: explicit `placement` wins, otherwise derived from the path. */
+export function navPlacement(item: NavItem): NavPlacement {
+  if (item.placement) return item.placement;
+  if (item.area !== "customer") return "primary";
+  if (underAny(item.href, HIDDEN_PATHS)) return "hidden";
+  if (underAny(item.href, ACCOUNT_PATHS)) return "account";
+  return "primary";
+}
+
+/** Maximum entries drawn inline in the customer top bar; the rest go to a "More" menu. */
+export const MAX_PRIMARY_NAV = 5;
+
+export interface CustomerNavLayout {
+  /** Drawn inline in the top bar (at most MAX_PRIMARY_NAV). */
+  primary: NavItem[];
+  /** Primary entries beyond the cap, offered from the top bar's "More" menu. */
+  more: NavItem[];
+  /** Avatar-menu entries (with defaults when no feature registers any). */
+  account: NavItem[];
+}
+
+const DEFAULT_ACCOUNT_NAV: NavItem[] = [
+  { label: "Your account", href: "/account", icon: UserRound, area: "customer", access: "customer", order: 80, placement: "account" },
+  { label: "Account security", href: "/account/security", icon: ShieldCheck, area: "customer", access: "customer", order: 90, placement: "account" },
+];
+
+export function customerNavLayout(items: readonly NavItem[]): CustomerNavLayout {
+  const byOrder = (a: NavItem, b: NavItem) => a.order - b.order;
+  const all = [...items].sort(byOrder);
+  const primaryAll = all.filter((item) => navPlacement(item) === "primary");
+  const account = all.filter((item) => navPlacement(item) === "account");
+  const accountHrefs = new Set(account.map((item) => item.href));
+  for (const fallback of DEFAULT_ACCOUNT_NAV) if (!accountHrefs.has(fallback.href)) account.push(fallback);
+  account.sort(byOrder);
+  return { primary: primaryAll.slice(0, MAX_PRIMARY_NAV), more: primaryAll.slice(MAX_PRIMARY_NAV), account };
+}
+
 export function isActivePath(location: string, href: string): boolean {
   if (href === "/" || href === "/admin") return location === href;
   return location === href || location.startsWith(`${href}/`);
@@ -57,9 +103,10 @@ function initials(name: string): string {
   return ((parts[0]?.[0] ?? "") + (parts.length > 1 ? (parts[parts.length - 1]?.[0] ?? "") : "")).toUpperCase() || "?";
 }
 
-export function AccountMenu({ user, area }: { user: MeUser; area: "customer" | "console" }) {
+export function AccountMenu({ user, area, items: accountItems }: { user: MeUser; area: "customer" | "console"; items?: readonly NavItem[] }) {
   const signOut = useSignOut();
   const staff = user.role !== "customer";
+  const entries = accountItems ?? DEFAULT_ACCOUNT_NAV;
   return (
     <DropdownMenu
       header={
@@ -76,8 +123,15 @@ export function AccountMenu({ user, area }: { user: MeUser; area: "customer" | "
         </button>
       }
       items={[
-        { label: "Account", icon: <UserRound aria-hidden="true" />, asChild: <Link href="/account">Account</Link> },
-        { label: "Security", icon: <ShieldCheck aria-hidden="true" />, asChild: <Link href="/account/security">Security</Link> },
+        ...entries.map((entry) => ({
+          label: entry.label,
+          asChild: (
+            <Link href={entry.href}>
+              <entry.icon aria-hidden={true} />
+              {entry.label}
+            </Link>
+          ),
+        })),
         ...(staff ? [area === "console" ? { label: "Customer view", icon: <UserRound aria-hidden="true" />, asChild: <Link href="/">Customer view</Link> } : { label: "Console", icon: <Settings aria-hidden="true" />, asChild: <Link href="/admin">Console</Link> }] : []),
         "separator" as const,
         { label: "Sign out", icon: <LogOut aria-hidden="true" />, onSelect: () => void signOut() },

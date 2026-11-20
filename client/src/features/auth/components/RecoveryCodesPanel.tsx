@@ -61,9 +61,9 @@ export function RecoveryCodesPanel({ batch, onAcknowledge }: { batch: RecoveryBa
       <Callout tone="warning" title="Save these codes now">
         They are shown only once. Each code signs you in a single time if you lose your authenticator app or passkey.
       </Callout>
-      <ol aria-label="Recovery codes" className="grid grid-cols-1 gap-2 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-4 font-mono text-[0.9375rem] text-ink xs:grid-cols-2">
+      <ol aria-label="Recovery codes" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,17rem),1fr))] gap-2 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 font-mono text-sm text-ink sm:p-4">
         {batch.recoveryCodes.map((code) => (
-          <li key={code} className="rounded-md bg-surface px-3 py-2 text-center tracking-wide break-all">
+          <li key={code} className="rounded-md bg-surface px-3 py-2 text-center tracking-wide [overflow-wrap:anywhere]">
             {code}
           </li>
         ))}

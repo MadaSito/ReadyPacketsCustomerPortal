@@ -11,7 +11,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { GlobalSearchSlot, NotificationSlot } from "../slots";
-import { AccountMenu, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
   const groups = new Map<string, NavItem[]>();
@@ -45,7 +45,7 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
                   )}
                 >
                   <item.icon aria-hidden={true} className="size-5 shrink-0" />
-                  {collapsed ? null : <span className="truncate">{item.label}</span>}
+                  {collapsed ? null : <span className="min-w-0 truncate whitespace-nowrap">{item.label}</span>}
                 </Link>
               );
               return <li key={item.href}>{collapsed ? <Tooltip content={item.label} side="right">{link}</Tooltip> : link}</li>;
@@ -58,7 +58,7 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
 }
 
 export function ConsoleShell({ user, children }: { user: MeUser; children: ReactNode }) {
-  const groups = groupNav(visibleNav(ALL_NAV, "console", user.role));
+  const groups = groupNav(visibleNav(ALL_NAV, "console", user.role).filter((item) => navPlacement(item) !== "hidden"));
   const [collapsed, setCollapsed] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
@@ -91,7 +91,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
 
       <div className="flex min-w-0 flex-1 flex-col">
         <PreviewBanner />
-      <MaintenanceBanner />
+        <MaintenanceBanner />
         <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
           <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
             <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
@@ -101,7 +101,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
             <div className="min-w-0 flex-1 px-1 sm:max-w-md">
               <GlobalSearchSlot />
             </div>
-            <div className="ml-auto flex items-center gap-1">
+            <div className="ml-auto flex shrink-0 items-center gap-1">
               <NotificationSlot area="console" />
               <ThemeToggle />
               <AccountMenu user={user} area="console" />
