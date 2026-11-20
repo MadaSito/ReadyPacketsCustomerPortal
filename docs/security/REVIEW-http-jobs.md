@@ -92,7 +92,7 @@ code-read only (no tests added or run). Severity summary: **1 Medium, 3 Info.**
 
 ### A-1 (Medium): no consecutive-failure limit on TOTP; budget-only throttling allows slow online guessing
 - `policy.ts:43-45` throttles every second-factor attempt with the per-account `auth_high_risk` budget, whose default is
-  30 per 300 s (`server/security/rateLimiter.ts` `DEFAULT_BUDGETS`). `factors.ts:57-67` accepts any of 3 steps (`store.ts:82`
+  30 per 300 s (`server/security/rateLimiter.ts` `DEFAULT_BUDGETS`). `factors.ts:57-67` accepts any of 3 steps (`store.ts:20`
   `window: 1`). `assurance_accounts` (`schema.ts:6-22`) has no failure counter, and nothing escalates, locks or notifies on
   repeated wrong codes; each denial is only audited (`factors.ts:96-98`).
 - Impact: an attacker who has the password (the precondition for an `mfa_challenge` remediation session) can submit
@@ -104,7 +104,7 @@ code-read only (no tests added or run). Severity summary: **1 Medium, 3 Info.**
 
 ### A-2..A-4 (Info)
 - A-2: authenticator data backup flags (BE/BS, `credentialDeviceType`, `credentialBackedUp`) are neither stored nor used
-  (`passkeys.ts:96-114`). Synced passkeys are therefore accepted silently; storing the flags would let the audit center
+  (`passkeys.ts:92-97,144-155`). Synced passkeys are therefore accepted silently; storing the flags would let the audit center
   and a future policy distinguish device-bound from synced credentials.
 - A-3: `window: 1` accepts the next step; using it advances `lastTotpStep`, so the legitimate user's current-step code is then
   refused as replay for up to 30 s (`factors.ts:62`). Usability only; consider `window` past-only (−1..0).
