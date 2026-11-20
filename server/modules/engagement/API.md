@@ -127,15 +127,15 @@ Categories: `"general" | "order" | "billing" | "technical" | "deliverable" | "ac
 | Procedure | Guard | Description |
 | --- | --- | --- |
 | `tickets.list` | `protectedProcedure` | `{ status?, cursor?, limit? }` → caller's own tickets only (`requesterUserId === session.userId`). |
-| `tickets.get` | `protectedProcedure` | `{ ticketId }` → ticket detail, customer-visible replies (`internalOnly: false`), and status history. Other customers' tickets → `NOT_FOUND`. |
+| `tickets.get` | `protectedProcedure` | `{ ticketId, replyCursor?, replyLimit? (1..100, default 50) }` → ticket detail, paginated customer-visible replies (`internalOnly: false`, `repliesNextCursor`), and bounded status history (latest 100 entries, `statusHistoryHasMore`). Other customers' tickets → `NOT_FOUND`. |
 | `tickets.openSummary` | `protectedProcedure` | `{}` → `{ openCount, awaitingCustomerCount }` for dashboard widget. |
 | `tickets.create` | `protectedProcedure` (`form_submission`) | `{ subject (5..190), category, body (10..8000), relatedOrderId?, idempotencyKey }` → validates `assertCanReadOrder` if `relatedOrderId` supplied; creates ticket + initial message + history + audit `ticket.created`. |
 | `tickets.reply` | `protectedProcedure` (`form_submission`) | `{ ticketId, body (1..8000), idempotencyKey }` → customer reply on own ticket; transitions `pending_customer` / `resolved` (within reopen window) → `pending_staff`; `closed` refuses (`CONFLICT / TICKET_CLOSED`). |
 | `tickets.close` | `protectedProcedure` | `{ ticketId }` → customer closes own ticket; records status history + audit `ticket.status.changed`. |
 | `tickets.reopen` | `protectedProcedure` | `{ ticketId, reason (3..500) }` → customer reopens `resolved` ticket within configured reopen window (`engagement.tickets.reopen_window_days`, default 14 days); `closed` tickets cannot be reopened by customer (`CONFLICT / TICKET_REOPEN_DENIED`). |
 | `tickets.admin.list` | `staffProcedure` + `tickets.read_all` | `{ status?, priority?, category?, assignedToMe?, unassignedOnly?, customerId?, cursor?, limit? }` → console queue. |
-| `tickets.admin.get` | `staffProcedure` + `tickets.read_all` | `{ ticketId }` → full detail including `internalOnly` notes, assignment, and full status history. |
-| `tickets.admin.reply` | `staffProcedure` + `tickets.manage` | `{ ticketId, body (1..8000), internalOnly?: boolean, nextStatus?, idempotencyKey }` → staff reply or internal note (`internalOnly: true` never notifies customer and never changes status unless specified). |
+| `tickets.admin.get` | `staffProcedure` + `tickets.read_all` | `{ ticketId, replyCursor?, replyLimit? (1..100, default 50) }` → full detail including paginated `internalOnly` notes (`repliesNextCursor`), assignment, and bounded status history (`statusHistoryHasMore`). |
+| `tickets.admin.reply` | `staffProcedure` + `tickets.manage` | `{ ticketId, body (1..8000), internalOnly?: boolean, nextStatus?, idempotencyKey }` → staff reply or internal note (`internalOnly: true` never notifies customer, never changes status unless specified, and never advances customer-visible `updatedAt` / `lastMessageAt`). |
 | `tickets.admin.setStatus` | `staffProcedure` + `tickets.manage` | `{ ticketId, toStatus, reasonCode? }` → controlled transition + history + audit `ticket.status.changed`. |
 | `tickets.admin.assign` | `staffProcedure` + `tickets.manage` | `{ ticketId, assigneeUserId: string \| null }` → assigns to active staff/admin user + audit `ticket.assigned`. |
 | `tickets.admin.setPriority` | `staffProcedure` + `tickets.manage` | `{ ticketId, priority }` → updates priority + audit `ticket.priority.changed`. |
@@ -155,7 +155,7 @@ Categories: `"general" | "order" | "billing" | "technical" | "deliverable" | "ac
 
 | Procedure | Guard | Description |
 | --- | --- | --- |
-| `search.query` | `protectedProcedure` (`expensive`) | `{ query (2..64 NFC), domains?: ("orders" \| "tickets" \| "messages" \| "customers")[], limitPerDomain? (1..10, default 5) }` → searches non-encrypted reference prefixes + HMAC token blind-indexes within a strict time budget, re-authorizes every candidate row before returning, never acts as an existence oracle, and audits staff/admin global searches (`engagement.search.executed`). `"customers"` domain is returned only when caller holds `search.global` + `customers.read_all`. |
+| `search.query` | `protectedProcedure` (`expensive`) | `{ query (2..64 NFC), domains?: ("orders" \| "tickets" \| "messages" \| "customers")[], limitPerDomain? (1..10, default 5) }` → searches sargable reference prefixes + tenant-scoped HMAC token blind-indexes within a configured budget (MySQL 8 `MAX_EXECUTION_TIME` hints + soft JS deadline for peer calls), re-authorizes every candidate row before returning, never acts as an existence oracle, and audits staff/admin global searches (`engagement.search.executed`). `"customers"` domain is returned only when caller holds `search.global` + `customers.read_all`. |
 
 ---
 

@@ -3,8 +3,14 @@
  * Other modules import TYPES from here and reach the instance through `deps.services.engagement` at call time.
  */
 import type { ModuleDeps } from "../../container.js";
-import type { DbOrTx, ModuleLifecycle, Tx } from "../../core/types.js";
-import { ulid } from "../../core/ids.js";
+import type { DbOrTx, ModuleHealth, ModuleLifecycle, Tx } from "../../core/types.js";
+import "./settings.js";
+import { registerEngagementMailTemplates } from "./mail.js";
+import { createMessagesService, type MessagesService } from "./messagesService.js";
+import { createNotificationsService, type NotificationsService } from "./notificationsService.js";
+import { createPortableEngagementService } from "./portableService.js";
+import { createSearchService, type SearchService } from "./searchService.js";
+import { createTicketsService, type TicketsService } from "./ticketsService.js";
 import type {
   ImportOrderMessageInput,
   ImportTicketInput,
@@ -15,6 +21,31 @@ import type {
 } from "./types.js";
 
 export * from "./types.js";
+export type {
+  MessageAttachmentView,
+  OrderMessageView,
+  OrderThreadSummaryView,
+} from "./messagesService.js";
+export type {
+  NotificationView,
+  NotificationPreferenceView,
+} from "./notificationsService.js";
+export type {
+  BoundedSearchResponse,
+  CustomerSearchResultItem,
+  MessageSearchResultItem,
+  OrderSearchResultItem,
+  TicketSearchResultItem,
+} from "./searchService.js";
+export type {
+  TicketDetailView,
+  TicketHistoryView,
+  TicketReplyView,
+  TicketSummaryView,
+} from "./ticketsService.js";
+
+export const NOTIFICATIONS_RETENTION_JOB_TYPE = "engagement.notifications.retention";
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface EngagementModule extends ModuleLifecycle {
   /**
@@ -54,27 +85,77 @@ export interface EngagementModule extends ModuleLifecycle {
 
   /** Idempotent portable import for historical support tickets (no mail/notification replay; audited in tx). */
   importTicket(input: ImportTicketInput, tx: Tx): Promise<{ publicId: string; ticketNumber: string; created: boolean }>;
+
+  /** Router-facing domain services (used by `engagementRouter` and integration tests). */
+  readonly messages: MessagesService;
+  readonly tickets: TicketsService;
+  readonly notifications: NotificationsService;
+  readonly search: SearchService;
 }
 
-export function createEngagementModule(_deps: ModuleDeps): EngagementModule {
+export function createEngagementModule(deps: ModuleDeps): EngagementModule {
+  registerEngagementMailTemplates(deps.mailer);
+
+  const notifications = createNotificationsService(deps);
+  const messages = createMessagesService(deps, notifications);
+  const tickets = createTicketsService(deps, notifications);
+  const search = createSearchService(deps);
+  const portable = createPortableEngagementService(deps);
+
+  deps.jobs.register(
+    NOTIFICATIONS_RETENTION_JOB_TYPE,
+    async (job) =>
+      notifications.runRetentionJob(
+        job.signal,
+        (tx) => job.assertStillOwned(tx),
+        job.correlationId,
+        job.jobId,
+      ),
+    { retrySafe: true },
+  );
+
+  deps.jobs.registerSchedule({
+    name: "engagement.notifications.retention.daily",
+    type: NOTIFICATIONS_RETENTION_JOB_TYPE,
+    everyMs: DAY_MS,
+  });
+
+  async function health(): Promise<ModuleHealth[]> {
+    const checkedAt = deps.clock.now();
+    try {
+      const unreadTotal = await notifications.totalUnreadMetric();
+      return [
+        {
+          component: "engagement.notifications",
+          state: "ok",
+          summary: "In-app notifications store is healthy.",
+          metrics: { unreadTotal },
+          checkedAt,
+        },
+      ];
+    } catch {
+      return [
+        {
+          component: "engagement.notifications",
+          state: "failing",
+          summary: "In-app notifications store could not be queried.",
+          checkedAt,
+        },
+      ];
+    }
+  }
+
   return {
-    async notify(_input: NotifyInput, _tx?: Tx): Promise<NotifyResult> {
-      return { publicId: ulid(), deliveredInApp: true, enqueuedEmail: false };
-    },
-    async portableOrderMessages() {
-      return { items: [], nextAfter: null };
-    },
-    async portableEvidence() {
-      return { items: [], nextAfter: null };
-    },
-    async portableTickets() {
-      return { items: [], nextAfter: null };
-    },
-    async importOrderMessage(input) {
-      return { publicId: input.sourcePublicId, created: false };
-    },
-    async importTicket(input) {
-      return { publicId: input.sourcePublicId, ticketNumber: input.sourceTicketNumber, created: false };
-    },
+    notify: notifications.notify,
+    portableOrderMessages: portable.portableOrderMessages,
+    portableEvidence: portable.portableEvidence,
+    portableTickets: portable.portableTickets,
+    importOrderMessage: portable.importOrderMessage,
+    importTicket: portable.importTicket,
+    messages,
+    tickets,
+    notifications,
+    search,
+    health,
   };
 }
