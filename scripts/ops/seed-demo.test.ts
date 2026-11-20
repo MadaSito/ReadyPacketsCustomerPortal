@@ -2,6 +2,7 @@
  * Demo seeder against the real composition root and an isolated MySQL test database (SYNTHETIC data only).
  * Only substitutions: FakeClock (deterministic session/step-up windows) and a temporary storage directory.
  */
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -119,5 +120,23 @@ describe("seed-demo", () => {
     const xref = Number(/startxref\n(\d+)\n%%EOF\n$/.exec(pdf)![1]);
     expect(pdf.slice(xref, xref + 5)).toBe("xref\n");
     expect(pdf).not.toMatch(/\/(JavaScript|JS|AA|OpenAction|Launch|EmbeddedFile)\b/);
+  });
+
+  it("no operator command imports another command that runs when executed directly", () => {
+    // Each command is bundled into one file; a bundled "run when executed directly" guard of an imported
+    // command would fire inside the importing command (this once made the demo seed run the catalog import
+    // and exit). Shared code belongs in a module without an entry point.
+    const dir = import.meta.dirname;
+    const commands = readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+    const withEntryPoint = commands.filter((f) => /import\.meta\.url\s*===/.test(readFileSync(join(dir, f), "utf8")));
+    expect(withEntryPoint).toContain("seed-demo.ts");
+    const offenders: string[] = [];
+    for (const file of commands) {
+      const source = readFileSync(join(dir, file), "utf8");
+      for (const target of withEntryPoint) {
+        if (target !== file && source.includes(`"./${target.replace(/\.ts$/, ".js")}"`)) offenders.push(`${file} -> ${target}`);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

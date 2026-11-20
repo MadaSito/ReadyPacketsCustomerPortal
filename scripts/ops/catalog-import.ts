@@ -22,33 +22,13 @@ import { pathToFileURL } from "node:url";
 import type { AppConfig } from "../../server/config/env.js";
 import { DomainError } from "../../server/core/errors.js";
 import type { OfferingsImportInput, OfferingsImportResult } from "../../server/modules/orders/catalog.js";
+import { toImportInput } from "./catalog/importInput.js";
 import { DEFAULT_OFFERINGS_FILE, OfferingsFileError, loadOfferings, type Offerings } from "./catalog/offerings.js";
 
 export const CATALOG_IMPORT_ACTOR = { system: "ops.catalog_import" } as const;
 const MAX_FILE_BYTES = 1024 * 1024;
 
-/** Maps the offerings document onto the catalog service input (listed packets + bundle rule only). */
-export function toImportInput(doc: Offerings): OfferingsImportInput {
-  return {
-    currency: doc.currency,
-    packets: doc.packets.map((packet) => ({
-      packetNumber: packet.packetNumber,
-      groupKey: packet.groupKey,
-      name: packet.name,
-      sortOrder: packet.packetNumber * 10,
-      tiers: packet.tiers.map((t) => ({
-        tier: t.tier,
-        productKey: t.productKey,
-        name: t.name,
-        priceMinor: t.priceMinor,
-        outcome: t.outcome,
-        timeline: t.timeline,
-        deliverables: t.deliverables.map((d) => ({ title: d.title, detail: d.detail })),
-      })),
-    })),
-    bundle: { requiredPacketNumbers: [...doc.bundle.requiredPacketNumbers], discountPercent: doc.bundle.discountPercent, label: doc.bundle.name },
-  };
-}
+export { toImportInput };
 
 export interface CatalogImportArgs {
   file: string;

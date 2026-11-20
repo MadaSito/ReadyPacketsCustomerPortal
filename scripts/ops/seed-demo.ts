@@ -24,7 +24,7 @@ import type { Services } from "../../server/container.js";
 import { DomainError } from "../../server/core/errors.js";
 import type { SessionPrincipal } from "../../server/core/types.js";
 import { seedOrdersDemo } from "../../server/modules/orders/demoSeed.js";
-import { toImportInput } from "./catalog-import.js";
+import { toImportInput } from "./catalog/importInput.js";
 import { loadOfferings, OfferingsFileError } from "./catalog/offerings.js";
 import { readSecretFile } from "./lib/secretFile.js";
 
