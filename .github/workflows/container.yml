@@ -1,0 +1,92 @@
+# Builds the container image and runs the whole Docker Compose stack (deploy/docker) end to end on the
+# runner: secrets initialisation, MySQL with required TLS, migrations, web + worker, the TLS proxy, first
+# administrator, catalogue import, sign-in and a restart. No secrets are used or required.
+# TODO(pin): replace every action major tag below with a full commit SHA (see ci.yml).
+name: container
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stack:
+    name: compose stack (build, start, verify, restart)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - name: Shell scripts (ShellCheck)
+        run: shellcheck -x deploy/docker/*.sh scripts/ci/container-smoke.sh
+      - name: Compose file is valid
+        env:
+          RP_DOMAIN: localhost
+          RP_INSTALLATION_ID: rp-000000000000000000000000
+        run: docker compose --file deploy/docker/compose.yaml config --quiet
+      - name: Set up the stack exactly as an operator would (self-signed certificate for localhost)
+        run: sudo bash deploy/docker/install-vps.sh --domain localhost --tls-internal
+      - name: End-to-end checks
+        run: sudo bash scripts/ci/container-smoke.sh
+      - name: Image contents
+        run: |
+          set -euo pipefail
+          docker image inspect readypackets-portal:local --format 'size={{.Size}} user={{.Config.User}}'
+          # No package manager, no development tree and no demo seed in the runtime image.
+          docker run --rm --network none --entrypoint sh readypackets-portal:local -c '
+            set -eu
+            for tool in npm npx pnpm corepack yarn; do
+              if command -v "$tool" >/dev/null 2>&1; then echo "unexpected tool: $tool"; exit 1; fi
+            done
+            for path in dist/ops/seed-demo.js node_modules/vite node_modules/vitest node_modules/.bin server client tests deploy; do
+              if [ -e "/opt/readypackets/$path" ]; then echo "unexpected path: $path"; exit 1; fi
+            done
+            test -f /opt/readypackets/healthcheck.mjs
+            # Nothing in the program directory is writable by group or others.
+            loose=$(find /opt/readypackets -perm /022 ! -type l | head -5)
+            if [ -n "$loose" ]; then echo "group/other-writable files:"; echo "$loose"; exit 1; fi
+            node --version'
+      - name: Container logs (on failure)
+        if: failure()
+        run: |
+          sudo docker compose --project-directory deploy/docker --file deploy/docker/compose.yaml \
+            --env-file deploy/docker/.env ps --all || true
+          sudo docker compose --project-directory deploy/docker --file deploy/docker/compose.yaml \
+            --env-file deploy/docker/.env logs --no-color --tail=300 || true
+      - name: Remove the stack
+        if: always()
+        run: sudo bash deploy/docker/rp-docker.sh destroy --confirm localhost || true
+
+  docker-install:
+    name: Docker install path (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "ubuntu:22.04", "debian:12"]
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - name: install-vps.sh installs Docker from the signed repository on a clean system
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "$GITHUB_WORKSPACE:/src:ro" "$IMAGE" bash -c '
+            set -euo pipefail
+            bash /src/deploy/docker/install-vps.sh --docker-only
+            docker --version
+            docker compose version
+            # A second run must find Docker and change nothing.
+            bash /src/deploy/docker/install-vps.sh --docker-only | grep -q "already installed"'

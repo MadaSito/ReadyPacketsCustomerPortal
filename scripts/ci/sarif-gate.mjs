@@ -11,6 +11,11 @@
 // The optional baseline is a reviewed list of accepted findings: [{ ruleId, path, justification }].
 // A blocking result matching an entry (same rule, same file) is reported as accepted. An entry that
 // matches nothing fails the gate, so exceptions are removed as soon as they stop being needed.
+//
+// Set SARIF_GATE_PARTIAL=1 when the analysis covers only part of the code. On pull requests CodeQL
+// reports only findings that touch the changed lines, so an accepted finding elsewhere is simply not
+// in the output; unmatched baseline entries are then listed but do not fail the gate. The complete
+// analysis on the main branch keeps enforcing them.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -93,12 +98,17 @@ for (const file of files) {
   }
 }
 
+const partial = process.env.SARIF_GATE_PARTIAL === "1";
 const stale = baseline.filter((entry) => !entry.used);
 for (const entry of stale) {
-  console.log(`STALE   baseline entry no longer matches a finding: ${entry.ruleId}  ${entry.path}`);
+  console.log(
+    partial
+      ? `unseen  baseline entry not matched in this partial analysis: ${entry.ruleId}  ${entry.path}`
+      : `STALE   baseline entry no longer matches a finding: ${entry.ruleId}  ${entry.path}`,
+  );
 }
 console.log(
   `\n${total} result(s): ${blocking} blocking at or above security-severity ${threshold.toFixed(1)}, ` +
-    `${accepted} accepted by the reviewed baseline, ${stale.length} stale baseline entr${stale.length === 1 ? "y" : "ies"}.`,
+    `${accepted} accepted by the reviewed baseline, ${stale.length} ${partial ? "unseen" : "stale"} baseline entr${stale.length === 1 ? "y" : "ies"}.`,
 );
-process.exit(blocking > 0 || stale.length > 0 ? 1 : 0);
+process.exit(blocking > 0 || (!partial && stale.length > 0) ? 1 : 0);

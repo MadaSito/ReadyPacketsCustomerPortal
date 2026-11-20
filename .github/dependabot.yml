@@ -40,3 +40,26 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # Base images of the container stack are pinned by digest; these entries propose digest and tag updates.
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker-compose
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(docker)"

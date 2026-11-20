@@ -2,6 +2,8 @@
 
 This runbook covers a dedicated single node for `my.readypackets.com`, with `portal.readypackets.com` as a permanent redirect. Nginx is the public edge; the separate Node web and worker services use local MySQL and private object storage. Review [verification and release gates](../../deploy/VERIFICATION.md) before admitting customer data. Do not use a preview build or a Perplexity authentication service.
 
+For a quick evaluation or test installation under another host name, use the Docker Compose stack instead: [`deploy/docker/README.md`](../../deploy/docker/README.md). It is not a replacement for this runbook (no backups, drain or rollback).
+
 ## Prepare the host
 
 - **Release**: Obtain a trusted clone in a root-controlled directory and identify the reviewed full Git commit SHA. Verify provenance, the lockfile, and that `migrations/meta/_journal.json` and its SQL files are included. The kit intentionally refuses a release without this journal. Run the kit shipped with that reviewed checkout, not scripts from an untrusted working directory or an arbitrary branch.

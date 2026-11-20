@@ -47,6 +47,9 @@ jobs:
           # Otherwise the analysis still runs and the two steps below keep and gate the results.
           upload: ${{ vars.CODE_SCANNING_ENABLED == 'true' && 'always' || 'never' }}
       - name: Gate on high and critical findings (security-severity >= 7.0)
+        env:
+          # Pull request analysis is limited to the changed lines; see scripts/ci/sarif-gate.mjs.
+          SARIF_GATE_PARTIAL: ${{ github.event_name == 'pull_request' && '1' || '0' }}
         run: node scripts/ci/sarif-gate.mjs "$RUNNER_TEMP/codeql-sarif" 7.0 .github/codeql-baseline.json
       - uses: actions/upload-artifact@v7 # TODO(pin)
         if: always()

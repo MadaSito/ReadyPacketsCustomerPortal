@@ -12,7 +12,7 @@ change. It describes intent and state; it is not a certification or a guarantee.
 | Public marketing site | https://www.readypackets.com (separate system) |
 | Customer portal (this repository) | https://my.readypackets.com (canonical); `portal.readypackets.com` redirects to it |
 | Audiences | customers, staff, administrators |
-| Hosting | self-hosted VPS (Nginx + systemd); optional Docker profile |
+| Hosting | self-hosted VPS (Nginx + systemd); Docker Compose stack for evaluation and testing (Caddy + MySQL, `deploy/docker/`) |
 
 ## Owner instructions that govern every change
 
@@ -55,7 +55,7 @@ server/trpc        procedure guards and root router
 server/modules     identity, assurance, orders, files, engagement, compliance, audit, siem, platform,
                    jobs, portable, backup, integrations
 portable/          vendor-neutral portable data contract, verifier CLI, reference importer, adapters
-deploy/            nginx, systemd, Docker, installer
+deploy/            nginx, systemd, installer; docker/ = evaluation stack
 migrations/        versioned forward-only SQL migrations
 docs/              specs, engineering contract, ADRs, runbooks, verification, context, session logs
 ```
