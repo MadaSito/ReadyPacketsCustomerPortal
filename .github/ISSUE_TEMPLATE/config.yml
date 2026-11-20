@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    # PLACEHOLDER: replace OWNER/REPO with the real repository path.
+    url: https://github.com/OWNER/REPO/security/advisories/new
+    about: Never open a public issue for a vulnerability. Use a private security advisory (see SECURITY.md).

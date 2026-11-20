@@ -1,0 +1,134 @@
+# Continuous integration for the ReadyPackets portal. No secrets are used or required.
+# TODO(pin): replace every action major tag below with a full commit SHA (plus a `# vX.Y.Z` comment)
+# once the SHA has been confirmed against the upstream release; Dependabot then keeps the pins current.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  CI: "true"
+
+jobs:
+  static:
+    name: typecheck + lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6 # TODO(pin) — version comes from package.json "packageManager"
+      - uses: actions/setup-node@v7 # TODO(pin)
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck (TypeScript 7 native compiler)
+        run: pnpm typecheck
+      - name: Lint
+        run: pnpm lint
+
+  test:
+    name: tests (node + jsdom, MySQL 8.4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          # Ephemeral CI-only database; a synthetic value, not a secret.
+          MYSQL_ROOT_PASSWORD: ci_root_local_only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_root_local_only --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      # tests/helpers/testDb.ts creates and drops rp_test_* databases through this URL.
+      RP_DEV_MYSQL_URL: mysql://root:ci_root_local_only@127.0.0.1:3306
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6 # TODO(pin)
+      - uses: actions/setup-node@v7 # TODO(pin)
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Server, shared, scripts, portable and integration tests (node)
+        run: pnpm test:server
+      - name: Client component tests (jsdom)
+        run: pnpm test:client
+
+  build:
+    name: build (standard + preview) + migration check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6 # TODO(pin)
+      - uses: actions/setup-node@v7 # TODO(pin)
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build (preview profile)
+        run: pnpm build:preview
+      - name: Build (standard)
+        run: pnpm build
+      - name: Committed migrations match the Drizzle schema
+        # drizzle-kit generate is offline (no database). Any new or changed file under migrations/
+        # means a schema change was committed without its migration.
+        run: |
+          pnpm db:generate
+          if [ -n "$(git status --porcelain -- migrations)" ]; then
+            git status --porcelain -- migrations
+            echo "::error::Schema changes are not captured in committed migrations. Run pnpm db:generate and commit migrations/."
+            exit 1
+          fi
+
+  portable:
+    name: portable golden fixture + schemas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6 # TODO(pin)
+      - uses: actions/setup-node@v7 # TODO(pin)
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Regenerate golden fixture and JSON Schemas (must be byte-identical)
+        run: |
+          pnpm exec tsx portable/scripts/make-golden.ts
+          pnpm exec tsx portable/scripts/export-schemas.ts
+          if [ -n "$(git status --porcelain -- portable/fixtures portable/schemas)" ]; then
+            git status --porcelain -- portable/fixtures portable/schemas
+            echo "::error::portable golden fixture or schemas are stale or non-deterministic."
+            exit 1
+          fi
+      - name: Verify golden fixture with the standalone verifier
+        # Public test passphrase documented in portable/fixtures/README.md (synthetic fixture only).
+        run: |
+          printf '%s' 'correct horse battery staple 2026' > "$RUNNER_TEMP/golden-pass.txt"
+          pnpm exec tsx portable/cli/verify.ts verify portable/fixtures/golden-v3.rpkg --passphrase-file "$RUNNER_TEMP/golden-pass.txt"

@@ -1,0 +1,38 @@
+# Dependency update automation. Updates arrive as reviewable PRs; nothing merges automatically.
+# New dependencies still require a row in docs/engineering/DEPENDENCIES.md (see docs/engineering/SDLC.md).
+version: 2
+updates:
+  - package-ecosystem: npm # reads package.json + pnpm-lock.yaml
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 10
+    versioning-strategy: increase
+    labels: [dependencies]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      production-minor-patch:
+        dependency-type: production
+        update-types: [minor, patch]
+      development-minor-patch:
+        dependency-type: development
+        update-types: [minor, patch]
+    # Major versions arrive as individual PRs so each gets its own review and ADR if needed.
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns: ["*"]

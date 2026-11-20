@@ -1,0 +1,30 @@
+# Code owners. Every handle below is a PLACEHOLDER (@readypackets/PLACEHOLDER-*): replace with real
+# GitHub teams or users before enabling "Require review from Code Owners" on the protected main branch.
+# Later rules take precedence over earlier ones.
+
+*                               @readypackets/PLACEHOLDER-maintainers
+
+# Security-sensitive areas require a security reviewer in addition to the area owner.
+/server/http/                   @readypackets/PLACEHOLDER-security
+/server/security/               @readypackets/PLACEHOLDER-security
+/server/config/                 @readypackets/PLACEHOLDER-security
+/server/modules/identity/       @readypackets/PLACEHOLDER-security
+/server/modules/assurance/      @readypackets/PLACEHOLDER-security
+/server/modules/audit/          @readypackets/PLACEHOLDER-security
+/server/modules/siem/           @readypackets/PLACEHOLDER-security
+/portable/                      @readypackets/PLACEHOLDER-security
+/shared/capabilities.ts         @readypackets/PLACEHOLDER-security
+/migrations/                    @readypackets/PLACEHOLDER-maintainers @readypackets/PLACEHOLDER-security
+/deploy/                        @readypackets/PLACEHOLDER-ops @readypackets/PLACEHOLDER-security
+/scripts/ops/                   @readypackets/PLACEHOLDER-ops
+
+# Client UI and accessibility.
+/client/                        @readypackets/PLACEHOLDER-frontend
+
+# Supply chain and process.
+/.github/                       @readypackets/PLACEHOLDER-security
+/package.json                   @readypackets/PLACEHOLDER-maintainers @readypackets/PLACEHOLDER-security
+/pnpm-lock.yaml                 @readypackets/PLACEHOLDER-maintainers @readypackets/PLACEHOLDER-security
+/pnpm-workspace.yaml            @readypackets/PLACEHOLDER-security
+/SECURITY.md                    @readypackets/PLACEHOLDER-security
+/docs/engineering/              @readypackets/PLACEHOLDER-maintainers
