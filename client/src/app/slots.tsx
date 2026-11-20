@@ -36,8 +36,8 @@ const AnalyticsConsentSlotImpl = consentLoader ? lazy(() => consentLoader().then
 export function NotificationSlot({ area }: { area: "customer" | "console" }) {
   return slot(<NotificationBellPopover area={area} />);
 }
-export function GlobalSearchSlot() {
-  return slot(<GlobalSearchBox />);
+export function GlobalSearchSlot({ className }: { className?: string }) {
+  return slot(<GlobalSearchBox className={className} />);
 }
 export function AnalyticsConsentSlot() {
   return AnalyticsConsentSlotImpl ? slot(<AnalyticsConsentSlotImpl />) : null;

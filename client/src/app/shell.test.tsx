@@ -144,3 +144,23 @@ describe("avatar initials (D4)", () => {
     expect(initials("3M Ops")).toBe("3O");
   });
 });
+
+describe("console header search (D5)", () => {
+  it("inline search only from md up; a single 44px Search link to /search below md", () => {
+    renderUi(
+      <ConsoleShell user={user("admin")}>
+        <h1>Page</h1>
+      </ConsoleShell>,
+      { path: "/admin" },
+    );
+    const inline = screen.getByTestId("console-search-inline");
+    expect(inline.className).toMatch(/(^| )hidden( |$)/);
+    expect(inline.className).toContain("md:block");
+    expect(inline.className).toContain("min-w-[20rem]");
+    const links = screen.getAllByRole("link", { name: "Search" });
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute("href", "/search");
+    expect(links[0]?.className).toContain("size-11");
+    expect(links[0]?.className).toContain("md:hidden");
+  });
+});

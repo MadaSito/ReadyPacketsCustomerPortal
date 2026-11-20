@@ -2,7 +2,7 @@
  * Staff/admin console shell: grouped sidebar (collapsible to icons on ≥ lg), drawer on smaller screens,
  * top bar with global search slot, notifications, theme and account menu, maintenance banner.
  */
-import { ChevronsLeft, ChevronsRight, Menu } from "lucide-react";
+import { ChevronsLeft, ChevronsRight, Menu, Search } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { ALL_NAV } from "@/app/registry";
@@ -98,9 +98,17 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
             <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded lg:hidden">
               <BrandLogo variant="icon" label="" className="h-9" />
             </Link>
-            <div className="min-w-0 flex-1 px-1 sm:max-w-md">
-              <GlobalSearchSlot />
+            {/* Inline search from md up (min width keeps the placeholder whole); a single icon link below md. */}
+            <div className="hidden min-w-[20rem] flex-1 px-1 md:block md:max-w-md" data-testid="console-search-inline">
+              <GlobalSearchSlot className="flex w-full items-center gap-2 [&>*:first-child]:min-w-0 [&>*:first-child]:flex-1" />
             </div>
+            <Link
+              href="/search"
+              aria-label="Search"
+              className="inline-flex size-11 shrink-0 items-center justify-center rounded-[var(--radius-control)] text-body hover:bg-surface-sunken hover:text-ink md:hidden"
+            >
+              <Search aria-hidden="true" className="size-5" />
+            </Link>
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <NotificationSlot area="console" />
               <ThemeToggle />
