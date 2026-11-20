@@ -102,6 +102,15 @@ Read [Install on Ubuntu 24.04](docs/operations/INSTALL.md) and [release gates](d
 - [0010 Indexing boundary](docs/adr/0010-indexing-boundary.md)
 - [0011 Analytics consent](docs/adr/0011-analytics-consent.md)
 - [0012 Toolchain](docs/adr/0012-toolchain.md)
+- [0013 Transaction and lock discipline](docs/adr/0013-transaction-and-lock-discipline.md)
+- [0014 Payments are recorded manually; the Stripe adapter is a disabled scaffold](docs/adr/0014-payments-manual-recording.md)
+- [0015 Restore is an operator procedure, never a web action](docs/adr/0015-restore-is-an-operator-procedure.md)
+- [0016 The preview profile requires an explicit synthetic-data acknowledgement](docs/adr/0016-preview-profile-acknowledgement.md)
+- [0017 SIEM delivery states what was actually confirmed](docs/adr/0017-siem-delivery-receipts.md)
+- [0018 Portable package envelope and import custody](docs/adr/0018-portable-package-envelope.md)
+- [0019 Audit chain keys and off-host checkpoints](docs/adr/0019-audit-chain-key-custody.md)
+- [0020 Release scope: installable web app first; optional integrations ship disabled](docs/adr/0020-delivery-scope-mobile-and-integrations.md)
+- [0021 Analytics on the portal origin: quarantine and accepted residual](docs/adr/0021-analytics-origin-residual.md)
 
 ### Security
 

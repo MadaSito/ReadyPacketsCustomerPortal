@@ -125,6 +125,10 @@ export async function createSystem(overrides: Partial<AppConfig> = {}, options: 
       return messages;
     },
     async audit(filter) {
+      // Edge denials are recorded as best-effort notes (bounded queue, flushed in batches). Flush before reading
+      // so assertions never race the queue when the machine is busy.
+      const emitter = services.audit as typeof services.audit & { flushNotes?: () => Promise<void> };
+      await emitter.flushNotes?.();
       const names = filter.eventName === undefined ? undefined : [filter.eventName].flat();
       return t.db.select().from(auditEvents).where(and(
         filter.requestId ? eq(auditEvents.requestId, filter.requestId) : undefined,
