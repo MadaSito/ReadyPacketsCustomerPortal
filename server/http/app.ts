@@ -4,11 +4,12 @@
  * REQUIRED ORDER (architecture §4.1 / §9.3):
  *   1. trust-proxy from config.trustedProxies; server-generated request context (AsyncLocalStorage)
  *   2. host validation (canonical host only; alias hosts 308 → canonical; unknown hosts refused)
- *   3. security headers + per-response nonce CSP; raw signed webhooks (before body parsing)
- *   4. bounded body parsers
+ *   3. security headers + per-response nonce CSP; preview CORS
+ *   4. cheap address admission, origin checks, durable edge budgets and bounded body parsers
+ *      (signed webhooks use a separate raw body route with no browser credentials)
  *   5. session resolution (services.sessionResolver) → request actor
- *   6. CSRF/origin enforcement for unsafe methods (identity is resolved BEFORE this check)
- *   7. rate limits  8. /api/trpc (createContext)  9. module raw routes (createModuleHttpRouter)
+ *   6. session-bound CSRF validation for unsafe methods
+ *   7. CSRF bootstrap  8. /api/trpc (independent procedure budgets)  9. module raw routes
  *  10. health endpoints  11. static assets + SPA fallback (prebuilt dist/public; no dev server in production)
  *  12. safe JSON error handler (never stacks/SQL/paths)
  */
@@ -27,9 +28,11 @@ import {
   issueAnonymousCsrfToken, matchesSessionCsrfToken, secureEqual,
 } from "../security/csrf.js";
 import { applySecurityHeaders, newCspNonce, setAnalyticsCsp, type AnalyticsCspPolicy } from "../security/headers.js";
+import { rateLimitAddress } from "../security/rateLimitAddress.js";
 import { createTrpcContext } from "../trpc/context.js";
 import { appRouter } from "../trpc/root.js";
 import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, requestHost, routeTemplate } from "./edge.js";
+import { createEdgeAdmission } from "./edgeAdmission.js";
 import { sendSafeError, trpcRetryAfter } from "./errors.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
@@ -52,6 +55,7 @@ const JSON_LIMIT_BYTES = 256 * 1024;
 const MAX_BATCH_SIZE = 8;
 const MAX_REQUEST_TARGET = 8_192;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const PROBE_PATHS = new Set(["/healthz", "/readyz"]);
 const CATEGORY_PRIORITY: Record<RateLimitCategory, number> = {
   standard_browsing: 0, api: 1, form_submission: 2, expensive: 3, user_login: 4, auth_high_risk: 5,
 };
@@ -103,23 +107,11 @@ function tRpcBudget(router: AnyTRPCRouter, calls: readonly string[]): RateLimitC
 
 async function applyRateLimit(services: Services, category: RateLimitCategory, key: string, cost = 1): Promise<void> {
   const verdict = await services.rateLimiter.consume(category, key, cost);
-  if (!verdict.allowed) {
-    throw new DomainError("RATE_LIMITED", "RATE_LIMITED", "Too many requests. Please wait a moment and try again.", {
-      retryAfterSeconds: verdict.retryAfterSeconds,
-    });
-  }
+  if (!verdict.allowed) throw rateLimited(verdict.retryAfterSeconds);
 }
 
-async function denyBrowserRequest(services: Services, reason: "ORIGIN_NOT_ALLOWED" | "CSRF_INVALID"): Promise<never> {
-  const eventName = reason === "ORIGIN_NOT_ALLOWED" ? "http.origin.denied" : "http.csrf.denied";
-  try {
-    await services.audit.record({ eventName, category: "security", action: "request", outcome: "denied", severity: "WARN", reasonCode: reason });
-  } catch {
-    services.logger.warn("http security denial could not be recorded", { reasonCode: reason });
-  }
-  throw new DomainError("FORBIDDEN", reason, reason === "ORIGIN_NOT_ALLOWED"
-    ? "This request did not come from the portal origin."
-    : "Your security token is no longer valid. Reload the page and try again.");
+function rateLimited(retryAfterSeconds: number): DomainError {
+  return new DomainError("RATE_LIMITED", "RATE_LIMITED", "Too many requests. Please wait a moment and try again.", { retryAfterSeconds });
 }
 
 export function createApp(services: Services, options: AppOptions = {}): Express {
@@ -128,6 +120,22 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   if (canonical.protocol !== "https:" && canonical.protocol !== "http:") throw new Error("Invalid canonical HTTP origin");
   if (options.staticDir) assertSeparateStorage(options.staticDir, config.storageDir);
   const anonymousKey = Buffer.from(config.tokenHashKey, "base64");
+  const admission = createEdgeAdmission(anonymousKey);
+  const currentAddress = () => rateLimitAddress(getRequestContext()?.ipAddress);
+  function denyBrowserRequest(reason: "ORIGIN_NOT_ALLOWED" | "CSRF_INVALID"): never {
+    const origin = reason === "ORIGIN_NOT_ALLOWED";
+    if (admission.shouldNote(currentAddress(), services.clock.now().getTime(), origin ? 1 : 2)) {
+      try {
+        services.audit.note({
+          eventName: origin ? "http.origin.denied" : "http.csrf.denied",
+          category: "security", action: "request", outcome: "denied", severity: "WARN", reasonCode: reason,
+        });
+      } catch { /* A failed best-effort audit note cannot affect the denial. */ }
+    }
+    throw new DomainError("FORBIDDEN", reason, origin
+      ? "This request did not come from the portal origin."
+      : "Your security token is no longer valid. Reload the page and try again.");
+  }
   const app = express();
   const preview = previewProfile(config);
   const router = options.trpcRouter ?? appRouter;
@@ -201,6 +209,19 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     next();
   });
 
+  // No database, credential lookup or durable audit before this admission gate.
+  app.use((req, _res, next) => {
+    if (PROBE_PATHS.has(req.path) && (req.method === "GET" || req.method === "HEAD")) return next();
+    const retry = admission.consume(currentAddress(), services.clock.now().getTime());
+    if (retry > 0) throw rateLimited(retry);
+    const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");
+    if (!pathIn(SIGNED_WEBHOOK_PATH, req.path) && !preview?.usesExplicitCredentials &&
+        (bootstrap || !SAFE_METHODS.has(req.method)) && !hasCanonicalOrigin(req, canonical.origin, bootstrap)) {
+      denyBrowserRequest("ORIGIN_NOT_ALLOWED");
+    }
+    next();
+  });
+
   const signedWebhooks = options.signedWebhookRouter ?? express.Router({ caseSensitive: true, strict: true });
   if (!options.signedWebhookRouter) {
     const integrations = integrationHttp as typeof integrationHttp & {
@@ -212,7 +233,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     (async (req, _res, next) => {
       if (req.method !== "POST") throw notFound();
       if (!req.is("application/json")) throw validation("UNSUPPORTED_WEBHOOK_CONTENT", "This endpoint accepts JSON.");
-      const subject = `ip:${getRequestContext()?.ipAddress ?? "unknown"}`;
+      const subject = `ip:${currentAddress()}`;
       await applyRateLimit(services, "api", subject);
       next();
     }) satisfies RequestHandler,
@@ -221,45 +242,9 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     () => { throw notFound(); },
   );
 
-  // 4. Reject oversized/malformed JSON (no inflation); multipart and binary remain untouched.
-  app.use("/api", express.json({ limit: JSON_LIMIT_BYTES, inflate: false, strict: true }));
-
-  // 5. Resolve authoritative identity once, before CSRF, including remediation sessions.
-  app.use(async (req, res, next) => {
-    const context = getRequestContext()!;
-    const credentials = preview?.credentials(req) ?? cookieCredentials(req, config);
-    const probe = req.path === "/healthz" || req.path === "/readyz";
-    const session = !probe && credentials.token && credentials.token.length <= 512
-      ? await services.sessionResolver.resolve(credentials) : null;
-    const transport = preview?.transport(res) ?? cookieTransport(res, config);
-    setHttpState(req, { context, session, transport, cspNonce: nonceByRequest.get(req)! });
-    if (session) {
-      setRequestActor({ userId: session.userId, role: session.role, sessionId: session.sessionId });
-      res.setHeader("Cache-Control", "no-store");
-    }
-    next();
-  });
-
-  // 6. Canonical browser origins + session-bound double submit on unsafe methods.
+  // Cross-replica admission, also before session resolution. The strictest tRPC budget wins.
   app.use(async (req, _res, next) => {
-    if (SAFE_METHODS.has(req.method)) return next();
-    if (!preview?.usesExplicitCredentials && !hasCanonicalOrigin(req, canonical.origin)) {
-      await denyBrowserRequest(services, "ORIGIN_NOT_ALLOWED");
-    }
-    const { session } = getHttpState(req);
-    const token = req.get(HEADER_CSRF);
-    const cookie = preview?.usesExplicitCredentials ? token : readCookie(req, config.csrfCookieName);
-    const matches = token && cookie && secureEqual(token, cookie) && (session
-      ? matchesSessionCsrfToken(token, session.sessionId, session.csrfSecret)
-      : isAnonymousCsrfToken(token, services.clock.now(), anonymousKey));
-    if (!matches) await denyBrowserRequest(services, "CSRF_INVALID");
-    next();
-  });
-
-  // 7. Per-IP request admission. tRPC batches take the strictest budget before any procedure runs,
-  // with the per-procedure limiter providing the independent session/identity check afterwards.
-  app.use(async (req, _res, next) => {
-    const subject = `ip:${getRequestContext()?.ipAddress ?? "unknown"}`;
+    const subject = `ip:${currentAddress()}`;
     if (pathIn(TRPC_PATH, req.path)) {
       const calls = tRpcCalls(req);
       if (!calls.length || (calls.length > 1 && req.query.batch !== "1")) {
@@ -272,16 +257,45 @@ export function createApp(services: Services, options: AppOptions = {}): Express
         ? "expensive" : pathIn("/api/identity", req.path) || pathIn("/api/assurance", req.path)
           ? "auth_high_risk" : "api";
       await applyRateLimit(services, category, subject);
-    } else if (isNavigation(req) && req.path !== "/healthz" && req.path !== "/readyz") {
+    } else if (isNavigation(req) && !PROBE_PATHS.has(req.path)) {
       await applyRateLimit(services, "standard_browsing", subject);
     }
     next();
   });
 
-  app.get("/api/csrf", async (req, res) => {
-    if (!preview?.usesExplicitCredentials && !hasCanonicalOrigin(req, canonical.origin, true)) {
-      await denyBrowserRequest(services, "ORIGIN_NOT_ALLOWED");
+  // 4. Reject oversized/malformed JSON (no inflation); multipart and binary remain untouched.
+  app.use("/api", express.json({ limit: JSON_LIMIT_BYTES, inflate: false, strict: true }));
+
+  // 5. Resolve authoritative identity once, before CSRF, including remediation sessions.
+  app.use(async (req, res, next) => {
+    const context = getRequestContext()!;
+    const credentials = preview?.credentials(req) ?? cookieCredentials(req, config);
+    const probe = PROBE_PATHS.has(req.path);
+    const session = !probe && credentials.token && credentials.token.length <= 512
+      ? await services.sessionResolver.resolve(credentials) : null;
+    const transport = preview?.transport(res) ?? cookieTransport(res, config);
+    setHttpState(req, { context, session, transport, cspNonce: nonceByRequest.get(req)! });
+    if (session) {
+      setRequestActor({ userId: session.userId, role: session.role, sessionId: session.sessionId });
+      res.setHeader("Cache-Control", "no-store");
     }
+    next();
+  });
+
+  // 6. Session-bound double submit on unsafe methods. Origin was already checked.
+  app.use((req, _res, next) => {
+    if (SAFE_METHODS.has(req.method)) return next();
+    const { session } = getHttpState(req);
+    const token = req.get(HEADER_CSRF);
+    const cookie = preview?.usesExplicitCredentials ? token : readCookie(req, config.csrfCookieName);
+    const matches = token && cookie && secureEqual(token, cookie) && (session
+      ? matchesSessionCsrfToken(token, session.sessionId, session.csrfSecret)
+      : isAnonymousCsrfToken(token, services.clock.now(), anonymousKey));
+    if (!matches) denyBrowserRequest("CSRF_INVALID");
+    next();
+  });
+
+  app.get("/api/csrf", async (req, res) => {
     const session = getHttpState(req).session;
     const now = services.clock.now();
     const existing = preview ? undefined : readCookie(req, config.csrfCookieName);

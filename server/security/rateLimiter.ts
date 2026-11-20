@@ -1,20 +1,21 @@
 /**
  * Database-backed, restart-safe rate limiter with distinct budgets per category. Owner: http_security engineer.
- * Integrator stub: replace the body; keep the factory signature.
  */
-import { createHash } from "node:crypto";
+import { createHmac, hkdfSync } from "node:crypto";
 import { and, eq, lte } from "drizzle-orm";
 import { z } from "zod";
 import { RATE_LIMIT_CATEGORIES } from "../core/types.js";
 import type { Clock, Db, Logger, MaintainableRateLimiter, RateLimitCategory, SettingsStore } from "../core/types.js";
 import { defineSetting, readSetting, type ValueSettingDefinition } from "../modules/platform/index.js";
 import { rateLimitCounters as counters } from "./rateLimiterSchema.js";
+import { normalizeRateLimitKey } from "./rateLimitAddress.js";
 
 export interface RateLimiterDeps {
   db: Db;
   clock: Clock;
   logger: Logger;
   settings: SettingsStore;
+  tokenHashKey: string;
 }
 
 export interface DbRateLimiter extends MaintainableRateLimiter {
@@ -59,6 +60,9 @@ const budgetSettings = Object.fromEntries(RATE_LIMIT_CATEGORIES.map((category) =
 const SLOT_MASK = (1 << 18) - 1;
 
 export function createRateLimiter(deps: RateLimiterDeps): DbRateLimiter {
+  const slotKey = Buffer.from(hkdfSync(
+    "sha256", Buffer.from(deps.tokenHashKey, "base64"), "", "readypackets/http/durable-rate-limit-slot/v1", 32,
+  ));
   const nextAlert = new Map<RateLimitCategory, number>();
 
   const limiter: DbRateLimiter = {
@@ -69,7 +73,8 @@ export function createRateLimiter(deps: RateLimiterDeps): DbRateLimiter {
       try {
         // Override changes take effect without dropping active windows (new durations apply upon reset).
         const budget = await readSetting(deps.settings, budgetSettings[category]);
-        const slot = createHash("sha256").update(category).update("\0").update(key).digest().readUInt32BE(0) & SLOT_MASK;
+        const slot = createHmac("sha256", slotKey).update(category).update("\0")
+          .update(normalizeRateLimitKey(key)).digest().readUInt32BE(0) & SLOT_MASK;
         const where = and(eq(counters.category, category), eq(counters.slot, slot));
         return await deps.db.transaction(async (tx) => {
           // The upsert takes the same exclusive row lock across processes, even when hits is unchanged.

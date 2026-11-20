@@ -93,7 +93,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   const crypto = overrides.core?.crypto ?? createFieldCrypto(config);
   const audit = overrides.core?.audit ?? createAuditEmitter({ config, db, clock, logger, crypto });
   const settings = overrides.core?.settings ?? createSettingsStore({ db, clock, logger, crypto, audit });
-  const rateLimiter = overrides.core?.rateLimiter ?? createRateLimiter({ db, clock, logger, settings });
+  const rateLimiter = overrides.core?.rateLimiter ?? createRateLimiter({ db, clock, logger, settings, tokenHashKey: config.tokenHashKey });
   const storage = overrides.core?.storage ?? createObjectStorage({ config, logger });
   const queueDeps = { config, db, clock, logger, audit, crypto, settings };
   const jobs = overrides.core?.jobs ?? createJobQueue(queueDeps);

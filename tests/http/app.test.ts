@@ -9,6 +9,7 @@ import { getRequestContext } from "../../server/core/requestContext.js";
 import type { RateLimiter } from "../../server/core/types.js";
 import { createApp, type AppOptions } from "../../server/http/app.js";
 import { sendPrivateDownload } from "../../server/http/downloads.js";
+import { EDGE_REQUESTS_PER_WINDOW } from "../../server/http/edgeAdmission.js";
 import { getHttpState } from "../../server/http/requestState.js";
 import { ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken } from "../../server/security/csrf.js";
 import { protectedProcedure, publicProcedure, router } from "../../server/trpc/trpc.js";
@@ -190,7 +191,7 @@ describe("HTTP edge: authority, headers, proxy and probes", () => {
 });
 
 describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
-  it("exercises missing, forged, cross-session and cross-origin CSRF while validating session first", async () => {
+  it("checks origins before session lookup and validates CSRF against the resolved session", async () => {
     const h = harness();
     const perform = (browserOrigin: string, cookieToken: string, csrfHeader?: string) => {
       const pending = h.http.post("/api/trpc/update").set("Host", HOST).set("Origin", browserOrigin)
@@ -210,9 +211,44 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     const good = await perform(ORIGIN, csrfA, csrfA).set("Sec-Fetch-Site", "same-origin").expect(200);
     expect(good.body.result.data.json).toEqual({ requestId: good.headers["x-request-id"], actor: a.sessionId });
     expect(h.effect).toHaveBeenCalledTimes(1);
-    expect(h.sessionResolver).toHaveBeenCalledTimes(9);
-    expect(h.audit.named("http.csrf.denied")).toHaveLength(3);
-    expect(h.audit.named("http.origin.denied")).toHaveLength(5);
+    expect(h.sessionResolver).toHaveBeenCalledTimes(4);
+    expect(h.audit.events).toHaveLength(0);
+    expect(h.audit.notes.map(({ eventName }) => eventName)).toEqual(["http.csrf.denied", "http.origin.denied"]);
+  });
+
+  it("stops repeated denials at the local gate before the durable limiter, session, or audit", async () => {
+    const h = harness({}, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
+    const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+    h.services.rateLimiter = { consume };
+    const target = (address: string) => h.http.post("/api/mutate").set("Host", HOST)
+      .set("X-Forwarded-For", address).set("Origin", "https://outside.example.test")
+      .set("Cookie", requestCookies(h.config, TOKEN_A, csrfA));
+    for (let index = 0; index < EDGE_REQUESTS_PER_WINDOW; index++) {
+      await target(`2001:db8:1234:5678::${(index + 1).toString(16)}`).expect(403);
+    }
+    const cookie = requestCookies(h.config, TOKEN_A, csrfA);
+    await h.http.get("/unmatched-asset").set("Host", HOST).set("X-Forwarded-For", "2001:0DB8:1234:5678::cc")
+      .set("Cookie", cookie).expect(429).expect("Retry-After", "10");
+    await h.http.get("/healthz").set("Host", HOST).set("X-Forwarded-For", "2001:db8:1234:5678::cc")
+      .set("Cookie", cookie).expect(200);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(consume).not.toHaveBeenCalled();
+    expect(h.audit.events).toHaveLength(0);
+    expect(h.audit.notes.map(({ eventName }) => eventName)).toEqual(["http.origin.denied"]);
+    h.clock.advance(10_000);
+    await h.http.get("/api/check").set("Host", HOST).set("X-Forwarded-For", "2001:db8:1234:5678::dd")
+      .set("Cookie", cookie).expect(200, { actor: a.sessionId });
+    expect(consume).toHaveBeenCalledWith("api", "ip:2001:db8:1234:5678::/64", 1);
+  });
+
+  it("maps trusted forwarded IPv4-mapped forms to the same durable subject as IPv4", async () => {
+    const h = harness({}, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
+    const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+    h.services.rateLimiter = { consume };
+    for (const address of ["192.0.2.7", "::ffff:192.0.2.7", "::FFFF:C000:207"]) {
+      await h.http.get("/api/check").set("Host", HOST).set("X-Forwarded-For", address).expect(200);
+    }
+    expect(consume.mock.calls).toEqual(Array.from({ length: 3 }, () => ["api", "ip:192.0.2.7", 1]));
   });
 
   it("applies identical CSRF controls to raw module routes and refuses mutation over GET", async () => {
@@ -255,10 +291,12 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     const h = harness();
     const consume: RateLimiter["consume"] = vi.fn(async () => ({ allowed: false, retryAfterSeconds: 24 }));
     h.services.rateLimiter = { consume };
-    const result = await h.http.get("/api/trpc/open,scarce?batch=1").set("Host", HOST).expect(429);
+    const result = await h.http.get("/api/trpc/open,scarce?batch=1").set("Host", HOST)
+      .set("Cookie", requestCookies(h.config, TOKEN_A, csrfA)).expect(429);
     expect(result.headers["retry-after"]).toBe("24");
     expect(result.body).toHaveLength(2);
     expect(consume).toHaveBeenCalledWith("auth_high_risk", expect.stringMatching(/^edge:ip:/), 2);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
     const big = await h.http.get(`/api/trpc/${Array(9).fill("open").join(",")}?batch=1`).set("Host", HOST).expect(400);
     expect(big.body.error.json.data.safe.reasonCode).toBe("BATCH_TOO_LARGE");
     await h.http.get("/api/trpc/open,scarce").set("Host", HOST).expect(400);
@@ -333,9 +371,11 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(h.sessionResolver).not.toHaveBeenCalled();
     await h.http.post("/api/integrations/webhooks/unknown").set("Host", HOST).send({ example: true }).expect(404);
     await h.http.get("/api/integrations/webhooks/synthetic").set("Host", HOST).expect(404);
-    const oversized = await h.http.post("/api/mutate").set("Host", HOST).send({ example: "x".repeat(256 * 1024) }).expect(413);
+    const oversized = await h.http.post("/api/mutate").set("Host", HOST).set("Origin", ORIGIN)
+      .send({ example: "x".repeat(256 * 1024) }).expect(413);
     expect(oversized.body.safe.reasonCode).toBe("BODY_TOO_LARGE");
-    const malformed = await h.http.post("/api/mutate").set("Host", HOST).set("Content-Type", "application/json").send("{not json").expect(400);
+    const malformed = await h.http.post("/api/mutate").set("Host", HOST).set("Origin", ORIGIN)
+      .set("Content-Type", "application/json").send("{not json").expect(400);
     expect(malformed.body.safe.reasonCode).toBe("INVALID_JSON");
     expect(malformed.text).not.toContain("{not json");
   });

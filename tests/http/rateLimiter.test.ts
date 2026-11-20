@@ -15,14 +15,15 @@ describe("database rate limiter", () => {
   it("serializes concurrent consumption across instances, honors duration/cost, and survives fresh instances", async () => {
     const h = createTestDeps({ db: database.db });
     await h.settings.set("http.rate_limit.auth_high_risk", { maxRequests: 9, windowSeconds: 4 });
-    const first = createRateLimiter(h.deps);
-    const second = createRateLimiter(h.deps);
+    const deps = { ...h.deps, tokenHashKey: h.config.tokenHashKey };
+    const first = createRateLimiter(deps);
+    const second = createRateLimiter(deps);
     const results = await Promise.all(Array.from({ length: 12 }, (_, index) => (
       (index % 2 ? first : second).consume("auth_high_risk", "ip:198.51.100.41", 2)
     )));
     expect(results.filter((result) => result.allowed)).toHaveLength(4);
     expect(results.filter((result) => !result.allowed).every((result) => result.retryAfterSeconds === 4)).toBe(true);
-    const restarted = createRateLimiter(h.deps);
+    const restarted = createRateLimiter(deps);
     await expect(restarted.consume("auth_high_risk", "ip:198.51.100.41", 1)).resolves.toEqual({ allowed: true, retryAfterSeconds: 0 });
     await expect(restarted.consume("auth_high_risk", "ip:198.51.100.41")).resolves.toEqual({ allowed: false, retryAfterSeconds: 4 });
     await expect(restarted.consume("api", "ip:198.51.100.41")).resolves.toEqual({ allowed: true, retryAfterSeconds: 0 });
@@ -33,7 +34,7 @@ describe("database rate limiter", () => {
 
   it("registers maintenance and prunes expired but not active counters", async () => {
     const h = createTestDeps({ db: database.db });
-    const limiter = createRateLimiter(h.deps);
+    const limiter = createRateLimiter({ ...h.deps, tokenHashKey: h.config.tokenHashKey });
     limiter.registerMaintenance(h.jobs);
     expect(h.jobs.schedules).toContainEqual({
       name: "http.rate_limit.cleanup", type: "http.rate_limit.cleanup", everyMs: 60_000,
@@ -49,10 +50,26 @@ describe("database rate limiter", () => {
     expect(await limiter.consume("expensive", "ip:198.51.100.43", 2)).toMatchObject({ allowed: false });
   });
 
+  it("shares normalized address counters for replicas with the same root and separates a different root", async () => {
+    const h = createTestDeps({ db: database.db });
+    await h.settings.set("http.rate_limit.form_submission", { maxRequests: 1, windowSeconds: 60 });
+    const deps = { ...h.deps, tokenHashKey: h.config.tokenHashKey };
+    const first = createRateLimiter(deps);
+    const replica = createRateLimiter(deps);
+    const otherRoot = createRateLimiter({ ...deps, tokenHashKey: Buffer.alloc(32, 213).toString("base64") });
+    await expect(first.consume("form_submission", "edge:ip:2001:db8:17:2::1")).resolves.toMatchObject({ allowed: true });
+    await expect(replica.consume("form_submission", "edge:ip:2001:0DB8:17:2:abcd:1234:5678:9abc"))
+      .resolves.toMatchObject({ allowed: false });
+    await expect(replica.consume("form_submission", "edge:ip:2001:db8:17:3::1")).resolves.toMatchObject({ allowed: true });
+    await expect(otherRoot.consume("form_submission", "edge:ip:2001:db8:17:2::1")).resolves.toMatchObject({ allowed: true });
+    await expect(first.consume("form_submission", "ip:::ffff:c000:20a")).resolves.toMatchObject({ allowed: true });
+    await expect(replica.consume("form_submission", "ip:192.0.2.10")).resolves.toMatchObject({ allowed: false });
+  });
+
   it("fails closed for API/security traffic and alerts once per interval when standard browsing fails open", async () => {
     const h = createTestDeps(); // intentionally has no DB implementation
     const error = vi.fn();
-    const limiter = createRateLimiter({ ...h.deps, logger: { ...silentLogger, error } });
+    const limiter = createRateLimiter({ ...h.deps, tokenHashKey: h.config.tokenHashKey, logger: { ...silentLogger, error } });
     await expect(limiter.consume("auth_high_risk", "ip:198.51.100.41")).resolves.toEqual({ allowed: false, retryAfterSeconds: 30 });
     await expect(limiter.consume("api", "ip:198.51.100.41")).resolves.toEqual({ allowed: false, retryAfterSeconds: 30 });
     await expect(limiter.consume("standard_browsing", "ip:198.51.100.41")).resolves.toEqual({ allowed: true, retryAfterSeconds: 0 });

@@ -27,8 +27,10 @@ export function acceptsLocalProbe(req: Request, hostname: string | undefined): b
 }
 
 export function clientAddress(req: Request): string | undefined {
-  const address = (req.ip ?? req.socket.remoteAddress)?.replace(/^::ffff:/i, "");
-  return address && isIP(address) ? address : undefined;
+  const address = req.ip ?? req.socket.remoteAddress;
+  if (!address || !isIP(address)) return undefined;
+  const unmapped = address.replace(/^::ffff:/i, "");
+  return isIP(unmapped) === 4 ? unmapped : address;
 }
 
 export function isNavigation(req: Request): boolean {
