@@ -264,8 +264,11 @@ export interface ClaimedJob<P = unknown> {
   fencingToken: number;
   correlationId: string;
   signal: AbortSignal;
-  /** Throws if the claim was lost; call before each durable boundary. */
-  assertStillOwned(): Promise<void>;
+  /**
+   * Throws if the claim was lost; call before each durable boundary. Pass the writer's `tx` to take the
+   * fencing lock inside that transaction, so a stale claimant can never commit alongside the current owner.
+   */
+  assertStillOwned(tx?: Tx): Promise<void>;
 }
 
 export type JobResult =
@@ -274,10 +277,19 @@ export type JobResult =
   | { outcome: "unknown"; reasonCode: string }
   | { outcome: "canceled"; reasonCode: string };
 
+export interface JobHandlerOptions {
+  /**
+   * Declare true ONLY when re-running an interrupted attempt cannot duplicate an external effect (pure
+   * database work guarded by fencing/idempotency keys). Default false: an interrupted or ambiguous attempt
+   * becomes `unknown` and is never retried automatically.
+   */
+  retrySafe?: boolean;
+}
+
 export interface JobQueue {
   enqueue<P>(type: string, payload: P, options?: EnqueueOptions, tx?: Tx): Promise<{ jobId: string }>;
   /** Register at composition time. Handlers must be idempotent and honor `job.signal`. */
-  register<P>(type: string, handler: (job: ClaimedJob<P>) => Promise<JobResult>): void;
+  register<P>(type: string, handler: (job: ClaimedJob<P>) => Promise<JobResult>, options?: JobHandlerOptions): void;
   /**
    * Declares a recurring job (construction time). The scheduler enqueues `type` at most once per interval
    * across all workers (durable, idempotent per slot). `name` must be unique.

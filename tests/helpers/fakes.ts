@@ -21,6 +21,7 @@ import type {
   CoreDeps,
   Db,
   EnqueueOptions,
+  JobHandlerOptions,
   JobQueue,
   JobResult,
   Logger,
@@ -99,8 +100,10 @@ export class FakeJobs implements JobQueue {
     this.enqueued.push({ jobId, type, payload, options });
     return { jobId };
   }
-  register<P>(type: string, handler: (job: ClaimedJob<P>) => Promise<JobResult>): void {
+  handlerOptions = new Map<string, JobHandlerOptions>();
+  register<P>(type: string, handler: (job: ClaimedJob<P>) => Promise<JobResult>, options?: JobHandlerOptions): void {
     this.handlers.set(type, handler as (job: ClaimedJob<never>) => Promise<JobResult>);
+    this.handlerOptions.set(type, options ?? {});
   }
   /** Runs every queued job of a type through its registered handler (synchronously, in order). */
   async runAll(type?: string): Promise<JobResult[]> {
