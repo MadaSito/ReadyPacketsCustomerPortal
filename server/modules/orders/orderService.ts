@@ -4,6 +4,7 @@
  */
 import { and, asc, desc, eq, gte, inArray, isNotNull, like, lt, lte, or, sql } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
+import { hasFreshStepUp } from "../../trpc/trpc.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, FieldCrypto, Logger, Mailer, SessionPrincipal, SettingsStore, Tx } from "../../core/types.js";
@@ -79,6 +80,11 @@ export interface OrderListItem {
 }
 
 export function createOrderService(deps: OrderServiceDeps) {
+  /** Defence in depth: the router already enforces step-up for these capabilities; services re-check. */
+  function assertFreshStepUp(principal: SessionPrincipal): void {
+    if (!hasFreshStepUp(principal, deps.clock.now())) throw forbidden("STEP_UP_REQUIRED");
+  }
+
   const { policy, workflows } = deps;
 
   const encryptNote = (body: string, publicId: string) => deps.crypto.encrypt(body, `order_notes.body:${publicId}`);
@@ -687,6 +693,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     /* ------------------------------------------------------------- reference */
     async changeReference(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; newReference: string; reasonCode: string }) {
       if (!roleHasCapability(principal.role, "orders.identifiers.change") || principal.role === "customer") throw forbidden("CAPABILITY_NOT_GRANTED");
+      assertFreshStepUp(principal);
       const reference = normalizeReference(input.newReference);
       return deps.db.transaction(async (tx) => {
         const view = await policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
@@ -739,6 +746,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       input: { orderId: string; targetCustomerPublicId: string; expectedVersion: number; operationId: string; reasonCode: string },
     ) {
       if (principal.role !== "admin" || !roleHasCapability(principal.role, "orders.reassign")) throw forbidden("CAPABILITY_NOT_GRANTED");
+      assertFreshStepUp(principal);
       const [prior] = await deps.db
         .select({ r: orderReassignments, orderPublicId: orders.publicId, version: orders.version })
         .from(orderReassignments)

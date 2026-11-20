@@ -481,6 +481,9 @@ describe("reassignment", () => {
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: staff.publicId, operationId: idemKey() }), "VALIDATION:TARGET_NOT_ELIGIBLE");
     await expectError(mod.orders.reassign(admin.principal, { ...base, targetCustomerPublicId: alice.publicId, operationId: idemKey() }), "CONFLICT:TARGET_IS_OWNER");
     await expectError(mod.orders.reassign(staff.principal, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:CAPABILITY_NOT_GRANTED");
+    const noStepUp = { ...admin.principal, stepUpAt: null };
+    await expectError(mod.orders.reassign(noStepUp, { ...base, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "FORBIDDEN:STEP_UP_REQUIRED");
+    await expectError(mod.orders.changeReference(noStepUp, { orderId: order.publicId, expectedVersion: view.version, newReference: "RP-NEW-1", reasonCode: "FIX" }), "FORBIDDEN:STEP_UP_REQUIRED");
     await expectError(mod.orders.reassign(admin.principal, { ...base, expectedVersion: view.version + 5, targetCustomerPublicId: bob.publicId, operationId: idemKey() }), "CONFLICT:STALE_VERSION");
     expect(h.audit.named("order.reassign.refused").map((e) => e.reasonCode)).toEqual(expect.arrayContaining(["TARGET_INACTIVE", "TARGET_NOT_ELIGIBLE", "TARGET_IS_OWNER"]));
   });
