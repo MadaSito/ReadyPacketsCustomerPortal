@@ -3,6 +3,7 @@
  * Safe built-in defaults (brand pillars) when the setting is empty or unavailable. Auto-advance only when
  * the administrator enabled it AND the visitor does not prefer reduced motion; always pausable (WCAG 2.2.2).
  */
+import { PRESENTATION_QUERY_KEY } from "@/app/shell/common";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronLeft, ChevronRight, Pause, Play } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -26,7 +27,7 @@ function prefersReducedMotion(): boolean {
 
 export function BrandSlideshow() {
   const api = useAuthApi();
-  const presentation = useQuery({ queryKey: ["rp", "platform", "presentation"], queryFn: () => api.presentation(), staleTime: 5 * 60_000, retry: false });
+  const presentation = useQuery({ queryKey: PRESENTATION_QUERY_KEY, queryFn: () => api.presentation(), staleTime: 5 * 60_000, retry: false });
   const slides = presentation.data?.slides.length ? presentation.data.slides : DEFAULT_SLIDES;
   const autoAllowed = Boolean(presentation.data?.slideshow.autoAdvance) && !prefersReducedMotion();
   const interval = Math.min(Math.max(presentation.data?.slideshow.intervalSeconds ?? 8, 5), 60) * 1000;

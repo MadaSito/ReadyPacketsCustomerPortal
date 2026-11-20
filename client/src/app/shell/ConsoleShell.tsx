@@ -11,7 +11,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { GlobalSearchSlot, NotificationSlot } from "../slots";
-import { AccountMenu, Footer, MaintenanceBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { AccountMenu, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
   const groups = new Map<string, NavItem[]>();
@@ -66,7 +66,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
     <div className="flex min-h-dvh bg-surface-soft">
       <SkipLink />
       {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
-      <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy lg:flex", collapsed ? "w-20" : "w-64")}>
+      <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
         <div className={cn("flex h-16 items-center px-4", collapsed && "justify-center px-2")}>
           <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex rounded">
             {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
@@ -90,7 +90,8 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <MaintenanceBanner />
+        <PreviewBanner />
+      <MaintenanceBanner />
         <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
           <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
             <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
@@ -114,7 +115,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       </div>
 
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">
-        <div className="-m-4 min-h-full bg-navy p-4">
+        <div className="-m-4 min-h-full bg-navy p-4 rp-on-navy">
           <SideNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
         </div>
       </Drawer>

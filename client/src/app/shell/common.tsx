@@ -8,6 +8,7 @@ import { useAuthApi, type MeUser } from "@/lib/authApi";
 import { useSignOut } from "@/lib/signOut";
 import { Callout, DropdownMenu, IconButton, useTheme, type ThemePreference } from "@/ui";
 import { cn } from "@/ui/cn";
+import { RUNTIME } from "@/lib/runtime";
 
 export const LEGAL_NAME = "Ready Packets Consulting LLC";
 export const PUBLIC_SITE_URL = "https://www.readypackets.com";
@@ -106,6 +107,27 @@ export function Footer({ className }: { className?: string }) {
         </nav>
       </div>
     </footer>
+  );
+}
+
+export const PRESENTATION_QUERY_KEY = ["rp", "platform", "presentation"] as const;
+
+/** True when either the server (platform.presentation.preview) or this build reports the preview profile. */
+export function usePreviewProfile(): boolean {
+  const api = useAuthApi();
+  const presentation = useQuery({ queryKey: PRESENTATION_QUERY_KEY, queryFn: () => api.presentation(), staleTime: 5 * 60_000, retry: false });
+  return RUNTIME.preview || presentation.data?.preview === true;
+}
+
+/** Permanent, non-dismissible preview notice shown in every shell (review H-3). */
+export function PreviewBanner() {
+  if (!usePreviewProfile()) return null;
+  return (
+    <div className="border-b border-info/40 bg-info-soft" data-testid="preview-banner">
+      <p className="mx-auto max-w-7xl px-4 py-2 text-center text-sm font-semibold text-ink sm:px-6 lg:px-8">
+        Preview — synthetic data only. Do not enter real customer or personal information.
+      </p>
+    </div>
   );
 }
 

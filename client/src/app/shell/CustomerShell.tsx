@@ -10,7 +10,7 @@ import type { MeUser } from "@/lib/authApi";
 import { BrandLogo, Drawer, IconButton } from "@/ui";
 import { cn } from "@/ui/cn";
 import { NotificationSlot } from "../slots";
-import { AccountMenu, Footer, MaintenanceBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { AccountMenu, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
 
 const GRID_COLS: Record<number, string> = { 1: "grid-cols-1", 2: "grid-cols-2", 3: "grid-cols-3", 4: "grid-cols-4", 5: "grid-cols-5" };
 
@@ -24,6 +24,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
   return (
     <div className="flex min-h-dvh flex-col bg-surface-soft">
       <SkipLink />
+      <PreviewBanner />
       <MaintenanceBanner />
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
         <div className="mx-auto flex h-16 max-w-7xl items-center gap-3 px-3 sm:px-6 lg:px-8">

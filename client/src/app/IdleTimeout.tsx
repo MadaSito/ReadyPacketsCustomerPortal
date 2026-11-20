@@ -4,10 +4,28 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { useSignOut } from "@/lib/signOut";
-import { useRefreshSession } from "@/lib/session";
+import { useRefreshSession, useSession } from "@/lib/session";
 import { Button, Dialog } from "@/ui";
 
+/** Fallback only, used when identity.me does not (yet) report the server idle policy. */
 export const IDLE_DEFAULTS = { idleMs: 30 * 60_000, warnBeforeMs: 2 * 60_000 } as const;
+
+/** Idle limit from the server policy (identity.me → session.idleTimeoutSeconds), else the fallback. */
+export function idleLimitMs(idleTimeoutSeconds: number | undefined): number {
+  return typeof idleTimeoutSeconds === "number" && Number.isFinite(idleTimeoutSeconds) && idleTimeoutSeconds >= 60 ? idleTimeoutSeconds * 1000 : IDLE_DEFAULTS.idleMs;
+}
+
+/** Warn 2 minutes before, or at half the limit for very short policies. */
+export function warnBeforeFor(idleMs: number): number {
+  return Math.min(IDLE_DEFAULTS.warnBeforeMs, Math.floor(idleMs / 2));
+}
+
+/** Reads the server policy and renders the warning with it. */
+export function SessionIdleTimeout() {
+  const { me } = useSession();
+  const idleMs = idleLimitMs(me?.session?.idleTimeoutSeconds);
+  return <IdleTimeout idleMs={idleMs} warnBeforeMs={warnBeforeFor(idleMs)} />;
+}
 
 export function IdleTimeout({ idleMs = IDLE_DEFAULTS.idleMs, warnBeforeMs = IDLE_DEFAULTS.warnBeforeMs }: { idleMs?: number; warnBeforeMs?: number }) {
   const [warning, setWarning] = useState(false);

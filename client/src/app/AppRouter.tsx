@@ -5,7 +5,6 @@
  */
 import { Suspense, useEffect, useRef, useSyncExternalStore, type ComponentType, type ReactNode } from "react";
 import { Redirect, Route, Router, Switch, useLocation } from "wouter";
-import { useHashLocation } from "wouter/use-hash-location";
 import { ALL_ROUTES } from "./registry";
 import type { RouteDef } from "@/lib/routes";
 import { RUNTIME } from "@/lib/runtime";
@@ -15,7 +14,7 @@ import type { MeUser } from "@/lib/authApi";
 import { Spinner, useToast } from "@/ui";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { decideRoute, type SessionView } from "./guard";
-import { IdleTimeout } from "./IdleTimeout";
+import { SessionIdleTimeout } from "./IdleTimeout";
 import { NotFoundPage, ServiceUnavailablePage } from "./pages";
 import { RouteAnnouncerProvider, RouteFocus } from "./RouteFocus";
 import { ConsoleShell } from "./shell/ConsoleShell";
@@ -84,7 +83,7 @@ function RouteGate({ route }: { route: RouteDef }) {
   const Page = route.component as ComponentType;
   return (
     <Frame kind={kind} user={user}>
-      {view.status === "full" ? <IdleTimeout /> : null}
+      {view.status === "full" ? <SessionIdleTimeout /> : null}
       <ErrorBoundary resetKey={location}>
         <Suspense fallback={<PageLoading />}>
           <Page />
@@ -155,8 +154,17 @@ const subscribeUrl = (cb: () => void) => {
     window.removeEventListener("popstate", cb);
   };
 };
-function usePreviewLocation(): [string, ReturnType<typeof useHashLocation>[1]] {
-  const [, navigate] = useHashLocation();
+/** Canonical preview URL: `<doc>#/path?query` with an empty document search (old params never linger). */
+export function previewNavigate(to: string, options: { replace?: boolean; state?: unknown } = {}): void {
+  const oldURL = window.location.href;
+  const url = new URL(oldURL);
+  url.search = "";
+  url.hash = `/${to.replace(/^#?\/?/, "")}`;
+  window.history[options.replace ? "replaceState" : "pushState"](options.state ?? null, "", url.href);
+  window.dispatchEvent(new HashChangeEvent("hashchange", { oldURL, newURL: url.href }));
+}
+function usePreviewLocation(): [string, typeof previewNavigate] {
+  const navigate = previewNavigate;
   const path = useSyncExternalStore(subscribeUrl, () => splitHash(window.location.hash, window.location.search).path);
   return [path, navigate];
 }

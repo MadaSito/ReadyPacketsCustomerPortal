@@ -211,6 +211,8 @@ html:not(.dark) {
     font-weight: 600;
     text-decoration: none;
   }
+  /* Navy surfaces (console sidebar, mobile console drawer): light focus ring keeps ≥ 3:1 against navy. */
+  .rp-on-navy { --color-focus: var(--color-teal-light); }
   .rp-skip-link:focus { top: 0.75rem; }
 
   .prose-rp { color: var(--color-body); max-width: 72ch; }

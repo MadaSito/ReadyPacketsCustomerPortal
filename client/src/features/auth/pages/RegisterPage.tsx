@@ -4,11 +4,13 @@ import { PASSWORD_POLICY, countCodePoints } from "@shared/domain";
 import { useAuthApi, type Accepted } from "@/lib/authApi";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button, Callout, Checkbox, Field, Input } from "@/ui";
+import { usePreviewProfile } from "@/app/shell/common";
 import { AuthLayout } from "../components/AuthLayout";
-import { FormError, PasswordInput, PasswordMeter, PreviewLinkCallout, useFocusOnError } from "../components/bits";
+import { FormError, PasswordInput, PasswordMeter, useFocusOnError } from "../components/bits";
 
 export default function RegisterPage() {
   const api = useAuthApi();
+  const preview = usePreviewProfile();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -54,7 +56,13 @@ export default function RegisterPage() {
         <Callout tone="success" live="polite" title="Almost there">
           If this address can be registered, we've sent a link to confirm it. Follow the link to finish setting up your account and multi-factor authentication.
         </Callout>
-        <PreviewLinkCallout link={done.previewLink} label="open the verification link" />
+        {/* Never render done.previewLink here: whether it is present would reveal if the address already had an
+            account (review C-04). Preview users get the link from the signed-in resend on /verify-email. */}
+        {preview ? (
+          <Callout tone="info" title="Preview environment — e-mail delivery is not configured" className="mt-4">
+            Sign in with your new account; the verification screen offers a "Send a new link" button that shows the link here in preview.
+          </Callout>
+        ) : null}
         <Button asChild variant="secondary" block className="mt-6">
           <Link href="/sign-in">Back to sign in</Link>
         </Button>

@@ -16,12 +16,31 @@ This document lists the evidence we have. It is **not** a WCAG/ADA certification
 
 The axe runs use the wcag2a/aa, wcag21a/aa, wcag22aa and best-practice tags. color-contrast is disabled (covered by the token tests), and so is region (components are rendered in isolation).
 
+## Review findings (docs/security/REVIEW-client.md)
+
+| ID | Status | Fix and evidence |
+| --- | --- | --- |
+| C-01 | Closed | The TOTP setup material is fetched directly into component state, never through TanStack, and is cleared on confirm or unmount. Evidence: `isolation.test.tsx` "keeps the TOTP seed out of the query and mutation caches". |
+| C-02 | Closed | `IdentityScope` keys the private cache on user, role, session state and next step. On a change the subtree is withheld while every non-`me` query and all mutations are purged. A non-`me` query failing with UNAUTHENTICATED re-checks `me`. The preview bridge uses the same purge. Evidence: `isolation.test.tsx` covers A → 401 → B and a direct A → B swap (same role, seeded private and assurance data). |
+| C-03 | Closed (client) | Sign-out only succeeds once revocation is confirmed. On failure, local data is wiped, `me` is re-checked, and if the session is still live the user stays on the page with an error. Evidence: `isolation.test.tsx` sign-out tests. Clearing preview header credentials locally after a failed revocation belongs to `lib/sessionTransport.ts` (http_security). It is noted, not done here. |
+| C-04 | Closed (client) | The register page never renders `previewLink`. Preview users get the link from the signed-in "Send a new link" on `/verify-email`. Evidence: `review.test.tsx` "register is uniform". Server-side uniformity of the preview response belongs to identity. |
+| C-05 | Closed | Preview routing uses paired hooks. `previewNavigate` writes `#/path?query` and clears the document search, and the location/search hooks parse the same representation. Copied links with the query inside the hash now match. Evidence: `isolation.test.tsx` and `review.test.tsx` hash tests. |
+| C-06 | Closed | ConfirmDialog is limited to `max-h-[90dvh]`, with a scrollable body and a fixed action footer. Zoom and short-landscape checks are still pending in a real browser. |
+| C-07 | Closed | Toast tracks hover and focus-within separately and resumes the timer only when both are released. |
+| C-08 | Closed | DataTable has a mobile "Sort by" select and a direction toggle driven by the same sort state. The wide-table wrapper is a focusable, labelled region. Evidence: `isolation.test.tsx` "DataTable mobile sorting". |
+| Focus on navy | Closed | `.rp-on-navy` switches the focus ring to teal-light on the console sidebar and drawer. It stays at 3:1 or better against navy and navy-elevated in both themes (`review.test.tsx`). |
+| Sticky header and drawers | Partly | `html { scroll-padding-top: 5rem }`, the skip link uses `preventScroll` plus `scrollIntoView`, and overlays do not restore focus when closing caused a navigation. Rendered focus-obscuration checks are pending /root's browser QA. |
+
+The H-3 preview banner is a permanent, non-dismissible "Preview — synthetic data only" notice in the public, customer and console frames. It appears when `platform.presentation.preview` is true or the build is the preview runtime (`review.test.tsx`).
+
+The idle timeout reads `me.session.idleTimeoutSeconds` (requested from identity_engineer). Until that field ships, it falls back to 30 minutes. The warning comes 2 minutes before, or at half the limit for very short policies.
+
 ## Not verified / not done
 
 - No real-browser runs: no Playwright/axe in a browser, no responsive screenshots at 320, 768, 1280 and 1920 px, no 200%/400% zoom or reflow checks, no forced-colors or reduced-motion visual checks.
 - No screen-reader passes (NVDA, JAWS, VoiceOver, TalkBack).
 - Passkey ceremonies were tested only as UI wiring (`@simplewebauthn/browser` is not exercised in jsdom).
-- Service worker: registration and the update prompt are untested until the integrator adds vite-plugin-pwa. Offline behaviour has not been checked.
-- Idle timeout values (30 minutes, warning 2 minutes before) are assumptions. They should come from server session policy.
-- The analytics consent banner depends on the integrations feature shipping `features/integrations/consent.tsx`.
+- Service worker: VitePWA is configured by the integrator (navigations NetworkOnly with an offline.html fallback, index.html not precached, /api NetworkOnly). The update prompt and offline behaviour have not been checked in a browser.
+- Idle timeout: the client reads the server policy, but `me.session` is not shipped yet, so the 30-minute fallback is still the one in effect.
+- The analytics consent slot is now provided by integrations (3f99849). It has not been checked in a rendered browser.
 - The production build has not been run by me since the latest commits (it is the integrator's responsibility).

@@ -24,6 +24,8 @@ export interface MeResult {
   state: "full" | "remediation";
   pendingSteps: TransitionStep[];
   nextStep: TransitionStep | null;
+  /** Server session policy for this session (identity_engineer). Optional until the server ships it. */
+  session?: { idleTimeoutSeconds: number; absoluteExpiresAt: string };
 }
 export interface Accepted {
   accepted: true;
@@ -58,6 +60,8 @@ export interface PublicPresentation {
   slideshow: { autoAdvance: boolean; intervalSeconds: number };
   supportText: string;
   announcement: { text: string; tone: "info" | "warning" } | null;
+  /** True when the server runs the preview profile (synthetic data only). */
+  preview?: boolean;
 }
 
 export interface AuthApi {
