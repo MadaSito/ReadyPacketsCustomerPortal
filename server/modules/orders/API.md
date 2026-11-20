@@ -1,6 +1,6 @@
 # Orders, catalog, workflow, locks, sharing — API
 
-Owner: orders_engineer. Status: v1 signatures (implementation in progress; see VERIFICATION.md for what is tested).
+Owner: orders_engineer. Status: v2. Server implementation committed; see VERIFICATION.md for what is tested.
 
 Import types from `server/modules/orders/index.ts`; reach the instance as `deps.services.orders` **at call time**.
 
@@ -9,7 +9,8 @@ Import types from `server/modules/orders/index.ts`; reach the instance as `deps.
 ```ts
 type OrderAccessRole = "owner" | "contributor" | "viewer" | "staff" | "admin";
 type OrderWriteKind =
-  | "order"      // edit order fields / notes / sharing (sharing: owner + staff only)
+  | "order"      // edit order fields / notes
+  | "sharing"    // manage grants (owner, or staff with orders.manage)
   | "file"       // upload / replace / delete / visibility
   | "message"    // post a message on the order thread
   | "intake"     // submit / edit intake forms
@@ -33,7 +34,10 @@ interface OrderAccessView {
   origin: "portal" | "import";
 }
 
-interface AccessOptions { tx?: Tx; forUpdate?: boolean }   // forUpdate => SELECT … FOR UPDATE inside tx
+interface AccessOptions { tx?: Tx; forUpdate?: boolean }
+// forUpdate (inside tx) => the order row is SELECT … FOR UPDATE and the grant re-check is a locking read
+// (FOR SHARE), so a grant revoked after the caller's REPEATABLE READ snapshot is still seen. Lock order is
+// always order row first, then grant rows; revocation (sharing.revoke, reassign) follows the same order.
 
 assertCanReadOrder(principal: SessionPrincipal, orderPublicId: string, options?: AccessOptions): Promise<OrderAccessView>
 assertCanWriteOrder(principal: SessionPrincipal, orderPublicId: string, options: AccessOptions & { kind: OrderWriteKind }): Promise<OrderAccessView>
@@ -45,7 +49,8 @@ listAccessibleOrderIds(principal, options?: { limit?: number; tx?: Tx }): Promis
 /** Read-checked summary for cards, notifications, invoices, search hits. */
 getOrderSummary(principal, orderPublicId): Promise<OrderSummary>
 /** Trusted server-side lookup (no principal) — ONLY for jobs/collectors that already authorised. */
-getOrderRefById(orderId: number, tx?: Tx): Promise<{ id; publicId; reference; ownerUserId; lockState; statusKey } | null>
+getOrderRefById(orderId: number, tx?: Tx, options?: { forUpdate?: boolean /* requires tx, else VALIDATION TX_REQUIRED */ }):
+  Promise<{ id; publicId; reference; ownerUserId; lockState; statusKey } | null>
 ```
 
 Rules (all re-evaluated on every call, no caching):
@@ -53,8 +58,10 @@ Rules (all re-evaluated on every call, no caching):
 - Principal must be a **full** session (`state === "full"`, no pending steps), else `NOT_FOUND` (defence in depth; guards already refuse).
 - Unknown id, malformed id, other customer's order, revoked/declined/pending grant ⇒ `NOT_FOUND` (`ORDER_NOT_FOUND`) — no existence oracle. Cross-tenant denials are audited `authz.order.denied` (security, denied).
 - Customer read: owner, or holder of an **accepted, unrevoked** grant (viewer or contributor).
-- Customer write: owner, or contributor grant, for kinds `order*`, `file`, `message`, `intake`. Viewers ⇒ `FORBIDDEN` (`GRANT_READ_ONLY`) — they can already see the order, so FORBIDDEN leaks nothing. `invoice` is never a customer write. Sharing management (`order` kind used by sharing endpoints) is owner-only.
-- Staff: read needs `orders.read_all`; write needs `orders.manage` (kind `status` needs `orders.transition`). Without the capability ⇒ `NOT_FOUND`.
+- Customer write: owner, or contributor grant, for kinds `order*`, `file`, `message`, `intake`. Viewers ⇒ `FORBIDDEN` (`GRANT_READ_ONLY`) — they can already see the order, so FORBIDDEN leaks nothing. `invoice` is never a customer write. Sharing management (kind `sharing`) and customer transitions (kind `status`) are owner-only (`FORBIDDEN OWNER_ONLY`).
+- Staff: read needs `orders.read_all`. Writes need a capability per kind: order/sharing/message/intake → `orders.manage`, file → `files.manage`, invoice → `invoices.manage`, status → `orders.transition`. No read capability ⇒ `NOT_FOUND`; read but no write capability ⇒ `FORBIDDEN`.
+- `ownerPublicId` comes from a join on the team-contract `users.publicId` column (read-only, no identity internals).
+- Denials raised while the caller holds a transaction are queued as durable audit writes, not awaited (no second-connection wait inside a caller transaction).
 - **Locks** (writes only; reads/downloads are never blocked by a lock):
 
   | lockState | customer writes | staff/admin writes |
@@ -78,15 +85,22 @@ portableOrders(tx: DbOrTx, sel: { after?: number; limit: number /* ≤ 200 */; c
 //   lineItems: { publicId, productPublicId, productVersion, name, description, features: string[], unitPriceMinor, currency, quantity, lineTotalMinor }[],
 //   statusHistory: { publicId, fromStatus, toStatus, actorRole, reasonCode, customerVisibleNote: boolean, occurredAt }[],
 //   customerNotes: { publicId, body, createdAt }[] }      // internal notes and grants are NOT portable (grants are authority)
-importOrder(input: ImportOrderInput, tx: Tx): Promise<{ id: number; publicId: string; reference: string; created: boolean }>
+importOrder(input: ImportOrderInput, tx: Tx): Promise<{ id; publicId; reference; created: boolean;
+  receipts: { lineItems: {sourcePublicId|null, publicId}[]; statusHistory: …; customerNotes: … } }>   // fresh target ids; receipts map optional child sourcePublicId
 // ImportOrderInput = { importId: string; sourceInstallationId: string; sourceOrderPublicId: string; sourceReference?: string;
 //   targetOwnerUserId: number /* resolved by portable mapping, re-validated here: must be an existing customer */;
-//   projectName; statusKey /* mapped to the target default workflow; unknown ⇒ initial state, recorded */;
+//   projectName (1..160); statusKey /* must exist in the target default workflow, else VALIDATION IMPORT_STATUS_UNSUPPORTED (never guessed) */;
 //   totalMinor; currency; createdAt; submittedAt?; lineItems: ImportLineItem[]; statusHistory?: …; customerNotes?: …;
 //   editable?: false /* default; true only with explicit approved operation, still audited */ }
+// Limits: name ≤160, description ≤2000, features ≤50×≤200, quantity 1..10000, safe-int money, ISO currency (single currency),
+//   ≤200 line items, ≤500 history entries, ≤200 notes, note ≤5000. Existing link + same owner ⇒ created:false; different owner ⇒ CONFLICT IMPORT_LINK_CONFLICT.
 // Behaviour: idempotent on (sourceInstallationId, sourceOrderPublicId) via order_import_provenance; dates + money preserved;
 // NO workflow replay, NO notifications, NO mail; lockState = imported_read_only unless editable; reference collision ⇒
 // a fresh target reference is generated and the source reference stored as provenance only; audit `order.imported` in tx.
+findImportedOrder(sourceInstallationId, sourceOrderPublicId, tx?): Promise<{ id; publicId; reference; ownerUserId; lockState; createdAt; submittedAt; totalMinor; currency; importId } | null>
+isPortableStatusSupported(statusKey: string, tx?): Promise<boolean>   // write-free; current default workflow or built-in default
+preflightImportOrder(raw: unknown): { ok: true; input } | { ok: false; reasonCode: "IMPORT_ORDER_INVALID" | "IMPORT_CURRENCY_UNSUPPORTED" |
+  "IMPORT_MIXED_CURRENCY" | "IMPORT_LINE_TOTAL_MISMATCH" | "IMPORT_TOTAL_MISMATCH"; paths: string[] }   // pure; importOrder re-runs it
 checkCatalogViability(items: { productPublicId?: string; name: string; currency: string }[]): Promise<{ matched: number; unmatched: number }>
 // Imported line items are snapshots — they never need a live catalog product; this is informational for dry-run plans.
 
@@ -96,7 +110,9 @@ searchOrders(principal, query: string /* 2..64 chars */, limit ≤ 20): Promise<
 
 On reassignment orders calls (inside its transaction): `services.files.reassignOrderFiles(orderId, newOwnerUserId, tx)` (which also revokes outstanding download tickets). If files is missing the method the reassignment is refused (fail closed).
 
-Orders consumes: `services.identity.getUser(userId)` → `{ id, publicId, role, status, email, name } | null`; `services.identity.getUserByPublicId(publicId)`; `services.engagement.notify({ userId, kind, title, body, link })`.
+Orders consumes: `services.identity.getUser(userId, { tx?, forUpdate? })` and `getUserByPublicId(publicId, { tx?, forUpdate? })`; `services.engagement.notify({ userId, kind, title, body, link, idempotencyKey, skipEmail: true })` after commit; optionally `services.compliance.assertRequiredPoliciesAccepted(userId, { audience: "customer" })` before a customer creates an order (skipped if compliance is absent). All missing required hooks fail closed (`UNAVAILABLE`).
+
+Privileged service methods (setLock, changeReference, reassign) re-check the actor row inside their transaction (still active, same role, capability still granted ⇒ else `FORBIDDEN ACTOR_NOT_AUTHORIZED`), and changeReference/reassign re-check fresh step-up (`STEP_UP_REQUIRED`), in addition to the router guards.
 
 ## 3. tRPC (`trpc.orders.*`)
 
@@ -105,14 +121,17 @@ Orders consumes: `services.identity.getUser(userId)` → `{ id, publicId, role, 
 | `catalog.list` | protected | active products of active groups, current version |
 | `list` | protected | accessible orders, cursor pagination, `status?` filter |
 | `get` | protected | read-checked detail: items, customer-visible history + notes, my accessRole, lock, allowed transitions for me |
+| `summary` | protected | read-checked `OrderSummary` |
 | `create` | protected + `orders.create` | `{ projectName, items: [{ productPublicId, quantity }], note? , idempotencyKey }` |
 | `update` | protected | `{ orderId, expectedVersion, projectName }` write kind=order |
 | `addNote` | protected | customer-visible note (staff may pass `visibility: "internal"`) |
 | `transition` | protected | `{ orderId, expectedVersion, toStatus, note? }` — workflow decides who may trigger |
 | `sharing.list/invite/revoke` | protected | owner (or staff with orders.manage) |
-| `sharing.myInvitations/accept/decline` | protected | grantee side |
+| `sharing.myInvitations`, `sharing.respond({ grantId, accept })` | protected | grantee side; verified matching e-mail required |
 | `admin.list` | staff + `orders.read_all` | filters: status, customerPublicId, from/to, referencePrefix; cursor |
-| `admin.get` | staff + `orders.read_all` | includes internal notes, full history, grants, reference history |
+| `admin.get` | staff + `orders.read_all` | includes internal notes, full history, grants |
+| `admin.referenceHistory` | staff + `orders.read_all` | active + retired references |
+| `admin.createForCustomer` | staff + `orders.manage` | create on behalf of an active customer |
 | `admin.setLock` | staff + `orders.manage` (legal_hold / unlock imported: admin) | |
 | `admin.changeReference` | admin + `orders.identifiers.change` (step-up) | retired reference reserved forever |
 | `admin.reassign` | admin + `orders.reassign` (step-up) | `{ orderId, targetCustomerPublicId, expectedVersion, operationId, reasonCode }` |
@@ -129,6 +148,6 @@ Orders consumes: `services.identity.getUser(userId)` → `{ id, publicId, role, 
 ## 5. Mail templates, settings, health
 
 - Mail: `orders.status_changed` (vars: `reference`, `statusLabel`, `link`), `orders.share_invited` (vars: `reference`, `link`).
-- Settings: `orders.reference.prefix` (default `RP`), `orders.notify.mail` (default false — in-app notifications always).
+- Settings: `orders.reference.prefix` (default `RP`), `orders.notify.mail` (default false — in-app notifications always), `orders.sharing.invite_ttl_days` (default 14).
 - Health: `orders.catalog` (`not_configured` while the catalog is empty), `orders.workflow` (`failing` if no default workflow).
-- Demo seed: `seedOrdersDemo(db)` exported from `server/modules/orders/demoSeed.ts` — clearly synthetic, never run automatically.
+- Demo seed: `seedOrdersDemo(ordersModule, adminPrincipal, { currency? })` exported from `server/modules/orders/demoSeed.ts` — clearly synthetic, never run automatically.
