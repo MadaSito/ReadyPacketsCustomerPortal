@@ -1,0 +1,140 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/order-shares.schema.json",
+  "title": "ReadyPackets portable record: order-shares (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "orderPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "granteeCustomerPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "access": {
+      "type": "string",
+      "enum": [
+        "read",
+        "comment",
+        "write"
+      ]
+    },
+    "grantedBy": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "customer",
+            "staff",
+            "admin",
+            "system",
+            "unknown"
+          ]
+        },
+        "publicId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "publicId"
+      ],
+      "additionalProperties": false
+    },
+    "grantedAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+    },
+    "expiresAt": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "revokedAt": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "publicId",
+    "orderPublicId",
+    "granteeCustomerPublicId",
+    "access",
+    "grantedBy",
+    "grantedAt",
+    "expiresAt",
+    "revokedAt"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

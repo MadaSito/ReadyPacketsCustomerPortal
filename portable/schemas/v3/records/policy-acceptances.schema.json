@@ -1,0 +1,105 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/policy-acceptances.schema.json",
+  "title": "ReadyPackets portable record: policy-acceptances (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "policyVersionPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "customerPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "orderPublicId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "method": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+    },
+    "acceptedAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+    },
+    "evidenceNote": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "publicId",
+    "policyVersionPublicId",
+    "customerPublicId",
+    "orderPublicId",
+    "method",
+    "acceptedAt",
+    "evidenceNote"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

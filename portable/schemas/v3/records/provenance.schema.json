@@ -1,0 +1,145 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/provenance.schema.json",
+  "title": "ReadyPackets portable record: provenance (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "subjectType": {
+      "type": "string",
+      "enum": [
+        "customers",
+        "orders",
+        "order-items",
+        "order-status-history",
+        "order-shares",
+        "files",
+        "file-versions",
+        "message-threads",
+        "messages",
+        "tickets",
+        "ticket-comments",
+        "policy-versions",
+        "policy-acceptances",
+        "intake-definitions",
+        "intake-submissions",
+        "invoices",
+        "payments",
+        "refunds",
+        "provenance"
+      ]
+    },
+    "subjectPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "sourceSystemPseudonym": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "sourceRecordType": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "sourceReference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "transformation": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "adapter": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          },
+          "required": [
+            "adapter",
+            "version"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "notes": {
+      "maxItems": 50,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+      }
+    }
+  },
+  "required": [
+    "publicId",
+    "subjectType",
+    "subjectPublicId",
+    "sourceSystemPseudonym",
+    "sourceRecordType",
+    "sourceReference",
+    "transformation",
+    "notes"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

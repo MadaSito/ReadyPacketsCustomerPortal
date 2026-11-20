@@ -1,0 +1,286 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/customers.schema.json",
+  "title": "ReadyPackets portable record: customers (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "customerNumber": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+    },
+    "email": {
+      "type": "string",
+      "maxLength": 254,
+      "format": "email",
+      "pattern": "^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+    },
+    "firstName": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "middleName": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lastName": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "preferredName": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "suffix": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "company": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "phone": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 255
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "address": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timezone": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "locale": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 35
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "marketingOptIn": {
+      "type": "boolean"
+    },
+    "customFields": {
+      "maxItems": 200,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 255
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 4000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "value"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "createdAt": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "updatedAt": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "publicId",
+    "customerNumber",
+    "status",
+    "email",
+    "firstName",
+    "middleName",
+    "lastName",
+    "preferredName",
+    "suffix",
+    "company",
+    "phone",
+    "address",
+    "timezone",
+    "locale",
+    "marketingOptIn",
+    "createdAt",
+    "updatedAt"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

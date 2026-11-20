@@ -1,0 +1,103 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/files.schema.json",
+  "title": "ReadyPackets portable record: files (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "orderPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "category": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+    },
+    "phase": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "visibleToCustomer": {
+      "type": "boolean"
+    },
+    "createdAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+    },
+    "deletedAt": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "publicId",
+    "orderPublicId",
+    "category",
+    "phase",
+    "visibleToCustomer",
+    "createdAt",
+    "deletedAt"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}

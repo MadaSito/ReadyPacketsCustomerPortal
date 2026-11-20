@@ -1,0 +1,140 @@
+{
+  "$id": "https://schemas.readypackets.example/portable/v3/records/order-items.schema.json",
+  "title": "ReadyPackets portable record: order-items (contract 3.0)",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "publicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "heldUnknown": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/__schema0"
+      }
+    },
+    "orderPublicId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "position": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "sku": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "tier": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_:.-]{0,63}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+    },
+    "unitPrice": {
+      "type": "object",
+      "properties": {
+        "amountMinor": {
+          "type": "integer",
+          "minimum": -9000000000000,
+          "maximum": 9000000000000
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      },
+      "required": [
+        "amountMinor",
+        "currency"
+      ],
+      "additionalProperties": false
+    },
+    "lineTotal": {
+      "type": "object",
+      "properties": {
+        "amountMinor": {
+          "type": "integer",
+          "minimum": -9000000000000,
+          "maximum": 9000000000000
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      },
+      "required": [
+        "amountMinor",
+        "currency"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "publicId",
+    "orderPublicId",
+    "position",
+    "sku",
+    "name",
+    "tier",
+    "quantity",
+    "unitPrice",
+    "lineTotal"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    }
+  }
+}
