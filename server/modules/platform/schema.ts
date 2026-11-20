@@ -40,8 +40,14 @@ export const platformPresentationImages = mysqlTable(
     uploadedByUserId: refColumn("uploaded_by_user_id"),
     createdAt: createdAtColumn(),
     deletedAt: utcDateTime("deleted_at"),
+    /** Set once the stored bytes of a soft-deleted image were removed (GC success marker). */
+    objectPurgedAt: utcDateTime("object_purged_at"),
   },
-  (t) => [index("platform_presentation_images_sha_idx").on(t.sha256)],
+  (t) => [
+    index("platform_presentation_images_sha_idx").on(t.sha256),
+    uniqueIndex("platform_presentation_images_storage_key_uq").on(t.storageKey),
+    index("platform_presentation_images_gc_idx").on(t.deletedAt, t.objectPurgedAt),
+  ],
 );
 
 /** Resumable re-encryption progress per (target, run). Checkpoint = last processed numeric id. */

@@ -3,8 +3,8 @@
  */
 import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
-import { and, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
-import { notFound, validation } from "../../core/errors.js";
+import { and, asc, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { AuditUnavailableError, DomainError, notFound, validation } from "../../core/errors.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { AuditEmitter, Clock, Db, ObjectStorage, SettingsStore, Tx } from "../../core/types.js";
 import type { ActorGuard } from "./actorGuard.js";
@@ -198,15 +198,11 @@ export function createPresentationService(deps: PresentationDeps) {
         createdAt: clock.now(),
       };
     } catch (error) {
-      // Remove the staged object only when we can prove no durable row references it (an error raised
-      // around COMMIT is ambiguous: the row and its audit may have committed).
-      const referenced = await db
-        .select({ id: platformPresentationImages.id })
-        .from(platformPresentationImages)
-        .where(eq(platformPresentationImages.storageKey, key))
-        .limit(1)
-        .then((rows) => rows.length > 0, () => true);
-      if (!referenced) await storage.delete(key).catch(() => undefined);
+      // Delete the staged object ONLY when the transaction definitely rolled back: the error was raised by
+      // our own code inside the callback (guard, quota, audit refusal) before COMMIT was attempted. Any
+      // other database error may be an ambiguous COMMIT outcome — leave the object (an unreferenced object
+      // is harmless and private; a referenced-but-missing one would break the slideshow).
+      if (error instanceof DomainError || error instanceof AuditUnavailableError) await storage.delete(key).catch(() => undefined);
       throw error;
     }
   }
@@ -225,7 +221,7 @@ export function createPresentationService(deps: PresentationDeps) {
 
   async function deleteImage(publicId: string, guard: ActorGuard): Promise<void> {
     if (!ULID_PATTERN.test(publicId)) throw notFound();
-    const storageKey = await db.transaction(async (tx) => {
+    await db.transaction(async (tx) => {
       await guard(tx);
       // Lock order: slides setting row, then the image row (same order as uploads and slides updates).
       await lockSlidesRow(tx);
@@ -251,41 +247,36 @@ export function createPresentationService(deps: PresentationDeps) {
         tx,
       );
       await tx.update(platformPresentationImages).set({ deletedAt: clock.now() }).where(eq(platformPresentationImages.id, row.id));
-      return row.storageKey;
     });
-    await collectDeletedObject(storageKey);
+    // Definitive outcome reached (COMMIT returned): collect bytes of deleted images, bounded.
+    await purgeDeletedImageObjects(10).catch(() => 0);
   }
 
   /**
-   * Garbage-collects the stored bytes of a soft-deleted image, only after re-reading the authoritative row
-   * (deleted_at set) — never on an ambiguous outcome. The row is kept as the durable record. Failures are
-   * retried by purgeDeletedImageObjects().
+   * Garbage-collects stored bytes of soft-deleted images, oldest first, after the authoritative commit.
+   * The row stays as the durable record; `object_purged_at` marks success so the sweep advances and a
+   * failed delete is retried on the next sweep. Runs (bounded) after every delete; also callable by a job.
    */
-  async function collectDeletedObject(storageKey: string): Promise<boolean> {
-    const [row] = await db
-      .select({ deletedAt: platformPresentationImages.deletedAt })
-      .from(platformPresentationImages)
-      .where(eq(platformPresentationImages.storageKey, storageKey))
-      .limit(1);
-    if (!row?.deletedAt) return false;
-    try {
-      await storage.delete(storageKey);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Bounded sweep for objects whose post-commit collection failed (idempotent; safe to run from a job). */
-  async function purgeDeletedImageObjects(limit = 50): Promise<number> {
+  async function purgeDeletedImageObjects(limit = 20): Promise<number> {
     const rows = await db
-      .select({ storageKey: platformPresentationImages.storageKey })
+      .select({ id: platformPresentationImages.id, storageKey: platformPresentationImages.storageKey })
       .from(platformPresentationImages)
-      .where(isNotNull(platformPresentationImages.deletedAt))
-      .orderBy(desc(platformPresentationImages.id))
+      .where(and(isNotNull(platformPresentationImages.deletedAt), isNull(platformPresentationImages.objectPurgedAt)))
+      .orderBy(asc(platformPresentationImages.id))
       .limit(Math.max(1, Math.min(500, limit)));
     let purged = 0;
-    for (const row of rows) if (await collectDeletedObject(row.storageKey)) purged += 1;
+    for (const row of rows) {
+      try {
+        await storage.delete(row.storageKey);
+      } catch {
+        continue; // retried next sweep
+      }
+      await db
+        .update(platformPresentationImages)
+        .set({ objectPurgedAt: clock.now() })
+        .where(and(eq(platformPresentationImages.id, row.id), isNotNull(platformPresentationImages.deletedAt)));
+      purged += 1;
+    }
     return purged;
   }
 

@@ -275,4 +275,31 @@ describe("presentation service", () => {
     await t.db.update(platformPresentationImages).set({ deletedAt: h.clock.now() });
     expect((await platform.presentation()).slides[0]?.image).toBeNull();
   });
+
+  it("keeps the staged object when the transaction outcome is ambiguous (non-domain error)", async () => {
+    const ambiguous = async () => {
+      throw new Error("connection lost during COMMIT");
+    };
+    await expect(platform.presentationService.uploadImage(png(32, 32), ambiguous)).rejects.toThrow();
+    expect(h.storage.objects.size).toBe(1); // unreferenced private object is harmless; never delete on an unknown outcome
+  });
+
+  it("garbage-collects deleted image bytes oldest-first with a success marker and retries failures", async () => {
+    const image = await platform.presentationService.uploadImage(png(32, 32), allow);
+    const realDelete = h.storage.delete.bind(h.storage);
+    h.storage.delete = async () => {
+      throw new Error("storage offline");
+    };
+    await platform.presentationService.deleteImage(image.id, allow);
+    expect(h.storage.objects.size).toBe(1);
+    const [pending] = await t.db.select().from(platformPresentationImages);
+    expect(pending?.deletedAt).not.toBeNull();
+    expect(pending?.objectPurgedAt).toBeNull();
+    h.storage.delete = realDelete;
+    expect(await platform.presentationService.purgeDeletedImageObjects(10)).toBe(1);
+    expect(h.storage.objects.size).toBe(0);
+    const [done] = await t.db.select().from(platformPresentationImages);
+    expect(done?.objectPurgedAt).not.toBeNull();
+    expect(await platform.presentationService.purgeDeletedImageObjects(10)).toBe(0);
+  });
 });
