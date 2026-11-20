@@ -33,7 +33,9 @@ export const CAPABILITIES = [
   // compliance
   "policies.manage",
   "intake.manage",
+  "intake.review",
   "invoices.read_all",
+  "invoices.record_payment",
   "invoices.manage",
   // audit / siem
   "audit.read",
@@ -55,6 +57,8 @@ export const CAPABILITIES = [
   "portable.import",
   "backup.read",
   "backup.run",
+  "backup.verify",
+  "backup.restore",
   "backup.retention.manage",
 ] as const;
 export type Capability = (typeof CAPABILITIES)[number];
@@ -72,7 +76,9 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "tickets.read_all",
   "tickets.manage",
   "search.global",
+  "intake.review",
   "invoices.read_all",
+  "invoices.record_payment",
   "platform.health.read",
 ];
 
@@ -104,6 +110,7 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "portable.export",
   "portable.import",
   "backup.run",
+  "backup.restore",
   "backup.retention.manage",
 ]);
 
