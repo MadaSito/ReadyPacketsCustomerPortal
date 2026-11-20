@@ -2,7 +2,7 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Package } from "lucide-react";
 import { useState } from "react";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
 import { DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
@@ -30,7 +30,12 @@ function toInput(filters: Filters) {
 export default function AdminOrdersPage() {
   const trpc = useTRPC();
   const { me } = useSession();
-  const [draft, setDraft] = useState<Filters>(EMPTY);
+  const search = useSearch();
+  // Deep links such as /admin/orders?status=in_review (from the console overview) pre-select the status filter.
+  const [draft, setDraft] = useState<Filters>(() => {
+    const status = new URLSearchParams(search).get("status") ?? "";
+    return { ...EMPTY, status: STATUS_KEY.test(status) ? status : "" };
+  });
   // Filter controls apply immediately; the reference search applies on submit.
   const [appliedRef, setAppliedRef] = useState("");
   const applied: Filters = { ...draft, referencePrefix: appliedRef };

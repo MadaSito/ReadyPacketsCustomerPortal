@@ -11,7 +11,9 @@ import NewOrderPage from "./pages/NewOrderPage";
 import OrderDetailPage from "./pages/OrderDetailPage";
 import AdminOrderDetailPage from "./pages/AdminOrderDetailPage";
 import OrdersListPage from "./pages/OrdersListPage";
+import OrdersPipelineWidget from "./OrdersPipelineWidget";
 import RecentOrdersWidget from "./RecentOrdersWidget";
+import { ordersFeature } from "./routes";
 import { newIdempotencyKey } from "./shared";
 
 /** Generic fake of the tRPC/TanStack proxy: every procedure path resolves through `handlers`. */
@@ -432,6 +434,53 @@ describe("console", () => {
     const { container } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
     expect((await screen.findAllByText("submitted → completed")).length).toBeGreaterThan(0);
     await expectNoAxeViolations(container);
+  });
+});
+
+describe("console orders pipeline widget", () => {
+  it("shows per-status counts (N+ when capped), newest orders with links, one heading, and no axe violations", async () => {
+    session.role = "staff";
+    handlers.set("orders.admin.list", (input) => {
+      const { status } = input as { status?: string };
+      if (status === "submitted") return { items: [{ ...listItem, ownerName: "Synthetic Customer" }], nextCursor: null };
+      if (status === "in_review") return { items: [{ ...listItem, statusKey: "in_review", statusLabel: "In review" }], nextCursor: "next" };
+      if (status) return { items: [], nextCursor: null };
+      return { items: [{ ...listItem, ownerName: "Synthetic Customer" }], nextCursor: null };
+    });
+    const { container } = renderUi(<OrdersPipelineWidget />, { path: "/admin" });
+    expect(await screen.findByRole("link", { name: "RP-2026-000001" })).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);
+    expect(screen.getByRole("link", { name: "All orders" })).toHaveAttribute("href", "/admin/orders");
+    expect(screen.getByRole("link", { name: "1+ In review orders" })).toHaveAttribute("href", "/admin/orders?status=in_review");
+    expect(screen.getByRole("link", { name: "0 Awaiting customer orders" })).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(1);
+    expect(calls.filter((c) => c.path === "orders.admin.list")).toHaveLength(5);
+    await expectNoAxeViolations(container);
+  });
+
+  it("shows an error state, never zero counts, when any read fails", async () => {
+    session.role = "staff";
+    handlers.set("orders.admin.list", (input) => {
+      if ((input as { status?: string }).status === "in_progress") throw new Error("boom");
+      return { items: [], nextCursor: null };
+    });
+    renderUi(<OrdersPipelineWidget />, { path: "/admin" });
+    expect(await screen.findByText("We couldn't load the orders pipeline")).toBeInTheDocument();
+    expect(screen.queryByText("No orders have been placed yet.")).not.toBeInTheDocument();
+  });
+
+  it("shows an honest empty state and is gated to staff with orders.read_all", async () => {
+    session.role = "staff";
+    handlers.set("orders.admin.list", () => ({ items: [], nextCursor: null }));
+    renderUi(<OrdersPipelineWidget />, { path: "/admin" });
+    expect(await screen.findByText("No orders have been placed yet.")).toBeInTheDocument();
+    expect(ordersFeature.widgets?.find((w) => w.key === "orders.pipeline")).toMatchObject({ area: "console", access: "staff", capability: "orders.read_all", span: 8 });
+  });
+
+  it("admin order list honours ?status= deep links from the overview", async () => {
+    session.role = "staff";
+    handlers.set("orders.admin.list", () => ({ items: [], nextCursor: null }));
+    renderUi(<AdminOrdersPage />, { path: "/admin/orders?status=in_review" });
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.admin.list")?.input).toMatchObject({ status: "in_review" }));
   });
 });
 
