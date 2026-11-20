@@ -150,7 +150,12 @@ class V3Package implements PortablePackage {
       if (newerMinor) {
         warnings.push({ code: "NEWER_MINOR_VERSION", message: "The package uses a newer minor contract version; unknown fields are preserved as held-unknown." });
         const known = new Set(Object.keys(ManifestSchema.shape));
-        for (const k of Object.keys(r)) if (!known.has(k)) delete r[k];
+        const unknownKeys = Object.keys(r).filter((k) => !known.has(k));
+        for (const k of unknownKeys) delete r[k];
+        // Manifest-level additions cannot be held per record; they are reported (never dropped silently).
+        if (unknownKeys.length) {
+          warnings.push({ code: "NEWER_MINOR_MANIFEST_FIELDS", message: `The manifest has ${unknownKeys.length} newer top-level field(s) this reader does not model: ${unknownKeys.slice(0, 10).map((k) => k.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64)).join(", ")}.` });
+        }
       }
       const parsed = ManifestSchema.safeParse(r);
       if (!parsed.success) {
