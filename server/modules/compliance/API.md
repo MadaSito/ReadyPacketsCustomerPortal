@@ -164,8 +164,8 @@ export interface ComplianceModule extends ModuleLifecycle {
 | `policies.admin.deleteDraftVersion` | `policies.manage` (step-up) | `{ versionPublicId }` -> `{ deleted: true }`; durable audit recorded before delete; refuses published versions |
 | `policies.admin.publishVersion` | `policies.manage` (step-up) | `{ versionPublicId, effectiveAt? }` -> `{ versionPublicId, contentHash, publishedAt, effectiveAt }` |
 | `policies.admin.listAcceptances` | `policies.manage` | `{ documentPublicId?, versionPublicId?, userPublicId?, cursor?, limit? }` -> `{ items, nextCursor }` |
-| `intake.listForOrder` | `protectedProcedure` | `{ items, lockState }` for `{ orderPublicId }` (`default`, `catalog_item`, and `workflow` scope; note-only projection) |
-| `intake.getSubmission` | `protectedProcedure` | `{ questionnaire, version, submission, revisions, nextCursor, canWrite }` for `{ orderPublicId, questionnairePublicId, cursor?, limit? }` |
+| `intake.listForOrder` | `protectedProcedure` | `{ orderPublicId, orderReference, lockState, items }` for `{ orderPublicId }` (`default`, `catalog_item`, and `workflow` scope; greatest-per-group latest review note SQL join; all submission answers are AES-256-GCM encrypted at rest and field `sensitive: boolean` marks UI display sensitivity) |
+| `intake.getSubmission` | `protectedProcedure` | `{ item, revisions, nextCursor }` for `{ orderPublicId, questionnairePublicId, cursor?, limit? }` |
 | `intake.saveDraft` | `protectedProcedure` | `{ orderPublicId, questionnairePublicId, answers }` -> `{ submissionPublicId, status, revisionNumber }` |
 | `intake.submit` | `protectedProcedure` | `{ orderPublicId, questionnairePublicId, answers }` -> `{ submissionPublicId, status, revisionNumber }` |
 | `intake.review` | `staffProcedure` + `intake.review` | `{ submissionPublicId, decision: "accepted" \| "returned_for_changes", reviewNote? }` -> `{ submissionPublicId, status, revisionNumber }` |
@@ -176,7 +176,7 @@ export interface ComplianceModule extends ModuleLifecycle {
 | `intake.admin.saveDraftVersion` | `intake.manage` | `{ questionnairePublicId, versionPublicId?, fields }` -> `{ versionPublicId, versionNumber, schemaHash }`; published versions are immutable |
 | `intake.admin.publishVersion` | `intake.manage` | `{ versionPublicId }` -> `{ versionPublicId, schemaHash, publishedAt }` |
 | `invoices.listMine` | `protectedProcedure` | `{ status?, cursor?, limit? }` -> `{ items, nextCursor }` (customer-visible `issued`/`paid`/`void` only) |
-| `invoices.listForOrder` | `protectedProcedure` | `{ orderPublicId }` -> `InvoiceSummaryView[]` (hides `draft` from customers) |
+| `invoices.listForOrder` | `protectedProcedure` | `{ orderPublicId }` -> `{ orderPublicId, orderReference, lockState, onlinePaymentConfigured, items }` (hides `draft` from customers) |
 | `invoices.get` | `protectedProcedure` | `{ invoicePublicId }` -> `InvoiceDetailView` (`onlinePaymentConfigured: false`, `onlinePaymentMessage: "Online payment is not configured"`) |
 | `invoices.admin.list` | `staffProcedure` (`invoices.read_all`) | `{ status?, orderPublicId?, cursor?, limit? }` -> `{ items, nextCursor }` |
 | `invoices.admin.createDraft` | `staffProcedure` + `invoices.manage` (step-up) | `{ orderPublicId, currency, lines, discountMinor, taxMinor, dueAt?, memo? }` -> `{ invoicePublicId, totalMinor, currency }` |

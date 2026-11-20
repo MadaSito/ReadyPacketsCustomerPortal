@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNotNull, lt } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
@@ -197,9 +197,10 @@ export function createIntakeService(deps: ModuleDeps) {
     return false;
   }
 
-  async function listForOrder(
+  async function listForOrderInternal(
     principal: SessionPrincipal,
     orderPublicId: string,
+    onlyQuestionnairePublicId?: string,
   ): Promise<{
     orderPublicId: string;
     orderReference: string;
@@ -210,14 +211,29 @@ export function createIntakeService(deps: ModuleDeps) {
     const orderView = await ordersSvc.assertCanReadOrder(principal, orderPublicId);
     const scopeFacts = await resolveOrderScopeFacts(deps.db, orderView.id, { principal, orderPublicId });
 
-    const [allQuestionnaires, existingSubs] = await Promise.all([
-      deps.db.select().from(intakeQuestionnaires).orderBy(asc(intakeQuestionnaires.slug)),
-      deps.db
-        .select()
-        .from(intakeSubmissions)
-        .where(eq(intakeSubmissions.orderId, orderView.id))
-        .orderBy(asc(intakeSubmissions.id)),
-    ]);
+    const allQuestionnaires = onlyQuestionnairePublicId
+      ? await deps.db
+          .select()
+          .from(intakeQuestionnaires)
+          .where(eq(intakeQuestionnaires.publicId, onlyQuestionnairePublicId))
+          .limit(1)
+      : await deps.db.select().from(intakeQuestionnaires).orderBy(asc(intakeQuestionnaires.slug));
+
+    if (allQuestionnaires.length === 0) {
+      return {
+        orderPublicId: orderView.publicId,
+        orderReference: orderView.reference,
+        lockState: orderView.lockState,
+        items: [],
+      };
+    }
+
+    const qIds = allQuestionnaires.map((q) => q.id);
+    const existingSubs = await deps.db
+      .select()
+      .from(intakeSubmissions)
+      .where(and(eq(intakeSubmissions.orderId, orderView.id), inArray(intakeSubmissions.questionnaireId, qIds)))
+      .orderBy(asc(intakeSubmissions.id));
 
     const subByQuestionnaireId = new Map<number, typeof intakeSubmissions.$inferSelect>();
     for (const sub of existingSubs) {
@@ -240,10 +256,15 @@ export function createIntakeService(deps: ModuleDeps) {
     }
 
     const neededVersionIds = new Set<number>();
+    const applicableSubIds: number[] = [];
     for (const q of applicableQuestionnaires) {
       const sub = subByQuestionnaireId.get(q.id);
-      if (sub) neededVersionIds.add(sub.questionnaireVersionId);
-      else if (q.currentPublishedVersionId !== null) neededVersionIds.add(q.currentPublishedVersionId);
+      if (sub) {
+        neededVersionIds.add(sub.questionnaireVersionId);
+        applicableSubIds.push(sub.id);
+      } else if (q.currentPublishedVersionId !== null) {
+        neededVersionIds.add(q.currentPublishedVersionId);
+      }
     }
 
     const versions =
@@ -255,33 +276,47 @@ export function createIntakeService(deps: ModuleDeps) {
         : [];
     const versionById = new Map(versions.map((v) => [v.id, v]));
 
-    // Project ONLY note fields (never encrypted 160 KB `answersEnc` blobs) to resolve latest review notes.
-    const subIds = existingSubs.map((s) => s.id);
-    const noteRows =
-      subIds.length > 0
-        ? await deps.db
-            .select({
-              submissionId: intakeSubmissionRevisions.submissionId,
-              publicId: intakeSubmissionRevisions.publicId,
-              revisionNumber: intakeSubmissionRevisions.revisionNumber,
-              noteEnc: intakeSubmissionRevisions.noteEnc,
-            })
-            .from(intakeSubmissionRevisions)
-            .where(
-              and(
-                inArray(intakeSubmissionRevisions.submissionId, subIds),
-                isNotNull(intakeSubmissionRevisions.noteEnc),
-              ),
-            )
-            .orderBy(desc(intakeSubmissionRevisions.revisionNumber))
-        : [];
+    // Fetch at most ONE latest non-null review note per submission via greatest-per-group SQL join
+    // on `cmp_irev_sub_rev_uq (submission_id, revision_number)` — never materializes historical notes or `answersEnc`.
     const latestNoteBySubId = new Map<number, string | null>();
-    for (const rev of noteRows) {
-      if (!latestNoteBySubId.has(rev.submissionId) && rev.noteEnc) {
-        latestNoteBySubId.set(
-          rev.submissionId,
-          deps.crypto.decrypt(rev.noteEnc, `intake_submission_revisions.note:${rev.publicId}`),
+    if (applicableSubIds.length > 0) {
+      const latestPerSub = deps.db
+        .select({
+          submissionId: intakeSubmissionRevisions.submissionId,
+          maxRev: sql<number>`MAX(${intakeSubmissionRevisions.revisionNumber})`.as("max_rev"),
+        })
+        .from(intakeSubmissionRevisions)
+        .where(
+          and(
+            inArray(intakeSubmissionRevisions.submissionId, applicableSubIds),
+            isNotNull(intakeSubmissionRevisions.noteEnc),
+          ),
+        )
+        .groupBy(intakeSubmissionRevisions.submissionId)
+        .as("latest_note_per_sub");
+
+      const noteRows = await deps.db
+        .select({
+          submissionId: intakeSubmissionRevisions.submissionId,
+          publicId: intakeSubmissionRevisions.publicId,
+          noteEnc: intakeSubmissionRevisions.noteEnc,
+        })
+        .from(intakeSubmissionRevisions)
+        .innerJoin(
+          latestPerSub,
+          and(
+            eq(intakeSubmissionRevisions.submissionId, latestPerSub.submissionId),
+            eq(intakeSubmissionRevisions.revisionNumber, latestPerSub.maxRev),
+          ),
         );
+
+      for (const rev of noteRows) {
+        if (rev.noteEnc) {
+          latestNoteBySubId.set(
+            rev.submissionId,
+            deps.crypto.decrypt(rev.noteEnc, `intake_submission_revisions.note:${rev.publicId}`),
+          );
+        }
       }
     }
 
@@ -348,6 +383,18 @@ export function createIntakeService(deps: ModuleDeps) {
     };
   }
 
+  async function listForOrder(
+    principal: SessionPrincipal,
+    orderPublicId: string,
+  ): Promise<{
+    orderPublicId: string;
+    orderReference: string;
+    lockState: string;
+    items: OrderIntakeItemView[];
+  }> {
+    return listForOrderInternal(principal, orderPublicId);
+  }
+
   async function getSubmission(
     principal: SessionPrincipal,
     input: {
@@ -364,8 +411,8 @@ export function createIntakeService(deps: ModuleDeps) {
     const pageLimit = Math.min(25, Math.max(1, input.limit ?? 10));
     const cursorId = decodeIdCursor(input.cursor);
 
-    const listed = await listForOrder(principal, input.orderPublicId);
-    const item = listed.items.find((i) => i.questionnairePublicId === input.questionnairePublicId);
+    const listed = await listForOrderInternal(principal, input.orderPublicId, input.questionnairePublicId);
+    const item = listed.items[0];
     if (!item) throw notFound("INTAKE_QUESTIONNAIRE_NOT_FOUND");
 
     if (!item.submission) {
