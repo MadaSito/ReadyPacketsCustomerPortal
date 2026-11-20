@@ -1,7 +1,7 @@
 /**
  * Siem module — Drizzle MySQL tables. Owner: siem module engineer.
  */
-import { bigint, boolean, index, int, json, mysqlTable, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { bigint, boolean, index, int, json, mediumtext, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 import type { AuditCategory } from "../../core/types.js";
 import {
   createdAtColumn,
@@ -26,6 +26,7 @@ export const siemDestinations = mysqlTable(
     port: int("port", { unsigned: true }).notNull().default(6514),
     otlpPath: varchar("otlp_path", { length: 255 }),
     allowPrivateNetwork: boolean("allow_private_network").notNull().default(false),
+    endpointGeneration: int("endpoint_generation", { unsigned: true }).notNull().default(1),
     facility: int("facility", { unsigned: true }).notNull().default(16),
     appName: varchar("app_name", { length: 48 }).notNull().default("readypackets"),
     hostnameOverride: varchar("hostname_override", { length: 255 }),
@@ -38,6 +39,11 @@ export const siemDestinations = mysqlTable(
     minSeverity: varchar("min_severity", { length: 16 }).notNull().default("INFO"),
     categoriesJson: json("categories_json").$type<AuditCategory[]>().notNull(),
     authHeaderName: varchar("auth_header_name", { length: 64 }),
+    // Per-destination envelope-encrypted secret columns (AAD bound to publicId + version + endpointKey).
+    caEnc: mediumtext("ca_enc"),
+    clientCertEnc: mediumtext("client_cert_enc"),
+    clientKeyEnc: mediumtext("client_key_enc"),
+    authSecretEnc: text("auth_secret_enc"),
     hasCustomCa: boolean("has_custom_ca").notNull().default(false),
     hasClientCert: boolean("has_client_cert").notNull().default(false),
     hasClientKey: boolean("has_client_key").notNull().default(false),
@@ -47,6 +53,9 @@ export const siemDestinations = mysqlTable(
     secretUpdatedAt: utcDateTime("secret_updated_at"),
     auditCursor: varchar("audit_cursor", { length: 255 }),
     lastProjectedSeq: bigint("last_projected_seq", { mode: "number", unsigned: true }).notNull().default(0),
+    lastCursorProgressAt: utcDateTime("last_cursor_progress_at"),
+    prunedAuditCount: bigint("pruned_audit_count", { mode: "number", unsigned: true }).notNull().default(0),
+    missingAuditGapCount: bigint("missing_audit_gap_count", { mode: "number", unsigned: true }).notNull().default(0),
     circuitState: varchar("circuit_state", { length: 16 }).notNull().default("closed"),
     consecutiveFailures: int("consecutive_failures", { unsigned: true }).notNull().default(0),
     circuitOpenUntil: utcDateTime("circuit_open_until"),
@@ -57,6 +66,7 @@ export const siemDestinations = mysqlTable(
     deliveredCount: bigint("delivered_count", { mode: "number", unsigned: true }).notNull().default(0),
     failedAttemptCount: bigint("failed_attempt_count", { mode: "number", unsigned: true }).notNull().default(0),
     deadLetteredCount: bigint("dead_lettered_count", { mode: "number", unsigned: true }).notNull().default(0),
+    uncertainCount: bigint("uncertain_count", { mode: "number", unsigned: true }).notNull().default(0),
     lastTestAt: utcDateTime("last_test_at"),
     lastTestOutcome: varchar("last_test_outcome", { length: 16 }),
     lastTestReason: varchar("last_test_reason", { length: 64 }),
@@ -82,6 +92,7 @@ export const siemOutbox = mysqlTable(
     publicId: publicIdColumn(),
     destinationId: refColumn("destination_id").notNull(),
     destinationVersion: int("destination_version", { unsigned: true }).notNull(),
+    endpointGeneration: int("endpoint_generation", { unsigned: true }).notNull().default(1),
     eventId: varchar("event_id", { length: 64 }).notNull(),
     chainSeq: bigint("chain_seq", { mode: "number", unsigned: true }),
     eventOccurredAt: utcDateTime("event_occurred_at").notNull(),
@@ -92,6 +103,7 @@ export const siemOutbox = mysqlTable(
     state: varchar("state", { length: 16 }).notNull().default("queued"),
     attempts: int("attempts", { unsigned: true }).notNull().default(0),
     maxAttempts: int("max_attempts", { unsigned: true }).notNull().default(8),
+    uncertainDelivery: boolean("uncertain_delivery").notNull().default(false),
     nextAttemptAt: utcDateTime("next_attempt_at").notNull(),
     lastAttemptAt: utcDateTime("last_attempt_at"),
     lastReasonCode: varchar("last_reason_code", { length: 64 }),
@@ -102,7 +114,7 @@ export const siemOutbox = mysqlTable(
   },
   (table) => [
     uniqueIndex("siem_outbox_dest_event_uq").on(table.destinationId, table.eventId),
-    index("siem_outbox_ready_idx").on(table.destinationId, table.state, table.nextAttemptAt, table.id),
+    index("siem_outbox_ready_idx").on(table.destinationId, table.state, table.endpointGeneration, table.id),
     index("siem_outbox_state_age_idx").on(table.state, table.createdAt, table.id),
   ],
 );

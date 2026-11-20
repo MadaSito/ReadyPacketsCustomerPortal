@@ -21,22 +21,106 @@ export const OTEL_SEVERITY_NUMBER: Record<Severity, number> = {
 const VALID_CATEGORIES = new Set<string>(AUDIT_CATEGORIES);
 const VALID_OUTCOMES = new Set<string>(AUDIT_OUTCOMES);
 const VALID_SEVERITIES = new Set<string>(SEVERITIES);
-const VALID_SOURCE_CLASSES = new Set(["loopback", "private", "public", "unknown"]);
+const VALID_SOURCE_CLASSES = new Set(["loopback", "private", "public", "unknown", "none"]);
 
 const SAFE_ATTR_KEY = /^[a-z][a-z0-9_]{0,39}$/;
-const SENSITIVE_KEY_RE =
-  /(?:^|_)(?:password|passwd|pwd|secret|token|api_?key|private_?key|client_?key|passphrase|cookie|csrf|session|mfa|totp|otp|recovery_?code|email|e_?mail|phone|ip|ip_?address|source_?address|user_?agent|file_?name|filename|customer_?name|full_?name|first_?name|last_?name|body|raw|sql|stack|pem|cert|bearer|authorization|credential)(?:$|_)/i;
+
+/**
+ * Strict typed allowlist of string attribute keys permitted to leave the installation
+ * (aligned with `server/modules/audit/envelope.ts` `EXTERNAL_ATTRIBUTE_KEYS` + SIEM probe/receipt enums).
+ * Arbitrary free-form text keys (`note`, `comment`, `summary`, `customer_label`, etc.) are NEVER exported.
+ */
+export const EXTERNAL_STRING_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "action_kind",
+  "audience",
+  "auth_method",
+  "bucket",
+  "capability",
+  "category",
+  "checkpoint_reason",
+  "continuity_mode",
+  "decision",
+  "derived_invoice_status",
+  "dimension",
+  "disposition",
+  "event_type",
+  "field",
+  "flag",
+  "format",
+  "from_priority",
+  "from_role",
+  "from_state",
+  "from_status",
+  "integrity",
+  "key_custody",
+  "key_readiness",
+  "kind",
+  "match_type",
+  "method",
+  "mfa_method",
+  "min_severity",
+  "mode",
+  "mode_from",
+  "mode_to",
+  "next_step",
+  "phase",
+  "previous_status",
+  "priority",
+  "probe",
+  "procedure",
+  "profile",
+  "protocol",
+  "purpose",
+  "receipt_confirmation",
+  "record_type",
+  "role",
+  "scope_kind",
+  "setting_key",
+  "status",
+  "target",
+  "template",
+  "tls_mode",
+  "to_priority",
+  "to_role",
+  "to_state",
+  "to_status",
+]);
+
+/** Integrity custody SHA-256 hex digest keys permitted on external audit checkpoint/export events. */
+export const EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "head_link_hmac_sha256",
+  "export_sha256",
+]);
+
+/**
+ * Strict typed allowlist of numeric attribute keys permitted to leave the installation.
+ */
+export const EXTERNAL_NUMERIC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "attempt",
+  "attempts",
+  "checkpoint_seq",
+  "keep_last_count",
+  "max_age_days",
+  "max_attempts",
+  "port",
+  "revision_number",
+  "status_code",
+  "tolerance_seconds",
+  "version",
+  "version_number",
+  "workflow_version",
+]);
+
+/** Safe fixed-vocabulary token format for allowlisted external string attributes (no spaces, quotes, `@`, or prose). */
+const SAFE_EXTERNAL_TOKEN_RE = /^[A-Za-z0-9_.:/-]{1,64}$/;
+const SAFE_SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const SAFE_ID_RE = /^[A-Za-z0-9_.:/-]{1,80}$/;
 
 const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
-const JWT_RE = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
-const PEM_RE = /-----BEGIN [A-Z0-9 ]+-----/;
 const URL_CRED_RE = /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i;
-const BEARER_RE = /^\s*(?:Bearer|Basic)\s+/i;
 const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 const IPV6_LIKE_RE = /^(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
 const LONG_SECRET_LIKE_RE = /^[A-Za-z0-9+/_=-]{40,}$/;
-
-const SAFE_ID_RE = /^[A-Za-z0-9_.:/-]{1,80}$/;
 
 function cleanSafeId(value: string | null | undefined, maxLen = 80): string | null {
   if (!value || typeof value !== "string") return null;
@@ -54,27 +138,24 @@ function cleanIsoUtc(value: string | null | undefined, fallbackIso: string): str
   return parsed.toISOString();
 }
 
-function isUnsafeStringAttributeValue(value: string): boolean {
-  if (value.length > 128) return true;
+function isSafeAllowlistedToken(value: string): boolean {
+  if (!SAFE_EXTERNAL_TOKEN_RE.test(value)) return false;
   if (
     EMAIL_RE.test(value) ||
-    JWT_RE.test(value) ||
-    PEM_RE.test(value) ||
     URL_CRED_RE.test(value) ||
-    BEARER_RE.test(value) ||
     IPV4_RE.test(value) ||
     IPV6_LIKE_RE.test(value) ||
     value.startsWith("rpenc:") ||
     LONG_SECRET_LIKE_RE.test(value)
   ) {
-    return true;
+    return false;
   }
-  return false;
+  return true;
 }
 
 /**
  * Defense-in-depth projection sanitizer: enforces the fixed pseudonymous external contract
- * even if an upstream caller passes an unprojected envelope or unexpected attributes.
+ * with a strict typed attribute allowlist (never a permissive regex denylist).
  */
 export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditEvent): ExternalAuditEvent {
   const severityText: Severity = VALID_SEVERITIES.has(input.severity_text) ? input.severity_text : "INFO";
@@ -90,10 +171,15 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
   if (input.safe_counts && typeof input.safe_counts === "object") {
     let countKeys = 0;
     for (const [key, val] of Object.entries(input.safe_counts)) {
-      if (countKeys >= 16) break;
+      if (countKeys >= 16) {
+        dropped += 1;
+        continue;
+      }
       if (SAFE_ATTR_KEY.test(key) && typeof val === "number" && Number.isSafeInteger(val) && val >= 0) {
         cleanCounts[key] = val;
         countKeys += 1;
+      } else {
+        dropped += 1;
       }
     }
   }
@@ -106,7 +192,7 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
         dropped += 1;
         continue;
       }
-      if (!SAFE_ATTR_KEY.test(key) || SENSITIVE_KEY_RE.test(key)) {
+      if (!SAFE_ATTR_KEY.test(key)) {
         dropped += 1;
         continue;
       }
@@ -114,18 +200,25 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
         cleanAttributes[key] = val;
         attrKeys += 1;
       } else if (typeof val === "number") {
-        if (Number.isFinite(val)) {
+        if (
+          EXTERNAL_NUMERIC_ATTRIBUTE_KEYS.has(key) &&
+          Number.isFinite(val) &&
+          Math.abs(val) <= Number.MAX_SAFE_INTEGER
+        ) {
           cleanAttributes[key] = val;
           attrKeys += 1;
         } else {
           dropped += 1;
         }
       } else if (typeof val === "string") {
-        if (isUnsafeStringAttributeValue(val)) {
-          dropped += 1;
-        } else {
+        if (EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS.has(key) && SAFE_SHA256_HEX_RE.test(val)) {
           cleanAttributes[key] = val;
           attrKeys += 1;
+        } else if (EXTERNAL_STRING_ATTRIBUTE_KEYS.has(key) && isSafeAllowlistedToken(val)) {
+          cleanAttributes[key] = val;
+          attrKeys += 1;
+        } else {
+          dropped += 1;
         }
       } else {
         dropped += 1;
@@ -135,7 +228,7 @@ export function sanitizeProjectedEvent(input: AuditEnvelopeLike | ExternalAuditE
 
   const sourceClass =
     typeof input.source_address_class === "string" && VALID_SOURCE_CLASSES.has(input.source_address_class)
-      ? input.source_address_class
+      ? (input.source_address_class as ExternalAuditEvent["source_address_class"])
       : null;
 
   return {
@@ -195,9 +288,13 @@ export function matchesDestinationFilter(
 }
 
 /**
- * Prevents SIEM's own operational delivery/spool diagnostics from recursively re-spooling
+ * Prevents SIEM's own operational delivery/spool/cursor diagnostics from recursively re-spooling
  * into failing destinations while preserving SIEM admin configuration and dead-letter audit events.
  */
 export function isSiemOperationalSelfEvent(eventName: string): boolean {
-  return eventName.startsWith("siem.delivery.") || eventName.startsWith("siem.spool.");
+  return (
+    eventName.startsWith("siem.delivery.") ||
+    eventName.startsWith("siem.spool.") ||
+    eventName.startsWith("siem.cursor.")
+  );
 }

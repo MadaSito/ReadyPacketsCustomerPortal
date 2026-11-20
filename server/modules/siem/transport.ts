@@ -1,4 +1,3 @@
-import { lookup as dnsLookup } from "node:dns/promises";
 import https from "node:https";
 import net from "node:net";
 import tls, { type PeerCertificate, type TLSSocket } from "node:tls";
@@ -182,89 +181,27 @@ export async function resolvePinnedTarget(
 ): Promise<PinnedEgressTarget> {
   const { url, allowedSchemes } = buildTargetUrl(dest);
 
-  if (egress?.resolveAndAssertAllowed) {
-    try {
-      const pinned = await egress.resolveAndAssertAllowed({
-        url,
-        allowedSchemes,
-        allowApprovedPrivate: dest.allowPrivateNetwork,
-        purpose: "siem",
-      });
-      if (isBlockedIpAddress(pinned.address, dest)) {
-        throw new SiemTransportError("EGRESS_BLOCKED", false, false);
-      }
-      return pinned;
-    } catch (err) {
-      if (err instanceof SiemTransportError) throw err;
-      throw classifySocketError(err, false);
-    }
-  }
-
-  if (egress?.assertAllowed && !dest.allowPrivateNetwork) {
-    try {
-      const pinned = await egress.assertAllowed(url, "siem");
-      if (isBlockedIpAddress(pinned.address, dest)) {
-        throw new SiemTransportError("EGRESS_BLOCKED", false, false);
-      }
-      return pinned;
-    } catch (err) {
-      if (err instanceof SiemTransportError) throw err;
-      throw classifySocketError(err, false);
-    }
-  }
-
-  // Fallback single-shot DNS resolution + strict IP policy when integrations module stub is unpopulated in isolated unit tests.
-  const parsed = new URL(url);
-  if (!allowedSchemes.includes(parsed.protocol) || parsed.username || parsed.password) {
-    throw new SiemTransportError("EGRESS_BLOCKED", false, false);
-  }
-  const bareHost = parsed.hostname.replace(/^\[|\]$/g, "");
-  // Reject octal/hex IPv4 tricks (`0177.0.0.1`, `0x7f000001`, pure integer host).
-  if (/^(?:0x[0-9a-f]+|\d+)$/i.test(bareHost) || /^(?:0\d+\.)/.test(bareHost)) {
+  // Fail closed when centralized egress policy (`services.integrations.egress`) is unavailable.
+  if (!egress?.resolveAndAssertAllowed) {
     throw new SiemTransportError("EGRESS_BLOCKED", false, false);
   }
 
-  const directIpFamily = net.isIP(bareHost);
-  if (directIpFamily === 4 || directIpFamily === 6) {
-    if (isBlockedIpAddress(bareHost, dest)) {
+  try {
+    const pinned = await egress.resolveAndAssertAllowed({
+      url,
+      allowedSchemes,
+      allowApprovedPrivate: dest.allowPrivateNetwork,
+      purpose: "siem",
+    });
+    // Defense-in-depth secondary IP check at the SIEM boundary.
+    if (isBlockedIpAddress(pinned.address, dest)) {
       throw new SiemTransportError("EGRESS_BLOCKED", false, false);
     }
-    return {
-      hostname: bareHost,
-      port: dest.port,
-      protocol: parsed.protocol,
-      address: bareHost,
-      family: directIpFamily,
-      servername: undefined,
-      normalizedUrl: url,
-    };
-  }
-
-  let records: { address: string; family: number }[];
-  try {
-    records = await dnsLookup(bareHost, { all: true, verbatim: true });
+    return pinned;
   } catch (err) {
+    if (err instanceof SiemTransportError) throw err;
     throw classifySocketError(err, false);
   }
-  if (records.length === 0) {
-    throw new SiemTransportError("DNS_RESOLUTION_FAILED", false, false);
-  }
-  // Every resolved A/AAAA record must pass the egress policy so round-robin cannot bypass SSRF checks.
-  for (const rec of records) {
-    if ((rec.family !== 4 && rec.family !== 6) || isBlockedIpAddress(rec.address, dest)) {
-      throw new SiemTransportError("EGRESS_BLOCKED", false, false);
-    }
-  }
-  const chosen = records[0]!;
-  return {
-    hostname: bareHost,
-    port: dest.port,
-    protocol: parsed.protocol,
-    address: chosen.address,
-    family: chosen.family as 4 | 6,
-    servername: bareHost,
-    normalizedUrl: url,
-  };
 }
 
 function verifyServerIdentityStrict(expectedHost: string, cert: PeerCertificate): Error | undefined {
@@ -329,6 +266,20 @@ export class SiemTlsConnectionPool {
     egress: IntegrationsEgressPort | undefined,
     signal?: AbortSignal,
   ): Promise<PooledTlsEntry> {
+    // Re-authorize against centralized egress policy BEFORE reusing any pooled TLS socket so
+    // live allowlist revocations or DNS address changes take effect immediately on the next batch.
+    let pinned: PinnedEgressTarget;
+    try {
+      pinned = await resolvePinnedTarget(dest, egress);
+    } catch (err) {
+      this.evict(dest.publicId);
+      throw err;
+    }
+
+    if (signal?.aborted) {
+      throw new SiemTransportError("TRANSPORT_ERROR", true, false);
+    }
+
     const versionKey = `${dest.publicId}:v${dest.version}`;
     const existing = this.entries.get(dest.publicId);
     if (
@@ -336,17 +287,14 @@ export class SiemTlsConnectionPool {
       existing.key === versionKey &&
       existing.healthy &&
       !existing.socket.destroyed &&
-      existing.socket.writable
+      existing.socket.writable &&
+      existing.pinned.address === pinned.address &&
+      existing.pinned.port === pinned.port
     ) {
       return existing;
     }
     if (existing) {
       this.evict(dest.publicId);
-    }
-
-    const pinned = await resolvePinnedTarget(dest, egress);
-    if (signal?.aborted) {
-      throw new SiemTransportError("TRANSPORT_ERROR", true, false);
     }
 
     const isIpHost = net.isIP(pinned.hostname) !== 0;

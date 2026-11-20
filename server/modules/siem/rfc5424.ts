@@ -90,7 +90,7 @@ export function sanitizePrintUsAscii(value: string | null | undefined, maxLen: n
 
 /**
  * Sanitizes an SD-NAME / PARAM-NAME token per RFC 5424 §6.3.2:
- * 1..32 PRINTUSASCII excluding `=`, SP, `]`, `"`.
+ * 1..32 PRINTUSASCII excluding `=`, SP, `]`, `"`, `\`.
  */
 export function sanitizeSdToken(value: string, maxLen = 32, allowAt = false): string {
   let out = "";
@@ -112,6 +112,28 @@ export function sanitizeSdToken(value: string, maxLen = 32, allowAt = false): st
     }
   }
   return out.length > 0 ? out : "rp";
+}
+
+/**
+ * Allocates a unique 1..32-byte RFC 5424 PARAM-NAME within an SD-ELEMENT so 40-char keys
+ * that share a 32-char prefix never emit duplicate PARAM-NAMEs.
+ */
+function allocateUniqueSdParamName(candidate: string, used: Set<string>): string {
+  const base = sanitizeSdToken(candidate, 32, false);
+  if (!used.has(base)) {
+    used.add(base);
+    return base;
+  }
+  for (let n = 2; n < 1_000; n += 1) {
+    const suffix = `_${n}`;
+    const stem = base.slice(0, Math.max(1, 32 - suffix.length));
+    const disambiguated = `${stem}${suffix}`;
+    if (!used.has(disambiguated)) {
+      used.add(disambiguated);
+      return disambiguated;
+    }
+  }
+  return base;
 }
 
 /**
@@ -178,18 +200,6 @@ export function truncateUtf8Buffer(buf: Buffer, maxBytes: number): Buffer {
   while (end > 0 && (buf[end]! & 0b1100_0000) === 0b1000_0000) {
     end -= 1;
   }
-  if (end > 0) {
-    const lead = buf[end]!;
-    let seqLen = 1;
-    if ((lead & 0b1000_0000) === 0) seqLen = 1;
-    else if ((lead & 0b1110_0000) === 0b1100_0000) seqLen = 2;
-    else if ((lead & 0b1111_0000) === 0b1110_0000) seqLen = 3;
-    else if ((lead & 0b1111_1000) === 0b1111_0000) seqLen = 4;
-    if (end + seqLen > maxBytes) {
-      // The multi-byte sequence starting at `end` does not fit within `maxBytes`; exclude `lead` too.
-      // (Note: when `end === maxBytes`, `buf[end]` was the first excluded byte, handled below.)
-    }
-  }
   return buf.subarray(0, end);
 }
 
@@ -209,63 +219,90 @@ function buildStructuredData(
   const maxPrefixLen = Math.max(1, 32 - penSuffix.length);
   const sdId = `${sanitizeSdToken(sdIdName, maxPrefixLen, false)}${penSuffix}`;
 
-  const pairs: [string, string][] = [
-    ["event_id", event.event_id],
-    ["category", event.category],
-    ["event", event.event_name],
-    ["action", event.action],
-    ["outcome", event.outcome],
-  ];
+  const usedNames = new Set<string>();
+  const pairs: [string, string][] = [];
+  const pushParam = (rawKey: string, rawVal: string) => {
+    const paramName = allocateUniqueSdParamName(rawKey, usedNames);
+    pairs.push([paramName, escapeSdParamValue(rawVal)]);
+  };
+
+  pushParam("event_id", event.event_id);
+  pushParam("category", event.category);
+  pushParam("event", event.event_name);
+  pushParam("action", event.action);
+  pushParam("outcome", event.outcome);
 
   if (!minimalOnly) {
-    if (event.reason_code) pairs.push(["reason", event.reason_code]);
-    if (event.chain_seq !== null) pairs.push(["seq", String(event.chain_seq)]);
-    if (event.actor_ref) pairs.push(["actor_ref", event.actor_ref]);
-    if (event.actor_role) pairs.push(["actor_role", event.actor_role]);
-    if (event.resource_type) pairs.push(["resource_type", event.resource_type]);
-    if (event.resource_ref) pairs.push(["resource_ref", event.resource_ref]);
-    if (event.correlation_id) pairs.push(["correlation_id", event.correlation_id]);
-    if (event.trace_id) pairs.push(["trace_id", event.trace_id]);
-    if (event.request_id) pairs.push(["request_id", event.request_id]);
-    for (const [k, v] of Object.entries(event.safe_counts)) {
-      pairs.push([sanitizeSdToken(`cnt_${k}`, 32), String(v)]);
+    if (event.reason_code) pushParam("reason", event.reason_code);
+    if (event.chain_seq !== null) pushParam("seq", String(event.chain_seq));
+    if (event.actor_ref) pushParam("actor_ref", event.actor_ref);
+    if (event.actor_role) pushParam("actor_role", event.actor_role);
+    if (event.resource_type) pushParam("resource_type", event.resource_type);
+    if (event.resource_ref) pushParam("resource_ref", event.resource_ref);
+    if (event.correlation_id) pushParam("correlation_id", event.correlation_id);
+    if (event.trace_id) pushParam("trace_id", event.trace_id);
+    if (event.request_id) pushParam("request_id", event.request_id);
+    for (const key of Object.keys(event.safe_counts).sort()) {
+      pushParam(`cnt_${key}`, String(event.safe_counts[key]!));
     }
-    for (const [k, v] of Object.entries(event.attributes)) {
-      if (v !== null) {
-        pairs.push([sanitizeSdToken(`attr_${k}`, 32), String(v)]);
+    for (const key of Object.keys(event.attributes).sort()) {
+      const v = event.attributes[key];
+      if (v !== null && v !== undefined) {
+        pushParam(`attr_${key}`, String(v));
       }
     }
   } else {
-    pairs.push(["truncated", "1"]);
+    pushParam("truncated", "1");
   }
 
-  const formattedParams = pairs
-    .map(([k, v]) => `${sanitizeSdToken(k, 32)}="${escapeSdParamValue(v)}"`)
-    .join(" ");
-
+  const formattedParams = pairs.map(([k, v]) => `${k}="${v}"`).join(" ");
   return `[${sdId} ${formattedParams}]`;
 }
 
+/**
+ * Builds a structured single-line JSON `MSG` body so dynamic attributes are isolated inside
+ * `"attributes"` and JSON-quoted, preventing core-field collisions or unquoted `key=value` spoofing.
+ */
 function buildMsgBody(event: ExternalAuditEvent): string {
-  const parts: string[] = [
-    `event_id=${neutralizeControls(event.event_id)}`,
-    `event=${neutralizeControls(event.event_name)}`,
-    `category=${neutralizeControls(event.category)}`,
-    `action=${neutralizeControls(event.action)}`,
-    `outcome=${neutralizeControls(event.outcome)}`,
-  ];
-  if (event.reason_code) parts.push(`reason=${neutralizeControls(event.reason_code)}`);
-  if (event.actor_role) parts.push(`role=${neutralizeControls(event.actor_role)}`);
-  if (event.actor_ref) parts.push(`actor_ref=${neutralizeControls(event.actor_ref)}`);
-  if (event.resource_type) parts.push(`resource_type=${neutralizeControls(event.resource_type)}`);
-  if (event.resource_ref) parts.push(`resource_ref=${neutralizeControls(event.resource_ref)}`);
-  if (event.correlation_id) parts.push(`correlation_id=${neutralizeControls(event.correlation_id)}`);
-  for (const [k, v] of Object.entries(event.attributes)) {
-    if (v !== null) {
-      parts.push(`${sanitizeSdToken(k, 32)}=${neutralizeControls(String(v))}`);
-    }
+  const cleanAttributes: Record<string, string | number | boolean> = {};
+  for (const key of Object.keys(event.attributes).sort()) {
+    const val = event.attributes[key];
+    if (val === null || val === undefined) continue;
+    const safeKey = neutralizeControls(key);
+    cleanAttributes[safeKey] = typeof val === "string" ? neutralizeControls(val) : val;
   }
-  return parts.join(" ");
+
+  const cleanCounts: Record<string, number> = {};
+  for (const key of Object.keys(event.safe_counts).sort()) {
+    cleanCounts[neutralizeControls(key)] = event.safe_counts[key]!;
+  }
+
+  const payload: Record<string, unknown> = {
+    schema_version: neutralizeControls(event.schema_version),
+    event_id: neutralizeControls(event.event_id),
+    event: neutralizeControls(event.event_name),
+    category: neutralizeControls(event.category),
+    action: neutralizeControls(event.action),
+    outcome: neutralizeControls(event.outcome),
+  };
+  if (event.chain_seq !== null) payload.chain_seq = event.chain_seq;
+  if (event.reason_code) payload.reason = neutralizeControls(event.reason_code);
+  if (event.actor_role) payload.role = neutralizeControls(event.actor_role);
+  if (event.actor_ref) payload.actor_ref = neutralizeControls(event.actor_ref);
+  if (event.resource_type) payload.resource_type = neutralizeControls(event.resource_type);
+  if (event.resource_ref) payload.resource_ref = neutralizeControls(event.resource_ref);
+  if (event.correlation_id) payload.correlation_id = neutralizeControls(event.correlation_id);
+  if (event.trace_id) payload.trace_id = neutralizeControls(event.trace_id);
+  if (event.request_id) payload.request_id = neutralizeControls(event.request_id);
+  if (Object.keys(cleanCounts).length > 0) payload.safe_counts = cleanCounts;
+  if (Object.keys(cleanAttributes).length > 0) payload.attributes = cleanAttributes;
+  if (event.dropped_attributes > 0) payload.dropped_attributes = event.dropped_attributes;
+
+  // Escape U+2028 / U+2029 / bidi controls if any survived into JSON string literals.
+  return JSON.stringify(payload)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+    .replace(/[\u202a-\u202e\u2066-\u2069]/g, (ch) => `\\u${ch.codePointAt(0)!.toString(16).padStart(4, "0")}`);
 }
 
 /**
@@ -299,7 +336,7 @@ export function formatRfc5424Message(
     return { text: fullText, bytes: fullBytes, pri, facility, syslogSeverity, truncated: false };
   }
 
-  // Safe truncation: ensure HEADER + SP + STRUCTURED-DATA fits with room for MSG + `[truncated]`.
+  // Safe truncation: ensure HEADER + SP + STRUCTURED-DATA fits with room for MSG + ` [truncated]`.
   const suffix = " [truncated]";
   const suffixBytes = Buffer.from(suffix, "utf8");
   const bomBytes = includeBom ? UTF8_BOM_BYTES : Buffer.alloc(0);
@@ -313,7 +350,6 @@ export function formatRfc5424Message(
   }
 
   if (prefixBytes.byteLength >= maxMessageBytes) {
-    // Extreme minimal fallback if header + minimal SD still fills budget: use nil SD (`-`).
     const fallbackPrefix = Buffer.from(`${header} - `, "utf8");
     const remaining = maxMessageBytes - fallbackPrefix.byteLength - bomBytes.byteLength - suffixBytes.byteLength;
     if (remaining <= 0) {

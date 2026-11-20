@@ -39,6 +39,7 @@ export const SIEM_REASON_CODES = [
   "PROTOCOL_REJECTED",
   "SECRET_UNREADABLE",
   "DESTINATION_MISCONFIGURED",
+  "ENDPOINT_CHANGED",
   "TRANSPORT_ERROR",
 ] as const;
 export type SiemReasonCode = (typeof SIEM_REASON_CODES)[number];
@@ -69,7 +70,7 @@ export interface ExternalAuditEvent {
   actor_role: string;
   resource_type: string | null;
   resource_ref: string | null;
-  source_address_class: "loopback" | "private" | "public" | "unknown" | null;
+  source_address_class: "loopback" | "private" | "public" | "unknown" | "none" | null;
   request_id: string | null;
   trace_id: string | null;
   span_id: string | null;
@@ -99,6 +100,8 @@ export interface AuditReadBatch {
   events: AuditEnvelopeLike[];
   nextCursor: string | null;
   headSeq: number;
+  pruned?: number;
+  missing?: number;
 }
 
 export interface AuditReadPort {
@@ -188,6 +191,11 @@ export interface UpdateSiemDestinationInput {
   categories?: readonly AuditCategory[];
   authHeaderName?: string | null;
   secrets?: SiemSecretInput;
+  /**
+   * When changing `host`, `port`, `format`, or `otlpPath`, explicitly migrate queued outbox events
+   * to the new endpoint (`true`) or quarantine old-endpoint queued events to dead-letter (`false`, default).
+   */
+  migrateBacklog?: boolean;
 }
 
 export interface SiemDestinationSummary {
@@ -236,6 +244,9 @@ export interface SiemDestinationSummary {
     deliveredCount: number;
     failedAttemptCount: number;
     deadLetteredCount: number;
+    uncertainCount: number;
+    prunedAuditCount: number;
+    missingAuditGapCount: number;
     lastTestAt: Date | null;
     lastTestOutcome: "completed" | "failed" | "unknown" | null;
     lastTestReason: string | null;
@@ -267,7 +278,9 @@ export interface SiemDeadLetterItem {
   eventName: string;
   attempts: number;
   maxAttempts: number;
+  uncertainDelivery: boolean;
   lastReasonCode: string | null;
+  correlationId: string | null;
   deadLetteredAt: Date | null;
   createdAt: Date;
 }
@@ -289,7 +302,10 @@ export interface SiemModule extends ModuleLifecycle {
     input: { publicId: string; enabled: boolean; expectedVersion: number },
   ): Promise<SiemDestinationSummary>;
   deleteDestination(principal: SessionPrincipal, input: { publicId: string; expectedVersion: number }): Promise<void>;
-  sendTestEvent(principal: SessionPrincipal, input: { publicId: string }): Promise<SiemTestResult>;
+  sendTestEvent(
+    principal: SessionPrincipal,
+    input: { publicId: string; expectedVersion?: number },
+  ): Promise<SiemTestResult>;
   listDeadLetters(
     principal: SessionPrincipal,
     input: { destinationPublicId?: string; cursor?: string; limit?: number },

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { DomainError, validation } from "../../core/errors.js";
 import type { FieldCrypto, SettingsStore, Tx } from "../../core/types.js";
 import { defineSecret, defineSetting } from "../platform/settingsRegistry.js";
+import type { SiemDestinationRow } from "./schema.js";
 import type { SiemSecretInput } from "./types.js";
 
 export const SIEM_BATCH_SIZE = defineSetting({
@@ -101,34 +102,6 @@ export const SIEM_DEFAULT_CLIENT_KEY = defineSecret({
   exportable: false,
 });
 
-export const SIEM_DESTINATION_CREDENTIALS = defineSecret({
-  key: "siem.destinations.credentials",
-  owner: "siem",
-  group: "observability",
-  label: "SIEM per-destination encrypted credentials",
-  description: "Write-only encrypted credential ring for SIEM destination CA bundles, mTLS keys, and OTLP tokens.",
-  schema: z.string().min(2).max(524_288),
-  exportable: false,
-});
-
-export interface StoredDestinationSecretEntry {
-  caEnc?: string;
-  certEnc?: string;
-  keyEnc?: string;
-  authEnc?: string;
-}
-
-type SecretRingMap = Record<string, StoredDestinationSecretEntry>;
-
-const secretEntrySchema = z.object({
-  caEnc: z.string().min(1).max(131_072).optional(),
-  certEnc: z.string().min(1).max(131_072).optional(),
-  keyEnc: z.string().min(1).max(131_072).optional(),
-  authEnc: z.string().min(1).max(16_384).optional(),
-});
-
-const secretRingSchema = z.record(z.string().min(1).max(64), secretEntrySchema);
-
 export interface ResolvedDestinationSecrets {
   customCaPem: string | null;
   clientCertPem: string | null;
@@ -136,16 +109,34 @@ export interface ResolvedDestinationSecrets {
   authSecret: string | null;
 }
 
-export interface ValidatedTlsMaterial {
-  customCaPem: string | null;
-  clientCertPem: string | null;
-  clientKeyPem: string | null;
-  authSecret: string | null;
+export interface ValidatedTlsMaterial extends ResolvedDestinationSecrets {
   caCertExpiresAt: Date | null;
   clientCertExpiresAt: Date | null;
 }
 
+export interface SealedDestinationSecretColumns {
+  caEnc: string | null;
+  clientCertEnc: string | null;
+  clientKeyEnc: string | null;
+  authSecretEnc: string | null;
+}
+
+export interface SealedDestinationSecretsResult {
+  material: ValidatedTlsMaterial;
+  columns: SealedDestinationSecretColumns;
+}
+
 const PEM_CERT_BLOCK = /-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g;
+
+export function computeEndpointKey(target: {
+  format: string;
+  host: string;
+  port: number;
+  otlpPath?: string | null;
+}): string {
+  const pathPart = target.format === "otlp_https" ? (target.otlpPath ?? "/v1/logs") : "";
+  return `${target.format}|${target.host.toLowerCase()}|${target.port}|${pathPart}`;
+}
 
 export function parseCaBundleAndExpiry(pemBundle: string): Date {
   const normalized = pemBundle.replace(/\r\n/g, "\n").trim();
@@ -224,49 +215,58 @@ export function validateAuthSecretValue(secret: string): string {
   return trimmed;
 }
 
-async function loadSecretRing(settings: SettingsStore, tx?: Tx): Promise<SecretRingMap> {
-  const raw = await settings.getSecret(SIEM_DESTINATION_CREDENTIALS.key, tx);
-  if (raw === null) return {};
-  let parsed: unknown;
+type SecretSlot = "ca" | "cert" | "key" | "auth";
+
+function aadFor(publicId: string, version: number, endpointKey: string, slot: SecretSlot): string {
+  return `siem_destinations.${slot}:${publicId}:v${version}:${endpointKey}`;
+}
+
+function decryptRowSlot(
+  crypto: FieldCrypto,
+  ciphertext: string | null | undefined,
+  publicId: string,
+  version: number,
+  endpointKey: string,
+  slot: SecretSlot,
+): string | null {
+  if (!ciphertext) return null;
   try {
-    parsed = JSON.parse(raw);
+    return crypto.decrypt(ciphertext, aadFor(publicId, version, endpointKey, slot));
   } catch {
-    throw new DomainError("UNAVAILABLE", "SECRET_UNREADABLE", "Stored SIEM credentials could not be read safely.");
+    throw new DomainError("UNAVAILABLE", "SECRET_UNREADABLE", "Stored SIEM credentials could not be decrypted.");
   }
-  const checked = secretRingSchema.safeParse(parsed);
-  if (!checked.success) {
-    throw new DomainError("UNAVAILABLE", "SECRET_UNREADABLE", "Stored SIEM credentials could not be read safely.");
-  }
-  return { ...checked.data };
 }
 
-function aadFor(publicId: string, slot: "ca" | "cert" | "key" | "auth"): string {
-  return `siem_destinations.${slot}:${publicId}`;
-}
-
-export async function readDestinationSecrets(
+/**
+ * Decrypts per-destination credentials directly from the version-bound `siem_destinations` row,
+ * falling back to optional installation-wide TLS defaults in `SettingsStore` when per-destination TLS is unset.
+ * Because ciphertexts are stored per-row and AAD-bound to `(publicId, version, endpointKey)`,
+ * concurrent updates on distinct destinations never contend and stale endpoint snapshots fail closed.
+ */
+export async function readDestinationSecretsFromRow(
+  row: Pick<
+    SiemDestinationRow,
+    | "publicId"
+    | "version"
+    | "format"
+    | "host"
+    | "port"
+    | "otlpPath"
+    | "caEnc"
+    | "clientCertEnc"
+    | "clientKeyEnc"
+    | "authSecretEnc"
+  >,
   settings: SettingsStore,
   crypto: FieldCrypto,
-  publicId: string,
   tx?: Tx,
 ): Promise<ResolvedDestinationSecrets> {
-  const ring = await loadSecretRing(settings, tx);
-  const entry = ring[publicId];
-  const decryptSlot = (ciphertext: string | undefined, slot: "ca" | "cert" | "key" | "auth"): string | null => {
-    if (!ciphertext) return null;
-    try {
-      return crypto.decrypt(ciphertext, aadFor(publicId, slot));
-    } catch {
-      throw new DomainError("UNAVAILABLE", "SECRET_UNREADABLE", "Stored SIEM credentials could not be decrypted.");
-    }
-  };
+  const endpointKey = computeEndpointKey(row);
+  let customCaPem = decryptRowSlot(crypto, row.caEnc, row.publicId, row.version, endpointKey, "ca");
+  let clientCertPem = decryptRowSlot(crypto, row.clientCertEnc, row.publicId, row.version, endpointKey, "cert");
+  let clientKeyPem = decryptRowSlot(crypto, row.clientKeyEnc, row.publicId, row.version, endpointKey, "key");
+  const authSecret = decryptRowSlot(crypto, row.authSecretEnc, row.publicId, row.version, endpointKey, "auth");
 
-  let customCaPem = decryptSlot(entry?.caEnc, "ca");
-  let clientCertPem = decryptSlot(entry?.certEnc, "cert");
-  let clientKeyPem = decryptSlot(entry?.keyEnc, "key");
-  const authSecret = decryptSlot(entry?.authEnc, "auth");
-
-  // Fall back to optional installation-wide defaults in SettingsStore when per-destination TLS secrets are unset.
   if (!customCaPem) {
     customCaPem = await settings.getSecret(SIEM_DEFAULT_CA_BUNDLE.key, tx);
   }
@@ -284,54 +284,66 @@ export async function readDestinationSecrets(
   return { customCaPem, clientCertPem, clientKeyPem, authSecret };
 }
 
-export interface PreparedDestinationSecrets {
-  material: ValidatedTlsMaterial;
-  persist: () => Promise<void>;
-}
-
-export async function prepareDestinationSecrets(
-  settings: SettingsStore,
-  crypto: FieldCrypto,
-  publicId: string,
-  patch: SiemSecretInput | undefined,
-  tx?: Tx,
-): Promise<PreparedDestinationSecrets> {
-  const ring = await loadSecretRing(settings, tx);
-  const current = ring[publicId] ?? {};
-
-  const decryptExisting = (ciphertext: string | undefined, slot: "ca" | "cert" | "key" | "auth"): string | null => {
-    if (!ciphertext) return null;
-    try {
-      return crypto.decrypt(ciphertext, aadFor(publicId, slot));
-    } catch {
-      throw new DomainError("UNAVAILABLE", "SECRET_UNREADABLE", "Existing SIEM credentials could not be decrypted.");
-    }
-  };
+/**
+ * Validates and seals per-destination secret columns bound to `(publicId, targetVersion, targetEndpointKey)`.
+ * When `existingRow` is provided (updates / enable toggles), unmodified slots are decrypted under the
+ * existing row's `(version, endpointKey)` and re-encrypted under `(targetVersion, targetEndpointKey)` inside the same row lock.
+ */
+export function sealDestinationSecrets(params: {
+  crypto: FieldCrypto;
+  publicId: string;
+  targetVersion: number;
+  targetEndpointKey: string;
+  patch: SiemSecretInput | undefined;
+  existingRow?: Pick<
+    SiemDestinationRow,
+    | "version"
+    | "format"
+    | "host"
+    | "port"
+    | "otlpPath"
+    | "caEnc"
+    | "clientCertEnc"
+    | "clientKeyEnc"
+    | "authSecretEnc"
+  >;
+}): SealedDestinationSecretsResult {
+  const { crypto, publicId, targetVersion, targetEndpointKey, patch, existingRow } = params;
+  const oldEndpointKey = existingRow ? computeEndpointKey(existingRow) : targetEndpointKey;
+  const oldVersion = existingRow ? existingRow.version : targetVersion;
 
   const nextCa =
     patch?.customCaPem === undefined
-      ? decryptExisting(current.caEnc, "ca")
+      ? existingRow
+        ? decryptRowSlot(crypto, existingRow.caEnc, publicId, oldVersion, oldEndpointKey, "ca")
+        : null
       : patch.customCaPem === null || patch.customCaPem.trim() === ""
         ? null
         : patch.customCaPem.replace(/\r\n/g, "\n").trim();
 
   const nextCert =
     patch?.clientCertPem === undefined
-      ? decryptExisting(current.certEnc, "cert")
+      ? existingRow
+        ? decryptRowSlot(crypto, existingRow.clientCertEnc, publicId, oldVersion, oldEndpointKey, "cert")
+        : null
       : patch.clientCertPem === null || patch.clientCertPem.trim() === ""
         ? null
         : patch.clientCertPem.replace(/\r\n/g, "\n").trim();
 
   const nextKey =
     patch?.clientKeyPem === undefined
-      ? decryptExisting(current.keyEnc, "key")
+      ? existingRow
+        ? decryptRowSlot(crypto, existingRow.clientKeyEnc, publicId, oldVersion, oldEndpointKey, "key")
+        : null
       : patch.clientKeyPem === null || patch.clientKeyPem.trim() === ""
         ? null
         : patch.clientKeyPem.replace(/\r\n/g, "\n").trim();
 
   const nextAuth =
     patch?.authSecret === undefined
-      ? decryptExisting(current.authEnc, "auth")
+      ? existingRow
+        ? decryptRowSlot(crypto, existingRow.authSecretEnc, publicId, oldVersion, oldEndpointKey, "auth")
+        : null
       : patch.authSecret === null || patch.authSecret.trim() === ""
         ? null
         : validateAuthSecretValue(patch.authSecret);
@@ -346,23 +358,6 @@ export async function prepareDestinationSecrets(
   const caCertExpiresAt = nextCa ? parseCaBundleAndExpiry(nextCa) : null;
   const clientCertExpiresAt = nextCert && nextKey ? validateClientCertAndKeyPair(nextCert, nextKey) : null;
 
-  let serializedToPersist: string | null | undefined;
-  if (patch !== undefined) {
-    const nextEntry: StoredDestinationSecretEntry = {};
-    if (nextCa) nextEntry.caEnc = crypto.encrypt(nextCa, aadFor(publicId, "ca"));
-    if (nextCert) nextEntry.certEnc = crypto.encrypt(nextCert, aadFor(publicId, "cert"));
-    if (nextKey) nextEntry.keyEnc = crypto.encrypt(nextKey, aadFor(publicId, "key"));
-    if (nextAuth) nextEntry.authEnc = crypto.encrypt(nextAuth, aadFor(publicId, "auth"));
-
-    if (Object.keys(nextEntry).length === 0) {
-      delete ring[publicId];
-    } else {
-      ring[publicId] = nextEntry;
-    }
-
-    serializedToPersist = Object.keys(ring).length === 0 ? null : JSON.stringify(ring);
-  }
-
   return {
     material: {
       customCaPem: nextCa,
@@ -372,27 +367,17 @@ export async function prepareDestinationSecrets(
       caCertExpiresAt,
       clientCertExpiresAt,
     },
-    persist: async () => {
-      if (serializedToPersist !== undefined) {
-        await settings.setSecret(SIEM_DESTINATION_CREDENTIALS.key, serializedToPersist, tx);
-      }
+    columns: {
+      caEnc: nextCa ? crypto.encrypt(nextCa, aadFor(publicId, targetVersion, targetEndpointKey, "ca")) : null,
+      clientCertEnc: nextCert
+        ? crypto.encrypt(nextCert, aadFor(publicId, targetVersion, targetEndpointKey, "cert"))
+        : null,
+      clientKeyEnc: nextKey
+        ? crypto.encrypt(nextKey, aadFor(publicId, targetVersion, targetEndpointKey, "key"))
+        : null,
+      authSecretEnc: nextAuth
+        ? crypto.encrypt(nextAuth, aadFor(publicId, targetVersion, targetEndpointKey, "auth"))
+        : null,
     },
   };
-}
-
-export async function deleteDestinationSecrets(settings: SettingsStore, publicId: string, tx?: Tx): Promise<void> {
-  const raw = await settings.getSecret(SIEM_DESTINATION_CREDENTIALS.key, tx);
-  if (raw === null) return;
-  let ring: SecretRingMap;
-  try {
-    ring = secretRingSchema.parse(JSON.parse(raw));
-  } catch {
-    // Deleting a destination cleans up corrupt/retired secret entries rather than stranding deletion.
-    await settings.setSecret(SIEM_DESTINATION_CREDENTIALS.key, null, tx);
-    return;
-  }
-  if (!(publicId in ring)) return;
-  delete ring[publicId];
-  const serialized = Object.keys(ring).length === 0 ? null : JSON.stringify(ring);
-  await settings.setSecret(SIEM_DESTINATION_CREDENTIALS.key, serialized, tx);
 }

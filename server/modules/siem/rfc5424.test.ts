@@ -112,12 +112,43 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect(parts[5]).toBe("auth.login.failed");
     expect(parts[6]).toBe("-");
 
-    // MSG begins at parts[7..] and never embeds an unassigned PEN SD block like "[readypackets@32473 ...]".
+    // MSG begins at parts[7..] as canonical single-line JSON and never embeds an unassigned PEN SD block like "[readypackets@32473 ...]".
     const msgBody = parts.slice(7).join(" ");
-    expect(msgBody).toContain("event_id=01JCXX00000000000000000001");
-    expect(msgBody).toContain("outcome=denied");
+    expect(msgBody).toContain('"event_id":"01JCXX00000000000000000001"');
+    expect(msgBody).toContain('"outcome":"denied"');
     expect(msgBody).not.toContain("@32473");
     expect(msgBody.startsWith("[")).toBe(false);
+    const parsedMsg = JSON.parse(msgBody) as Record<string, unknown>;
+    expect(parsedMsg.event_id).toBe("01JCXX00000000000000000001");
+    expect(parsedMsg.attributes).toEqual({ mfa_required: true });
+  });
+
+  it("disambiguates 40-char attribute keys sharing a 32-char prefix in STRUCTURED-DATA and isolates dynamic attributes in JSON MSG", () => {
+    const ev = sampleEvent({
+      attributes: {
+        shared_prefix_attribute_identifier_alpha: "one",
+        shared_prefix_attribute_identifier_bravo: "two role=admin",
+      },
+    });
+    const formatted = formatRfc5424Message(ev, {
+      facility: 16,
+      enterpriseNumber: 55555,
+      sdIdName: "rp",
+      includeBom: false,
+    });
+    const sdStart = formatted.text.indexOf("[rp@55555 ");
+    const sdEnd = formatted.text.indexOf("] ");
+    const sdSection = formatted.text.slice(sdStart, sdEnd + 1);
+    const paramNames = [...sdSection.matchAll(/\s([!-~]+?)="/g)].map((m) => m[1]!);
+    // Every PARAM-NAME in the SD-ELEMENT must be <= 32 chars and strictly unique (zero duplicates!).
+    expect(new Set(paramNames).size).toBe(paramNames.length);
+    expect(paramNames.every((n) => n.length <= 32)).toBe(true);
+
+    // JSON MSG isolates `two role=admin` inside `attributes` so it cannot spoof top-level `role`.
+    const jsonPart = formatted.text.slice(sdEnd + 2);
+    const parsed = JSON.parse(jsonPart) as { role: string; attributes: Record<string, unknown> };
+    expect(parsed.role).toBe("anonymous");
+    expect(parsed.attributes.shared_prefix_attribute_identifier_bravo).toBe("two role=admin");
   });
 
   it("formats private enterprise STRUCTURED-DATA [sdId@PEN ...] and escapes \", \\, and ] in PARAM-VALUE", () => {
@@ -237,7 +268,7 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect(record.spanId).toBe("00f067aa0ba902b7");
   });
 
-  it("enforces fixed pseudonymous security projection even if caller passes unprojected fields or secret/PII attributes", () => {
+  it("enforces fixed pseudonymous security projection and strict typed external attribute allowlist", () => {
     const dirtyInput = {
       ...sampleEvent(),
       actor_user_id: 99,
@@ -246,7 +277,11 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
       source_address_ref: "203.0.113.42",
       ipAddress: "203.0.113.42",
       attributes: {
-        safe_flag: "enabled",
+        auth_method: "totp",
+        mfa_verified: true,
+        version: 3,
+        unallowlisted_free_text: "arbitrary customer text",
+        arbitrary_amount: 999999,
         user_email: "alice@example.com",
         passwordHash: "$argon2id$secret",
         client_ip: "198.51.100.9",
@@ -267,7 +302,12 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect(serialized).not.toContain("alice@example.com");
     expect(serialized).not.toContain("bob@example.org");
     expect(serialized).not.toContain("argon2id");
-    expect(projected.attributes.safe_flag).toBe("enabled");
-    expect(projected.dropped_attributes).toBeGreaterThanOrEqual(3);
+    expect(serialized).not.toContain("arbitrary customer text");
+    expect(projected.attributes.auth_method).toBe("totp");
+    expect(projected.attributes.mfa_verified).toBe(true);
+    expect(projected.attributes.version).toBe(3);
+    expect("unallowlisted_free_text" in projected.attributes).toBe(false);
+    expect("arbitrary_amount" in projected.attributes).toBe(false);
+    expect(projected.dropped_attributes).toBeGreaterThanOrEqual(6);
   });
 });

@@ -3,7 +3,7 @@
  * Other modules import TYPES from here and reach the instance through `deps.services.siem` at call time.
  */
 import { performance } from "node:perf_hooks";
-import { and, asc, desc, eq, inArray, lte, or, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import type { ModuleDeps, Services } from "../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../core/errors.js";
@@ -30,10 +30,11 @@ import {
   SIEM_MAX_ATTEMPTS,
   SIEM_OLDEST_ALERT_SECONDS,
   SIEM_SPOOL_MAX_EVENTS,
-  deleteDestinationSecrets,
+  computeEndpointKey,
   parseCaBundleAndExpiry,
-  prepareDestinationSecrets,
-  readDestinationSecrets,
+  readDestinationSecretsFromRow,
+  sealDestinationSecrets,
+  type ResolvedDestinationSecrets,
   validateAuthSecretValue,
   validateClientCertAndKeyPair,
 } from "./settings.js";
@@ -71,6 +72,7 @@ import {
   purgeDeadLettersSchema,
   replayDeadLettersSchema,
   setEnabledSchema,
+  testDestinationSchema,
   updateDestinationSchema,
 } from "./validation.js";
 
@@ -94,7 +96,12 @@ export {
   formatJsonlRecord,
   formatOtlpLogsPayload,
 } from "./formats.js";
-export { sanitizeProjectedEvent, matchesDestinationFilter } from "./projection.js";
+export {
+  EXTERNAL_NUMERIC_ATTRIBUTE_KEYS,
+  EXTERNAL_STRING_ATTRIBUTE_KEYS,
+  matchesDestinationFilter,
+  sanitizeProjectedEvent,
+} from "./projection.js";
 
 const CERT_EXPIRY_WARN_MS = 14 * 24 * 60 * 60 * 1_000;
 const LEASE_DURATION_MS = 60_000;
@@ -120,6 +127,12 @@ interface IdentityAssertPort {
 
 interface JobsAdminPort {
   isDraining?: () => Promise<boolean>;
+}
+
+interface DestinationLease {
+  row: SiemDestinationRow;
+  token: string;
+  fence: number;
 }
 
 function getAuditPort(services: Services): AuditReadPort | undefined {
@@ -267,17 +280,38 @@ function parseDeadLetterCursor(cursor: string | undefined): { id: number } | nul
   return { id };
 }
 
+/**
+ * Extracts numeric `chain_seq` from an audit forwarder cursor (`s1:<seq>` base64url or `seq:<seq>`)
+ * so progress-only retention-pruned pages keep `lastProjectedSeq` accurate.
+ */
+function extractSeqFromAuditCursor(cursor: string | null | undefined): number | null {
+  if (!cursor) return null;
+  const plainMatch = /^seq:(\d{1,15})$/.exec(cursor);
+  if (plainMatch) return Number(plainMatch[1]);
+  try {
+    const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    const b64Match = /^s1:(\d{1,15})$/.exec(decoded);
+    if (b64Match) return Number(b64Match[1]);
+  } catch {
+    // Opaque cursor format — ignore without throwing.
+  }
+  return null;
+}
+
 export function createSiemModule(deps: ModuleDeps): SiemModule {
   const pool = new SiemTlsConnectionPool();
-  // Rate-limit spool saturation operational audit events per destination (max once per 10 minutes).
   const lastSaturationAuditMs = new Map<string, number>();
+  const activeTestProbes = new Set<string>();
 
   async function recordDenialAndThrow(principal: SessionPrincipal | null | undefined, capability: Capability): Promise<never> {
     const now = deps.clock.now();
     try {
       assertPrincipalSnapshot(principal, capability, now);
     } catch (err) {
-      if (err instanceof DomainError && (err.code === "UNAUTHENTICATED" || err.code === "FORBIDDEN" || err.code === "REMEDIATION_REQUIRED")) {
+      if (
+        err instanceof DomainError &&
+        (err.code === "UNAUTHENTICATED" || err.code === "FORBIDDEN" || err.code === "REMEDIATION_REQUIRED")
+      ) {
         try {
           await deps.audit.record({
             category: "security",
@@ -339,12 +373,12 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     return map;
   }
 
-  async function currentAuditHeadSeq(): Promise<number> {
+  async function currentAuditHeadSeq(referenceCursor?: string | null): Promise<number> {
     const auditPort = getAuditPort(deps.services);
     if (!auditPort) return 0;
     try {
-      // Cheap headSeq probe with limit=1 from null only if needed; better: readEventsAfter(lastCursor, 1) returns headSeq.
-      const res = await auditPort.readEventsAfter(null, 1);
+      // Probe from a known advanced cursor when available so retention-pruned early pages are not rescanned.
+      const res = await auditPort.readEventsAfter(referenceCursor ?? null, 1);
       return res.headSeq;
     } catch {
       return 0;
@@ -411,6 +445,9 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         deliveredCount: row.deliveredCount,
         failedAttemptCount: row.failedAttemptCount,
         deadLetteredCount: row.deadLetteredCount,
+        uncertainCount: row.uncertainCount,
+        prunedAuditCount: row.prunedAuditCount,
+        missingAuditGapCount: row.missingAuditGapCount,
         lastTestAt: row.lastTestAt,
         lastTestOutcome: (row.lastTestOutcome as "completed" | "failed" | "unknown" | null) ?? null,
         lastTestReason: row.lastTestReason,
@@ -445,8 +482,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     if (secrets.customCaPem && secrets.customCaPem.trim() !== "") {
       parseCaBundleAndExpiry(secrets.customCaPem);
     }
-    const hasCertPatch = secrets.clientCertPem !== undefined && secrets.clientCertPem !== null && secrets.clientCertPem.trim() !== "";
-    const hasKeyPatch = secrets.clientKeyPem !== undefined && secrets.clientKeyPem !== null && secrets.clientKeyPem.trim() !== "";
+    const hasCertPatch =
+      secrets.clientCertPem !== undefined && secrets.clientCertPem !== null && secrets.clientCertPem.trim() !== "";
+    const hasKeyPatch =
+      secrets.clientKeyPem !== undefined && secrets.clientKeyPem !== null && secrets.clientKeyPem.trim() !== "";
     if (hasCertPatch && hasKeyPatch) {
       validateClientCertAndKeyPair(secrets.clientCertPem!, secrets.clientKeyPem!);
     }
@@ -455,13 +494,23 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     }
   }
 
+  function highestKnownCursor(rows: readonly SiemDestinationRow[]): string | null {
+    let best: SiemDestinationRow | null = null;
+    for (const r of rows) {
+      if (r.auditCursor && (!best || r.lastProjectedSeq > best.lastProjectedSeq)) {
+        best = r;
+      }
+    }
+    return best?.auditCursor ?? null;
+  }
+
   async function listDestinations(principal: SessionPrincipal): Promise<SiemDestinationSummary[]> {
     await ensureAuthorized(principal, "siem.read");
     const now = deps.clock.now();
     const rows = await deps.db.select().from(siemDestinations).orderBy(asc(siemDestinations.name), asc(siemDestinations.id));
     const [statsMap, headSeq] = await Promise.all([
       loadOutboxStatsByDestination(rows.map((r) => r.id)),
-      currentAuditHeadSeq(),
+      currentAuditHeadSeq(highestKnownCursor(rows)),
     ]);
     return rows.map((row) => mapDestinationSummary(row, statsMap.get(row.id), headSeq, now));
   }
@@ -472,7 +521,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     const now = deps.clock.now();
     const [row] = await deps.db.select().from(siemDestinations).where(eq(siemDestinations.publicId, publicId)).limit(1);
     if (!row) throw notFound("DESTINATION_NOT_FOUND");
-    const [statsMap, headSeq] = await Promise.all([loadOutboxStatsByDestination([row.id]), currentAuditHeadSeq()]);
+    const [statsMap, headSeq] = await Promise.all([
+      loadOutboxStatsByDestination([row.id]),
+      currentAuditHeadSeq(row.auditCursor),
+    ]);
     return mapDestinationSummary(row, statsMap.get(row.id), headSeq, now);
   }
 
@@ -508,7 +560,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     const publicId = ulid(now.getTime());
 
     // External DNS/egress preflight BEFORE opening DB transaction (no connection held during DNS I/O).
-    if (enabled) {
+    // Fail closed immediately if centralized egress service is absent; run full DNS/egress preflight when enabled.
+    if (enabled || !getEgressPort(deps.services)) {
       await preflightEgressOrThrow({
         publicId,
         version: 1,
@@ -532,6 +585,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     }
 
     const reqCtx = getRequestContext();
+    const endpointKey = computeEndpointKey({ format: input.format, host, port, otlpPath });
 
     await deps.db.transaction(async (tx) => {
       await assertActorCurrentInTx(deps, principal, "siem.manage", now, tx);
@@ -546,14 +600,14 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         throw conflict("DESTINATION_NAME_IN_USE", "A SIEM destination with that name already exists.");
       }
 
-      const preparedSecrets = await prepareDestinationSecrets(
-        deps.settings,
-        deps.crypto,
+      const sealed = sealDestinationSecrets({
+        crypto: deps.crypto,
         publicId,
-        input.secrets ?? {},
-        tx,
-      );
-      const validatedTls = preparedSecrets.material;
+        targetVersion: 1,
+        targetEndpointKey: endpointKey,
+        patch: input.secrets ?? {},
+      });
+      const validatedTls = sealed.material;
       const anySecretSaved = Boolean(
         validatedTls.customCaPem || validatedTls.clientCertPem || validatedTls.clientKeyPem || validatedTls.authSecret,
       );
@@ -567,6 +621,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         port,
         otlpPath,
         allowPrivateNetwork,
+        endpointGeneration: 1,
         facility,
         appName,
         hostnameOverride,
@@ -579,6 +634,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         minSeverity,
         categoriesJson: categories,
         authHeaderName,
+        caEnc: sealed.columns.caEnc,
+        clientCertEnc: sealed.columns.clientCertEnc,
+        clientKeyEnc: sealed.columns.clientKeyEnc,
+        authSecretEnc: sealed.columns.authSecretEnc,
         hasCustomCa: validatedTls.customCaPem !== null,
         hasClientCert: validatedTls.clientCertPem !== null,
         hasClientKey: validatedTls.clientKeyPem !== null,
@@ -586,6 +645,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         caCertExpiresAt: validatedTls.caCertExpiresAt,
         clientCertExpiresAt: validatedTls.clientCertExpiresAt,
         secretUpdatedAt: anySecretSaved ? now : null,
+        lastCursorProgressAt: enabled ? now : null,
         createdByUserId: principal.userId,
         version: 1,
         createdAt: now,
@@ -616,8 +676,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         tx,
       );
 
-      await preparedSecrets.persist();
-
       if (enabled) {
         await deps.jobs.enqueue(
           "siem.deliver",
@@ -642,7 +700,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     const input = updateDestinationSchema.parse(rawInput);
     preValidateSecretSyntax(input.secrets);
 
-    // Read current destination outside tx so DNS/egress preflight can execute BEFORE opening the transaction.
     const [snapshot] = await deps.db
       .select()
       .from(siemDestinations)
@@ -650,59 +707,47 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       .limit(1);
     if (!snapshot) throw notFound("DESTINATION_NOT_FOUND");
 
-    const nextFormat = (input.format ?? snapshot.format) as SiemFormat;
-    const nextHost = input.host !== undefined ? normalizeAndValidateHost(input.host) : snapshot.host;
-    const nextPort = input.port ?? snapshot.port;
-    const nextOtlpPath =
+    const previewFormat = (input.format ?? snapshot.format) as SiemFormat;
+    const previewHost = input.host !== undefined ? normalizeAndValidateHost(input.host) : snapshot.host;
+    const previewPort = input.port ?? snapshot.port;
+    const previewOtlpPath =
       input.otlpPath !== undefined || input.format !== undefined
-        ? normalizeOtlpPath(input.otlpPath !== undefined ? input.otlpPath : snapshot.otlpPath, nextFormat)
+        ? normalizeOtlpPath(input.otlpPath !== undefined ? input.otlpPath : snapshot.otlpPath, previewFormat)
         : snapshot.otlpPath;
-    const nextAuthHeader =
+    const previewAuthHeader =
       input.authHeaderName !== undefined || input.format !== undefined
         ? normalizeAuthHeaderName(
             input.authHeaderName !== undefined ? input.authHeaderName : snapshot.authHeaderName,
-            nextFormat,
+            previewFormat,
           )
         : snapshot.authHeaderName;
-    const nextEnabled = input.enabled ?? snapshot.enabled;
-    const nextAllowPrivate = input.allowPrivateNetwork ?? snapshot.allowPrivateNetwork;
-    const nextFacility = input.facility ?? snapshot.facility;
-    const nextAppName = input.appName ?? snapshot.appName;
-    const nextHostnameOverride =
-      input.hostnameOverride === undefined
-        ? snapshot.hostnameOverride
-        : input.hostnameOverride && input.hostnameOverride.trim().length > 0
-          ? input.hostnameOverride.trim()
-          : null;
-    const nextEnterpriseNumber =
-      input.enterpriseNumber === undefined ? snapshot.enterpriseNumber : input.enterpriseNumber;
-    const nextSdIdName = input.sdIdName ?? snapshot.sdIdName;
-    const nextIncludeBom = input.includeBom ?? snapshot.includeBom;
-    const nextMaxBytes = input.maxMessageBytes ?? snapshot.maxMessageBytes;
-    const nextConnectTimeout = input.connectTimeoutMs ?? snapshot.connectTimeoutMs;
-    const nextWriteTimeout = input.writeTimeoutMs ?? snapshot.writeTimeoutMs;
-    const nextMinSeverity = input.minSeverity ?? (snapshot.minSeverity as Severity);
-    const nextCategories = input.categories ? [...new Set(input.categories)] : [...snapshot.categoriesJson];
+    const previewEnabled = input.enabled ?? snapshot.enabled;
+    const previewAllowPrivate = input.allowPrivateNetwork ?? snapshot.allowPrivateNetwork;
 
-    if (nextEnabled) {
+    if (previewEnabled) {
       await preflightEgressOrThrow({
         publicId: snapshot.publicId,
         version: snapshot.version + 1,
-        format: nextFormat,
-        host: nextHost,
-        port: nextPort,
-        otlpPath: nextOtlpPath,
-        allowPrivateNetwork: nextAllowPrivate,
-        facility: nextFacility,
-        appName: nextAppName,
-        hostnameOverride: nextHostnameOverride,
-        enterpriseNumber: nextEnterpriseNumber,
-        sdIdName: nextSdIdName,
-        includeBom: nextIncludeBom,
-        maxMessageBytes: nextMaxBytes,
-        connectTimeoutMs: nextConnectTimeout,
-        writeTimeoutMs: nextWriteTimeout,
-        authHeaderName: nextAuthHeader,
+        format: previewFormat,
+        host: previewHost,
+        port: previewPort,
+        otlpPath: previewOtlpPath,
+        allowPrivateNetwork: previewAllowPrivate,
+        facility: input.facility ?? snapshot.facility,
+        appName: input.appName ?? snapshot.appName,
+        hostnameOverride:
+          input.hostnameOverride === undefined
+            ? snapshot.hostnameOverride
+            : input.hostnameOverride && input.hostnameOverride.trim().length > 0
+              ? input.hostnameOverride.trim()
+              : null,
+        enterpriseNumber: input.enterpriseNumber === undefined ? snapshot.enterpriseNumber : input.enterpriseNumber,
+        sdIdName: input.sdIdName ?? snapshot.sdIdName,
+        includeBom: input.includeBom ?? snapshot.includeBom,
+        maxMessageBytes: input.maxMessageBytes ?? snapshot.maxMessageBytes,
+        connectTimeoutMs: input.connectTimeoutMs ?? snapshot.connectTimeoutMs,
+        writeTimeoutMs: input.writeTimeoutMs ?? snapshot.writeTimeoutMs,
+        authHeaderName: previewAuthHeader,
         deploymentProfile: deps.config.deploymentProfile,
       });
     }
@@ -724,6 +769,40 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         throw conflict("VERSION_MISMATCH", "This destination was modified by another session. Reload and try again.");
       }
 
+      const nextFormat = (input.format ?? locked.format) as SiemFormat;
+      const nextHost = input.host !== undefined ? normalizeAndValidateHost(input.host) : locked.host;
+      const nextPort = input.port ?? locked.port;
+      const nextOtlpPath =
+        input.otlpPath !== undefined || input.format !== undefined
+          ? normalizeOtlpPath(input.otlpPath !== undefined ? input.otlpPath : locked.otlpPath, nextFormat)
+          : locked.otlpPath;
+      const nextAuthHeader =
+        input.authHeaderName !== undefined || input.format !== undefined
+          ? normalizeAuthHeaderName(
+              input.authHeaderName !== undefined ? input.authHeaderName : locked.authHeaderName,
+              nextFormat,
+            )
+          : locked.authHeaderName;
+      const nextEnabled = input.enabled ?? locked.enabled;
+      const nextAllowPrivate = input.allowPrivateNetwork ?? locked.allowPrivateNetwork;
+      const nextFacility = input.facility ?? locked.facility;
+      const nextAppName = input.appName ?? locked.appName;
+      const nextHostnameOverride =
+        input.hostnameOverride === undefined
+          ? locked.hostnameOverride
+          : input.hostnameOverride && input.hostnameOverride.trim().length > 0
+            ? input.hostnameOverride.trim()
+            : null;
+      const nextEnterpriseNumber =
+        input.enterpriseNumber === undefined ? locked.enterpriseNumber : input.enterpriseNumber;
+      const nextSdIdName = input.sdIdName ?? locked.sdIdName;
+      const nextIncludeBom = input.includeBom ?? locked.includeBom;
+      const nextMaxBytes = input.maxMessageBytes ?? locked.maxMessageBytes;
+      const nextConnectTimeout = input.connectTimeoutMs ?? locked.connectTimeoutMs;
+      const nextWriteTimeout = input.writeTimeoutMs ?? locked.writeTimeoutMs;
+      const nextMinSeverity = input.minSeverity ?? (locked.minSeverity as Severity);
+      const nextCategories = input.categories ? [...new Set(input.categories)] : [...locked.categoriesJson];
+
       const nextName = input.name ?? locked.name;
       if (nextName !== locked.name) {
         const [dup] = await tx
@@ -737,15 +816,81 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         }
       }
 
-      const preparedSecrets = await prepareDestinationSecrets(
-        deps.settings,
-        deps.crypto,
-        locked.publicId,
-        input.secrets,
-        tx,
-      );
-      const validatedTls = preparedSecrets.material;
+      const oldEndpointKey = computeEndpointKey(locked);
+      const nextEndpointKey = computeEndpointKey({
+        format: nextFormat,
+        host: nextHost,
+        port: nextPort,
+        otlpPath: nextOtlpPath,
+      });
+      const endpointChanged = nextEndpointKey !== oldEndpointKey;
+
+      // Security invariant: changing host/port/format/path must NEVER silently forward existing
+      // mTLS private keys or collector auth tokens to a different endpoint.
+      if (endpointChanged) {
+        if (locked.hasClientKey && input.secrets?.clientKeyPem === undefined) {
+          throw validation(
+            "CREDENTIALS_REQUIRE_ROTATION_OR_CLEAR",
+            "Changing the receiver endpoint requires rotating or clearing stored mTLS client credentials.",
+          );
+        }
+        if (locked.hasAuthSecret && input.secrets?.authSecret === undefined) {
+          throw validation(
+            "CREDENTIALS_REQUIRE_ROTATION_OR_CLEAR",
+            "Changing the receiver endpoint requires rotating or clearing the stored authentication secret.",
+          );
+        }
+      }
+
       const nextVersion = locked.version + 1;
+      const nextEndpointGen = endpointChanged ? locked.endpointGeneration + 1 : locked.endpointGeneration;
+
+      const sealed = sealDestinationSecrets({
+        crypto: deps.crypto,
+        publicId: locked.publicId,
+        targetVersion: nextVersion,
+        targetEndpointKey: nextEndpointKey,
+        patch: input.secrets,
+        existingRow: locked,
+      });
+      const validatedTls = sealed.material;
+
+      let migratedBacklogCount = 0;
+      let quarantinedBacklogCount = 0;
+
+      if (endpointChanged) {
+        const queuedItems = await tx
+          .select({ id: siemOutbox.id })
+          .from(siemOutbox)
+          .where(and(eq(siemOutbox.destinationId, locked.id), eq(siemOutbox.state, "queued")))
+          .for("update");
+
+        if (queuedItems.length > 0) {
+          const ids = queuedItems.map((q) => q.id);
+          if (input.migrateBacklog === true) {
+            migratedBacklogCount = ids.length;
+            await tx
+              .update(siemOutbox)
+              .set({
+                destinationVersion: nextVersion,
+                endpointGeneration: nextEndpointGen,
+                updatedAt: now,
+              })
+              .where(inArray(siemOutbox.id, ids));
+          } else {
+            quarantinedBacklogCount = ids.length;
+            await tx
+              .update(siemOutbox)
+              .set({
+                state: "dead_letter",
+                lastReasonCode: "ENDPOINT_CHANGED",
+                deadLetteredAt: now,
+                updatedAt: now,
+              })
+              .where(inArray(siemOutbox.id, ids));
+          }
+        }
+      }
 
       await tx
         .update(siemDestinations)
@@ -757,6 +902,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           port: nextPort,
           otlpPath: nextOtlpPath,
           allowPrivateNetwork: nextAllowPrivate,
+          endpointGeneration: nextEndpointGen,
           facility: nextFacility,
           appName: nextAppName,
           hostnameOverride: nextHostnameOverride,
@@ -769,6 +915,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           minSeverity: nextMinSeverity,
           categoriesJson: nextCategories,
           authHeaderName: nextAuthHeader,
+          caEnc: sealed.columns.caEnc,
+          clientCertEnc: sealed.columns.clientCertEnc,
+          clientKeyEnc: sealed.columns.clientKeyEnc,
+          authSecretEnc: sealed.columns.authSecretEnc,
           hasCustomCa: validatedTls.customCaPem !== null,
           hasClientCert: validatedTls.clientCertPem !== null,
           hasClientKey: validatedTls.clientKeyPem !== null,
@@ -776,9 +926,14 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           caCertExpiresAt: validatedTls.caCertExpiresAt,
           clientCertExpiresAt: validatedTls.clientCertExpiresAt,
           secretUpdatedAt: input.secrets !== undefined ? now : locked.secretUpdatedAt,
-          // Reset open circuit on configuration repair so recovery is probed promptly.
+          lastCursorProgressAt:
+            nextEnabled && !locked.enabled ? now : locked.lastCursorProgressAt,
+          deadLetteredCount: sql`${siemDestinations.deadLetteredCount} + ${quarantinedBacklogCount}`,
           circuitState: locked.circuitState === "open" ? "half_open" : locked.circuitState,
           circuitOpenUntil: locked.circuitState === "open" ? null : locked.circuitOpenUntil,
+          // Invalidate any in-flight worker lease when endpoint changes so old snapshots stop immediately.
+          leaseOwnerJobId: endpointChanged ? null : locked.leaseOwnerJobId,
+          leaseExpiresAt: endpointChanged ? null : locked.leaseExpiresAt,
           version: nextVersion,
           updatedAt: now,
         })
@@ -786,11 +941,11 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
       await deps.audit.record(
         {
-          category: "admin",
+          category: endpointChanged ? "security" : "admin",
           eventName: "siem.destination.updated",
           action: "update",
           outcome: "completed",
-          severity: "INFO",
+          severity: endpointChanged ? "WARN" : "INFO",
           actor: { userId: principal.userId, role: principal.role },
           resource: { type: "siem_destination", publicId: locked.publicId },
           attributes: {
@@ -799,18 +954,21 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             enabled: nextEnabled,
             allow_private_network: nextAllowPrivate,
             min_severity: nextMinSeverity,
+            endpoint_changed: endpointChanged,
             secrets_modified: input.secrets !== undefined,
             has_custom_ca: validatedTls.customCaPem !== null,
             has_mtls: validatedTls.clientCertPem !== null,
             version: nextVersion,
           },
-          safeCounts: { categories: nextCategories.length },
+          safeCounts: {
+            categories: nextCategories.length,
+            backlog_migrated: migratedBacklogCount,
+            backlog_quarantined: quarantinedBacklogCount,
+          },
           occurredAt: now,
         },
         tx,
       );
-
-      await preparedSecrets.persist();
 
       if (nextEnabled) {
         await deps.jobs.enqueue(
@@ -865,12 +1023,30 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
 
       const nextVersion = locked.version + 1;
+      const endpointKey = computeEndpointKey(locked);
+      const resealed = sealDestinationSecrets({
+        crypto: deps.crypto,
+        publicId: locked.publicId,
+        targetVersion: nextVersion,
+        targetEndpointKey: endpointKey,
+        patch: undefined,
+        existingRow: locked,
+      });
+
       await tx
         .update(siemDestinations)
         .set({
           enabled: input.enabled,
+          caEnc: resealed.columns.caEnc,
+          clientCertEnc: resealed.columns.clientCertEnc,
+          clientKeyEnc: resealed.columns.clientKeyEnc,
+          authSecretEnc: resealed.columns.authSecretEnc,
+          lastCursorProgressAt:
+            input.enabled && !locked.enabled ? now : locked.lastCursorProgressAt,
           circuitState: input.enabled && locked.circuitState === "open" ? "half_open" : locked.circuitState,
           circuitOpenUntil: input.enabled && locked.circuitState === "open" ? null : locked.circuitOpenUntil,
+          leaseOwnerJobId: input.enabled ? locked.leaseOwnerJobId : null,
+          leaseExpiresAt: input.enabled ? locked.leaseExpiresAt : null,
           version: nextVersion,
           updatedAt: now,
         })
@@ -953,7 +1129,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         tx,
       );
 
-      await deleteDestinationSecrets(deps.settings, locked.publicId, tx);
       await tx.delete(siemOutbox).where(eq(siemOutbox.destinationId, locked.id));
       await tx.delete(siemDestinations).where(eq(siemDestinations.id, locked.id));
     });
@@ -961,139 +1136,181 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     pool.evict(input.publicId);
   }
 
-  async function sendTestEvent(principal: SessionPrincipal, rawInput: { publicId: string }): Promise<SiemTestResult> {
-    await ensureAuthorized(principal, "siem.read");
-    const { publicId } = destinationPublicIdSchema.parse(rawInput);
-    const [row] = await deps.db.select().from(siemDestinations).where(eq(siemDestinations.publicId, publicId)).limit(1);
-    if (!row) throw notFound("DESTINATION_NOT_FOUND");
+  /**
+   * Step-up connectivity probe (`siem.manage`):
+   * - Re-validates the actor inside a DB transaction BEFORE decrypting credentials or dialing.
+   * - Binds to a single consistent `(row, secrets)` revision snapshot (`expectedVersion` enforced if supplied).
+   * - Uses an isolated one-shot TLS connection pool so live worker sockets are never evicted or shared.
+   */
+  async function sendTestEvent(
+    principal: SessionPrincipal,
+    rawInput: { publicId: string; expectedVersion?: number },
+  ): Promise<SiemTestResult> {
+    await ensureAuthorized(principal, "siem.manage");
+    const input = testDestinationSchema.parse(rawInput);
 
-    const startedAt = deps.clock.now();
-    const startPerfMs = performance.now();
-    const testEventId = ulid(startedAt.getTime());
-    const reqCtx = getRequestContext();
-
-    // Record durable intent (`attempted`) BEFORE making the external TLS connection.
-    await deps.audit.record({
-      category: "integration",
-      eventName: "siem.destination.test",
-      action: "test",
-      outcome: "attempted",
-      severity: "INFO",
-      actor: { userId: principal.userId, role: principal.role },
-      resource: { type: "siem_destination", publicId: row.publicId },
-      deliveryId: testEventId,
-      attributes: { format: row.format },
-      occurredAt: startedAt,
-    });
-
-    const syntheticEvent: ExternalAuditEvent = sanitizeProjectedEvent({
-      schema_version: "rp.audit/1",
-      event_id: testEventId,
-      chain_seq: null,
-      occurred_at: startedAt.toISOString(),
-      observed_at: startedAt.toISOString(),
-      severity_text: "INFO",
-      severity_number: 9,
-      category: "system",
-      event_name: "siem.connectivity.test",
-      action: "test",
-      outcome: "completed",
-      reason_code: null,
-      service: deps.config.serviceName,
-      installation_ref: deps.config.installationId,
-      release_ref: deps.config.releaseRef,
-      deployment_profile: deps.config.deploymentProfile,
-      origin: "http",
-      actor_ref: deps.crypto.pseudonym(String(principal.userId), "audit.actor"),
-      actor_role: principal.role,
-      resource_type: "siem_destination",
-      resource_ref: deps.crypto.pseudonym(row.publicId, "audit.resource"),
-      source_address_class: null,
-      request_id: reqCtx?.requestId ?? null,
-      trace_id: reqCtx?.traceId ?? null,
-      span_id: reqCtx?.spanId ?? null,
-      correlation_id: reqCtx?.correlationId ?? null,
-      parent_correlation_id: null,
-      job_id: null,
-      package_id: null,
-      import_id: null,
-      delivery_id: testEventId,
-      provider: row.format,
-      duration_ms: null,
-      safe_counts: { events: 1 },
-      attributes: { synthetic: true, probe: "siem_admin_test" },
-      dropped_attributes: 0,
-    });
-
-    // Always force a fresh TLS handshake on explicit connectivity test so rotated certs/CA rules are verified live.
-    pool.evict(row.publicId);
-
-    let outcome: "completed" | "failed" | "unknown" = "failed";
-    let reasonCode: string | null = null;
-    let receiptConfirmation: SiemReceiptConfirmation = "none";
-
-    try {
-      const secrets = await readDestinationSecrets(deps.settings, deps.crypto, row.publicId);
-      const delivered = await deliverProjectedBatch({
-        pool,
-        dest: toTransportConfig(row, deps.config.deploymentProfile),
-        secrets,
-        events: [syntheticEvent],
-        egress: getEgressPort(deps.services),
-      });
-      outcome = "completed";
-      receiptConfirmation = delivered.receiptConfirmation;
-    } catch (err) {
-      const classified = classifySocketError(err, false);
-      outcome = classified.uncertainAfterWrite ? "unknown" : "failed";
-      reasonCode = classified.reasonCode;
-      receiptConfirmation = "none";
+    if (activeTestProbes.has(input.publicId)) {
+      throw conflict("TEST_ALREADY_IN_PROGRESS", "A connectivity test is already running for this destination.");
     }
+    activeTestProbes.add(input.publicId);
 
-    const finishedAt = deps.clock.now();
-    const durationMs = Math.max(0, Math.round(performance.now() - startPerfMs));
+    const probePool = new SiemTlsConnectionPool();
+    try {
+      const startedAt = deps.clock.now();
+      const startPerfMs = performance.now();
+      const testEventId = ulid(startedAt.getTime());
+      const reqCtx = getRequestContext();
 
-    await deps.db.transaction(async (tx) => {
-      await tx
-        .update(siemDestinations)
-        .set({
-          lastTestAt: finishedAt,
-          lastTestOutcome: outcome,
-          lastTestReason: reasonCode,
-          updatedAt: finishedAt,
-        })
-        .where(eq(siemDestinations.id, row.id));
+      // Atomically verify actor step-up, read consistent row + secrets, and record durable `attempted` audit BEFORE network I/O.
+      const { row, secrets } = await deps.db.transaction(async (tx) => {
+        await assertActorCurrentInTx(deps, principal, "siem.manage", startedAt, tx);
 
-      await deps.audit.record(
-        {
-          category: "integration",
-          eventName: "siem.destination.test",
-          action: "test",
-          outcome,
-          severity: outcome === "completed" ? "INFO" : "WARN",
-          reasonCode: reasonCode ?? undefined,
-          actor: { userId: principal.userId, role: principal.role },
-          resource: { type: "siem_destination", publicId: row.publicId },
-          deliveryId: testEventId,
-          durationMs,
-          attributes: {
-            format: row.format,
-            receipt_confirmation: receiptConfirmation,
+        const [found] = await tx
+          .select()
+          .from(siemDestinations)
+          .where(eq(siemDestinations.publicId, input.publicId))
+          .limit(1);
+        if (!found) throw notFound("DESTINATION_NOT_FOUND");
+        if (input.expectedVersion !== undefined && found.version !== input.expectedVersion) {
+          throw conflict("VERSION_MISMATCH", "This destination was modified by another session. Reload and try again.");
+        }
+
+        const resolvedSecrets: ResolvedDestinationSecrets = await readDestinationSecretsFromRow(
+          found,
+          deps.settings,
+          deps.crypto,
+          tx,
+        );
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "siem.destination.test",
+            action: "test",
+            outcome: "attempted",
+            severity: "INFO",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "siem_destination", publicId: found.publicId },
+            deliveryId: testEventId,
+            attributes: { format: found.format, version: found.version },
+            occurredAt: startedAt,
           },
-          occurredAt: finishedAt,
-        },
-        tx,
-      );
-    });
+          tx,
+        );
 
-    return {
-      eventId: testEventId,
-      attemptedAt: startedAt,
-      outcome,
-      reasonCode,
-      receiptConfirmation,
-      durationMs,
-    };
+        return { row: found, secrets: resolvedSecrets };
+      });
+
+      const syntheticEvent: ExternalAuditEvent = sanitizeProjectedEvent({
+        schema_version: "rp.audit/1",
+        event_id: testEventId,
+        chain_seq: null,
+        occurred_at: startedAt.toISOString(),
+        observed_at: startedAt.toISOString(),
+        severity_text: "INFO",
+        severity_number: 9,
+        category: "system",
+        event_name: "siem.connectivity.test",
+        action: "test",
+        outcome: "completed",
+        reason_code: null,
+        service: deps.config.serviceName,
+        installation_ref: deps.config.installationId,
+        release_ref: deps.config.releaseRef,
+        deployment_profile: deps.config.deploymentProfile,
+        origin: "http",
+        actor_ref: deps.crypto.pseudonym(`user:${principal.userId}`, "audit.actor").slice(0, 32),
+        actor_role: principal.role,
+        resource_type: "siem_destination",
+        resource_ref: deps.crypto.pseudonym(`siem_destination:${row.publicId}`, "audit.resource").slice(0, 32),
+        source_address_class: null,
+        request_id: reqCtx?.requestId ?? null,
+        trace_id: reqCtx?.traceId ?? null,
+        span_id: reqCtx?.spanId ?? null,
+        correlation_id: reqCtx?.correlationId ?? null,
+        parent_correlation_id: null,
+        job_id: null,
+        package_id: null,
+        import_id: null,
+        delivery_id: testEventId,
+        provider: row.format,
+        duration_ms: null,
+        safe_counts: { events: 1 },
+        attributes: { synthetic: true, probe: "siem_admin_test" },
+        dropped_attributes: 0,
+      });
+
+      let outcome: "completed" | "failed" | "unknown" = "failed";
+      let reasonCode: string | null = null;
+      let receiptConfirmation: SiemReceiptConfirmation = "none";
+
+      try {
+        const delivered = await deliverProjectedBatch({
+          pool: probePool,
+          dest: toTransportConfig(row, deps.config.deploymentProfile),
+          secrets,
+          events: [syntheticEvent],
+          egress: getEgressPort(deps.services),
+        });
+        outcome = "completed";
+        receiptConfirmation = delivered.receiptConfirmation;
+      } catch (err) {
+        const classified = classifySocketError(err, false);
+        outcome = classified.uncertainAfterWrite ? "unknown" : "failed";
+        reasonCode = classified.reasonCode;
+        receiptConfirmation = "none";
+      }
+
+      const finishedAt = deps.clock.now();
+      const durationMs = Math.max(0, Math.round(performance.now() - startPerfMs));
+
+      await deps.db.transaction(async (tx) => {
+        // Only update test status on the tested configuration revision so concurrent edits are never overwritten.
+        await tx
+          .update(siemDestinations)
+          .set({
+            lastTestAt: finishedAt,
+            lastTestOutcome: outcome,
+            lastTestReason: reasonCode,
+            updatedAt: finishedAt,
+          })
+          .where(and(eq(siemDestinations.id, row.id), eq(siemDestinations.version, row.version)));
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "siem.destination.test",
+            action: "test",
+            outcome,
+            severity: outcome === "completed" ? "INFO" : "WARN",
+            reasonCode: reasonCode ?? undefined,
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "siem_destination", publicId: row.publicId },
+            deliveryId: testEventId,
+            durationMs,
+            attributes: {
+              format: row.format,
+              receipt_confirmation: receiptConfirmation,
+              version: row.version,
+            },
+            occurredAt: finishedAt,
+          },
+          tx,
+        );
+      });
+
+      return {
+        eventId: testEventId,
+        attemptedAt: startedAt,
+        outcome,
+        reasonCode,
+        receiptConfirmation,
+        durationMs,
+      };
+    } finally {
+      activeTestProbes.delete(input.publicId);
+      await probePool.closeAll().catch(() => {});
+    }
   }
 
   async function listDeadLetters(
@@ -1149,7 +1366,9 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         eventName: outbox.eventName,
         attempts: outbox.attempts,
         maxAttempts: outbox.maxAttempts,
+        uncertainDelivery: outbox.uncertainDelivery,
         lastReasonCode: outbox.lastReasonCode,
+        correlationId: outbox.correlationId,
         deadLetteredAt: outbox.deadLetteredAt,
         createdAt: outbox.createdAt,
       })),
@@ -1199,19 +1418,35 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
       replayedCount = candidates.length;
       if (replayedCount > 0) {
-        const ids = candidates.map((c) => c.id);
         const destIds = [...new Set(candidates.map((c) => c.destinationId))];
-
-        await tx
-          .update(siemOutbox)
-          .set({
-            state: "queued",
-            attempts: 0,
-            nextAttemptAt: now,
-            deadLetteredAt: null,
-            updatedAt: now,
+        const destRows = await tx
+          .select({
+            id: siemDestinations.id,
+            version: siemDestinations.version,
+            endpointGeneration: siemDestinations.endpointGeneration,
           })
-          .where(inArray(siemOutbox.id, ids));
+          .from(siemDestinations)
+          .where(inArray(siemDestinations.id, destIds))
+          .for("update");
+        const destById = new Map(destRows.map((d) => [d.id, d]));
+
+        for (const destId of destIds) {
+          const destMeta = destById.get(destId);
+          if (!destMeta) continue;
+          const groupIds = candidates.filter((c) => c.destinationId === destId).map((c) => c.id);
+          await tx
+            .update(siemOutbox)
+            .set({
+              state: "queued",
+              attempts: 0,
+              destinationVersion: destMeta.version,
+              endpointGeneration: destMeta.endpointGeneration,
+              nextAttemptAt: now,
+              deadLetteredAt: null,
+              updatedAt: now,
+            })
+            .where(inArray(siemOutbox.id, groupIds));
+        }
 
         await tx
           .update(siemDestinations)
@@ -1304,15 +1539,19 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     return { purgedCount };
   }
 
-  async function acquireDestinationLease(
-    destId: number,
-    ownerId: string,
-    fencingToken: number | undefined,
-  ): Promise<SiemDestinationRow | null> {
+  /**
+   * Acquires an exclusive destination lease with:
+   * - Unique per-claim-attempt `token` (`lease_<ulid>`) so retries of the same `jobId` never share identity.
+   * - Destination-local monotonic `fence` (`lastFencingToken + 1`) so cross-job fencing tokens never block newer jobs.
+   */
+  async function acquireDestinationLease(destId: number, job?: ClaimedJob<unknown>): Promise<DestinationLease | null> {
     const now = deps.clock.now();
     const expiresAt = new Date(now.getTime() + LEASE_DURATION_MS);
+    const token = `lease_${ulid(now.getTime())}`;
 
     return deps.db.transaction(async (tx) => {
+      if (job) await job.assertStillOwned(tx);
+
       const [row] = await tx
         .select()
         .from(siemDestinations)
@@ -1320,51 +1559,81 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           and(
             eq(siemDestinations.id, destId),
             eq(siemDestinations.enabled, true),
-            or(
-              isNull(siemDestinations.leaseOwnerJobId),
-              eq(siemDestinations.leaseOwnerJobId, ownerId),
-              lte(siemDestinations.leaseExpiresAt, now),
-            ),
+            or(isNull(siemDestinations.leaseOwnerJobId), lte(siemDestinations.leaseExpiresAt, now)),
           ),
         )
         .for("update")
         .limit(1);
 
       if (!row) return null;
-      if (fencingToken !== undefined && fencingToken < row.lastFencingToken) {
-        return null;
-      }
 
-      const nextFence = fencingToken !== undefined ? Math.max(row.lastFencingToken, fencingToken) : row.lastFencingToken;
+      const nextFence = row.lastFencingToken + 1;
       await tx
         .update(siemDestinations)
         .set({
-          leaseOwnerJobId: ownerId,
+          leaseOwnerJobId: token,
           leaseExpiresAt: expiresAt,
           lastFencingToken: nextFence,
         })
         .where(eq(siemDestinations.id, row.id));
 
-      return { ...row, leaseOwnerJobId: ownerId, leaseExpiresAt: expiresAt, lastFencingToken: nextFence };
+      return {
+        row: { ...row, leaseOwnerJobId: token, leaseExpiresAt: expiresAt, lastFencingToken: nextFence },
+        token,
+        fence: nextFence,
+      };
     });
   }
 
-  async function releaseDestinationLease(destId: number, ownerId: string): Promise<void> {
+  async function releaseDestinationLease(destId: number, lease: DestinationLease): Promise<void> {
     await deps.db
       .update(siemDestinations)
       .set({ leaseOwnerJobId: null, leaseExpiresAt: null })
-      .where(and(eq(siemDestinations.id, destId), eq(siemDestinations.leaseOwnerJobId, ownerId)));
+      .where(
+        and(
+          eq(siemDestinations.id, destId),
+          eq(siemDestinations.leaseOwnerJobId, lease.token),
+          eq(siemDestinations.lastFencingToken, lease.fence),
+        ),
+      );
+  }
+
+  async function assertDestinationLeaseInTx(
+    tx: Tx,
+    destId: number,
+    lease: DestinationLease,
+    expectedEndpointGen: number,
+    job?: ClaimedJob<unknown>,
+  ): Promise<SiemDestinationRow> {
+    if (job) await job.assertStillOwned(tx);
+    const [locked] = await tx
+      .select()
+      .from(siemDestinations)
+      .where(eq(siemDestinations.id, destId))
+      .for("update")
+      .limit(1);
+
+    if (
+      !locked ||
+      !locked.enabled ||
+      locked.leaseOwnerJobId !== lease.token ||
+      locked.lastFencingToken !== lease.fence ||
+      locked.endpointGeneration !== expectedEndpointGen
+    ) {
+      throw conflict("LEASE_LOST", "Destination lease or endpoint generation changed.");
+    }
+    return locked;
   }
 
   async function projectEventsForDestination(params: {
-    dest: SiemDestinationRow;
-    ownerId: string;
+    lease: DestinationLease;
     job?: ClaimedJob<unknown>;
     batchSize: number;
     maxAttempts: number;
     spoolMaxEvents: number;
   }): Promise<number> {
-    const { dest, ownerId, job, batchSize, maxAttempts, spoolMaxEvents } = params;
+    const { lease, job, batchSize, maxAttempts, spoolMaxEvents } = params;
+    const dest = lease.row;
     const auditPort = getAuditPort(deps.services);
     if (!auditPort) return 0;
 
@@ -1372,7 +1641,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     let lastSeq = dest.lastProjectedSeq;
     let totalProjected = 0;
 
-    for (let pageIdx = 0; pageIdx < 5; pageIdx += 1) {
+    for (let pageIdx = 0; pageIdx < 10; pageIdx += 1) {
       if (job?.signal.aborted) break;
 
       const [spoolRow] = await deps.db
@@ -1404,11 +1673,28 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
       const readBudget = Math.min(Math.max(batchSize * 2, 100), 500, spoolMaxEvents - activeSpool);
       const batch = await auditPort.readEventsAfter(cursor, readBudget);
-      if (batch.events.length === 0) {
+      const batchPruned = Math.max(0, Math.floor(batch.pruned ?? 0));
+      const batchMissing = Math.max(0, Math.floor(batch.missing ?? 0));
+      const cursorAdvanced = Boolean(batch.nextCursor && batch.nextCursor !== cursor);
+      const now = deps.clock.now();
+
+      // Caught up cleanly at headSeq with no new events, no cursor advance, and no gaps.
+      if (batch.events.length === 0 && !cursorAdvanced && batchPruned === 0 && batchMissing === 0) {
+        if (batch.headSeq <= lastSeq) {
+          await deps.db
+            .update(siemDestinations)
+            .set({ lastCursorProgressAt: now })
+            .where(
+              and(
+                eq(siemDestinations.id, dest.id),
+                eq(siemDestinations.leaseOwnerJobId, lease.token),
+                eq(siemDestinations.lastFencingToken, lease.fence),
+              ),
+            );
+        }
         break;
       }
 
-      const now = deps.clock.now();
       const toInsert: (typeof siemOutbox.$inferInsert)[] = [];
       for (const rawEvent of batch.events) {
         if (typeof rawEvent.chain_seq === "number" && rawEvent.chain_seq > lastSeq) {
@@ -1433,6 +1719,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           publicId: ulid(now.getTime()),
           destinationId: dest.id,
           destinationVersion: dest.version,
+          endpointGeneration: dest.endpointGeneration,
           eventId: projected.event_id,
           chainSeq: projected.chain_seq,
           eventOccurredAt: Number.isNaN(occurredDate.getTime()) ? now : occurredDate,
@@ -1443,6 +1730,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           state: "queued",
           attempts: 0,
           maxAttempts,
+          uncertainDelivery: false,
           nextAttemptAt: now,
           correlationId: projected.correlation_id ?? job?.correlationId ?? null,
           createdAt: now,
@@ -1451,17 +1739,13 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
 
       const nextCursor = batch.nextCursor ?? cursor;
+      const cursorSeq = extractSeqFromAuditCursor(nextCursor);
+      if (cursorSeq !== null && cursorSeq > lastSeq) {
+        lastSeq = cursorSeq;
+      }
+
       const insertedInPage = await deps.db.transaction(async (tx) => {
-        if (job) await job.assertStillOwned(tx);
-        const [locked] = await tx
-          .select({ id: siemDestinations.id, leaseOwnerJobId: siemDestinations.leaseOwnerJobId })
-          .from(siemDestinations)
-          .where(eq(siemDestinations.id, dest.id))
-          .for("update")
-          .limit(1);
-        if (!locked || locked.leaseOwnerJobId !== ownerId) {
-          throw conflict("LEASE_LOST", "Destination lease was claimed by another worker.");
-        }
+        await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
 
         if (toInsert.length > 0) {
           await tx
@@ -1475,41 +1759,86 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
           .set({
             auditCursor: nextCursor,
             lastProjectedSeq: lastSeq,
+            lastCursorProgressAt: now,
+            prunedAuditCount: sql`${siemDestinations.prunedAuditCount} + ${batchPruned}`,
+            missingAuditGapCount: sql`${siemDestinations.missingAuditGapCount} + ${batchMissing}`,
+            leaseExpiresAt: new Date(now.getTime() + LEASE_DURATION_MS),
             updatedAt: now,
           })
           .where(eq(siemDestinations.id, dest.id));
 
+        if (batchMissing > 0) {
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "siem.audit.loss_detected",
+              action: "observe",
+              outcome: "failed",
+              severity: "WARN",
+              reasonCode: "AUDIT_EVENTS_MISSING",
+              actor: { role: "system" },
+              resource: { type: "siem_destination", publicId: dest.publicId },
+              safeCounts: { missing: batchMissing, pruned: batchPruned },
+              occurredAt: now,
+            },
+            tx,
+          );
+        }
+
         return toInsert.length;
       });
 
+      if (batchPruned > 0) {
+        deps.audit.note({
+          category: "system",
+          eventName: "siem.cursor.retention_pruned",
+          action: "observe",
+          outcome: "completed",
+          severity: "INFO",
+          reasonCode: "AUDIT_RETENTION_PRUNED",
+          actor: { role: "system" },
+          resource: { type: "siem_destination", publicId: dest.publicId },
+          safeCounts: { pruned: batchPruned },
+          occurredAt: now,
+        });
+      }
+
       totalProjected += insertedInPage;
-      if (!batch.nextCursor || batch.nextCursor === cursor) break;
-      cursor = batch.nextCursor;
+      if (!cursorAdvanced) break;
+      cursor = nextCursor;
     }
 
     return totalProjected;
   }
 
   async function transmitReadyBatchesForDestination(params: {
-    destId: number;
-    ownerId: string;
+    lease: DestinationLease;
     job?: ClaimedJob<unknown>;
     batchSize: number;
     circuitThreshold: number;
     circuitCooldownSeconds: number;
   }): Promise<{ delivered: number; failed: number; deadLettered: number }> {
-    const { destId, ownerId, job, batchSize, circuitThreshold, circuitCooldownSeconds } = params;
+    const { lease, job, batchSize, circuitThreshold, circuitCooldownSeconds } = params;
+    const destId = lease.row.id;
     let delivered = 0;
     let failed = 0;
     let deadLettered = 0;
 
-    // Process up to 5 batches per cycle so large backlogs drain briskly while remaining bounded.
     for (let round = 0; round < 5; round += 1) {
       if (job?.signal.aborted) break;
       const now = deps.clock.now();
 
+      // Re-read current destination row + verify lease & endpoint generation BEFORE decrypting or dialing.
       const [dest] = await deps.db.select().from(siemDestinations).where(eq(siemDestinations.id, destId)).limit(1);
-      if (!dest || !dest.enabled || dest.leaseOwnerJobId !== ownerId) break;
+      if (
+        !dest ||
+        !dest.enabled ||
+        dest.leaseOwnerJobId !== lease.token ||
+        dest.lastFencingToken !== lease.fence ||
+        dest.endpointGeneration !== lease.row.endpointGeneration
+      ) {
+        break;
+      }
 
       let effectiveCircuit = dest.circuitState as SiemCircuitState;
       if (effectiveCircuit === "open") {
@@ -1520,26 +1849,46 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
 
       const limit = effectiveCircuit === "half_open" ? Math.min(10, batchSize) : batchSize;
-      const readyRows: SiemOutboxRow[] = await deps.db
+
+      // Strict per-destination FIFO head-of-line query: newer events never overtake a backed-off head event.
+      const fifoHead: SiemOutboxRow[] = await deps.db
         .select()
         .from(siemOutbox)
         .where(
           and(
             eq(siemOutbox.destinationId, dest.id),
             eq(siemOutbox.state, "queued"),
-            lte(siemOutbox.nextAttemptAt, now),
+            eq(siemOutbox.endpointGeneration, dest.endpointGeneration),
           ),
         )
         .orderBy(asc(siemOutbox.id))
         .limit(limit);
 
+      if (fifoHead.length === 0) break;
+      if (fifoHead[0]!.nextAttemptAt.getTime() > now.getTime()) {
+        // Head of queue is still in retry backoff; preserve strict FIFO order.
+        break;
+      }
+
+      const readyRows: SiemOutboxRow[] = [];
+      for (const candidate of fifoHead) {
+        if (candidate.nextAttemptAt.getTime() > now.getTime()) break;
+        readyRows.push(candidate);
+      }
       if (readyRows.length === 0) break;
+
+      // Verify job fence right before outbound network I/O so an expired worker never transmits.
+      if (job) {
+        await deps.db.transaction(async (tx) => {
+          await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
+        });
+      }
 
       let deliveryError: SiemTransportError | null = null;
       let receiptConfirmation: SiemReceiptConfirmation = "none";
 
       try {
-        const secrets = await readDestinationSecrets(deps.settings, deps.crypto, dest.publicId);
+        const secrets = await readDestinationSecretsFromRow(dest, deps.settings, deps.crypto);
         const res = await deliverProjectedBatch({
           pool,
           dest: toTransportConfig(dest, deps.config.deploymentProfile),
@@ -1558,16 +1907,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       if (!deliveryError) {
         const rowIds = readyRows.map((r) => r.id);
         await deps.db.transaction(async (tx) => {
-          if (job) await job.assertStillOwned(tx);
-          const [locked] = await tx
-            .select({ id: siemDestinations.id, leaseOwnerJobId: siemDestinations.leaseOwnerJobId })
-            .from(siemDestinations)
-            .where(eq(siemDestinations.id, dest.id))
-            .for("update")
-            .limit(1);
-          if (!locked || locked.leaseOwnerJobId !== ownerId) {
-            throw conflict("LEASE_LOST", "Destination lease was claimed by another worker.");
-          }
+          await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
 
           await tx.delete(siemOutbox).where(inArray(siemOutbox.id, rowIds));
           await tx
@@ -1581,32 +1921,25 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
               lastFailureReason: null,
               deliveredCount: sql`${siemDestinations.deliveredCount} + ${rowIds.length}`,
               receiptConfirmation,
+              leaseExpiresAt: new Date(completedAt.getTime() + LEASE_DURATION_MS),
               updatedAt: completedAt,
             })
             .where(eq(siemDestinations.id, dest.id));
         });
         delivered += rowIds.length;
-        // If half-open probe succeeded, loop continues with full batchSize!
       } else {
         const reasonCode = deliveryError.reasonCode;
         const retryable = deliveryError.retryable;
+        const uncertainAfterWrite = deliveryError.uncertainAfterWrite;
 
         let batchDeadLetters = 0;
         await deps.db.transaction(async (tx) => {
-          if (job) await job.assertStillOwned(tx);
-          const [locked] = await tx
-            .select()
-            .from(siemDestinations)
-            .where(eq(siemDestinations.id, dest.id))
-            .for("update")
-            .limit(1);
-          if (!locked || locked.leaseOwnerJobId !== ownerId) {
-            throw conflict("LEASE_LOST", "Destination lease was claimed by another worker.");
-          }
+          const locked = await assertDestinationLeaseInTx(tx, dest.id, lease, dest.endpointGeneration, job);
 
           for (const item of readyRows) {
             const nextAttempts = item.attempts + 1;
             const exhaust = !retryable || nextAttempts >= item.maxAttempts;
+            const markedUncertain = item.uncertainDelivery || uncertainAfterWrite;
             if (exhaust) {
               batchDeadLetters += 1;
               await tx
@@ -1614,6 +1947,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
                 .set({
                   state: "dead_letter",
                   attempts: nextAttempts,
+                  uncertainDelivery: markedUncertain,
                   lastAttemptAt: completedAt,
                   lastReasonCode: reasonCode,
                   deadLetteredAt: completedAt,
@@ -1627,6 +1961,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
                 .set({
                   state: "queued",
                   attempts: nextAttempts,
+                  uncertainDelivery: markedUncertain,
                   lastAttemptAt: completedAt,
                   nextAttemptAt: new Date(completedAt.getTime() + delayMs),
                   lastReasonCode: reasonCode,
@@ -1654,9 +1989,31 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
               lastFailureReason: reasonCode,
               failedAttemptCount: sql`${siemDestinations.failedAttemptCount} + 1`,
               deadLetteredCount: sql`${siemDestinations.deadLetteredCount} + ${batchDeadLetters}`,
+              uncertainCount: uncertainAfterWrite
+                ? sql`${siemDestinations.uncertainCount} + ${readyRows.length}`
+                : locked.uncertainCount,
+              leaseExpiresAt: new Date(completedAt.getTime() + LEASE_DURATION_MS),
               updatedAt: completedAt,
             })
             .where(eq(siemDestinations.id, dest.id));
+
+          if (uncertainAfterWrite) {
+            await deps.audit.record(
+              {
+                category: "system",
+                eventName: "siem.delivery.uncertain_outcome",
+                action: "observe",
+                outcome: "unknown",
+                severity: "WARN",
+                reasonCode,
+                actor: { role: "system" },
+                resource: { type: "siem_destination", publicId: locked.publicId },
+                safeCounts: { uncertain_events: readyRows.length },
+                occurredAt: completedAt,
+              },
+              tx,
+            );
+          }
 
           if (batchDeadLetters > 0) {
             await deps.audit.record(
@@ -1697,7 +2054,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
         failed += readyRows.length;
         deadLettered += batchDeadLetters;
-        // Stop retrying this destination in the same tick; backoff/circuit schedules the next attempt.
         break;
       }
     }
@@ -1718,7 +2074,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       }
     }
 
-    // Read all operational settings BEFORE opening any transaction.
     const [batchSize, maxAttempts, spoolMaxEvents, circuitThreshold, circuitCooldownSeconds] = await Promise.all([
       deps.settings.get(SIEM_BATCH_SIZE.key, (r) => SIEM_BATCH_SIZE.schema.parse(r), SIEM_BATCH_SIZE.default),
       deps.settings.get(SIEM_MAX_ATTEMPTS.key, (r) => SIEM_MAX_ATTEMPTS.schema.parse(r), SIEM_MAX_ATTEMPTS.default),
@@ -1749,7 +2104,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       .where(and(...conditions))
       .orderBy(asc(siemDestinations.id));
 
-    const ownerId = job?.jobId ?? `direct_${ulid(deps.clock.now().getTime())}`;
     let projected = 0;
     let delivered = 0;
     let failed = 0;
@@ -1757,13 +2111,12 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
     for (const candidate of candidates) {
       if (job?.signal.aborted) break;
-      const leased = await acquireDestinationLease(candidate.id, ownerId, job?.fencingToken);
-      if (!leased) continue;
+      const lease = await acquireDestinationLease(candidate.id, job);
+      if (!lease) continue;
 
       try {
         projected += await projectEventsForDestination({
-          dest: leased,
-          ownerId,
+          lease,
           job,
           batchSize,
           maxAttempts,
@@ -1771,8 +2124,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         });
 
         const txResult = await transmitReadyBatchesForDestination({
-          destId: leased.id,
-          ownerId,
+          lease,
           job,
           batchSize,
           circuitThreshold,
@@ -1782,7 +2134,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         failed += txResult.failed;
         deadLettered += txResult.deadLettered;
       } finally {
-        await releaseDestinationLease(leased.id, ownerId).catch(() => {});
+        await releaseDestinationLease(lease.row.id, lease).catch(() => {});
       }
     }
 
@@ -1791,7 +2143,7 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
 
   async function health(): Promise<ModuleHealth[]> {
     const checkedAt = deps.clock.now();
-    const [oldestAlertSeconds, spoolMaxEvents, rows, headSeq] = await Promise.all([
+    const [oldestAlertSeconds, spoolMaxEvents, rows] = await Promise.all([
       deps.settings.get(
         SIEM_OLDEST_ALERT_SECONDS.key,
         (r) => SIEM_OLDEST_ALERT_SECONDS.schema.parse(r),
@@ -1803,7 +2155,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         SIEM_SPOOL_MAX_EVENTS.default,
       ),
       deps.db.select().from(siemDestinations),
-      currentAuditHeadSeq(),
     ]);
 
     if (rows.length === 0) {
@@ -1819,24 +2170,31 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
             deadLetters: 0,
             oldestPendingAgeSeconds: 0,
             maxLagSeq: 0,
+            maxCursorLagAgeSeconds: 0,
           },
           checkedAt,
         },
       ];
     }
 
-    const statsMap = await loadOutboxStatsByDestination(rows.map((r) => r.id));
+    const [statsMap, headSeq] = await Promise.all([
+      loadOutboxStatsByDestination(rows.map((r) => r.id)),
+      currentAuditHeadSeq(highestKnownCursor(rows)),
+    ]);
     const enabledRows = rows.filter((r) => r.enabled);
 
     let totalQueued = 0;
     let totalDeadLetters = 0;
     let oldestPendingAgeSeconds = 0;
     let maxLagSeq = 0;
+    let maxCursorLagAgeSeconds = 0;
+    let totalMissingGaps = 0;
 
     for (const row of rows) {
       const s = statsMap.get(row.id);
       totalQueued += s?.queuedCount ?? 0;
       totalDeadLetters += s?.deadLetterCount ?? 0;
+      totalMissingGaps += row.missingAuditGapCount;
       if (row.enabled && s?.oldestQueuedCreatedAt) {
         const age = Math.max(0, Math.floor((checkedAt.getTime() - s.oldestQueuedCreatedAt.getTime()) / 1_000));
         if (age > oldestPendingAgeSeconds) oldestPendingAgeSeconds = age;
@@ -1844,6 +2202,11 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       if (row.enabled) {
         const lag = Math.max(0, headSeq - row.lastProjectedSeq);
         if (lag > maxLagSeq) maxLagSeq = lag;
+        if (lag > 0) {
+          const baseline = row.lastCursorProgressAt ?? row.createdAt;
+          const lagAge = Math.max(0, Math.floor((checkedAt.getTime() - baseline.getTime()) / 1_000));
+          if (lagAge > maxCursorLagAgeSeconds) maxCursorLagAgeSeconds = lagAge;
+        }
       }
     }
 
@@ -1854,6 +2217,8 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       deadLetters: totalDeadLetters,
       oldestPendingAgeSeconds,
       maxLagSeq,
+      maxCursorLagAgeSeconds,
+      missingAuditGaps: totalMissingGaps,
     };
 
     if (enabledRows.length === 0) {
@@ -1882,10 +2247,20 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       return (s?.queuedCount ?? 0) + (s?.deadLetterCount ?? 0) >= spoolMaxEvents;
     });
     const hasSecretError = enabledRows.some((r) => r.lastFailureReason === "SECRET_UNREADABLE");
+    const hasMissingAuditGap = enabledRows.some((r) => r.missingAuditGapCount > 0);
 
-    if (totalDeadLetters > 0 || hasOpenCircuit || hasExpiredCert || hasSpoolSaturation || hasSecretError) {
+    if (
+      totalDeadLetters > 0 ||
+      hasOpenCircuit ||
+      hasExpiredCert ||
+      hasSpoolSaturation ||
+      hasSecretError ||
+      hasMissingAuditGap
+    ) {
       state = "failing";
-      if (hasExpiredCert) {
+      if (hasMissingAuditGap) {
+        summary = "Unexplained sequence gaps were detected in the audit stream; verify audit chain integrity.";
+      } else if (hasExpiredCert) {
         summary = "One or more enabled SIEM destinations have an expired TLS certificate.";
       } else if (hasSpoolSaturation) {
         summary = "A SIEM destination spool reached capacity; cursor projection is paused without dropping events.";
@@ -1908,11 +2283,14 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
       });
       const hasHalfOpen = enabledRows.some((r) => r.circuitState === "half_open" || r.consecutiveFailures > 0);
       const hasOldBacklog = oldestPendingAgeSeconds >= oldestAlertSeconds;
+      const hasOverdueCursorLag = maxLagSeq > 0 && maxCursorLagAgeSeconds >= oldestAlertSeconds;
 
-      if (hasExpiringSoonCert || hasHalfOpen || hasOldBacklog) {
+      if (hasExpiringSoonCert || hasHalfOpen || hasOldBacklog || hasOverdueCursorLag) {
         state = "degraded";
         if (hasOldBacklog) {
           summary = "Pending SIEM events exceed the configured delivery age threshold.";
+        } else if (hasOverdueCursorLag) {
+          summary = "One or more SIEM destinations are lagging behind the sealed audit head.";
         } else if (hasExpiringSoonCert) {
           summary = "A configured SIEM TLS certificate expires within 14 days.";
         } else {
@@ -1924,7 +2302,6 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
     return [{ component: "siem.delivery", state, summary, metrics, checkedAt }];
   }
 
-  // Register recurring worker handler and schedule at composition time.
   deps.jobs.register<{ destinationPublicId?: string; reason?: string }>(
     "siem.deliver",
     async (job): Promise<JobResult> => {

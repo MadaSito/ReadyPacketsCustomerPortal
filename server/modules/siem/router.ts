@@ -10,6 +10,7 @@ import {
   purgeDeadLettersSchema,
   replayDeadLettersSchema,
   setEnabledSchema,
+  testDestinationSchema,
   updateDestinationSchema,
 } from "./validation.js";
 
@@ -49,9 +50,9 @@ export const siemRouter = router({
           return { deleted: true as const };
         }),
 
-      test: siemReadProcedure
+      test: siemManageProcedure
         .meta({ rateLimit: "expensive" })
-        .input(destinationPublicIdSchema)
+        .input(testDestinationSchema)
         .mutation(({ ctx, input }) => ctx.services.siem.sendTestEvent(ctx.session, input)),
     }),
 

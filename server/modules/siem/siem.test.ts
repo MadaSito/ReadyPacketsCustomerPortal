@@ -189,6 +189,28 @@ async function startHttpsOtlpCollector(options: { certPem: string; keyPem: strin
  */
 class FakeAuditStream {
   private events: (ExternalAuditEvent & { actor_user_id?: number; source_address_ref?: string })[] = [];
+  private scriptedBatches: {
+    events: (ExternalAuditEvent & { actor_user_id?: number; source_address_ref?: string })[];
+    nextCursor: string | null;
+    headSeq: number;
+    pruned?: number;
+    missing?: number;
+  }[] = [];
+
+  enqueueScriptedBatch(batch: {
+    events: ExternalAuditEvent[];
+    nextCursor: string | null;
+    headSeq: number;
+    pruned?: number;
+    missing?: number;
+  }): void {
+    this.scriptedBatches.push(batch);
+  }
+
+  setHeadSeqOffset(extraHead: number): void {
+    this.extraHeadSeq = extraHead;
+  }
+  private extraHeadSeq = 0;
 
   append(partial: Partial<ExternalAuditEvent> & { event_name: string; actor_user_id?: number }): ExternalAuditEvent {
     const seq = this.events.length + 1;
@@ -237,13 +259,16 @@ class FakeAuditStream {
   }
 
   async readEventsAfter(cursor: string | null, limit: number) {
+    if (this.scriptedBatches.length > 0) {
+      return this.scriptedBatches.shift()!;
+    }
     const afterSeq = cursor ? Number(cursor.replace("seq:", "")) : 0;
     const slice = this.events.filter((e) => (e.chain_seq ?? 0) > afterSeq).slice(0, limit);
     const last = slice[slice.length - 1];
     return {
       events: slice,
       nextCursor: last ? `seq:${last.chain_seq}` : cursor,
-      headSeq: this.events.length,
+      headSeq: this.events.length + this.extraHeadSeq,
     };
   }
 
@@ -445,12 +470,17 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
     auditStream.append({ event_name: "auth.session.viewed", severity_text: "INFO", severity_number: 9, category: "security" });
     auditStream.append({ event_name: "orders.invoice.warn", severity_text: "WARN", severity_number: 13, category: "business" });
     const matching = auditStream.append({
-      event_name: "auth.mfa.failed",
+      event_name: "audit.checkpoint.created",
       severity_text: "WARN",
       severity_number: 13,
       category: "security",
-      reason_code: "TOTP_INVALID",
-      attributes: { note: "東京 multi-byte UTF-8 frame check" },
+      reason_code: "CHECKPOINT_SEALED",
+      attributes: {
+        auth_method: "totp",
+        checkpoint_seq: 3,
+        head_link_hmac_sha256: "a".repeat(64),
+        note: "free-text note must be dropped by typed allowlist",
+      },
     });
     // Also emit an internal SIEM delivery operational event — must be skipped to prevent feedback loops!
     auditStream.append({
@@ -470,7 +500,9 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
     expect(wireMsg.startsWith("<132>1 ")).toBe(true);
     expect(wireMsg).toContain("[rp@54321 ");
     expect(wireMsg).toContain(`event_id="${matching.event_id}"`);
-    expect(wireMsg).toContain("東京 multi-byte UTF-8 frame check");
+    expect(wireMsg).toContain('"auth_method":"totp"');
+    expect(wireMsg).toContain(`"head_link_hmac_sha256":"${"a".repeat(64)}"`);
+    expect(wireMsg).not.toContain("free-text note must be dropped");
     // Privacy proof: numeric actor_user_id (4242) and raw IP (203.0.113.77) NEVER leave the system!
     expect(wireMsg).not.toContain("4242");
     expect(wireMsg).not.toContain("203.0.113.77");
@@ -1001,7 +1033,7 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
       }),
     ).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
 
-    // 4. Fail-closed audit: if `audit.record` throws `AuditUnavailableError`, neither DB row nor secret persists!
+    // 4. Fail-closed audit: if `audit.record` throws `AuditUnavailableError`, neither DB row nor encrypted secret column persists!
     const validAdmin = steppedUpAdmin(now);
     h.audit.failRecords = true;
     await expect(
@@ -1009,7 +1041,8 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
         name: "Should Rollback",
         enabled: false,
         format: "otlp_https",
-        host: "siem.example.com",
+        host: "rollback.siem.test",
+        allowPrivateNetwork: true,
         categories: ["security"],
         secrets: { authSecret: "Bearer top_secret_should_rollback" },
       }),
@@ -1017,7 +1050,6 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
     h.audit.failRecords = false;
 
     expect(await siem.listDestinations(validAdmin)).toEqual([]);
-    expect(h.settings.secrets.size).toBe(0);
 
     await siem.close!();
   });
@@ -1049,7 +1081,6 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
           await runner.execute(mysql.format("SELECT 1") as unknown as Parameters<Db["execute"]>[0]);
         },
         async getSecret(key: string, tx?: Tx): Promise<string | null> {
-          // If `tx` were omitted inside a `singleDb.transaction(...)`, `singleDb.execute` would block forever on the 1-slot pool!
           const runner = tx ?? singleDb;
           await runner.execute(mysql.format("SELECT 1") as unknown as Parameters<Db["execute"]>[0]);
           return secretBacking.get(key) ?? null;
@@ -1089,6 +1120,9 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
       const h = createTestDeps({ db: singleDb });
       h.deps.settings = txRequiredSettings;
       h.deps.audit = txVerifyingAudit;
+      h.services.integrations = {
+        egress: createLoopbackPinningEgress(createEgressPolicy(h.deps)),
+      } as unknown as typeof h.services.integrations;
 
       // Rule 2: Wire live in-tx identity session & role state so mid-flight revocation/demotion is caught inside `tx`.
       let liveSessionState = {
@@ -1099,7 +1133,7 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
       };
       h.services.identity = {
         sessions: {
-          assertCurrent: async (principal: unknown, tx: Tx) => {
+          assertCurrent: async (_principal: unknown, tx: Tx) => {
             await tx.execute(mysql.format("SELECT 1") as unknown as Parameters<Db["execute"]>[0]);
             if (!liveSessionState.live) {
               throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Revoked");
@@ -1122,7 +1156,8 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
         name: "Single Pool Proof",
         enabled: false,
         format: "otlp_https",
-        host: "collector.example.com",
+        host: "singlepool.siem.test",
+        allowPrivateNetwork: true,
         categories: ["security"],
         secrets: { authSecret: "Bearer single_pool_token" },
       });
@@ -1133,6 +1168,7 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
         minSeverity: "WARN",
       });
       expect(updated.minSeverity).toBe("WARN");
+      expect(updated.secrets.hasAuthSecret).toBe(true);
 
       // Rule 2 check A: Demote actor role in DB while `admin` snapshot still claims `role: "admin"`.
       liveSessionState = { ...liveSessionState, role: "customer" };
@@ -1146,25 +1182,394 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
         siem.deleteDestination(admin, { publicId: updated.publicId, expectedVersion: updated.version }),
       ).rejects.toMatchObject({ code: "UNAUTHENTICATED", reasonCode: "SESSION_NOT_CURRENT" });
 
-      // Restore active admin session; verify Rule 3: if delete audit fails, row + secrets remain intact!
+      // Restore active admin session; verify Rule 3: if delete audit fails, row + per-row encrypted secrets remain intact!
       liveSessionState = { ...liveSessionState, live: true };
       failDeleteAudit = true;
       await expect(
         siem.deleteDestination(admin, { publicId: updated.publicId, expectedVersion: updated.version }),
       ).rejects.toMatchObject({ code: "UNAVAILABLE" });
-      expect((await siem.listDestinations(admin)).length).toBe(1);
-      expect(secretBacking.size).toBe(1);
+      const surviving = await siem.listDestinations(admin);
+      expect(surviving.length).toBe(1);
+      expect(surviving[0]?.secrets.hasAuthSecret).toBe(true);
 
       // Allow audit -> delete commits, having recorded audit BEFORE deleting the row!
       failDeleteAudit = false;
       await siem.deleteDestination(admin, { publicId: updated.publicId, expectedVersion: updated.version });
       expect(auditLogOrder).toEqual(["audit_recorded_while_row_still_exists"]);
       expect(await siem.listDestinations(admin)).toEqual([]);
-      expect(secretBacking.size).toBe(0);
 
       await siem.close!();
     } finally {
       await singleConnPool.end();
     }
+  });
+
+  it("REGRESSION (Security Review): endpoint edits enforce credential rotation/clear + backlog quarantine/migration, and concurrent per-destination secret updates never clobber", async () => {
+    const { h, siem, auditStream } = setupModule();
+    const admin = steppedUpAdmin(h.clock.now());
+
+    const serverCert = pki.issueServerCert({
+      commonName: "*.siem.test",
+      dnsNames: ["old.siem.test", "new.siem.test", "dest-a.siem.test", "dest-b.siem.test"],
+    });
+    const otlpA = await startHttpsOtlpCollector({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    const otlpB = await startHttpsOtlpCollector({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    activeServers.push(otlpA, otlpB);
+
+    // 1. Concurrent updates on distinct destinations never overwrite each other's encrypted secret columns.
+    const destA = await siem.createDestination(admin, {
+      name: "Collector A",
+      enabled: false,
+      format: "otlp_https",
+      host: "dest-a.siem.test",
+      port: otlpA.port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+    const destB = await siem.createDestination(admin, {
+      name: "Collector B",
+      enabled: false,
+      format: "otlp_https",
+      host: "dest-b.siem.test",
+      port: otlpB.port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    await Promise.all([
+      siem.updateDestination(admin, {
+        publicId: destA.publicId,
+        expectedVersion: destA.version,
+        secrets: { authSecret: "Bearer secret_alpha" },
+      }),
+      siem.updateDestination(admin, {
+        publicId: destB.publicId,
+        expectedVersion: destB.version,
+        secrets: { authSecret: "Bearer secret_bravo" },
+      }),
+    ]);
+
+    const resA = await siem.sendTestEvent(admin, { publicId: destA.publicId });
+    const resB = await siem.sendTestEvent(admin, { publicId: destB.publicId });
+    expect(resA.outcome).toBe("completed");
+    expect(resB.outcome).toBe("completed");
+    expect(otlpA.requests[0]?.headers.authorization).toBe("Bearer secret_alpha");
+    expect(otlpB.requests[0]?.headers.authorization).toBe("Bearer secret_bravo");
+
+    // 2. Changing `host` while `hasAuthSecret` is true WITHOUT rotating or clearing authSecret is rejected!
+    const freshA = await siem.getDestination(admin, destA.publicId);
+    await expect(
+      siem.updateDestination(admin, {
+        publicId: freshA.publicId,
+        expectedVersion: freshA.version,
+        host: "new.siem.test",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "CREDENTIALS_REQUIRE_ROTATION_OR_CLEAR",
+    });
+
+    // 3. Queue an undelivered event on `destA` (point port at a closed receiver first), then change endpoint with `migrateBacklog: false` (default) => quarantined to dead_letter with `ENDPOINT_CHANGED`!
+    const closedTmp = await startHttpsOtlpCollector({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    const closedPort = closedTmp.port;
+    await closedTmp.close();
+
+    const movedToClosed = await siem.updateDestination(admin, {
+      publicId: freshA.publicId,
+      expectedVersion: freshA.version,
+      enabled: true,
+      port: closedPort,
+      secrets: { authSecret: "Bearer rotated_for_closed" },
+    });
+    auditStream.append({ event_name: "auth.queued.old_endpoint", severity_text: "WARN", severity_number: 13, category: "security" });
+    const failedCycle = await siem.runDeliveryCycle();
+    expect(failedCycle.projected).toBe(1);
+    expect(failedCycle.failed).toBe(1);
+
+    const beforeRepoint = await siem.getDestination(admin, movedToClosed.publicId);
+    expect(beforeRepoint.delivery.queuedCount).toBe(1);
+
+    // Repoint to `new.siem.test:otlpB.port` WITHOUT `migrateBacklog: true` => queued backlog is quarantined (`ENDPOINT_CHANGED`)!
+    const repointed = await siem.updateDestination(admin, {
+      publicId: beforeRepoint.publicId,
+      expectedVersion: beforeRepoint.version,
+      host: "new.siem.test",
+      port: otlpB.port,
+      secrets: { authSecret: "Bearer rotated_for_new_endpoint" },
+    });
+    expect(repointed.delivery.queuedCount).toBe(0);
+    expect(repointed.delivery.deadLetterCount).toBe(1);
+
+    const quarantinedDls = await siem.listDeadLetters(admin, { destinationPublicId: repointed.publicId });
+    expect(quarantinedDls.items[0]?.lastReasonCode).toBe("ENDPOINT_CHANGED");
+
+    await siem.close!();
+  });
+
+  it("REGRESSION (Security & Audit S-1): persists progress-only cursor across retention-pruned empty pages, records siem.audit.loss_detected on missing gaps, and flags overdue lag", async () => {
+    const { h, siem, auditStream } = setupModule();
+    const admin = steppedUpAdmin(h.clock.now());
+
+    const serverCert = pki.issueServerCert({
+      commonName: "cursor.siem.test",
+      dnsNames: ["cursor.siem.test"],
+    });
+    const receiver = await startTlsReceiver({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    activeServers.push(receiver);
+
+    const dest = await siem.createDestination(admin, {
+      name: "Cursor Progress Receiver",
+      enabled: true,
+      format: "syslog_rfc5425",
+      host: "cursor.siem.test",
+      port: receiver.port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    const postPruneEvent = {
+      ...auditStream.append({
+        event_name: "auth.after_pruned_window",
+        severity_text: "WARN",
+        severity_number: 13,
+        category: "security",
+      }),
+      chain_seq: 251,
+    };
+
+    // Page 1: 250 retention-pruned events (`events: []`, `nextCursor: "seq:250"`, `pruned: 250`).
+    // Page 2: real event at `seq: 251`.
+    auditStream.enqueueScriptedBatch({
+      events: [],
+      nextCursor: "seq:250",
+      headSeq: 251,
+      pruned: 250,
+      missing: 0,
+    });
+    auditStream.enqueueScriptedBatch({
+      events: [postPruneEvent],
+      nextCursor: "seq:251",
+      headSeq: 251,
+      pruned: 0,
+      missing: 0,
+    });
+    auditStream.enqueueScriptedBatch({
+      events: [],
+      nextCursor: "seq:251",
+      headSeq: 251,
+      pruned: 0,
+      missing: 0,
+    });
+
+    const cycle1 = await siem.runDeliveryCycle();
+    expect(cycle1.projected).toBe(1);
+    expect(cycle1.delivered).toBe(1);
+    await waitForCount(() => receiver.frames.length, 1);
+    expect(receiver.frames[0]).toContain("auth.after_pruned_window");
+
+    const afterPrune = await siem.getDestination(admin, dest.publicId);
+    expect(afterPrune.delivery.lastProjectedSeq).toBe(251);
+    expect(afterPrune.delivery.prunedAuditCount).toBe(250);
+    expect(afterPrune.delivery.missingAuditGapCount).toBe(0);
+
+    // Now simulate unexplained audit loss (`missing: 3`): must record durable `siem.audit.loss_detected` (WARN, AUDIT_EVENTS_MISSING) and mark health `failing`.
+    auditStream.enqueueScriptedBatch({
+      events: [],
+      nextCursor: "seq:254",
+      headSeq: 254,
+      pruned: 0,
+      missing: 3,
+    });
+    auditStream.enqueueScriptedBatch({
+      events: [],
+      nextCursor: "seq:254",
+      headSeq: 254,
+      pruned: 0,
+      missing: 0,
+    });
+
+    await siem.runDeliveryCycle();
+
+    const lossEvent = h.audit.events.find((e) => e.eventName === "siem.audit.loss_detected");
+    expect(lossEvent).toBeDefined();
+    expect(lossEvent?.severity).toBe("WARN");
+    expect(lossEvent?.reasonCode).toBe("AUDIT_EVENTS_MISSING");
+    expect(lossEvent?.safeCounts).toMatchObject({ missing: 3 });
+
+    const afterGap = await siem.getDestination(admin, dest.publicId);
+    expect(afterGap.delivery.missingAuditGapCount).toBe(3);
+
+    const gapHealth = await siem.health!();
+    expect(gapHealth[0]?.state).toBe("failing");
+    expect(gapHealth[0]?.metrics?.missingAuditGaps).toBe(3);
+
+    await siem.close!();
+  });
+
+  it("REGRESSION (Security Review): cross-job fencingToken values never starve subsequent jobs, live egress revocation evicts pooled TLS sockets, and missing egress port fails closed", async () => {
+    let allowEgress = true;
+    const { h, siem, auditStream } = setupModule();
+    const baseEgress = h.services.integrations.egress;
+    const revokedEgress: IntegrationsEgressPort = {
+      async resolveAndAssertAllowed(input) {
+        if (!allowEgress) {
+          throw new DomainError("FORBIDDEN", "EGRESS_BLOCKED", "Destination revoked by live egress policy.");
+        }
+        return baseEgress.resolveAndAssertAllowed!(input);
+      },
+    };
+    h.services.integrations = { egress: revokedEgress } as unknown as typeof h.services.integrations;
+
+    const admin = steppedUpAdmin(h.clock.now());
+    const serverCert = pki.issueServerCert({
+      commonName: "egress-live.siem.test",
+      dnsNames: ["egress-live.siem.test"],
+    });
+    const receiver = await startTlsReceiver({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    activeServers.push(receiver);
+
+    const dest = await siem.createDestination(admin, {
+      name: "Live Egress Guarded",
+      enabled: true,
+      format: "syslog_rfc5425",
+      host: "egress-live.siem.test",
+      port: receiver.port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    const mkJob = (jobId: string, fencingToken: number) => ({
+      jobId,
+      type: "siem.deliver",
+      payload: {},
+      attempt: 1,
+      fencingToken,
+      correlationId: `cor_${jobId}`,
+      signal: new AbortController().signal,
+      assertStillOwned: async () => {},
+    });
+
+    // 1. Job A runs with `fencingToken: 50`; subsequent scheduled Job B has `fencingToken: 1` (fresh job row) and MUST NOT be starved!
+    auditStream.append({ event_name: "auth.job_a", severity_text: "WARN", severity_number: 13, category: "security" });
+    const rA = await siem.runDeliveryCycle({ job: mkJob("job_retried_high_token", 50) });
+    expect(rA.delivered).toBe(1);
+
+    auditStream.append({ event_name: "auth.job_b", severity_text: "WARN", severity_number: 13, category: "security" });
+    const rB = await siem.runDeliveryCycle({ job: mkJob("job_next_scheduled_token_1", 1) });
+    expect(rB.delivered).toBe(1);
+    await waitForCount(() => receiver.frames.length, 2);
+    expect(receiver.handshakeCount).toBe(1); // Reused pooled socket while egress remained allowed!
+
+    // 2. Revoke egress live! Even though a pooled TLS socket is open, the next batch MUST re-authorize via egress, evict the socket, and deliver ZERO frames!
+    allowEgress = false;
+    auditStream.append({ event_name: "auth.after_revocation", severity_text: "WARN", severity_number: 13, category: "security" });
+    const rRevoked = await siem.runDeliveryCycle({ job: mkJob("job_after_revoke", 1) });
+    expect(rRevoked.delivered).toBe(0);
+    expect(rRevoked.failed).toBe(1);
+    expect(receiver.frames.length).toBe(2);
+
+    const postRevoke = await siem.getDestination(admin, dest.publicId);
+    expect(postRevoke.delivery.lastFailureReason).toBe("EGRESS_BLOCKED");
+
+    // 3. Removing centralized egress port altogether fails closed (`EGRESS_BLOCKED`) instead of bypassing policy.
+    (h.services as unknown as { integrations?: unknown }).integrations = undefined;
+    await expect(
+      siem.createDestination(admin, {
+        name: "No Egress Service",
+        enabled: false,
+        format: "syslog_rfc5425",
+        host: "egress-live.siem.test",
+        port: receiver.port,
+        allowPrivateNetwork: true,
+        categories: ["security"],
+      }),
+    ).rejects.toMatchObject({ reasonCode: "EGRESS_BLOCKED" });
+
+    await siem.close!();
+  });
+
+  it("REGRESSION (Security Review): enforces strict FIFO head-of-line backoff and requires step-up on isolated sendTestEvent", async () => {
+    const { h, siem, auditStream } = setupModule();
+    const admin = steppedUpAdmin(h.clock.now());
+    await h.settings.set(SIEM_CIRCUIT_THRESHOLD.key, 10); // Keep circuit closed so item-level backoff is exercised directly.
+
+    const serverCert = pki.issueServerCert({
+      commonName: "fifo.siem.test",
+      dnsNames: ["fifo.siem.test"],
+    });
+    const temp = await startTlsReceiver({ certPem: serverCert.certPem, keyPem: serverCert.keyPem });
+    const port = temp.port;
+    await temp.close();
+
+    const dest = await siem.createDestination(admin, {
+      name: "Strict FIFO Receiver",
+      enabled: true,
+      format: "syslog_rfc5425",
+      host: "fifo.siem.test",
+      port,
+      allowPrivateNetwork: true,
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    // Event 1 fails at t=0 -> backed off for ~1.6s–2.4s (`nextAttemptAt >= t + 1.6s`).
+    const firstEv = auditStream.append({ event_name: "auth.fifo.first", severity_text: "WARN", severity_number: 13, category: "security" });
+    const c1 = await siem.runDeliveryCycle();
+    expect(c1.failed).toBe(1);
+
+    // Event 2 arrives at t=500ms while receiver is now ONLINE! Because Event 1 is still backed off at the head of the FIFO queue, Event 2 MUST NOT overtake Event 1!
+    h.clock.advance(500);
+    const liveReceiver = await startTlsReceiver({ certPem: serverCert.certPem, keyPem: serverCert.keyPem, port });
+    activeServers.push(liveReceiver);
+
+    const secondEv = auditStream.append({ event_name: "auth.fifo.second", severity_text: "WARN", severity_number: 13, category: "security" });
+    const c2 = await siem.runDeliveryCycle();
+    expect(c2.projected).toBe(1);
+    expect(c2.delivered).toBe(0);
+    expect(liveReceiver.frames.length).toBe(0);
+
+    // Once FakeClock advances past Event 1's backoff, BOTH deliver strictly in FIFO order (`firstEv` then `secondEv`)!
+    h.clock.advance(20_000);
+    admin.stepUpAt = h.clock.now();
+    const c3 = await siem.runDeliveryCycle();
+    expect(c3.delivered).toBe(2);
+    await waitForCount(() => liveReceiver.frames.length, 2);
+    expect(liveReceiver.frames[0]).toContain(firstEv.event_id);
+    expect(liveReceiver.frames[1]).toContain(secondEv.event_id);
+    expect(liveReceiver.handshakeCount).toBe(1);
+
+    // Verify `destinations.test` via tRPC router requires `siem.manage` + step-up, and uses a one-shot isolated socket without evicting the worker's pooled socket!
+    const noopTransport: SessionTransport = { issue() {}, clear() {} };
+    const createCaller = createCallerFactory(siemRouter);
+    const unstepped = fakePrincipal({
+      role: "admin",
+      state: "full",
+      pendingSteps: [],
+      authenticatedAt: h.clock.now(),
+      mfaVerifiedAt: h.clock.now(),
+      stepUpAt: null,
+    });
+    await expect(
+      createCaller({ services: h.services, session: unstepped, request: newRequestContext("test"), transport: noopTransport })
+        .admin.destinations.test({ publicId: dest.publicId }),
+    ).rejects.toMatchObject({ cause: expect.objectContaining({ code: "STEP_UP_REQUIRED" }) });
+
+    const probe = await siem.sendTestEvent(admin, { publicId: dest.publicId });
+    expect(probe.outcome).toBe("completed");
+    await waitForCount(() => liveReceiver.frames.length, 3);
+    expect(liveReceiver.handshakeCount).toBe(2); // Probe dialed its own one-shot TLS socket
+
+    // Subsequent worker cycle STILL reuses its original pooled socket (`handshakeCount` stays 2, not 3!).
+    auditStream.append({ event_name: "auth.fifo.third", severity_text: "WARN", severity_number: 13, category: "security" });
+    const c4 = await siem.runDeliveryCycle();
+    expect(c4.delivered).toBe(1);
+    await waitForCount(() => liveReceiver.frames.length, 4);
+    expect(liveReceiver.handshakeCount).toBe(2);
+
+    await siem.close!();
   });
 });

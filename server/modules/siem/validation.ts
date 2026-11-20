@@ -162,6 +162,7 @@ export const updateDestinationSchema = z.strictObject({
   categories: z.array(z.enum(AUDIT_CATEGORIES)).min(1).max(AUDIT_CATEGORIES.length).optional(),
   authHeaderName: z.string().trim().max(64).nullable().optional(),
   secrets: siemSecretsSchema.optional(),
+  migrateBacklog: z.boolean().optional(),
 });
 
 export const setEnabledSchema = z.strictObject({
@@ -177,6 +178,11 @@ export const deleteDestinationSchema = z.strictObject({
 
 export const destinationPublicIdSchema = z.strictObject({
   publicId: z.string().regex(ULID_PATTERN, "Invalid destination identifier."),
+});
+
+export const testDestinationSchema = z.strictObject({
+  publicId: z.string().regex(ULID_PATTERN, "Invalid destination identifier."),
+  expectedVersion: z.number().int().min(1).max(1_000_000_000).optional(),
 });
 
 export const listDeadLettersSchema = z.strictObject({
