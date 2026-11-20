@@ -208,13 +208,16 @@ export interface FieldCrypto {
 }
 
 export interface SettingsStore {
-  /** Returns the parsed non-secret setting or the provided default. */
-  get<T>(key: string, parse: (raw: unknown) => T, fallback: T): Promise<T>;
+  /**
+   * Returns the parsed non-secret setting or the provided default. Pass `tx` when reading inside a
+   * transaction so the read uses that connection (a second pool connection could starve a small pool).
+   */
+  get<T>(key: string, parse: (raw: unknown) => T, fallback: T, tx?: Tx): Promise<T>;
   set(key: string, value: unknown, tx?: Tx): Promise<void>;
   /** Secrets are encrypted at rest with FieldCrypto and never returned to browsers. */
-  getSecret(key: string): Promise<string | null>;
+  getSecret(key: string, tx?: Tx): Promise<string | null>;
   setSecret(key: string, value: string | null, tx?: Tx): Promise<void>;
-  isFeatureEnabled(flag: string): Promise<boolean>;
+  isFeatureEnabled(flag: string, tx?: Tx): Promise<boolean>;
 }
 
 /* ---------------------------------------------------------------- mail / jobs */
