@@ -1,0 +1,19 @@
+# Applies to builds that use deploy/docker/Dockerfile with the repository root as context.
+.git
+.github
+node_modules
+dist
+coverage
+docs
+**/*.log
+**/.env
+**/.env.*
+!**/.env.example
+**/.DS_Store
+**/*.tsbuildinfo
+.vite
+/var
+/tmp
+deploy/*
+!deploy/docker
+deploy/docker/.env

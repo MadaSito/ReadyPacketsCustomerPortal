@@ -1,0 +1,274 @@
+# ReadyPackets portal — self-contained Docker Compose stack (single host).
+#
+# Start it with the wrapper, which writes the small .env file this file needs:
+#     ./rp-docker.sh up --domain portal.example.com --acme-email you@example.com
+# Read README.md in this directory first. This stack is intended for evaluation and testing; the hardened
+# native kit (deploy/install.sh) remains the reference production layout.
+#
+# Start order:  init → db-perms → db → migrate → web + worker → caddy
+#   init      creates passwords, a private database CA + certificate and the application keys, once
+#   db        MySQL 8.4, TLS required, reachable only on the internal data network, no published port
+#   migrate   applies schema migrations with the migrator account, then exits
+#   web       HTTP server (RP_ROLE=web); worker  background jobs (RP_ROLE=worker)
+#   caddy     the only published service: ports 80 and 443, automatic TLS certificate
+#
+# No secret appears in this file, in .env, in container environment variables or in argv: every secret
+# is a file in a named volume, readable only by the account that needs it.
+name: readypackets
+
+x-app: &app
+  image: readypackets-portal:local
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-app-environment: &app-environment
+  NODE_ENV: production
+  RP_DEPLOYMENT_PROFILE: production
+  # The process listens on the container interface; only Caddy can reach it (no published port).
+  HOST: 0.0.0.0
+  PORT: "5000"
+  RP_CANONICAL_ORIGIN: https://${RP_DOMAIN:?Run rp-docker.sh up --domain <host> first}
+  RP_TRUSTED_PROXIES: ${RP_PROXY_IP:-172.30.250.10}
+  RP_STORAGE_DIR: /var/lib/readypackets/storage
+  TMPDIR: /var/lib/readypackets/tmp
+  RP_INSTALLATION_ID: ${RP_INSTALLATION_ID:?Run rp-docker.sh up --domain <host> first}
+  RP_RELEASE_REF: ${RP_RELEASE_REF:-container}
+  RP_SERVICE_NAME: readypackets
+  RP_MIGRATIONS_DIR: /opt/readypackets/migrations
+  DATABASE_URL_FILE: /run/readypackets/secrets/database_url
+  RP_DATA_KEYRING_FILE: /run/readypackets/secrets/rp_data_keyring
+  RP_INDEX_KEY_FILE: /run/readypackets/secrets/rp_index_key
+  RP_PSEUDONYM_KEY_FILE: /run/readypackets/secrets/rp_pseudonym_key
+  RP_TOKEN_HASH_KEY_FILE: /run/readypackets/secrets/rp_token_hash_key
+  RP_AUDIT_CHAIN_KEY_FILE: /run/readypackets/secrets/rp_audit_chain_key
+
+services:
+  init:
+    <<: [*app, *hardening, *logging]
+    user: "0:0"
+    network_mode: none
+    # Root is needed only to hand the generated files to the service account.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    command: ["/usr/local/bin/rp-init-secrets"]
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    volumes:
+      - app-secrets:/secrets/app
+      - migrator-secrets:/secrets/migrator
+      - db-secrets:/secrets/db
+    restart: "no"
+
+  db-perms:
+    <<: [*hardening, *logging]
+    image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    user: "0:0"
+    network_mode: none
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    # Gives the database files to the image's own "mysql" account, whatever its numeric id is.
+    entrypoint: ["chown", "-R", "mysql:mysql", "/run/rp-db-secrets"]
+    volumes:
+      - db-secrets:/run/rp-db-secrets
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  db:
+    <<: [*hardening, *logging]
+    image: mysql:8.4@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    user: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/rp-db-secrets/root_password
+      MYSQL_DATABASE: readypackets
+      # The administrative account exists for the local socket only; it cannot sign in over the network.
+      MYSQL_ROOT_HOST: localhost
+      RP_DB_CLIENT_NET: ${RP_DATA_SUBNET:-172.30.251.0/24}
+    command:
+      - --skip-name-resolve=ON
+      - --require-secure-transport=ON
+      - --ssl-ca=/run/rp-db-secrets/ca.pem
+      - --ssl-cert=/run/rp-db-secrets/server-cert.pem
+      - --ssl-key=/run/rp-db-secrets/server-key.pem
+      - --tls-version=TLSv1.2,TLSv1.3
+      - --local-infile=OFF
+      - --mysqlx=OFF
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --binlog-expire-logs-seconds=259200
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /var/run/mysqld:mode=1777,size=1m
+    volumes:
+      - db-data:/var/lib/mysql
+      - db-secrets:/run/rp-db-secrets:ro
+      - ./mysql-init.sh:/docker-entrypoint-initdb.d/10-readypackets-accounts.sh:ro
+    networks: [data]
+    depends_on:
+      db-perms:
+        condition: service_completed_successfully
+    healthcheck:
+      # TCP only: the first-run bootstrap server has networking off, so this turns healthy only when the
+      # real server is accepting connections. No credential is used; "alive" is all that is asked.
+      test: ["CMD", "mysqladmin", "ping", "--protocol=tcp", "--host=127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 90s
+    pids_limit: 1024
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+  migrate:
+    <<: [*app, *hardening, *logging]
+    command: ["node", "dist/ops/migrate.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL_FILE: /run/readypackets/migrator/database_url
+      RP_MIGRATIONS_DIR: /opt/readypackets/migrations
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    volumes:
+      - migrator-secrets:/run/readypackets/migrator:ro
+    networks: [data]
+    depends_on:
+      db:
+        condition: service_healthy
+    pids_limit: 256
+    restart: "no"
+
+  web:
+    <<: [*app, *hardening, *logging]
+    init: true
+    environment:
+      <<: *app-environment
+      RP_ROLE: web
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    volumes:
+      - app-secrets:/run/readypackets/secrets:ro
+      - storage:/var/lib/readypackets/storage
+      - web-tmp:/var/lib/readypackets/tmp
+    networks: [edge, data]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - 'fetch("http://127.0.0.1:5000/readyz").then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    pids_limit: 512
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+  worker:
+    <<: [*app, *hardening, *logging]
+    init: true
+    environment:
+      <<: *app-environment
+      RP_ROLE: worker
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    volumes:
+      - app-secrets:/run/readypackets/secrets:ro
+      - storage:/var/lib/readypackets/storage
+      - worker-tmp:/var/lib/readypackets/tmp
+    networks: [edge, data]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    pids_limit: 512
+    stop_grace_period: 90s
+    restart: unless-stopped
+
+  caddy:
+    <<: [*hardening, *logging]
+    image: caddy:2@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+    cap_add: [NET_BIND_SERVICE]
+    environment:
+      RP_DOMAIN: ${RP_DOMAIN:?Run rp-docker.sh up --domain <host> first}
+      RP_TLS_DIRECTIVE: ${RP_TLS_DIRECTIVE:-}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      edge:
+        ipv4_address: ${RP_PROXY_IP:-172.30.250.10}
+    depends_on:
+      web:
+        condition: service_healthy
+    pids_limit: 256
+    restart: unless-stopped
+
+  # Operator commands (first administrator, catalogue import). Not started by "up"; used through
+  # rp-docker.sh, which runs it with "docker compose run --rm".
+  ops:
+    <<: [*app, *hardening, *logging]
+    profiles: [ops]
+    init: true
+    environment:
+      <<: *app-environment
+      RP_ROLE: web
+      TMPDIR: /tmp
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    volumes:
+      - app-secrets:/run/readypackets/secrets:ro
+      - storage:/var/lib/readypackets/storage
+    networks: [data]
+    pids_limit: 256
+    restart: "no"
+
+networks:
+  # Caddy, web and worker. Outbound connections (mail, SIEM, webhooks, certificates) leave from here.
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RP_EDGE_SUBNET:-172.30.250.0/24}
+  # Database traffic only. "internal" means no route to or from the outside world.
+  data:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RP_DATA_SUBNET:-172.30.251.0/24}
+
+volumes:
+  db-data:
+  db-secrets:
+  app-secrets:
+  migrator-secrets:
+  storage:
+  web-tmp:
+  worker-tmp:
+  caddy-data:
+  caddy-config:
