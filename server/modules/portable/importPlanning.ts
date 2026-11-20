@@ -93,7 +93,7 @@ export async function buildPlan(deps: ModuleDeps, args: {
         if (!email.success) {
           step.disposition = "conflict";
           step.reason = "PORTABLE_CUSTOMER_EMAIL_REQUIRED";
-        } else if (item.record.customerNumber != null && !reference.success) {
+        } else if (item.record.customerNumber !== null && item.record.customerNumber !== undefined && !reference.success) {
           step.disposition = "conflict";
           step.reason = "PORTABLE_CUSTOMER_REF_INVALID";
         } else if ((customerFieldCounts.get(`email:${email.data}`) ?? 0) > 1 ||

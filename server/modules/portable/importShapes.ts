@@ -30,7 +30,7 @@ export function targetDate(value: unknown): Date {
 }
 
 export function customerCreatedAt(value: unknown): Date | undefined {
-  return value == null ? undefined : targetDate(value);
+  return value === null || value === undefined ? undefined : targetDate(value);
 }
 
 export function numberField(record: JsonRecord, field: string) { return integer(record[field]); }
