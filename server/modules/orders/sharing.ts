@@ -223,7 +223,7 @@ export function createSharingService(deps: SharingDeps) {
       const emailIndex = await myVerifiedEmailIndex(principal);
       if (!emailIndex) throw grantNotFound();
       return deps.db.transaction(async (tx) => {
-        // Canonical lock order: order row, THEN grant row (a join FOR UPDATE could lock the grant first).
+        // Canonical lock order: order row → actor users row → actor session → grant row.
         const [located] = await tx.select({ orderId: orderGrants.orderId }).from(orderGrants).where(eq(orderGrants.publicId, input.grantId)).limit(1);
         if (!located) throw grantNotFound();
         const [order] = await tx
@@ -232,13 +232,19 @@ export function createSharingService(deps: SharingDeps) {
           .where(eq(orders.id, located.orderId))
           .limit(1)
           .for("update");
+        if (!order) throw grantNotFound();
+        await actorCheck(principal, tx);
+        // Locking re-read of the (already locked) users row: sees the CURRENT verified e-mail, not the snapshot.
+        const me = await identityPort(deps.services).getUser(principal.userId, { tx, forUpdate: true });
+        const verified = me && me.status === "active" && me.role === "customer" && (me as { emailVerified?: boolean }).emailVerified === true;
+        if (!verified || indexOf(normalizeEmail(me.email)) !== emailIndex) throw grantNotFound();
         const [grant] = await tx
           .select()
           .from(orderGrants)
           .where(and(eq(orderGrants.publicId, input.grantId), eq(orderGrants.orderId, located.orderId)))
           .limit(1)
           .for("update");
-        const row = order && grant ? { grant, ...order } : undefined;
+        const row = grant ? { grant, ...order } : undefined;
         const now = deps.clock.now();
         if (
           !row ||
@@ -249,10 +255,6 @@ export function createSharingService(deps: SharingDeps) {
         ) {
           throw grantNotFound();
         }
-        // Grant + order rows are locked above; now the actor (users → session), then re-derive the verified
-        // e-mail from the locked users row so a just-changed or unverified address cannot accept.
-        await actorCheck(principal, tx);
-        if ((await myVerifiedEmailIndex(principal, tx)) !== emailIndex) throw grantNotFound();
         await tx
           .update(orderGrants)
           .set(

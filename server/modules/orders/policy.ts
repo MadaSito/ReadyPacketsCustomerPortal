@@ -32,13 +32,15 @@ interface PolicyDeps {
 type OrderKey = { publicId: string } | { id: number };
 
 async function loadOrder(db: DbOrTx, key: OrderKey, forUpdate: boolean) {
+  // Locks the ORDER row only. The owner's users row is never locked here (a join FOR UPDATE would lock it too and
+  // break the users-rows-in-ascending-id rule for callers that later lock actor/target users). The owner
+  // publicId is immutable, so a non-locking projection of it is safe.
   const query = db
     .select({
       id: orders.id,
       publicId: orders.publicId,
       reference: orders.reference,
       ownerUserId: orders.ownerUserId,
-      ownerPublicId: users.publicId,
       statusKey: orders.statusKey,
       lockState: orders.lockState,
       origin: orders.origin,
@@ -46,11 +48,13 @@ async function loadOrder(db: DbOrTx, key: OrderKey, forUpdate: boolean) {
       workflowVersionId: orders.workflowVersionId,
     })
     .from(orders)
-    .innerJoin(users, eq(users.id, orders.ownerUserId))
     .where("publicId" in key ? eq(orders.publicId, key.publicId) : eq(orders.id, key.id))
     .limit(1);
-  const rows = forUpdate ? await query.for("update") : await query;
-  return rows[0] ?? null;
+  const [row] = forUpdate ? await query.for("update") : await query;
+  if (!row) return null;
+  const [owner] = await db.select({ publicId: users.publicId }).from(users).where(eq(users.id, row.ownerUserId)).limit(1);
+  if (!owner) return null;
+  return { ...row, ownerPublicId: owner.publicId };
 }
 
 /** Current, accepted, unrevoked grant for (order, user) — or null. */

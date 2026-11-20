@@ -7,7 +7,9 @@
  * steps, the persisted role still grants the capability, and — for step-up capabilities — the persisted
  * step-up is fresh.
  *
- * Lock order (shared with files): order row(s) → users row(s) (ascending id) → user_sessions → grants → files.
+ * Lock order (shared with files): order row (alone, never joined with the owner's users row) → [policy grant
+ * re-check FOR SHARE] → users row(s) (ascending id) → user_sessions → grant rows FOR UPDATE → files. The order row
+ * serializes every writer of that order, so grant locks of one order cannot form a cycle with users rows.
  * Mutations on an existing order lock the order row FIRST and call this afterwards. Mutations that lock no
  * order row (create, catalog, workflows) call it as the first statement.
  *
