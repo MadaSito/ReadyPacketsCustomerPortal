@@ -142,3 +142,20 @@ A change is done when:
 
 Workflows use `contents: read` by default (CodeQL additionally `security-events: write`), never persist
 checkout credentials and need no repository secrets.
+
+Notes on how the checks behave on this repository:
+
+- **MySQL client tools.** The test job installs the Oracle MySQL 8.4 client from the vendor APT repository
+  (signing key fingerprint checked before it is trusted), because the backup module calls `mysqldump` /
+  `mysql` 8.4 and the hosted runner image ships 8.0. This mirrors the install requirement in
+  `docs/operations/INSTALL.md`.
+- **CodeQL without code scanning.** GitHub accepts code-scanning uploads only on public repositories or
+  private ones with GitHub Code Security. Until the repository variable `CODE_SCANNING_ENABLED` is set to
+  `true`, the analysis still runs on every push and pull request, the SARIF file is kept as a workflow
+  artifact for 30 days, and `scripts/ci/sarif-gate.mjs` fails the job on any finding with
+  `security-severity` 7.0 or higher. Dependency review needs the same GitHub feature and is skipped until
+  the variable is set; `pnpm audit --prod` runs in every case.
+- **Reviewed exceptions.** `.github/codeql-baseline.json` lists CodeQL findings accepted after review, each
+  with a written justification; an entry that no longer matches a finding fails the gate so it gets removed.
+  `.gitleaksignore` lists exact gitleaks fingerprints of synthetic test fixtures. Adding to either file is a
+  security-relevant change and needs the same review as code.

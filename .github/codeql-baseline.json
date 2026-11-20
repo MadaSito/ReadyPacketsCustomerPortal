@@ -1,0 +1,12 @@
+[
+  {
+    "ruleId": "js/insufficient-password-hash",
+    "path": "server/modules/backup/bundle.ts",
+    "justification": "Not a password hash. computeManifestContentSha256 is an integrity checksum over the backup manifest. The manifest schema is strict and carries only the backup key identifier (requiredKeys.backupKeyId), never key material; CodeQL taints the identifier because it is parsed next to the passphrase in keys.ts. Passphrase-based keys are derived with scrypt in server/modules/backup/crypto.ts. Reviewed 2026-11-20."
+  },
+  {
+    "ruleId": "js/missing-rate-limiting",
+    "path": "server/http/static.ts",
+    "justification": "Rate limited upstream by a limiter CodeQL does not model. The admission middleware in server/http/app.ts charges every navigation request to the standard_browsing budget before registerStatic is mounted, and the application shell handler returns early for anything that is not a navigation, so the index.html read is only reachable after that charge. Reviewed 2026-11-20."
+  }
+]

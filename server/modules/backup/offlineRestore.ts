@@ -16,8 +16,7 @@
  *     using dedicated target-scoped credentials (refusing live credential reuse or live-schema write privileges), while
  *     recording durable pre-execution intent and final `RestoreDrillSummary` in the live `backup_restore_drills` ledger.
  */
-import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { eq, inArray } from "drizzle-orm";
@@ -28,6 +27,7 @@ import { ulid } from "../../core/ids.js";
 import type { AuditEmitter, Clock, Db, FieldCrypto, Logger } from "../../core/types.js";
 import type { OperationState } from "../../../shared/domain.js";
 import { createChainService } from "../audit/chain.js";
+import { openRegularFileNoFollow } from "./archiveFile.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { createObjectStorage } from "../files/storage.js";
 import { readAndValidateBackupBundle } from "./bundle.js";
@@ -84,11 +84,10 @@ async function openRegularArchiveFileNoFollow(filePath: string): Promise<Readabl
   if (!path.isAbsolute(filePath)) {
     throw validation("INVALID_ARCHIVE_PATH", "Encrypted archive path (--archive-file) must be an absolute path.");
   }
-  const st = await lstat(filePath).catch(() => null);
-  if (!st || st.isSymbolicLink() || !st.isFile()) {
-    throw validation("INVALID_ARCHIVE_PATH", "Archive path must exist and be a regular file (symlinks refused).");
-  }
-  const fh = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fh = await openRegularFileNoFollow(
+    filePath,
+    "Archive path must exist and be a regular file (symlinks refused).",
+  );
   return fh.createReadStream({ autoClose: true });
 }
 

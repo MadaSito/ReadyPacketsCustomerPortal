@@ -5,7 +5,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -1443,9 +1443,14 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     expect(validatedTls.tlsCaFile).toBe(caPath);
     const cnf = await createPrivateDefaultsFile(validatedTls);
     try {
-      const st = await stat(cnf.filePath);
-      expect(st.mode & 0o777).toBe(0o600);
-      const cnfText = await readFile(cnf.filePath, "utf8");
+      const cnfHandle = await open(cnf.filePath, "r");
+      let cnfText: string;
+      try {
+        expect((await cnfHandle.stat()).mode & 0o777).toBe(0o600);
+        cnfText = await cnfHandle.readFile("utf8");
+      } finally {
+        await cnfHandle.close();
+      }
       expect(cnfText).toContain("protocol=TCP");
       expect(cnfText).toContain("local-infile=0");
       expect(cnfText).toContain("ssl-mode=VERIFY_IDENTITY");

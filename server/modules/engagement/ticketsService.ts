@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomInt } from "node:crypto";
 import { and, asc, count, desc, eq, gt, inArray, isNull, lt } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { UserRole } from "../../../shared/domain.js";
@@ -87,10 +87,9 @@ export function generateTicketNumber(now: Date): string {
   const yyyy = String(now.getUTCFullYear());
   const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(now.getUTCDate()).padStart(2, "0");
-  const bytes = randomBytes(6);
   let suffix = "";
-  for (const b of bytes) {
-    suffix += TICKET_ALPHABET[b % TICKET_ALPHABET.length];
+  for (let i = 0; i < 6; i += 1) {
+    suffix += TICKET_ALPHABET[randomInt(TICKET_ALPHABET.length)];
   }
   return `TK-${yyyy}${mm}${dd}-${suffix}`;
 }

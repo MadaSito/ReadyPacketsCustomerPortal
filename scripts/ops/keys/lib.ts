@@ -3,7 +3,7 @@
  * Nothing here logs; callers decide where (and whether) material is written.
  */
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { diagnoseConfig, type ConfigProblem } from "../../../server/config/env.js";
 
@@ -84,8 +84,15 @@ export function writeSecretFiles(dir: string, secrets: Record<string, string>): 
   const lines: string[] = [];
   for (const [name, value] of Object.entries(secrets)) {
     const file = path.join(dir, name.toLowerCase());
-    if (existsSync(file)) throw new Error(`${file} already exists; refusing to overwrite key material`);
-    writeFileSync(file, `${value}\n`, { mode: 0o600, flag: "wx" });
+    try {
+      // "wx" creates exclusively: an existing path (or symlink) fails here instead of being checked first.
+      writeFileSync(file, `${value}\n`, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`${file} already exists; refusing to overwrite key material`, { cause: error });
+      }
+      throw error;
+    }
     lines.push(`${name}_FILE=${file}`);
   }
   return lines;

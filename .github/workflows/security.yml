@@ -47,7 +47,7 @@ jobs:
           # Otherwise the analysis still runs and the two steps below keep and gate the results.
           upload: ${{ vars.CODE_SCANNING_ENABLED == 'true' && 'always' || 'never' }}
       - name: Gate on high and critical findings (security-severity >= 7.0)
-        run: node scripts/ci/sarif-gate.mjs "$RUNNER_TEMP/codeql-sarif" 7.0
+        run: node scripts/ci/sarif-gate.mjs "$RUNNER_TEMP/codeql-sarif" 7.0 .github/codeql-baseline.json
       - uses: actions/upload-artifact@v7 # TODO(pin)
         if: always()
         with:

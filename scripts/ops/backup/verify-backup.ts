@@ -13,13 +13,13 @@
  * Exit codes: 0 verified · 78 configuration/missing key · 1 verification failed.
  */
 import { createHash } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { CryptoError, DomainError, validation } from "../../../server/core/errors.js";
+import { openRegularFileNoFollow } from "../../../server/modules/backup/archiveFile.js";
 import { readAndValidateBackupBundle } from "../../../server/modules/backup/bundle.js";
 import { decryptBackupStream } from "../../../server/modules/backup/crypto.js";
 import { resolveBackupKeyring } from "../../../server/modules/backup/keys.js";
@@ -61,16 +61,12 @@ function parseVerifyArgs(argv: readonly string[]): VerifyCliArgs {
 
 async function verifyOfflineFile(filePath: string, expectedBackupId: string | null): Promise<number> {
   const startedMs = Date.now();
-  const st = await lstat(filePath).catch(() => null);
-  if (!st || st.isSymbolicLink() || !st.isFile()) {
-    throw validation("INVALID_ARCHIVE_PATH", "Archive path must exist and be a regular file.");
-  }
   const keyring = await resolveBackupKeyring(null, { env: process.env });
   if (!keyring) {
     throw new DomainError("NOT_CONFIGURED", "BACKUP_KEY_MISSING", "Set RP_BACKUP_KEY_FILE (0600) or RP_BACKUP_KEY.");
   }
 
-  const fh = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const fh = await openRegularFileNoFollow(filePath, "Archive path must exist and be a regular file.");
   const fileStream = createReadStream("", { fd: fh.fd, autoClose: true });
   const decryptor = decryptBackupStream(fileStream, {
     keyring,
