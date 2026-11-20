@@ -262,6 +262,18 @@ export const requireCapability = (capability: Capability) =>
       throw new DomainError("FORBIDDEN", "CAPABILITY_NOT_GRANTED", "You do not have permission to perform this action.");
     }
     if (STEP_UP_CAPABILITIES.has(capability) && !hasFreshStepUp(session, ctx.services.clock.now())) {
+      // An expected prompt in the normal flow, not an attack signal: recorded as a best-effort note so the
+      // audit trail shows the challenge without failing or flooding the durable security stream.
+      ctx.services.audit.note({
+        category: "security",
+        eventName: "authz.step_up.required",
+        action: "authorize",
+        outcome: "refused",
+        severity: "INFO",
+        reasonCode: "STEP_UP_REQUIRED",
+        resource: { type: "procedure" },
+        attributes: { procedure: path, capability },
+      });
       throw new DomainError(
         "STEP_UP_REQUIRED",
         "STEP_UP_REQUIRED",
