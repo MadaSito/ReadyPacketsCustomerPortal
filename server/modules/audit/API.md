@@ -115,3 +115,18 @@ admin explicitly set — no policy ⇒ keep forever).
 
 `audit.store` (recent durable-write failures), `audit.chain` (unsealed backlog, oldest unsealed age vs 15 min
 horizon, last verify result), `audit.notes` (best-effort queue depth, dropped count).
+
+## 9. Client pages (`client/src/features/audit`)
+
+All lazy, `access: "admin"`; capability shown per route (server re-checks every call).
+
+| Route | Capability | Purpose |
+| --- | --- | --- |
+| `/admin/audit` | `audit.read` | Event search (ID search, quick filters, AND/OR builder), detail drawer, pivots, reveal source address, add to case, save search, export (step-up). Deep links: `?correlationId=<id>` (30-day window) and `?saved=<savedQueryId>`; both are read from the query string or from the hash route. |
+| `/admin/audit/saved` | `audit.read` | Saved searches; open via `?saved=`; owner delete. |
+| `/admin/audit/cases` | `audit.read` (mutations `audit.cases.manage`) | Cases list/filter, create, status, encrypted notes. |
+| `/admin/audit/exports` | `audit.export` | Exports with manifest/SHA-256; download via `GET /api/audit/exports/:id/download` (retries once after step-up; size must equal manifest). |
+| `/admin/audit/integrity` | `audit.read` (checkpoint `audit.retention.manage`) | Chain status, verify, signed checkpoints. |
+| `/admin/audit/retention` | `audit.retention.manage` | Policies, legal holds, preview and real run (typed `REMOVE`), all under step-up. |
+
+Other features may link to `/admin/audit?correlationId=<workflow correlation id>`.

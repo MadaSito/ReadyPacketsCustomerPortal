@@ -37,6 +37,13 @@ Evidence classes: **AT** = automated test (real MySQL where noted), **RV** = cod
 | Retention gate serialises hold create / case attach / reopen against deletion | lock design in `retention.ts` (`lockGate`) | RV — no concurrent two-connection race test |
 | tRPC router wiring and raw download route (`router.ts`, `http.ts`) | typecheck only | RV |
 | Export job fencing (`assertStillOwned(tx)` at every transition) | code; FakeJobs fence is a no-op | RV |
+| UI query model: bounded window, quick filters ANDed, ID search ORed across id fields by shape, advanced AND/OR group, `in` splitting, malformed ID refused client-side | `client/src/features/audit/audit.test.tsx` › audit query model, rejects malformed IDs | AT (jsdom) |
+| UI deep links: `?correlationId=` and `?saved=<id>` honoured under hash routing; saved query applied verbatim; return to filters | `audit.test.tsx` › audit center page | AT (jsdom) |
+| UI event list loading/empty/error states, stacked mobile cards, drawer with pivots and seal state; source address shown only after explicit reveal | `audit.test.tsx` › audit presentational parts | AT (jsdom + axe) |
+| UI integrity summary shows break reason + first break seq; "sealing is behind" warning | `audit.test.tsx` › integrity summary | AT (jsdom + axe) |
+| UI exports: download only for completed/unexpired; `sessionFetch` with `no-store`; refuses non-attachment or size ≠ manifest | `audit.test.tsx` › exports | AT (jsdom + axe) |
+| UI retention: real run needs typed `REMOVE`, runs under step-up wrapper; saved searches/cases/retention views axe-clean | `audit.test.tsx` › retention, saved searches | AT (jsdom + axe) |
+| UI export download retry after HTTP `STEP_UP_REQUIRED` (403 JSON `safe.domainCode`) | code in `ExportsPage.tsx` | RV — not tested (step-up dialog not driven) |
 
 ## Known limitations (not done / not verified)
 
