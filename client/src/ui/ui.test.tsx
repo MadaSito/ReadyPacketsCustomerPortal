@@ -2,8 +2,9 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { Button, Checkbox, ConfirmDialog, DataTable, Dialog, Drawer, Field, Input, StatusBadge, useStepUp, useToast } from "@/ui";
+import { Button, Checkbox, ErrorState, ConfirmDialog, DataTable, Dialog, Drawer, Field, Input, StatusBadge, useStepUp, useToast } from "@/ui";
 import { OPERATION_STATES } from "@shared/domain";
+import { render } from "@testing-library/react";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "./testing";
 
 describe("Field", () => {
@@ -186,5 +187,49 @@ describe("useStepUp", () => {
     await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Do it: StepUpCancelledError" })).toBeInTheDocument());
     expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ErrorState step-up (D3)", () => {
+  const assuranceState = () => Promise.resolve({ mfaEnrolled: true, recoveryCodesAcknowledged: true, passkeyCount: 0, totpEnrolled: true, recoveryCodesRemaining: 8 });
+
+  it("a STEP_UP_REQUIRED read renders a verify prompt, not the dead-end error", async () => {
+    const { container } = renderUi(<ErrorState error={stepUpError} onRetry={() => undefined} />);
+    expect(screen.getByText("Verification required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Verify identity" })).toBeInTheDocument();
+    expect(screen.queryByText("We couldn't load this")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+
+  it("successful verification retries exactly once; cancel leaves the prompt", async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    const stepUp = vi.fn().mockResolvedValue({ ok: true });
+    renderUi(<ErrorState error={stepUpError} onRetry={onRetry} />, { api: fakeAuthApi({ stepUp, assuranceState }) });
+    await user.click(screen.getByRole("button", { name: "Verify identity" }));
+    let dialog = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Verify identity" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Verify identity" }));
+    dialog = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.type(within(dialog).getByLabelText(/Password/), "pw");
+    await user.type(within(dialog).getByLabelText(/6-digit code/), "123456");
+    await user.click(within(dialog).getByRole("button", { name: "Verify" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+    expect(stepUp).toHaveBeenCalledTimes(1);
+  });
+
+  it("other errors are unchanged, and step-up errors fall back to the generic panel without a provider", () => {
+    const other = Object.assign(new Error("x"), { data: { safe: { domainCode: "NOT_FOUND", safeMessage: "Not here.", requestId: "req-1" } } });
+    const onRetry = vi.fn();
+    renderUi(<ErrorState error={other} onRetry={onRetry} />);
+    expect(screen.getByText("We couldn't load this")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify identity" })).not.toBeInTheDocument();
+    const bare = render(<ErrorState error={stepUpError} />);
+    expect(within(bare.container).getByText("We couldn't load this")).toBeInTheDocument();
   });
 });

@@ -6,33 +6,16 @@
  */
 import { startAuthentication } from "@simplewebauthn/browser";
 import { KeyRound } from "lucide-react";
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useContext, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useAuthApi, type SecondFactorInput } from "@/lib/authApi";
-import { errorMessage, safeError } from "@/lib/trpc";
+import { errorMessage } from "@/lib/trpc";
+import { isStepUpRequired, StepUpCancelledError, StepUpContext, type StepUpApi } from "./stepUpContext";
 import { Button } from "./Button";
 import { Callout } from "./Feedback";
 import { Field, Input, RadioGroup } from "./Field";
 import { Dialog } from "./Overlay";
 
-export class StepUpCancelledError extends Error {
-  constructor() {
-    super("Step-up verification was cancelled.");
-    this.name = "StepUpCancelledError";
-  }
-}
-
-export function isStepUpRequired(error: unknown): boolean {
-  return safeError(error)?.domainCode === "STEP_UP_REQUIRED";
-}
-
-export interface StepUpApi {
-  /** Run an action, transparently handling one step-up round trip. */
-  run: <T>(action: () => Promise<T>, options?: { reason?: string }) => Promise<T>;
-  /** Ask for step-up proactively (before opening a sensitive screen). Resolves true when verified. */
-  request: (options?: { reason?: string }) => Promise<boolean>;
-}
-
-const StepUpContext = createContext<StepUpApi | null>(null);
+export { isStepUpRequired, StepUpCancelledError, type StepUpApi } from "./stepUpContext";
 
 export function useStepUp(): StepUpApi {
   const ctx = useContext(StepUpContext);

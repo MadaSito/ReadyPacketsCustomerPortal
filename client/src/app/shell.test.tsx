@@ -6,7 +6,7 @@ import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { AppRoutes } from "./AppRouter";
 import { ConsoleShell } from "./shell/ConsoleShell";
 import { CustomerShell } from "./shell/CustomerShell";
-import { customerNavLayout, LEGAL_NAME, MAX_PRIMARY_NAV, navPlacement, PUBLIC_SITE_URL, visibleNav } from "./shell/common";
+import { customerNavLayout, initials, LEGAL_NAME, MAX_PRIMARY_NAV, navPlacement, PUBLIC_SITE_URL, visibleNav } from "./shell/common";
 import { ALL_NAV } from "./registry";
 import type { NavItem } from "@/lib/routes";
 
@@ -129,5 +129,18 @@ describe("customer nav placement (D1: no top-bar collisions)", () => {
     const menu = await screen.findByRole("menu");
     for (const entry of layout.account) expect(within(menu).getByRole("menuitem", { name: entry.label })).toHaveAttribute("href", entry.href);
     expect(within(menu).getByRole("menuitem", { name: "Sign out" })).toBeInTheDocument();
+  });
+});
+
+describe("avatar initials (D4)", () => {
+  it("uses only letter/number word starts, max two, Unicode-aware", () => {
+    expect(initials("Demo (synthetic admin)")).toBe("DA");
+    expect(initials("Avery Example")).toBe("AE");
+    expect(initials("  Zoë  ")).toBe("Z");
+    expect(initials("Élodie de la Cruz")).toBe("ÉC");
+    expect(initials("李 小龙")).toBe("李小");
+    expect(initials("(admin)")).toBe("?");
+    expect(initials("   ")).toBe("?");
+    expect(initials("3M Ops")).toBe("3O");
   });
 });

@@ -1,8 +1,10 @@
 import { AlertTriangle, CheckCircle2, Info, XCircle, type LucideIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import { QueryClientContext } from "@tanstack/react-query";
+import { useContext, useState, type ReactNode } from "react";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button } from "./Button";
 import { cn } from "./cn";
+import { isStepUpRequired, useOptionalStepUp } from "./stepUpContext";
 
 export type CalloutTone = "info" | "success" | "warning" | "danger";
 const calloutStyles: Record<CalloutTone, { box: string; icon: LucideIcon; iconClass: string }> = {
@@ -92,8 +94,57 @@ export interface ErrorStateProps {
   onRetry?: () => void;
   className?: string;
 }
-/** Error panel announced politely. Shows only the server's safe message and the request reference. */
-export function ErrorState({ error, title = "We couldn't load this", message, onRetry, className }: ErrorStateProps) {
+/**
+ * Error panel. Shows only the server's safe message and the request reference.
+ * A STEP_UP_REQUIRED error (a read that needs a fresh verification) instead renders a calm "Verification
+ * required" prompt whose button opens the step-up dialog and, once verified, retries: `onRetry` when given,
+ * otherwise a refetch of the active queries that are in error. Without a StepUpProvider it falls back to
+ * the generic panel.
+ */
+export function ErrorState(props: ErrorStateProps) {
+  const stepUp = useOptionalStepUp();
+  if (stepUp && isStepUpRequired(props.error)) return <StepUpRequiredState {...props} request={stepUp.request} />;
+  return <GenericErrorState {...props} />;
+}
+
+export const STEP_UP_REQUIRED_COPY = {
+  title: "Verification required",
+  body: "For your security, confirm your password and a verification code to view this page.",
+  action: "Verify identity",
+} as const;
+
+function StepUpRequiredState({ onRetry, className, request }: ErrorStateProps & { request: (o?: { reason?: string }) => Promise<boolean> }) {
+  const queryClient = useContext(QueryClientContext);
+  const [busy, setBusy] = useState(false);
+  const verify = async () => {
+    setBusy(true);
+    try {
+      const ok = await request({ reason: STEP_UP_REQUIRED_COPY.body });
+      if (!ok) return;
+      if (onRetry) onRetry();
+      else void queryClient?.refetchQueries({ type: "active", predicate: (query) => query.state.status === "error" });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Callout
+      tone="info"
+      live="polite"
+      title={STEP_UP_REQUIRED_COPY.title}
+      className={className}
+      actions={
+        <Button size="sm" loading={busy} onClick={() => void verify()}>
+          {STEP_UP_REQUIRED_COPY.action}
+        </Button>
+      }
+    >
+      <p>{STEP_UP_REQUIRED_COPY.body}</p>
+    </Callout>
+  );
+}
+
+function GenericErrorState({ error, title = "We couldn't load this", message, onRetry, className }: ErrorStateProps) {
   const safe = safeError(error);
   return (
     <Callout

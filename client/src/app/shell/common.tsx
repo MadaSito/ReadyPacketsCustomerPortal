@@ -98,9 +98,12 @@ export function ThemeToggle({ className }: { className?: string }) {
   );
 }
 
-function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  return ((parts[0]?.[0] ?? "") + (parts.length > 1 ? (parts[parts.length - 1]?.[0] ?? "") : "")).toUpperCase() || "?";
+/** Up to two initials from words that start with a letter or digit (Unicode-aware); "?" when none. */
+export function initials(name: string): string {
+  const words = name.trim().split(/\s+/u).filter((word) => /^[\p{L}\p{N}]/u.test(word));
+  const picks = words.map((word) => [...word][0] ?? "");
+  const chosen = picks.length > 1 ? [picks[0], picks[picks.length - 1]] : picks;
+  return chosen.join("").toLocaleUpperCase() || "?";
 }
 
 export function AccountMenu({ user, area, items: accountItems }: { user: MeUser; area: "customer" | "console"; items?: readonly NavItem[] }) {
