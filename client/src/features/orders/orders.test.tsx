@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
-import AdminCatalogPage, { parseAmountToMinor } from "./pages/AdminCatalogPage";
+import AdminCatalogPage, { parseAmountToMinor, parseDeliverables, parsePacketNumbers } from "./pages/AdminCatalogPage";
 import AdminOrdersPage from "./pages/AdminOrdersPage";
 import AdminWorkflowsPage from "./pages/AdminWorkflowsPage";
 import NewOrderPage from "./pages/NewOrderPage";
@@ -80,7 +80,28 @@ const detail = {
   canShare: true,
   ownerPublicId: "01JTESTUSER00000000000000A",
   submittedAt: now,
-  lineItems: [{ publicId: "01JTESTLINE00000000000000A", productPublicId: null, productVersion: 1, name: "Synthetic item", description: "Demo", features: [], unitPriceMinor: 1250, currency: "USD", quantity: 2, lineTotalMinor: 2500 }],
+  subtotalMinor: 2500,
+  discountMinor: 0,
+  discountLabel: null,
+  lineItems: [
+    {
+      publicId: "01JTESTLINE00000000000000A",
+      productPublicId: null,
+      productVersion: 1,
+      name: "Synthetic item",
+      description: "Demo",
+      features: [],
+      packetNumber: null,
+      tier: null,
+      outcome: "",
+      timeline: "",
+      deliverables: [],
+      unitPriceMinor: 1250,
+      currency: "USD",
+      quantity: 2,
+      lineTotalMinor: 2500,
+    },
+  ],
   notes: [{ publicId: "01JTESTNOTE00000000000000A", visibility: "customer", authorRole: "customer", mine: true, body: "Customer note", createdAt: now }],
   history: [{ publicId: "01JTESTHIST00000000000000A", fromLabel: null, toLabel: "Submitted", toStatus: "submitted", actorRole: "customer", reasonCode: "CREATED", hasNote: false, occurredAt: now }],
   transitions: [{ to: "canceled", label: "Canceled", actionLabel: "Cancel order", destructive: true, requiresNote: true }],
@@ -88,23 +109,83 @@ const detail = {
 const catalog = [
   {
     publicId: "01JTESTGROUP000000000000A",
+    groupKey: null,
+    packetNumber: null,
     name: "Synthetic group",
     description: "",
     sortOrder: 0,
     active: true,
     rowVersion: 1,
     products: [
-      { publicId: "01JTESTPROD000000000000A1", productKey: "synthetic-a", groupPublicId: "01JTESTGROUP000000000000A", name: "Synthetic A", description: "First", features: ["One"], priceMinor: 1000, currency: "USD", versionNumber: 1, versionPublicId: "x", sortOrder: 0, active: true, rowVersion: 1 },
-      { publicId: "01JTESTPROD000000000000A2", productKey: "synthetic-b", groupPublicId: "01JTESTGROUP000000000000A", name: "Synthetic B", description: "", features: [], priceMinor: 500, currency: "USD", versionNumber: 2, versionPublicId: "y", sortOrder: 1, active: true, rowVersion: 1 },
+      { publicId: "01JTESTPROD000000000000A1", productKey: "synthetic-a", groupPublicId: "01JTESTGROUP000000000000A", packetNumber: null, tier: null, outcome: "", timeline: "", deliverables: [], name: "Synthetic A", description: "First", features: ["One"], priceMinor: 1000, currency: "USD", versionNumber: 1, versionPublicId: "x", sortOrder: 0, active: true, rowVersion: 1 },
+      { publicId: "01JTESTPROD000000000000A2", productKey: "synthetic-b", groupPublicId: "01JTESTGROUP000000000000A", packetNumber: null, tier: null, outcome: "", timeline: "", deliverables: [], name: "Synthetic B", description: "", features: [], priceMinor: 500, currency: "USD", versionNumber: 2, versionPublicId: "y", sortOrder: 1, active: true, rowVersion: 1 },
     ],
   },
 ];
+
+/** Synthetic packet catalog (packet numbers 41/42 so nothing resembles real offerings). */
+const packetProduct = (packet: number, tier: "Basic" | "Premium", id: string, priceMinor: number) => ({
+  publicId: id,
+  productKey: `synthetic-${packet}-${tier.toLowerCase()}`,
+  groupPublicId: `01JTESTPKTGRP0000000000${packet}`,
+  packetNumber: packet,
+  tier,
+  name: `Synthetic Packet ${packet} - ${tier}`,
+  description: "",
+  features: ["Synthetic deliverable"],
+  outcome: `Synthetic outcome ${packet} ${tier}`,
+  timeline: "1 - 2 synthetic days",
+  deliverables: [{ title: "Synthetic deliverable", detail: "Synthetic detail" }],
+  priceMinor,
+  currency: "USD",
+  versionNumber: 1,
+  versionPublicId: "v",
+  sortOrder: tier === "Basic" ? 0 : 2,
+  active: true,
+  rowVersion: 1,
+});
+const packetCatalog = [41, 42].map((packet) => ({
+  publicId: `01JTESTPKTGRP0000000000${packet}`,
+  groupKey: `synthetic-${packet}`,
+  packetNumber: packet,
+  name: `Synthetic Packet ${packet}`,
+  description: "Synthetic packet",
+  sortOrder: packet,
+  active: true,
+  rowVersion: 1,
+  products: [packetProduct(packet, "Basic", `01JTESTPKT${packet}B00000000000A`, packet * 100), packetProduct(packet, "Premium", `01JTESTPKT${packet}P00000000000A`, packet * 300)],
+}));
+const allProducts: { publicId: string; priceMinor: number; packetNumber: number | null }[] = [
+  ...catalog.flatMap((g) => g.products),
+  ...packetCatalog.flatMap((g) => g.products),
+];
+
+/** Fake server quote: sums lines; 10% "Synthetic bundle" once packets 41 and 42 are both present. */
+function fakeQuote(input: unknown) {
+  const { items } = input as { items: { productPublicId: string; quantity: number }[] };
+  const lines = items.map((item) => ({ item, product: allProducts.find((p) => p.publicId === item.productPublicId)! }));
+  const subtotalMinor = lines.reduce((sum, { item, product }) => sum + product.priceMinor * item.quantity, 0);
+  const present = new Set(lines.map(({ product }) => product.packetNumber).filter((n) => n !== null));
+  const missingPacketNumbers = [41, 42].filter((n) => !present.has(n));
+  const applied = missingPacketNumbers.length === 0;
+  const discountMinor = applied ? Math.floor((subtotalMinor * 10 + 50) / 100) : 0;
+  return {
+    currency: "USD",
+    subtotalMinor,
+    discountMinor,
+    discountLabel: applied ? "Synthetic bundle" : null,
+    totalMinor: subtotalMinor - discountMinor,
+    bundle: { enabled: true, label: "Synthetic bundle", discountPercent: 10, requiredPacketNumbers: [41, 42], missingPacketNumbers, applied },
+  };
+}
 
 beforeEach(() => {
   handlers.clear();
   calls.length = 0;
   session.role = "customer";
   handlers.set("orders.sharing.myInvitations", () => []);
+  handlers.set("orders.quote", fakeQuote);
+  handlers.set("orders.admin.catalog.bundleRule", () => ({ enabled: false, requiredPacketNumbers: [], discountPercent: 0, label: "" }));
 });
 
 describe("customer order list", () => {
@@ -197,6 +278,55 @@ describe("new order wizard", () => {
     const keys = calls.filter((c) => c.path === "orders.create").map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("packet catalog: picker + server quote, bundle discount on review, one tier per packet sent as quantity 1", async () => {
+    handlers.set("orders.catalog.list", () => packetCatalog);
+    handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));
+    const user = userEvent.setup();
+    const { container, location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByRole("heading", { name: "Packet 41: Synthetic Packet 41" });
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByText("Choose at least one packet or item to continue.")).toBeInTheDocument();
+    await user.click(within(screen.getByRole("group", { name: "Tier for Synthetic Packet 41" })).getByRole("radio", { name: /Premium/ }));
+    await user.click(within(screen.getByRole("group", { name: "Tier for Synthetic Packet 42" })).getByRole("radio", { name: /Basic/ }));
+    const figures = await screen.findByTestId("packet-summary-figures");
+    // 12300 + 4200 = 16500; 10% = 1650 -> 14850 (all from the fake server quote)
+    await waitFor(() => expect(within(figures).getByText("Synthetic bundle")).toBeInTheDocument());
+    expect(figures).toHaveTextContent("$148.50");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Packet project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
+    expect(screen.getByText("Subtotal").parentElement).toHaveTextContent("$165.00");
+    expect(screen.getByText("Synthetic bundle").parentElement).toHaveTextContent("$16.50");
+    expect(screen.getByText("Total").parentElement).toHaveTextContent("$148.50");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const create = calls.filter((c) => c.path === "orders.create");
+    expect(create).toHaveLength(1);
+    expect((create[0]!.input as { items: unknown[] }).items).toEqual([
+      { productPublicId: "01JTESTPKT41P00000000000A", quantity: 1 },
+      { productPublicId: "01JTESTPKT42B00000000000A", quantity: 1 },
+    ]);
+    expect(Object.keys(create[0]!.input as object)).not.toContain("totalMinor");
+  });
+
+  it("shows the server's packet rule message when create is refused", async () => {
+    handlers.set("orders.catalog.list", () => packetCatalog);
+    handlers.set("orders.create", () => {
+      throw Object.assign(new Error("tier"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "PACKET_TIER_CONFLICT", safeMessage: "x", requestId: "r1" } } });
+    });
+    const user = userEvent.setup();
+    renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await user.click(within(await screen.findByRole("group", { name: "Tier for Synthetic Packet 41" })).getByRole("radio", { name: /Basic/ }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Packet project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(await screen.findByRole("button", { name: "Submit order" }));
+    expect(await screen.findByText("Choose one tier per packet.")).toBeInTheDocument();
   });
 
   it("explains an empty catalog instead of showing a broken form", async () => {
@@ -481,6 +611,102 @@ describe("console orders pipeline widget", () => {
     handlers.set("orders.admin.list", () => ({ items: [], nextCursor: null }));
     renderUi(<AdminOrdersPage />, { path: "/admin/orders?status=in_review" });
     await waitFor(() => expect(calls.find((c) => c.path === "orders.admin.list")?.input).toMatchObject({ status: "in_review" }));
+  });
+});
+
+describe("increment 02 display", () => {
+  it("order detail shows tier, outcome, timeline, deliverables and the subtotal/discount/total", async () => {
+    handlers.set("orders.get", () => ({
+      ...detail,
+      subtotalMinor: 16500,
+      discountMinor: 1650,
+      discountLabel: "Synthetic bundle",
+      totalMinor: 14850,
+      lineItems: [
+        {
+          ...detail.lineItems[0]!,
+          name: "Synthetic Packet 41 - Premium",
+          packetNumber: 41,
+          tier: "Premium",
+          outcome: "Synthetic outcome",
+          timeline: "1 - 2 synthetic days",
+          deliverables: [
+            { title: "Synthetic deliverable one", detail: "Synthetic detail" },
+            { title: "Synthetic deliverable two", detail: "" },
+          ],
+          quantity: 1,
+          unitPriceMinor: 16500,
+          lineTotalMinor: 16500,
+        },
+      ],
+    }));
+    const user = userEvent.setup();
+    const { container } = renderUi(
+      <Route path="/orders/:orderId">
+        <OrderDetailPage />
+      </Route>,
+      { path: `/orders/${ORDER_ID}` },
+    );
+    expect((await screen.findAllByText("Premium")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("1 - 2 synthetic days").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Synthetic outcome/).length).toBeGreaterThan(0);
+    expect(screen.getByText("Subtotal").parentElement).toHaveTextContent("$165.00");
+    expect(screen.getByText("Synthetic bundle").parentElement).toHaveTextContent("$16.50");
+    const toggle = screen.getAllByText(/2 deliverables/)[0]!;
+    await user.click(toggle);
+    expect(screen.getAllByText("Synthetic deliverable one").length).toBeGreaterThan(0);
+    await expectNoAxeViolations(container);
+  });
+
+  it("admin catalog shows packet groups and tiers, saves packet fields and edits the bundle rule", async () => {
+    session.role = "admin";
+    handlers.set("orders.admin.catalog.list", () => packetCatalog);
+    handlers.set("orders.admin.catalog.updateProduct", () => ({ publicId: "x", versionNumber: 2, rowVersion: 2 }));
+    handlers.set("orders.admin.catalog.updateBundleRule", (input) => (input as { rule: unknown }).rule);
+    const user = userEvent.setup();
+    const { container } = renderUi(<AdminCatalogPage />, { path: "/admin/catalog" });
+    expect((await screen.findAllByText("Packet 41")).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/No bundle discount is applied/)).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+    await user.click(screen.getAllByRole("button", { name: /Edit Synthetic Packet 41 - Basic/ })[0]!);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByLabelText(/^Tier/)).toHaveValue("Basic");
+    expect(within(dialog).getByLabelText(/^Deliverables/)).toHaveValue("Synthetic deliverable | Synthetic detail");
+    await user.clear(within(dialog).getByLabelText(/^Timeline/));
+    await user.type(within(dialog).getByLabelText(/^Timeline/), "3 - 4 synthetic days");
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Save product" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.admin.catalog.updateProduct")?.input).toMatchObject({ packetNumber: 41, tier: "Basic", timeline: "3 - 4 synthetic days", deliverables: [{ title: "Synthetic deliverable", detail: "Synthetic detail" }] }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "Edit bundle discount" }));
+    const ruleDialog = await screen.findByRole("dialog");
+    await user.click(within(ruleDialog).getByLabelText("Apply the bundle discount"));
+    await user.click(within(ruleDialog).getByRole("button", { name: "Save bundle discount" }));
+    expect(await within(ruleDialog).findByText(/To turn the discount on/)).toBeInTheDocument();
+    await user.type(within(ruleDialog).getByLabelText(/Required packets/), "42, 41");
+    await user.clear(within(ruleDialog).getByLabelText(/Discount/));
+    await user.type(within(ruleDialog).getByLabelText(/Discount/), "10");
+    await user.type(within(ruleDialog).getByLabelText(/^Label/), "Synthetic bundle");
+    await expectNoAxeViolations(ruleDialog);
+    await user.click(within(ruleDialog).getByRole("button", { name: "Save bundle discount" }));
+    await waitFor(() =>
+      expect(calls.find((c) => c.path === "orders.admin.catalog.updateBundleRule")?.input).toEqual({
+        rule: { enabled: true, requiredPacketNumbers: [41, 42], discountPercent: 10, label: "Synthetic bundle" },
+      }),
+    );
+    expect(await screen.findByText(/10% off the order subtotal/)).toBeInTheDocument();
+  });
+
+  it("parses deliverables and packet number lists", () => {
+    expect(parseDeliverables("A | one\n\nB\n C | two | three ")).toEqual([
+      { title: "A", detail: "one" },
+      { title: "B", detail: "" },
+      { title: "C", detail: "two | three" },
+    ]);
+    expect(parsePacketNumbers("3, 1 2,2")).toEqual([1, 2, 3]);
+    expect(parsePacketNumbers("1, x")).toBeNull();
+    expect(parsePacketNumbers("")).toEqual([]);
   });
 });
 

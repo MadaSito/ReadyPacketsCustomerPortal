@@ -120,6 +120,19 @@ function Overview({ order, area }: { order: OrderDetail; area: Area }) {
             { label: "Last updated", value: <DateTime value={order.updatedAt} format="relative" /> },
             { label: "Your access", value: ACCESS_ROLE_LABELS[order.accessRole] ?? order.accessRole },
             ...(area === "console" && order.origin === "import" ? [{ label: "Origin", value: "Imported" }] : []),
+            ...(order.discountMinor > 0
+              ? [
+                  { label: "Subtotal", value: <Money value={money(order.subtotalMinor, order.currency)} /> },
+                  {
+                    label: order.discountLabel ?? "Discount",
+                    value: (
+                      <>
+                        −<Money value={money(order.discountMinor, order.currency)} />
+                      </>
+                    ),
+                  },
+                ]
+              : []),
             { label: "Total", value: <Money value={money(order.totalMinor, order.currency)} /> },
           ]}
         />
@@ -139,6 +152,7 @@ function Overview({ order, area }: { order: OrderDetail; area: Area }) {
                 <span className="flex min-w-0 flex-col">
                   <span className="font-semibold break-words text-ink">{item.name}</span>
                   {item.description ? <span className="text-sm break-words text-muted">{item.description}</span> : null}
+                  <ItemPacketDetails item={item} />
                 </span>
               ),
             },
@@ -150,6 +164,50 @@ function Overview({ order, area }: { order: OrderDetail; area: Area }) {
         />
       </div>
     </div>
+  );
+}
+
+/** Snapshot of the packet terms the customer ordered (tier, outcome, timeline, deliverables). */
+function ItemPacketDetails({ item }: { item: OrderDetail["lineItems"][number] }) {
+  if (!item.tier && !item.outcome && !item.timeline && item.deliverables.length === 0) return null;
+  return (
+    <span className="mt-1 flex min-w-0 flex-col gap-1 text-sm text-body">
+      {item.tier || item.timeline ? (
+        <span className="flex flex-wrap gap-x-4 gap-y-0.5">
+          {item.tier ? (
+            <span>
+              <span className="text-muted">Tier:</span> <span className="font-medium text-ink">{item.tier}</span>
+            </span>
+          ) : null}
+          {item.timeline ? (
+            <span>
+              <span className="text-muted">Timeline:</span> <span className="text-ink">{item.timeline}</span>
+            </span>
+          ) : null}
+        </span>
+      ) : null}
+      {item.outcome ? (
+        <span className="break-words">
+          <span className="text-muted">Outcome:</span> {item.outcome}
+        </span>
+      ) : null}
+      {item.deliverables.length > 0 ? (
+        <details className="group">
+          <summary className="cursor-pointer rounded font-medium text-action underline-offset-2 hover:underline">
+            {item.deliverables.length} {item.deliverables.length === 1 ? "deliverable" : "deliverables"}
+            <span className="sr-only"> for {item.name}</span>
+          </summary>
+          <ul className="mt-1 flex list-disc flex-col gap-1 ps-5">
+            {item.deliverables.map((deliverable, index) => (
+              <li key={`${index}-${deliverable.title}`} className="break-words">
+                <span className="font-medium text-ink">{deliverable.title}</span>
+                {deliverable.detail ? <span className="text-muted"> — {deliverable.detail}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </span>
   );
 }
 

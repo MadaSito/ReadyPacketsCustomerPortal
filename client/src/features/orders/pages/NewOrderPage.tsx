@@ -1,11 +1,23 @@
-/** Customer order wizard (/orders/new): choose items → details → review. Owner: orders_engineer. */
+/**
+ * Customer order wizard (/orders/new): choose items → details → review. Owner: orders_engineer.
+ * Packet catalogs (increment 02) use the packet picker from ./customer/packets; any other groups keep the
+ * quantity list. Every amount shown comes from the server quote (`orders.quote`); the client never prices.
+ */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PackageOpen } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, EmptyState, ErrorState, Field, Input, KeyValueList, Money, PageHeader, Skeleton, Textarea, useToast } from "@/ui";
+import { isPacketCatalog, nonPacketGroups, PacketPicker, packetItems, PacketSummary, useOrderQuote } from "../customer/packets";
 import { money, newIdempotencyKey } from "../shared";
+
+const REASON_MESSAGES: Record<string, string> = {
+  PRODUCT_UNAVAILABLE: "An item is no longer available. Go back and review your choices.",
+  PACKET_TIER_CONFLICT: "Choose one tier per packet.",
+  PACKET_QUANTITY_ONE: "Each packet can be ordered once.",
+  MIXED_CURRENCY: "Items priced in different currencies must be ordered separately.",
+};
 
 const STEPS = ["Choose items", "Details", "Review"] as const;
 const MAX_QUANTITY = 1000;
@@ -19,6 +31,7 @@ export default function NewOrderPage() {
   const create = useMutation(trpc.orders.create.mutationOptions());
   const [step, setStep] = useState(0);
   const [quantities, setQuantities] = useState<Record<string, string>>({});
+  const [selection, setSelection] = useState<Record<number, string | null>>({});
   const [projectName, setProjectName] = useState("");
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -42,13 +55,24 @@ export default function NewOrderPage() {
     if (error) errorRef.current?.focus();
   }, [error]);
 
-  const products = useMemo(() => (catalog.data ?? []).flatMap((group) => group.products.map((product) => ({ ...product, groupName: group.name }))), [catalog.data]);
-  const chosen = products
-    .map((product) => ({ product, quantity: Number.parseInt(quantities[product.publicId] ?? "0", 10) }))
-    .filter((line) => Number.isInteger(line.quantity) && line.quantity > 0);
-  const currency = chosen[0]?.product.currency ?? products[0]?.currency ?? "USD";
-  const total = chosen.reduce((sum, line) => sum + line.product.priceMinor * line.quantity, 0);
+  const groups = useMemo(() => catalog.data ?? [], [catalog.data]);
+  const packetCatalog = isPacketCatalog(groups);
+  const listGroups = useMemo(() => (packetCatalog ? nonPacketGroups(groups) : groups), [groups, packetCatalog]);
+  const products = useMemo(() => groups.flatMap((group) => group.products.map((product) => ({ ...product, groupName: group.name }))), [groups]);
+  const listProducts = useMemo(() => listGroups.flatMap((group) => group.products), [listGroups]);
+  const chosenList = listProducts
+    .map((product) => ({ product, quantity: Number(quantities[product.publicId] ?? "0") }))
+    .filter((line) => Number.isInteger(line.quantity) && line.quantity > 0 && line.quantity <= MAX_QUANTITY);
+  const packetLines = packetCatalog ? packetItems(selection, groups) : [];
+  const items = [...packetLines, ...chosenList.map((line) => ({ productPublicId: line.product.publicId, quantity: line.quantity }))];
+  const chosen = items.flatMap((item) => {
+    const product = products.find((candidate) => candidate.publicId === item.productPublicId);
+    return product ? [{ product, quantity: item.quantity }] : [];
+  });
   const mixedCurrency = new Set(chosen.map((line) => line.product.currency)).size > 1;
+  const quote = useOrderQuote(mixedCurrency ? [] : items);
+  const quoteReason = quote.error ? safeError(quote.error)?.reasonCode : undefined;
+  const quoteProblem = quote.error ? (quoteReason && REASON_MESSAGES[quoteReason]) || "The total could not be calculated. Please try again." : null;
 
   const header = (
     <PageHeader
@@ -99,7 +123,7 @@ export default function NewOrderPage() {
         return !Number.isInteger(value) || value < 0 || value > MAX_QUANTITY;
       });
       if (invalid) return setError(`Quantities must be whole numbers from 0 to ${MAX_QUANTITY}.`);
-      if (chosen.length === 0) return setError("Choose at least one item to continue.");
+      if (chosen.length === 0) return setError(packetCatalog ? "Choose at least one packet or item to continue." : "Choose at least one item to continue.");
       if (mixedCurrency) return setError("Items priced in different currencies must be ordered separately.");
     }
     if (step === 1) {
@@ -118,7 +142,7 @@ export default function NewOrderPage() {
     try {
       const result = await create.mutateAsync({
         projectName: projectName.trim(),
-        items: chosen.map((line) => ({ productPublicId: line.product.publicId, quantity: line.quantity })),
+        items,
         note: note.trim() ? note.trim() : undefined,
         idempotencyKey,
       });
@@ -133,7 +157,7 @@ export default function NewOrderPage() {
         await queryClient.invalidateQueries({ queryKey: trpc.compliance.policies.myStatus.queryKey() });
         return;
       }
-      setError(safe?.reasonCode === "PRODUCT_UNAVAILABLE" ? "An item is no longer available. Go back and review your choices." : errorMessage(err));
+      setError((safe?.reasonCode && REASON_MESSAGES[safe.reasonCode]) || errorMessage(err));
     }
   };
 
@@ -170,13 +194,19 @@ export default function NewOrderPage() {
           </Callout>
         </div>
       ) : null}
-      <form onSubmit={step === STEPS.length - 1 ? (e) => (e.preventDefault(), void submit()) : next} noValidate className="flex max-w-3xl flex-col gap-5">
+      <form onSubmit={step === STEPS.length - 1 ? (e) => (e.preventDefault(), void submit()) : next} noValidate className={`flex flex-col gap-5 ${packetCatalog && step === 0 ? "max-w-6xl" : "max-w-3xl"}`}>
         <h2 ref={headingRef} tabIndex={-1} className="text-xl font-semibold text-ink outline-none">
           {STEPS[step]}
         </h2>
         {step === 0 ? (
           <div className="flex flex-col gap-4">
-            {(catalog.data ?? []).map((group) => (
+            {packetCatalog ? (
+              <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+                <PacketPicker groups={groups} selection={selection} onChange={setSelection} headingLevel={3} />
+                <PacketSummary groups={groups} selection={selection} quote={quote.quote} pending={quote.pending} error={quote.error} headingLevel={3} />
+              </div>
+            ) : null}
+            {listGroups.map((group) => (
               <Card key={group.publicId} title={group.name} description={group.description || undefined} headingLevel={3}>
                 <ul className="flex flex-col divide-y divide-line">
                   {group.products.map((product) => (
@@ -214,9 +244,22 @@ export default function NewOrderPage() {
                 </ul>
               </Card>
             ))}
-            <p className="text-body" aria-live="polite">
-              {chosen.length === 0 ? "No items chosen yet." : <>Estimated total: <Money value={money(total, currency)} /></>}
-            </p>
+            {packetCatalog && listGroups.length === 0 ? null : (
+              <p className="text-body" aria-live="polite">
+                {chosen.length === 0 ? (
+                  "No items chosen yet."
+                ) : quoteProblem ? (
+                  quoteProblem
+                ) : quote.quote && !quote.pending ? (
+                  <>
+                    Estimated total: <Money value={money(quote.quote.totalMinor, quote.quote.currency)} />
+                    {quote.quote.discountMinor > 0 ? <> (includes {quote.quote.discountLabel ?? "discount"})</> : null}
+                  </>
+                ) : (
+                  "Calculating total…"
+                )}
+              </p>
+            )}
           </div>
         ) : null}
         {step === 1 ? (
@@ -242,7 +285,24 @@ export default function NewOrderPage() {
                     </>
                   ),
                 })),
-                { label: "Total", value: <Money value={money(total, currency)} /> },
+                ...(quote.quote && !quote.pending && !quoteProblem
+                  ? [
+                      ...(quote.quote.discountMinor > 0
+                        ? [
+                            { label: "Subtotal", value: <Money value={money(quote.quote.subtotalMinor, quote.quote.currency)} /> },
+                            {
+                              label: quote.quote.discountLabel ?? "Discount",
+                              value: (
+                                <>
+                                  −<Money value={money(quote.quote.discountMinor, quote.quote.currency)} />
+                                </>
+                              ),
+                            },
+                          ]
+                        : []),
+                      { label: "Total", value: <Money value={money(quote.quote.totalMinor, quote.quote.currency)} /> },
+                    ]
+                  : [{ label: "Total", value: quoteProblem ?? "Calculating…" }]),
                 ...(note.trim() ? [{ label: "Note", value: <span className="break-words whitespace-pre-wrap">{note.trim()}</span>, wide: true }] : []),
               ]}
             />
