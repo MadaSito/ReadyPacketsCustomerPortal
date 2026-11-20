@@ -57,24 +57,31 @@ verifyChain(options?: { fromSeq?: number; maxEvents?: number }): Promise<ChainVe
 `ExternalAuditEvent` = envelope minus `actor_user_id`, `resource_public_id`, `session_ref`,
 `source_address_ref`, `durability`, plus `chain_seq`. Shape is stable under `schema_version`.
 
-Admin service methods (called by the router with the verified principal; all audited):
-`search`, `getEvent`, `pivot`, `stats`, saved queries (`listSavedQueries/saveQuery/deleteSavedQuery`),
-cases (`listCases/getCase/createCase/updateCaseStatus/attachEvents/addCaseNote`), exports
-(`requestExport/listExports/openExportDownload`), integrity (`verifyChain`, `listCheckpoints`, `createCheckpoint`),
-retention (`getRetention/setRetentionPolicy/listLegalHolds/createLegalHold/releaseLegalHold/runRetention`).
+Admin service methods (first arg = verified `SessionPrincipal`; capability + step-up re-checked in the
+service; privileged mutations re-validate the actor's current role/status inside their transaction; all audited):
+`search`, `getEvent`, `revealSourceAddress`, `pivot`, `stats`; saved queries `listSavedQueries/saveQuery/deleteSavedQuery`;
+cases `listCases/getCase/createCase/updateCaseStatus/attachEvents/addCaseNote`; exports
+`requestExport/listExports/openExportDownload/recordDownloadResult`; integrity
+`integrityStatus/verifyIntegrity/listCheckpoints/createCheckpoint`; retention
+`getRetention/setRetentionPolicy/createLegalHold/releaseLegalHold/runRetention(principal, dryRun)`.
 
-## 4. tRPC (`trpc.audit.*`) — all `adminProcedure`
+## 4. tRPC (`trpc.audit.*`) — all `adminProcedure`, strict Zod inputs
 
 | Procedure | Capability | Notes |
 | --- | --- | --- |
-| `search`, `event`, `pivot`, `stats`, `savedQueries.*`, `integrity.status/checkpoints` | `audit.read` | |
-| `integrity.verify` | `audit.read` | audited `audit.integrity.verified` |
-| `cases.*` mutations | `audit.cases.manage` | |
-| `exports.request`, `exports.list` | `audit.export` (step-up) | |
-| `retention.*` mutations | `audit.retention.manage` (step-up) | |
+| `search`, `event`, `pivot`, `stats`, `revealSourceAddress` | `audit.read` | each audited (`audit.search.executed`, `audit.event.viewed`, `audit.stats.viewed`, WARN `audit.source_address.revealed`) |
+| `savedQueries.list/save/remove` | `audit.read` | delete is owner-only (others get NOT_FOUND) |
+| `cases.list/get` | `audit.read` | |
+| `cases.create/setStatus/attachEvents/addNote` | `audit.cases.manage` | attach/reopen take the retention gate (shared) |
+| `exports.list/request` | `audit.export` (step-up) | ≤ 3 active per user |
+| `integrity.status/checkpoints/verify` | `audit.read` | verify audited `audit.integrity.verified` / ERROR `audit.integrity.break_detected` |
+| `integrity.createCheckpoint` | `audit.retention.manage` (step-up) | signed + audited in one tx |
+| `retention.get` | `audit.read` | |
+| `retention.setPolicy/createHold/releaseHold/run` | `audit.retention.manage` (step-up) | `run({dryRun:true})` previews |
 
-Raw HTTP: `GET /api/audit/exports/:exportId/download` — `audit.export` + step-up, owner-or-admin scope,
-streamed via `sendPrivateDownload`.
+Raw HTTP: `GET /api/audit/exports/:exportId/download` — `audit.export` + step-up, requester only, streamed via
+`sendPrivateDownload`. Durable `audit.export.download_attempted` BEFORE bytes; truthful
+`audit.export.downloaded` (`completed|failed|unknown`) after the stream ends.
 
 ## 5. Query AST (`server/modules/audit/query.ts`)
 
@@ -85,25 +92,26 @@ type Group = { kind: "group"; op: "and" | "or"; terms: (Term | Group)[] };
 interface AuditQuery { from: string; to: string; where?: Group }   // ISO; window ≤ 400 days
 ```
 
-Limits: depth ≤ 3, ≤ 30 terms, `in` ≤ 25 values. Fields: `category, event_name, action, outcome,
-severity (gte/lte on number), actor_ref, actor_role, resource_type, resource_public_id, reason_code,
-request_id, trace_id, correlation_id, job_id, package_id, import_id, delivery_id, provider,
-source_address_ref, origin, release_ref`. Compiled to parameterised Drizzle SQL only.
-Pagination: newest first, cursor on `(occurred_at, event_id)`.
+Limits: depth ≤ 3, ≤ 30 terms, `in` ≤ 25 values, ≤ 400 JSON nodes in `where` (checked iteratively before
+schema parsing; the schema itself is depth-specific, not recursive). Fields: `QUERY_FIELDS` in query.ts
+(per-field value grammar). Compiled to parameterised Drizzle SQL only. Pagination: newest first, cursor on
+`(occurred_at, event_id)`.
 
 ## 6. Audit event names emitted by this module
 
-`audit.search.executed`, `audit.event.viewed`, `audit.export.requested|completed|failed|downloaded`,
-`audit.saved_query.created|deleted`, `audit.case.created|status_changed|events_attached|note_added`,
-`audit.integrity.verified|break_detected`, `audit.checkpoint.created`, `audit.retention.policy_changed`,
-`audit.legal_hold.created|released`, `audit.retention.run`, `audit.note.dropped` (count of best-effort drops).
+`audit.search.executed`, `audit.event.viewed`, `audit.stats.viewed`, `audit.source_address.revealed`,
+`audit.export.requested|completed|failed|download_attempted|downloaded`, `audit.saved_query.created|deleted`,
+`audit.case.created|status_changed|events_attached|note_added|viewed`, `audit.integrity.verified|break_detected`,
+`audit.checkpoint.created`, `audit.retention.policy_changed`, `audit.legal_hold.created|released`,
+`audit.retention.started|preview_started|batch_removed|run|previewed`, `audit.note.dropped`.
 
 ## 7. Jobs and schedules
 
-`audit.chain.seal` (every 10 s), `audit.checkpoint.create` (hourly), `audit.export.generate`,
-`audit.retention.run` (daily; dry-run by default unless invoked by an admin with `dryRun: false`).
+`audit.chain.seal` (every 10 s), `audit.chain.sweep` (daily full-scan seal), `audit.checkpoint.create` (hourly),
+`audit.export.generate` (on request), `audit.retention.run` (daily; a REAL run, but it only applies policies an
+admin explicitly set — no policy ⇒ keep forever).
 
 ## 8. Health components
 
-`audit.store` (write probe/last failure), `audit.chain` (unsealed backlog, oldest unsealed age, last verify),
-`audit.notes` (best-effort queue depth, dropped count).
+`audit.store` (recent durable-write failures), `audit.chain` (unsealed backlog, oldest unsealed age vs 15 min
+horizon, last verify result), `audit.notes` (best-effort queue depth, dropped count).
