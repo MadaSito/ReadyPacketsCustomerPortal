@@ -43,7 +43,9 @@ Evidence classes: **automated-test** (a named test asserts it), **manual-check**
 | Notification e-mail (`orders.notify.mail`) goes through mailer templates | not-verified (templates registered; enqueue path not asserted) | — |
 | Compliance gate on customer order create | not-verified (optional port, not configured in tests) | — |
 | Admin workflow create/publish procedures | not-verified (service only; covered indirectly by `ensureDefault`) | — |
-| Customer and console UI (`client/src/features/orders`) | target (see that folder's tests once built) | — |
+| Customer and console UI renders loading/empty/error states, no built-in catalog, wizard submits once with idempotency key, tab-from-URL, staff-only tabs hidden from customers, transition requires note, reassign requires typed reference, price input validated | automated-test (jsdom) | client/src/features/orders/orders.test.tsx (17 tests) |
+| No axe violations per page family (list, detail, admin list, catalog, workflows, widget) | automated-test (jsdom + axe; colour contrast not evaluable in jsdom) | orders.test.tsx › "… without axe violations" |
+| Real browser, assistive technology, 320–1920 px layouts | not-verified | — |
 | WCAG 2.2 AA in a real browser and assistive technology; 320–1920px layout | not-verified | — |
 
 ## Known limits
