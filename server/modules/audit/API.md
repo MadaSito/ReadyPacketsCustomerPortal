@@ -45,9 +45,20 @@ the source IP is stored only encrypted (`audit_events.source_address:<event_id>`
 For other modules (SIEM, backup, portable):
 
 ```ts
-/** Commit-safe order: events in hash-chain sequence order (only committed+sealed events). cursor = opaque string or null. */
-readEventsAfter(cursor: string | null, limit: number /* 1..1000 */): Promise<{ events: AuditEnvelope[]; nextCursor: string | null; headSeq: number }>
-/** Privacy-safe projection for external forwarding: no actor_user_id, resource_public_id, session/source refs; pseudonymous refs only. */
+/**
+ * Commit-safe order: events in hash-chain sequence order (only committed+sealed events). cursor = opaque string or null.
+ * Seqs whose event is gone are skipped and counted: `pruned` = authenticated-looking retention tombstone exists,
+ * `missing` = no tombstone (unexplained loss: alert, then run verifyChain, which checks tombstone receipts).
+ * Retention-only windows are read through (≤ 20 pages per call), so `events: []` means caught up to `headSeq`
+ * (or 20 pages of removed rows: call again — nextCursor advanced).
+ */
+readEventsAfter(cursor: string | null, limit: number /* 1..1000 */): Promise<{ events: AuditEnvelope[]; nextCursor: string | null; headSeq: number; pruned: number; missing: number }>
+/**
+ * Privacy-safe projection for external forwarding: no actor_user_id, resource_public_id, session/source refs.
+ * Attributes: booleans always; string/number values only for keys in EXTERNAL_ATTRIBUTE_KEYS (fixed vocabularies:
+ * statuses, roles, formats, modes, versions, ports). Identifiers, references, slugs, hashes and amounts are withheld
+ * and counted in `dropped_attributes`. "local" exports keep all stored attributes.
+ */
 projectForExternal(event: AuditEnvelope): ExternalAuditEvent
 /** Chains committed-but-unsealed events (also scheduled every 10 s as job `audit.chain.seal`). */
 sealPending(): Promise<{ sealed: number; headSeq: number }>

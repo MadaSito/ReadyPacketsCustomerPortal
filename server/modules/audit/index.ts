@@ -27,7 +27,7 @@ type Tail<F> = F extends (ctx: AuditCtx, principal: P, ...rest: infer R) => infe
 
 export interface AuditModule extends ModuleLifecycle {
   /* ---- for other modules (SIEM, backup, portable) — no principal: trusted server-side callers only ---- */
-  readEventsAfter(cursor: string | null, limit: number): Promise<{ events: AuditEnvelope[]; nextCursor: string | null; headSeq: number }>;
+  readEventsAfter(cursor: string | null, limit: number): Promise<{ events: AuditEnvelope[]; nextCursor: string | null; headSeq: number; pruned: number; missing: number }>;
   projectForExternal(event: AuditEnvelope): ExternalAuditEvent;
   sealPending(options?: { fullScan?: boolean }): Promise<{ sealed: number; headSeq: number }>;
   verifyChain(options?: { fromSeq?: number; maxEvents?: number }): Promise<ChainVerification>;

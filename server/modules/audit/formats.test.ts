@@ -65,3 +65,22 @@ describe("JSONL", () => {
     expect((JSON.parse(line) as { correlation_id: string }).correlation_id).toBe("a\u2028b\u2029c\nd");
   });
 });
+
+describe("external projection allowlist", () => {
+  it("forwards flags and fixed-vocabulary keys, withholds identifiers and references (counted), keeps them locally", async () => {
+    const { projectForExternal } = await import("./envelope.js");
+    const { exportRecord } = await import("./formats.js");
+    const env = {
+      ...base, actor_user_id: 7, resource_public_id: "01JD0000000000000000000009", session_ref: "s".repeat(32), source_address_ref: null,
+      durability: "durable", dropped_attributes: 1,
+      attributes: { from_status: "open", to_status: "closed", password_updated: true, previous_reference: "RP-1001", owner_public_id: "01JD0000000000000000000002", total_minor: 1200 },
+    } as unknown as Parameters<typeof projectForExternal>[0];
+    const ext = projectForExternal(env);
+    expect(ext.attributes).toEqual({ from_status: "open", to_status: "closed", password_updated: true });
+    expect(ext.dropped_attributes).toBe(4);
+    expect(JSON.stringify(ext)).not.toContain("RP-1001");
+    const local = exportRecord(env, "local");
+    expect(local.attributes).toMatchObject({ previous_reference: "RP-1001", total_minor: 1200 });
+    expect(local.dropped_attributes).toBe(1);
+  });
+});

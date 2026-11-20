@@ -44,6 +44,11 @@ Evidence classes: **AT** = automated test (real MySQL where noted), **RV** = cod
 | UI exports: download only for completed/unexpired; `sessionFetch` with `no-store`; refuses non-attachment or size ≠ manifest | `audit.test.tsx` › exports | AT (jsdom + axe) |
 | UI retention: real run needs typed `REMOVE`, runs under step-up wrapper; saved searches/cases/retention views axe-clean | `audit.test.tsx` › retention, saved searches | AT (jsdom + axe) |
 | UI export download retry after HTTP `STEP_UP_REQUIRED` (403 JSON `safe.domainCode`) | code in `ExportsPage.tsx` | RV — not tested (step-up dialog not driven) |
+| Partial-range verify never overwrites global status with success; any break is persisted | `chain.test.ts` › partial-range success never overwrites | AT (MySQL) |
+| Query budget for attribute terms (≤ 3, ≤ 31 days) | `module.test.ts` › budgets unindexed attribute conditions | AT |
+| SIEM read: reads through retention-only windows; `pruned` vs `missing` counts; caught-up tail | `module.test.ts` › SIEM read continues past retention-only windows | AT (MySQL) |
+| External projection allowlist: booleans + vocabulary keys forwarded; ids/references/amounts withheld and counted; local keeps all | `formats.test.ts` › external projection allowlist | AT |
+| camelCase keys normalised; secret/PII keys keep booleans only | `emitter.test.ts` › normalises camelCase keys | AT |
 
 ## Known limitations (not done / not verified)
 
@@ -55,10 +60,16 @@ Evidence classes: **AT** = automated test (real MySQL where noted), **RV** = cod
   with a separate retention account holding `DELETE ON audit_events`. Not applied by migrations.
 - **Sealing horizon.** Transactions open longer than 15 minutes can commit events below the scan watermark; the
   daily full-scan sweep seals them, and verify reports `unsealedOlderThanHorizon`.
-- **No `MAX_EXECUTION_TIME`** on search/stats queries; attribute (JSON) filters are unindexed and scan the time window.
-- **Field allowlisting is pattern-based, not per-event typed.** Attributes pass a denylist of secret/PII shapes
-  plus a short-string charset; external projections copy all attributes. A per-event field registry with an
-  external allowlist is an open ADR item.
+- **No `MAX_EXECUTION_TIME`** on search/stats queries. Bound instead: attribute (JSON) terms ≤ 3 and only in
+  windows ≤ 31 days (`QUERY_TOO_MANY_ATTRIBUTE_TERMS`, `QUERY_ATTRIBUTE_RANGE_TOO_LONG`), ≤ 30 terms, ≤ 400 days.
+- **Attribute storage is pattern-based, not per-event typed.** Keys are normalised to snake_case; secret/PII-shaped
+  keys keep boolean flags only; strings pass a short charset. External projections (SIEM/syslog/"external"
+  exports) forward booleans plus a fixed-vocabulary key allowlist (`EXTERNAL_ATTRIBUTE_KEYS`); everything else is
+  withheld and counted. A per-event typed field registry remains an ADR item.
+- Exports read all pages in one REPEATABLE READ consistent-snapshot transaction (deletes after the snapshot are
+  invisible; prior retention reported as `retention_removed_in_window`). The concurrent-delete case is reasoned
+  from InnoDB MVCC, not exercised by a test (RV). `accessMode: "read only"` is not used (drizzle SQL bug).
+- Verifier status (`last_verify_ok`) is written only by full-chain runs or by any run that finds a break.
 - Session revocation is not re-checked inside mutation transactions (role/status are).
 - Concurrency of verify vs. sealing is bounded to the sampled head (statement-level reads, not one snapshot).
 - UI: jsdom + axe tests only; no browser layout, screen-reader or 320–1920 px visual verification (NV).

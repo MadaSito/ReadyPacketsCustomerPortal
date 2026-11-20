@@ -5,16 +5,16 @@
  */
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import { and, desc, eq, inArray, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import { conflict, notFound } from "../../core/errors.js";
 import { ulid, ULID_PATTERN } from "../../core/ids.js";
-import type { ClaimedJob, JobResult, SessionPrincipal } from "../../core/types.js";
+import type { ClaimedJob, Db, JobResult, SessionPrincipal } from "../../core/types.js";
 import { actorOf, assertActorCurrent, assertAuditCapability, type AuditCtx } from "./access.js";
 import { AUDIT_SCHEMA_VERSION } from "./envelope.js";
 import { CONTENT_TYPES, csvHeader, encodeRecord, exportRecord, type ExportFormat, type ExportProfile } from "./formats.js";
 import { afterCursor, compileQuery, encodeCursor, ORDER_NEWEST_FIRST, type AuditQuery } from "./query.js";
 import { rowToEnvelope } from "./rows.js";
-import { auditChain, auditEvents, auditExports } from "./schema.js";
+import { auditChain, auditEvents, auditExports, auditTombstones } from "./schema.js";
 
 export const EXPORT_JOB = "audit.export.generate";
 export const MAX_EXPORT_ROWS = 100_000;
@@ -57,8 +57,17 @@ export interface ExportManifest {
   /** Evidence snapshot: only events sealed at or below this chain seq and occurred at or before `snapshot_cutoff`. */
   chain_head_seq: number;
   snapshot_cutoff: string;
-  /** Retention may remove events inside the snapshot while the job runs; such rows are simply absent (never altered). */
+  /**
+   * All pages are read inside ONE read-only REPEATABLE READ transaction with a consistent snapshot (InnoDB MVCC):
+   * retention or any delete committed after the snapshot started cannot remove rows from the export, and
+   * concurrent inserts are excluded by `chain_head_seq`/`snapshot_cutoff`. "complete" therefore means "every
+   * matching event present in the store at snapshot time"; events removed by retention BEFORE the snapshot are
+   * absent and reported (unfiltered, by time window) in `retention_removed_in_window`.
+   */
   completeness: "complete" | "truncated";
+  snapshot_isolation: "repeatable_read_consistent_snapshot";
+  /** Tombstones (authenticated retention removals) with occurred_at in the query window and seq ≤ head. They may or may not have matched the filter. */
+  retention_removed_in_window: number;
   installation_ref: string;
   generated_at: string;
   order: "occurred_at desc, event_id desc";
@@ -140,6 +149,7 @@ export async function listExports(ctx: AuditCtx, principal: SessionPrincipal): P
 /** Streams pages of the query as encoded lines; stops at MAX_EXPORT_ROWS. */
 async function* encodedRows(
   ctx: AuditCtx,
+  reader: Db,
   query: AuditQuery,
   format: ExportFormat,
   profile: ExportProfile,
@@ -152,7 +162,7 @@ async function* encodedRows(
   let cursor: string | null = null;
   for (;;) {
     if (job?.signal.aborted) throw new Error("EXPORT_CANCELED");
-    const rows = await ctx.deps.db
+    const rows = await reader
       .select({ event: auditEvents, seq: auditChain.seq })
       .from(auditEvents)
       .innerJoin(auditChain, eq(auditChain.eventRowId, auditEvents.id))
@@ -210,16 +220,31 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
   const state = { rows: 0, truncated: false };
   try {
     const hash = createHash("sha256");
-    const source = Readable.from(
-      (async function* () {
-        for await (const chunk of encodedRows(ctx, stored.query, format, stored.profile, state, snapshot, job)) {
-          const buf = Buffer.from(chunk, "utf8");
-          hash.update(buf);
-          yield buf;
-        }
-      })(),
+    // One consistent snapshot (SELECT-only) for every page and the tombstone count (no other DB access inside it).
+    const { info, retentionRemoved } = await ctx.deps.db.transaction(
+      async (snap) => {
+        const reader = snap as unknown as Db;
+        const source = Readable.from(
+          (async function* () {
+            for await (const chunk of encodedRows(ctx, reader, stored.query, format, stored.profile, state, snapshot, job)) {
+              const buf = Buffer.from(chunk, "utf8");
+              hash.update(buf);
+              yield buf;
+            }
+          })(),
+        );
+        const put = await ctx.deps.storage.put(key, source, { maxBytes: MAX_EXPORT_BYTES });
+        const window = compileQuery(stored.query);
+        const [tombs] = await reader
+          .select({ n: sql<number>`count(*)` })
+          .from(auditTombstones)
+          .where(and(gte(auditTombstones.occurredAt, window.from), lt(auditTombstones.occurredAt, window.to), lte(auditTombstones.seq, snapshot.headSeq)));
+        return { info: put, retentionRemoved: Number(tombs?.n ?? 0) };
+      },
+      // accessMode "read only" is not combined: drizzle emits "with consistent snapshot read only" (missing comma,
+      // ER_PARSE_ERROR on MySQL 8). The callback issues only SELECTs.
+      { isolationLevel: "repeatable read", withConsistentSnapshot: true },
     );
-    const info = await ctx.deps.storage.put(key, source, { maxBytes: MAX_EXPORT_BYTES });
     const manifest: ExportManifest = {
       manifest_version: "rp.audit.export/1",
       export_id: exportId,
@@ -235,6 +260,8 @@ export async function generateExport(ctx: AuditCtx, job: ClaimedJob<{ exportId?:
       chain_head_seq: snapshot.headSeq,
       snapshot_cutoff: snapshot.cutoff.toISOString(),
       completeness: state.truncated ? "truncated" : "complete",
+      snapshot_isolation: "repeatable_read_consistent_snapshot",
+      retention_removed_in_window: retentionRemoved,
       installation_ref: ctx.deps.config.installationId,
       generated_at: ctx.deps.clock.now().toISOString(),
       order: "occurred_at desc, event_id desc",

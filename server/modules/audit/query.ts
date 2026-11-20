@@ -20,6 +20,9 @@ export const MAX_DEPTH = 3;
 export const MAX_TERMS = 30;
 export const MAX_IN = 25;
 export const MAX_WINDOW_DAYS = 400;
+/** Attribute (JSON path) terms cannot use an index: they are limited in number and in the window they scan. */
+export const MAX_ATTRIBUTE_TERMS = 3;
+export const MAX_ATTRIBUTE_WINDOW_DAYS = 31;
 export const MAX_PAGE = 100;
 
 type Op = "eq" | "in" | "prefix" | "gte" | "lte";
@@ -135,7 +138,7 @@ export type AuditQuery = z.infer<typeof auditQuerySchema>;
 
 const bad = (reason: string, message: string) => validation(reason, message);
 
-function compileGroup(group: Group, depth: number, budget: { terms: number }): SQL {
+function compileGroup(group: Group, depth: number, budget: { terms: number; attributeTerms: number }): SQL {
   if (depth > MAX_DEPTH) throw bad("QUERY_TOO_DEEP", `Filters can be nested at most ${MAX_DEPTH} levels deep.`);
   const parts: SQL[] = [];
   for (const term of group.terms) {
@@ -145,6 +148,12 @@ function compileGroup(group: Group, depth: number, budget: { terms: number }): S
     }
     budget.terms += 1;
     if (budget.terms > MAX_TERMS) throw bad("QUERY_TOO_LARGE", `A query may contain at most ${MAX_TERMS} conditions.`);
+    if (term.field === "attribute") {
+      budget.attributeTerms += 1;
+      if (budget.attributeTerms > MAX_ATTRIBUTE_TERMS) {
+        throw bad("QUERY_TOO_MANY_ATTRIBUTE_TERMS", `A query may contain at most ${MAX_ATTRIBUTE_TERMS} attribute conditions.`);
+      }
+    }
     parts.push(compileTerm(term));
   }
   const combined = group.op === "and" ? and(...parts) : or(...parts);
@@ -198,9 +207,12 @@ export function compileQuery(input: unknown): CompiledQuery {
   const to = new Date(query.to);
   if (!(from < to)) throw bad("QUERY_TIME_RANGE_INVALID", "The start of the time range must be before its end.");
   if (to.getTime() - from.getTime() > MAX_WINDOW_DAYS * 86_400_000) throw bad("QUERY_TIME_RANGE_TOO_LONG", `Search at most ${MAX_WINDOW_DAYS} days at a time.`);
-  const budget = { terms: 0 };
+  const budget = { terms: 0, attributeTerms: 0 };
   const parts: SQL[] = [gte(auditEvents.occurredAt, from), lt(auditEvents.occurredAt, to)];
   if (query.where) parts.push(compileGroup(query.where, 1, budget));
+  if (budget.attributeTerms > 0 && to.getTime() - from.getTime() > MAX_ATTRIBUTE_WINDOW_DAYS * 86_400_000) {
+    throw bad("QUERY_ATTRIBUTE_RANGE_TOO_LONG", `Attribute conditions can search at most ${MAX_ATTRIBUTE_WINDOW_DAYS} days at a time.`);
+  }
   return { where: and(...parts)!, from, to, termCount: budget.terms };
 }
 

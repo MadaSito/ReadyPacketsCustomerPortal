@@ -22,7 +22,15 @@ type Exported = ExternalAuditEvent & Partial<Pick<AuditEnvelope, "actor_user_id"
 export function exportRecord(envelope: AuditEnvelope, profile: ExportProfile): Exported {
   const external = projectForExternal(envelope);
   if (profile === "external") return external;
-  return { ...external, actor_user_id: envelope.actor_user_id, resource_public_id: envelope.resource_public_id, session_ref: envelope.session_ref };
+  // Local evidence keeps every stored (already sanitised) attribute and the true dropped count.
+  return {
+    ...external,
+    attributes: { ...envelope.attributes },
+    dropped_attributes: envelope.dropped_attributes,
+    actor_user_id: envelope.actor_user_id,
+    resource_public_id: envelope.resource_public_id,
+    session_ref: envelope.session_ref,
+  };
 }
 
 export function toJsonLine(record: Exported): string {

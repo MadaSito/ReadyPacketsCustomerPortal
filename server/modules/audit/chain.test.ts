@@ -92,6 +92,23 @@ describe("audit hash chain (real MySQL)", () => {
     expect((await chain.verify()).firstBreak).toMatchObject({ seq: 3, reason: "EVENT_MISSING" });
   });
 
+  it("a partial-range success never overwrites the global verifier status; any break is persisted", async () => {
+    await emit(6);
+    await chain.sealPending();
+    const status = async () => (await t.db.select().from(auditChainHead))[0]!;
+    expect((await chain.verify({ fromSeq: 4 })).ok).toBe(true);
+    expect((await status()).lastVerifiedAt).toBeNull();
+    expect((await chain.verify({ maxEvents: 2 })).complete).toBe(false);
+    expect((await status()).lastVerifiedAt).toBeNull();
+    const [victim] = await t.db.select().from(auditChain).where(eq(auditChain.seq, 5));
+    await t.db.update(auditEvents).set({ outcome: "failed" }).where(eq(auditEvents.id, victim!.eventRowId));
+    expect((await chain.verify({ fromSeq: 4 })).ok).toBe(false);
+    expect(await status()).toMatchObject({ lastVerifyOk: false, lastVerifyBreakSeq: 5 });
+    // A later PARTIAL success must not clear the recorded break.
+    expect((await chain.verify({ fromSeq: 1, maxEvents: 3 })).ok).toBe(true);
+    expect(await status()).toMatchObject({ lastVerifyOk: false, lastVerifyBreakSeq: 5 });
+  });
+
   it("detects deletion of a chain link (seq gap)", async () => {
     await emit(5);
     await chain.sealPending();

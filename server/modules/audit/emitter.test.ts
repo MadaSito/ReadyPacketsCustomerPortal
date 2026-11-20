@@ -69,6 +69,21 @@ describe("audit emitter (real MySQL)", () => {
     expect(JSON.stringify(row)).not.toContain("sess_public_1");
   });
 
+  it("normalises camelCase keys and keeps boolean flags about secrets, never their values", async () => {
+    await emitter.record({
+      category: "admin",
+      eventName: "integration.smtp.updated",
+      action: "update",
+      outcome: "completed",
+      attributes: { fromStatus: "open", toStatus: "closed", password_updated: true, secrets_included: false, password: "hunter2-hunter2", hasReviewNote: true, from_status: "dup" },
+    });
+    const [row] = await t.db.select().from(auditEvents);
+    const env = rowToEnvelope(row!);
+    expect(env.attributes).toEqual({ from_status: "open", to_status: "closed", password_updated: true, secrets_included: false, has_review_note: true });
+    expect(env.dropped_attributes).toBe(2);
+    expect(JSON.stringify(row)).not.toContain("hunter2");
+  });
+
   it("drops unsafe attributes instead of storing them", async () => {
     await emitter.record({
       category: "security",

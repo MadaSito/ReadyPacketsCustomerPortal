@@ -145,6 +145,17 @@ describe("audit center (real MySQL, real emitter)", () => {
       expect(() => compileQuery(wide)).toThrow(DomainError);
       expect(auditQuerySchema.safeParse({ ...window(), where: { kind: "group", op: "and", terms: [{ field: "category", op: "in", value: Array.from({ length: 26 }, () => "a") }] } }).success).toBe(false);
     });
+
+    it("budgets unindexed attribute conditions: at most 3 terms and a 31-day window", () => {
+      const attr = (i: number) => ({ field: "attribute", key: `k${i}`, op: "eq", value: "open" });
+      const g = (n: number) => ({ kind: "group", op: "and", terms: Array.from({ length: n }, (_, i) => attr(i)) });
+      const month = { from: new Date(h.clock.now().getTime() - 30 * DAY).toISOString(), to: h.clock.now().toISOString() };
+      const quarter = { from: new Date(h.clock.now().getTime() - 90 * DAY).toISOString(), to: h.clock.now().toISOString() };
+      expect(compileQuery({ ...month, where: g(3) }).termCount).toBe(3);
+      expect(() => compileQuery({ ...month, where: g(4) })).toThrow(DomainError);
+      expect(() => compileQuery({ ...quarter, where: g(1) })).toThrow(DomainError);
+      expect(compileQuery({ ...quarter, where: { kind: "group", op: "and", terms: [{ field: "category", op: "eq", value: "security" }] } }).termCount).toBe(1);
+    });
   });
 
   describe("authorization (zero trust, re-checked in the service)", () => {
@@ -232,6 +243,25 @@ describe("audit center (real MySQL, real emitter)", () => {
       const verify = await mod.verifyIntegrity(admin);
       expect(verify).toMatchObject({ ok: true, pruned: 3 });
       expect(await countEvents("audit.integrity.verified")).toBe(1);
+    });
+
+    it("SIEM read continues past retention-only windows and separates pruned from unexplained missing seqs", async () => {
+      await emit(3, { occurredAt: new Date(h.clock.now().getTime() - 100 * DAY) });
+      await emit(3);
+      await mod.setRetentionPolicy(admin, { category: "business", retainDays: 30 });
+      await mod.sealPending();
+      await mod.runRetention(admin, false);
+      const first = await mod.readEventsAfter(null, 2);
+      expect(first.pruned).toBe(3);
+      expect(first.missing).toBe(0);
+      expect(first.events.length).toBeGreaterThan(0);
+      const [victim] = await t.db.select().from(auditChain).where(eq(auditChain.seq, 5));
+      await t.db.delete(auditEvents).where(eq(auditEvents.id, victim!.eventRowId));
+      const again = await mod.readEventsAfter(null, 1000);
+      expect(again).toMatchObject({ pruned: 3, missing: 1 });
+      const tail = await mod.readEventsAfter(again.nextCursor, 1000);
+      expect(tail.events).toHaveLength(0);
+      expect(tail.nextCursor).toBe(again.nextCursor);
     });
 
     it("a DB-only actor cannot disguise a deletion as pruning (tombstone receipts are keyed)", async () => {

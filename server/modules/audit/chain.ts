@@ -355,10 +355,14 @@ export function createChainService(deps: { db: Db; clock: Clock; logger: Logger;
         verifiedAt: now.toISOString(),
       };
       const breakInfo = result.firstBreak as ChainVerification["firstBreak"];
-      await deps.db
-        .update(auditChainHead)
-        .set({ lastVerifiedAt: now, lastVerifyOk: result.ok, lastVerifyBreakSeq: breakInfo ? breakInfo.seq : null })
-        .where(eq(auditChainHead.id, HEAD_ID));
+      // Only a full-chain pass may claim "verified"; a partial range never overwrites global status with success.
+      // A break found in ANY range is always persisted (fail closed).
+      if (!result.ok || (fromSeq === 1 && complete && lastSeq >= head.headSeq)) {
+        await deps.db
+          .update(auditChainHead)
+          .set({ lastVerifiedAt: now, lastVerifyOk: result.ok, lastVerifyBreakSeq: breakInfo ? breakInfo.seq : null })
+          .where(eq(auditChainHead.id, HEAD_ID));
+      }
       if (!result.ok) log.error("audit chain verification failed", { break_seq: breakInfo?.seq, reason: breakInfo?.reason });
       return result;
     },

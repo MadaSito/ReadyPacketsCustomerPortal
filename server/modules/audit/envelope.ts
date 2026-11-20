@@ -120,9 +120,22 @@ export function classifyAddress(address: string | undefined): SourceAddressClass
 }
 
 /** Validates one attribute; returns the safe value or undefined if it must be dropped. */
+const PII_KEY = /email|name|ip_?addr|address|phone|filename|body|sql|query_text|message|note|comment|user_agent/;
+
+/**
+ * Canonical attribute key: lower camelCase (`fromStatus`) becomes snake_case (`from_status`); anything else
+ * is returned unchanged and must already match ATTRIBUTE_KEY_RE. Keeps evidence from modules that use camelCase.
+ */
+export function normaliseAttributeKey(key: string): string {
+  return /^[a-z][a-zA-Z0-9]*$/.test(key) && /[A-Z]/.test(key) ? key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`) : key;
+}
+
 export function sanitiseAttribute(key: string, value: unknown): SafeAttributeValue | undefined {
-  if (!ATTRIBUTE_KEY_RE.test(key) || SENSITIVE_KEY.test(key) || /email|name|ip_?addr|address|phone|filename|body|sql|query_text|message|note|comment|user_agent/.test(key)) {
-    return undefined;
+  if (!ATTRIBUTE_KEY_RE.test(key)) return undefined;
+  if (SENSITIVE_KEY.test(key) || PII_KEY.test(key)) {
+    // A flag ABOUT a secret or personal field (`password_updated: true`, `secrets_included: false`) carries no
+    // secret material; any other value type under such a key is dropped.
+    return typeof value === "boolean" ? value : undefined;
   }
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") {
@@ -194,9 +207,10 @@ export function buildEnvelope(input: AuditEventInput, ctx: EnvelopeContext): Aud
       dropped += 1;
       continue;
     }
-    const safe = sanitiseAttribute(key, rawAttributes[key]);
+    const canonical = normaliseAttributeKey(key);
+    const safe = Object.hasOwn(attributes, canonical) ? undefined : sanitiseAttribute(canonical, rawAttributes[key]);
     if (safe === undefined) dropped += 1;
-    else attributes[key] = safe;
+    else attributes[canonical] = safe;
   }
   const safeCounts: Record<string, number> = {};
   for (const [key, value] of Object.entries(input.safeCounts ?? {})) {
@@ -327,7 +341,28 @@ export function canonicalBytes(envelope: AuditEnvelope): string {
   return JSON.stringify(CANONICAL_FIELDS.map((field) => [field, canonicalValue(envelope[field])]));
 }
 
+/**
+ * Attribute keys whose string/number values may leave the installation (SIEM, syslog, "external" exports).
+ * They carry fixed vocabularies (states, roles, formats, modes) or small technical numbers — never identifiers,
+ * references, names, amounts or hashes. Booleans under any accepted key are flags and are always forwarded.
+ * Everything else stays local (local exports and the audit center) and is counted in `dropped_attributes`.
+ */
+export const EXTERNAL_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "action_kind", "audience", "auth_method", "category", "continuity_mode", "decision", "disposition", "field", "format",
+  "from_priority", "from_role", "from_state", "from_status", "integrity", "key_custody", "key_readiness", "match_type",
+  "method", "min_severity", "mode", "next_step", "phase", "previous_status", "priority", "procedure", "profile",
+  "protocol", "purpose", "record_type", "role", "scope_kind", "status", "target", "tls_mode", "to_priority", "to_role",
+  "to_state", "to_status", "event_type", "derived_invoice_status", "port", "version", "version_number",
+  "revision_number", "workflow_version", "keep_last_count", "max_age_days", "tolerance_seconds",
+]);
+
 export function projectForExternal(envelope: AuditEnvelope): ExternalAuditEvent {
   const { actor_user_id: _a, resource_public_id: _r, session_ref: _s, source_address_ref: _ip, durability: _d, ...rest } = envelope;
-  return { ...rest, attributes: { ...rest.attributes }, safe_counts: { ...rest.safe_counts } };
+  const attributes: Record<string, SafeAttributeValue> = {};
+  let withheld = 0;
+  for (const [key, value] of Object.entries(rest.attributes)) {
+    if (typeof value === "boolean" || value === null || EXTERNAL_ATTRIBUTE_KEYS.has(key)) attributes[key] = value;
+    else withheld += 1;
+  }
+  return { ...rest, attributes, safe_counts: { ...rest.safe_counts }, dropped_attributes: rest.dropped_attributes + withheld };
 }
