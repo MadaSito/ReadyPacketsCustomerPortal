@@ -90,6 +90,8 @@
     "build:preview": "vite build --mode preview && pnpm build:server",
     "build:server": "node scripts/build-server.mjs",
     "start": "node dist/server/main.js",
+    "ops:migrate": "node dist/ops/migrate.js",
+    "ops:admin-create": "node dist/ops/create-admin.js",
     "typecheck": "node node_modules/typescript7/bin/tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",

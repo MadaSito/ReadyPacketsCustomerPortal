@@ -4,6 +4,7 @@
  *   RP_ROLE=worker  background jobs only (readypackets-worker.service)
  *   RP_ROLE=all     both in one process  (development / preview)
  */
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { ConfigError, loadConfig } from "./config/env.js";
 import { createContainer } from "./container.js";
@@ -27,7 +28,13 @@ async function main(): Promise<void> {
 
   const shutdownTasks: (() => Promise<void>)[] = [];
   if (config.role === "web" || config.role === "all") {
-    const staticDir = process.env.RP_STATIC_DIR ?? path.resolve(import.meta.dirname, "../dist/public");
+    // Bundled layout: dist/server/main.js next to dist/public. Source layout (tsx): server/main.ts.
+    const staticDir =
+      process.env.RP_STATIC_DIR ??
+      [path.resolve(import.meta.dirname, "../public"), path.resolve(import.meta.dirname, "../dist/public")].find((dir) =>
+        existsSync(path.join(dir, "index.html")),
+      ) ??
+      path.resolve(import.meta.dirname, "../public");
     const app = createApp(services, { staticDir });
     const server = app.listen(config.port, config.host, () => {
       log.info("http listening", { host: config.host, port: config.port, profile: config.deploymentProfile });
