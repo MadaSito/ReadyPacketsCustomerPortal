@@ -104,6 +104,23 @@ preflightImportOrder(raw: unknown): { ok: true; input } | { ok: false; reasonCod
 checkCatalogViability(items: { productPublicId?: string; name: string; currency: string }[]): Promise<{ matched: number; unmatched: number }>
 // Imported line items are snapshots — they never need a live catalog product; this is informational for dry-run plans.
 
+// Increment 02 (packets). PortableOrder also carries subtotalMinor, discountMinor, discountLabel (string|null);
+//   line items carry packetNumber (number|null), tier ("Basic"|"Standard"|"Premium"|null), outcome, timeline, deliverables {title, detail}[].
+//   ImportOrderInput accepts the same fields as OPTIONAL (absent ⇒ subtotal = total + discount, discount 0, label null, no packet).
+//   Preflight: subtotal − discount = total, 0 ≤ discount ≤ subtotal, Σ lines = subtotal, packetNumber/tier both set or both null.
+
+// Production webhooks (integrations_engineer): trusted — the caller authorises first. Runs in the caller's tx, no locks.
+getProductionScope(orderId: number, opts?: { tx?: DbOrTx }): Promise<{ orderId; orderPublicId; reference; ownerUserId; statusKey;
+  lockState; origin; packets: { packetNumber: number; tier: "Basic" | "Standard" | "Premium" }[] /* ascending */; otherItemCount: number } | null>
+
+// Offerings import (scripts/ops/catalog-import.ts, portable_contract_engineer)
+catalog.upsertFromOfferings(actor: SessionPrincipal | { system: "ops.catalog_import" }, doc: OfferingsImportInput, opts?: { dryRun?: boolean }):
+  Promise<{ dryRun; groups: { created; updated; unchanged }; products: { created; versioned; unchanged }; bundleRule: "created" | "updated" | "unchanged" | "skipped" }>
+// One transaction. A session actor is re-validated in-tx (catalog.manage); the system actor is in-process only (never routed) and is
+// audited as role "system". Matches groupKey/productKey; new version only when terms differ; never deletes; never changes `active`;
+// writes orders.bundle_rule (enabled) when the doc has a bundle. dryRun runs every check, skips the bundle write, and rolls back.
+// Errors: OFFERINGS_INVALID, OFFERINGS_DUPLICATE_KEY, GROUP_KEY_TAKEN, PACKET_NUMBER_TAKEN, PACKET_TIER_TAKEN, PRODUCT_KEY_TAKEN.
+
 // Engagement search provider (bounded)
 searchOrders(principal, query: string /* 2..64 chars */, limit ≤ 20): Promise<{ publicId; reference; projectName; statusLabel; updatedAt }[]>
 ```
@@ -120,11 +137,12 @@ Reads (O-02): `orders.get`, `getOrderSummary` and `sharing.list` authorize and p
 
 | Procedure | Guard | Notes |
 | --- | --- | --- |
-| `catalog.list` | protected | active products of active groups, current version |
+| `catalog.list` | protected | active products of active groups, current version; groups carry `groupKey`, `packetNumber`; products carry `packetNumber`, `tier`, `outcome`, `timeline`, `deliverables` |
+| `quote` | protected | `{ items }` (same shape as create) ⇒ `OrderQuote { currency, subtotalMinor, discountMinor, discountLabel, totalMinor, bundle \| null }`; same validation and pricing as create; writes nothing |
 | `list` | protected | accessible orders, cursor pagination, `status?` filter |
 | `get` | protected | read-checked detail: items, customer-visible history + notes, my accessRole, lock, allowed transitions for me |
 | `summary` | protected | read-checked `OrderSummary` |
-| `create` | protected + `orders.create` | `{ projectName, items: [{ productPublicId, quantity }], note? , idempotencyKey }` |
+| `create` | protected + `orders.create` | `{ projectName, items: [{ productPublicId, quantity }], note? , idempotencyKey }`. Packet items: quantity exactly 1 (`PACKET_QUANTITY_ONE`), one tier per packet (`PACKET_TIER_CONFLICT`). Subtotal, discount and total are computed on the server and stored on the order; the client never sends amounts |
 | `update` | protected | `{ orderId, expectedVersion, projectName }` write kind=order |
 | `addNote` | protected | customer-visible note (staff may pass `visibility: "internal"`) |
 | `transition` | protected | `{ orderId, expectedVersion, toStatus, note? }` — workflow decides who may trigger |
@@ -137,7 +155,7 @@ Reads (O-02): `orders.get`, `getOrderSummary` and `sharing.list` authorize and p
 | `admin.setLock` | staff + `orders.manage` (legal_hold / unlock imported: admin) | |
 | `admin.changeReference` | admin + `orders.identifiers.change` (step-up) | retired reference reserved forever |
 | `admin.reassign` | admin + `orders.reassign` (step-up) | `{ orderId, targetCustomerPublicId, expectedVersion, operationId, reasonCode }` |
-| `admin.catalog.*` | admin + `catalog.manage` | groups/products CRUD; price/name change ⇒ new immutable product version |
+| `admin.catalog.*` | admin + `catalog.manage` | groups/products CRUD; price/name/description/features/outcome/timeline/deliverables change ⇒ new immutable product version. Packet placement: `packetNumber` + `tier` both set or both null and equal to the group's packet number (`PACKET_PLACEMENT_INCOMPLETE`, `PACKET_GROUP_MISMATCH`, `PACKET_TIER_TAKEN`). `bundleRule` (query) / `updateBundleRule({ rule })` (`BUNDLE_RULE_INVALID`) |
 | `admin.workflows.*` | admin + `workflows.manage` | versioned definitions; orders keep their bound version |
 
 ## 4. Audit events (fixed names)
@@ -145,11 +163,11 @@ Reads (O-02): `orders.get`, `getOrderSummary` and `sharing.list` authorize and p
 `order.created`, `order.updated`, `order.note.added`, `order.status.changed`, `order.transition.denied`, `order.lock.changed`,
 `order.reference.changed`, `order.reassigned`, `order.reassign.refused`, `order.share.invited`, `order.share.accepted`,
 `order.share.declined`, `order.share.revoked`, `order.imported`, `authz.order.denied`, `catalog.group.changed`,
-`catalog.product.changed`, `workflow.changed`.
+`catalog.product.changed`, `catalog.bundle_rule.changed`, `workflow.changed`. Catalog events carry `packet_number`, `tier` and, for the import, `source: "offerings_import"`; `order.created` carries `discount_minor`.
 
 ## 5. Mail templates, settings, health
 
 - Mail: `orders.status_changed` (vars: `reference`, `statusLabel`, `link`), `orders.share_invited` (vars: `reference`, `link`).
-- Settings: `orders.reference.prefix` (default `RP`), `orders.notify.mail` (default false — in-app notifications always), `orders.sharing.invite_ttl_days` (default 14).
+- Settings: `orders.reference.prefix` (default `RP`), `orders.notify.mail` (default false — in-app notifications always), `orders.sharing.invite_ttl_days` (default 14), `orders.bundle_rule` `{ enabled, requiredPacketNumbers, discountPercent, label }` (default disabled). Discount = round-half-up(subtotal × percent / 100) in minor units on the whole order subtotal, applied only when every required packet is present; capped at the subtotal.
 - Health: `orders.catalog` (`not_configured` while the catalog is empty), `orders.workflow` (`failing` if no default workflow).
-- Demo seed: `seedOrdersDemo(ordersModule, adminPrincipal, { currency? })` exported from `server/modules/orders/demoSeed.ts` — clearly synthetic, never run automatically.
+- Demo seed: `seedOrdersDemo(ordersModule, adminPrincipal, { currency? })` exported from `server/modules/orders/demoSeed.ts` — clearly synthetic, never run automatically, and only when the catalog is empty. For a packet demo, import the offerings file through `catalog.upsertFromOfferings` and create orders with `orders.create` using `{ productPublicId, quantity: 1 }` per packet.

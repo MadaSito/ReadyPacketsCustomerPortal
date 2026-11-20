@@ -50,7 +50,17 @@ Evidence classes: **automated-test** (a named test asserts it), **manual-check**
 | Notification e-mail (`orders.notify.mail`) goes through mailer templates | not-verified (templates registered; enqueue path not asserted) | — |
 | Compliance gate on customer order create | not-verified (optional port, not configured in tests) | — |
 | Admin workflow create/publish procedures | not-verified (service only; covered indirectly by `ensureDefault`) | — |
-| Customer and console UI renders loading/empty/error states, no built-in catalog, wizard submits once with idempotency key, tab-from-URL, staff-only tabs hidden from customers, transition requires note, reassign requires typed reference, price input validated | automated-test (jsdom) | client/src/features/orders/orders.test.tsx (17 tests) |
+| Packet catalog fields stored and returned; features = deliverable titles; placement rules (pair, group match, one product per packet+tier, unique packet number and group key) | automated-test | packets.test › packet catalog › stores and returns … ; … rejects incomplete placement … |
+| Outcome/timeline/deliverables change ⇒ new version; omitted fields kept | automated-test | packets.test › packet catalog › an outcome/timeline/deliverables change … |
+| Offerings import: idempotent by key, versions only changed terms, dry run writes nothing, system actor audited as `system`, invalid doc refused | automated-test | packets.test › … › upsertFromOfferings is idempotent … |
+| Bundle rule edit validated, audited, admin + `catalog.manage` only | automated-test | packets.test › … › admin bundle rule edit … |
+| Packet quantity 1 and one tier per packet on quote and create; non-packet quantities unchanged | automated-test | packets.test › … › enforces quantity 1 and one tier per packet … |
+| Server-side discount (round half up), quote = create figures, snapshot of tier/outcome/timeline/deliverables, amounts survive catalog changes | automated-test | packets.test › … › quotes the bundle hint … ; pricing (pure) › rounds half up … |
+| `getProductionScope`: sorted packets, other items counted, caller tx honoured, null when missing | automated-test | packets.test › … › quotes the bundle hint … |
+| Disabled rule ⇒ no discount, `bundle: null` | automated-test | packets.test › … › disabled rule … |
+| Packet wizard (picker, server-quoted totals, review discount, quantity-1 items), packet rule error message, order detail packet terms and discount, admin packet fields and bundle rule dialog | automated-test (jsdom + axe) | orders.test.tsx › new order wizard › packet catalog … ; increment 02 display › … |
+| Portable v3 fields round trip through the portable module | not-verified here (collectors are owned by portable_ops_engineer) | — |
+| Customer and console UI renders loading/empty/error states, no built-in catalog, wizard submits once with idempotency key, tab-from-URL, staff-only tabs hidden from customers, transition requires note, reassign requires typed reference, price input validated | automated-test (jsdom) | client/src/features/orders/orders.test.tsx (30 tests) |
 | No axe violations per page family (list, detail, admin list, catalog, workflows, widget) | automated-test (jsdom + axe; colour contrast not evaluable in jsdom) | orders.test.tsx › "… without axe violations" |
 | Real browser, assistive technology, 320–1920 px layouts | not-verified | — |
 | WCAG 2.2 AA in a real browser and assistive technology; 320–1920px layout | not-verified | — |

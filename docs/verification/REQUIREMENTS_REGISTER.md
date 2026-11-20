@@ -234,19 +234,31 @@ Abbreviated paths: `id/` = `server/modules/identity/`, `as/` = `server/modules/a
 | ARCH-9.3 | Preview profile cannot run on readypackets.com | platform | `server/config/env.ts` | `env.test.ts` "never allows the preview profile on readypackets.com or any subdomain, in any NODE_ENV…", "requires the exact synthetic-data acknowledgement…"; `cl/app/review.test.tsx` "shows a permanent, non-dismissible banner…" | Verified by automated test — H-3 residual (preview with `NODE_ENV=production` on a non-readypackets host) mitigated and accepted in `86d4ec1` (REVIEW-http-jobs) |
 | ARCH-10 | Portal `noindex`, analytics consent | http, integrations | ADR 0010, 0011 | See PI-16, PI-17 | Partially implemented — inherits PI-17 (INT-01 open); noindex verified per PI-16 |
 
+## Increment 02 — Master Offerings Matrix v3.0 (orders part, contract §B)
+
+Source: `docs/engineering/INCREMENT_02_CONTRACT.md` (feb3603). Sections A, C, D and E have other owners and are added
+here when they report. Prices and offerings are data (`data/catalog/…`), never code; all tests use synthetic packets.
+
+| ID | Requirement (short quote) | Owner | Implementation | Evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| INC02-B1 | Packet catalog fields (packet number, tier, outcome, timeline, deliverables) "both set or both null"; versioned | orders | `or/schema.ts`, `or/catalog.ts` | `or/packets.test.ts` "stores and returns groupKey, packetNumber, tier…", "rejects incomplete placement…", "an outcome/timeline/deliverables change writes a new version…" [db] | Verified by automated test |
+| INC02-B2 | "quantity exactly 1, at most one tier per packet"; discount "computed on the server; the client never sends amounts" | orders | `or/pricing.ts`, `or/orderService.ts` (`create`, `quote`) | `or/packets.test.ts` "enforces quantity 1 and one tier per packet…", "quotes the bundle hint, then applies the discount server-side…", "rounds half up…", "disabled rule…" [db]/[unit]; `cl/features/orders/orders.test.tsx` "packet catalog: picker + server quote…" [jsdom] | Verified by automated test |
+| INC02-B3 | `getProductionScope` in the caller's transaction; idempotent audited offerings import that never deletes | orders | `or/orderService.ts`, `or/catalog.ts` (`upsertFromOfferings`) | `or/packets.test.ts` "quotes the bundle hint…" (scope), "upsertFromOfferings is idempotent…", "admin bundle rule edit…" [db] | Verified by automated test — the ops script itself (`scripts/ops/catalog-import.ts`) is section A |
+| INC02-B4 | Admin catalog edits packet fields and the bundle rule; order detail shows tier, outcome, timeline, deliverables and subtotal/discount/total | orders | `cl/features/orders/pages/AdminCatalogPage.tsx`, `OrderDetailView.tsx`, `NewOrderPage.tsx` | `cl/features/orders/orders.test.tsx` "admin catalog shows packet groups and tiers…", "order detail shows tier, outcome…" [jsdom + axe] | Verified by automated test (jsdom only; no browser check recorded yet) |
+
 ## Summary
 
-Counts by primary status across all 130 rows above (PI 17, MP 104, ARCH 9), computed from the Status column
-at refresh:
+Counts by primary status across all 134 rows above (PI 17, MP 104, ARCH 9, INC02 4), computed from the Status
+column at refresh:
 
 | Status | Count |
 | --- | --- |
-| Verified by automated test | 74 |
+| Verified by automated test | 78 |
 | Partially implemented | 34 |
 | Implemented, not independently verified | 11 |
 | Not implemented | 8 |
 | Out of scope | 3 |
-| **Total** | **130** |
+| **Total** | **134** |
 
 "Verified by automated test" always means the tagged evidence class (unit, db, loopback, jsdom), never a
 deployed system. Where an owner fixed a review finding but no independent re-review is recorded, the row says
@@ -300,3 +312,5 @@ so.
 - 2026-11-20 — first complete draft (orders_engineer).
 - 2026-11-20 — refresh at integration HEAD `f07f0f2` (orders_engineer): all modules reported; counts
   recomputed; see "Changes at this refresh".
+- 2026-11-20 — increment 02 §B rows added (orders_engineer, commits `d0129c8`, `3bcfba9`); sections A, C, D, E pending
+  their owners.
