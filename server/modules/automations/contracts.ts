@@ -580,6 +580,35 @@ export interface AutomationsModule extends ModuleLifecycle {
     options?: { replaceBuiltIn?: boolean },
   ): void;
 
+  /**
+   * Trusted server-internal port (Package I outbound webhooks): returns all registered trigger
+   * catalogue entries (built-in `TRIGGER_CATALOGUE` merged with dynamic registrations) without requiring a user principal.
+   * Callers dispatching to external endpoints MUST respect `entry.staffOnly === true` (refuse or omit internal triggers).
+   */
+  listTriggerCatalogue(): readonly TriggerCatalogueEntry[];
+
+  /**
+   * Trusted server-internal port (Package I outbound webhooks): returns all trigger catalogue entries matching `event`.
+   */
+  matchingTriggersForEvent(event: AuditTapEvent): readonly TriggerCatalogueEntry[];
+
+  /**
+   * Trusted server-internal port (Package I outbound webhooks): resolves non-personal `from: "event"` and
+   * `from: "context"` scalar fields for `(triggerKey, event)` using registered context resolvers.
+   * Never includes `personal: true` fields (such as `recipient_name`) or internal user IDs.
+   */
+  resolveTriggerEventFields(input: {
+    triggerKey: string;
+    event: AuditTapEvent;
+    signal?: AbortSignal;
+  }): Promise<{
+    entry: TriggerCatalogueEntry;
+    fields: Record<string, AutomationScalarValue>;
+    orderPublicId: string | null;
+    filePublicId: string | null;
+    staffOnly: boolean;
+  } | null>;
+
   getCatalogue(principal: SessionPrincipal): Promise<AutomationCatalogueView>;
   getSettings(principal: SessionPrincipal): Promise<AutomationSettingsView>;
   updateSettings(

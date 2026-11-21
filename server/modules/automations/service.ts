@@ -3303,9 +3303,72 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
 
   /* --------------------------------------------------- Module lifecycle */
 
+  function syncStaticRegistrations(): void {
+    const latestStatic = getStaticAutomationRegistrations();
+    for (const [k, t] of latestStatic.triggers.entries()) {
+      triggerMap.set(k, t);
+    }
+    for (const [k, a] of latestStatic.actions.entries()) {
+      assertAllowedActionKey(k);
+      actionMap.set(k, a);
+    }
+  }
+
+  function listTriggerCatalogue(): readonly TriggerCatalogueEntry[] {
+    syncStaticRegistrations();
+    return allTriggerEntries();
+  }
+
+  function matchingTriggersForEvent(event: AuditTapEvent): readonly TriggerCatalogueEntry[] {
+    syncStaticRegistrations();
+    return entriesMatchingTapEvent(event);
+  }
+
+  async function resolveTriggerEventFields(input: {
+    triggerKey: string;
+    event: AuditTapEvent;
+    signal?: AbortSignal;
+  }): Promise<{
+    entry: TriggerCatalogueEntry;
+    fields: Record<string, AutomationScalarValue>;
+    orderPublicId: string | null;
+    filePublicId: string | null;
+    staffOnly: boolean;
+  } | null> {
+    syncStaticRegistrations();
+    const entry = findTriggerEntry(input.triggerKey);
+    if (!entry) return null;
+    const controller = new AbortController();
+    const signal = input.signal ?? controller.signal;
+    const resolved = await resolveFullTriggerContext({
+      triggerMode: "event",
+      triggerKey: entry.key,
+      snapshot: { event: input.event },
+      signal,
+    });
+    const nonPersonalFields: Record<string, AutomationScalarValue> = {};
+    const personalSet = new Set(
+      entry.fields.filter((f) => f.personal).map((f) => f.key),
+    );
+    for (const [k, v] of Object.entries(resolved.fields)) {
+      if (k === "recipient_name" || personalSet.has(k)) continue;
+      nonPersonalFields[k] = v;
+    }
+    return {
+      entry,
+      fields: nonPersonalFields,
+      orderPublicId: resolved.orderPublicId,
+      filePublicId: resolved.filePublicId,
+      staffOnly: resolved.staffOnlyTrigger,
+    };
+  }
+
   return {
     registerAutomationTrigger,
     registerAutomationAction,
+    listTriggerCatalogue,
+    matchingTriggersForEvent,
+    resolveTriggerEventFields,
     getCatalogue,
     getSettings,
     updateSettings,
@@ -3323,14 +3386,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     getRun,
 
     init() {
-      const latestStatic = getStaticAutomationRegistrations();
-      for (const [k, t] of latestStatic.triggers.entries()) {
-        triggerMap.set(k, t);
-      }
-      for (const [k, a] of latestStatic.actions.entries()) {
-        assertAllowedActionKey(k);
-        actionMap.set(k, a);
-      }
+      syncStaticRegistrations();
       ensureAutomationMailTemplateRegistered(deps.mailer);
       if (!tapRegistered && deps.services.auditCenter?.registerTap) {
         deps.services.auditCenter.registerTap({
