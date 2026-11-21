@@ -169,6 +169,22 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     recipients: [person("ticket_requester", "Ticket requester"), person("ticket_assignee", "Assigned staff member"), ACTOR],
   },
   {
+    key: "community.topic_created", label: "Community topic started", group: "Support", owner: "community", staffOnly: true,
+    description: "A member started a community topic (published or held for review). Fires only while the forum is switched on.",
+    eventName: "community.topic.created", outcomes: ["completed"], resourceType: "community_topic",
+    fields: [actorRole, f("post_state", "Opening post state", "enum", "event", { enumValues: ["published", "pending"] }),
+      f("held_reason", "Held for review because", "string"), f("topic_link", "Link to the topic", "string", "context")],
+    recipients: [STAFF, ADMINS],
+  },
+  {
+    key: "community.post_reported", label: "Community post reported", group: "Support", owner: "community", staffOnly: true,
+    description: "A member reported a community post. Hidden automatically when the report threshold is reached.",
+    eventName: "community.post.reported", outcomes: ["completed"], resourceType: "community_post",
+    fields: [f("report_reason", "Report reason", "enum", "event", { enumValues: ["spam", "abuse", "off_topic", "personal_info", "other"] }),
+      f("auto_hidden", "Hidden automatically", "boolean"), f("queue_link", "Link to the moderation queue", "string", "context")],
+    recipients: [STAFF, ADMINS],
+  },
+  {
     key: "invoice.issued", label: "Invoice issued", group: "Billing", owner: "compliance",
     description: "An invoice was issued to a customer.",
     eventName: "invoice.issued", outcomes: ["completed"], resourceType: "invoice",
