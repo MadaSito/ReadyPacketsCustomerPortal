@@ -67,8 +67,9 @@ lock rules, client conventions, shared-machine discipline). This file adds what 
    for a bounded retention period**, and each view is audited.
 8. **Mail failover never risks a duplicate:** the secondary transport is tried only when the primary
    definitely did not accept the message (not configured, connection refused, authentication failed,
-   explicit rejection that is marked retryable elsewhere). An unknown outcome is retried on the same
-   transport as today.
+   explicit rejection). An **unknown** outcome is never replayed and never fails over — exactly as today
+   (payload purged, resend blocked) — unless the provider gave an affirmative idempotency guarantee; it is
+   shown to the operator for review.
 9. **Templates and automations are data, never code.** Logic-less `{{variable}}` substitution with
    escaping; HTML is sanitised on save against an allow-list; no scripts, no remote code, no expressions.
 10. **Automations are triggered by a curated catalogue of events and can only run registered actions.**
@@ -266,6 +267,40 @@ providers); `/root` for ADRs, status, application context, requirements register
   or URLs that embed tokens.
 - Accessibility: every new page passes the axe checks used by the existing feature tests, works at 320 px,
   and is operable by keyboard; drag-only interactions always have a non-drag alternative.
+
+### 4.1 Review gates added after the design review (http_security_engineer, accepted by /root)
+
+- **I (SSO):** `state` is consumed atomically and is bound to its purpose (sign-in, link, step-up, test),
+  the browser (pre-auth cookie) and, for link / step-up, the session. Enforce verifier, nonce, an explicit
+  algorithm allow-list, issuer, audience, tenant and the canonical redirect URI; log the callback without
+  its query string. After the callback the user gets a full session only when the same assurance gates as
+  a local sign-in are met; otherwise only the remediation steps (local factor, forced change). Sessions
+  rotate on sign-in and the event is audited. A step-up through Entra must come from the **same linked
+  identity** and prove fresh multi-factor (`auth_time` fresh **and** `amr` with `mfa`); a fresh `auth_time`
+  alone is not multi-factor. Changing tenant, client or secret invalidates pending grants. No privilege
+  ever follows from an e-mail address.
+- **I (linking):** linking requires proof of control of the Entra account (a completed callback), fresh
+  step-up, and uniqueness of (tenant, object) and of the user's link. An administrator binding requires
+  step-up and an object id verified in the configured tenant. The local-MFA-administrator invariant is
+  enforced inside the transaction of every credential, role and status change, with a tested recovery path.
+- **B / D (mail):** redacted audit copies and stored content are rendered from redacted input, not by
+  string-replacing secrets in rendered output. The audit copy has its own delivery state and its address
+  is verified (confirmation message) before use. Content views are bounded, purged and served `no-store`.
+  Placeholders are typed and allowed only in safe sinks (text, attribute values of allowed https / mailto
+  links); this holds for editor and preview requests too.
+- **Preview pattern (one approved way):** a sandboxed `iframe` with `srcDoc`, no `allow-scripts`, no
+  `allow-same-origin`, a restrictive policy in the document, and a preview-only projection that removes
+  every navigation and network attribute. No `dangerouslySetInnerHTML`, no relaxation of the global policy.
+- **J (automations):** a durable automation-origin marker travels with every asynchronous descendant
+  (jobs, mails, webhooks, audit events) so loop protection survives the worker boundary. Deduplicate by
+  trigger event, automation version and action. Schedules and run counts are bounded. Webhook secrets are
+  never echoed; deliveries are signed with a timestamp; a lost lease must not dispatch twice.
+- **G / H (storage):** OAuth `state` is bound to actor, session, provider, configuration and connection;
+  capability and fresh step-up are re-checked in the callback. Graph upload-session URLs are guarded
+  separately (bounded host lineage, no bearer token forwarded, URL never logged). Request the narrowest
+  permissions and verify the identity of the object after upload.
+- **K:** the normal policy is enforced in a real browser; no `unsafe-inline`, `unsafe-eval` or
+  style-attribute exception for any library.
 
 ## 5. Definition of done (each owner)
 
