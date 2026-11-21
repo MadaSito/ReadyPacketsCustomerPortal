@@ -19,7 +19,7 @@ import { PASSWORD_RESET_JOB } from "./auth.js";
 import { identityRouter } from "./router.js";
 import { createIdentityModule, type IdentityModule } from "./index.js";
 import { createPasswordHasher } from "./password/hasher.js";
-import { customerRefHistory, customerRefReservations, identityTokens, users, userSessions } from "./schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "./schema.js";
 
 const PW = "copper lantern drifts beyond quiet harbor";
 const PW2 = "violet glacier hums under amber skies";
@@ -96,7 +96,7 @@ describe("identity module (MySQL)", () => {
   const userRow = async (id: number) => (await db.db.select().from(users).where(eq(users.id, id)).limit(1))[0]!;
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(() => build());

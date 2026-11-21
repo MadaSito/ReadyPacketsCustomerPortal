@@ -16,7 +16,7 @@ import { createTestDeps, type TestHarness } from "../../../../tests/helpers/fake
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import { createEntraAssurance } from "../../assurance/entra.js";
 import { createIdentityModule, type IdentityModule } from "../index.js";
-import { customerRefHistory, customerRefReservations, identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
 import { authorizationUrl, entraEndpoints, OidcValidationError, peekKeyId, verifyIdToken } from "./oidc.js";
 import { createFakeEntra, type FakeEntra, type FakeEntraIdentity } from "./testing.js";
 import type { SsoConfigInput } from "./service.js";
@@ -130,7 +130,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     db.db.select().from(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)));
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(async () => build());
