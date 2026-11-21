@@ -27,6 +27,8 @@ third-party service at runtime unless an administrator explicitly configured tha
 | radix-ui | client | accessible primitives | |
 | lucide-react | client | icons | |
 | clsx, tailwind-merge | client | class composition | |
+| @xyflow/react 13.0.2 (MIT) | client | FlowCanvas (workflow designer, automation canvas) in `client/src/ui` | Lazy route chunk only. CSP: creates no `<style>` elements and never sets a `style` attribute; positions go through React style props (CSSOM, not governed by `style-src`). Its static CSS is bundled into our stylesheet. No network access. |
+| @tiptap/core, @tiptap/react, @tiptap/pm, @tiptap/starter-kit, @tiptap/extension-image 3.35.0 (MIT; open-source extensions only, no Pro) | client | RichTextEditor for HTML e-mail bodies in `client/src/ui` | Lazy route chunk only. CSP: core would inject a `<style>` element by default, so the editor is always created with `injectCSS: false` (enforced in our wrapper and its test) and its base CSS is in our stylesheet. ProseMirror uses `style.cssText` (CSSOM) only. Output is re-sanitised on the server. No network access. |
 | tailwindcss 4, @tailwindcss/vite, vite 8, @vitejs/plugin-react | build | client build | |
 | vite-plugin-pwa, workbox-* | build | static-shell service worker | never caches authenticated data |
 | typescript 6 (lint), typescript7 alias (typecheck) | dev | type checking | typescript-eslint does not yet support TS 7 |
