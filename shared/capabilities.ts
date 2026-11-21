@@ -82,6 +82,7 @@ export const CAPABILITIES = [
   "privacy.consent.manage",
   "payments.manage",
   "carts.read_all",
+  "storage.copies.read",
   // portable / backup
   "portable.export",
   "portable.import",

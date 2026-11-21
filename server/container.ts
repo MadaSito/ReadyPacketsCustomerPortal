@@ -43,6 +43,7 @@ import { registerStorageOAuthAdapters } from "./modules/storage/oauth/register.j
 import { createSharepointModule, type SharepointModule } from "./modules/sharepoint/index.js";
 import { createMailTemplatesModule, type MailTemplatesModule } from "./modules/mailTemplates/index.js";
 import { createAutomationsModule, type AutomationsModule } from "./modules/automations/index.js";
+import { createProtectionModule, type ProtectionModule } from "./modules/protection/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -64,6 +65,7 @@ export interface ModuleRegistry {
   sharepoint: SharepointModule;
   mailTemplates: MailTemplatesModule;
   automations: AutomationsModule;
+  protection: ProtectionModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -102,7 +104,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   const crypto = overrides.core?.crypto ?? createFieldCrypto(config);
   const audit = overrides.core?.audit ?? createAuditEmitter({ config, db, clock, logger, crypto });
   const settings = overrides.core?.settings ?? createSettingsStore({ db, clock, logger, crypto, audit });
-  const rateLimiter = overrides.core?.rateLimiter ?? createRateLimiter({ db, clock, logger, settings, tokenHashKey: config.tokenHashKey });
+  const rateLimiter = overrides.core?.rateLimiter ?? createRateLimiter({ db, clock, logger, settings, tokenHashKey: config.tokenHashKey, protectionDisabled: config.protectionDisabled });
   const storage = overrides.core?.storage ?? createObjectStorage({ config, logger });
   const queueDeps = { config, db, clock, logger, audit, crypto, settings };
   const jobs = overrides.core?.jobs ?? createJobQueue(queueDeps);
@@ -133,6 +135,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.sharepoint = createSharepointModule(deps);
   services.mailTemplates = createMailTemplatesModule(deps);
   services.automations = createAutomationsModule(deps);
+  services.protection = createProtectionModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -157,6 +160,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.sharepoint,
     services.mailTemplates,
     services.automations,
+    services.protection,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();
