@@ -18,6 +18,9 @@ export const EGRESS_PRESET_KEYS = [
   "wasabi_s3",
   "backblaze_b2",
   "azure_blob",
+  "stripe",
+  "square",
+  "square_sandbox",
 ] as const;
 export type EgressPresetKey = (typeof EGRESS_PRESET_KEYS)[number];
 
@@ -48,6 +51,8 @@ export interface SetEgressPresetInput {
  * `publicAddressesOnly: true`, `https:` scheme, and port `443` inside `egress.ts`.
  */
 export const MANDATORY_CLOUD_ALLOWLIST_PURPOSES: ReadonlySet<EgressPurpose> = new Set<EgressPurpose>([
+  "stripe",
+  "square",
   "graph",
   "graph_upload",
   "entra_oidc",
@@ -160,6 +165,33 @@ export const PRESET_CATALOG: readonly StaticPresetMeta[] = [
     fixedHosts: [],
     justification: "Preset: Azure Blob Storage account HTTPS endpoint",
     capabilities: ["integrations.manage", "storage.manage"],
+  },
+  {
+    key: "stripe",
+    label: "Stripe Checkout & Payments API",
+    purpose: "stripe",
+    parameterized: false,
+    fixedHosts: ["api.stripe.com"],
+    justification: "Preset: Stripe Checkout Sessions and Payment Intents HTTPS API",
+    capabilities: ["integrations.manage", "payments.manage"],
+  },
+  {
+    key: "square",
+    label: "Square Production Payments API",
+    purpose: "square",
+    parameterized: false,
+    fixedHosts: ["connect.squareup.com"],
+    justification: "Preset: Square production payment links and payments HTTPS API",
+    capabilities: ["integrations.manage", "payments.manage"],
+  },
+  {
+    key: "square_sandbox",
+    label: "Square Sandbox Payments API",
+    purpose: "square",
+    parameterized: false,
+    fixedHosts: ["connect.squareupsandbox.com"],
+    justification: "Preset: Square sandbox payment links and payments HTTPS API",
+    capabilities: ["integrations.manage", "payments.manage"],
   },
 ];
 

@@ -1,6 +1,6 @@
 # `server/modules/integrations` — Public API & Contract
 
-Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/features/integrations/consent.tsx`, `client/src/features/integrations/routes.tsx`; admin pages under `client/src/features/integrations/admin/**` owned by `identity_engineer`).
+Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/features/integrations/**`, `docs/integrations/**`).
 
 ---
 
@@ -19,6 +19,7 @@ export const EGRESS_PURPOSES = [
   "webhook",
   "sharepoint",
   "stripe",
+  "square",
   "antivirus",
   "graph",
   "graph_upload",
@@ -57,6 +58,7 @@ export interface EgressFetchOptions {
    * Strips any `Location` header from returned headers and never follows redirects.
    */
   acceptUploadIncomplete?: boolean;
+  beforeSend?: () => Promise<void>;
 }
 
 export interface EgressFetchResponse {
@@ -75,6 +77,9 @@ export const EGRESS_PRESET_KEYS = [
   "wasabi_s3",
   "backblaze_b2",
   "azure_blob",
+  "stripe",
+  "square",
+  "square_sandbox",
 ] as const;
 export type EgressPresetKey = (typeof EGRESS_PRESET_KEYS)[number];
 
@@ -101,7 +106,7 @@ export interface SetEgressPresetInput {
 }
 ```
 
-- **Mandatory cloud-purpose policy (`graph`, `graph_upload`, `entra_oidc`, `storage_s3`, `storage_azure`, `storage_dropbox`, `storage_gdrive`)**:
+- **Mandatory cloud-purpose policy (`stripe`, `square`, `graph`, `graph_upload`, `entra_oidc`, `storage_s3`, `storage_azure`, `storage_dropbox`, `storage_gdrive`)**:
   - HTTPS (`https:` on port `443`) only.
   - `requireAllowlistRule = true` and `publicAddressesOnly = true` are **always** enforced inside `egress.ts` regardless of caller options (`allowPrivateAddress: true` rules are rejected for these purposes).
   - `graph_upload` additionally hard-refuses `Authorization`, `Cookie`, and `Proxy-Authorization` headers (`EGRESS_FORBIDDEN_UPLOAD_HEADER`) and supports curated suffix patterns `*.sharepoint.com` and `*.files.1drv.com` (never broad cloud-compute wildcards).
@@ -114,127 +119,23 @@ export interface SetEgressPresetInput {
     - `entra_oidc` (`purpose: "entra_oidc"`): `login.microsoftonline.com`
     - `dropbox` (`purpose: "storage_dropbox"`): `api.dropboxapi.com`, `content.dropboxapi.com`
     - `google_drive` (`purpose: "storage_gdrive"`): `oauth2.googleapis.com`, `www.googleapis.com`
+    - `stripe` (`purpose: "stripe"`): `api.stripe.com`
+    - `square` (`purpose: "square"`): `connect.squareup.com`
+    - `square_sandbox` (`purpose: "square"`): `connect.squareupsandbox.com`
   - Parameterized exact-host storage presets (never wildcard `*.amazonaws.com` or `*.blob.core.windows.net`):
     - `amazon_s3` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.amazonaws.com` (+ `<bucket>.s3.<region>.amazonaws.com` when `bucket` supplied)
     - `wasabi_s3` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.wasabisys.com` (+ `<bucket>.s3.<region>.wasabisys.com` when `bucket` supplied)
     - `backblaze_b2` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.backblazeb2.com` (+ `<bucket>.s3.<region>.backblazeb2.com` when `bucket` supplied)
     - `azure_blob` (`purpose: "storage_azure"`, `{ accountName }`): `<accountName>.blob.core.windows.net`
-  - Custom S3-compatible endpoints use `egress.createAllowlistRule` with `purpose: "storage_s3"`, `matchType: "host"`, `protocol: "https:"`, `port: 443`, `allowPrivateAddress: false`.
-  - `setPresetEnabled` authorizes administrators holding `integrations.manage` or the matching domain step-up capability (`mail.manage`, `storage.manage`, or `identity.sso.manage`), re-validated in-transaction via `identity.sessions.assertCurrent(principal, tx)`.
+  - `setPresetEnabled` authorizes administrators holding `integrations.manage` or the matching domain step-up capability (`mail.manage`, `storage.manage`, `identity.sso.manage`, or `payments.manage`), re-validated in-transaction via `identity.sessions.assertCurrent(principal, tx)`.
 
 ### 1.2 Microsoft Graph Core & Graph Mail (`services.integrations.graph`, `services.integrations.graphAdmin`, `services.integrations.createScopedGraphClient`)
 
-Single Microsoft Graph client implementation (`server/modules/integrations/graph/**`) shared exclusively by Graph Mail, SharePoint document libraries / list sync, and OneDrive for Business.
-
-```ts
-export interface GraphCredentialsInput {
-  /** Single-tenant Entra directory GUID only (`common`, `organizations`, `consumers` refused). */
-  tenantId: string;
-  /** Entra application (client) GUID. */
-  clientId: string;
-  clientSecret: string;
-  /** Optional caller version tag bound into the token-cache isolation key. */
-  credentialVersion?: string | number;
-}
-
-export interface GraphRequestInput {
-  method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
-  /** Relative v1.0 Graph path starting with `/` (e.g. `"/sites/root"`, `"/users/ops%40example.com/sendMail"`). */
-  path: string;
-  query?: Record<string, string | number | boolean | undefined>;
-  body?: unknown;
-  rawBody?: Uint8Array;
-  headers?: Record<string, string>;
-  timeoutMs?: number;
-  maxResponseBytes?: number;
-  signal?: AbortSignal;
-  /** Runs after token acquisition + DNS/allowlist resolution and directly before opening the HTTPS socket (G-02). */
-  beforeSend?: () => Promise<void>;
-}
-
-export interface GraphResponse<T = unknown> {
-  status: number;
-  headers: Record<string, string>;
-  rawBody: Buffer;
-  json<U = T>(): U;
-}
-
-export interface GraphUploadChunkInput {
-  /** Pre-authenticated capability URL returned by Graph `createUploadSession` (`https:` on 443). */
-  uploadUrl: string;
-  bytes: Uint8Array;
-  /** e.g. `"bytes 0-327679/1048576"` */
-  contentRange: string;
-  /** Optional additional host/suffix lineage restriction (e.g. `[siteHostname, "*.files.1drv.com"]`). */
-  allowedHostSuffixes?: readonly string[];
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  beforeSend?: () => Promise<void>;
-}
-
-export interface GraphUploadSessionControlInput {
-  uploadUrl: string;
-  method: "GET" | "DELETE";
-  allowedHostSuffixes?: readonly string[];
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  beforeSend?: () => Promise<void>;
-}
-
-export interface GraphUploadChunkResult {
-  status: number;
-  headers: Record<string, string>;
-  rawBody: Buffer;
-  json<T = unknown>(): T | null;
-}
-
-export class GraphApiError extends DomainError {
-  readonly status: number | null;
-  readonly graphCode: string | null;
-  readonly retryable: boolean;
-  /** True only when the target Graph request may already have been transmitted over the wire. */
-  readonly requestSent: boolean;
-  readonly reason: string;
-}
-
-export interface GraphClient {
-  isConfigured(): Promise<boolean>;
-  request<T = unknown>(input: GraphRequestInput): Promise<GraphResponse<T>>;
-  uploadChunk(input: GraphUploadChunkInput): Promise<GraphUploadChunkResult>;
-  uploadSessionControl(input: GraphUploadSessionControlInput): Promise<GraphUploadChunkResult>;
-}
-```
-
-- **Token acquisition & isolation**:
-  - `POST https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token` (`grant_type=client_credentials`, `scope=https://graph.microsoft.com/.default`) via `egress.fetchPinned(..., "graph")`.
-  - Single-tenant GUID strictly enforced (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`); `common`, `organizations`, and `consumers` are explicitly rejected.
-  - Access tokens are cached in volatile memory until `expires_in - 60s` (`deps.clock.now()`), isolated per `sha256(tenantId + ":" + clientId + ":" + credentialVersion + ":" + sha256(clientSecret))`, coalesced single-flight per key, cleared on credential/config change and `stop()`, and **never** logged, audited, or included in thrown errors.
-- **`createScopedGraphClient(credentials?: GraphCredentialsInput): GraphClient`**:
-  - When `credentials` is provided (e.g. decrypted per-connection SharePoint/OneDrive credentials), binds a `GraphClient` to those credentials while sharing the module's egress policy and isolated token cache. When omitted, returns `services.integrations.graph` (the installation Graph configuration).
-- **`uploadChunk` capability-URL safety (§4.1)**:
-  - Uses `purpose: "graph_upload"`, enforces host lineage (`*.sharepoint.com` or `*.files.1drv.com`, narrowed further by `allowedHostSuffixes` when supplied), strips/forbids `Authorization` and `Cookie`, and never logs `uploadUrl` paths or query strings.
-- **Graph Mail Transport (`key: "graph"`)**:
-  - Registered during `IntegrationsModule.init()` via `deps.services.jobAdmin.registerMailTransport(graphMailTransport)`.
-  - Calls `POST /v1.0/users/{encodeURIComponent(mailbox)}/sendMail` (`saveToSentItems: false`, application permission `Mail.Send`), using `senderMailbox` if configured on Graph settings or `MailTransportMessage.sender.fromAddress`.
-  - Outcome classification per Decision 8:
-    - Disabled / incomplete settings / `microsoft_graph` egress preset off -> `{ outcome: "not_configured", safeDetail: "graph_not_configured" }`.
-    - Pre-send token failure, DNS/egress denial, or explicit Graph `4xx` rejection (`400`/`401`/`403`/`404` `retryable: false`, `429` `retryable: true`) -> `{ outcome: "rejected", retryable, safeDetail }` (safe for secondary failover).
-    - HTTP `202` / `200` / `204` -> `{ outcome: "accepted", safeDetail: "graph_accepted" }`.
-    - Mid-flight timeout, connection drop, or `5xx` gateway ambiguity on `POST /sendMail` (`requestSent === true`) -> `{ outcome: "unknown", safeDetail: "graph_delivery_uncertain" }` (**never** replayed and **never** failed over).
-- **Restricting `Mail.Send` to a single mailbox in Exchange Online (operator guidance)**:
-  - Microsoft Graph `Mail.Send` application permission is tenant-wide by default unless scoped in Exchange Online RBAC for Applications:
-    1. Connect via `Connect-ExchangeOnline`.
-    2. Register the Entra enterprise app's service principal in Exchange Online: `New-ServicePrincipal -AppId <ClientAppId> -ObjectId <EnterpriseAppServicePrincipalObjectId> -DisplayName "ReadyPackets Portal Graph Mail"`.
-    3. Create a management scope targeting only the dedicated sender mailbox: `New-ManagementScope -Name "ReadyPacketsSenderMailboxOnly" -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'noreply@yourdomain.example'"`.
-    4. Assign `Application Mail.Send` restricted to that scope: `New-ManagementRoleAssignment -Name "ReadyPacketsGraphMailSendScoped" -App <ClientAppId> -Role "Application Mail.Send" -CustomResourceScope "ReadyPacketsSenderMailboxOnly"`.
-    5. Verify with `Test-ServicePrincipalAuthorization -Identity <ClientAppId> -Resource another-user@yourdomain.example` (`InScope: False`).
+Single Microsoft Graph client implementation (`server/modules/integrations/graph/**`) shared exclusively by Graph Mail, SharePoint document libraries / list sync, and OneDrive for Business. Unchanged from Increment 03.
 
 ### 1.3 Outbound SMTP Transport (`services.integrations.smtp`)
 
-- Enforces TLS (`tlsMode: "starttls" | "implicit"`, `rejectUnauthorized: true`, `minVersion: "TLSv1.2"`, plaintext port 25 unconditionally forbidden with `SMTP_PORT_25_FORBIDDEN`), pins sockets through `egress.assertAllowed(..., "smtp")`, and rejects CRLF/NUL header injection across `sender`, `to`, and `subject`.
-- `SmtpSendInput` accepts optional `sender?: MailSenderIdentity` (`{ fromAddress, fromName, replyToAddress? }`) from `jobs` mail engine, falling back to legacy `integrations.smtp.config` sender fields when omitted.
-- Exposes `smtp.getDefaultSender(): Promise<MailSenderIdentity | null>` (legacy fallback for existing upgrades) and treats SMTP as complete/ready when sender identity is configured either in `jobs` shared sender settings or in `integrations.smtp.config`.
-- Both `smtp.sendTestMessage(principal, input?)` and `graphAdmin.sendTestMessage(principal)` send test mail **exclusively to the signed-in administrator's own email address** (`deps.services.identity.getUser(principal.userId)`). Passing any third-party `toAddress` is refused with `FORBIDDEN / TEST_RECIPIENT_MUST_BE_SELF`.
+Unchanged from Increment 03.
 
 ### 1.4 Provider Registry & Health (`services.integrations.providers`)
 
@@ -247,49 +148,160 @@ export type ProviderState = "disabled" | "not_configured" | "configured" | "degr
 
 - Disabled by default; exact route allowlist `["/privacy", "/terms"]` with clean query/hash and anonymous visitor session.
 - Clarity project ID `^[A-Za-z0-9]{6,32}$`; PostHog token `^phc_[A-Za-z0-9_]{12,176}$`; PostHog host restricted to `https://us.i.posthog.com`, `https://eu.i.posthog.com`, or an admin-allowlisted exact HTTPS origin.
+- **Increment 04 consent-store integration (`client/src/features/integrations/consent.tsx`)**:
+  - Reads `consent` / `useConsent` from `@/lib/consent`.
+  - When `consent.enabled()` (`privacy.consent` feature on): suppresses the legacy banner, gates PostHog on `consent.has("analytics")` (`opt_in_capturing` / `opt_out_capturing`, cookieless fetch transport), gates Clarity on `consent.has("session_replay")` (`clarity("consent")` on grant, `clarity("consent", false)` + script/realm teardown on withdrawal).
+  - When `consent.enabled()` is false: preserves existing strict opt-in behaviour.
 
 ### 1.6 Disabled Scaffolds (`stripe`, `saml`, `sharepoint`) & Production Webhooks (`production`)
 
-- **`stripe`**, **`saml`**, **`sharepoint`** remain disabled scaffolds as documented in Increment 01/02 (`STRIPE_LEDGER_MUTATION_ENABLED = false`).
+- **`stripe`**, **`saml`**, **`sharepoint`** remain backwards-compatible scaffolds (`STRIPE_LEDGER_MUTATION_ENABLED = false`; console links administrators to `/admin/payments` for hosted checkout).
 - **`production`** (`P101` & `P201`) implements fenced outbox webhook delivery per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
+
+### 1.7 Outbound Webhook Subscriptions, Inbound Endpoints, Delivery Log & Re-Run (`services.integrations.webhooks`)
+
+Implements Increment 04 Package I (Decisions 10 & 11) in `server/modules/integrations/webhooks/**`. Ships **disabled** (`enabled: false`) by default.
+
+```ts
+export type WebhookSubscriptionStatus = "active" | "paused" | "disabled_failing";
+export type WebhookDirection = "outbound" | "inbound";
+export type WebhookDeliveryStatus =
+  | "queued"
+  | "delivering"
+  | "delivered"
+  | "retrying"
+  | "failed"
+  | "dead"
+  | "unknown"
+  | "processed"
+  | "duplicate"
+  | "rejected";
+
+export interface WebhookPublishOptions {
+  /** Optional caller deduplication token per subscription (defaults to generated ULID). */
+  deduplicationKey?: string;
+  correlationId?: string;
+  resourceType?: string;
+  resourcePublicId?: string;
+}
+
+export interface WebhooksService {
+  /** Registered with `auditCenter.registerTap(webhooks.auditTap)` in `init()`. */
+  readonly auditTap: AuditTap;
+
+  /**
+   * Explicit server-side event publication port for domain events not already covered by
+   * `TRIGGER_CATALOGUE` (note: catalogue events such as `invoice.paid` from durable
+   * `invoice.payment.recorded` are captured automatically via `auditTap` in the caller's `tx`).
+   * Redacts payload fields, refuses `staffOnly` trigger keys, and enqueues outbox rows in `tx`
+   * when `integrations.webhooks.config.enabled === true`.
+   */
+  publish(
+    eventKey: string,
+    payload: Record<string, unknown>,
+    options?: WebhookPublishOptions,
+    tx?: Tx,
+  ): Promise<{ queued: number; deliveryPublicIds: string[] }>;
+
+  /** Read-only provider registered on `services.publicApi.registerProvider("webhookSubscriptions", ...)` in `init()`. */
+  listSubscriptionsPublicApi(
+    query: ApiListQuery,
+    caller: ApiCaller,
+  ): Promise<ApiPage<WebhookSubscriptionDto>>;
+  getSubscriptionPublicApi(
+    publicId: string,
+    caller: ApiCaller,
+  ): Promise<WebhookSubscriptionDto | null>;
+
+  /** Raw HTTP receiver handler invoked by `createInboundWebhooksHttpRouter(services)`. */
+  receiveInboundHttp(input: {
+    endpointPublicId: string;
+    rawBody: Buffer;
+    headers: Record<string, string | undefined>;
+    correlationId: string;
+    ipAddress?: string | null;
+  }): Promise<{
+    httpStatus: number;
+    body: {
+      ok: boolean;
+      deliveryId?: string;
+      duplicate?: boolean;
+      code?: string;
+      message?: string;
+    };
+  }>;
+}
+```
+
+- **Outbound subscriptions & signing**:
+  - Target URLs must use `https:` on port `443`, pass `egress.assertAllowed(url, "webhook")` (`requireAllowlistRule: true`, `publicAddressesOnly: true`, pinned IP resolution, no redirects, no private/loopback/link-local/metadata ranges).
+  - Subscribes only to non-`staffOnly` trigger keys from `automations.listTriggerCatalogue()` (`staffOnly` triggers and `personal: true` fields are stripped/refused so internal staff notes and personal fields never leave via generic webhooks).
+  - Signing secret (`whsec_<48-hex>`) is generated CSPRNG, returned **once** on creation and rotation, stored encrypted via `FieldCrypto` (AAD bound to row `publicId`), and never returned again (`secretLast4` only).
+  - Secret rotation supports a configurable overlap window (`overlapMinutes: 0..1440`, default `60`): while `now < previousSecretExpiresAt`, outbound deliveries send `X-ReadyPackets-Signature: t=<unixSec>,v1=<primaryHmac>,v1=<previousHmac>` over `<unixSec>.<rawJsonBody>`.
+  - Outbound headers: `Content-Type: application/json; charset=utf-8`, `User-Agent: ReadyPackets-Webhooks/1.0`, `X-ReadyPackets-Event`, `X-ReadyPackets-Delivery`, `X-ReadyPackets-Timestamp`, `X-ReadyPackets-Signature`, `X-Correlation-Id`, plus `X-ReadyPackets-Replay: 1` on redeliveries.
+  - Sustained consecutive terminal failures reaching `autoDisableThreshold` (default `10`) transition the subscription to `disabled_failing` and emit durable `integration.webhook.subscription_auto_disabled`.
+- **Inbound endpoints & automation trigger**:
+  - Mounted by `http_security_engineer` at `/api/webhooks/inbound` via `createInboundWebhooksHttpRouter(services)` (`POST /:endpointPublicId`).
+  - Verifies constant-time HMAC-SHA256 (`timingSafeEqual`) over `<unixSec>.<rawBody>` from `X-ReadyPackets-Signature: t=<unixSec>,v1=<hex>` (accepting primary secret or unexpired overlap secret) and enforces `|now - t| <= toleranceSeconds` (max `300` seconds = ±5 minutes) **before** `JSON.parse`.
+  - Deduplicates by `(inboundEndpointId, externalEventId)` (`X-ReadyPackets-Event-Id` or top-level JSON `id`).
+  - Verified inbound events **can only start automations**: registers `webhook.inbound_received` (`eventName: "integration.webhook.inbound_received"`, `owner: "integrations"`, `resourceType: "webhook_inbound_endpoint"`, fields `endpoint_public_id`, `endpoint_key`, `event_type`, `external_event_id`, `is_replay`) via `automations.registerAutomationTrigger(...)`.
+- **Delivery log, redaction, retention & re-run**:
+  - Logs outbound deliveries and inbound events with redacted headers and bodies (`server/observability/redact.ts`), bounded to **64 KiB** (`65_536` bytes), `FieldCrypto` AES-256-GCM encrypted, retained `retentionDays` (`0..90`, default `30`; `0` omits/purges stored bodies immediately and disables replay per ADR 0034).
+  - `redeliver` (outbound) and `reprocessInbound` (inbound) require `api.replay` (step-up MFA + in-tx `identity.sessions.assertCurrent`), are durably audited, issue a **new** `deliveryPublicId` (`replayOfPublicId` linked) + `X-ReadyPackets-Replay: 1` (`is_replay: true`), and refuse with `CONFLICT` (`WEBHOOK_BODY_TRUNCATED` / `WEBHOOK_BODY_PURGED`) when the stored body was truncated (> 64 KiB) or purged.
 
 ---
 
 ## 2. Exact tRPC Procedures & Return Types (`trpc.integrations.*`)
 
-All `admin.*` queries require `adminProcedure`. Mail mutations (`admin.smtp.*`, `admin.graph.*`) accept administrators holding either `integrations.manage` or `mail.manage` (both step-up MFA capabilities, re-validated inside every DB transaction via `identity.sessions.assertCurrent`).
+All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate sessions in-transaction via `identity.sessions.assertCurrent`.
 
-- **`publicAnalyticsConfig`** (`query`, public) -> `PublicAnalyticsConfig`
-- **`admin.providers`** (`query`) -> `ProviderStatus[]` (`smtp`, `graph`, `clarity`, `posthog`, `stripe`, `saml`, `sharepoint`)
-- **`admin.smtpReadiness`** (`query`) -> `SmtpReadiness`
-- **`admin.smtp.get`** (`query`) -> `SmtpConfigView` (`{ enabled, configured, verified, state, summary, host, port, tlsMode, username, passwordConfigured, passwordLast4: string | null, fromAddress, fromName, replyToAddress, lastCheckedAt, lastOutcome }`)
-- **`admin.smtp.update`** (`mutation`, step-up) -> input `{ enabled, host, port, tlsMode, username, password?: string | null, fromAddress?, fromName?, replyToAddress? }` -> `SmtpConfigView`
-- **`admin.smtp.sendTest`** (`mutation`, step-up, `expensive` rate limit) -> input `{ toAddress?: string }` (optional; if omitted sends to signed-in admin; if supplied must match signed-in admin email) -> `SmtpTestResult` (`{ outcome: "accepted"|"rejected"|"unknown", reasonCode, safeMessage, recipientAddress, durationMs, checkedAt }`)
-- **`admin.graph.get`** (`query`) -> `GraphConfigView` (`{ enabled, configured, verified, state, summary, tenantId, clientId, clientSecretConfigured: boolean, clientSecretLast4: string | null, senderMailbox: string, egressPresetEnabled: boolean, lastCheckedAt: Date | null, lastOutcome: "succeeded"|"failed"|"unknown"|null }`)
-- **`admin.graph.update`** (`mutation`, step-up) -> input `{ enabled: boolean, tenantId: string, clientId: string, clientSecret?: string | null, senderMailbox?: string, enableEgressPreset?: boolean }` -> `GraphConfigView`
-- **`admin.graph.testConnection`** (`mutation`, step-up, `expensive` rate limit) -> input `{}` -> `GraphTestResult` (`{ outcome: "succeeded"|"failed", reasonCode, safeMessage, durationMs, checkedAt }`)
-- **`admin.graph.sendTest`** (`mutation`, step-up, `expensive` rate limit) -> input `{}` (sends exclusively to signed-in administrator) -> `GraphMailTestResult` (`{ outcome: "accepted"|"rejected"|"unknown", reasonCode, safeMessage, recipientAddress, durationMs, checkedAt }`)
-- **`admin.egress.list`** (`query`) -> `EgressAllowlistRuleView[]`
-- **`admin.egress.presets`** (`query`) -> `EgressPresetView[]`
-- **`admin.egress.setPreset`** (`mutation`, step-up) -> input `{ presetKey: EgressPresetKey, enabled: boolean, params?: { region?: string; bucket?: string; accountName?: string } }` -> `EgressPresetView`
-- **`admin.egress.create`**, **`admin.egress.update`**, **`admin.egress.remove`**, **`admin.egress.check`** — unchanged (`purpose` accepts all 13 `EGRESS_PURPOSES`)
-- **`admin.analytics.*`**, **`admin.stripe.*`**, **`admin.saml.*`**, **`admin.sharepoint.get`**, **`production.*`** — unchanged from Increment 01/02.
+- **`publicAnalyticsConfig`**, **`admin.providers`**, **`admin.smtpReadiness`**, **`admin.smtp.*`**, **`admin.graph.*`**, **`admin.analytics.*`**, **`admin.stripe.*`**, **`admin.saml.*`**, **`admin.sharepoint.get`**, **`production.*`** — unchanged.
+- **`admin.egress.*`** — `purpose` accepts all 15 `EGRESS_PURPOSES` (including `"square"`); `presetKey` accepts all 12 `EGRESS_PRESET_KEYS` (including `"stripe"`, `"square"`, `"square_sandbox"`, gated by `integrations.manage` or `payments.manage`).
+- **`admin.webhooks.settings.get`** (`query`, `adminProcedure`) -> `WebhooksSettingsView` (`{ enabled, retentionDays, autoDisableThreshold, deliveryTimeoutMs }`)
+- **`admin.webhooks.settings.update`** (`mutation`, `webhooks.manage` step-up) -> `WebhooksSettingsView`
+- **`admin.webhooks.catalogue`** (`query`, `adminProcedure`) -> `WebhookCatalogueEventView[]` (non-`staffOnly` trigger keys, labels, groups, descriptions)
+- **`admin.webhooks.subscriptions.list`** (`query`, `adminProcedure`) -> `{ items: WebhookSubscriptionView[]; nextCursor: string | null }`
+- **`admin.webhooks.subscriptions.get`** (`query`, `adminProcedure`) -> `WebhookSubscriptionView`
+- **`admin.webhooks.subscriptions.create`** (`mutation`, `webhooks.manage` step-up) -> `{ subscription: WebhookSubscriptionView; signingSecretOnce: string }`
+- **`admin.webhooks.subscriptions.update`** (`mutation`, `webhooks.manage` step-up) -> `WebhookSubscriptionView`
+- **`admin.webhooks.subscriptions.setPaused`** (`mutation`, `webhooks.manage` step-up) -> `WebhookSubscriptionView`
+- **`admin.webhooks.subscriptions.rotateSecret`** (`mutation`, `webhooks.manage` step-up) -> `{ subscription: WebhookSubscriptionView; signingSecretOnce: string }`
+- **`admin.webhooks.subscriptions.testDelivery`** (`mutation`, `webhooks.manage` step-up, `expensive` rate limit) -> `WebhookDeliveryDetailView`
+- **`admin.webhooks.subscriptions.remove`** (`mutation`, `webhooks.manage` step-up) -> `{ deleted: true }`
+- **`admin.webhooks.inbound.list`** (`query`, `adminProcedure`) -> `{ items: WebhookInboundEndpointView[]; nextCursor: string | null }`
+- **`admin.webhooks.inbound.get`** (`query`, `adminProcedure`) -> `WebhookInboundEndpointView`
+- **`admin.webhooks.inbound.create`** (`mutation`, `webhooks.manage` step-up) -> `{ endpoint: WebhookInboundEndpointView; signingSecretOnce: string }`
+- **`admin.webhooks.inbound.update`** (`mutation`, `webhooks.manage` step-up) -> `WebhookInboundEndpointView`
+- **`admin.webhooks.inbound.setEnabled`** (`mutation`, `webhooks.manage` step-up) -> `WebhookInboundEndpointView`
+- **`admin.webhooks.inbound.rotateSecret`** (`mutation`, `webhooks.manage` step-up) -> `{ endpoint: WebhookInboundEndpointView; signingSecretOnce: string }`
+- **`admin.webhooks.inbound.remove`** (`mutation`, `webhooks.manage` step-up) -> `{ deleted: true }`
+- **`admin.webhooks.deliveries.list`** (`query`, `adminProcedure`) -> input `{ direction?, subscriptionPublicId?, inboundEndpointPublicId?, eventKey?, status?, from?, to?, correlationId?, search?, cursor?, limit? }` -> `{ items: WebhookDeliveryListItemView[]; nextCursor: string | null }`
+- **`admin.webhooks.deliveries.get`** (`query`, `adminProcedure`) -> `WebhookDeliveryDetailView` (includes redacted/decrypted headers & bodies if not purged + `attempts: WebhookDeliveryAttemptView[]`)
+- **`admin.webhooks.deliveries.redeliver`** (`mutation`, `api.replay` step-up, `expensive` rate limit) -> `WebhookDeliveryDetailView`
+- **`admin.webhooks.deliveries.reprocessInbound`** (`mutation`, `api.replay` step-up, `expensive` rate limit) -> `WebhookDeliveryDetailView`
 
 ---
 
-## 3. Raw HTTP Routes (`server/modules/integrations/http.ts`)
+## 3. Raw HTTP Routes
 
-- `POST /api/integrations/webhooks/stripe` — verifies `Stripe-Signature`, durably logs inert received event (`status = "ignored"`, `ledgerMutated = false`).
+- `server/modules/integrations/http.ts` (`registerSignedIntegrationWebhooks`, unchanged):
+  - `POST /api/integrations/webhooks/stripe` — legacy inert scaffold receiver.
+- `server/modules/integrations/webhooks/http.ts` (mounted by `http_security_engineer` at `/api/webhooks/inbound`):
+  - `export function createInboundWebhooksHttpRouter(services: Services): Router` (`Router({ caseSensitive: true, strict: true })`).
+  - `POST /:endpointPublicId` — expects raw `Buffer` on `req.body` (max 256 KiB, no decompression, no session/CSRF/CORS), verifies HMAC-SHA256 signature and ±5m timestamp before JSON parse, deduplicates event ID, logs redacted encrypted envelope, and triggers automations only.
 
 ---
 
 ## 4. Audit Events, Health Components & Tables
 
-- **Audit events**:
-  - `integration.smtp.updated`, `integration.smtp.test_attempted`, `integration.smtp.tested`
-  - `integration.graph.updated`, `integration.graph.connection_test_attempted`, `integration.graph.connection_tested`, `integration.graph.test_attempted`, `integration.graph.tested`
-  - `integration.egress.preset_updated`, `integration.egress.rule_created`, `integration.egress.rule_updated`, `integration.egress.rule_deleted`, `integration.egress.denied`, `integration.egress.checked`
-  - `integration.analytics.updated`, `integration.stripe.*`, `integration.saml.*`, `integration.production.*`
-- **Health components**: `mail.smtp`, `mail.graph`, `integrations.clarity`, `integrations.posthog`, `integrations.stripe`, `integrations.saml`, `integrations.sharepoint`, `integrations.production`
-- **Tables** (no schema migration required — existing tables cover all Increment 03 columns):
-  - `integration_egress_allowlist`, `integration_provider_checks`, `integration_webhook_events`, `integration_production_dispatches`
+- **New Increment 04 audit events**:
+  - `integration.webhooks.settings_updated`
+  - `integration.webhook.subscription_created`, `integration.webhook.subscription_updated`, `integration.webhook.subscription_paused`, `integration.webhook.subscription_resumed`, `integration.webhook.subscription_secret_rotated`, `integration.webhook.subscription_deleted`, `integration.webhook.subscription_auto_disabled`, `integration.webhook.subscription_tested`
+  - `integration.webhook.delivered`, `integration.webhook.delivery_failed`, `integration.webhook.redelivered`
+  - `integration.webhook.inbound_created`, `integration.webhook.inbound_updated`, `integration.webhook.inbound_secret_rotated`, `integration.webhook.inbound_deleted`, `integration.webhook.inbound_received`, `integration.webhook.inbound_rejected`, `integration.webhook.inbound_reprocessed`
+- **Health components**: adds `integrations.webhooks` (`disabled` when off, `healthy` / `degraded` when on).
+- **Additive Increment 04 tables (`server/modules/integrations/schema.ts`)**:
+  - `integration_webhook_subscriptions`
+  - `integration_webhook_inbound_endpoints`
+  - `integration_webhook_deliveries`
+  - `integration_webhook_delivery_attempts`
