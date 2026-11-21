@@ -1,5 +1,5 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
-import { JSDOM } from "jsdom";
 import {
   ALLOWED_DELIVERY_TAGS,
   MAX_HTML_INPUT_BYTES,
@@ -11,6 +11,13 @@ import {
   sanitizeTemplateHtmlOnSave,
   validateSubjectTemplate,
 } from "./sanitizer.js";
+
+interface JsdomModule {
+  JSDOM: new (html: string) => { window: { document: Document } };
+}
+
+const requireModule = createRequire(import.meta.url);
+const { JSDOM } = requireModule("jsdom") as JsdomModule;
 
 const ALLOWED_DELIVERY_SET = new Set<string>(ALLOWED_DELIVERY_TAGS);
 const INERT_FORBIDDEN_TAGS = new Set(["a", "img", "script", "style", "svg", "math", "iframe", "form", "object", "embed", "base", "link", "meta"]);
@@ -369,7 +376,7 @@ describe("mailTemplates sanitizer security gates (D-S01..D-S04) & independent st
       }
     };
 
-    const genBlock = (depth: number): string => {
+    const genBlock = (_depth: number): string => {
       const kind = nextRand() % 7;
       switch (kind) {
         case 0:

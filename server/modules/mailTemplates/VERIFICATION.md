@@ -13,6 +13,11 @@
    - Capability (`mail.manage`) and fresh step-up enforcement with `authz.mail_templates.denied` audit events.
    - `email.send_template` automation action execution, `automation:<runPublicId>` correlation propagation, sensitive-template refusal, and `forbidOnStaffOnlyTrigger: true` + runtime default-deny on `staffOnlyTrigger` (`AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN`, `J-A01`).
 
+4. **`client/src/features/mailTemplates/mailTemplates.test.tsx`** (4 UI + `axe-core` suites):
+   - Verifies `/admin/email-templates` catalogue filtering, custom template creation modal, editor (`RichTextEditor` + plain-text tab + variable chips + save/publish/test-send/reset/version restore), and `InertMailPreview` sandboxed rendering with zero `axe-core` violations.
+5. **`client/src/features/auth/legal.test.tsx`** (10 UI + `axe-core` suites):
+   - Verifies `/privacy` discloses Microsoft Graph, cloud storage copy providers (S3, Wasabi, Backblaze B2, Azure Blob, Dropbox, Google Drive, OneDrive, SharePoint), Entra ID SSO, automation webhooks, and remote copy retention with zero `axe-core` violations.
+
 ## Fakes vs Live External Services
 
 - Database persistence, transactions, optimistic locking, blind-indexed/AEAD-encrypted user lookup, and Drizzle schema generation were verified against a real isolated MySQL instance (`createTestDb`).

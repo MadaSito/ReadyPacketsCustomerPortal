@@ -73,7 +73,14 @@ const RESERVED_INTERNAL_TEMPLATE_KEYS = new Set(["jobs.mail.verify_audit_copy"])
 const TEMPLATE_KEY_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
 
 const SIMPLE_EMAIL_RE = /^[^\s@<>"',;\\]+@[^\s@<>"',;\\]+\.[^\s@<>"',;\\]{2,}$/;
-const HEADER_CONTROL_RE = /[\r\n\u0000-\u001f\u007f]/;
+
+function hasControlChar(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
 
 export const sendTemplateActionConfigSchema = z
   .strictObject({
@@ -90,7 +97,7 @@ export const sendTemplateActionConfigSchema = z
       .string()
       .trim()
       .max(254)
-      .refine((v) => !HEADER_CONTROL_RE.test(v) && SIMPLE_EMAIL_RE.test(v), "Invalid e-mail address.")
+      .refine((v) => !hasControlChar(v) && SIMPLE_EMAIL_RE.test(v), "Invalid e-mail address.")
       .optional(),
     subject: z.string().trim().min(1).max(160).optional(),
     body: z.string().trim().min(1).max(4000).optional(),
@@ -259,7 +266,7 @@ async function runSendTemplateAction(
 
     if (config.recipientMode === "fixed") {
       const addr = config.fixedAddress?.trim().toLowerCase() ?? "";
-      if (!addr || HEADER_CONTROL_RE.test(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
+      if (!addr || hasControlChar(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
         return {
           outcome: "failed",
           reasonCode: "INVALID_FIXED_RECIPIENT",
@@ -310,7 +317,7 @@ async function runSendTemplateAction(
       let displayName = "Customer";
       if (u.nameEnc) {
         try {
-          displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`).toString("utf8");
+          displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`);
         } catch {
           displayName = "Customer";
         }
@@ -416,7 +423,7 @@ async function runSendTemplateAction(
 
   if (config.recipientMode === "fixed") {
     const addr = config.fixedAddress?.trim().toLowerCase() ?? "";
-    if (!addr || HEADER_CONTROL_RE.test(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
+    if (!addr || hasControlChar(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
       return {
         outcome: "failed",
         reasonCode: "INVALID_FIXED_RECIPIENT",
@@ -475,7 +482,7 @@ async function runSendTemplateAction(
     let displayName: string | null = null;
     if (u.nameEnc) {
       try {
-        displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`).toString("utf8");
+        displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`);
       } catch {
         displayName = null;
       }

@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
-import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { MailTemplate, OutboundMail, SessionPrincipal } from "../../core/types.js";

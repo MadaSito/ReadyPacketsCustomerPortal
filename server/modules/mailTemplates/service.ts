@@ -639,7 +639,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.created",
             action: "create",
             outcome: "completed",
@@ -787,7 +787,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.draft.saved",
             action: "update",
             outcome: "completed",
@@ -889,7 +889,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.version.published",
             action: "transition",
             outcome: "completed",
@@ -956,7 +956,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.reset_to_default",
             action: "transition",
             outcome: "completed",
@@ -1077,7 +1077,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.version.restored",
             action: "update",
             outcome: "completed",
@@ -1290,7 +1290,7 @@ export function createMailTemplatesService(deps: ModuleDeps) {
 
         await deps.audit.record(
           {
-            category: "operational",
+            category: "admin",
             eventName: "mail_template.test.sent",
             action: "create",
             outcome: "completed",
