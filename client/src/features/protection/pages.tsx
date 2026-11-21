@@ -109,8 +109,10 @@ function RuleEditor({ rule, index, onChange, remove }: { rule: Rule; index: numb
       <Field label="Request field"><Select value={rule.field} options={options(["path", "method", "header", "query", "ip", "country"])}
         onChange={(e) => {
           const field = e.target.value as Rule["field"];
-          const { header: _header, ...rest } = rule;
-          onChange({ ...rest, field, ...(field === "header" ? { header: "user-agent" } : {}), operator: "exact" });
+          onChange({
+            id: rule.id, label: rule.label, value: rule.value, action: rule.action,
+            field, ...(field === "header" ? { header: "user-agent" } : {}), operator: "exact",
+          });
         }} /></Field>
       {rule.field === "header" ? <Field label="Header name"><Select options={options(headerNames)} value={rule.header}
         onChange={(e) => onChange({ ...rule, header: e.target.value as Rule["header"] })} /></Field> : null}
@@ -271,8 +273,8 @@ function Blocks({ source }: { source: "automatic" | "rate" }) {
   const release = useMutation(trpc.protection.releaseBlock.mutationOptions());
   const [selection, setSelection] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const rows = source === "automatic" ? query.data?.automatic.map((r) => ({ ...r, subject: r.ipAddress })) :
-    query.data?.rateLimits.map((r) => ({ ...r, subject: categoryLabels[r.category] }));
+  const rows = source === "automatic" ? query.data?.automatic.map((r) => ({ publicId: r.publicId, expiresAt: r.expiresAt, subject: r.ipAddress })) :
+    query.data?.rateLimits.map((r) => ({ publicId: r.publicId, expiresAt: r.expiresAt, subject: categoryLabels[r.category] }));
   async function confirm() {
     if (!selection) return;
     try {

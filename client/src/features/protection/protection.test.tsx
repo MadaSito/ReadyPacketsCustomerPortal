@@ -49,7 +49,7 @@ function renderPage(Component: ComponentType, path: string, title: string) {
       },
     })],
   });
-  return renderUi(<main><RouteFocus title={title} /><Component /></main>, {
+  return renderUi(<main><RouteFocus title={title} path={path} /><Component /></main>, {
     path, queryClient,
     wrapper: (tree) => <TRPCProvider queryClient={queryClient} trpcClient={client}>{tree}</TRPCProvider>,
   });

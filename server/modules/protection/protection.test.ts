@@ -19,8 +19,9 @@ describe("application protection", () => {
     const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
     let liveRole: "admin" | "customer" = "admin";
     let stepUpAt: Date | null = h.clock.now();
-    h.services.identity = { sessions: { assertCurrent: async () => ({ role: liveRole, stepUpAt, pendingSteps: [], mfaVerifiedAt: null }) } }
-      as unknown as typeof h.services.identity;
+    h.services.identity = {
+      sessions: { assertCurrent: async () => ({ role: liveRole, stepUpAt, pendingSteps: [], mfaVerifiedAt: null }) },
+    } as unknown as typeof h.services.identity;
     const module = createProtectionModule(h.deps);
     const app = express();
     if (trustedProxy) app.set("trust proxy", "loopback");
