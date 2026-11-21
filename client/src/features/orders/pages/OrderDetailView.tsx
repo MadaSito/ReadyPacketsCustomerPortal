@@ -15,6 +15,7 @@ import {
 } from "@/ui";
 import { ConsoleActions } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
+import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 type Area = "customer" | "console";
@@ -90,6 +91,7 @@ export function OrderDetailView({ area }: { area: Area }) {
           </Callout>
         </div>
       ) : null}
+      <WorkflowRulesPanel orderId={order.publicId} area={area} />
       {consoleArea ? (
         <div className="mb-6">
           <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} />
@@ -229,7 +231,9 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
       toast.show({ tone: "success", title: "Note added" });
       await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
     } catch (err) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      setError(message.startsWith("Some items are still needed") ? `${message} See “Needed before the next step” on this page.` : message);
+      await queryClient.invalidateQueries({ queryKey: trpc.orders.requirements.forOrder.queryKey({ orderId: order.publicId }) });
     }
   };
   return (

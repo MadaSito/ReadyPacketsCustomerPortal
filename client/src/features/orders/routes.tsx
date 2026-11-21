@@ -1,6 +1,6 @@
 /** orders feature — routes, navigation and dashboard widget. Owner: orders_engineer. Every page is lazy. */
 import { lazy } from "react";
-import { ClipboardList, Package, Workflow } from "lucide-react";
+import { ClipboardList, Package, Plus, Workflow } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
 
 const OrdersListPage = lazy(() => import("./pages/OrdersListPage"));
@@ -25,7 +25,8 @@ export const ordersFeature: FeatureRoutes = {
     { path: "/admin/workflows/:workflowId/versions", access: "admin", title: "Workflow versions", component: lazy(() => import("./pages/workflows/WorkflowVersionsPage")), capability: "workflows.manage" },
   ],
   nav: [
-    { label: "Orders", href: "/orders", icon: Package, area: "customer", access: "customer", order: 10 },
+    { label: "My orders", href: "/orders", icon: Package, area: "customer", access: "customer", order: 10 },
+    { label: "Create an order", href: "/orders/new", icon: Plus, area: "customer", access: "customer", order: 12 },
     { label: "Orders", href: "/admin/orders", icon: Package, area: "console", group: "Operations", access: "staff", capability: "orders.read_all", order: 10 },
     { label: "Catalog", href: "/admin/catalog", icon: ClipboardList, area: "console", group: "Operations", access: "admin", capability: "catalog.manage", order: 12 },
     { label: "Workflows", href: "/admin/workflows", icon: Workflow, area: "console", group: "Operations", access: "admin", capability: "workflows.manage", order: 14 },
