@@ -22,6 +22,7 @@ import { publicApiRouter } from "../modules/publicApi/router.js";
 import { communityRouter } from "../modules/community/router.js";
 import { referralsRouter } from "../modules/referrals/router.js";
 import { cartRouter } from "../modules/cart/router.js";
+import { knowledgeRouter } from "../modules/knowledge/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -46,6 +47,7 @@ export const appRouter = router({
   community: communityRouter,
   referrals: referralsRouter,
   cart: cartRouter,
+  knowledge: knowledgeRouter,
 });
 
 export type AppRouter = typeof appRouter;

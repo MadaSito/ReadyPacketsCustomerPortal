@@ -741,6 +741,159 @@ CREATE TABLE `payment_webhook_events` (
 	CONSTRAINT `pmt_wh_prov_ext_uq` UNIQUE(`provider`,`external_event_id`)
 );
 --> statement-breakpoint
+CREATE TABLE `knowledge_article_attachments` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` char(26) NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`uploaded_by_user_id` bigint unsigned NOT NULL,
+	`storage_key` varchar(48) NOT NULL,
+	`display_name_enc` text NOT NULL,
+	`byte_size` bigint unsigned NOT NULL,
+	`sha256` char(64) NOT NULL,
+	`content_type` varchar(80) NOT NULL,
+	`extension` varchar(16) NOT NULL,
+	`deleted_at` datetime(3),
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_article_attachments_id` PRIMARY KEY(`id`),
+	CONSTRAINT `knowledge_article_attachments_public_id_unique` UNIQUE(`public_id`),
+	CONSTRAINT `uq_kb_att_storage_key` UNIQUE(`storage_key`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_article_feedback` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` char(26) NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`user_id` bigint unsigned NOT NULL,
+	`helpful` boolean NOT NULL,
+	`comment_enc` text,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	`updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_article_feedback_id` PRIMARY KEY(`id`),
+	CONSTRAINT `knowledge_article_feedback_public_id_unique` UNIQUE(`public_id`),
+	CONSTRAINT `uq_kb_fb_art_user` UNIQUE(`article_id`,`user_id`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_article_relations` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`related_article_id` bigint unsigned NOT NULL,
+	`sort_order` int unsigned NOT NULL DEFAULT 0,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_article_relations_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uq_kb_rel_pair` UNIQUE(`article_id`,`related_article_id`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_article_tags` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`tag` varchar(64) NOT NULL,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_article_tags_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uq_kb_tags_pair` UNIQUE(`article_id`,`tag`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_article_versions` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` char(26) NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`version_number` int unsigned NOT NULL,
+	`category_id` bigint unsigned,
+	`slug` varchar(120) NOT NULL,
+	`title` varchar(200) NOT NULL,
+	`summary` varchar(500) NOT NULL,
+	`body_html` mediumtext NOT NULL,
+	`body_text` mediumtext NOT NULL,
+	`tags_json` text NOT NULL,
+	`audience` enum('customers','staff') NOT NULL,
+	`reviewed_on` varchar(10),
+	`change_note` varchar(255),
+	`author_user_id` bigint unsigned NOT NULL,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_article_versions_id` PRIMARY KEY(`id`),
+	CONSTRAINT `knowledge_article_versions_public_id_unique` UNIQUE(`public_id`),
+	CONSTRAINT `uq_kb_ver_num` UNIQUE(`article_id`,`version_number`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_article_view_dedup` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`article_id` bigint unsigned NOT NULL,
+	`viewer_slot_hash` char(64) NOT NULL,
+	`expires_at` datetime(3) NOT NULL,
+	CONSTRAINT `knowledge_article_view_dedup_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uq_kb_view_dedup_slot` UNIQUE(`article_id`,`viewer_slot_hash`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_articles` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` char(26) NOT NULL,
+	`category_id` bigint unsigned,
+	`slug` varchar(120) NOT NULL,
+	`title` varchar(200) NOT NULL,
+	`summary` varchar(500) NOT NULL,
+	`body_html` mediumtext NOT NULL,
+	`body_text` mediumtext NOT NULL,
+	`tags_json` text NOT NULL,
+	`audience` enum('customers','staff') NOT NULL DEFAULT 'customers',
+	`state` enum('draft','published','archived') NOT NULL DEFAULT 'draft',
+	`published_at` datetime(3),
+	`reviewed_on` varchar(10),
+	`author_user_id` bigint unsigned NOT NULL,
+	`updated_by_user_id` bigint unsigned NOT NULL,
+	`sort_order` int unsigned NOT NULL DEFAULT 0,
+	`view_count` bigint unsigned NOT NULL DEFAULT 0,
+	`helpful_yes_count` int unsigned NOT NULL DEFAULT 0,
+	`helpful_no_count` int unsigned NOT NULL DEFAULT 0,
+	`current_version_number` int unsigned NOT NULL DEFAULT 1,
+	`version` int unsigned NOT NULL DEFAULT 1,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	`updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_articles_id` PRIMARY KEY(`id`),
+	CONSTRAINT `knowledge_articles_public_id_unique` UNIQUE(`public_id`),
+	CONSTRAINT `uq_kb_art_slug` UNIQUE(`slug`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_attachment_tickets` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`token_hash` char(64) NOT NULL,
+	`attachment_id` bigint unsigned NOT NULL,
+	`user_id` bigint unsigned NOT NULL,
+	`session_id` varchar(80) NOT NULL,
+	`issued_at` datetime(3) NOT NULL,
+	`expires_at` datetime(3) NOT NULL,
+	CONSTRAINT `knowledge_attachment_tickets_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uq_kb_tkt_hash` UNIQUE(`token_hash`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_categories` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`public_id` char(26) NOT NULL,
+	`parent_category_id` bigint unsigned,
+	`slug` varchar(120) NOT NULL,
+	`title` varchar(160) NOT NULL,
+	`description` varchar(500),
+	`sort_order` int unsigned NOT NULL DEFAULT 0,
+	`archived_at` datetime(3),
+	`version` int unsigned NOT NULL DEFAULT 1,
+	`created_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	`updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+	CONSTRAINT `knowledge_categories_id` PRIMARY KEY(`id`),
+	CONSTRAINT `knowledge_categories_public_id_unique` UNIQUE(`public_id`),
+	CONSTRAINT `uq_kb_cat_slug` UNIQUE(`slug`)
+);
+--> statement-breakpoint
+CREATE TABLE `knowledge_search_logs` (
+	`id` bigint unsigned AUTO_INCREMENT NOT NULL,
+	`audience_scope` enum('customers','staff') NOT NULL DEFAULT 'customers',
+	`normalized_term` varchar(120) NOT NULL,
+	`search_count` int unsigned NOT NULL DEFAULT 1,
+	`zero_result_count` int unsigned NOT NULL DEFAULT 0,
+	`last_result_count` int unsigned NOT NULL DEFAULT 0,
+	`first_searched_at` datetime(3) NOT NULL,
+	`last_searched_at` datetime(3) NOT NULL,
+	CONSTRAINT `knowledge_search_logs_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uq_kb_search_term_scope` UNIQUE(`audience_scope`,`normalized_term`)
+);
+--> statement-breakpoint
 ALTER TABLE `user_sessions` ADD `ip_address_enc` text;--> statement-breakpoint
 ALTER TABLE `user_sessions` ADD `country` char(2);--> statement-breakpoint
 ALTER TABLE `order_grants` ADD `customer_grant_id` bigint unsigned;--> statement-breakpoint
@@ -784,6 +937,21 @@ ALTER TABLE `cart_items` ADD CONSTRAINT `cart_item_cart_fk` FOREIGN KEY (`cart_i
 ALTER TABLE `carts` ADD CONSTRAINT `cart_owner_user_fk` FOREIGN KEY (`owner_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `payment_attempts` ADD CONSTRAINT `pmt_att_cust_user_fk` FOREIGN KEY (`customer_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE `payment_webhook_events` ADD CONSTRAINT `pmt_wh_att_fk` FOREIGN KEY (`attempt_id`) REFERENCES `payment_attempts`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_attachments` ADD CONSTRAINT `kb_att_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_attachments` ADD CONSTRAINT `kb_att_uploader_fk` FOREIGN KEY (`uploaded_by_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_feedback` ADD CONSTRAINT `kb_fb_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_feedback` ADD CONSTRAINT `kb_fb_user_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_relations` ADD CONSTRAINT `kb_rel_src_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_relations` ADD CONSTRAINT `kb_rel_dst_art_fk` FOREIGN KEY (`related_article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_tags` ADD CONSTRAINT `kb_tags_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_versions` ADD CONSTRAINT `kb_ver_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_versions` ADD CONSTRAINT `kb_ver_author_fk` FOREIGN KEY (`author_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_article_view_dedup` ADD CONSTRAINT `kb_vdedup_art_fk` FOREIGN KEY (`article_id`) REFERENCES `knowledge_articles`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_articles` ADD CONSTRAINT `kb_art_cat_fk` FOREIGN KEY (`category_id`) REFERENCES `knowledge_categories`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_articles` ADD CONSTRAINT `kb_art_author_fk` FOREIGN KEY (`author_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_articles` ADD CONSTRAINT `kb_art_updater_fk` FOREIGN KEY (`updated_by_user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_attachment_tickets` ADD CONSTRAINT `kb_tkt_att_fk` FOREIGN KEY (`attachment_id`) REFERENCES `knowledge_article_attachments`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE `knowledge_attachment_tickets` ADD CONSTRAINT `kb_tkt_user_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX `identity_sign_in_events_time_idx` ON `identity_sign_in_events` (`occurred_at`);--> statement-breakpoint
 CREATE INDEX `identity_sign_in_events_user_idx` ON `identity_sign_in_events` (`user_id`,`occurred_at`);--> statement-breakpoint
 CREATE INDEX `identity_sign_in_events_kind_idx` ON `identity_sign_in_events` (`kind`,`occurred_at`);--> statement-breakpoint
@@ -849,6 +1017,20 @@ CREATE INDEX `pmt_att_st_exp_idx` ON `payment_attempts` (`status`,`expires_at`);
 CREATE INDEX `pmt_att_prov_ord_idx` ON `payment_attempts` (`provider`,`provider_order_ref`);--> statement-breakpoint
 CREATE INDEX `pmt_wh_st_rec_idx` ON `payment_webhook_events` (`status`,`received_at`);--> statement-breakpoint
 CREATE INDEX `pmt_wh_att_idx` ON `payment_webhook_events` (`attempt_id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_att_article` ON `knowledge_article_attachments` (`article_id`,`deleted_at`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_fb_art_created` ON `knowledge_article_feedback` (`article_id`,`created_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_rel_target` ON `knowledge_article_relations` (`related_article_id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_tags_lookup` ON `knowledge_article_tags` (`tag`,`article_id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_ver_created` ON `knowledge_article_versions` (`article_id`,`created_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_view_dedup_exp` ON `knowledge_article_view_dedup` (`expires_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_art_pub_list` ON `knowledge_articles` (`state`,`audience`,`sort_order`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_art_cat_sort` ON `knowledge_articles` (`category_id`,`state`,`sort_order`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_art_updated` ON `knowledge_articles` (`updated_at`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_tkt_exp` ON `knowledge_attachment_tickets` (`expires_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_cat_parent_sort` ON `knowledge_categories` (`parent_category_id`,`sort_order`,`id`);--> statement-breakpoint
+CREATE INDEX `idx_kb_search_top` ON `knowledge_search_logs` (`audience_scope`,`search_count`,`last_searched_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_search_zero` ON `knowledge_search_logs` (`audience_scope`,`zero_result_count`,`last_searched_at`);--> statement-breakpoint
+CREATE INDEX `idx_kb_search_ret` ON `knowledge_search_logs` (`last_searched_at`);--> statement-breakpoint
 CREATE INDEX `user_sessions_live_idx` ON `user_sessions` (`revoked_at`,`last_seen_at`);--> statement-breakpoint
 CREATE INDEX `order_grants_customer_grant_idx` ON `order_grants` (`customer_grant_id`);--> statement-breakpoint
 CREATE INDEX `order_files_slot_idx` ON `order_files` (`order_id`,`slot_key`,`status_key`);

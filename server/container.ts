@@ -48,6 +48,7 @@ import { createPublicApiModule, type PublicApiModule } from "./modules/publicApi
 import { createCommunityModule, type CommunityModule } from "./modules/community/index.js";
 import { createReferralsModule, type ReferralsModule } from "./modules/referrals/index.js";
 import { createCartModule, type CartModule } from "./modules/cart/index.js";
+import { createKnowledgeModule, type KnowledgeModule } from "./modules/knowledge/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -74,6 +75,7 @@ export interface ModuleRegistry {
   community: CommunityModule;
   referrals: ReferralsModule;
   cart: CartModule;
+  knowledge: KnowledgeModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -148,6 +150,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.community = createCommunityModule(deps);
   services.referrals = createReferralsModule(deps);
   services.cart = createCartModule(deps);
+  services.knowledge = createKnowledgeModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -177,6 +180,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.community,
     services.referrals,
     services.cart,
+    services.knowledge,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();

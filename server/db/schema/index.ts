@@ -26,4 +26,5 @@ export * from "../../modules/community/schema.js";
 export * from "../../modules/referrals/schema.js";
 export * from "../../modules/cart/schema.js";
 export * from "../../modules/payments/schema.js";
+export * from "../../modules/knowledge/schema.js";
 export * from "../../security/rateLimiterSchema.js";
