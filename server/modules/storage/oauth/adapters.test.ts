@@ -16,6 +16,10 @@ const credentials = { clientSecret: "local-fake-secret", refreshToken: "local-fa
 const publicId = "01KFZZZZZZZZZZZZZZZZZZZZZZ";
 const answer = (status: number, body: unknown = {}, headers = {}): EgressFetchResponse =>
   ({ status, headers, body: Buffer.from(JSON.stringify(body)) });
+const fenced = (request: StorageRequest): StorageRequest => async (url, options) => {
+  await options?.beforeSend?.();
+  return request(url, options);
+};
 
 function file(data: Buffer, overrides: Partial<StoragePutInput> = {}): StoragePutInput {
   return { path: [], name: "café.pdf", size: data.length, sha256: sha(data), contentType: "application/pdf",
@@ -50,7 +54,7 @@ describe("Dropbox protocol fake", () => {
       }
       throw new Error("Unexpected fake Dropbox request");
     });
-    const adapter = dropboxAdapter(request).create({ publicId, config: { ...config, rootPath: "Reports" }, credentials });
+    const adapter = dropboxAdapter(fenced(request)).create({ publicId, config: { ...config, rootPath: "Reports" }, credentials });
     await expect(adapter.test()).resolves.toEqual({ ok: true, code: "OK" });
     await adapter.ensureFolder([], undefined, fence);
     await expect(adapter.put(file(body, { beforeWrite: fence }))).resolves.toEqual({ remoteId: "id:fake_file", size: body.length });
@@ -77,7 +81,7 @@ describe("Dropbox protocol fake", () => {
       if (url.pathname.endsWith("/finish")) return answer(200, { id: "id:fake", size: body.length, content_hash: "0".repeat(64) });
       throw new Error("Unexpected fake Dropbox request");
     });
-    const adapter = dropboxAdapter(request).create({ publicId, config, credentials });
+    const adapter = dropboxAdapter(fenced(request)).create({ publicId, config, credentials });
     await expect(adapter.put(file(body, { sha256: "0".repeat(64) }))).rejects.toMatchObject({ code: "INTEGRITY_MISMATCH" });
     expect(request.mock.calls.some(([url]) => String(url).endsWith("/finish"))).toBe(false);
     await expect(adapter.put(file(body))).rejects.toMatchObject({ code: "INTEGRITY_MISMATCH" });
@@ -123,7 +127,7 @@ describe("Google Drive protocol fake", () => {
       });
       throw new Error("Unexpected fake Google Drive request");
     });
-    return { request, adapter: googleDriveAdapter(request, async (_, generate) => generate()).create({ publicId, config, credentials }) };
+    return { request, adapter: googleDriveAdapter(fenced(request), async (_, generate) => generate()).create({ publicId, config, credentials }) };
   }
 
   it("uses the app-created root, checks range acknowledgements and fetches independent integrity metadata", async () => {

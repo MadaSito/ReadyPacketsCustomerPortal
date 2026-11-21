@@ -59,8 +59,9 @@ export function googleDriveAdapter(request: StorageRequest, reserveFolder: Reser
       const objectKey = (parent: string, name: string) => createHash("sha256").update(JSON.stringify([publicId, parent, name])).digest("hex");
       async function api(url: URL, options: EgressFetchOptions = {}, fence?: () => Promise<void>, ambiguous = false) {
         const bearer = await access(options.signal);
-        await fence?.();
-        return dataRequest(request, ambiguous, !ambiguous)(url, { ...options, headers: { Authorization: `Bearer ${bearer}`, ...options.headers } });
+        return dataRequest(request, ambiguous, !ambiguous)(url, {
+          ...options, beforeSend: fence, headers: { Authorization: `Bearer ${bearer}`, ...options.headers },
+        });
       }
       const json = (data: unknown) => {
         const body = JSON.stringify(data);

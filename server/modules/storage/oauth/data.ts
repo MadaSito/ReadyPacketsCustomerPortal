@@ -64,11 +64,20 @@ export function testResult(error: unknown): StorageTestResult {
 
 export function dataRequest(request: StorageRequest, ambiguous: boolean, retrySafe: boolean): StorageRequest {
   return async (url, options) => {
+    const fence = options?.beforeSend;
+    let fenceFailure: { cause: unknown } | undefined;
     try {
-      const resp = await request(url, options);
+      const resp = await request(url, fence ? { ...options, beforeSend: async () => {
+        try { await fence(); } catch (cause) {
+          fenceFailure = { cause };
+          throw cause;
+        }
+      } } : options);
       if (resp.status >= 500) throw new StorageAdapterError(ambiguous ? "OUTCOME_UNKNOWN" : "PROVIDER_UNAVAILABLE", retrySafe);
       return resp;
     } catch (error) {
+      // A lost local write fence is not a request failure or an ambiguous external effect.
+      if (fenceFailure) throw fenceFailure.cause;
       if (error instanceof StorageAdapterError) throw error;
       const hint = testResult(error);
       if (!hint.ok && hint.code !== "PROVIDER_UNAVAILABLE" && hint.code !== "OK") throw new StorageAdapterError(hint.code);

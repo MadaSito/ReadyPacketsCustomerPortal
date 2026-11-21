@@ -37,15 +37,13 @@ export function dropboxAdapter(request: StorageRequest): StorageAdapterDefinitio
       async function rpc(operation: string, arg: unknown, signal?: AbortSignal, fence?: () => Promise<void>) {
         const body = JSON.stringify(arg);
         const bearer = await access(signal);
-        await fence?.();
-        return send(API + operation, { method: "POST", signal, body, headers: {
+        return send(API + operation, { method: "POST", signal, body, beforeSend: fence, headers: {
           Authorization: `Bearer ${bearer}`, "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(body)),
         } });
       }
       async function upload(operation: string, arg: unknown, body: Buffer, signal?: AbortSignal, fence?: () => Promise<void>) {
         const bearer = await access(signal);
-        await fence?.();
-        return send(CONTENT + operation, { method: "POST", signal, body, timeoutMs: 30_000, maxRequestBytes: CHUNK, headers: {
+        return send(CONTENT + operation, { method: "POST", signal, body, timeoutMs: 30_000, maxRequestBytes: CHUNK, beforeSend: fence, headers: {
           Authorization: `Bearer ${bearer}`, "Content-Type": "application/octet-stream",
           "Dropbox-API-Arg": headerJson(arg), "Content-Length": String(body.length),
         } });

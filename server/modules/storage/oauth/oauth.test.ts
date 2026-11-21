@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 import { eq } from "drizzle-orm";
 import { Router } from "express";
 import request from "supertest";
@@ -13,6 +14,7 @@ import { deriveSessionCsrfToken } from "../../../security/csrf.js";
 import { router } from "../../../trpc/trpc.js";
 import { createEgressPolicy, type EgressFetchResponse } from "../../integrations/egress.js";
 import { integrationEgressAllowlist } from "../../integrations/schema.js";
+import { dropboxAdapter } from "../adapters/dropbox.js";
 import { googleDriveAdapter } from "../adapters/googleDrive.js";
 import { createStorageModule } from "../index.js";
 import { storageConnections } from "../schema.js";
@@ -298,8 +300,14 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     let providerResponse = response(200, grant);
     const httpsRequester = vi.fn(async () => providerResponse);
     let address = "93.184.216.34";
+    let revokeOnUploadDns = false;
+    let writeAllowed = true;
     const egress = createEgressPolicy(f.h.deps, {
-      dnsLookup: async () => [{ address, family: 4 }], httpsRequester,
+      dnsLookup: async (hostname) => {
+        if (revokeOnUploadDns && hostname === "content.dropboxapi.com") writeAllowed = false;
+        return [{ address, family: 4 }];
+      },
+      httpsRequester,
     });
     f.h.services.integrations = { egress } as typeof f.h.services.integrations;
     const dropbox = requestForOAuthProvider(f.h.services, "dropbox");
@@ -327,5 +335,19 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     expect(progress.headers.location).toBeUndefined();
     await expect(gdrive(driveUploadUrl, { method: "POST", acceptUploadIncomplete: true })).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(dropbox(dropboxUrl, { method: "PUT", acceptUploadIncomplete: true })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    providerResponse = response(200, grant);
+    httpsRequester.mockClear();
+    revokeOnUploadDns = true;
+    const lostWrite = forbidden("STORAGE_ASSIGNMENT_INACTIVE");
+    const adapter = dropboxAdapter(dropbox).create({
+      publicId: f.target.publicId, config: { clientId: "fake-app" }, credentials: { clientSecret: secret, refreshToken: refresh },
+    });
+    const bytes = Buffer.from("synthetic data");
+    await expect(adapter.put({
+      path: [], name: "test.txt", size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), contentType: "text/plain",
+      body: Readable.from([bytes]), beforeWrite: async () => { if (!writeAllowed) throw lostWrite; },
+    })).rejects.toBe(lostWrite);
+    expect(writeAllowed).toBe(false);
+    expect(httpsRequester).toHaveBeenCalledTimes(1); // refresh only: no upload was sent
   });
 });
