@@ -237,7 +237,7 @@ with open(state_path, "w", encoding="utf-8") as fh:
         {
             "totpSecret": enrolled["secret"],
             "unusedRecoveryCodes": recovery_codes[1:],
-            "customerPublicId": customer["publicId"],
+            "customerPublicId": customer["customerId"],
             "customerRef": customer["customerRef"],
             "orderPublicId": order["publicId"],
             "orderReference": order["reference"],
@@ -383,7 +383,7 @@ assert cleared["active"] is False
 
 # Verify pre-upgrade customer and order survived migration 0002 intact.
 loaded_customer = trpc_query("identity.admin.customers.get", {"customerId": state["customerPublicId"]})
-assert loaded_customer["customerRef"] == state["customerRef"], f"customer mismatch: {loaded_customer}"
+assert loaded_customer["customer"]["customerRef"] == state["customerRef"], f"customer mismatch: {loaded_customer}"
 
 loaded_order = trpc_query("orders.admin.get", {"orderId": state["orderPublicId"]})
 assert loaded_order["reference"] == state["orderReference"], f"order mismatch: {loaded_order}"
@@ -402,9 +402,9 @@ assert (
 ), f"unexpected post-upgrade customer reference: {new_customer}"
 
 # Verify Increment 03 migrated surfaces respond cleanly (and ship disabled by default).
-backups = trpc_query("backup.listArchives", {"limit": 10})
+backups = trpc_query("backup.admin.list", {"limit": 10})
 assert any(item["trigger"] == "pre_upgrade" and item["verificationStatus"] == "verified" for item in backups["items"]), (
-    f"pre_upgrade archive missing from backup.listArchives: {backups}"
+    f"pre_upgrade archive missing from backup.admin.list: {backups}"
 )
 storage_conns = trpc_query("storage.connections.list", {"limit": 10})
 assert storage_conns["items"] == [], f"expected zero storage connections by default: {storage_conns}"
