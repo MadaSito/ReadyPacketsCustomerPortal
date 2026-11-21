@@ -171,3 +171,103 @@ The kit provides labelled controls, focus management in overlays, live regions f
 order, label icon-only actions, write meaningful link text, and keep tests with `axe-core` (see
 `client/src/ui/ui.test.tsx` for the `expectNoAxeViolations` helper pattern). We target WCAG 2.2 AA; we do not
 claim certification.
+
+## Increment 03 components (package K)
+
+All exported from `@/ui`. `FlowCanvas` and `RichTextEditor` are lazy wrappers: the library code (@xyflow/react,
+TipTap) loads in its own chunk the first time the component renders; a `Skeleton` shows meanwhile. Nothing in them
+injects `<style>` elements or style attributes, so they run under `style-src 'self'` without changes.
+
+### FlowCanvas — `import { FlowCanvas } from "@/ui"`
+```ts
+type FlowTone = "neutral" | "info" | "success" | "warning" | "danger";
+interface FlowNode { id: string; label: string; sublabel?: string; kind?: string /* small tag, e.g. "Trigger" */; tone?: FlowTone; x: number; y: number }
+interface FlowEdge { id: string; from: string; to: string; label?: string }
+type FlowSelection = { type: "node" | "edge"; id: string } | null;
+interface FlowCanvasProps {
+  label: string;                                   // accessible name, e.g. "Workflow canvas"
+  nodes: FlowNode[]; edges: FlowEdge[];            // controlled: the canvas never keeps its own copy
+  selected?: FlowSelection; onSelect?: (s: FlowSelection) => void;
+  onMove?: (id: string, x: number, y: number) => void;    // drag end, or keyboard move (snapped to 20 px)
+  onConnect?: (from: string, to: string) => void;          // drag handle-to-handle, or keyboard connect
+  onDelete?: (s: NonNullable<FlowSelection>) => void;      // Delete / Backspace on the selection
+  readOnly?: boolean;                              // no move / connect / delete; select + pan / zoom still work
+  height?: "sm" | "md" | "lg";                     // 20 / 30 / 40 rem (capped to 70 vh on phones)
+}
+```
+Keyboard: Tab reaches the toolbar (Zoom in, Zoom out, Fit) and then each node in reading order; Enter / Space
+selects; arrow keys move the selected node by 20 px (Shift: 100 px); `C` on a selected node starts "connect"
+mode, Tab / Enter on the target finishes it, Escape cancels; Delete removes the selection (only with `onDelete`).
+Every action is announced in a polite live region. Drag-only is never required, but you must still offer a form
+alternative for connecting and for editing properties (side panel). Reduced motion: no animated edges or
+transitions; fit / zoom are instant.
+
+### RichTextEditor — `import { RichTextEditor } from "@/ui"`
+```ts
+interface EditorVariable { name: string; label: string; required?: boolean }
+interface RichTextEditorProps {
+  label: string; hint?: string; error?: string; required?: boolean; id?: string;
+  value: string;                          // HTML in the subset below
+  onChange: (html: string) => void;
+  variables?: EditorVariable[];           // palette; inserted as chips
+  disabled?: boolean;
+}
+```
+Toolbar: Heading 2 / Heading 3 / Paragraph, Bold, Italic, Bulleted list, Numbered list, Link, Image, Button,
+Insert variable, Undo, Redo (all buttons with names and `aria-pressed`; Ctrl/Cmd+B / I / Z work).
+Output HTML subset (the server sanitiser must accept exactly this and drop the rest):
+`p, h2, h3, strong, em, ul, ol, li, br, hr`, `a[href]` (href `https:`, `mailto:` or exactly `{{variable}}`),
+`a[href][data-rp-button="primary"]` (button), `img[src][alt]` (src `https:` only; alt required).
+Variables appear in the output as the literal text `{{name}}` (inside text or as an href), never as markup.
+Pasted content is reduced to the subset in the editor too, but the server sanitiser is the authority.
+
+### InertMailPreview — `import { InertMailPreview } from "@/ui"`
+```ts
+interface InertMailPreviewProps { title: string; html?: string /* server structural projection */; text: string; height?: "sm" | "md" | "lg" }
+```
+Tabs "Structure preview" (sandboxed `srcDoc` iframe, `sandbox=""`, no allow tokens, `referrerPolicy="no-referrer"`,
+CSP meta `default-src 'none'; base-uri 'none'; form-action 'none'` first) and "Plain text". `html` must be the
+server's preview projection (no href/src/srcset, no forms/meta/base/styles/SVG/MathML); the component never builds
+HTML and never uses `dangerouslySetInnerHTML`. Without `html` only the plain text is shown. The only approved way to
+show stored or rendered mail HTML in the console.
+
+### Wizard — `import { Wizard } from "@/ui"`
+```ts
+interface WizardStep { id: string; label: string; optional?: boolean }
+interface WizardProps {
+  steps: WizardStep[]; current: string;            // controlled
+  onNext: () => void;                              // the step's <form> submit (validate here; don't advance on error)
+  onBack?: () => void;                             // Back hidden on the first step
+  onStepSelect?: (id: string) => void;             // makes completed steps clickable
+  completed?: string[];
+  nextLabel?: string;                              // default "Continue"; e.g. "Publish" on the last step
+  nextDisabled?: boolean; busy?: boolean;
+  secondaryAction?: ReactNode;                     // e.g. <Button variant="ghost">Save draft</Button>
+  children: ReactNode;                             // current step body (fields only; no <form>)
+}
+```
+Renders the progress `<ol aria-label="Progress">` (compact "Step 2 of 4" on phones), the step `<h2>` (focused on
+step change), one `<form noValidate>` and the Back / Continue bar. Entered data is yours: keep it in the parent.
+
+### SsoButton — `import { SsoButton } from "@/ui"`
+```ts
+interface SsoButtonProps { href: string; label?: string /* "Sign in with SSO" */; providerName?: string /* "Microsoft Entra ID" */; disabled?: boolean; divider?: boolean /* "or" divider above, default true */ }
+```
+Full-width secondary-style button (a real link, so the browser performs a top-level navigation to the start
+endpoint), key icon, provider name as a second line, preceded by an "or" divider. The sign-in page shows it through `SsoSignInSlot` (identity feature).
+
+### Console navigation for increment 03
+Each owner adds the entry to their own `routes.tsx` `nav` with these values (paths are siblings because the
+sidebar marks `href` and everything under `href/` as current):
+
+| Label | href | group | order | owner |
+| --- | --- | --- | --- | --- |
+| Workflows (exists) | `/admin/workflows` | Operations | 14 | orders |
+| Single sign-on | `/admin/sso` | Security | 31 | identity |
+| E-mail delivery | `/admin/email-delivery` | Integrations | 60 | siem |
+| E-mail templates | `/admin/email-templates` | Integrations | 61 | compliance |
+| Automations | `/admin/automations` | Integrations | 62 | audit (client) |
+| Storage connections | `/admin/storage` | Integrations | 63 | siem |
+| SharePoint order sync | `/admin/sharepoint-sync` | Integrations | 64 | siem |
+
+The existing `/admin/mail` (jobs, "Mail") stays as the message log; suggested new label "Mail log".

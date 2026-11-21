@@ -72,7 +72,7 @@ describe("Jobs administration pages", () => {
     await expectNoAxeViolations();
   });
 
-  it("shows held and SMTP acceptance distinctly and offers resend only for held mail", async () => {
+  it("shows holds and provider acceptance distinctly and offers resend only for held mail", async () => {
     renderConsole(<MailPage />, {
       "jobs.admin.listMail": () => ({
         items: [
@@ -84,11 +84,37 @@ describe("Jobs administration pages", () => {
     });
     const table = await screen.findByRole("table", { name: "Outgoing mail" });
     expect(within(table).getByText("Held: mail not configured")).toBeInTheDocument();
-    expect(within(table).getByText("SMTP accepted")).toBeInTheDocument();
+    expect(within(table).getByText("Provider accepted")).toBeInTheDocument();
     expect(within(table).getByRole("button", { name: `Resend message ${mailId}` })).toBeInTheDocument();
     expect(within(table).queryByRole("button", { name: `Resend message ${jobId}` })).not.toBeInTheDocument();
     expect(screen.getByText("Acceptance is not delivery")).toBeInTheDocument();
     await expectNoAxeViolations();
+  });
+
+  it("displays both retained bodies without interpreting HTML or caching the mutation", async () => {
+    const user = userEvent.setup();
+    const html = '<img src="https://remote.example.test/pixel"><a href="https://remote.example.test/">[REDACTED]</a>';
+    const load = vi.fn(() => ({ to: "recipient@example.test", subject: "Retained", text: "[REDACTED]", html }));
+    const view = renderConsole(<MailPage />, {
+      "jobs.admin.listMail": () => ({
+        items: [{ publicId: mailId, template: "test.retained", state: "accepted", canViewContent: true, updatedAt: date }],
+        nextCursor: null,
+      }),
+      "jobs.mail.content": load,
+    });
+    const table = await screen.findByRole("table", { name: "Outgoing mail" });
+    const opener = within(table).getByRole("button", { name: `View message ${mailId}` });
+    expect(load).not.toHaveBeenCalled();
+    await user.click(opener);
+    const dialog = await screen.findByRole("dialog", { name: "Retained message" });
+    expect(load).toHaveBeenCalledWith({ publicId: mailId });
+    expect(within(dialog).getByRole("region", { name: "Plain-text body" })).toHaveTextContent("[REDACTED]");
+    expect(within(dialog).getByRole("region", { name: "HTML source (not rendered)" })).toHaveTextContent(html);
+    expect(dialog.querySelector("img,a,iframe")).toBeNull();
+    expect(view.queryClient.getMutationCache().getAll()).toHaveLength(0);
+    await expectNoAxeViolations();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "Retained message" })).not.toBeInTheDocument();
   });
 
   it("reveals captured mail only on request and keeps it out of the mutation cache", async () => {

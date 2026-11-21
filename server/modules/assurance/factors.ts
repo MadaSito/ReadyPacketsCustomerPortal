@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, forbidden, notFound } from "../../core/errors.js";
 import type { AuditEventInput, SessionPrincipal, Tx } from "../../core/types.js";
+import { TOTP_FAILURE_LIMIT } from "./breakGlass.js";
 import type { SecondFactorInput } from "./input.js";
 import * as passkeys from "./passkeys.js";
 import { assertCurrent, badProof, isFull, requireFresh, requireFull, requireTransition, throttle } from "./policy.js";
@@ -23,7 +24,6 @@ interface AuthenticationBinding {
 const clearedPending = { pendingTotpSecretEnc: null, pendingTotpExpiresAt: null, pendingTotpSessionId: null } as const;
 const clearedTotpFailures = { totpFailures: 0, totpLockedUntil: null } as const;
 const TOTP_COOLDOWN_THRESHOLD = 10;
-const TOTP_FAILURE_LIMIT = 50;
 const ok = { ok: true } as const;
 
 export function createFactorService(deps: ModuleDeps) {
@@ -39,8 +39,10 @@ export function createFactorService(deps: ModuleDeps) {
 
   async function actorTx<T>(
     actor: SessionPrincipal, work: (tx: Tx, account: AssuranceAccount, now: Date) => Promise<T>,
+    guardLocalAdmin = false,
   ): Promise<T> {
     return deps.db.transaction(async (tx) => {
+      if (guardLocalAdmin) await deps.services.assurance.lockLocalAdministratorPolicy(tx);
       await assertCurrent(deps, actor, tx);
       const now = deps.clock.now();
       return work(tx, await lockAccount(tx, actor.userId, now), now);
@@ -53,18 +55,23 @@ export function createFactorService(deps: ModuleDeps) {
   }
 
   async function countTotpFailure(tx: Tx, account: AssuranceAccount, now: Date, actor?: AuditActor): Promise<void> {
-    const totpFailures = account.totpFailures + 1;
-    const hardLock = totpFailures === TOTP_FAILURE_LIMIT;
+    const nextFailures = account.totpFailures + 1;
+    const needsHardLock = nextFailures === TOTP_FAILURE_LIMIT;
+    const protectLastAdmin = needsHardLock && actor?.role === "admin" && (await getPasskeys(tx, actor.userId)).length === 0
+      && await deps.services.assurance.wouldLoseLastLocalAdministrator(tx, actor.userId);
+    const hardLock = needsHardLock && !protectLastAdmin;
+    // Keep attempts at one per maximum cooldown after reaching the cap; never reset or extend a running cooldown.
+    const totpFailures = protectLastAdmin ? TOTP_FAILURE_LIMIT - 1 : nextFailures;
     const cooldownMs = totpFailures < TOTP_COOLDOWN_THRESHOLD
       ? 0
       : Math.min(3_600_000, 30_000 * 2 ** (totpFailures - TOTP_COOLDOWN_THRESHOLD));
     await tx.update(assuranceAccounts).set({
       totpFailures, totpLockedUntil: hardLock || !cooldownMs ? null : new Date(+now + cooldownMs), updatedAt: now,
     }).where(eq(assuranceAccounts.id, account.id));
-    if (totpFailures !== TOTP_COOLDOWN_THRESHOLD && !hardLock) return;
+    if (totpFailures !== TOTP_COOLDOWN_THRESHOLD && !needsHardLock) return;
     await record("auth.totp.locked", tx, actor, {
-      action: "throttle", outcome: "denied", severity: "WARN",
-      reasonCode: hardLock ? "TOTP_REPLACEMENT_REQUIRED" : "TOTP_COOLDOWN",
+      action: "throttle", outcome: "denied", severity: protectLastAdmin ? "ERROR" : "WARN",
+      reasonCode: protectLastAdmin ? "LOCAL_MFA_ADMIN_COOLDOWN" : hardLock ? "TOTP_REPLACEMENT_REQUIRED" : "TOTP_COOLDOWN",
     });
     await deps.services.engagement.notify({
       userId: account.userId, kind: "security.totp_locked",
@@ -139,6 +146,7 @@ export function createFactorService(deps: ModuleDeps) {
       await throttle(deps, userId);
       return deps.db.transaction(async (tx) => {
         // Trusted service interface; HTTP ceremonies use actorTx and require a live session.
+        if (input.method === "totp") await deps.services.assurance.lockLocalAdministratorPolicy(tx);
         const subject = await deps.services.identity.getUser(userId, { tx, forUpdate: true });
         if (subject?.status !== "active" || subject.authSource !== "local") return false;
         const account = await lockAccount(tx, userId, deps.clock.now());
@@ -225,7 +233,7 @@ export function createFactorService(deps: ModuleDeps) {
         const batch = await replaceRecoveryCodes(deps, tx, account, now);
         await record("auth.recovery_codes.reissued", tx, actor, { action: "update" });
         return batch;
-      });
+      }, actor.role === "admin" && factor.method === "totp");
       if (!result) throw badProof();
       return result;
     },
@@ -256,23 +264,27 @@ export function createFactorService(deps: ModuleDeps) {
         }
         await record("auth.mfa.verified", tx, actor);
         return deps.services.identity.sessions.markMfaVerified(actor.sessionId, { tx });
-      });
+      }, actor.role === "admin" && factor.method === "totp");
       if (!issued) throw badProof();
       return issued;
     },
-    async stepUp(actor: SessionPrincipal, password: string, factor: SecondFactorInput) {
+    async stepUp(actor: SessionPrincipal, password: string | undefined, factor: SecondFactorInput) {
       requireFull(actor);
       await throttle(deps, actor.userId);
       const issued = await actorTx(actor, async (tx, account) => {
-        // Verify the currently locked credential, not a password read before a competing reset.
-        if (!await deps.services.identity.verifyPassword(actor.userId, password, { tx }) ||
+        // A full Entra session may use a fresh local strong factor without a local password.
+        // Local sessions must still verify the current password; recovery codes are not Entra step-up proofs.
+        const primaryValid = actor.authMethod === "entra"
+          ? factor.method !== "recovery_code"
+          : password !== undefined && await deps.services.identity.verifyPassword(actor.userId, password, { tx });
+        if (!primaryValid ||
             !await proof(tx, account, factor, { sessionId: actor.sessionId, purpose: "step_up" }, actor)) {
           await denied("auth.step_up.denied", actor, tx);
           return null;
         }
         await record("auth.step_up.verified", tx, actor);
         return deps.services.identity.sessions.markStepUp(actor.sessionId, { tx });
-      });
+      }, actor.role === "admin" && factor.method === "totp");
       if (!issued) throw badProof();
       return issued;
     },
@@ -302,7 +314,8 @@ export function createFactorService(deps: ModuleDeps) {
       return actorTx(actor, async (tx, _account, now) => {
         requireFresh(actor, now);
         const subject = await deps.services.identity.getUser(actor.userId, { tx });
-        if (subject?.authSource !== "local") throw forbidden("LOCAL_ACCOUNT_REQUIRED");
+        if (!subject || (subject.authSource !== "local" && actor.authMethod !== "entra"))
+          throw forbidden("LOCAL_ACCOUNT_REQUIRED");
         return passkeys.beginRegistration(deps, tx, actor, subject.email);
       });
     },
@@ -349,10 +362,12 @@ export function createFactorService(deps: ModuleDeps) {
         }
         if (keys.length < 2 && !account.totpSecretEnc)
           throw conflict("LAST_STRONG_FACTOR", "Register another passkey or authenticator app before removing this passkey.");
+        if (actor.role === "admin" && keys.length === 1 && account.totpFailures >= TOTP_FAILURE_LIMIT)
+          await deps.services.assurance.assertLocalAdministratorMayLoseAccess(tx, actor.userId);
         await tx.delete(assurancePasskeys).where(eq(assurancePasskeys.id, key.id));
         await record("auth.passkey.removed", tx, actor, { action: "delete" }, publicId);
         return true;
-      });
+      }, actor.role === "admin");
       if (!result) throw notFound("PASSKEY_NOT_FOUND");
       return ok;
     },

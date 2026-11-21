@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
-import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS } from "./schema.js";
+import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS, WORKFLOW_DRAFT_SOURCES } from "./schema.js";
 import { bundleRuleSchema } from "./settings.js";
 
 const id = z.string().regex(ULID_PATTERN);
@@ -104,6 +104,55 @@ const workflowsAdmin = router({
     .use(requireCapability("workflows.manage"))
     .input(z.strictObject({ workflowId: id, expectedVersion: version, name: nfc(1, 120), definition: z.unknown(), makeDefault: z.boolean() }))
     .mutation(({ ctx, input }) => ctx.services.orders.workflows.publish(ctx.session, input)),
+
+  /* ---- increment 03: designer (drafts edited by the wizard and the canvas) ---- */
+  installStandard: adminProcedure
+    .use(requireCapability("workflows.manage"))
+    .mutation(({ ctx }) => ctx.services.orders.workflows.installStandard(ctx.session)),
+  versions: adminProcedure
+    .use(requireCapability("workflows.manage"))
+    .input(z.strictObject({ workflowId: id }))
+    .query(({ ctx, input }) => ctx.services.orders.workflows.listVersions(input.workflowId)),
+  version: adminProcedure
+    .use(requireCapability("workflows.manage"))
+    .input(z.strictObject({ versionId: id }))
+    .query(({ ctx, input }) => ctx.services.orders.workflows.getVersion(input.versionId)),
+  drafts: router({
+    list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.listDrafts()),
+    get: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(z.strictObject({ draftId: id }))
+      .query(({ ctx, input }) => ctx.services.orders.workflows.getDraft(input.draftId)),
+    create: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(
+        z.strictObject({
+          from: z.enum(WORKFLOW_DRAFT_SOURCES),
+          copyVersionId: id.optional(),
+          workflowId: id.optional(),
+          workflowKey: statusKey.optional(),
+          name: nfc(1, 120).optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.createDraft(ctx.session, input)),
+    save: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(z.strictObject({ draftId: id, expectedVersion: version, name: nfc(1, 120), definition: z.unknown(), layout: z.unknown().optional() }))
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.saveDraft(ctx.session, input)),
+    validate: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(z.strictObject({ definition: z.unknown() }))
+      // A mutation only so the body travels in POST (no writes, no audit).
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.validate(input.definition)),
+    discard: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(z.strictObject({ draftId: id, expectedVersion: version }))
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.discardDraft(ctx.session, input)),
+    publish: adminProcedure
+      .use(requireCapability("workflows.manage"))
+      .input(z.strictObject({ draftId: id, expectedVersion: version, makeDefault: z.boolean(), changeNote: nfc(0, 500).optional() }))
+      .mutation(({ ctx, input }) => ctx.services.orders.workflows.publishDraft(ctx.session, input)),
+  }),
 });
 
 const sharing = router({

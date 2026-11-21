@@ -5,7 +5,7 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, SessionResolver, Tx } from "../../core/types.js";
-import type { TransitionStep, UserRole } from "../../../shared/domain.js";
+import type { AuthMethod, TransitionStep, UserRole } from "../../../shared/domain.js";
 import { createAdminService, type AdminService, type CustomerListItem, type Page } from "./admin.js";
 import { createAuthService, PASSWORD_RESET_JOB, type PasswordResetJob, type AuthService } from "./auth.js";
 import { createCredentialService } from "./credentials.js";
@@ -56,7 +56,7 @@ export interface IdentityModule extends ModuleLifecycle {
     openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal>;
   };
   transitions: {
-    derive(userId: number, session?: { mfaVerifiedAt: Date | null; tx?: DbOrTx }): Promise<TransitionStep[]>;
+    derive(userId: number, session?: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod; tx?: DbOrTx }): Promise<TransitionStep[]>;
   };
   createPendingCustomer(
     input: { email: string; name: string; customerRef?: string | null; publicId?: string; createdAt?: Date },
@@ -131,7 +131,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       async derive(userId, session) {
         const row = await repo.byId(userId, session?.tx ? { tx: session.tx } : {});
         if (!row) return [];
-        return transitions.derive(row, session ? { mfaVerifiedAt: session.mfaVerifiedAt } : undefined, session?.tx);
+        return transitions.derive(row, session ? { mfaVerifiedAt: session.mfaVerifiedAt, authMethod: session.authMethod } : undefined, session?.tx);
       },
     },
     createPendingCustomer: admin.createPendingCustomer,

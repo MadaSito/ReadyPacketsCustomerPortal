@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull } from "drizzle-orm";
 import { randomBytes } from "node:crypto";
 import type { Services } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
@@ -10,6 +10,7 @@ import { createCallerFactory } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { users, userSessions } from "../identity/schema.js";
+import { assessEntraSignIn, isFreshEntraAuthentication } from "./entra.js";
 import { createAssuranceModule } from "./index.js";
 import { assuranceRouter } from "./router.js";
 import * as assuranceSchema from "./schema.js";
@@ -24,7 +25,7 @@ describe("assurance: isolated transactional model", () => {
   let h: TestHarness;
   const issue = vi.fn();
   const notify = vi.fn();
-  const smtpReadiness = vi.fn();
+  const mailReadiness = vi.fn();
   const markMfaVerified = vi.fn(() => Promise.resolve({
     token: randomBytes(32).toString("base64url"),
     csrfToken: randomBytes(32).toString("base64url"), absoluteExpiresAt: h.clock.now(),
@@ -57,8 +58,8 @@ describe("assurance: isolated transactional model", () => {
     return fakePrincipal({ userId: id, userPublicId: publicId, sessionId, role, ...overrides });
   }
 
-  async function enroll() {
-    const account = await fixture({ state: "remediation", pendingSteps: ["enroll_mfa"], mfaVerifiedAt: null });
+  async function enroll(role: SessionPrincipal["role"] = "customer") {
+    const account = await fixture({ role, state: "remediation", pendingSteps: ["enroll_mfa"], mfaVerifiedAt: null });
     const result = await caller(account).beginTotpEnrollment();
     const code = totp(result.secret).generate({ timestamp: +h.clock.now() });
     const recovery = await caller(account).confirmTotpEnrollment({ code });
@@ -75,8 +76,8 @@ describe("assurance: isolated transactional model", () => {
     h = createTestDeps({ db: db.db });
     h.services.assurance = createAssuranceModule(h.deps);
     h.services.engagement = { notify } as unknown as Services["engagement"];
-    smtpReadiness.mockResolvedValue({ ready: true });
-    h.services.integrations = { smtp: { getReadiness: smtpReadiness } } as unknown as Services["integrations"];
+    mailReadiness.mockResolvedValue({ ready: true });
+    h.services.jobAdmin = { getMailReadiness: mailReadiness } as Services["jobAdmin"];
     async function findUser(where: ReturnType<typeof eq>, opts?: { tx?: DbOrTx; forUpdate?: boolean }) {
       const query = (opts?.tx ?? db.db).select().from(users).where(where).limit(1);
       const [row] = await (opts?.forUpdate ? query.for("update") : query);
@@ -86,6 +87,10 @@ describe("assurance: isolated transactional model", () => {
     h.services.identity = {
       getUser: (id: number, opts?: { tx?: DbOrTx; forUpdate?: boolean }) => findUser(eq(users.id, id), opts),
       getUserByPublicId: (id: string, opts?: { tx?: DbOrTx; forUpdate?: boolean }) => findUser(eq(users.publicId, id), opts),
+      listLocalAdministratorCandidates: async (tx: Tx) => (await tx.select({ id: users.id }).from(users).where(and(
+        eq(users.role, "admin"), eq(users.status, "active"), eq(users.authSource, "local"),
+        isNotNull(users.passwordHash), isNotNull(users.emailVerifiedAt),
+      )).orderBy(asc(users.id)).for("update")).map(({ id }) => id),
       verifyPassword: vi.fn().mockResolvedValue(true),
       setPassword: async (id: number, password: string, opts: { mustChange: boolean; tx: Tx }) => {
         if (password.length < 15) throw new DomainError("VALIDATION", "PASSWORD_TOO_SHORT", "Choose a longer password.");
@@ -116,6 +121,138 @@ describe("assurance: isolated transactional model", () => {
         },
       },
     } as unknown as Services["identity"];
+  });
+
+  it("trusts only a validated explicit MFA assertion when the trust switch is enabled", () => {
+    expect(assessEntraSignIn(["pwd", "mfa"], true)).toEqual({ mfaVerified: true });
+    for (const amr of [undefined, [], ["pwd"], ["MFA"], ["urn:example:mfa"]]) {
+      expect(assessEntraSignIn(amr, true)).toEqual({ mfaVerified: false });
+    }
+    expect(assessEntraSignIn(["mfa"], false)).toEqual({ mfaVerified: false });
+  });
+
+  it("requires a fresh auth_time for the same validated Entra transaction and audits rotation", async () => {
+    const actor = await fixture({ authMethod: "entra" });
+    const requestedAt = h.clock.now();
+    const authTime = Math.floor(+requestedAt / 1000);
+    h.clock.advance(1000);
+    const proof = { amr: ["mfa"], trustEntraMfa: true, requestedAt, authTime };
+    const complete = (input: typeof proof, principal = actor) => db.db.transaction(
+      (tx) => h.services.assurance.completeEntraStepUp(principal, input, tx),
+    );
+    for (const invalid of [
+      { ...proof, authTime: authTime - 1 }, { ...proof, authTime: authTime + 2 },
+      { ...proof, authTime: Number.NaN }, { ...proof, authTime: authTime + 0.5 },
+      { ...proof, amr: ["pwd"] }, { ...proof, trustEntraMfa: false },
+    ]) await expect(complete(invalid)).rejects.toMatchObject({ reasonCode: "AUTHENTICATION_PROOF_INVALID" });
+    await expect(complete(proof, { ...actor, authMethod: "local" })).rejects.toMatchObject({ reasonCode: "AUTHENTICATION_PROOF_INVALID" });
+    expect(markStepUp).not.toHaveBeenCalled();
+    await expect(complete(proof)).resolves.toMatchObject({ token: expect.any(String) });
+    expect(markStepUp).toHaveBeenCalledTimes(1);
+    expect(h.audit.events).toContainEqual(expect.objectContaining({ eventName: "auth.step_up.verified" }));
+    h.clock.advance(5 * 60_000);
+    expect(isFreshEntraAuthentication(authTime, requestedAt, h.clock.now())).toBe(false);
+    await expect(complete(proof)).rejects.toMatchObject({ reasonCode: "AUTHENTICATION_PROOF_INVALID" });
+  });
+
+  it("keeps local password step-up mandatory and permits an Entra session a fresh local factor, not recovery codes", async () => {
+    const { account, result, ack, recovery } = await enroll();
+    await caller(ack).acknowledgeRecoveryCodes({ recoverySetId: recovery.recoverySetId! });
+    markStepUp.mockClear();
+    const local = { ...account, state: "full", pendingSteps: [] } as const;
+    const entra = { ...local, authMethod: "entra" } as const;
+    h.clock.advance(30_000);
+    const factor = { method: "totp", code: totp(result.secret).generate({ timestamp: +h.clock.now() }) } as const;
+    await expect(caller(local).stepUp({ factor })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller(entra).stepUp({ factor: { method: "recovery_code", code: recovery.recoveryCodes![0]! } }))
+      .rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller(entra).stepUp({ factor })).resolves.toEqual({ ok: true });
+    expect(h.services.identity.verifyPassword).not.toHaveBeenCalled();
+    expect(markStepUp).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a local MFA administrator for SSO enablement and serializes concurrent MFA resets", async () => {
+    const assurance = h.services.assurance;
+    const inPolicy = <T>(work: (tx: Tx) => Promise<T>) => db.db.transaction(async (tx) => {
+      await assurance.lockLocalAdministratorPolicy(tx);
+      return work(tx);
+    });
+    const breakGlassConflict = { reasonCode: "LOCAL_MFA_ADMIN_REQUIRED" };
+    const external = await fixture({ role: "admin", stepUpAt: h.clock.now() }, "saml");
+    const unenrolled = await fixture({ role: "admin" });
+    try {
+      await expect(inPolicy(assurance.assertLocalAdministratorRemains)).rejects.toMatchObject(breakGlassConflict);
+      const first = await enroll("admin");
+      try {
+        await expect(assurance.breakGlassHealth()).resolves.toEqual({
+          localMfaAdministrators: 1, soleLocalMfaAdministratorHasPasskey: false,
+        });
+        await db.db.insert(assurancePasskeys).values({
+          userId: first.account.userId, credentialId: "synthetic-health-check",
+          credentialIndex: h.deps.crypto.blindIndex(first.account.userPublicId, "test.passkey"), publicKey: "synthetic", counter: 0, nameEnc: "synthetic",
+        });
+        await expect(assurance.breakGlassHealth()).resolves.toEqual({
+          localMfaAdministrators: 1, soleLocalMfaAdministratorHasPasskey: true,
+        });
+        await db.db.delete(assurancePasskeys).where(eq(assurancePasskeys.userId, first.account.userId));
+        await expect(caller(external).admin.resetMfa({ customerId: first.account.userPublicId }))
+          .rejects.toMatchObject({ cause: breakGlassConflict });
+        await expect(caller(external).admin.setCredential({ customerId: first.account.userPublicId, mode: "email_link" }))
+          .rejects.toMatchObject({ cause: breakGlassConflict });
+        await expect(inPolicy(assurance.assertLocalAdministratorRemains)).resolves.toBeUndefined();
+        const second = await enroll("admin");
+        try {
+          await expect(assurance.breakGlassHealth()).resolves.toEqual({
+            localMfaAdministrators: 2, soleLocalMfaAdministratorHasPasskey: null,
+          });
+          const results = await Promise.allSettled([first, second].map(({ account }) =>
+            inPolicy((tx) => assurance.resetSecondFactors(account.userId, tx))));
+          expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+          expect(results.find(({ status }) => status === "rejected")).toMatchObject({ reason: breakGlassConflict });
+          await expect(inPolicy(assurance.assertLocalAdministratorRemains)).resolves.toBeUndefined();
+        } finally {
+          await db.db.update(users).set({ status: "deactivated" }).where(eq(users.id, second.account.userId));
+        }
+      } finally {
+        await db.db.update(users).set({ status: "deactivated" }).where(eq(users.id, first.account.userId));
+      }
+    } finally {
+      for (const { userId } of [external, unenrolled]) {
+        await db.db.update(users).set({ status: "deactivated" }).where(eq(users.id, userId));
+      }
+    }
+  });
+
+  it("retains hourly TOTP recovery instead of permanently locking the last usable local admin", async () => {
+    const { account, result, ack, recovery } = await enroll("admin");
+    try {
+      await caller(ack).acknowledgeRecoveryCodes({ recoverySetId: recovery.recoverySetId! });
+      await db.db.update(assuranceAccounts).set({ totpFailures: 49 }).where(eq(assuranceAccounts.userId, account.userId));
+      const loginMfa = caller({ ...account, pendingSteps: ["mfa_challenge"] });
+      h.clock.advance(30_000);
+      const codeAt = () => totp(result.secret).generate({ timestamp: +h.clock.now() });
+      const wrong = () => {
+        let n = 0;
+        while (totpStep(result.secret, String(n).padStart(6, "0"), h.clock.now()) !== null) n += 1;
+        return String(n).padStart(6, "0");
+      };
+      const lockedAt = h.clock.now();
+      await expect(loginMfa.challenge({ method: "totp", code: wrong() })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      const read = () => db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, account.userId)).limit(1);
+      expect((await read())[0]).toMatchObject({ totpFailures: 49, totpLockedUntil: new Date(+lockedAt + 3_600_000) });
+      expect(h.audit.named("auth.totp.locked")).toMatchObject([{ reasonCode: "LOCAL_MFA_ADMIN_COOLDOWN", severity: "ERROR" }]);
+      await expect(loginMfa.challenge({ method: "totp", code: codeAt() })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      expect((await read())[0]).toMatchObject({ totpFailures: 49, totpLockedUntil: new Date(+lockedAt + 3_600_000) });
+      h.clock.advance(3_600_000);
+      await expect(loginMfa.challenge({ method: "totp", code: wrong() })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      expect((await read())[0]).toMatchObject({ totpFailures: 49, totpLockedUntil: new Date(+lockedAt + 7_200_000) });
+      expect(h.audit.named("auth.totp.locked")).toHaveLength(2);
+      h.clock.advance(3_600_000);
+      await expect(loginMfa.challenge({ method: "totp", code: codeAt() })).resolves.toEqual({ ok: true });
+      expect((await read())[0]).toMatchObject({ totpFailures: 0, totpLockedUntil: null });
+    } finally {
+      await db.db.update(users).set({ status: "deactivated" }).where(eq(users.id, account.userId));
+    }
   });
 
   it("binds timed setup to one session, encrypts its secret and issues recovery codes only at confirmation", async () => {
@@ -373,12 +510,14 @@ describe("assurance: isolated transactional model", () => {
     expect(notify).not.toHaveBeenCalled();
   });
 
-  it("refuses email reset while SMTP is unavailable without locking the target out", async () => {
-    smtpReadiness.mockResolvedValue({ ready: false });
+  it("refuses email reset while the selected mail route is unavailable without locking the target out", async () => {
+    mailReadiness.mockResolvedValue({ ready: false });
     const target = await fixture();
     const actor = await fixture({ role: "admin", stepUpAt: h.clock.now() });
+    await expect(caller(target).admin.mailReadiness()).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(caller(actor).admin.mailReadiness()).resolves.toEqual({ ready: false });
     await expect(caller(actor).admin.setCredential({ customerId: target.userPublicId, mode: "email_link" }))
-      .rejects.toMatchObject({ cause: { reasonCode: "SMTP_NOT_READY" } });
+      .rejects.toMatchObject({ cause: { reasonCode: "MAIL_NOT_READY" } });
     const [updated] = await db.db.select().from(users).where(eq(users.id, target.userId));
     expect(updated?.mustChangePassword).toBe(false);
     expect(updated?.passwordHash).toBeTruthy();
@@ -399,7 +538,7 @@ describe("assurance: isolated transactional model", () => {
     expect(updated?.passwordHash).toBe(before?.passwordHash);
     const [session] = await db.db.select().from(userSessions).where(eq(userSessions.publicId, target.sessionId));
     expect(session?.revokedAt).toBeNull();
-    expect(smtpReadiness).not.toHaveBeenCalled();
+    expect(mailReadiness).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
   });
 

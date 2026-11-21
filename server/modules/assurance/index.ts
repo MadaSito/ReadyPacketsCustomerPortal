@@ -5,17 +5,21 @@
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleLifecycle, Tx } from "../../core/types.js";
 import { createCredentialAdmin } from "./admin.js";
+import { createLocalAdministratorPolicy } from "./breakGlass.js";
+import { createEntraAssurance } from "./entra.js";
 import { createFactorService } from "./factors.js";
 import { clearFactors, getState, pruneChallenges, prunePendingTotp } from "./store.js";
 
 export type { SecondFactorInput } from "./input.js";
 export type AssuranceState = Awaited<ReturnType<typeof getState>>;
-export interface AssuranceModule extends ModuleLifecycle, ReturnType<typeof createFactorService>, ReturnType<typeof createCredentialAdmin> {
+export interface AssuranceModule extends ModuleLifecycle, ReturnType<typeof createFactorService>, ReturnType<typeof createCredentialAdmin>,
+  ReturnType<typeof createEntraAssurance>, ReturnType<typeof createLocalAdministratorPolicy> {
   getAssuranceState(userId: number, tx?: DbOrTx): Promise<AssuranceState>;
   resetSecondFactors(userId: number, tx: Tx): Promise<void>;
 }
 
 export function createAssuranceModule(deps: ModuleDeps): AssuranceModule {
+  const localAdministratorPolicy = createLocalAdministratorPolicy(deps);
   deps.jobs.register("assurance.prune_ceremonies", async (job) => {
     job.signal.throwIfAborted();
     const now = deps.clock.now();
@@ -32,7 +36,13 @@ export function createAssuranceModule(deps: ModuleDeps): AssuranceModule {
   return {
     ...createFactorService(deps),
     ...createCredentialAdmin(deps),
+    ...createEntraAssurance(deps),
+    ...localAdministratorPolicy,
     getAssuranceState: (userId, tx) => getState(tx ?? deps.db, userId),
-    resetSecondFactors: (userId, tx) => clearFactors(tx, userId, deps.clock.now()),
+    async resetSecondFactors(userId, tx) {
+      // The caller must have taken lockLocalAdministratorPolicy before taking any user locks.
+      await localAdministratorPolicy.assertLocalAdministratorMayLoseAccess(tx, userId);
+      await clearFactors(tx, userId, deps.clock.now());
+    },
   };
 }

@@ -106,14 +106,15 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
           }
         },
       });
+      const digestVerified = result.sha256 !== undefined || result.verifiedTransportDigest !== undefined;
       await currentTx(async (tx) => {
         await job.assertStillOwned(tx);
         const now = clock.now();
         await tx.update(storageFileCopies).set({ state: "copied", remoteIdEnc: crypto.encrypt(result.remoteId, remoteAad(row.publicId)),
-          digestVerified: result.sha256 !== undefined, updatedAt: now, finishedAt: now }).where(eq(storageFileCopies.id, row.id));
+          digestVerified, updatedAt: now, finishedAt: now }).where(eq(storageFileCopies.id, row.id));
         await auditCopy(job, row, "completed", undefined, tx);
       });
-      return { outcome: "completed", safeCounts: { files: 1, digestVerified: result.sha256 === undefined ? 0 : 1 } };
+      return { outcome: "completed", safeCounts: { files: 1, digestVerified: digestVerified ? 1 : 0 } };
     } catch (error) {
       // Lost leases cannot publish a result; the durable queue records interrupted/uncertain attempts.
       job.signal.throwIfAborted();

@@ -4,11 +4,14 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { AuditEventInput, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { azureBlobAdapter } from "./adapters/azureBlob.js";
+import { s3Adapter } from "./adapters/s3.js";
 import { assertCurrentStorageAdmin, assertStorageAdmin } from "./authz.js";
 import type {
   StorageAdapter, StorageAdapterDefinition, StorageConfig, StorageConnectionView, StorageCredentials,
   StorageModule, StorageProviderKind, StoragePurpose, StorageTestResult,
 } from "./contracts.js";
+import { StorageAdapterError } from "./contracts.js";
 import { registerFileCopies } from "./fileCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
 import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storageTest, storageUpdate } from "./validation.js";
@@ -148,7 +151,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
           replacement === null ? null : crypto.encrypt(JSON.stringify(replacement), aad(row.publicId)),
         oauthConnected: replacement === undefined ? row.oauthConnected : Boolean(replacement?.refreshToken),
         version: row.version + 1,
-        destinationVersion: configChanged ? row.destinationVersion + 1 : row.destinationVersion,
+        destinationVersion: changedAuth ? row.destinationVersion + 1 : row.destinationVersion,
         lastTestAt: changedAuth ? null : row.lastTestAt,
         lastTestCode: changedAuth ? null : row.lastTestCode,
         updatedAt: now,
@@ -305,12 +308,25 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
         const current = await assigned(input.purpose, input.connectionPublicId, tx, row.destinationVersion);
         if (current.credentialsEnc !== row.credentialsEnc) throw notFound("STORAGE_ASSIGNMENT_INACTIVE");
       });
-      input.signal?.throwIfAborted();
-      await check();
-      await adapter.ensureFolder(input.path, input.signal);
-      input.signal?.throwIfAborted();
-      await check();
-      const result = await adapter.put(input);
+      let result;
+      try {
+        const beforeWrite = async () => {
+          input.signal?.throwIfAborted();
+          await check();
+        };
+        await beforeWrite();
+        await adapter.ensureFolder(input.path, input.signal, beforeWrite);
+        await beforeWrite();
+        result = await adapter.put({ ...input, beforeWrite });
+      } catch (error) {
+        if (!(error instanceof StorageAdapterError)) throw error;
+        const reason = error.code === "OUTCOME_UNKNOWN" ? "STORAGE_COPY_UNCERTAIN" :
+          error.code === "INTEGRITY_MISMATCH" ? "STORAGE_INTEGRITY_MISMATCH" :
+          error.code === "EGRESS_DENIED" ? "STORAGE_EGRESS_DENIED" :
+          error.retryable ? "STORAGE_PROVIDER_RETRY" : error.code === "TOO_LARGE" ? "STORAGE_PROVIDER_LIMIT" : "STORAGE_PROVIDER_DENIED";
+        throw new DomainError(reason === "STORAGE_COPY_UNCERTAIN" ? "UNKNOWN_OUTCOME" : "UNAVAILABLE", reason,
+          "The storage provider could not complete the copy.");
+      }
       if (!result.remoteId || result.remoteId.length > 4096 || /[\p{C}]/u.test(result.remoteId) ||
           result.size !== input.size || (result.sha256 !== undefined && result.sha256 !== input.sha256)) {
         throw new DomainError("UNAVAILABLE", "STORAGE_INTEGRITY_MISMATCH", "The provider did not verify the uploaded object.");
@@ -326,5 +342,8 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
     },
   };
   const copies = registerFileCopies(deps, service);
+  const egress = () => deps.services.integrations.egress;
+  service.registerAdapter("s3", s3Adapter(egress, clock));
+  service.registerAdapter("azure_blob", azureBlobAdapter(egress, clock));
   return service;
 }

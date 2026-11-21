@@ -7,7 +7,7 @@ const read = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
 const trees = ["dist", "migrations", "node_modules", "data/catalog"];
 const required = [
   "package.json", "dist/server/main.js", "dist/public/index.html", "migrations/meta/_journal.json",
-  "dist/ops/migrate.js", "dist/ops/create-admin.js", "dist/ops/catalog-import.js",
+  "dist/ops/migrate.js", "dist/ops/create-admin.js", "dist/ops/recover-admin.js", "dist/ops/catalog-import.js",
   "dist/ops/run-backup.js", "dist/ops/verify-backup.js",
   "dist/ops/restore-isolated.js", "dist/ops/generate-keys.js", "dist/ops/keys-doctor.js",
   "data/catalog/readypackets-offerings-v3.0.json", "data/catalog/offerings.schema.json",

@@ -7,7 +7,7 @@ import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
 import { engineFor, ensureMaintenanceGate, gateDraining, jobAudit, MAINTENANCE_ID } from "./queue.js";
-import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailOutbox } from "./schema.js";
+import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 type JobState = (typeof JOB_STATES)[number];
 type MailState = (typeof MAIL_STATES)[number];
@@ -35,6 +35,7 @@ const mailView = {
   correlationId: mailOutbox.correlationId, jobPublicId: mailOutbox.jobPublicId, generation: mailOutbox.generation,
   expiresAt: mailOutbox.expiresAt, createdAt: mailOutbox.createdAt, updatedAt: mailOutbox.updatedAt,
   hasPayload: sql<boolean>`${mailOutbox.payloadEnc} is not null`.mapWith(Boolean),
+  contentExpiresAt: mailOutbox.contentExpiresAt,
 };
 
 function pageLimit(input: Page): number {
@@ -82,6 +83,54 @@ export function createJobsAdmin(deps: ModuleDeps) {
     const [gate] = await db.select({ active: jobMaintenance.active }).from(jobMaintenance)
       .where(eq(jobMaintenance.id, MAINTENANCE_ID)).limit(1);
     return gate?.active ?? false;
+  }
+
+  async function limitVerification(subject: "request" | "confirm") {
+    const verdict = await deps.rateLimiter.consume("expensive", `mail:audit-copy:${subject}`, 1);
+    if (!verdict.allowed) {
+      throw new DomainError("RATE_LIMITED", "MAIL_AUDIT_RATE_LIMITED", "Wait before trying mailbox verification again.", {
+        retryAfterSeconds: verdict.retryAfterSeconds,
+      });
+    }
+  }
+
+  async function assertCurrentMailActor(principal: SessionPrincipal | null, capability: "mail.manage" | "mail.content.read", tx: Tx) {
+    const sessions = deps.services.identity?.sessions;
+    if (!principal || !sessions?.assertCurrent) throw forbidden("ACTOR_UNVERIFIABLE");
+    const current = await sessions.assertCurrent(principal, tx);
+    if (current.role !== "admin" || current.pendingSteps.length || !roleHasCapability(current.role, capability)) {
+      throw forbidden("CAPABILITY_NOT_GRANTED");
+    }
+    const now = clock.now().getTime();
+    const at = current.stepUpAt?.getTime() ?? Number.NaN;
+    if (!(at <= now && at >= now - STEP_UP_MAX_AGE_MS)) {
+      throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Confirm your password and authentication code to continue.", { capability });
+    }
+  }
+
+  async function withCurrentMailActor<T>(principal: SessionPrincipal | null, capability: "mail.manage" | "mail.content.read",
+    run: (tx: Tx) => Promise<T>,
+  ): Promise<T> {
+    let denied = false;
+    try {
+      return await db.transaction(async (tx) => {
+        try { await assertCurrentMailActor(principal, capability, tx); }
+        catch (error) {
+          denied = error instanceof DomainError;
+          throw error;
+        }
+        return run(tx);
+      });
+    } catch (error) {
+      if (denied) {
+        await deps.audit.record({
+          category: "security", eventName: "job.admin.denied", action: "authorize", outcome: "denied",
+          reasonCode: "MAIL_ACTOR_NOT_CURRENT", resource: { type: "job_admin" },
+          actor: principal ? { userId: principal.userId, role: principal.role } : { role: "anonymous" },
+        });
+      }
+      throw error;
+    }
   }
 
   async function drainCounts(executor: Tx | typeof db) {
@@ -258,10 +307,13 @@ export function createJobsAdmin(deps: ModuleDeps) {
       const canReadCaptures = allowsMailCapture(deps.config.deploymentProfile)
         && rows.some((row) => row.state === "captured" && row.expiresAt > now)
         && await (mailEngineFor(deps.mailer)?.captureEnabled() ?? false);
-      const safe = rows.map(({ hasPayload, ...row }) => ({
+      const canReadContent = rows.some(({ contentExpiresAt }) => contentExpiresAt && contentExpiresAt > now)
+        && !!await mailEngineFor(deps.mailer)?.retentionDays();
+      const safe = rows.map(({ hasPayload, contentExpiresAt, ...row }) => ({
         ...row,
         canResend: hasPayload && ["held", "failed"].includes(row.state) && row.expiresAt > now && row.generation < 20,
         canViewCapture: row.state === "captured" && row.expiresAt > now && canReadCaptures,
+        canViewContent: canReadContent && !!contentExpiresAt && contentExpiresAt > now,
       }));
       return pageOf(safe, limit);
     },
@@ -269,10 +321,17 @@ export function createJobsAdmin(deps: ModuleDeps) {
       await authorize(principal, "jobs.read");
       const [row] = await db.select({ id: mailOutbox.id }).from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1);
       if (!row) throw notFound();
-      const attempts = await db.select({
+      const prior = await db.select({
         generation: mailAttempts.generation, state: mailAttempts.state, reasonCode: mailAttempts.reasonCode,
         startedAt: mailAttempts.startedAt, finishedAt: mailAttempts.finishedAt,
       }).from(mailAttempts).where(eq(mailAttempts.mailId, row.id)).orderBy(desc(mailAttempts.generation)).limit(20);
+      const deliveries = await db.select({
+        generation: mailTransportAttempts.generation, state: mailTransportAttempts.state,
+        reasonCode: mailTransportAttempts.reasonCode, startedAt: mailTransportAttempts.startedAt,
+        finishedAt: mailTransportAttempts.finishedAt, transport: mailTransportAttempts.transport, purpose: mailTransportAttempts.purpose,
+      }).from(mailTransportAttempts).where(eq(mailTransportAttempts.mailId, row.id)).orderBy(desc(mailTransportAttempts.id)).limit(60);
+      const attempts = [...deliveries, ...prior.map((item) => ({ ...item, transport: null, purpose: "legacy" as const }))]
+        .sort((a, b) => b.generation - a.generation || b.startedAt.getTime() - a.startedAt.getTime());
       return { publicId, attempts };
     },
     async resend(principal: SessionPrincipal | null, publicId: string) {
@@ -286,6 +345,30 @@ export function createJobsAdmin(deps: ModuleDeps) {
     async capture(principal: SessionPrincipal | null, publicId: string) {
       await authorize(principal, "jobs.mail.capture");
       return db.transaction((tx) => mailer().viewCapture(tx, publicId));
+    },
+    async mailContent(principal: SessionPrincipal | null, publicId: string) {
+      await authorize(principal, "mail.content.read");
+      return withCurrentMailActor(principal, "mail.content.read", (tx) => mailer().viewContent(tx, publicId));
+    },
+    async auditCopyStatus(principal: SessionPrincipal | null) {
+      await authorize(principal, "mail.manage");
+      return mailer().auditCopyStatus();
+    },
+    async requestAuditCopyVerification(principal: SessionPrincipal | null) {
+      await authorize(principal, "mail.manage");
+      await limitVerification("request");
+      await ensureMaintenanceGate(deps);
+      return withCurrentMailActor(principal, "mail.manage", async (tx) => {
+        if (await gateDraining(tx)) throw new DomainError("MAINTENANCE", "PORTAL_DRAINING", activeMessage);
+        return mailer().requestAuditCopyVerification(tx);
+      });
+    },
+    async confirmAuditCopyVerification(principal: SessionPrincipal | null, code: string): Promise<{ verified: true }> {
+      await authorize(principal, "mail.manage");
+      await limitVerification("confirm");
+      const result = await withCurrentMailActor(principal, "mail.manage", (tx) => mailer().confirmAuditCopyVerification(tx, code));
+      if (!result.verified) throw validation("MAIL_AUDIT_CODE_INVALID", "The code is invalid or expired. Request a new code and try again.");
+      return { verified: true };
     },
     async health(): Promise<ModuleHealth[]> {
       const now = clock.now();

@@ -38,6 +38,7 @@ export interface SessionState {
   mfaVerifiedAt: Date | null;
   stepUpAt: Date | null;
   absoluteExpiresAt: Date;
+  authMethod: AuthMethod;
 }
 
 export interface SessionListItem {
@@ -221,7 +222,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
     async create(
       tx: Tx,
       user: Pick<UserRow, "id">,
-      options: { authMethod: AuthMethod; userAgent?: string },
+      options: { authMethod: AuthMethod; userAgent?: string; mfaVerifiedAt?: Date | null },
     ): Promise<{ sessionId: string; issued: IssuedSession }> {
       const now = deps.clock.now();
       const p = await policy(tx);
@@ -238,6 +239,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         authenticatedAt: now,
         lastSeenAt: now,
         absoluteExpiresAt,
+        mfaVerifiedAt: options.mfaVerifiedAt ?? null,
         deviceSummary: deviceSummary(options.userAgent),
       });
       return { sessionId: publicId, issued: issued(publicId, token, csrfSecret, absoluteExpiresAt) };
@@ -287,6 +289,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         mfaVerifiedAt: joined.session.mfaVerifiedAt,
         stepUpAt: joined.session.stepUpAt,
         absoluteExpiresAt: joined.session.absoluteExpiresAt,
+        authMethod: joined.session.authMethod,
       };
     },
 
@@ -303,6 +306,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       if (!user || !row || row.userId !== user.id) throw sessionNotCurrent();
       if (!isLive(row, user, deps.clock.now(), await policy(tx))) throw sessionNotCurrent();
       if (user.role !== principal.role) throw sessionNotCurrent();
+      if (row.authMethod !== principal.authMethod) throw sessionNotCurrent();
       let secret: string;
       try {
         secret = deps.crypto.decrypt(row.csrfSecretEnc, csrfAad(row.publicId));

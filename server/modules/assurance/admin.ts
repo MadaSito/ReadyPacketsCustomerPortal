@@ -4,7 +4,6 @@ import { conflict, DomainError, forbidden, notFound } from "../../core/errors.js
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import type { AdminCredentialInput } from "./input.js";
 import { assertCurrent, requireFresh, throttle } from "./policy.js";
-import { clearFactors } from "./store.js";
 
 type IdentityUser = NonNullable<Awaited<ReturnType<ModuleDeps["services"]["identity"]["getUserByPublicId"]>>>;
 const capability = "customers.credentials.administer";
@@ -38,6 +37,7 @@ export function createCredentialAdmin(deps: ModuleDeps) {
       if (!candidate || (candidate.role === "admin" && actor.role !== "admin")) throw notFound("USER_NOT_FOUND");
       if (preflight) await preflight(candidate);
       return await deps.db.transaction(async (tx) => {
+        await deps.services.assurance.lockLocalAdministratorPolicy(tx);
         // Two admins acting on one another must not acquire user locks in opposite order.
         if (actor.userId < candidate.id) await assertCurrent(deps, actor, tx);
         const target = await identity.getUserByPublicId(customerId, { tx, forUpdate: true });
@@ -71,6 +71,7 @@ export function createCredentialAdmin(deps: ModuleDeps) {
         let generatedPassword: string | undefined;
         if (input.mode === "email_link") {
           // Never pass an emailed reset link back to the administrator, even in preview.
+          if (target.role === "admin") await deps.services.assurance.assertLocalAdministratorMayLoseAccess(tx, target.id);
           await identity.issueAdminSetPasswordLink(target.id, { tx });
         } else {
           if (input.mode === "generate_temporary") generatedPassword = identity.generateTemporaryPassword();
@@ -93,15 +94,15 @@ export function createCredentialAdmin(deps: ModuleDeps) {
         requireVerifiedAddress(target);
         // The settings lookup can borrow its own pooled connection. Do not hold a
         // transaction during this advisory check; target eligibility is rechecked under lock.
-        if (!(await deps.services.integrations.smtp.getReadiness()).ready) {
-          throw new DomainError("NOT_CONFIGURED", "SMTP_NOT_READY", "Set-password email is unavailable. Configure email delivery or use a temporary password.");
+        if (!(await deps.services.jobAdmin.getMailReadiness()).ready) {
+          throw new DomainError("NOT_CONFIGURED", "MAIL_NOT_READY", "Set-password email is unavailable. Configure email delivery or use a temporary password.");
         }
       } : undefined);
     },
     async resetMfa(actor: SessionPrincipal, customerId: string) {
       return scope(actor, customerId, async (tx, target) => {
         await deps.services.identity.sessions.revokeAllForUser(target.id, { reason: "ADMIN_MFA_RESET", tx });
-        await clearFactors(tx, target.id, deps.clock.now());
+        await deps.services.assurance.resetSecondFactors(target.id, tx);
         await deps.audit.record({
           category: "admin", eventName: "admin.credentials.mfa_reset", action: "update", outcome: "completed",
           actor: { role: actor.role, userId: actor.userId }, resource: { type: "user", publicId: target.publicId },

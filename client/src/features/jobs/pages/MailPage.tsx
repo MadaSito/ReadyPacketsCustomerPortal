@@ -10,6 +10,8 @@ import {
 import { AuditLink, Id, mailLabels, mailStates, MailStatus } from "../controls";
 
 type Capture = { to: string; subject: string; text: string };
+type StoredMessage = Capture & { html: string };
+const purposeLabel = { legacy: "Earlier attempt", primary: "Primary", secondary: "Secondary", audit_copy: "Audit copy" };
 const stateOptions = [{ value: "", label: "All delivery states" }, ...mailStates.map((state) => ({ value: state, label: mailLabels[state] }))];
 
 export default function MailPage() {
@@ -22,6 +24,8 @@ export default function MailPage() {
   const [pendingResend, setPendingResend] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [capture, setCapture] = useState<Capture | null>(null);
+  const [storedMessage, setStoredMessage] = useState<StoredMessage | null>(null);
+  const [openingMessage, setOpeningMessage] = useState(false);
   const captureOpener = useRef<HTMLButtonElement | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -35,16 +39,17 @@ export default function MailPage() {
 
   const closeCapture = useCallback(() => {
     setCapture(null);
+    setStoredMessage(null);
     const opener = captureOpener.current;
     captureOpener.current = null;
     requestAnimationFrame(() => opener?.isConnected && opener.focus());
   }, []);
 
   useEffect(() => {
-    if (!capture) return;
+    if (!capture && !storedMessage) return;
     const timer = setTimeout(closeCapture, 120_000);
     return () => clearTimeout(timer);
-  }, [capture, closeCapture]);
+  }, [capture, storedMessage, closeCapture]);
 
   const viewCapture = async (publicId: string) => {
     setCaptureError(null);
@@ -56,6 +61,20 @@ export default function MailPage() {
       if (!(failure instanceof StepUpCancelledError)) setCaptureError(errorMessage(failure));
     } finally {
       setCapturing(false);
+    }
+  };
+
+  const viewMessage = async (publicId: string) => {
+    setCaptureError(null);
+    setOpeningMessage(true);
+    try {
+      setStoredMessage(await stepUp.run(() => rpc.jobs.mail.content.mutate({ publicId }), {
+        reason: "Opening retained mail requires fresh verification.",
+      }));
+    } catch (failure) {
+      if (!(failure instanceof StepUpCancelledError)) setCaptureError(errorMessage(failure));
+    } finally {
+      setOpeningMessage(false);
     }
   };
 
@@ -80,7 +99,7 @@ export default function MailPage() {
         setStatus(mailStates.find((value) => value === event.target.value) ?? "")} /></Field>
     </FilterBar>
     <Callout title="Acceptance is not delivery" tone="info">
-      SMTP acceptance means the server accepted the submission. It does not confirm arrival in the recipient’s inbox.
+      Provider acceptance confirms submission, not arrival in the recipient’s inbox.
     </Callout>
     {message ? <Callout tone="success" live="polite">{message}</Callout> : null}
     {captureError ? <Callout tone="danger" live="assertive">{captureError}</Callout> : null}
@@ -97,10 +116,15 @@ export default function MailPage() {
         <Button variant="secondary" onClick={() => setSelected(row)} aria-label={`Attempts for message ${row.publicId}`}>Attempts</Button>
         {row.canResend ? <Button variant="secondary" aria-label={`Resend message ${row.publicId}`} onClick={() => setPendingResend(row.publicId)}>Resend</Button> : null}
         {row.canViewCapture ? <Button variant="secondary" aria-label={`View capture for message ${row.publicId}`}
-          disabled={capturing} onClick={(event) => {
+          disabled={capturing || openingMessage} onClick={(event) => {
             captureOpener.current = event.currentTarget;
             void viewCapture(row.publicId);
           }}>View capture</Button> : null}
+        {row.canViewContent ? <Button variant="secondary" aria-label={`View message ${row.publicId}`}
+          disabled={capturing || openingMessage} onClick={(event) => {
+            captureOpener.current = event.currentTarget;
+            void viewMessage(row.publicId);
+          }}>View message</Button> : null}
       </div>} />
     <LoadMore hasMore={result.hasNextPage} loading={result.isFetchingNextPage} onLoadMore={() => void result.fetchNextPage()}
       summary={!result.isPending && !result.isError ? `Showing ${rows.length} messages` : undefined} />
@@ -110,11 +134,13 @@ export default function MailPage() {
         <AuditLink correlationId={selected.correlationId} />
         {selected.jobPublicId ? <Button asChild variant="secondary"><Link href={`/admin/jobs/${selected.jobPublicId}`}>View related job</Link></Button> : null}
       </> : null}>
-      <DataTable caption="Message attempt history" rowKey={(row) => String(row.generation)} rows={attempts.data?.attempts ?? []}
+      <DataTable caption="Message attempt history" rowKey={(row) => `${row.generation}:${row.purpose}`} rows={attempts.data?.attempts ?? []}
         loading={attempts.isPending} error={attempts.error} onRetry={() => void attempts.refetch()}
         empty={<EmptyState title="No delivery attempts yet" description="Attempts appear after a worker processes the message." />}
         columns={[
           { key: "attempt", header: "Attempt", primary: true, cell: (row) => <span className="tabular-nums">{row.generation}</span> },
+          { key: "purpose", header: "Purpose", cell: (row) => purposeLabel[row.purpose] },
+          { key: "transport", header: "Transport", cell: (row) => row.transport === "smtp" ? "SMTP" : row.transport === "graph" ? "Microsoft Graph" : "Not recorded" },
           { key: "state", header: "Outcome", cell: (row) => <MailStatus state={row.state} /> },
           { key: "reason", header: "Reason", cell: (row) => <Id value={row.reasonCode} /> },
           { key: "finished", header: "Finished", cell: (row) => <DateTime value={row.finishedAt} /> },
@@ -131,6 +157,15 @@ export default function MailPage() {
         <KeyValueList items={[{ label: "Recipient", value: <span className="break-all">{capture.to}</span> },
           { label: "Subject", value: capture.subject }]} />
         <CodeBlock label="Plain-text message" wrap>{capture.text}</CodeBlock>
+      </div>
+    </Dialog> : null}
+    {storedMessage ? <Dialog title="Retained message" description="Sensitive template values are redacted. Viewing this message is audited."
+      open size="lg" onOpenChange={(open) => { if (!open) closeCapture(); }}>
+      <div className="ph-no-capture space-y-4" data-clarity-mask="true">
+        <KeyValueList items={[{ label: "Recipient", value: <span className="break-all">{storedMessage.to}</span> },
+          { label: "Subject", value: <span className="break-words">{storedMessage.subject}</span> }]} />
+        <CodeBlock label="Plain-text body" wrap>{storedMessage.text}</CodeBlock>
+        <CodeBlock label="HTML source (not rendered)" wrap>{storedMessage.html}</CodeBlock>
       </div>
     </Dialog> : null}
   </>;

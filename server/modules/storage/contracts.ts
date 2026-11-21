@@ -16,6 +16,8 @@ export interface StoragePutInput {
   contentType: string;
   body: Readable;
   signal?: AbortSignal;
+  /** Call before each externally visible write, including upload session commits. */
+  beforeWrite?: () => Promise<void>;
 }
 
 export interface StoragePutResult {
@@ -24,6 +26,8 @@ export interface StoragePutResult {
   size: number;
   /** Provider-reported SHA-256 only; unset when unavailable. Never return ETAG, MD5 or a request echo here. */
   sha256?: string;
+  /** Other provider-generated transport checksums verified by the adapter; not equivalent to SHA-256. */
+  verifiedTransportDigest?: "md5" | "quickxor";
 }
 
 export type StorageTestCode = "OK" | "NOT_CONFIGURED" | "AUTH_FAILED" | "DESTINATION_NOT_FOUND" |
@@ -33,9 +37,19 @@ export interface StorageTestResult {
   code: StorageTestCode;
 }
 
+export type StorageAdapterErrorCode = Exclude<StorageTestCode, "OK"> | "DESTINATION_CONFLICT" |
+  "INTEGRITY_MISMATCH" | "INVALID_INPUT" | "TOO_LARGE" | "OUTCOME_UNKNOWN";
+/** Use fixed codes only. Retryable means a retry cannot duplicate the prior external effect. */
+export class StorageAdapterError extends Error {
+  constructor(readonly code: StorageAdapterErrorCode, readonly retryable = false) {
+    super(code);
+    this.name = "StorageAdapterError";
+  }
+}
+
 export interface StorageAdapter {
   test(signal?: AbortSignal): Promise<StorageTestResult>;
-  ensureFolder(path: readonly string[], signal?: AbortSignal): Promise<void>;
+  ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
   /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
   remove(remoteId: string, signal?: AbortSignal): Promise<void>;

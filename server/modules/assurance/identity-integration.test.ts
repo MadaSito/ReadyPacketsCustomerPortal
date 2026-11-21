@@ -27,7 +27,7 @@ describe("assurance against real identity policies and sessions", () => {
     h.services.identity = createIdentityModule(h.deps);
     h.services.assurance = createAssuranceModule(h.deps);
     h.services.engagement = { notify: vi.fn() } as unknown as Services["engagement"];
-    h.services.integrations = { smtp: { getReadiness: async () => ({ ready: true }) } } as unknown as Services["integrations"];
+    h.services.jobAdmin = { getMailReadiness: async () => ({ ready: true }) } as Services["jobAdmin"];
 
     function browser() {
       let token: string | undefined;

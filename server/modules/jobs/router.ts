@@ -10,9 +10,20 @@ const page = { limit: z.number().int().min(1).max(100).optional(), cursor: publi
 const read = adminProcedure.use(requireCapability("jobs.read"));
 const manage = adminProcedure.use(requireCapability("jobs.manage"));
 const maintenanceManage = adminProcedure.use(requireCapability("maintenance.manage"));
+const mailManage = adminProcedure.use(requireCapability("mail.manage"));
 
 export const jobsRouter = router({
   maintenanceBanner: publicProcedure.query(({ ctx }) => ctx.services.jobAdmin.maintenanceBanner()),
+  mail: router({
+    content: adminProcedure.use(requireCapability("mail.content.read")).input(idInput)
+      .mutation(({ ctx, input }) => ctx.services.jobAdmin.mailContent(ctx.session, input.publicId)),
+    auditCopy: router({
+      status: mailManage.query(({ ctx }) => ctx.services.jobAdmin.auditCopyStatus(ctx.session)),
+      requestVerification: mailManage.mutation(({ ctx }) => ctx.services.jobAdmin.requestAuditCopyVerification(ctx.session)),
+      confirmVerification: mailManage.input(z.strictObject({ code: z.string().regex(/^[a-zA-Z0-9_-]{22}$/) }))
+        .mutation(({ ctx, input }) => ctx.services.jobAdmin.confirmAuditCopyVerification(ctx.session, input.code)),
+    }),
+  }),
   admin: router({
     list: read.input(z.strictObject({ ...page, type: z.string().max(100).regex(JOB_TYPE).optional(), state: z.enum(JOB_STATES).optional() }))
       .query(({ ctx, input }) => ctx.services.jobAdmin.list(ctx.session, input)),

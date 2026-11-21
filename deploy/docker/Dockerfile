@@ -23,7 +23,8 @@ RUN pnpm build \
     && rm -rf node_modules/.bin \
     && rm -f dist/ops/seed-demo.js dist/ops/seed-demo.js.map \
     && test -f dist/server/main.js -a -f dist/public/index.html -a -f dist/ops/migrate.js \
-         -a -f dist/ops/create-admin.js -a -f dist/ops/catalog-import.js -a -f dist/ops/generate-keys.js \
+         -a -f dist/ops/create-admin.js -a -f dist/ops/recover-admin.js -a -f dist/ops/catalog-import.js \
+         -a -f dist/ops/generate-keys.js \
          -a -f dist/ops/keys-doctor.js -a -f migrations/meta/_journal.json \
          -a -f data/catalog/readypackets-offerings-v3.0.json -a -f data/catalog/offerings.schema.json \
     && chmod -R go-w package.json node_modules dist migrations data/catalog

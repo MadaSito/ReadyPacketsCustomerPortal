@@ -8,7 +8,7 @@ import type {
   AuditEmitter, AuditOutcome, ClaimedJob, Clock, Db, EnqueueOptions, FieldCrypto,
   JobHandlerOptions, JobQueue, JobResult, Logger, SettingsStore, Tx,
 } from "../../core/types.js";
-import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox } from "./schema.js";
+import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 export { createMailer } from "./mail.js";
 
@@ -423,7 +423,21 @@ export class JobEngine implements JobQueue {
   async #settleInterruptedMail(tx: Tx, row: JobRow, now: Date): Promise<void> {
     const [mail] = await tx.select().from(mailOutbox).where(eq(mailOutbox.jobPublicId, row.publicId))
       .limit(1).for("update");
-    if (!mail || (mail.state !== "queued" && mail.state !== "sending")) return;
+    if (!mail) return;
+    if (mail.state === "accepted") {
+      const condition = and(eq(mailTransportAttempts.mailId, mail.id), eq(mailTransportAttempts.generation, mail.generation),
+        eq(mailTransportAttempts.purpose, "audit_copy"), eq(mailTransportAttempts.state, "sending"));
+      const [copy] = await tx.select({ id: mailTransportAttempts.id }).from(mailTransportAttempts).where(condition).limit(1);
+      if (!copy) return;
+      await tx.update(mailTransportAttempts).set({ state: "unknown", reasonCode: "MAIL_PROVIDER_OUTCOME_UNKNOWN", finishedAt: now }).where(condition);
+      await this.deps.audit.record({
+        category: "job", eventName: "job.mail.audit_copy.unknown", action: "transition", outcome: "unknown",
+        reasonCode: "MAIL_PROVIDER_OUTCOME_UNKNOWN", actor: { role: "system" },
+        resource: { type: "mail", publicId: mail.publicId }, correlationId: row.correlationId, jobId: row.publicId,
+      }, tx);
+      return;
+    }
+    if (mail.state !== "queued" && mail.state !== "sending") return;
     // A provider can only be called after the sending marker commits. A queued
     // mail row therefore definitively did not reach the provider.
     const outcome = mail.state === "sending" ? "unknown" : "failed";
@@ -432,7 +446,10 @@ export class JobEngine implements JobQueue {
       ...(outcome === "unknown" ? { payloadEnc: null } : {}) }).where(eq(mailOutbox.id, mail.id));
     if (outcome === "unknown") {
       await tx.update(mailAttempts).set({ state: "unknown", reasonCode, finishedAt: now })
-        .where(and(eq(mailAttempts.mailId, mail.id), eq(mailAttempts.generation, mail.generation)));
+        .where(and(eq(mailAttempts.mailId, mail.id), eq(mailAttempts.generation, mail.generation), eq(mailAttempts.state, "sending")));
+      await tx.update(mailTransportAttempts).set({ state: "unknown", reasonCode, finishedAt: now })
+        .where(and(eq(mailTransportAttempts.mailId, mail.id), eq(mailTransportAttempts.generation, mail.generation),
+          eq(mailTransportAttempts.state, "sending")));
     }
     await this.deps.audit.record({
       category: "job", eventName: outcome === "unknown" ? "job.mail.unknown" : "job.mail.failed",

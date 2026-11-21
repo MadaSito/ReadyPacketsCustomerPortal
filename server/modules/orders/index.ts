@@ -8,7 +8,8 @@ import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from
 import { createActorCheck } from "./actor.js";
 import { createCatalogService, type CatalogService } from "./catalog.js";
 import { registerOrderMailTemplates } from "./mail.js";
-import { createOrderService, type OrderService } from "./orderService.js";
+import { createOrderService, type OrderChangeListener, type OrderService, type OrderSyncView } from "./orderService.js";
+export type { OrderChangeEvent, OrderChangeKind, OrderChangeListener, OrderSyncView } from "./orderService.js";
 import { createOrderPolicy } from "./policy.js";
 import { createPortableHooks, type ImportReceipt, type PortableHooks } from "./portable.js";
 import { createSharingService, type SharingService } from "./sharing.js";
@@ -54,6 +55,11 @@ export interface OrdersModule extends ModuleLifecycle {
   preflightImportOrder: PortableHooks["preflightImportOrder"];
   checkCatalogViability(items: { productPublicId?: string; name: string; currency: string }[]): Promise<{ matched: number; unmatched: number }>;
 
+  /** Increment 03: in-transaction change hook (SharePoint order sync). Register at wiring time; a throw aborts the write. */
+  registerChangeListener(listener: OrderChangeListener): void;
+  /** Increment 03: trusted read for the order-data sync worker; null when the order does not exist. */
+  getOrderSyncView(orderPublicId: string, tx?: DbOrTx): Promise<OrderSyncView | null>;
+
   /* ---- services used by the router ---- */
   catalog: CatalogService;
   workflows: WorkflowService;
@@ -80,6 +86,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     getOrderSummary: orders.getOrderSummary,
     getOrderRefById: orders.getOrderRefById,
     getProductionScope: orders.getProductionScope,
+    registerChangeListener: orders.registerChangeListener,
+    getOrderSyncView: orders.getOrderSyncView,
     searchOrders: orders.searchOrders,
     portableOrders: portable.portableOrders,
     importOrder: portable.importOrder,

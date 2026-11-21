@@ -28,7 +28,7 @@ export const assuranceRouter = router({
     ctx.transport.issue(await ctx.services.assurance.challenge(ctx.session, input));
     return ok;
   }),
-  stepUp: highRisk.input(z.strictObject({ password: passwordInput, factor: factorInput })).mutation(async ({ ctx, input }) => {
+  stepUp: highRisk.input(z.strictObject({ password: passwordInput.optional(), factor: factorInput })).mutation(async ({ ctx, input }) => {
     ctx.transport.issue(await ctx.services.assurance.stepUp(ctx.session, input.password, input.factor));
     return ok;
   }),
@@ -44,6 +44,7 @@ export const assuranceRouter = router({
   removePasskey: highRisk.input(z.strictObject({ publicId }))
     .mutation(({ ctx, input }) => ctx.services.assurance.removePasskey(ctx.session, input.publicId)),
   admin: router({
+    mailReadiness: administer.query(({ ctx }) => ctx.services.jobAdmin.getMailReadiness()),
     setCredential: administer.input(adminCredentialInput)
       .mutation(({ ctx, input }) => ctx.services.assurance.administerCredential(ctx.session, input)),
     resetMfa: administer.input(z.strictObject({ customerId: publicId }))
