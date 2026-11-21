@@ -43,8 +43,18 @@ done
 grep -qi '<div id="root"' "$work/shell.html" || fail "the shell does not look like the portal"
 web "$origin/api/trpc/identity.passwordPolicy" | grep -q '"minLength"' || fail "the public API did not answer"
 
-step "plain HTTP is redirected, unknown names are refused"
+step "plain HTTP is redirected, callback paths are refused, unknown names are refused"
 expect "redirect" "$(plain -o /dev/null -w '%{http_code} %{redirect_url}' http://localhost/sign-in)" "308 https://localhost/sign-in"
+refuse_callback() {
+    local label=$1 url=$2 code
+    code=$(plain -D "$work/callback.headers" -o /dev/null -w '%{http_code}' "$url")
+    expect "$label status" "$code" 404
+    ! grep -qi '^location:' "$work/callback.headers" || fail "$label leaked a Location header"
+}
+refuse_callback "OIDC callback on plain HTTP" "http://localhost/api/identity/sso/callback?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback "OIDC callback mixed-case trailing slash on plain HTTP" "http://localhost/API/identity/sso/callback/?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback "storage OAuth callback on plain HTTP" "http://localhost/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback "bare storage OAuth callback on plain HTTP" "http://localhost/API/storage/oauth/callback?code=callback-canary-81a4&state=state-canary-92b5"
 expect "unknown host on port 80" "$(plain -o /dev/null -w '%{http_code}' -H 'Host: unknown.example' http://localhost/)" 421
 if web -o /dev/null --resolve unknown.example:443:127.0.0.1 https://unknown.example/ 2>/dev/null; then
     fail "an unknown name completed a TLS handshake"
