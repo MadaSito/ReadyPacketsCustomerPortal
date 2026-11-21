@@ -246,6 +246,8 @@ export const ssoAuthRequests = mysqlTable(
     userId: refColumn("user_id"),
     configEpoch: int("config_epoch", { unsigned: true }).notNull(),
     nextPath: varchar("next_path", { length: 512 }),
+    /** Parked authorization code (session-bound purposes only, ≤ 2 minutes, single use). */
+    codeEnc: text("code_enc"),
     resultEnc: text("result_enc"),
     refusalCode: varchar("refusal_code", { length: 40 }),
     requestedAt: utcDateTime("requested_at").notNull(),

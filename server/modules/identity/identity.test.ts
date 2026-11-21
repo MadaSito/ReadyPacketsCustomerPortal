@@ -42,6 +42,8 @@ describe("identity module (MySQL)", () => {
   let identity: IdentityModule;
   let assurance: Map<number, { mfaEnrolled: boolean; recoveryCodesAcknowledged: boolean }>;
   let seq = 0;
+  /** Users the fake break-glass policy refuses to let lose access (assurance owns the real rules). */
+  const breakGlassBlocked = new Set<number>();
 
   function build(config: Partial<AppConfig> = {}) {
     h = createTestDeps({ db: db.db, config });
@@ -50,6 +52,10 @@ describe("identity module (MySQL)", () => {
       getAssuranceState: async (userId: number) => {
         const state = assurance.get(userId) ?? { mfaEnrolled: false, recoveryCodesAcknowledged: false };
         return { ...state, passkeyCount: 0, totpEnrolled: state.mfaEnrolled };
+      },
+      lockLocalAdministratorPolicy: async () => {},
+      assertLocalAdministratorMayLoseAccess: async (_tx: Tx, userId: number) => {
+        if (breakGlassBlocked.has(userId)) throw new DomainError("CONFLICT", "LOCAL_MFA_ADMIN_REQUIRED", "Keep a local administrator.");
       },
     } as unknown as Services["assurance"];
     identity = createIdentityModule(h.deps);
@@ -519,6 +525,51 @@ describe("identity module (MySQL)", () => {
       await rejects(identity.admin.changeRole(sa.principal, a.publicId, "staff", (await userRow(a.id)).version), "SELF_ROLE_CHANGE");
       await rejects(identity.admin.setStaffStatus(sa.principal, a.publicId, "suspended", "SECURITY_REVIEW"), "SELF_STATUS_CHANGE");
     });
+
+    it("break-glass (I-A01): demoting or deactivating the sole local-MFA admin is refused even with another active admin", async () => {
+      const actor = await makeUser({ role: "admin" });
+      const sole = await makeUser({ role: "admin" });
+      breakGlassBlocked.add(sole.id);
+      try {
+        const sa = await session(actor.email, { stepUp: true });
+        await rejects(identity.admin.changeRole(sa.principal, sole.publicId, "staff", (await userRow(sole.id)).version), "LOCAL_MFA_ADMIN_REQUIRED");
+        await rejects(identity.admin.setStaffStatus(sa.principal, sole.publicId, "deactivated", "SECURITY_REVIEW"), "LOCAL_MFA_ADMIN_REQUIRED");
+        expect((await userRow(sole.id)).role).toBe("admin");
+        expect((await userRow(sole.id)).status).toBe("active");
+      } finally {
+        breakGlassBlocked.delete(sole.id);
+      }
+    });
+
+    it("listLocalAdministratorCandidates: active local admins with verified e-mail and a password only", async () => {
+      const ok = await makeUser({ role: "admin" });
+      const unverified = await makeUser({ role: "admin", verified: false });
+      const entra = await makeUser({ role: "admin" });
+      await db.db.update(users).set({ authSource: "entra" }).where(eq(users.id, entra.id));
+      const staff = await makeUser({ role: "staff" });
+      const ids = await db.db.transaction((tx) => identity.listLocalAdministratorCandidates(tx as Tx));
+      expect(ids).toContain(ok.id);
+      expect(ids).not.toContain(unverified.id);
+      expect(ids).not.toContain(entra.id);
+      expect(ids).not.toContain(staff.id);
+      expect([...ids].sort((x, y) => x - y)).toEqual(ids);
+      const plain = await db.db.transaction((tx) => identity.listLocalAdministratorCandidates(tx as Tx, { lock: false }));
+      expect(plain).toEqual(ids);
+    });
+
+    it("recoverLocalAdministratorPassword: forces change, resets auth source, revokes sessions, refuses non-admins", async () => {
+      const admin = await makeUser({ role: "admin" });
+      await session(admin.email);
+      await db.db.update(users).set({ authSource: "entra" }).where(eq(users.id, admin.id));
+      const result = await db.db.transaction((tx) => identity.recoverLocalAdministratorPassword(admin.id, PW2, { tx: tx as Tx }));
+      expect(result.sessionsRevoked).toBeGreaterThanOrEqual(1);
+      const row = await userRow(admin.id);
+      expect(row.mustChangePassword).toBe(true);
+      expect(row.authSource).toBe("local");
+      expect(h.audit.named("identity.admin.local_password_recovered")).toHaveLength(1);
+      const staff = await makeUser({ role: "staff" });
+      await rejects(db.db.transaction((tx) => identity.recoverLocalAdministratorPassword(staff.id, PW2, { tx: tx as Tx })), "NOT_ACTIVE_ADMINISTRATOR");
+    });
   });
 
   describe("admin customer management", () => {
@@ -651,7 +702,7 @@ describe("identity module (MySQL)", () => {
       build({ deploymentProfile: "preview" });
       const email = `seed${Date.now()}@example.test`;
       const created = await provision("customer", "demo_seed", email);
-      expect(created.customerRef).toMatch(/^RP-/);
+      expect(created.customerRef).toMatch(/^RPCUS-/);
       await rejects(provision("customer", "demo_seed", email), "EMAIL_IN_USE");
       await rejects(
         db.db.transaction((tx) => identity.provisionLocalAccount({ email: "w@example.test", name: "W", role: "customer", password: "short", mustChangePassword: false }, { tx: tx as Tx, reason: "demo_seed" })),

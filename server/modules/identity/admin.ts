@@ -201,12 +201,15 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     capability: Capability,
   ): Promise<{ status: UserStatus }> {
     return deps.db.transaction(async (tx) => {
+      // Break-glass policy lock before any users lock (assurance contract, decision 3).
+      if (roles.includes("admin")) await deps.services.assurance.lockLocalAdministratorPolicy(tx);
       const row = await loadTarget(tx, principal, capability, publicId, roles);
       if (row.id === principal.userId) throw conflict("SELF_STATUS_CHANGE", "You cannot change the status of your own account.");
       const next: UserStatus = status === "active" ? (row.passwordHash || row.status === "active" ? "active" : "pending_activation") : status;
       if (row.status === next) return { status: next };
       if (row.role === "admin" && row.status === "active" && next !== "active") {
         if ((await repo.countActiveAdmins(tx, row.id)) < 1) throw conflict("LAST_ADMIN", "At least one active administrator must remain.");
+        await deps.services.assurance.assertLocalAdministratorMayLoseAccess(tx, row.id);
       }
       const now = deps.clock.now();
       await tx.update(users).set({ status: next, statusReasonCode: reasonCode, statusChangedAt: now, version: row.version + 1 }).where(eq(users.id, row.id));
@@ -230,6 +233,8 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
   }
 
   return {
+    /** Internal (SSO service): the same in-tx actor guard as every admin mutation. Not on tRPC. */
+    authorizeInTx: authorizeInTx as (tx: Tx, principal: SessionPrincipal, capability: Capability, targetPublicId?: string) => Promise<UserRow | null>,
     async searchCustomers(principal: SessionPrincipal, input: { query?: string; status?: UserStatus; cursor?: string; limit?: number }) {
       await require(principal, "customers.read_all", "identity.searchCustomers");
       const page = await listUsers(["customer"], input);
@@ -375,6 +380,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     async changeRole(principal: SessionPrincipal, publicId: string, role: UserRole, expectedVersion: number) {
       await require(principal, "staff.manage", "identity.admin.staff.changeRole");
       return deps.db.transaction(async (tx) => {
+        await deps.services.assurance.lockLocalAdministratorPolicy(tx);
         const row = await loadTarget(tx, principal, "staff.manage", publicId, ["customer", "staff", "admin"]);
         if (row.id === principal.userId) throw conflict("SELF_ROLE_CHANGE", "You cannot change your own role.");
         if (row.version !== expectedVersion) throw conflict("STALE_VERSION", "This account was changed by someone else. Reload and try again.");
@@ -382,6 +388,7 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
         if (row.role === "admin" && row.status === "active" && (await repo.countActiveAdmins(tx, row.id)) < 1) {
           throw conflict("LAST_ADMIN", "At least one active administrator must remain.");
         }
+        if (row.role === "admin") await deps.services.assurance.assertLocalAdministratorMayLoseAccess(tx, row.id);
         let customerRef = row.customerRef;
         if (role === "customer" && !customerRef) customerRef = await auth.claimNewRef(tx, row.id);
         await tx.update(users).set({ role, customerRef, version: row.version + 1 }).where(eq(users.id, row.id));

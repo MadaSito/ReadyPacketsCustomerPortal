@@ -15,7 +15,7 @@
 import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../../core/errors.js";
-import { randomToken } from "../../../core/ids.js";
+import { randomToken, ulid } from "../../../core/ids.js";
 import type { SessionPrincipal, Tx } from "../../../core/types.js";
 import { roleHasCapability } from "../../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS, hasFreshStepUp } from "../../../trpc/trpc.js";
@@ -53,7 +53,7 @@ import {
 } from "./oidc.js";
 
 /** Egress purpose for login.microsoftonline.com (owned by integrations_engineer). */
-export const ENTRA_EGRESS_PURPOSE = "entra_oidc" as EgressPurpose;
+export const ENTRA_EGRESS_PURPOSE: EgressPurpose = "entra_oidc";
 export const SSO_CALLBACK_PATH = "/api/identity/sso/callback";
 export const SSO_START_PATH = "/api/identity/sso/start";
 export const PREPARED_TTL_MS = 2 * 60_000;
@@ -165,6 +165,11 @@ export interface SsoTestResult {
   linkedToAnotherAccount: boolean;
 }
 
+export interface SignInMethods {
+  password: boolean;
+  sso: "linked" | "pending" | null;
+}
+
 export type SsoCompletion =
   | { purpose: "sign_in"; next: string | null; nextStep: string | null; issued: IssuedSession; provisioned: boolean }
   | { purpose: "link"; next: string | null }
@@ -183,7 +188,13 @@ interface StoredResult {
 
 const resultAad = (publicId: string) => `sso_auth_requests.result:${publicId}`;
 const verifierAad = (publicId: string) => `sso_auth_requests.verifier:${publicId}`;
+const codeAad = (publicId: string) => `sso_auth_requests.code:${publicId}`;
 const SECRET_AAD = "sso_configuration.client_secret";
+
+const toStored = (claims: VerifiedEntraClaims): StoredResult => ({
+  tid: claims.tenantId, oid: claims.objectId, amr: claims.amr ?? null, authTime: claims.authTime ?? null,
+  email: claims.email, name: claims.name, roles: claims.roles,
+});
 
 export interface SsoInternals {
   deps: ModuleDeps;
@@ -278,13 +289,11 @@ export function createSsoService(i: SsoInternals) {
     const row = await loadConfig(tx);
     const [linked] = await (tx ?? deps.db).select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(eq(ssoIdentities.provider, "entra"));
     let breakGlass: SsoAdminView["breakGlass"] = null;
-    const assurance = deps.services.assurance as unknown as { breakGlassHealth?: () => Promise<NonNullable<SsoAdminView["breakGlass"]>> };
-    if (typeof assurance.breakGlassHealth === "function") {
-      try {
-        breakGlass = await assurance.breakGlassHealth();
-      } catch {
-        breakGlass = null;
-      }
+    try {
+      // Same transaction (never a second pool connection while locks are held).
+      breakGlass = await deps.services.assurance.breakGlassHealth(tx);
+    } catch {
+      breakGlass = null;
     }
     return {
       enabled: row?.enabled === true,
@@ -298,7 +307,7 @@ export function createSsoService(i: SsoInternals) {
       jitStaffAppRole: row?.jitStaffAppRole ?? null,
       jitDailyLimit: row?.jitDailyLimit ?? 25,
       redirectUri: redirectUri(),
-      version: row?.version ?? 0,
+      version: row?.version ?? 1,
       complete: isComplete(row),
       availableInThisDeployment: availableInDeployment(),
       linkedAccounts: Number(linked?.n ?? 0),
@@ -404,9 +413,10 @@ export function createSsoService(i: SsoInternals) {
     async updateConfig(principal: SessionPrincipal, input: SsoConfigInput): Promise<SsoAdminView> {
       validateConfigInput(input);
       return deps.db.transaction(async (tx) => {
-        await i.authorizeInTx(tx, principal, "identity.sso.manage");
+        // Lock order: sso_configuration → users (see complete()).
         const row = await lockConfig(tx);
-        if (row.version !== input.expectedVersion && !(input.expectedVersion === 0 && row.version === 1 && !row.tenantId && !row.clientId)) {
+        await i.authorizeInTx(tx, principal, "identity.sso.manage");
+        if (row.version !== input.expectedVersion) {
           throw conflict("STALE_VERSION", "Single sign-on settings were changed by someone else. Reload and try again.");
         }
         const tenantId = input.tenantId?.trim().toLowerCase() ?? null;
@@ -466,8 +476,8 @@ export function createSsoService(i: SsoInternals) {
       return deps.db.transaction(async (tx) => {
         // Break-glass: the policy lock is taken before any users lock (assurance contract).
         await deps.services.assurance.lockLocalAdministratorPolicy(tx);
-        await i.authorizeInTx(tx, principal, "identity.sso.manage");
         const row = await lockConfig(tx);
+        await i.authorizeInTx(tx, principal, "identity.sso.manage");
         if (row.version !== expectedVersion) throw conflict("STALE_VERSION", "Single sign-on settings were changed by someone else. Reload and try again.");
         if (row.enabled === enabled) return adminView(tx);
         if (enabled) {
@@ -488,7 +498,7 @@ export function createSsoService(i: SsoInternals) {
     async startSignIn(input: { next: unknown; browser: string }): Promise<string> {
       const row = await loadConfig();
       if (!usable(row, "sign_in")) throw refusal("SSO_UNAVAILABLE");
-      const publicId = (await import("../../../core/ids.js")).ulid(now().getTime());
+      const publicId = ulid(now().getTime());
       const authz = await newAuthorization(row as SsoConfigurationRow & { tenantId: string; clientId: string }, "sign_in", publicId);
       const t = now();
       await deps.db.insert(ssoAuthRequests).values({
@@ -514,7 +524,6 @@ export function createSsoService(i: SsoInternals) {
       }
       const ticket = randomToken(32);
       const t = now();
-      const { ulid } = await import("../../../core/ids.js");
       await deps.db.insert(ssoAuthRequests).values({
         publicId: ulid(t.getTime()), purpose, status: "prepared", ticketHash: hash(ticket), sessionPublicId: principal.sessionId,
         userId: principal.userId, configEpoch: row!.epoch, nextPath: safeServerNext(next), requestedAt: t, expiresAt: new Date(t.getTime() + PREPARED_TTL_MS),
@@ -542,8 +551,11 @@ export function createSsoService(i: SsoInternals) {
     },
 
     /**
-     * Callback: consume state atomically (bound to this browser), exchange the code, verify the ID token and
-     * store the verified result. Returns the SPA path to redirect to (never containing code or state).
+     * Callback (provider's cross-site GET; only the Lax pre-auth binder cookie is present). Consumes state
+     * atomically, bound to this browser. Plain sign-in exchanges the code here; session-bound purposes
+     * (link / step-up / test) PARK the encrypted code for ≤ 2 minutes and never exchange it here (G-O01) —
+     * the exchange happens in complete(), where the Strict session cookie is present. Returns a same-origin
+     * SPA path carrying only the opaque attempt handle (never the code or the state).
      */
     async callback(input: { state: unknown; code: unknown; error: unknown; browser: string | undefined }): Promise<string> {
       const refused = (code: SsoRefusal) => `/sso/refused?reason=${code}`;
@@ -565,82 +577,103 @@ export function createSsoService(i: SsoInternals) {
         return refused("SSO_EXPIRED");
       }
       const [req] = await deps.db.select().from(ssoAuthRequests).where(eq(ssoAuthRequests.stateHash, stateHash)).limit(1);
+      if (!req) return refused("SSO_EXPIRED");
       const fail = async (publicCode: SsoRefusal, detail: string) => {
-        await deps.db.update(ssoAuthRequests).set({ refusalCode: detail.slice(0, 40), stateHash: null, nonceHash: null, verifierEnc: null }).where(eq(ssoAuthRequests.id, req!.id));
-        await auditDenied("identity.sso.callback_refused", detail, { purpose: req!.purpose });
+        await deps.db.update(ssoAuthRequests).set({ refusalCode: detail.slice(0, 40), stateHash: null, nonceHash: null, verifierEnc: null, codeEnc: null }).where(eq(ssoAuthRequests.id, req.id));
+        await auditDenied("identity.sso.callback_refused", detail, { purpose: req.purpose });
         return refused(publicCode);
       };
-      if (!req) return refused("SSO_EXPIRED");
       if (typeof input.error === "string") return fail("SSO_CANCELLED", input.error === "access_denied" ? "IDP_ACCESS_DENIED" : "IDP_ERROR");
       if (typeof input.code !== "string" || input.code.length < 10 || input.code.length > 4096 || !/^[\x21-\x7e]+$/.test(input.code)) return fail("SSO_FAILED", "CODE_MISSING");
       const row = await loadConfig();
       if (!usable(row, req.purpose)) return fail("SSO_UNAVAILABLE", "SSO_DISABLED");
       if (row!.epoch !== req.configEpoch) return fail("SSO_EXPIRED", "CONFIG_CHANGED");
-      const config = row as SsoConfigurationRow & { tenantId: string; clientId: string; clientSecretEnc: string };
+      const done = now();
+      const handle = `/sso/complete?attempt=${req.publicId}`;
+      if (req.purpose !== "sign_in") {
+        await deps.db
+          .update(ssoAuthRequests)
+          .set({ status: "verified", refusalCode: null, stateHash: null, codeEnc: deps.crypto.encrypt(input.code, codeAad(req.publicId)), expiresAt: new Date(done.getTime() + VERIFIED_TTL_MS) })
+          .where(and(eq(ssoAuthRequests.id, req.id), eq(ssoAuthRequests.status, "refused"), eq(ssoAuthRequests.refusalCode, "IN_PROGRESS")));
+        return handle;
+      }
       let claims: VerifiedEntraClaims;
       try {
-        const verifier = deps.crypto.decrypt(req.verifierEnc!, verifierAad(req.publicId));
-        const idToken = await postToken(config, input.code, verifier);
-        const key = await keyFor(config.tenantId, peekKeyId(idToken));
-        // The nonce is compared via its hash: verify against the stored hash by hashing the claim.
-        claims = verifyIdTokenWithNonceHash(idToken, key, config, req.nonceHash!, Math.floor(now().getTime() / 1000));
+        claims = await exchangeAndVerify(row!, req, input.code);
       } catch (error) {
         const reason = error instanceof OidcValidationError ? error.reasonCode : "VALIDATION_ERROR";
         return fail(reason.endsWith("UNAVAILABLE") ? "SSO_UNAVAILABLE" : "SSO_FAILED", reason);
       }
-      const result: StoredResult = {
-        tid: claims.tenantId, oid: claims.objectId, amr: claims.amr ?? null, authTime: claims.authTime ?? null,
-        email: claims.email, name: claims.name, roles: claims.roles,
-      };
-      const done = now();
       await deps.db
         .update(ssoAuthRequests)
         .set({
           status: "verified", refusalCode: null, stateHash: null, nonceHash: null, verifierEnc: null,
-          resultEnc: deps.crypto.encrypt(JSON.stringify(result), resultAad(req.publicId)), expiresAt: new Date(done.getTime() + VERIFIED_TTL_MS),
+          resultEnc: deps.crypto.encrypt(JSON.stringify(toStored(claims)), resultAad(req.publicId)), expiresAt: new Date(now().getTime() + VERIFIED_TTL_MS),
         })
         .where(and(eq(ssoAuthRequests.id, req.id), eq(ssoAuthRequests.status, "refused"), eq(ssoAuthRequests.refusalCode, "IN_PROGRESS")));
-      return "/sso/complete";
+      return handle;
     },
 
     /**
-     * Finalize (POST, CSRF-protected, same browser cookie). Link / step-up / test additionally require that the
-     * browser's LIVE session is exactly the initiating session.
+     * Step 2 (POST, CSRF-protected, same-site ⇒ Strict session cookie present). Requires the same browser
+     * binder and the opaque attempt handle; the attempt is burned (single use) before any other check. Link /
+     * step-up / test also require the LIVE session to be exactly the initiating session and actor; only then
+     * is the parked code exchanged. Final checks run under the configuration lock.
      */
-    async complete(input: { browser: string | undefined; session: SessionPrincipal | null; userAgent?: string }): Promise<SsoCompletion> {
-      if (!input.browser) throw refusal("SSO_EXPIRED");
+    async complete(input: { attempt: string; browser: string | undefined; session: SessionPrincipal | null; userAgent?: string }): Promise<SsoCompletion> {
+      if (!input.browser || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(input.attempt)) throw refusal("SSO_EXPIRED");
       const t = now();
       const [req] = await deps.db
         .select()
         .from(ssoAuthRequests)
-        .where(and(eq(ssoAuthRequests.browserHash, hash(input.browser)), eq(ssoAuthRequests.status, "verified"), gt(ssoAuthRequests.expiresAt, t)))
-        .orderBy(desc(ssoAuthRequests.id))
+        .where(and(eq(ssoAuthRequests.publicId, input.attempt), eq(ssoAuthRequests.browserHash, hash(input.browser))))
         .limit(1);
-      if (!req || !req.resultEnc) throw refusal("SSO_EXPIRED");
-      const result = JSON.parse(deps.crypto.decrypt(req.resultEnc, resultAad(req.publicId))) as StoredResult;
+      if (!req) throw refusal("SSO_EXPIRED");
+      // Burn first: whatever happens next, this attempt cannot be used again.
+      const [claimed] = (await deps.db
+        .update(ssoAuthRequests)
+        .set({ status: "completed", completedAt: t, resultEnc: null, codeEnc: null, verifierEnc: null, nonceHash: null })
+        .where(and(eq(ssoAuthRequests.id, req.id), eq(ssoAuthRequests.status, "verified"), gt(ssoAuthRequests.expiresAt, t)))) as unknown as [{ affectedRows?: number }];
       try {
+        if ((claimed?.affectedRows ?? 0) !== 1) throw refusal("SSO_EXPIRED", "ATTEMPT_REPLAYED_OR_EXPIRED");
+        let result: StoredResult;
+        if (req.purpose === "sign_in") {
+          if (!req.resultEnc) throw refusal("SSO_EXPIRED", "RESULT_MISSING");
+          result = JSON.parse(deps.crypto.decrypt(req.resultEnc, resultAad(req.publicId))) as StoredResult;
+        } else {
+          const principal = requireSameSession(req, input.session);
+          if (principal.state !== "full") throw refusal("SSO_SESSION_CHANGED", "SESSION_NOT_FULL");
+          if (!req.codeEnc) throw refusal("SSO_EXPIRED", "CODE_MISSING");
+          const config = await loadConfig();
+          if (!usable(config, req.purpose) || config!.epoch !== req.configEpoch) throw refusal("SSO_EXPIRED", "CONFIG_CHANGED");
+          try {
+            result = toStored(await exchangeAndVerify(config!, req, deps.crypto.decrypt(req.codeEnc, codeAad(req.publicId))));
+          } catch (error) {
+            if (!(error instanceof OidcValidationError)) throw error;
+            throw refusal(error.reasonCode.endsWith("UNAVAILABLE") ? "SSO_UNAVAILABLE" : "SSO_FAILED", error.reasonCode);
+          }
+        }
         return await deps.db.transaction(async (tx) => {
-          const [claimed] = (await tx
-            .update(ssoAuthRequests)
-            .set({ status: "completed", completedAt: t, resultEnc: null })
-            .where(and(eq(ssoAuthRequests.id, req.id), eq(ssoAuthRequests.status, "verified")))) as unknown as [{ affectedRows?: number }];
-          if ((claimed?.affectedRows ?? 0) !== 1) throw refusal("SSO_EXPIRED");
-          const config = await loadConfig(tx, true);
-          if (!usable(config, req.purpose) || config!.epoch !== req.configEpoch || config!.tenantId !== result.tid) throw refusal("SSO_EXPIRED", "CONFIG_CHANGED");
+          // Lock order for every SSO path: [policy] → sso_configuration → users (ascending) → user_sessions →
+          // sso_identities. Holding the configuration lock serializes this completion with configuration
+          // changes, so a policy change either fully precedes (refusal) or fully follows (its revocation
+          // sees the new session) — I-A02.
+          const config = await lockConfig(tx);
+          if (!usable(config, req.purpose) || config.epoch !== req.configEpoch || config.tenantId !== result.tid) throw refusal("SSO_EXPIRED", "CONFIG_CHANGED");
           switch (req.purpose) {
             case "sign_in":
-              return await completeSignIn(tx, req, result, config!, input.userAgent);
+              return await completeSignIn(tx, req, result, config, input.userAgent);
             case "link":
-              return await completeLink(tx, req, result, config!, input.session);
+              return await completeLink(tx, req, result, config, input.session);
             case "step_up":
-              return await completeStepUp(tx, req, result, config!, input.session);
+              return await completeStepUp(tx, req, result, config, input.session);
             case "test":
-              return await completeTest(tx, req, result, config!, input.session);
+              return await completeTest(tx, req, result, config, input.session);
           }
         });
       } catch (error) {
-        if (isSsoRefusal(error)) {
-          await deps.db.update(ssoAuthRequests).set({ status: "refused", refusalCode: error.reasonCode, resultEnc: null, completedAt: t }).where(eq(ssoAuthRequests.id, req.id));
+        if (isSsoRefusal(error) || (error instanceof DomainError && error.reasonCode === "STEP_UP_REQUIRED")) {
+          await deps.db.update(ssoAuthRequests).set({ status: "refused", refusalCode: error.reasonCode.slice(0, 40), resultEnc: null, codeEnc: null, completedAt: t }).where(eq(ssoAuthRequests.id, req.id));
           const detail = typeof error.details?.detail === "string" ? error.details.detail : error.reasonCode;
           if (req.purpose === "sign_in") {
             try {
@@ -737,16 +770,25 @@ export function createSsoService(i: SsoInternals) {
       });
     },
 
-    /** Sign-in methods per user for the staff / customer lists (bounded batch). */
-    async signInMethods(userIds: readonly number[]): Promise<Map<number, { password: boolean; sso: "linked" | "pending" | null }>> {
-      const out = new Map<number, { password: boolean; sso: "linked" | "pending" | null }>();
-      if (userIds.length === 0) return out;
-      const ids = [...new Set(userIds)].slice(0, 200);
-      const rows = await deps.db.select({ id: users.id, passwordHash: users.passwordHash }).from(users).where(inArray(users.id, ids));
-      const links = await deps.db.select({ userId: ssoIdentities.userId, verifiedAt: ssoIdentities.verifiedAt }).from(ssoIdentities).where(and(inArray(ssoIdentities.userId, ids), eq(ssoIdentities.provider, "entra")));
-      for (const row of rows) out.set(row.id, { password: row.passwordHash !== null, sso: null });
+    /** Sign-in methods per user (by publicId) for the staff / customer lists (bounded batch). */
+    async signInMethods(publicIds: readonly string[]): Promise<Map<string, SignInMethods>> {
+      const out = new Map<string, SignInMethods>();
+      const ids = [...new Set(publicIds)].slice(0, 200);
+      if (ids.length === 0) return out;
+      const rows = await deps.db.select({ id: users.id, publicId: users.publicId, passwordHash: users.passwordHash }).from(users).where(inArray(users.publicId, ids));
+      if (rows.length === 0) return out;
+      const byId = new Map<number, SignInMethods>();
+      for (const row of rows) {
+        const entry: SignInMethods = { password: row.passwordHash !== null, sso: null };
+        out.set(row.publicId, entry);
+        byId.set(row.id, entry);
+      }
+      const links = await deps.db
+        .select({ userId: ssoIdentities.userId, verifiedAt: ssoIdentities.verifiedAt })
+        .from(ssoIdentities)
+        .where(and(inArray(ssoIdentities.userId, [...byId.keys()]), eq(ssoIdentities.provider, "entra")));
       for (const link of links) {
-        const entry = out.get(link.userId);
+        const entry = byId.get(link.userId);
         if (entry) entry.sso = link.verifiedAt ? "linked" : "pending";
       }
       return out;
@@ -757,7 +799,7 @@ export function createSsoService(i: SsoInternals) {
       const cutoff = new Date(now().getTime() - 24 * 60 * 60_000);
       const [result] = (await deps.db.delete(ssoAuthRequests).where(lt(ssoAuthRequests.expiresAt, cutoff))) as unknown as [{ affectedRows?: number }];
       // Expired-but-recent rows lose their secrets immediately.
-      await deps.db.update(ssoAuthRequests).set({ stateHash: null, nonceHash: null, verifierEnc: null, resultEnc: null, ticketHash: null }).where(lt(ssoAuthRequests.expiresAt, now()));
+      await deps.db.update(ssoAuthRequests).set({ stateHash: null, nonceHash: null, verifierEnc: null, resultEnc: null, codeEnc: null, ticketHash: null }).where(lt(ssoAuthRequests.expiresAt, now()));
       return result?.affectedRows ?? 0;
     },
   };
@@ -779,6 +821,14 @@ export function createSsoService(i: SsoInternals) {
     return verifyIdToken(idToken, key, { ...config, nonce: claimNonce, nowSeconds });
   }
 
+  async function exchangeAndVerify(row: SsoConfigurationRow, req: SsoAuthRequestRow, code: string): Promise<VerifiedEntraClaims> {
+    if (!isComplete(row) || !req.verifierEnc || !req.nonceHash) throw new OidcValidationError("REQUEST_INCOMPLETE");
+    const verifier = deps.crypto.decrypt(req.verifierEnc, verifierAad(req.publicId));
+    const idToken = await postToken(row, code, verifier);
+    const key = await keyFor(row.tenantId, peekKeyId(idToken));
+    return verifyIdTokenWithNonceHash(idToken, key, row, req.nonceHash, Math.floor(now().getTime() / 1000));
+  }
+
   async function revokeEntraSessions(tx: Tx, userId: number, exceptSessionId?: string): Promise<number> {
     const conditions = [eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)];
     const rows = await tx.select({ publicId: userSessions.publicId }).from(userSessions).where(and(...conditions));
@@ -797,9 +847,10 @@ export function createSsoService(i: SsoInternals) {
     return session;
   }
 
-  async function findIdentity(tx: Tx, tid: string, oid: string) {
-    const [row] = await tx.select().from(ssoIdentities)
-      .where(and(eq(ssoIdentities.provider, "entra"), eq(ssoIdentities.tenantId, tid), eq(ssoIdentities.objectId, oid))).limit(1).for("update");
+  async function findIdentity(tx: Tx, tid: string, oid: string, lock = false) {
+    const query = tx.select().from(ssoIdentities)
+      .where(and(eq(ssoIdentities.provider, "entra"), eq(ssoIdentities.tenantId, tid), eq(ssoIdentities.objectId, oid))).limit(1);
+    const [row] = lock ? await query.for("update") : await query;
     return row ?? null;
   }
 
@@ -811,8 +862,11 @@ export function createSsoService(i: SsoInternals) {
       link = await provision(tx, result, config);
       provisioned = true;
     }
+    // users before sso_identities; then re-read the link under lock and require it unchanged.
     const user = await repo.byId(link.userId, { tx, forUpdate: true });
-    if (!user) throw refusal("SSO_NOT_LINKED", "USER_MISSING");
+    const lockedLink = await findIdentity(tx, result.tid, result.oid, true);
+    if (!user || !lockedLink || lockedLink.userId !== user.id) throw refusal("SSO_NOT_LINKED", "LINK_CHANGED");
+    link = lockedLink;
     if (user.status !== "active") throw refusal("SSO_ACCOUNT_INACTIVE", `ACCOUNT_${user.status.toUpperCase()}`.slice(0, 40));
     // Host recovery / forced change: Entra cannot skip the local remediation.
     if (user.mustChangePassword) throw refusal("SSO_LOCAL_SIGN_IN_REQUIRED", "LOCAL_REMEDIATION_PENDING");
@@ -839,6 +893,7 @@ export function createSsoService(i: SsoInternals) {
     return { purpose: "sign_in", next: req.nextPath, nextStep: steps[0] ?? null, issued: created.issued, provisioned };
   }
 
+  /** Runs under the configuration lock taken by complete() (serializes the bounded daily count). */
   async function provision(tx: Tx, result: StoredResult, config: SsoConfigurationRow) {
     if (config.jitMode === "off") throw refusal("SSO_NOT_LINKED", "IDENTITY_NOT_LINKED");
     // No privilege from an e-mail address, and no silent linking to an existing account.
@@ -852,7 +907,6 @@ export function createSsoService(i: SsoInternals) {
       role = "customer";
     }
     const since = new Date(now().getTime() - 24 * 60 * 60_000);
-    // Serialize the bounded count on the configuration row (already locked by complete()).
     const [count] = await tx.select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(and(eq(ssoIdentities.linkMethod, "jit"), gt(ssoIdentities.createdAt, since)));
     if (Number(count?.n ?? 0) >= config.jitDailyLimit) throw refusal("SSO_PROVISIONING_LIMIT", "JIT_DAILY_LIMIT");
     const name = (result.name?.trim() || result.email.split("@")[0]!).slice(0, 120);
@@ -880,7 +934,7 @@ export function createSsoService(i: SsoInternals) {
     const age = current.stepUpAt ? now().getTime() - current.stepUpAt.getTime() : -1;
     if (!(age >= 0 && age <= STEP_UP_MAX_AGE_MS)) throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Please confirm your identity again, then link your Microsoft account.");
     if (!domainAllowed(config, result.email)) throw refusal("SSO_DOMAIN_NOT_ALLOWED", "DOMAIN_NOT_ALLOWED");
-    const existing = await findIdentity(tx, result.tid, result.oid);
+    const existing = await findIdentity(tx, result.tid, result.oid, true);
     if (existing && existing.userId !== user.id) throw refusal("SSO_IDENTITY_IN_USE", "IDENTITY_LINKED_ELSEWHERE");
     const [own] = await tx.select().from(ssoIdentities).where(and(eq(ssoIdentities.userId, user.id), eq(ssoIdentities.provider, "entra"))).limit(1).for("update");
     const t = now();
@@ -905,8 +959,11 @@ export function createSsoService(i: SsoInternals) {
     try {
       issued = await deps.services.assurance.completeEntraStepUp(principal, { amr: result.amr ?? undefined, trustEntraMfa: config.trustEntraMfa, authTime: result.authTime, requestedAt: req.requestedAt }, tx);
     } catch (error) {
-      if (error instanceof DomainError && error.code === "UNAUTHENTICATED") throw refusal("SSO_SESSION_CHANGED", "SESSION_NOT_CURRENT");
-      throw refusal("SSO_MFA_REQUIRED", "STEP_UP_PROOF_REJECTED");
+      if (error instanceof DomainError) {
+        if (error.reasonCode === "AUTHENTICATION_PROOF_INVALID") throw refusal("SSO_MFA_REQUIRED", "STEP_UP_PROOF_REJECTED");
+        if (error.reasonCode === "SESSION_NOT_CURRENT" || error.reasonCode === "ACCOUNT_STEP_CHANGED") throw refusal("SSO_SESSION_CHANGED", error.reasonCode);
+      }
+      throw error; // audit / infrastructure failures propagate unchanged
     }
     return { purpose: "step_up", next: req.nextPath, issued };
   }

@@ -23,6 +23,6 @@ Owner: `siem_engineer` (Increment 03, Package E).
 - **SMTP relay (`trpc.integrations.admin.smtp.{get,update,sendTest}`)**:
   - `sendTest({})` sends to the signed-in administrator's verified address only.
   - Password is write-only (`passwordConfigured` boolean readback; `undefined` retain, `null` clear, string replace).
-- **Microsoft Graph mail (`trpc.integrations.admin.graph.{get,update,sendTest}`)**:
-  - Single-tenant Entra `tenantId` and `clientId` GUIDs (`common`, `organizations`, and `consumers` refused), `senderMailbox`, `egressPresetEnabled` / `egressReady`, and write-only `clientSecret` (`clientSecretConfigured` + `clientSecretLast4`).
-  - `sendTest({})` sends to the signed-in administrator's verified address only.
+- **Microsoft Graph mail (`trpc.integrations.admin.graph.{get,update,testConnection,sendTest}`)**:
+  - Single-tenant Entra `tenantId` and `clientId` GUIDs (`common`, `organizations`, and `consumers` refused), `senderMailbox`, `egressPresetEnabled` / `enableEgressPreset`, and write-only `clientSecret` (`clientSecretConfigured` + `clientSecretLast4`).
+  - `testConnection({})` verifies token acquisition and Graph connectivity; `sendTest({})` sends to the signed-in administrator's verified address only.

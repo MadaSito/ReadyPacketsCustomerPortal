@@ -60,6 +60,7 @@ export interface SmtpConfigView {
   tlsMode: "starttls" | "implicit" | null;
   username: string | null;
   passwordConfigured: boolean;
+  passwordLast4?: string | null;
   fromAddress: string | null;
   fromName: string | null;
   replyToAddress: string | null;
@@ -91,10 +92,10 @@ export interface GraphMailConfigView {
   clientSecretLast4: string | null;
   senderMailbox: string;
   egressPresetEnabled: boolean;
-  egressReady: boolean;
+  egressReady?: boolean;
   lastCheckedAt: Date | string | null;
   lastOutcome: LastCheckOutcome | null;
-  mailboxRestrictionNote: string;
+  mailboxRestrictionNote?: string;
 }
 
 export interface GraphMailUpdateInput {
@@ -102,8 +103,16 @@ export interface GraphMailUpdateInput {
   tenantId: string;
   clientId: string;
   clientSecret?: string | null;
-  senderMailbox: string;
-  egressPresetEnabled?: boolean;
+  senderMailbox?: string;
+  enableEgressPreset?: boolean;
+}
+
+export interface GraphConnectionTestResult {
+  outcome: "succeeded" | "failed";
+  reasonCode?: string;
+  safeMessage: string;
+  durationMs?: number;
+  checkedAt: Date | string;
 }
 
 export interface MailTransportTestResult {

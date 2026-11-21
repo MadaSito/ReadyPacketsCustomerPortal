@@ -19,6 +19,7 @@ const {
   updateSmtp,
   sendSmtpTest,
   updateGraph,
+  testGraphConnection,
   sendGraphTest,
   requestAuditVerification,
   confirmAuditVerification,
@@ -32,6 +33,7 @@ const {
   updateSmtp: vi.fn(),
   sendSmtpTest: vi.fn(),
   updateGraph: vi.fn(),
+  testGraphConnection: vi.fn(),
   sendGraphTest: vi.fn(),
   requestAuditVerification: vi.fn(),
   confirmAuditVerification: vi.fn(),
@@ -215,6 +217,12 @@ vi.mock("@/lib/trpc", () => {
               mutationFn: updateGraph,
             }),
           },
+          testConnection: {
+            mutationOptions: (opts?: Record<string, unknown>) => ({
+              ...opts,
+              mutationFn: testGraphConnection,
+            }),
+          },
           sendTest: {
             mutationOptions: (opts?: Record<string, unknown>) => ({
               ...opts,
@@ -302,6 +310,15 @@ vi.mock("@/lib/trpc", () => {
               return updateGraph(input);
             },
           },
+          testConnection: {
+            mutate: async (input: unknown) => {
+              if (!verifiedStepUp) {
+                verifiedStepUp = true;
+                throw stepUpGate();
+              }
+              return testGraphConnection(input);
+            },
+          },
           sendTest: {
             mutate: async (input: unknown) => {
               if (!verifiedStepUp) {
@@ -354,14 +371,16 @@ vi.mock("@/lib/trpc", () => {
 
 function adminSession(): MeResult {
   return {
-    status: "authenticated",
+    state: "full",
+    pendingSteps: [],
+    nextStep: null,
     user: {
       publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMA",
       email: "admin@readypackets.example.test",
       name: "Portal Admin",
       role: "admin",
+      status: "active",
     },
-    assurance: { mfaVerified: true, recentStepUp: false },
   };
 }
 
@@ -389,6 +408,11 @@ describe("E-mail delivery administration UI", () => {
       checkedAt: new Date("2026-11-21T10:05:00Z"),
     } satisfies MailTransportTestResult);
     updateGraph.mockReset().mockResolvedValue({});
+    testGraphConnection.mockReset().mockResolvedValue({
+      outcome: "succeeded",
+      safeMessage: "Client-credentials token acquired from tenant.",
+      checkedAt: new Date("2026-11-21T10:05:30Z"),
+    });
     sendGraphTest.mockReset().mockResolvedValue({
       outcome: "unknown",
       safeMessage: "Connection timed out after submission; delivery is unconfirmed.",
@@ -503,6 +527,7 @@ describe("E-mail delivery administration UI", () => {
     await waitFor(() => {
       expect(updateGraph).toHaveBeenCalledWith(
         expect.objectContaining({
+          enableEgressPreset: true,
           tenantId: "11111111-2222-3333-4444-555555555555",
           clientId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
           senderMailbox: "mailer@tenant.example.test",
@@ -511,7 +536,10 @@ describe("E-mail delivery administration UI", () => {
       );
     });
 
-    // Run Graph test and ensure unknown outcome is rendered honestly (never as failed)
+    // Run Graph connection check and mail send test
+    fireEvent.click(screen.getByRole("button", { name: "Test Graph connection" }));
+    expect(await screen.findByText(/Client-credentials token acquired/)).toBeTruthy();
+
     fireEvent.click(screen.getByRole("button", { name: "Send Graph test to me" }));
     expect(await screen.findByText(/Outcome unknown — the transport did not confirm acceptance/)).toBeTruthy();
   });

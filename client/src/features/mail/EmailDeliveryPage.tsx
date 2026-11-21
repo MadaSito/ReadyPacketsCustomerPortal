@@ -47,6 +47,7 @@ import {
   SECONDARY_TRANSPORT_OPTIONS,
   TEST_OUTCOME_META,
   TRANSPORT_LABELS,
+  type GraphConnectionTestResult,
   type GraphMailConfigView,
   type MailAuditCopySetting,
   type MailRoutingSetting,
@@ -148,6 +149,8 @@ export default function EmailDeliveryPage() {
   const [graphDraft, setGraphDraft] = useState<GraphDraft | null>(null);
   const [graphErrors, setGraphErrors] = useState<Record<string, string>>({});
   const [savingGraph, setSavingGraph] = useState(false);
+  const [testingGraphConn, setTestingGraphConn] = useState(false);
+  const [graphConnResult, setGraphConnResult] = useState<GraphConnectionTestResult | null>(null);
   const [testingGraph, setTestingGraph] = useState(false);
   const [graphTestResult, setGraphTestResult] = useState<MailTransportTestResult | null>(null);
 
@@ -428,7 +431,7 @@ export default function EmailDeliveryPage() {
         () =>
           mailClient.updateGraph({
             enabled: currentGraph.enabled,
-            egressPresetEnabled: currentGraph.egressPresetEnabled,
+            enableEgressPreset: currentGraph.egressPresetEnabled,
             tenantId: currentGraph.tenantId.trim(),
             clientId: currentGraph.clientId.trim(),
             senderMailbox: currentGraph.senderMailbox.trim(),
@@ -448,6 +451,27 @@ export default function EmailDeliveryPage() {
       });
     } finally {
       setSavingGraph(false);
+    }
+  };
+
+  const handleTestGraphConnection = async () => {
+    setTestingGraphConn(true);
+    try {
+      const result = await stepUp.run(() => mailClient.testGraphConnection({}), {
+        reason: "Testing the Microsoft Graph connection requires verification.",
+      });
+      setGraphConnResult(result);
+      toast.show({ tone: "info", title: "Microsoft Graph connection test completed" });
+      await refreshAll();
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      toast.show({
+        tone: "danger",
+        title: "Microsoft Graph connection test could not run",
+        description: errorMessage(err),
+      });
+    } finally {
+      setTestingGraphConn(false);
     }
   };
 
@@ -924,7 +948,9 @@ export default function EmailDeliveryPage() {
                           { label: "Status", value: <TransportBadge state={smtpData.state} verified={smtpData.verified} /> },
                           {
                             label: "Password",
-                            value: smtpData.passwordConfigured ? "Stored (encrypted)" : "Not stored",
+                            value: smtpData.passwordConfigured
+                              ? `Stored${smtpData.passwordLast4 ? ` (…${smtpData.passwordLast4})` : " (encrypted)"}`
+                              : "Not stored",
                           },
                           {
                             label: "Last check",
@@ -1130,7 +1156,7 @@ export default function EmailDeliveryPage() {
                           { label: "Status", value: <TransportBadge state={graphData.state} verified={graphData.verified} /> },
                           {
                             label: "Outbound allowlist",
-                            value: graphData.egressReady ? (
+                            value: (graphData.egressReady ?? graphData.egressPresetEnabled) ? (
                               <Badge tone="success">Allowed</Badge>
                             ) : (
                               <Badge tone="warning">Blocked until enabled</Badge>
@@ -1174,19 +1200,46 @@ export default function EmailDeliveryPage() {
                       description="Sends one test message to your signed-in administrator e-mail address through Microsoft Graph."
                     >
                       <div className="flex flex-col gap-3">
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          loading={testingGraph}
-                          disabled={!graphData.configured}
-                          onClick={() => void handleTestGraph()}
-                        >
-                          Send Graph test to me
-                        </Button>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            loading={testingGraphConn}
+                            disabled={!graphData.configured}
+                            onClick={() => void handleTestGraphConnection()}
+                          >
+                            Test Graph connection
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            loading={testingGraph}
+                            disabled={!graphData.configured}
+                            onClick={() => void handleTestGraph()}
+                          >
+                            Send Graph test to me
+                          </Button>
+                        </div>
                         {!graphData.configured ? (
                           <p className="text-sm text-muted">
                             Save complete Microsoft Graph credentials and enable the egress preset before testing.
                           </p>
+                        ) : null}
+                        {graphConnResult ? (
+                          <Callout
+                            tone={graphConnResult.outcome === "succeeded" ? "success" : "danger"}
+                            title={
+                              graphConnResult.outcome === "succeeded"
+                                ? "Microsoft Graph token and connection verified"
+                                : "Microsoft Graph connection check failed"
+                            }
+                            live="polite"
+                          >
+                            <p>{graphConnResult.safeMessage}</p>
+                            <p className="mt-1 text-xs">
+                              Checked <DateTime value={graphConnResult.checkedAt} />
+                            </p>
+                          </Callout>
                         ) : null}
                         {graphTestResult ? (
                           <Callout

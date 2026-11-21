@@ -6,6 +6,7 @@ import type { UseMutationOptions, UseQueryOptions } from "@tanstack/react-query"
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
 import type {
   AuditCopyVerificationStatus,
+  GraphConnectionTestResult,
   GraphMailConfigView,
   GraphMailUpdateInput,
   MailTransportTestResult,
@@ -31,6 +32,7 @@ export interface MailTRPCProxy {
   smtpSendTest: MutationProc<{ toAddress?: string }, MailTransportTestResult>;
   graphGet: QueryProcNoInput<GraphMailConfigView>;
   graphUpdate: MutationProc<GraphMailUpdateInput, GraphMailConfigView>;
+  graphTestConnection: MutationProc<Record<string, never>, GraphConnectionTestResult>;
   graphSendTest: MutationProc<Record<string, never>, MailTransportTestResult>;
   auditCopyStatus: QueryProcNoInput<AuditCopyVerificationStatus>;
   auditCopyRequestVerification: MutationProc<void, { queued: boolean }>;
@@ -42,6 +44,7 @@ export interface MailDirectClient {
   updateSmtp(input: SmtpUpdateInput): Promise<SmtpConfigView>;
   sendSmtpTest(input: { toAddress?: string }): Promise<MailTransportTestResult>;
   updateGraph(input: GraphMailUpdateInput): Promise<GraphMailConfigView>;
+  testGraphConnection(input: Record<string, never>): Promise<GraphConnectionTestResult>;
   sendGraphTest(input: Record<string, never>): Promise<MailTransportTestResult>;
   requestAuditCopyVerification(): Promise<{ queued: boolean }>;
   confirmAuditCopyVerification(input: { code: string }): Promise<{ verified: boolean }>;
@@ -67,6 +70,7 @@ export function useMailTRPC(): MailTRPCProxy {
         graph: {
           get: QueryProcNoInput<GraphMailConfigView>;
           update: MutationProc<GraphMailUpdateInput, GraphMailConfigView>;
+          testConnection: MutationProc<Record<string, never>, GraphConnectionTestResult>;
           sendTest: MutationProc<Record<string, never>, MailTransportTestResult>;
         };
       };
@@ -90,6 +94,7 @@ export function useMailTRPC(): MailTRPCProxy {
     smtpSendTest: trpc.integrations.admin.smtp.sendTest,
     graphGet: trpc.integrations.admin.graph.get,
     graphUpdate: trpc.integrations.admin.graph.update,
+    graphTestConnection: trpc.integrations.admin.graph.testConnection,
     graphSendTest: trpc.integrations.admin.graph.sendTest,
     auditCopyStatus: trpc.jobs.mail.auditCopy.status,
     auditCopyRequestVerification: trpc.jobs.mail.auditCopy.requestVerification,
@@ -114,6 +119,7 @@ export function useMailClient(): MailDirectClient {
         };
         graph: {
           update: { mutate(input: GraphMailUpdateInput): Promise<GraphMailConfigView> };
+          testConnection: { mutate(input: Record<string, never>): Promise<GraphConnectionTestResult> };
           sendTest: { mutate(input: Record<string, never>): Promise<MailTransportTestResult> };
         };
       };
@@ -133,6 +139,7 @@ export function useMailClient(): MailDirectClient {
     updateSmtp: (input) => client.integrations.admin.smtp.update.mutate(input),
     sendSmtpTest: (input) => client.integrations.admin.smtp.sendTest.mutate(input),
     updateGraph: (input) => client.integrations.admin.graph.update.mutate(input),
+    testGraphConnection: (input) => client.integrations.admin.graph.testConnection.mutate(input),
     sendGraphTest: (input) => client.integrations.admin.graph.sendTest.mutate(input),
     requestAuditCopyVerification: () => client.jobs.mail.auditCopy.requestVerification.mutate(),
     confirmAuditCopyVerification: (input) => client.jobs.mail.auditCopy.confirmVerification.mutate(input),

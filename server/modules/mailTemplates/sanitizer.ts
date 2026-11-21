@@ -4,24 +4,23 @@
  *
  * Security invariants (ADR 0025, Contract §2.D, §4, §4.1):
  *  1. Zero third-party HTML parser dependencies and zero pass-through markup: input HTML is
- *     tokenized into a bounded AST of compile-time literal tag names and text nodes, then
- *     re-serialized from scratch with every text character and attribute value escaped.
+ *     tokenized into a bounded AST of compile-time literal tag names (via `Map`, immune to
+ *     `Object.prototype` keys like `constructor`) and text nodes, enforcing HTML5 content-model
+ *     nesting (no nested `<a>`, no block-in-`<p>`, strict `table > thead|tbody > tr > th|td` so
+ *     standards parsers never foster-parent), then re-serialized from scratch.
  *  2. Opaque dangerous subtrees (`script`, `style`, `svg`, `math`, `iframe`, `form`, `meta`,
- *     `base`, `link`, `object`, `embed`, etc.) are dropped in full (tag + body).
+ *     `base`, `link`, `object`, `embed`, etc.) are rejected in strict mode and fail closed to
+ *     empty projection (`""`, falling back to plain text) in lenient preview mode.
  *  3. Delivery HTML allow-list accepts the RichTextEditor subset (`p, h2, h3, strong, em, ul,
- *     ol, li, br, hr, a[href], a[href][data-rp-button="primary"], img[src][alt]`) plus standard
- *     semantic headings/tables/code (`h1, h4, blockquote, pre, code, table, thead, tbody, tr,
- *     th, td`). Links require `https:`, `mailto:` or an exact `{{varName}}` placeholder; images
- *     require `https:` `src` and non-empty `alt`.
+ *     ol, li, br, hr, a[href], a[href][data-rp-button="primary"], img[src][alt]`) plus semantic
+ *     headings/tables/code (`h1, h4, blockquote, pre, code, table, thead, tbody, tr, th, td, span`).
+ *     Links require `https:`, single-recipient `mailto:` (percent-decoded verified), or an exact
+ *     `{{varName}}` placeholder; images require `https:` `src` and non-empty `alt`.
  *  4. Placeholders are strictly typed (`{{[a-zA-Z][a-zA-Z0-9_]{0,63}}}`) and allowed ONLY in
- *     text nodes and as the entire `a[href]` attribute value. Any malformed `{{...}}` or any
- *     placeholder in a disallowed tag/attribute/comment/URL prefix is rejected on save & preview.
- *  5. Inert preview projection (`projectInertMailPreviewHtml`) emits semantic text structure
- *     ONLY — zero `<a>`, zero `<img>`, zero `href`/`src`/`srcset`/`style`/`class`/`id`/`data-*`,
- *     zero `<meta>`/`<base>`/`<form>`/SVG/MathML — safe for `<InertMailPreview>` (`sandbox=""`).
- *  6. Subjects and addresses reject control characters (`HEADER_CONTROL_RE`); variables substituted
- *     into HTML text are always HTML-escaped, and `[REDACTED]` link values render as inert text
- *     so redacted audit/retained copies render cleanly.
+ *     text nodes and as the entire `a[href]` attribute value.
+ *  5. Inert preview projection (`projectInertMailPreviewHtml`) never throws, drops malformed EOF
+ *     remainders, fails closed to `""` on dangerous/over-limit HTML, and emits semantic text
+ *     structure ONLY — zero `<a>`, zero `<img>`, zero `href`/`src`/`srcset`/`style`/`class`/`id`.
  */
 import { createHash } from "node:crypto";
 import { validation } from "../../core/errors.js";
@@ -34,11 +33,14 @@ export const MAX_SUBJECT_LENGTH = 255;
 export const MAX_TEXT_BODY_LENGTH = 65_536;
 export const MAX_HTML_INPUT_BYTES = 128 * 1024;
 export const MAX_RENDERED_HTML_BYTES = 512 * 1024;
+export const MAX_TEMPLATE_VARS = 40;
 const MAX_AST_DEPTH = 16;
 const MAX_AST_NODES = 2_500;
 const MAX_URL_LENGTH = 2_048;
 const MAX_ALT_LENGTH = 240;
 export const REDACTED_MARKER = "[REDACTED]";
+
+const SIMPLE_MAILBOX_RE = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 
 export const ALLOWED_DELIVERY_TAGS = [
   "p",
@@ -67,41 +69,91 @@ export const ALLOWED_DELIVERY_TAGS = [
   "span",
 ] as const;
 
-type AllowedTag = (typeof ALLOWED_DELIVERY_TAGS)[number];
+export type AllowedTag = (typeof ALLOWED_DELIVERY_TAGS)[number];
 
-const ALLOWED_TAG_MAP: Readonly<Record<string, AllowedTag>> = {
-  p: "p",
-  h1: "h1",
-  h2: "h2",
-  h3: "h3",
-  h4: "h4",
-  strong: "strong",
-  b: "strong",
-  em: "em",
-  i: "em",
-  ul: "ul",
-  ol: "ol",
-  li: "li",
-  blockquote: "blockquote",
-  pre: "pre",
-  code: "code",
-  br: "br",
-  hr: "hr",
-  a: "a",
-  img: "img",
-  table: "table",
-  thead: "thead",
-  tbody: "tbody",
-  tr: "tr",
-  th: "th",
-  td: "td",
-  span: "span",
-};
+/** `Map` lookup avoids `Object.prototype` keys (`constructor`, `toString`, `__proto__`). */
+const ALLOWED_TAG_MAP = new Map<string, AllowedTag>([
+  ["p", "p"],
+  ["h1", "h1"],
+  ["h2", "h2"],
+  ["h3", "h3"],
+  ["h4", "h4"],
+  ["strong", "strong"],
+  ["b", "strong"],
+  ["em", "em"],
+  ["i", "em"],
+  ["ul", "ul"],
+  ["ol", "ol"],
+  ["li", "li"],
+  ["blockquote", "blockquote"],
+  ["pre", "pre"],
+  ["code", "code"],
+  ["br", "br"],
+  ["hr", "hr"],
+  ["a", "a"],
+  ["img", "img"],
+  ["table", "table"],
+  ["thead", "thead"],
+  ["tbody", "tbody"],
+  ["tr", "tr"],
+  ["th", "th"],
+  ["td", "td"],
+  ["span", "span"],
+]);
 
-const VOID_TAGS = new Set<string>(["br", "hr", "img", "input", "meta", "base", "link", "source", "track", "area", "col", "wbr", "param", "embed"]);
+const NEUTRAL_WRAPPER_TAGS = new Set<string>([
+  "html",
+  "body",
+  "div",
+  "section",
+  "article",
+  "main",
+  "header",
+  "footer",
+]);
 
-/** Tags whose entire content up to the matching end tag must be dropped (never unwrapped as text). */
-const OPAQUE_DROP_TAGS = new Set<string>([
+const VOID_TAGS = new Set<string>([
+  "br",
+  "hr",
+  "img",
+  "input",
+  "meta",
+  "base",
+  "link",
+  "source",
+  "track",
+  "area",
+  "col",
+  "wbr",
+  "param",
+  "embed",
+]);
+
+const BLOCK_TAGS = new Set<AllowedTag>([
+  "p",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "ul",
+  "ol",
+  "li",
+  "blockquote",
+  "pre",
+  "hr",
+  "table",
+  "thead",
+  "tbody",
+  "tr",
+  "th",
+  "td",
+]);
+
+const HEADING_TAGS = new Set<AllowedTag>(["h1", "h2", "h3", "h4"]);
+const TABLE_PART_TAGS = new Set<AllowedTag>(["thead", "tbody", "tr", "th", "td"]);
+
+/** Dangerous / foreign / executable / form / metadata elements — never allowed in delivery or preview. */
+const OPAQUE_DANGEROUS_TAGS = new Set<string>([
   "script",
   "style",
   "svg",
@@ -119,11 +171,8 @@ const OPAQUE_DROP_TAGS = new Set<string>([
   "textarea",
   "option",
   "optgroup",
-  "meta",
   "base",
   "link",
-  "head",
-  "title",
   "template",
   "noscript",
   "audio",
@@ -136,19 +185,20 @@ const OPAQUE_DROP_TAGS = new Set<string>([
   "portal",
 ]);
 
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: "\u00a0",
-  ndash: "\u2013",
-  mdash: "\u2014",
-  hellip: "\u2026",
-  copy: "\u00a9",
-  reg: "\u00ae",
-};
+/** `Map` avoids prototype-key resolution on `&constructor;` etc. */
+const NAMED_ENTITIES = new Map<string, string>([
+  ["amp", "&"],
+  ["lt", "<"],
+  ["gt", ">"],
+  ["quot", '"'],
+  ["apos", "'"],
+  ["nbsp", "\u00a0"],
+  ["ndash", "\u2013"],
+  ["mdash", "\u2014"],
+  ["hellip", "\u2026"],
+  ["copy", "\u00a9"],
+  ["reg", "\u00ae"],
+]);
 
 type AstNode =
   | { kind: "text"; text: string }
@@ -187,7 +237,7 @@ export function escapeHtmlText(value: string): string {
 }
 
 function decodeHtmlEntities(raw: string): string {
-  return raw.replace(/&(#x[0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z]{2,12});/g, (full, body: string) => {
+  const decoded = raw.replace(/&(#x[0-9a-fA-F]{1,6}|#[0-9]{1,7}|[a-zA-Z]{2,12});/g, (full, body: string) => {
     if (body.startsWith("#x") || body.startsWith("#X")) {
       const code = Number.parseInt(body.slice(2), 16);
       if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
@@ -204,9 +254,10 @@ function decodeHtmlEntities(raw: string): string {
       if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) return "";
       return String.fromCodePoint(code);
     }
-    const replacement = NAMED_ENTITIES[body.toLowerCase()];
+    const replacement = NAMED_ENTITIES.get(body.toLowerCase());
     return replacement ?? full;
   });
+  return decoded.normalize("NFC");
 }
 
 function hasAnyCurlyBraces(value: string): boolean {
@@ -215,11 +266,10 @@ function hasAnyCurlyBraces(value: string): boolean {
 
 /**
  * Validates all `{{...}}` placeholders in a plain-text or text-node segment and returns the
- * ordered unique variable names referenced. Any malformed `{{...}}`, triple brace, expression,
- * or unmatched `{{` / `}}` throws `VALIDATION_ERROR`.
+ * insertion-ordered unique variable names referenced using `Set` (O(1) per placeholder).
  */
 export function extractTextPlaceholders(input: string): string[] {
-  const found: string[] = [];
+  const found = new Set<string>();
   let cursor = 0;
   while (cursor < input.length) {
     const open = input.indexOf("{{", cursor);
@@ -245,10 +295,13 @@ export function extractTextPlaceholders(input: string): string[] {
         "Placeholders must be simple variable names such as {{reference}}.",
       );
     }
-    if (!found.includes(varName)) found.push(varName);
+    found.add(varName);
+    if (found.size > MAX_TEMPLATE_VARS) {
+      throw validation("TOO_MANY_TEMPLATE_VARIABLES", `Templates may reference at most ${MAX_TEMPLATE_VARS} variables.`);
+    }
     cursor = close + 2;
   }
-  return found;
+  return [...found];
 }
 
 export function substitutePlainText(
@@ -257,23 +310,26 @@ export function substitutePlainText(
   declaredVars?: ReadonlySet<string>,
 ): string {
   extractTextPlaceholders(template);
-  return template.replace(/\{\{([a-zA-Z][a-zA-Z0-9_]{0,63})\}\}/g, (_match, name: string) => {
-    if (declaredVars && !declaredVars.has(name)) {
-      throw validation("UNDECLARED_TEMPLATE_VARIABLE", `Template references undeclared variable {{${name}}}.`);
-    }
-    const raw = vars[name];
-    if (raw === undefined || raw === null) return "";
-    const str = String(raw);
-    if (str.includes("\0")) {
-      throw validation("INVALID_MAIL_RENDER", "Template variable contains disallowed null bytes.");
-    }
-    return str;
-  });
+  return template
+    .replace(/\{\{([a-zA-Z][a-zA-Z0-9_]{0,63})\}\}/g, (_match, name: string) => {
+      if (declaredVars && !declaredVars.has(name)) {
+        throw validation("UNDECLARED_TEMPLATE_VARIABLE", `Template references undeclared variable {{${name}}}.`);
+      }
+      const raw = vars[name];
+      if (raw === undefined || raw === null) return "";
+      const str = String(raw);
+      if (str.includes("\0")) {
+        throw validation("INVALID_MAIL_RENDER", "Template variable contains disallowed null bytes.");
+      }
+      return str;
+    })
+    .normalize("NFC");
 }
 
 /**
- * Validates and canonicalizes an allowed link URL (`https:` or `mailto:`) or image URL (`https:` only).
- * Optionally resolves a safe portal-relative path (`/orders/...`) against an `https:` `canonicalOrigin`.
+ * Validates and canonicalizes an allowed link URL (`https:` or single-address `mailto:`) or image
+ * URL (`https:` only). Enforces `MAX_URL_LENGTH` on both raw and canonicalized URL output, and
+ * rejects percent-encoded control/header/delimiter characters in `mailto:` targets.
  */
 export function parseAllowedTemplateUrl(
   rawUrl: string,
@@ -301,14 +357,30 @@ export function parseAllowedTemplateUrl(
     if (parsed.username || parsed.password) return null;
     if (parsed.protocol === "https:") {
       if (!parsed.hostname) return null;
-      return parsed.toString();
+      const canonical = parsed.toString();
+      if (canonical.length > MAX_URL_LENGTH || HEADER_CONTROL_RE.test(canonical)) return null;
+      return canonical;
     }
     if (options.allowMailto && parsed.protocol === "mailto:") {
-      // Reject query headers on mailto: (e.g. ?subject=...&body=... header/body injection) — address only.
-      if (parsed.search || parsed.hash || !parsed.pathname || HEADER_CONTROL_RE.test(parsed.pathname)) {
+      if (parsed.search || parsed.hash || !parsed.pathname) return null;
+      let decodedMailbox: string;
+      try {
+        decodedMailbox = decodeURIComponent(parsed.pathname);
+      } catch {
         return null;
       }
-      return `mailto:${parsed.pathname}`;
+      if (
+        !decodedMailbox ||
+        decodedMailbox.length > 254 ||
+        HEADER_CONTROL_RE.test(decodedMailbox) ||
+        /\s/u.test(decodedMailbox) ||
+        !SIMPLE_MAILBOX_RE.test(decodedMailbox)
+      ) {
+        return null;
+      }
+      const canonicalMailto = `mailto:${decodedMailbox}`;
+      if (canonicalMailto.length > MAX_URL_LENGTH) return null;
+      return canonicalMailto;
     }
     return null;
   } catch {
@@ -317,12 +389,6 @@ export function parseAllowedTemplateUrl(
 }
 
 interface ParseOptions {
-  /**
-   * `strict`: used on save, publish, preview, and render of authored templates — rejects unsafe
-   * URLs, missing image `alt`, malformed placeholders, or placeholders outside safe sinks.
-   * `lenient_preview`: used by `projectInertMailPreviewHtml` so arbitrary stored HTML can be
-   * projected safely without throwing while stripping all navigation/network/presentational attrs.
-   */
   mode: "strict" | "lenient_preview";
   allowPlaceholders: boolean;
   declaredVars?: ReadonlySet<string>;
@@ -359,6 +425,9 @@ function parseAttributes(
         i++;
         const valStart = i;
         while (i < len && rawAttrs[i] !== quote) i++;
+        if (strictPlaceholders && i >= len) {
+          throw validation("INVALID_HTML_INPUT", "Unterminated quoted attribute in HTML template.");
+        }
         value = decodeHtmlEntities(rawAttrs.slice(valStart, i));
         if (i < len && rawAttrs[i] === quote) i++;
       } else {
@@ -370,6 +439,11 @@ function parseAttributes(
     attrs.push({ name, value });
   }
   return attrs;
+}
+
+interface StackEntry {
+  rawTag: string;
+  node: Extract<AstNode, { kind: "element" }> | null;
 }
 
 interface ParsedHtmlResult {
@@ -388,42 +462,110 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
 
   const normalizedInput = rawHtml.normalize("NFC").replace(/\r\n?/g, "\n");
   const rootChildren: AstNode[] = [];
-  const stack: Array<{ rawTag: string; node: Extract<AstNode, { kind: "element" }> | null }> = [];
-  const referencedVars: string[] = [];
-  const hrefVars: string[] = [];
+  const stack: StackEntry[] = [];
+  const referencedVars = new Set<string>();
+  const hrefVars = new Set<string>();
   let nodeCount = 0;
+
+  const pushStack = (entry: StackEntry) => {
+    if (stack.length >= MAX_AST_DEPTH) {
+      throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template nesting exceeds maximum depth.");
+    }
+    stack.push(entry);
+  };
 
   const recordVar = (name: string, isHref = false) => {
     if (options.declaredVars && !options.declaredVars.has(name)) {
       throw validation("UNDECLARED_TEMPLATE_VARIABLE", `Template references undeclared variable {{${name}}}.`);
     }
-    if (!referencedVars.includes(name)) referencedVars.push(name);
-    if (isHref && !hrefVars.includes(name)) hrefVars.push(name);
+    referencedVars.add(name);
+    if (referencedVars.size > MAX_TEMPLATE_VARS) {
+      throw validation("TOO_MANY_TEMPLATE_VARIABLES", `Templates may reference at most ${MAX_TEMPLATE_VARS} variables.`);
+    }
+    if (isHref) hrefVars.add(name);
+  };
+
+  const currentElementEntry = (): Extract<AstNode, { kind: "element" }> | null => {
+    for (let idx = stack.length - 1; idx >= 0; idx--) {
+      const entry = stack[idx]!;
+      if (entry.node) return entry.node;
+    }
+    return null;
   };
 
   const currentTarget = (): AstNode[] => {
+    const parent = currentElementEntry();
+    return parent ? parent.children : rootChildren;
+  };
+
+  const hasOpenElement = (tag: AllowedTag): boolean => {
     for (let idx = stack.length - 1; idx >= 0; idx--) {
-      const entry = stack[idx]!;
-      if (entry.node) return entry.node.children;
+      if (stack[idx]!.node?.tag === tag) return true;
     }
-    return rootChildren;
+    return false;
+  };
+
+  const hasOpenHeading = (): boolean => {
+    for (let idx = stack.length - 1; idx >= 0; idx--) {
+      const t = stack[idx]!.node?.tag;
+      if (t && HEADING_TAGS.has(t)) return true;
+    }
+    return false;
+  };
+
+  const closeTopMatchingElement = (tag: AllowedTag): void => {
+    for (let idx = stack.length - 1; idx >= 0; idx--) {
+      if (stack[idx]!.node?.tag === tag) {
+        stack.length = idx;
+        return;
+      }
+      // Do not auto-close across table boundaries
+      const openTag = stack[idx]!.node?.tag;
+      if (openTag === "table" || openTag === "thead" || openTag === "tbody" || openTag === "tr" || openTag === "td" || openTag === "th") {
+        return;
+      }
+    }
   };
 
   const appendText = (rawSegment: string) => {
     if (!rawSegment) return;
     const decoded = decodeHtmlEntities(rawSegment);
     if (!decoded) return;
-    if (options.mode === "strict") {
-      if (options.allowPlaceholders) {
-        for (const v of extractTextPlaceholders(decoded)) recordVar(v, false);
-      } else if (hasAnyCurlyBraces(decoded)) {
-        // After substitution, literal braces in user values are allowed (they are escaped as text).
+
+    const parentElem = currentElementEntry();
+    // Prevent HTML5 table foster parenting: non-whitespace text directly inside table/thead/tbody/tr/ul/ol
+    const inContainerForbiddingBareText =
+      parentElem !== null &&
+      (parentElem.tag === "table" ||
+        parentElem.tag === "thead" ||
+        parentElem.tag === "tbody" ||
+        parentElem.tag === "tr" ||
+        parentElem.tag === "ul" ||
+        parentElem.tag === "ol");
+
+    if (inContainerForbiddingBareText) {
+      if (!decoded.trim()) {
+        // Pure formatting whitespace between table rows/cells or list items is dropped cleanly
+        return;
       }
+      if (options.mode === "strict") {
+        throw validation(
+          "INVALID_HTML_STRUCTURE",
+          `Bare text is not permitted directly inside <${parentElem.tag}>.`,
+        );
+      }
+      // In lenient preview mode, drop foster-parented bare text rather than corrupting table tree
+      return;
     }
+
+    if (options.mode === "strict" && options.allowPlaceholders) {
+      for (const v of extractTextPlaceholders(decoded)) recordVar(v, false);
+    }
+
     const target = currentTarget();
     const prev = target[target.length - 1];
     if (prev && prev.kind === "text") {
-      prev.text += decoded;
+      prev.text = (prev.text + decoded).normalize("NFC");
     } else {
       nodeCount++;
       if (nodeCount > MAX_AST_NODES) {
@@ -449,22 +591,41 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     // Comments: <!-- ... -->
     if (normalizedInput.startsWith("<!--", lt)) {
       const endComment = normalizedInput.indexOf("-->", lt + 4);
-      const commentBody = endComment === -1 ? normalizedInput.slice(lt + 4) : normalizedInput.slice(lt + 4, endComment);
+      if (endComment === -1) {
+        if (options.mode === "strict") {
+          throw validation("INVALID_HTML_INPUT", "Unclosed HTML comment in template.");
+        }
+        // Drop malformed comment remainder in lenient preview mode
+        break;
+      }
+      const commentBody = normalizedInput.slice(lt + 4, endComment);
       if (options.mode === "strict" && hasAnyCurlyBraces(commentBody)) {
         throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed inside HTML comments.");
       }
-      i = endComment === -1 ? len : endComment + 3;
+      i = endComment + 3;
       continue;
     }
 
-    // Declarations / CDATA / processing instructions: <!DOCTYPE ...>, <![CDATA[...]]>, <?...?>
+    // CDATA / processing instructions fail closed in both modes; only clean <!doctype html> is skipped in lenient preview
     if (normalizedInput[lt + 1] === "!" || normalizedInput[lt + 1] === "?") {
-      const gt = normalizedInput.indexOf(">", lt + 2);
-      const declBody = gt === -1 ? normalizedInput.slice(lt + 2) : normalizedInput.slice(lt + 2, gt);
+      if (normalizedInput[lt + 1] === "?" || normalizedInput.slice(lt, lt + 9).toUpperCase() === "<![CDATA[") {
+        throw validation("DISALLOWED_HTML_DECLARATION", "XML processing instructions and CDATA sections are not permitted.");
+      }
+      const gtDecl = normalizedInput.indexOf(">", lt + 2);
+      if (gtDecl === -1) {
+        if (options.mode === "strict") {
+          throw validation("INVALID_HTML_INPUT", "Unclosed HTML declaration.");
+        }
+        break;
+      }
+      const declBody = normalizedInput.slice(lt + 2, gtDecl);
       if (options.mode === "strict" && hasAnyCurlyBraces(declBody)) {
         throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed inside HTML declarations.");
       }
-      i = gt === -1 ? len : gt + 1;
+      if (!/^doctype\s+html\s*$/i.test(declBody.trim())) {
+        throw validation("DISALLOWED_HTML_DECLARATION", "Only standard <!doctype html> declarations are permitted.");
+      }
+      i = gtDecl + 1;
       continue;
     }
 
@@ -487,7 +648,7 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       if (options.mode === "strict") {
         throw validation("INVALID_HTML_INPUT", "Malformed unclosed HTML tag in template.");
       }
-      appendText(normalizedInput.slice(lt));
+      // Drop malformed trailing tag remainder in lenient preview mode (never emit raw `<...` text)
       break;
     }
 
@@ -498,12 +659,17 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
 
     // Closing tag: </tag>
     if (insideTag.startsWith("/")) {
-      const closeName = insideTag.slice(1).trim().split(/\s+/)[0]?.toLowerCase() ?? "";
       if (options.mode === "strict" && hasAnyCurlyBraces(insideTag)) {
         throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed in closing tags.");
       }
+      const closeName = insideTag.slice(1).trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+      if (OPAQUE_DANGEROUS_TAGS.has(closeName)) {
+        throw validation("DISALLOWED_HTML_ELEMENT", `HTML element <${closeName}> is not permitted.`);
+      }
+      const closeTarget = ALLOWED_TAG_MAP.get(closeName) ?? closeName;
       for (let s = stack.length - 1; s >= 0; s--) {
-        if (stack[s]!.rawTag === closeName) {
+        const entry = stack[s]!;
+        if (entry.rawTag === closeName || entry.node?.tag === closeTarget) {
           stack.length = s;
           break;
         }
@@ -524,25 +690,51 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       continue;
     }
 
-    // Drop entire opaque dangerous subtrees (`script`, `style`, `svg`, `math`, `iframe`, `form`, `meta`, `base`, etc.)
-    if (OPAQUE_DROP_TAGS.has(rawTagName)) {
+    // Fail closed on ANY dangerous / foreign / executable / form / style element in BOTH modes!
+    if (OPAQUE_DANGEROUS_TAGS.has(rawTagName)) {
+      throw validation(
+        "DISALLOWED_HTML_ELEMENT",
+        `HTML element <${rawTagName}> is not permitted in mail templates.`,
+      );
+    }
+
+    // Allow harmless `<head><meta charset="utf-8"></head>` wrapper produced by `wrapDeliveryHtmlDocument` in lenient preview only
+    if (rawTagName === "head" || rawTagName === "meta" || rawTagName === "title") {
       if (options.mode === "strict") {
-        throw validation(
-          "DISALLOWED_HTML_ELEMENT",
-          `HTML element <${rawTagName}> is not permitted in mail templates.`,
-        );
+        throw validation("DISALLOWED_HTML_ELEMENT", `HTML element <${rawTagName}> is not permitted in mail templates.`);
       }
-      if (!selfClosing && !VOID_TAGS.has(rawTagName)) {
-        const closeRe = new RegExp(`</\\s*${rawTagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b[^>]*>`, "i");
-        const rest = normalizedInput.slice(i);
-        const match = closeRe.exec(rest);
-        i = match ? i + match.index + match[0].length : len;
+      if (rawTagName === "meta") {
+        const metaAttrs = parseAttributes(rawAttrPart, false);
+        const onlyUtf8Charset =
+          metaAttrs.length === 1 &&
+          metaAttrs[0]!.name === "charset" &&
+          metaAttrs[0]!.value.toLowerCase() === "utf-8";
+        if (!onlyUtf8Charset) {
+          throw validation("DISALLOWED_HTML_ELEMENT", "Non-charset <meta> tags are not permitted in preview.");
+        }
+        continue;
+      }
+      if (rawTagName === "title") {
+        if (selfClosing) {
+          throw validation("DISALLOWED_HTML_ELEMENT", "Ambiguous self-closing <title/> is not permitted.");
+        }
+        const closeTitle = normalizedInput.indexOf("</title>", i);
+        const closeTitleUpper = closeTitle === -1 ? normalizedInput.toLowerCase().indexOf("</title>", i) : closeTitle;
+        if (closeTitleUpper === -1) {
+          throw validation("INVALID_HTML_INPUT", "Unclosed <title> element.");
+        }
+        i = closeTitleUpper + "</title>".length;
+        continue;
+      }
+      // `head`: unwrap only if non-self-closing; children inside `<head>` other than `<meta charset="utf-8">` / `<title>` will fail closed
+      if (!selfClosing) {
+        pushStack({ rawTag: "head", node: null });
       }
       continue;
     }
 
     const parsedAttrs = parseAttributes(rawAttrPart, options.mode === "strict" && options.allowPlaceholders);
-    const mappedTag = ALLOWED_TAG_MAP[rawTagName];
+    const mappedTag = ALLOWED_TAG_MAP.get(rawTagName);
 
     // Neutral structural wrappers (`html`, `body`, `div`, `section`, `article`, `main`, `header`, `footer`)
     if (!mappedTag) {
@@ -555,18 +747,86 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
             );
           }
         }
-        const neutralContainers = new Set(["html", "body", "div", "section", "article", "main", "header", "footer"]);
-        if (!neutralContainers.has(rawTagName)) {
+        if (!NEUTRAL_WRAPPER_TAGS.has(rawTagName)) {
           throw validation("DISALLOWED_HTML_ELEMENT", `HTML element <${rawTagName}> is not permitted in mail templates.`);
         }
+      } else if (!NEUTRAL_WRAPPER_TAGS.has(rawTagName)) {
+        // Unknown unknown/custom element in lenient preview: fail closed
+        throw validation("DISALLOWED_HTML_ELEMENT", `Unknown HTML element <${rawTagName}>.`);
       }
       if (!selfClosing && !VOID_TAGS.has(rawTagName)) {
-        if (stack.length >= MAX_AST_DEPTH) {
-          throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template nesting exceeds maximum depth.");
-        }
-        stack.push({ rawTag: rawTagName, node: null });
+        pushStack({ rawTag: rawTagName, node: null });
       }
       continue;
+    }
+
+    // HTML5 content-model enforcement to prevent implicit tree repair / foster parenting:
+    // 1. Auto-close open `<p>` before opening another block element (matches HTML5 `<p>` end-tag omission)
+    if (BLOCK_TAGS.has(mappedTag) && hasOpenElement("p")) {
+      closeTopMatchingElement("p");
+    }
+
+    // 2. Forbid nested `<a>` inside `<a>` and block elements inside `<a>` or `<h1-h4>`
+    if (mappedTag === "a" && hasOpenElement("a")) {
+      if (options.mode === "strict") {
+        throw validation("INVALID_HTML_STRUCTURE", "Nested links are not permitted in mail templates.");
+      }
+      closeTopMatchingElement("a");
+    }
+    if (BLOCK_TAGS.has(mappedTag) && (hasOpenElement("a") || hasOpenHeading())) {
+      if (options.mode === "strict") {
+        throw validation("INVALID_HTML_STRUCTURE", `Block element <${mappedTag}> cannot be nested inside a heading or link.`);
+      }
+      throw validation("INVALID_HTML_STRUCTURE", "Ambiguous block-in-inline nesting.");
+    }
+
+    // 3. Enforce strict list hierarchy (`ul|ol > li`) and table hierarchy (`table > thead|tbody > tr > th|td`)
+    const parentElem = currentElementEntry();
+    const parentTag = parentElem?.tag ?? null;
+
+    if (mappedTag === "li" && parentTag !== "ul" && parentTag !== "ol") {
+      if (options.mode === "strict") {
+        throw validation("INVALID_HTML_STRUCTURE", "<li> must be placed directly inside <ul> or <ol>.");
+      }
+      throw validation("INVALID_HTML_STRUCTURE", "Orphan <li> element.");
+    }
+    if ((parentTag === "ul" || parentTag === "ol") && mappedTag !== "li") {
+      throw validation("INVALID_HTML_STRUCTURE", `Only <li> elements are permitted directly inside <${parentTag}>.`);
+    }
+
+    if (TABLE_PART_TAGS.has(mappedTag)) {
+      const validTableParent =
+        ((mappedTag === "thead" || mappedTag === "tbody") && parentTag === "table") ||
+        (mappedTag === "tr" && (parentTag === "thead" || parentTag === "tbody")) ||
+        ((mappedTag === "th" || mappedTag === "td") && parentTag === "tr");
+
+      // Support `<table><tr>...` shorthand by synthesizing `<tbody>` so standards HTML5 parser matches 1:1
+      if (mappedTag === "tr" && parentTag === "table" && parentElem) {
+        nodeCount++;
+        if (nodeCount > MAX_AST_NODES) {
+          throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template contains too many elements.");
+        }
+        const synthTbody: Extract<AstNode, { kind: "element" }> = {
+          kind: "element",
+          tag: "tbody",
+          attrs: {},
+          children: [],
+        };
+        parentElem.children.push(synthTbody);
+        pushStack({ rawTag: "tbody", node: synthTbody });
+      } else if (!validTableParent) {
+        throw validation("INVALID_HTML_STRUCTURE", `Invalid table element nesting for <${mappedTag}>.`);
+      }
+    } else if (
+      parentTag === "table" ||
+      parentTag === "thead" ||
+      parentTag === "tbody" ||
+      parentTag === "tr"
+    ) {
+      throw validation(
+        "INVALID_HTML_STRUCTURE",
+        `Element <${mappedTag}> cannot be placed directly inside <${parentTag}>.`,
+      );
     }
 
     // Build sanitized attributes for `mappedTag`
@@ -631,7 +891,13 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         if (options.mode === "strict" && hasAnyCurlyBraces(attr.value)) {
           throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed in image alt attributes.");
         }
-        const normalizedAlt = attr.value.replace(/[\p{Cc}\u2028\u2029]+/gu, " ").trim().slice(0, MAX_ALT_LENGTH);
+        // Trim both before and AFTER slicing so second-pass sanitization is 100% byte-idempotent
+        const normalizedAlt = attr.value
+          .normalize("NFC")
+          .replace(/[\p{Cc}\u2028\u2029]+/gu, " ")
+          .trim()
+          .slice(0, MAX_ALT_LENGTH)
+          .trim();
         cleanAttrs.alt = normalizedAlt;
         continue;
       }
@@ -649,7 +915,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         continue;
       }
 
-      // Any other attribute is dropped — UNLESS in strict mode it contains a placeholder!
       if (options.mode === "strict" && hasAnyCurlyBraces(attr.value)) {
         throw validation(
           "UNSAFE_PLACEHOLDER_CONTEXT",
@@ -662,9 +927,8 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       if (options.mode === "strict") {
         throw validation("UNSAFE_TEMPLATE_URL", "Every link in a mail template requires an https:, mailto:, or {{variable}} href.");
       }
-      // In lenient preview mode, unwrap headless `<a>` into its children
       if (!selfClosing) {
-        stack.push({ rawTag: rawTagName, node: null });
+        pushStack({ rawTag: rawTagName, node: null });
       }
       continue;
     }
@@ -694,14 +958,15 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     currentTarget().push(elemNode);
 
     if (!selfClosing && !VOID_TAGS.has(mappedTag)) {
-      if (stack.length >= MAX_AST_DEPTH) {
-        throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template nesting exceeds maximum depth.");
-      }
-      stack.push({ rawTag: rawTagName, node: elemNode });
+      pushStack({ rawTag: rawTagName, node: elemNode });
     }
   }
 
-  return { roots: rootChildren, referencedVars, hrefVars };
+  return {
+    roots: rootChildren,
+    referencedVars: [...referencedVars],
+    hrefVars: [...hrefVars],
+  };
 }
 
 function serializeDeliveryNodes(
@@ -748,7 +1013,6 @@ function serializeDeliveryNodes(
         const rawVal = substitutions.vars[attrs.href.varName];
         const strVal = rawVal === undefined || rawVal === null ? "" : String(rawVal).trim();
         if (strVal === REDACTED_MARKER) {
-          // Redacted audit copy / stored content render: emit inert text span with no href
           parts.push(`<span>${inner} (${escapeHtmlText(REDACTED_MARKER)})</span>`);
           continue;
         }
@@ -882,7 +1146,8 @@ function astToPlainText(nodes: readonly AstNode[], listKind?: "ul" | "ol"): stri
 
 /**
  * Server-side HTML allow-list sanitizer for template authoring & persistence.
- * Returns canonical HTML plus all referenced `{{variable}}` names.
+ * Enforces canonical HTML size bound (`<= MAX_HTML_INPUT_BYTES`) after serialization so
+ * subsequent strict render passes are guaranteed to accept saved canonical HTML.
  */
 export function sanitizeTemplateHtmlOnSave(
   rawHtml: string,
@@ -894,6 +1159,9 @@ export function sanitizeTemplateHtmlOnSave(
     declaredVars,
   });
   const html = serializeDeliveryNodes(parsed.roots);
+  if (Buffer.byteLength(html, "utf8") > MAX_HTML_INPUT_BYTES) {
+    throw validation("HTML_TEMPLATE_TOO_LARGE", "Canonical HTML template exceeds maximum size of 128 KB.");
+  }
   const derivedText = astToPlainText(parsed.roots)
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -910,25 +1178,31 @@ export function sanitizeTemplateHtmlOnSave(
 }
 
 /**
- * Reusable server-side inert HTML preview projection (shared by Package D and Package B Jobs).
+ * Reusable server-side inert HTML preview projection.
  *
- * Strictly emits allowlisted semantic text structure ONLY (`p, h1-h4, strong, em, ul, ol, li,
- * blockquote, pre, code, br, hr, span, table, thead, tbody, tr, th, td`). Removes 100% of
- * navigation, network, form, metadata, script, style, SVG/MathML, and presentational attributes
- * (`href`, `src`, `srcset`, `style`, `class`, `id`, `data-*`, `on*`).
- *
- * Safe to pass directly as the `html` prop of `<InertMailPreview>` (`sandbox=""`).
+ * Never throws: any input exceeding size/depth/node limits or containing dangerous/foreign/form
+ * elements fails closed to `""` so `<InertMailPreview>` cleanly displays only the plain-text tab.
  */
 export function projectInertMailPreviewHtml(rawOrRenderedHtml: string): string {
-  if (!rawOrRenderedHtml || Buffer.byteLength(rawOrRenderedHtml, "utf8") > MAX_RENDERED_HTML_BYTES) {
+  if (!rawOrRenderedHtml || Buffer.byteLength(rawOrRenderedHtml, "utf8") > MAX_HTML_INPUT_BYTES) {
     return "";
   }
-  const cleaned = rawOrRenderedHtml.replace(/\0/g, "");
-  const parsed = parseHtmlToAst(cleaned, {
-    mode: "lenient_preview",
-    allowPlaceholders: false,
-  });
-  return serializeInertPreviewNodes(parsed.roots);
+  if (rawOrRenderedHtml.includes("\0")) {
+    return "";
+  }
+  try {
+    const parsed = parseHtmlToAst(rawOrRenderedHtml, {
+      mode: "lenient_preview",
+      allowPlaceholders: false,
+    });
+    const projected = serializeInertPreviewNodes(parsed.roots);
+    if (Buffer.byteLength(projected, "utf8") > MAX_HTML_INPUT_BYTES) {
+      return "";
+    }
+    return projected;
+  } catch {
+    return "";
+  }
 }
 
 export function validateSubjectTemplate(
@@ -942,7 +1216,6 @@ export function validateSubjectTemplate(
   if (HEADER_CONTROL_RE.test(normalized)) {
     throw validation("INVALID_TEMPLATE_SUBJECT", "Subject cannot contain line breaks or control characters.");
   }
-  // Reject HTML markup in subject templates so subjects stay crisp plain text
   if (/<[a-zA-Z!/]/.test(normalized)) {
     throw validation("INVALID_TEMPLATE_SUBJECT", "Subject must be plain text and cannot contain HTML tags.");
   }
@@ -991,10 +1264,6 @@ export function plainTextToDeliveryHtml(renderedText: string): string {
   return wrapDeliveryHtmlDocument(paragraphs || `<p>${escapeHtmlText(renderedText)}</p>`);
 }
 
-/**
- * Renders a validated template (`html` or `text`) with logic-less escaped `{{variable}}`
- * substitution AND repeats server-side HTML allow-list sanitization on the rendered HTML output.
- */
 export function renderMailTemplateVersion(input: {
   format: "html" | "text";
   subjectTemplate: string;
@@ -1026,7 +1295,6 @@ export function renderMailTemplateVersion(input: {
     return { subject, text, html };
   }
 
-  // 1. Parse stored HTML template strictly and substitute variables with context-specific escaping
   const ast = parseHtmlToAst(input.bodyHtmlTemplate, {
     mode: "strict",
     allowPlaceholders: true,
@@ -1037,7 +1305,7 @@ export function renderMailTemplateVersion(input: {
     canonicalOrigin: input.canonicalOrigin,
   });
 
-  // 2. Repeat server-side HTML allow-list sanitization on the rendered HTML (zero placeholders allowed)
+  // Repeat server-side HTML allow-list sanitization on the rendered HTML
   const resanitizedAst = parseHtmlToAst(substitutedBody, {
     mode: "strict",
     allowPlaceholders: false,

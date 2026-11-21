@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Shell scripts (ShellCheck)
-        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh
+        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh scripts/ci/native-install-upgrade.sh
       - name: Make the runner look like a new server
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Refusals that change nothing
@@ -231,3 +231,23 @@ jobs:
           sudo bash scripts/ci/native-install-run.sh diagnostics || true
           docker logs pebble 2>&1 | tail -80 || true
           sudo tail -80 /var/log/letsencrypt/letsencrypt.log || true
+
+  upgrade:
+    name: upgrade from d964a3b (with pre-existing admin, customer, order and smoke)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Make the runner look like a new server
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
+      - name: Install d964a3b, create live state, upgrade to HEAD and run smoke checks
+        run: sudo bash scripts/ci/native-install-upgrade.sh "$PORTAL_HOST" "$ALIAS_HOST" "$ADMIN_EMAIL"
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: |
+          sudo bash scripts/ci/native-install-run.sh diagnostics || true
+          sudo cat /etc/readypackets/upgrade-state 2>/dev/null || true
+

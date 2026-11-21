@@ -80,6 +80,16 @@ expect 'redirect' "$(web -o /dev/null -w '%{http_code} %{redirect_url}' "http://
     "308 $origin/sign-in?next=%2Forders"
 expect 'upper-case name is the same name' \
     "$(web -o /dev/null -w '%{http_code} %{redirect_url}' -H "Host: ${host^^}" "http://$host/x")" "308 $origin/x"
+refuse_callback() {  # refuse_callback <label> <url>: callback URLs return 404 and never a Location header
+    local label=$1 url=$2 code
+    code=$(web -D "$work/callback.headers" -o /dev/null -w '%{http_code}' "$url")
+    expect "$label status" "$code" 404
+    ! grep -qi '^location:' "$work/callback.headers" || fail "$label leaked a Location header"
+}
+refuse_callback 'OIDC callback on plain HTTP' "http://$host/api/identity/sso/callback?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback 'OIDC callback mixed-case trailing slash on plain HTTP' "http://$host/API/identity/sso/callback/?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback 'storage OAuth callback on plain HTTP' "http://$host/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
+refuse_callback 'bare storage OAuth callback on plain HTTP' "http://$host/API/storage/oauth/callback?code=callback-canary-81a4&state=state-canary-92b5"
 expect 'explicit default port' \
     "$(web -o /dev/null -w '%{http_code}' -H "Host: $host:443" "$origin/readyz")" 200
 closed() {  # closed <label> <curl args...>: the server must drop the connection without an answer
@@ -120,6 +130,8 @@ if [[ -n $alias ]]; then
     grep -qi '^strict-transport-security:' "$work/alias.headers" || fail 'the alias redirect carries no HSTS'
     expect 'alias on port 80' "$(web -o /dev/null -w '%{http_code} %{redirect_url}' "http://$alias/a")" "308 $origin/a"
     expect 'alias never serves the application' "$(web -o /dev/null -w '%{http_code}' "https://$alias/readyz")" 308
+    refuse_callback 'OIDC callback on HTTPS alias' "https://$alias/api/identity/sso/callback?code=callback-canary-81a4&state=state-canary-92b5"
+    refuse_callback 'storage OAuth callback on HTTPS alias' "https://$alias/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
 else
     step 'no alias is configured'
     ! grep -q 'RP_ALIAS_HOSTS' "$conf/portal.env" || fail 'portal.env names an alias'
@@ -212,6 +224,14 @@ expect 'install log' "$(mode_of "$install_log")" 600:root:root
 journalctl --boot --no-pager --output=cat > "$work/journal" 2>/dev/null || true
 [[ -s $work/journal ]] || fail 'the system journal could not be read'
 ! grep -qFf "$work/password" "$work/journal" || fail 'the administrator password is in the system journal'
+if [[ -n ${RP_SMOKE_ADMIN_PASSWORD_FILE:-} ]]; then
+    [[ -f $RP_SMOKE_ADMIN_PASSWORD_FILE ]] || fail 'RP_SMOKE_ADMIN_PASSWORD_FILE does not exist'
+    cp -- "$RP_SMOKE_ADMIN_PASSWORD_FILE" "$work/signin.password"
+    ! grep -qFf "$work/signin.password" "$work/journal" || fail 'the active administrator password is in the system journal'
+else
+    cp -- "$work/password" "$work/signin.password"
+fi
+expected_next_step=${RP_SMOKE_EXPECT_NEXT_STEP:-enroll_mfa}
 [[ ! -e $conf/initial-admin-password && ! -e $conf/initial-admin-email ]] || fail 'the pending password file was kept'
 expect 'administrator marker' "$(cat "$conf/admin-bootstrap-done")" created
 expect 'administrators in the database' "$(sql "SELECT COUNT(*) FROM readypackets.users WHERE role = 'admin'")" 1
@@ -226,12 +246,12 @@ sign_in() {
     token=$(printf '%s' "$value" | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))')
     # The request body and the anti-forgery values travel in root-only files, not in command lines.
     python3 -c 'import json, sys; print(json.dumps({"json": {"email": sys.argv[1], "password": open(sys.argv[2]).read().rstrip("\n")}}))' \
-        "$admin_email" "$work/password" > "$work/signin.body"
+        "$admin_email" "$work/signin.password" > "$work/signin.body"
     printf 'Cookie: %s=%s\nx-rp-csrf: %s\n' "$name" "$value" "$token" > "$work/signin.request-headers"
     web -D "$work/signin.headers" -o "$work/signin.json" -H "Origin: $origin" -H 'Sec-Fetch-Site: same-origin' \
         -H "@$work/signin.request-headers" -H 'Content-Type: application/json' \
         --data "@$work/signin.body" "$origin/api/trpc/identity.signIn"
-    grep -q '"nextStep":"enroll_mfa"' "$work/signin.json" || fail 'sign-in did not reach authenticator enrolment'
+    grep -q "\"nextStep\":\"$expected_next_step\"" "$work/signin.json" || fail "sign-in did not reach expected next step ($expected_next_step)"
     grep -i '^set-cookie: __Host-rp_session=' "$work/signin.headers" | grep -qi 'HttpOnly; Secure; SameSite=Strict' ||
         fail 'the session cookie is missing its protective attributes'
 }
