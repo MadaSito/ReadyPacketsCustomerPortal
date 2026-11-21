@@ -113,6 +113,12 @@ export interface FilesModule extends ModuleLifecycle {
   adoptVerifiedObject(input: AdoptVerifiedObjectInput, tx: Tx): Promise<FileRecord>;
   portableFiles(tx: Tx, options: { principal: SessionPrincipal; after?: string; limit: number; orderIds?: readonly number[] }): Promise<Page<PortableStoredFile>>;
   backupFiles(tx: Tx, options: { after?: string; limit: number }): Promise<Page<BackupStoredFile>>;
+  /** Fenced storage-copy worker only; locks current order/file scope and returns private source metadata. */
+  getOrderFileCopySource(filePublicId: string, tx: Tx): Promise<{
+    storageKey: string; size: number; sha256: string; contentType: string; displayName: string; extension: string;
+    ownerUserId: number; customerName: string; customerReference: string; customerPublicId: string;
+    orderReference: string; orderPublicId: string; filePublicId: string;
+  }>;
 }
 
 function boundedLimit(value = 30) {
@@ -550,6 +556,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           const file = await insertVersion(tx, principal, { ...request, staged, storageKey, previous });
           placementAttempted = true;
           await storage.move(staged.info.key, storageKey);
+          await deps.services.storageConnections?.stageOrderFile(file.publicId, tx);
           return file;
         });
       } catch (error) {
@@ -743,6 +750,26 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       return {
         items: rows.slice(0, limit).map((row) => ({ ...output(row), storageKey: row.storageKey })),
         nextCursor: rows.length > limit ? encodeCursor(rows[limit - 1]!.publicId) : null,
+      };
+    },
+    async getOrderFileCopySource(filePublicId, tx) {
+      const unavailable = () => notFound("STORAGE_COPY_SOURCE_INACTIVE");
+      const findSource = (lock: boolean) => findFile(filePublicId, tx, lock).catch((error: unknown) => {
+        if (error instanceof DomainError && error.code === "NOT_FOUND") throw unavailable();
+        throw error;
+      });
+      const initial = await findSource(false);
+      const order = await deps.services.orders.getOrderRefById(initial.orderId, tx, { forUpdate: true });
+      if (!order || order.lockState === "legal_hold") throw unavailable();
+      const owner = await deps.services.identity.getUser(order.ownerUserId, { tx, forUpdate: true });
+      const row = await findSource(true);
+      if (!owner || owner.status !== "active" || row.orderId !== order.id || row.orderPublicId !== order.publicId ||
+          row.ownerUserId !== owner.id || row.deletedAt || row.purgedAt) throw unavailable();
+      return {
+        storageKey: row.storageKey, size: row.byteSize, sha256: row.sha256, contentType: row.contentType,
+        displayName: output(row).displayName, extension: row.extension, ownerUserId: owner.id,
+        customerName: owner.name, customerReference: owner.customerRef ?? owner.publicId,
+        customerPublicId: owner.publicId, orderReference: order.reference, orderPublicId: order.publicId, filePublicId: row.publicId,
       };
     },
   };

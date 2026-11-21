@@ -4,7 +4,7 @@ The local private store remains authoritative. Storage connections are optional,
 
 ## Adapter registration
 
-Import the ports from `server/modules/storage/contracts.ts`. During the provider module's `init()`, call `deps.services.storage.registerAdapter(kind, { configSchema, credentialsSchema, purposes, create })`. The schemas are strict Zod objects: config is non-secret `Record<string, string | number | boolean>`; credentials are secret `Record<string, string>`. `create({ publicId, config, credentials })` returns a `StorageAdapter`. Register a kind once, including both `sharepoint` and `onedrive` if supporting both. Only the adapter defines provider-specific keys; communicate those keys to the storage UI owner.
+Import the ports from `server/modules/storage/contracts.ts`. During the provider module's `init()`, call `deps.services.storageConnections.registerAdapter(kind, { configSchema, credentialsSchema, purposes, create })`. `deps.services.storage` remains the local object storage port. The schemas are strict Zod objects: config is non-secret `Record<string, string | number | boolean>`; credentials are secret `Record<string, string>`. `create({ publicId, config, credentials })` returns a `StorageAdapter`. Register a kind once, including both `sharepoint` and `onedrive` if supporting both. Only the adapter defines provider-specific keys; communicate those keys to the storage UI owner.
 
 - `test(signal?) → { ok, code }`: non-mutating provider verification and fixed safe codes, never a provider error body. May run on disabled connections. Connectivity tests do not prove write permission.
 - `ensureFolder(path: readonly string[], signal?) → void`: idempotent; virtual-directory adapters may no-op.
@@ -29,7 +29,7 @@ All calls require an admin session, `storage.manage` and fresh step-up. Administ
 | `storage.assignments.list` (query) | none | `[{ purpose, connectionPublicId }]` |
 | `storage.assignments.set` (mutation) | `{ purpose, connectionPublicIds }` | assignments for the purpose |
 
-Connection view: `{ publicId, kind, name, config, credentialsConfigured, enabled, version, lastTest, createdAt, updatedAt }`; `lastTest` is `null` or `{ ok, code, checkedAt }`. Credentials are never returned. Omit credentials to retain, use `null` to clear, or provide a complete replacement. Kind is immutable. Updating config or credentials resets connection testing and requires an explicit re-enable after a successful test.
+Connection view: `{ publicId, kind, name, config, credentialsConfigured, oauthConnected, enabled, version, lastTest, createdAt, updatedAt }`; `lastTest` is `null` or `{ ok, code, checkedAt }`. Credentials are never returned. Omit credentials to retain for non-config changes, use `null` to clear, or provide a complete replacement. If credentials exist, a material config change must explicitly replace or clear them; disconnect an active OAuth grant first. OAuth refresh tokens are accepted only from the internal verified consent flow. Kind is immutable. Updating config or credentials resets connection testing and requires an explicit re-enable after a successful test.
 
 Kinds: `s3`, `azure_blob`, `dropbox`, `google_drive`, `sharepoint`, `onedrive`. Purposes: `order_files` (multiple), `backups` (at most one), `order_data` (at most one; provider must declare support). `assignments.set` replaces the selection for that purpose; `[]` clears it. Disabling a connection does not clear its assignments, but it cannot receive new copies while disabled.
 

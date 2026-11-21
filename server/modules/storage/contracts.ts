@@ -58,6 +58,7 @@ export interface StorageConnectionView {
   name: string;
   config: StorageConfig;
   credentialsConfigured: boolean;
+  oauthConnected: boolean;
   enabled: boolean;
   version: number;
   lastTest: (StorageTestResult & { checkedAt: Date }) | null;
@@ -91,8 +92,12 @@ export interface StorageCopyInput extends StoragePutInput {
   purpose: StoragePurpose;
   connectionPublicId: string;
   correlationId?: string;
+  /** Optional destination revision from a previously materialized copy record. */
+  expectedDestinationVersion?: number;
   /** Worker lease fence, rechecked before outbound writes; called with tx during durable checks. */
   assertStillOwned: (tx?: Tx) => Promise<void>;
+  /** Live source-scope check before each outbound stage. */
+  assertSourceCurrent?: (tx: Tx) => Promise<void>;
 }
 
 export interface StorageModule extends ModuleLifecycle {
@@ -124,4 +129,6 @@ export interface StorageModule extends ModuleLifecycle {
   }): Promise<{ config: StorageConfig; credentials: StorageCredentials }>;
   /** Worker-side: fail closed if disabled/unassigned; verify provider-reported size and digest. */
   copy(input: StorageCopyInput): Promise<StoragePutResult>;
+  /** Called inside file publication; stages durable jobs for the active order-file assignments. */
+  stageOrderFile(filePublicId: string, tx: Tx): Promise<void>;
 }
