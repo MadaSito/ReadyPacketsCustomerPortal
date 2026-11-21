@@ -1,0 +1,120 @@
+import type { Readable } from "node:stream";
+import type { z } from "zod";
+import type { ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
+import type { DbOrTx } from "../../db/client.js";
+
+export const STORAGE_PROVIDER_KINDS = ["s3", "azure_blob", "dropbox", "google_drive", "sharepoint", "onedrive"] as const;
+export type StorageProviderKind = (typeof STORAGE_PROVIDER_KINDS)[number];
+export const STORAGE_PURPOSES = ["order_files", "backups", "order_data"] as const;
+export type StoragePurpose = (typeof STORAGE_PURPOSES)[number];
+
+export interface StoragePutInput {
+  path: readonly string[];
+  name: string;
+  size: number;
+  /** Lowercase hex SHA-256 of the source bytes. */
+  sha256: string;
+  contentType: string;
+  body: Readable;
+  signal?: AbortSignal;
+}
+
+export interface StoragePutResult {
+  remoteId: string;
+  /** A byte count independently observed by the provider, not echoed from the request. */
+  size: number;
+  /** Provider-reported SHA-256 only; unset when unavailable. Never return ETAG, MD5 or a request echo here. */
+  sha256?: string;
+}
+
+export type StorageTestCode = "OK" | "NOT_CONFIGURED" | "AUTH_FAILED" | "DESTINATION_NOT_FOUND" |
+  "DESTINATION_DENIED" | "EGRESS_DENIED" | "RATE_LIMITED" | "PROVIDER_UNAVAILABLE";
+export interface StorageTestResult {
+  ok: boolean;
+  code: StorageTestCode;
+}
+
+export interface StorageAdapter {
+  test(signal?: AbortSignal): Promise<StorageTestResult>;
+  ensureFolder(path: readonly string[], signal?: AbortSignal): Promise<void>;
+  put(input: StoragePutInput): Promise<StoragePutResult>;
+  /** Explicit removal only. Never called by an automatic copy, retry, retention or assignment change. */
+  remove(remoteId: string, signal?: AbortSignal): Promise<void>;
+}
+
+export type StorageConfig = Record<string, string | number | boolean>;
+export type StorageCredentials = Record<string, string>;
+
+export interface StorageAdapterDefinition<C extends StorageConfig = StorageConfig, S extends StorageCredentials = StorageCredentials> {
+  /** Strict Zod objects: reject unknown keys and validate shape/length. Config is shown to administrators. */
+  configSchema: z.ZodType<C>;
+  credentialsSchema: z.ZodType<S>;
+  purposes: readonly StoragePurpose[];
+  create(input: { publicId: string; config: C; credentials: S }): StorageAdapter;
+}
+
+export interface StorageConnectionView {
+  publicId: string;
+  kind: StorageProviderKind;
+  name: string;
+  config: StorageConfig;
+  credentialsConfigured: boolean;
+  enabled: boolean;
+  version: number;
+  lastTest: (StorageTestResult & { checkedAt: Date }) | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface StorageAssignmentView {
+  purpose: StoragePurpose;
+  connectionPublicId: string;
+}
+
+export interface StorageConnectionCreate {
+  kind: StorageProviderKind;
+  name: string;
+  config: StorageConfig;
+  credentials?: StorageCredentials;
+}
+
+export interface StorageConnectionUpdate {
+  publicId: string;
+  expectedVersion: number;
+  name?: string;
+  config?: StorageConfig;
+  /** Omit to keep; null to clear. Otherwise replace the full credential object. */
+  credentials?: StorageCredentials | null;
+  enabled?: boolean;
+}
+
+export interface StorageCopyInput extends StoragePutInput {
+  purpose: StoragePurpose;
+  connectionPublicId: string;
+  correlationId?: string;
+  /** Worker lease fence, rechecked before outbound writes; called with tx during durable checks. */
+  assertStillOwned: (tx?: DbOrTx) => Promise<void>;
+}
+
+export interface StorageModule extends ModuleLifecycle {
+  registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
+    kind: StorageProviderKind, definition: StorageAdapterDefinition<C, S>,
+  ): void;
+  connections: {
+    list(principal: SessionPrincipal, input: { cursor?: string; limit?: number }): Promise<{
+      items: StorageConnectionView[]; nextCursor: string | null;
+    }>;
+    get(principal: SessionPrincipal, input: { publicId: string }): Promise<StorageConnectionView>;
+    create(principal: SessionPrincipal, input: StorageConnectionCreate): Promise<StorageConnectionView>;
+    update(principal: SessionPrincipal, input: StorageConnectionUpdate): Promise<StorageConnectionView>;
+    test(principal: SessionPrincipal, input: { publicId: string; expectedVersion: number }): Promise<StorageConnectionView>;
+  };
+  assignments: {
+    list(principal: SessionPrincipal): Promise<StorageAssignmentView[]>;
+    set(principal: SessionPrincipal, input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<StorageAssignmentView[]>;
+  };
+  /** Worker-side: only enabled, currently assigned connections. Includes no config or credentials. */
+  listAssigned(purpose: StoragePurpose, tx?: DbOrTx): Promise<StorageAssignmentView[]>;
+  /** Worker-side: fail closed if disabled/unassigned; verify provider-reported size and digest. */
+  copy(input: StorageCopyInput): Promise<StoragePutResult>;
+}
