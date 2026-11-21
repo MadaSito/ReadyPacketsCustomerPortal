@@ -12,6 +12,50 @@
 - `JobsModule.startWorker(): Promise<WorkerHandle>`; `WorkerHandle.stop(): Promise<void>`: stops claims immediately, gives started work a bounded settlement window, then signals cancellation and commits an interruption disposition if possible. An unsettled handler rejects stop; an HTTP listener stopping is not proof external effects ceased.
 - `Mailer.registerTemplate(template)` and `Mailer.enqueue(mail, tx?)` follow the core contract. Only registered variable names are allowed. All variables and literal recipients are encrypted. Stable outbox idempotency keys are unique; expired or already accepted/unknown messages are not automatically resent. Recipient user IDs resolve a current address at execution time.
 
+### Mail transport and published templates
+
+Import these types from `server/modules/jobs/index.ts`; register adapters on `deps.services.jobAdmin` in the provider's `init()` hook, after all constructors return. The registration methods are not router procedures.
+
+```ts
+type MailTransportKey = "smtp" | "graph";
+interface MailSenderIdentity {
+  fromAddress: string;
+  fromName: string;
+  replyToAddress?: string;
+}
+interface MailTransportMessage {
+  sender: MailSenderIdentity;
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+  signal: AbortSignal;
+}
+interface MailTransportResult {
+  outcome: "accepted" | "not_configured" | "rejected" | "unknown";
+  retryable?: boolean;
+  safeDetail?: string;
+}
+interface MailTransport {
+  readonly key: MailTransportKey;
+  isConfigured(): Promise<boolean>;
+  send(input: MailTransportMessage): Promise<MailTransportResult>;
+}
+interface PublishedMailTemplate {
+  readonly key: string;
+  readonly vars: readonly string[];
+  readonly sensitiveVars?: readonly string[];
+  render(vars: OutboundMail["vars"]): { subject: string; text: string; html?: string };
+}
+interface MailTemplateStore {
+  resolve(key: string, tx?: Tx): Promise<PublishedMailTemplate | null>;
+}
+```
+
+- `JobsModule.registerMailTransport(transport: MailTransport): void`: one adapter per key. `isConfigured` checks local prerequisites without submitting; `send` must use the supplied sender and honor cancellation. Use `rejected` only for explicit non-acceptance; set `retryable: true` only when a subsequent submit is safe. A thrown send or lost confirmation after possible submission is `unknown`; never send via the secondary in that case. `safeDetail`, if present, is a fixed safe classification, not provider text.
+- `JobsModule.registerMailTemplateStore(store: MailTemplateStore): void`: one provider. `resolve` returns the current published renderer or `null`, never a draft. Use the supplied transaction for reads if present. The published renderer is synchronous and must escape substitutions, handle redacted variable strings, and sanitize HTML again after substitution. The Jobs engine owns fallback to built-in renderers and preserves their `sensitiveVars`.
+- `JobsModule.getBuiltinMailTemplates(): readonly MailTemplate[]`: in-process snapshots of current built-in registrations, for discovering system defaults. Never expose functions or raw actual mail variables over a router.
+
 ## Console procedures
 
 - `jobs.maintenanceBanner`: public-safe `active` boolean and fixed text only.

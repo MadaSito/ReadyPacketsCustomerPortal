@@ -5,6 +5,7 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, Tx } from "../../core/types.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
+import type { MailTemplateStore, MailTransport, MailTransportKey } from "./mailPorts.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
 import { mailAttempts, mailOutbox } from "./schema.js";
 
@@ -77,8 +78,30 @@ function htmlAlternative(text: string): string {
 
 export class MailEngine implements Mailer {
   readonly #templates = new Map<string, MailTemplate>();
+  readonly #transports = new Map<MailTransportKey, MailTransport>();
+  #templateStore: MailTemplateStore | undefined;
 
   constructor(readonly deps: MailDeps) {}
+
+  registerMailTransport(transport: MailTransport): void {
+    if ((transport.key !== "smtp" && transport.key !== "graph") || this.#transports.has(transport.key)) {
+      throw new Error("INVALID_OR_DUPLICATE_MAIL_TRANSPORT");
+    }
+    this.#transports.set(transport.key, transport);
+  }
+
+  registerMailTemplateStore(store: MailTemplateStore): void {
+    if (this.#templateStore) throw new Error("DUPLICATE_MAIL_TEMPLATE_STORE");
+    this.#templateStore = store;
+  }
+
+  getBuiltinMailTemplates(): readonly MailTemplate[] {
+    return [...this.#templates.values()].map((template) => ({
+      ...template,
+      vars: [...template.vars],
+      sensitiveVars: [...(template.sensitiveVars ?? [])],
+    }));
+  }
 
   registerTemplate(template: MailTemplate): void {
     if (!JOB_TYPE.test(template.key) || template.key.length > 100 || this.#templates.size >= 250
