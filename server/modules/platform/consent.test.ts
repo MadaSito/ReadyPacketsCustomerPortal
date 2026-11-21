@@ -155,3 +155,24 @@ describe("consent: service", () => {
     expect(h.audit.named("privacy.consent.exported")).toHaveLength(1);
   });
 });
+
+describe("consent: retention", () => {
+  it("purges superseded and expired records after the retention period and unlinks erased accounts", async () => {
+    await enable();
+    const month = 30.4375 * 24 * 60 * 60 * 1000;
+    const first = await svc.record({ policyVersion: 1, choices: ALL, action: "accept_all", source: "banner", gpc: false }, { userPublicId: "usr_a", ipAddress: null });
+    await svc.record({ receipt: first.receipt, policyVersion: 1, choices: NONE, action: "withdraw", source: "account", gpc: false }, { userPublicId: "usr_a", ipAddress: null });
+    h.clock.advance(35 * month);
+    expect(await svc.purge()).toEqual({ superseded: 0, expired: 0 });
+    h.clock.advance(2 * month);
+    expect(await svc.purge()).toEqual({ superseded: 1, expired: 0 });
+    h.clock.advance(12 * month);
+    expect(await svc.purge()).toEqual({ superseded: 0, expired: 1 });
+    expect(await t.db.select().from(platformConsentRecords)).toHaveLength(0);
+
+    await svc.record({ policyVersion: 1, choices: NONE, action: "reject_all", source: "banner", gpc: false }, { userPublicId: "usr_b", ipAddress: null });
+    expect(await svc.forgetUser("usr_b")).toBe(1);
+    expect(await svc.mine("usr_b")).toHaveLength(0);
+    expect(await t.db.select().from(platformConsentRecords)).toHaveLength(1);
+  });
+});

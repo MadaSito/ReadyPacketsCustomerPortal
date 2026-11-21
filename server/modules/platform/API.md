@@ -286,3 +286,8 @@ time. No user agent and no IP in clear.
 #### Client store additions (assurance review)
 - `applyConsentDecision(choices, { policyVersion, receipt?, decidedAt?, bySignal? })`, `attachConsentReceipt(receipt)`, `consentReceipt()`, `removalsOnly(choices)`. Before the ledger call only `current ∩ requested` is applied (removals); the full choice, including any new grant, is applied after the server recorded it. With no previous decision, an all-off choice is applied first.
 - The store re-checks on `storage` events (other tabs), `focus`/`visibilitychange`/`pageshow`, and a timer at the renewal deadline; `has()` never returns a cached grant past expiry. Withdrawal in any tab removes reachable vendor cookies/storage and notifies subscribers.
+
+#### Retention (decided by /root)
+- Setting `privacy.consent.retention_months` (12–72, default 36): a record is deleted that many months after it was superseded by a newer decision of the same browser, or after it expired (renewal period).
+- Job `platform.consent.purge` every 6 h, batches of 1000, audits `privacy.consent.purged` with counts only.
+- `ctx.services.platform` internals: `consent.forgetUser(userPublicId, tx?)` — account erasure unlinks the person (sets `userPublicId` null); the anonymous record stays until retention ends. Identity's erasure flow should call it.

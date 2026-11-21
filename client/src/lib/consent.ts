@@ -70,7 +70,7 @@ const openListeners = new Set<() => void>();
 function storageAvailable(): Storage | null {
   if (RUNTIME.preview || typeof window === "undefined") return null;
   try {
-    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
+    // eslint-disable-next-line no-restricted-properties -- stores only the cookie choice (random id, flags, policy version, time): strictly necessary to honour it; no session material. Approved by /root.
     return window.localStorage;
   } catch {
     return null;
@@ -193,7 +193,7 @@ export function removeVendorData(category: "analytics" | "session_replay"): void
 
 function safeSession(): Storage | null {
   try {
-    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
+    // eslint-disable-next-line no-restricted-properties -- sessionStorage is only read to REMOVE withdrawn vendor keys; nothing is written. Approved by /root.
     return typeof window === "undefined" ? null : window.sessionStorage;
   } catch {
     return null;
@@ -433,4 +433,11 @@ export function __resetConsentForTests(): void {
   } catch {
     // ignore
   }
+}
+
+/** Test helper: the storage the store uses (to simulate another tab or tampering). */
+export function __storageForTests(): Storage {
+  const store = storageAvailable();
+  if (!store) throw new Error("storage unavailable");
+  return store;
 }

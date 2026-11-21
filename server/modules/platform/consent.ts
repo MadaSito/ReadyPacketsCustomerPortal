@@ -7,7 +7,8 @@
  * - The inventory is plain text only (no markup, no URLs as script sources); it is rendered as text.
  * - Everything is off until `feature.privacy.consent` is switched on (audited by the settings store).
  */
-import { and, desc, eq, gte, lt, lte, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, exists, gt, gte, inArray, lt, lte, sql, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/mysql-core";
 import { z } from "zod";
 import { DomainError, conflict, validation } from "../../core/errors.js";
 import type { AuditEmitter, Clock, Db, FieldCrypto, Logger, SettingsStore } from "../../core/types.js";
@@ -57,6 +58,19 @@ export const CONSENT_RENEW_MONTHS = defineSetting({
   description: "How long a choice is valid before the banner asks again (6 to 13 months).",
   schema: z.number().int().min(6).max(13),
   default: 12,
+  sensitivity: "public",
+  writeCapability: "privacy.consent.manage",
+  managedBy: MANAGED,
+});
+
+export const CONSENT_RETENTION_MONTHS = defineSetting({
+  key: "privacy.consent.retention_months",
+  owner: "platform",
+  group: "privacy",
+  label: "Keep consent records for (months)",
+  description: "How long a decision is kept after it was replaced by a newer one or expired (12 to 72 months). Choose the period your jurisdiction requires.",
+  schema: z.number().int().min(12).max(72),
+  default: 36,
   sensitivity: "public",
   writeCapability: "privacy.consent.manage",
   managedBy: MANAGED,
@@ -488,7 +502,41 @@ export function createConsentService(deps: ConsentServiceDeps) {
       });
       return { csv: `${lines.join("\r\n")}\r\n`, rows: kept.length, truncated };
     },
+
+    /**
+     * Retention: deletes records replaced by a newer decision of the same browser more than `retention`
+     * months ago, and records that expired (renewal period) more than `retention` months ago. Bounded batch;
+     * the caller (job) audits counts only.
+     */
+    async purge(): Promise<{ superseded: number; expired: number }> {
+      const [retention, renew] = await Promise.all([readSetting(settings, CONSENT_RETENTION_MONTHS), readSetting(settings, CONSENT_RENEW_MONTHS)]);
+      const now = clock.now().getTime();
+      const supersededBefore = new Date(now - retention * MONTH_MS);
+      const expiredBefore = new Date(now - (retention + renew) * MONTH_MS);
+      const t = platformConsentRecords;
+      const newer = alias(platformConsentRecords, "newer");
+      const superseded = await db
+        .select({ id: t.id })
+        .from(t)
+        .where(exists(db.select({ one: sql`1` }).from(newer).where(and(eq(newer.consentId, t.consentId), gt(newer.id, t.id), lt(newer.createdAt, supersededBefore)))))
+        .limit(PURGE_BATCH);
+      if (superseded.length) await db.delete(t).where(inArray(t.id, superseded.map((r) => r.id)));
+      const expired = await db.select({ id: t.id }).from(t).where(lt(t.createdAt, expiredBefore)).limit(PURGE_BATCH);
+      if (expired.length) await db.delete(t).where(inArray(t.id, expired.map((r) => r.id)));
+      if (superseded.length || expired.length) log.info("consent records purged", { superseded: superseded.length, expired: expired.length });
+      return { superseded: superseded.length, expired: expired.length };
+    },
+
+    /** Account erasure: unlinks the person; the anonymous record stays until retention ends. */
+    async forgetUser(userPublicId: string, tx?: Pick<Db, "update">): Promise<number> {
+      const [result] = await (tx ?? db).update(platformConsentRecords).set({ userPublicId: null }).where(eq(platformConsentRecords.userPublicId, userPublicId));
+      return result.affectedRows;
+    },
   };
 }
+
+export const CONSENT_PURGE_JOB = "platform.consent.purge";
+export const PURGE_BATCH = 1000;
+const MONTH_MS = 30.4375 * 24 * 60 * 60 * 1000;
 
 export type ConsentService = ReturnType<typeof createConsentService>;
