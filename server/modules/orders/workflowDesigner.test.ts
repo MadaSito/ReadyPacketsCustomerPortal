@@ -168,6 +168,7 @@ describe("designer service", () => {
   it("drafts an edit, saves invalid work in progress, refuses to publish it, then publishes a NEW version; existing orders keep theirs", async () => {
     const draft = await call(admin.principal).admin.workflows.drafts.create({ from: "copy", copyVersionId: (await mod.workflows.listVersions(standardId)).versions[0]!.publicId, workflowId: standardId });
     await expectError(mod.workflows.createDraft(admin.principal, { from: "standard", workflowId: standardId }), "CONFLICT:WORKFLOW_DRAFT_EXISTS");
+    expect((await mod.workflows.list()).find((workflow) => workflow.publicId === standardId)!.draftPublicId).toBe(draft.publicId);
     const loaded = await mod.workflows.getDraft(draft.publicId);
     expect(loaded).toMatchObject({ workflowPublicId: standardId, baseVersionNumber: 1, source: "copy", publishable: true, rowVersion: 1 });
 
@@ -243,7 +244,7 @@ describe("designer service", () => {
     expect((await mod.workflows.listDrafts()).find((entry) => entry.publicId === draft.publicId)).toMatchObject({ errorCount: 0, warningCount: 0, workflowPublicId: null });
     const published = await mod.workflows.publishDraft(admin.principal, { draftId: draft.publicId, expectedVersion: 2, makeDefault: false });
     expect(published).toMatchObject({ versionNumber: 1, isDefault: false });
-    expect((await mod.workflows.list()).find((workflow) => workflow.workflowKey === "rush")).toMatchObject({ isDefault: false, versionNumber: 1 });
+    expect((await mod.workflows.list()).find((workflow) => workflow.workflowKey === "rush")).toMatchObject({ isDefault: false, versionNumber: 1, draftPublicId: null, currentVersionPublicId: expect.any(String) });
     expect((await mod.workflows.currentDefault(t.db))!.workflowKey).toBe("standard");
   });
 

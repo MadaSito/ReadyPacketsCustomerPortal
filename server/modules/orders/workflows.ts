@@ -512,18 +512,23 @@ export function createWorkflowService(deps: WorkflowDeps) {
 
     async list() {
       const rows = await deps.db
-        .select({ workflow: orderWorkflows, version: orderWorkflowVersions })
+        .select({ workflow: orderWorkflows, version: orderWorkflowVersions, draftPublicId: orderWorkflowDrafts.publicId })
         .from(orderWorkflows)
         .leftJoin(orderWorkflowVersions, eq(orderWorkflowVersions.id, orderWorkflows.currentVersionId))
+        .leftJoin(orderWorkflowDrafts, eq(orderWorkflowDrafts.workflowId, orderWorkflows.id))
         .orderBy(desc(orderWorkflows.isDefault), asc(orderWorkflows.id))
         .limit(50);
-      return rows.map(({ workflow, version }) => ({
+      return rows.map(({ workflow, version, draftPublicId }) => ({
         publicId: workflow.publicId,
         workflowKey: workflow.workflowKey,
         name: workflow.name,
         isDefault: workflow.isDefault,
         rowVersion: workflow.version,
         versionNumber: version?.versionNumber ?? 0,
+        /** Increment 03: for "copy" drafts and the read-only view. */
+        currentVersionPublicId: version?.publicId ?? null,
+        /** Increment 03: the open draft editing this workflow, if any. */
+        draftPublicId: draftPublicId ?? null,
         definition: version ? workflowDefinitionSchema.parse(version.definition) : null,
       }));
     },
