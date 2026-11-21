@@ -193,7 +193,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
   const driveTenant = async (signal?: AbortSignal): Promise<string> => {
     const res = await call({ method: "GET", path: drive, query: { $select: "id,webUrl" }, signal });
     const body = expectOk(res, 200);
-    let host = "";
+    let host: string;
     try {
       host = new URL(str(body.webUrl) ?? "").hostname;
     } catch {
@@ -218,6 +218,16 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
     const hash = new QuickXorHash();
     let offset = 0;
     let finalItem: Record<string, unknown> | null = null;
+    // A lost fence must reach the job layer unchanged (never re-labelled as a retryable provider error).
+    let fenceError: { error: unknown } | null = null;
+    const fence = async () => {
+      try {
+        await input.beforeWrite?.();
+      } catch (error) {
+        fenceError = { error };
+        throw error;
+      }
+    };
     try {
       await readExactly(
         input.body,
@@ -227,7 +237,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           const end = offset + chunk.length - 1;
           for (let attempt = 1; ; attempt++) {
             let r: GraphResponse | null = null;
-            await input.beforeWrite?.();
+            await fence();
             try {
               r = await graph.uploadSessionPut({ url, body: chunk, contentRange: `bytes ${offset}-${end}/${input.size}`, signal: input.signal });
             } catch (error) {
@@ -254,6 +264,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       );
     } catch (error) {
       await graph.uploadSessionControl({ url, method: "DELETE" }).catch(() => undefined);
+      if (fenceError) throw (fenceError as { error: unknown }).error;
       throw toAdapterError(error);
     }
     if (!finalItem) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
@@ -271,7 +282,10 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
         return { ok: true, code: "OK" };
       } catch (error) {
         const e = toAdapterError(error);
-        const code = e.code === "DESTINATION_CONFLICT" || e.code === "INTEGRITY_MISMATCH" || e.code === "INVALID_INPUT" || e.code === "TOO_LARGE" ? "PROVIDER_UNAVAILABLE" : e.code;
+        const code =
+          e.code === "DESTINATION_CONFLICT" || e.code === "INTEGRITY_MISMATCH" || e.code === "INVALID_INPUT" || e.code === "TOO_LARGE" || e.code === "OUTCOME_UNKNOWN"
+            ? "PROVIDER_UNAVAILABLE"
+            : e.code;
         return { ok: false, code };
       }
     },
@@ -299,7 +313,9 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           throw error;
         }
       }
-      if (input.size <= SIMPLE_UPLOAD_MAX) {
+      // Simple PUT needs a raw-bytes request; transports without it use a (single-chunk) upload session.
+      if (input.size === 0 && graph.supportsRawBody === false) throw new StorageAdapterError("INVALID_INPUT", false);
+      if (input.size <= SIMPLE_UPLOAD_MAX && graph.supportsRawBody !== false) {
         const parts: Buffer[] = [];
         await readExactly(input.body, input.size, async (c) => void parts.push(Buffer.from(c)), SIMPLE_UPLOAD_MAX + 1);
         const bytes = Buffer.concat(parts);
@@ -441,7 +457,7 @@ export function graphDriveDiscovery(graph: GraphHttpPort) {
         .map((f) => {
           const parentPath = str(asRecord(f.parentReference).path) ?? "";
           const relative = parentPath.includes("root:") ? parentPath.slice(parentPath.indexOf("root:") + 5).replace(/^\//u, "") : "";
-          let decoded = relative;
+          let decoded: string;
           try {
             decoded = decodeURIComponent(relative);
           } catch {

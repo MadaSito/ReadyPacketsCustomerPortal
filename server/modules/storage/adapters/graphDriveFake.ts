@@ -82,6 +82,8 @@ export class FakeGraph implements GraphHttpPort {
   /** Corrupt the stored content (integrity mismatch simulation). */
   corruptUploads = false;
   validSecret = "fake-secret-value";
+  /** Mirrors a transport without raw-bytes requests (the published GraphClient today). */
+  supportsRawBody = true;
 
   constructor() {
     const drive = this.addDrive("Documents", "documentLibrary", "https://contoso.sharepoint.com/sites/Orders/Shared%20Documents");
@@ -157,6 +159,7 @@ export class FakeGraph implements GraphHttpPort {
   }
 
   async request(credentials: GraphCredentials, req: GraphRequest): Promise<GraphResponse> {
+    if (req.rawBody && !this.supportsRawBody) throw new Error("fake: raw body not supported by this transport");
     this.calls.push({ method: req.method, path: req.path, kind: "graph", authorized: true });
     if (credentials.clientSecret !== this.validSecret) throw new GraphTransportError("AUTH_FAILED", false);
     const hit = this.intercepted(req.method, req.path, "graph");

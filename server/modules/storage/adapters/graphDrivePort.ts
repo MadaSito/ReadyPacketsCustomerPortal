@@ -54,6 +54,8 @@ export class GraphTransportError extends Error {
 }
 
 export interface GraphHttpPort {
+  /** False when `request` cannot send `rawBody`; the adapter then uploads every file through an upload session. */
+  readonly supportsRawBody?: boolean;
   request(credentials: GraphCredentials, request: GraphRequest): Promise<GraphResponse>;
   /** PUT a byte range to a checked upload-session URL. No Authorization header. */
   uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string; signal?: AbortSignal }): Promise<GraphResponse>;

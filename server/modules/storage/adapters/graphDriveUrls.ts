@@ -52,8 +52,16 @@ export function parseSiteUrl(raw: string): ParsedSiteUrl | null {
   let siteParts: string[] = [];
   if (parts.length >= 2 && (parts[0]!.toLowerCase() === "sites" || parts[0]!.toLowerCase() === "teams")) siteParts = parts.slice(0, 2);
   else if (parts.length > 0 && !/\.aspx$/i.test(parts[parts.length - 1]!) && parts[0]!.toLowerCase() !== "_layouts") return null;
-  if (siteParts.some((p) => p === "." || p === ".." || /[\u0000-\u001f\\:]/.test(p))) return null;
+  if (siteParts.some((p) => p === "." || p === ".." || hasControlOrSeparator(p))) return null;
   return { hostname, serverRelativePath: siteParts.join("/") };
+}
+
+function hasControlOrSeparator(value: string): boolean {
+  for (const ch of value) {
+    const c = ch.codePointAt(0)!;
+    if (c <= 0x1f || ch === "\\" || ch === ":") return true;
+  }
+  return false;
 }
 
 /** Graph path for site discovery: /sites/{hostname} or /sites/{hostname}:/{path}. */
