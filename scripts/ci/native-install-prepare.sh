@@ -33,7 +33,10 @@ fi
 # The test names resolve to this machine, as a DNS record would on a real server.
 printf '127.0.0.1 %s %s\n' "$1" "$2" >> /etc/hosts
 
-# The runner image leaves /opt writable by everyone; a server has it root-owned, and the installer insists.
+# The runner image leaves /opt writable by everyone, with a default ACL that makes new files writable by
+# everyone too; a server has a plain root-owned /opt, and the installer insists on that.
+getfacl --absolute-names /opt 2>/dev/null || true
+if command -v setfacl >/dev/null; then setfacl --remove-all --remove-default /opt; fi
 chown root:root /opt
 chmod 0755 /opt
 rm -rf -- "$target"
