@@ -141,7 +141,11 @@ export function validateDraft(definition: WorkflowDraftDefinition): WorkflowIssu
     const reached = new Set<string>(firstIndexByKey.has(start) ? [start] : []);
     const queue = [...reached];
     while (queue.length) {
-      for (const next of outgoing.get(queue.shift()!) ?? []) if (!reached.has(next)) (reached.add(next), queue.push(next));
+      for (const next of outgoing.get(queue.shift()!) ?? []) {
+        if (reached.has(next)) continue;
+        reached.add(next);
+        queue.push(next);
+      }
     }
     states.forEach((state, index) => {
       const key = state.key.trim();

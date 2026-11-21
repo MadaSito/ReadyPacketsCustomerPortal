@@ -2,7 +2,7 @@
  * Versioned workflow definitions. Orders are bound to the version they started on; publishing a new version
  * affects new orders only (an explicit migration of existing orders is a recorded target, not implemented).
  */
-import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { ulid } from "../../core/ids.js";
