@@ -47,6 +47,11 @@ export interface TriggerCatalogueEntry {
   resourceType: string | null;
   fields: readonly TriggerField[];
   recipients: readonly TriggerRecipient[];
+  /**
+   * Staff-internal event: actions may address staff / administrators only — never a customer, a fixed external
+   * address or a webhook (the automations module enforces this when saving and when running).
+   */
+  staffOnly?: boolean;
 }
 
 const TICKET_STATUSES = ["open", "pending_customer", "pending_staff", "resolved", "closed"] as const;
@@ -127,10 +132,18 @@ const ENTRIES: TriggerCatalogueEntry[] = [
   },
   {
     key: "message.posted", label: "Order message posted", group: "Files and messages", owner: "engagement",
-    description: "A message was posted on an order.",
-    eventName: "engagement.message.sent", outcomes: ["completed"], resourceType: "order_message",
-    fields: [actorRole, f("visibility", "Visibility", "enum", "event", { enumValues: ["customer", "internal"] }), f("attachment_count", "Attachments", "number"), ...orderContext, recipientName],
+    description: "A customer-visible message was posted on an order. Internal staff notes never fire this trigger.",
+    eventName: "engagement.message.sent", outcomes: ["completed"], match: { visibility: "customer" }, resourceType: "order_message",
+    fields: [actorRole, f("attachment_count", "Attachments", "number"), ...orderContext, recipientName],
     recipients: [ORDER_OWNER, ORDER_ASSIGNEE, ACTOR, STAFF],
+  },
+  {
+    key: "message.internal_note", label: "Internal order note posted", group: "Files and messages", owner: "engagement",
+    description: "A staff-only note was posted on an order. Only staff can be addressed; the customer is never told.",
+    eventName: "engagement.message.sent", outcomes: ["completed"], match: { visibility: "internal" }, resourceType: "order_message",
+    staffOnly: true,
+    fields: [actorRole, f("attachment_count", "Attachments", "number"), ...orderContext, recipientName],
+    recipients: [ORDER_ASSIGNEE, ACTOR, STAFF],
   },
   {
     key: "ticket.opened", label: "Support ticket opened", group: "Support", owner: "engagement",
@@ -196,6 +209,18 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     description: "A stored backup failed its integrity verification.",
     eventName: "backup.verify.failed", outcomes: ["failed"], resourceType: "backup_archive",
     fields: [f("reason_code", "Reason", "string")], recipients: [ADMINS],
+  },
+  {
+    key: "backup.remote_copy_completed", label: "Off-host backup copy completed", group: "Operations", owner: "backup",
+    description: "A verified encrypted backup was copied to the assigned storage connection.",
+    eventName: "backup.remote_copy.completed", outcomes: ["completed"], resourceType: "backup_archive",
+    fields: [f("connection_public_id", "Storage connection", "public_id"), f("verified_bytes", "Verified size (bytes)", "number")], recipients: [ADMINS],
+  },
+  {
+    key: "backup.remote_copy_failed", label: "Off-host backup copy failed", group: "Operations", owner: "backup",
+    description: "A backup could not be copied to the assigned storage connection.",
+    eventName: "backup.remote_copy.failed", outcomes: ["failed"], resourceType: "backup_archive",
+    fields: [f("reason_code", "Reason", "string"), f("connection_public_id", "Storage connection", "public_id"), f("attempt_count", "Attempts", "number")], recipients: [ADMINS],
   },
   {
     key: "mail.delivery_failed", label: "E-mail delivery failed", group: "Operations", owner: "jobs",

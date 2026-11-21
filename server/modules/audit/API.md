@@ -181,8 +181,10 @@ Trigger catalogue rules (`TriggerCatalogueEntry`): `eventName` + `outcomes` (+ o
 `fields[].from = "event"` come from the tap event; `"context"` fields are resolved in the worker by the owning module's
 context resolver; `personal: true` fields are template-only (never conditions, run records, logs or audit).
 `recipients` are resolved to user ids by the owning module; never take an address from the event.
+`staffOnly: true` (internal order note): actions may address staff / administrators only — no customer, fixed external
+address or webhook; enforce on save and at run time. A tap with several writes runs in a savepoint (`tx` you receive is it).
 Initial entries: account registered / activated / password reset requested / password changed, order created / status
-changed / reassigned, file uploaded, order message posted, ticket opened / replied (public) / closed, invoice issued / paid,
+changed / reassigned, file uploaded, order message posted (customer-visible only) / internal order note (staff only), ticket opened / replied (public) / closed, invoice issued / paid,
 maintenance switched on (`job.maintenance.changed` + `MAINTENANCE_ENABLED`; there is no separate "maintenance window
-announced" event yet), backup completed / failed / verification failed, e-mail delivery failed.
+announced" event yet), backup completed / failed / verification failed / off-host copy completed / failed, e-mail delivery failed.
 Tests: `tap.test.ts` (real MySQL).

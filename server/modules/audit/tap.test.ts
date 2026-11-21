@@ -128,6 +128,18 @@ describe("audit tap (real MySQL)", () => {
     expect(onRecorded.mock.calls[0]![1]).toBeUndefined();
   });
 
+  it("isolates a multi-write tap in a savepoint so a failing tap leaves no partial rows", async () => {
+    install({
+      listens: () => true,
+      onRecorded: async (_e, tx) => { await (tx as Tx).insert(things).values({ label: "tap-1" }); throw new Error("second write failed"); },
+    });
+    await t.db.transaction(async (tx) => {
+      await tx.insert(things).values({ label: "business" });
+      await emitter.record(event(), tx);
+    });
+    expect((await t.db.select().from(things)).map((r) => r.label)).toEqual(["business"]);
+  });
+
   it("allows one tap at a time", () => {
     install({ listens: () => false, onRecorded: async () => undefined });
     expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/already installed/u);
@@ -192,6 +204,19 @@ describe("trigger catalogue", () => {
     expect(entriesForEvent(tapEvent({ eventName: "engagement.ticket.replied", resource: ticket, attributes: { internal_only: true } }))).toEqual([]);
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_DISABLED" }))).toEqual([]);
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_ENABLED" })).map((e) => e.key)).toEqual(["maintenance.enabled"]);
+  });
+
+  it("keeps internal order notes away from customer-facing triggers (review J-A01)", () => {
+    const message = { type: "order_message", publicId: "01JD0000000000000000000004" };
+    expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: { visibility: "internal", attachment_count: 1 } })).map((e) => e.key)).toEqual(["message.internal_note"]);
+    expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: { visibility: "customer" } })).map((e) => e.key)).toEqual(["message.posted"]);
+    expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: {} }))).toEqual([]);
+    const internal = TRIGGER_CATALOGUE.find((e) => e.key === "message.internal_note")!;
+    expect(internal.staffOnly).toBe(true);
+    expect(internal.recipients.map((r) => r.key)).not.toContain("order_owner");
+    for (const entry of TRIGGER_CATALOGUE) {
+      if (entry.eventName === "engagement.message.sent" || entry.eventName === "engagement.ticket.replied") expect(entry.match).toBeDefined();
+    }
   });
 
   it("requires the expected resource type", () => {

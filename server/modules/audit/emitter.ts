@@ -92,7 +92,10 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
     }
     tapStats.offered += 1;
     try {
-      await current.onRecorded(toTapEvent(envelope), tx);
+      const tapEvent = toTapEvent(envelope);
+      // Savepoint: a tap with several writes either lands completely or not at all (review J-A01 advisory).
+      if (tx) await tx.transaction((savepoint) => current.onRecorded(tapEvent, savepoint));
+      else await current.onRecorded(tapEvent, undefined);
     } catch (error) {
       tapStats.failures += 1;
       tapStats.lastFailureAt = deps.clock.now().toISOString();
