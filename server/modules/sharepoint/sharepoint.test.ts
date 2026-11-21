@@ -143,6 +143,49 @@ describe("sharepoint order sync (local fakes only)", () => {
     expect(h.jobs.enqueued).toHaveLength(0); // caught up: no further follow-up
   });
 
+  it("a retryable failure on the final attempt still dispatches a newer staged version", async () => {
+    await enable();
+    await changeOrder(); // v1
+    duringView = async () => {
+      duringView = null;
+      await changeOrder(); // v2 staged (its job may later exhaust against the claim)
+      h.jobs.enqueued = h.jobs.enqueued.filter((j) => j.options?.idempotencyKey !== `sharepoint:order:${ORDER}:v2`);
+    };
+    graph.intercept(({ method }) => (method === "POST" ? { status: 503, headers: {}, body: {} } : undefined));
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "failed", reasonCode: "SHAREPOINT_PROVIDER_UNAVAILABLE", retryable: true }]);
+    expect(h.jobs.enqueued.map((j) => j.options?.idempotencyKey)).toEqual([expect.stringMatching(new RegExp(`^sharepoint:order:${ORDER}:v2:after:`, "u"))]);
+  });
+
+  it("cancels a backfill when its settings or destination scope changes after a page was read", async () => {
+    await enable();
+    const second = "01JORDER000000000000000002";
+    let onList: (() => Promise<void>) | null = null;
+    (h.services.orders as unknown as Record<string, unknown>).listOrderPublicIdsForSync = async () => {
+      await onList?.();
+      return { publicIds: [ORDER, second], nextAfter: null };
+    };
+    // Destination generation change after the page read.
+    await mod.orderSync.backfill(admin);
+    onList = async () => void (destinationVersion += 1);
+    expect(await h.jobs.runAll(BACKFILL_JOB)).toEqual([{ outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" }]);
+    expect(h.jobs.enqueued).toHaveLength(0);
+    expect((await mod.orderSync.get(admin)).backfill).toMatchObject({ state: "failed", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED", enqueued: 0 });
+    expect(await db.db.select().from(sharepointOrderSync)).toHaveLength(0);
+
+    // Settings change (disable) while running ends the run; re-enabling does not silently resume it.
+    onList = null;
+    await mod.orderSync.backfill(admin);
+    const view = await mod.orderSync.get(admin);
+    onList = async () => {
+      onList = null;
+      await mod.orderSync.update(admin, { expectedVersion: view.version, enabled: false, listId: view.listId, listLabel: null, includePortalLink: true });
+    };
+    expect(await h.jobs.runAll(BACKFILL_JOB)).toEqual([{ outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" }]);
+    expect(h.jobs.enqueued).toHaveLength(0);
+    expect((await mod.orderSync.get(admin)).backfill).toMatchObject({ state: "failed", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" });
+    await expect(mod.orderSync.backfill(admin)).rejects.toMatchObject({ reasonCode: "SHAREPOINT_SYNC_DISABLED" });
+  });
+
   it("backfills existing orders in resumable bounded batches without duplicating list items", async () => {
     const all = [ORDER, "01JORDER000000000000000002", "01JORDER000000000000000003", "01JORDER000000000000000004", "01JORDER000000000000000005"];
     await expect(mod.orderSync.backfill(admin)).rejects.toMatchObject({ reasonCode: "SHAREPOINT_SYNC_DISABLED" });

@@ -20,6 +20,8 @@ export const sharepointSyncConfig = mysqlTable("sharepoint_sync_config", {
   backfillRunId: char("backfill_run_id", { length: 26 }),
   backfillState: mysqlEnum("backfill_state", ["running", "completed", "failed"]),
   backfillCursor: char("backfill_cursor", { length: 26 }),
+  /** Authorized scope "<settingsVersion>:<connectionPublicId>:<destinationVersion>"; any change cancels the run. */
+  backfillScope: varchar("backfill_scope", { length: 96 }),
   backfillEnqueued: int("backfill_enqueued", { unsigned: true }).notNull().default(0),
   backfillReasonCode: varchar("backfill_reason_code", { length: 64 }),
   backfillStartedAt: utcDateTime("backfill_started_at"),

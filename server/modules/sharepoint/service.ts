@@ -162,7 +162,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
   async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string, targetVersion?: number): Promise<void> {
     await db.transaction(async (tx) => {
       await job.assertStillOwned(tx);
-      if (targetVersion !== undefined && state !== "pending") {
+      if (targetVersion !== undefined) {
         const [latest] = await tx.select({ v: sharepointOrderSync.desiredVersion, token: sharepointOrderSync.claimToken }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
         if (latest?.token === claimToken) await followUp(tx, orderPublicId, latest.v, targetVersion, job);
       }
@@ -449,6 +449,11 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     return typeof fn === "function" ? fn.bind(deps.services.orders) : null;
   };
 
+  async function currentScope(tx: DbOrTx, config: { version: number } | null): Promise<string | null> {
+    const destination = await assignedDestination(tx);
+    return config && destination ? `${config.version}:${destination.connectionPublicId}:${destination.destinationVersion}` : null;
+  }
+
   /** One bounded batch per job; the next batch is a new job keyed by (run, cursor). DB work only. */
   async function runBackfill(job: ClaimedJob<BackfillJobPayload>): Promise<JobResult> {
     const config = await readConfig(db);
@@ -485,6 +490,11 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       // Resumable and exactly-once per batch: only the run/cursor this job was planned for may advance.
       if (!locked || locked.backfillRunId !== job.payload.runId || locked.backfillState !== "running" || locked.backfillCursor !== cursor) {
         return { outcome: "canceled" as const, reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" };
+      }
+      // Bound to the authorized scope: settings revision, list, connection and destination generation.
+      if (!locked.enabled || !locked.listId || locked.backfillScope === null || (await currentScope(tx, locked)) !== locked.backfillScope) {
+        await finish("failed", "SHAREPOINT_BACKFILL_SCOPE_CHANGED", tx);
+        return { outcome: "canceled" as const, reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" };
       }
       for (const id of ids) await stage(id, tx, { correlationId: job.correlationId });
       const last = ids[ids.length - 1] ?? cursor;
@@ -570,7 +580,16 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
           if (currentVersion !== input.expectedVersion) throw conflict("STALE_VERSION", "These settings were changed by someone else. Reload and try again.");
           const values = { enabled: input.enabled, listId: input.listId, listLabel, includePortalLink: input.includePortalLink, updatedByUserId: principal.userId, lastErrorCode: null, lastErrorAt: null };
           if (!current) await tx.insert(sharepointSyncConfig).values({ id: CONFIG_ID, version: 1, ...values });
-          else await tx.update(sharepointSyncConfig).set({ ...values, version: currentVersion + 1 }).where(eq(sharepointSyncConfig.id, CONFIG_ID));
+          else
+            await tx
+              .update(sharepointSyncConfig)
+              .set({
+                ...values,
+                version: currentVersion + 1,
+                // A settings change ends a running backfill; the administrator must start it again explicitly.
+                ...(current.backfillState === "running" ? { backfillState: "failed" as const, backfillReasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED", backfillFinishedAt: clock.now() } : {}),
+              })
+              .where(eq(sharepointSyncConfig.id, CONFIG_ID));
           const changedList = (current?.listId ?? null) !== input.listId;
           await adminAudit(principal, current?.enabled !== input.enabled ? (input.enabled ? "sharepoint.sync.enabled" : "sharepoint.sync.disabled") : "sharepoint.sync.updated", "update", tx, { safeCounts: { listChanged: changedList ? 1 : 0 } });
         });
@@ -594,12 +613,16 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
           const config = await readConfig(tx, true);
           if (!config?.enabled || !config.listId) throw new DomainError("NOT_CONFIGURED", "SHAREPOINT_SYNC_DISABLED", "Enable the sync first.");
           if (config.backfillState === "running" && !input.restart) return;
-          const resume = !input.restart && config.backfillState === "failed" && config.backfillRunId !== null;
+          const scope = await currentScope(tx, config);
+          if (!scope) throw new DomainError("NOT_CONFIGURED", "SHAREPOINT_NOT_CONFIGURED", "Assign a SharePoint connection first.");
+          // Resume only within the same authorized scope; any settings/destination change starts a new run.
+          const resume = !input.restart && config.backfillState === "failed" && config.backfillRunId !== null && config.backfillScope === scope;
           const runId = resume ? config.backfillRunId! : ulid(clock.now().getTime());
           await tx
             .update(sharepointSyncConfig)
             .set({
               backfillRunId: runId,
+              backfillScope: scope,
               backfillState: "running",
               backfillReasonCode: null,
               backfillFinishedAt: null,
