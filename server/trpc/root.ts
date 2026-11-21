@@ -19,6 +19,9 @@ import { mailTemplatesRouter } from "../modules/mailTemplates/router.js";
 import { automationsRouter } from "../modules/automations/router.js";
 import { protectionRouter } from "../modules/protection/router.js";
 import { publicApiRouter } from "../modules/publicApi/router.js";
+import { communityRouter } from "../modules/community/router.js";
+import { referralsRouter } from "../modules/referrals/router.js";
+import { cartRouter } from "../modules/cart/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -40,6 +43,9 @@ export const appRouter = router({
   automations: automationsRouter,
   protection: protectionRouter,
   publicApi: publicApiRouter,
+  community: communityRouter,
+  referrals: referralsRouter,
+  cart: cartRouter,
 });
 
 export type AppRouter = typeof appRouter;

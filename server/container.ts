@@ -45,6 +45,9 @@ import { createMailTemplatesModule, type MailTemplatesModule } from "./modules/m
 import { createAutomationsModule, type AutomationsModule } from "./modules/automations/index.js";
 import { createProtectionModule, type ProtectionModule } from "./modules/protection/index.js";
 import { createPublicApiModule, type PublicApiModule } from "./modules/publicApi/index.js";
+import { createCommunityModule, type CommunityModule } from "./modules/community/index.js";
+import { createReferralsModule, type ReferralsModule } from "./modules/referrals/index.js";
+import { createCartModule, type CartModule } from "./modules/cart/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -68,6 +71,9 @@ export interface ModuleRegistry {
   automations: AutomationsModule;
   protection: ProtectionModule;
   publicApi: PublicApiModule;
+  community: CommunityModule;
+  referrals: ReferralsModule;
+  cart: CartModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -139,6 +145,9 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.automations = createAutomationsModule(deps);
   services.protection = createProtectionModule(deps);
   services.publicApi = createPublicApiModule(deps);
+  services.community = createCommunityModule(deps);
+  services.referrals = createReferralsModule(deps);
+  services.cart = createCartModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -165,6 +174,9 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.automations,
     services.protection,
     services.publicApi,
+    services.community,
+    services.referrals,
+    services.cart,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();
