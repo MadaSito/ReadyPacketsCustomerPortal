@@ -71,6 +71,12 @@ standard.
   [`DEPENDENCIES.md`](DEPENDENCIES.md): why, licence, alternatives rejected.
 - Exact versions (`save-exact=true`) and a committed `pnpm-lock.yaml`; CI installs with
   `--frozen-lockfile`. `engine-strict=true` pins Node 22 LTS.
+- Native installer pin changes must update each version and both architecture-specific hashes together in
+  `deploy/auto-install.sh`. Match Node SHA-256 values to the Linux x64 and arm64 archives listed in the
+  corresponding `nodejs.org` `SHASUMS256.txt`. Verify the npm registry release tarballs for
+  `@pnpm/exe.linux-x64` and `@pnpm/exe.linux-arm64`, then record their SHA-512 hex digests. Keep pnpm aligned
+  with `package.json`'s `packageManager` and the lockfile; update the version checks in
+  `scripts/ci/native-install-smoke.sh`. Use the native workflow to exercise the changed pins.
 - Install/build scripts may run only for the reviewed packages listed in `pnpm-workspace.yaml`
   (`allowBuilds`).
 - Dependabot opens grouped weekly minor/patch PRs and individual major PRs for npm, and weekly PRs for GitHub
@@ -79,7 +85,7 @@ standard.
   high-severity vulnerabilities. A CycloneDX SBOM is produced on `main` and on the weekly schedule.
 - Third-party GitHub Actions are to be pinned by full commit SHA; the current workflows use official major
   tags with `TODO(pin)` markers until each SHA is confirmed.
-- No runtime dependency on Perplexity, Manus or any hosted AI/builder service.
+- No runtime dependency on a hosted AI or builder service.
 
 ## 5. Secure coding rules (summary of BUILD_CONTRACT.md §2 and §5)
 
@@ -139,6 +145,7 @@ A change is done when:
 | --- | --- | --- |
 | `.github/workflows/ci.yml` | push to `main`, pull requests, manual | frozen install; TypeScript 7 typecheck; ESLint; node and jsdom tests against a MySQL 8.4 service; standard and preview builds; migration drift (`db:generate` must not change `migrations/`); portable golden fixture and JSON Schemas regenerate byte-identically and verify with the standalone CLI |
 | `.github/workflows/security.yml` | push to `main`, pull requests, weekly, manual | CodeQL (`security-extended`); dependency review (PRs, fail on high); `pnpm audit --prod` (fail on high); gitleaks over full history; CycloneDX SBOM artifact (non-PR runs) |
+| `.github/workflows/native-install.yml` | push to `main`, pull requests, manual | prepares disposable Ubuntu 26.04 amd64/arm64 runners; exercises first install, repeat install, host validation and self-signed TLS; a separate local Pebble ACME job exercises certificate issuance, renewal and switching modes. Verification uses synthetic data and masks the temporary admin password in CI output. It does not exercise the live Let's Encrypt service. |
 
 Workflows use `contents: read` by default (CodeQL additionally `security-events: write`), never persist
 checkout credentials and need no repository secrets.

@@ -2,6 +2,7 @@
 # Usage: sudo bash deploy/upgrade.sh <reviewed-full-commit-sha>
 set -euo pipefail
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
 [[ $# == 1 ]] || die 'usage: upgrade.sh <reviewed-full-commit-sha>'
 lock_deploy
@@ -13,6 +14,12 @@ old=$(readlink -f "$base/current")
 [[ "$old" =~ ^"$base"/releases/[0-9a-f]{40}$ ]] || die 'unexpected current release layout'
 [[ "$old" != "$release" ]] || die 'release is already installed'
 [[ -L "$site" ]] || die 'the managed nginx site is required'
+# The web server files are rendered again further down; what they need is checked before anything is stopped.
+grep -qxF "RP_CANONICAL_ORIGIN=https://$origin" "$conf/portal.env" ||
+    die "the environment file and $site_conf name different portal hosts"
+[[ -r "$tls_dir/fullchain.pem" && -r "$tls_dir/privkey.pem" ]] ||
+    die "the web certificate is missing from $tls_dir"
+nginx -t 2>/dev/null || die 'the current web server configuration does not pass "nginx -t"; repair it before upgrading'
 prepare_dirs
 credentials_ok
 secret_ok rp_backup_key
@@ -74,6 +81,12 @@ point_release "$release" current
 phase=verifying
 record_phase
 install_unit_files
+# The Nginx files come from the release's templates too; the site stays fenced while they are replaced.
+render_site "$deploy_src/nginx/readypackets-edge.conf.template" "$nginx_dir/snippets/readypackets-edge.conf"
+render_site "$deploy_src/nginx/readypackets-tls.conf.template" "$nginx_dir/snippets/readypackets-tls.conf"
+render_site "$deploy_src/nginx/readypackets-portal.conf.template" "$nginx_dir/sites-available/readypackets-portal.conf"
+nginx -t
+systemctl reload nginx
 systemctl start "$worker" "$web"
 check_http local
 check_http edge

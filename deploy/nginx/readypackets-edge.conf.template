@@ -1,0 +1,20 @@
+#@ TEMPLATE (see readypackets-portal.conf.template). Installed as /etc/nginx/snippets/readypackets-edge.conf.
+# Settings shared by every ReadyPackets server block. They are set at server level, not http level, so they
+# replace whatever the distribution's nginx.conf sets instead of colliding with it or adding to it.
+server_tokens off;
+# The edge does not compress: the application decides what is sent, and responses are passed through unchanged.
+gzip off;
+
+# One access log in the safe format (no paths, queries, Referer, cookies or credentials). Declaring it here
+# replaces the stock "combined" access log for these servers, which would record full request lines.
+access_log /var/log/nginx/readypackets-access.log rp_json;
+# nginx error diagnostics can embed raw request lines. Use app logs + safe access log for request diagnostics.
+error_log /var/log/nginx/readypackets-error.log crit;
+
+# TLS policy. It is also included by the port-80 servers, where it has no effect, and by the catch-all 443
+# server, which matters: nginx takes the protocol versions of a listening socket from its default server.
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers off;
+ssl_session_cache shared:rp_tls:10m;
+ssl_session_tickets off;

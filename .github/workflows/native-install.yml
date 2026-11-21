@@ -1,0 +1,233 @@
+# Runs deploy/auto-install.sh end to end on throwaway Ubuntu 26.04 machines, exactly as an operator would on
+# a new server: every prerequisite is installed by the script, the portal is built from the checked-out
+# commit, and scripts/ci/native-install-smoke.sh then checks the running installation. One job uses a
+# self-signed certificate; the other obtains a certificate over ACME from a local test authority (Pebble),
+# which exercises the same Certbot path as Let's Encrypt. No secrets are used or required.
+# TODO(pin): replace every action major tag below with a full commit SHA (see ci.yml).
+name: native-install
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-install-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PORTAL_HOST: portal.rp-ci.example
+  ALIAS_HOST: www.rp-ci.example
+  ADMIN_EMAIL: ci.admin@example.com
+
+jobs:
+  self-signed:
+    name: auto-install (${{ matrix.runner }}, ${{ matrix.alias && 'with alias' || 'no alias' }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            alias: false
+          - runner: ubuntu-26.04-arm
+            alias: true
+            swap: true
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Shell scripts (ShellCheck)
+        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh
+      - name: Make the runner look like a new server
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
+      - name: Refusals that change nothing
+        run: |
+          set -uo pipefail
+          cd /opt/readypackets-src
+          bash deploy/auto-install.sh --help | grep -q -- '--domain <host>'
+          expect_refusal() {  # expect_refusal <text> <command...>
+            local text=$1 out
+            shift
+            if out=$("$@" 2>&1); then echo "expected a refusal: $*"; exit 1; fi
+            grep -qF -- "$text" <<<"$out" || { echo "unexpected message for: $*"; echo "$out"; exit 1; }
+          }
+          expect_refusal 'run as root' bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes
+          expect_refusal 'give the public host name' sudo bash deploy/auto-install.sh --tls-self-signed --yes
+          expect_refusal 'IP addresses are refused' sudo bash deploy/auto-install.sh --domain 203.0.113.10 --tls-self-signed --yes
+          expect_refusal 'not a valid public host name' sudo bash deploy/auto-install.sh --domain 'portal.example.com;id' --tls-self-signed --yes
+          expect_refusal 'give --acme-email' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --yes
+          expect_refusal 'not both' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --acme-email a@example.com --tls-self-signed --yes
+          expect_refusal 'must differ' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --alias "$PORTAL_HOST" --tls-self-signed --yes
+          expect_refusal '--swap takes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --swap maybe --yes
+          expect_refusal 'add --yes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed
+          # A link inside the clone, and a swap file that is not the private file this script makes.
+          sudo ln -s /tmp deploy/ci-outside-link
+          expect_refusal 'not a plain file or directory' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes
+          sudo rm deploy/ci-outside-link
+          sudo install -m 0644 /dev/null /swapfile.readypackets
+          expect_refusal 'is not a private' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes
+          sudo rm /swapfile.readypackets
+          for path in /etc/readypackets /opt/readypackets /etc/nginx /etc/mysql /usr/local/bin/node; do
+            if sudo test -e "$path"; then echo "a refused run left $path behind"; exit 1; fi
+          done
+      - name: Install (one command, no questions)
+        env:
+          WITH_ALIAS: ${{ matrix.alias }}
+          WITH_SWAP: ${{ matrix.swap }}
+        run: |
+          set -euo pipefail
+          options=(--domain "https://${PORTAL_HOST^^}/" --tls-self-signed --admin-email "$ADMIN_EMAIL" --print-credentials --yes)
+          if [[ $WITH_ALIAS == true ]]; then options+=(--alias "$ALIAS_HOST"); fi
+          # The runners have plenty of memory, so the swap file is asked for explicitly on one of them.
+          if [[ $WITH_SWAP == true ]]; then options+=(--swap yes); fi
+          sudo bash scripts/ci/native-install-run.sh first "${options[@]}"
+          # Certbot is only installed when a public certificate is asked for.
+          if command -v certbot >/dev/null; then echo 'certbot was installed for a self-signed setup'; exit 1; fi
+      - name: End-to-end checks
+        env:
+          WITH_ALIAS: ${{ matrix.alias }}
+        run: |
+          set -euo pipefail
+          if [[ $WITH_ALIAS == true ]]; then
+            sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST" "$ALIAS_HOST"
+          else
+            sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST"
+          fi
+      - name: A second run changes nothing and does not print the password again
+        env:
+          WITH_ALIAS: ${{ matrix.alias }}
+          WITH_SWAP: ${{ matrix.swap }}
+        run: |
+          set -euo pipefail
+          options=(--domain "$PORTAL_HOST" --tls-self-signed --admin-email other.admin@example.com --yes)
+          if [[ $WITH_ALIAS == true ]]; then options+=(--alias "$ALIAS_HOST"); fi
+          sudo bash scripts/ci/native-install-run.sh again "${options[@]}"
+          if [[ $WITH_SWAP == true ]]; then
+            sudo swapon --show=NAME --noheadings | grep -qxF /swapfile.readypackets || { echo 'the swap file is not active'; exit 1; }
+            [[ $(sudo stat -c '%a:%U' /swapfile.readypackets) == 600:root ]] || { echo 'the swap file is not private to root'; exit 1; }
+            [[ $(grep -c '^/swapfile.readypackets ' /etc/fstab) == 1 ]] || { echo 'expected exactly one fstab entry for the swap file'; exit 1; }
+          else
+            if sudo test -e /swapfile.readypackets; then echo 'a swap file was added although memory is plentiful'; exit 1; fi
+          fi
+      - name: Another host name is refused once installed
+        run: |
+          set -uo pipefail
+          if out=$(sudo bash /opt/readypackets-src/deploy/auto-install.sh --domain other.rp-ci.example --tls-self-signed --yes 2>&1); then
+            echo 'expected a refusal'; exit 1
+          fi
+          grep -qF 'already installed under another host name' <<<"$out" || { echo "$out" | tail -30; exit 1; }
+          sudo grep -qx "canonical_host=$PORTAL_HOST" /etc/readypackets/site.conf
+          curl --silent --fail --max-time 20 --cacert <(sudo cat /etc/readypackets/tls/fullchain.pem) \
+            --resolve "$PORTAL_HOST:443:127.0.0.1" -o /dev/null "https://$PORTAL_HOST/readyz"
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: sudo bash scripts/ci/native-install-run.sh diagnostics || true
+
+  acme:
+    name: auto-install (public certificate path, ACME test authority)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7 # TODO(pin)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Make the runner look like a new server
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST" without-universe
+      - name: Start a local ACME certificate authority (Pebble) and trust its root
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pebble"
+          cat > "$RUNNER_TEMP/pebble/config.json" <<'JSON'
+          {
+            "pebble": {
+              "listenAddress": "127.0.0.1:14000",
+              "managementListenAddress": "127.0.0.1:15000",
+              "certificate": "test/certs/localhost/cert.pem",
+              "privateKey": "test/certs/localhost/key.pem",
+              "httpPort": 80,
+              "tlsPort": 443,
+              "ocspResponderURL": "",
+              "externalAccountBindingRequired": false
+            }
+          }
+          JSON
+          # The authority validates over port 80 of this machine, like Let's Encrypt does from outside.
+          docker run --detach --name pebble --network host \
+            --add-host "$PORTAL_HOST:127.0.0.1" --add-host "$ALIAS_HOST:127.0.0.1" \
+            --env PEBBLE_VA_NOSLEEP=1 --env PEBBLE_WFE_NONCEREJECT=0 \
+            --volume "$RUNNER_TEMP/pebble/config.json:/config.json:ro" \
+            ghcr.io/letsencrypt/pebble:2.10.3@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef -config /config.json
+          docker cp pebble:/test/certs/pebble.minica.pem "$RUNNER_TEMP/pebble/minica.pem"
+          for _ in $(seq 1 30); do
+            if curl --silent --fail --cacert "$RUNNER_TEMP/pebble/minica.pem" -o /dev/null https://localhost:14000/dir; then break; fi
+            sleep 1
+          done
+          curl --silent --fail --cacert "$RUNNER_TEMP/pebble/minica.pem" https://localhost:15000/roots/0 |
+            sudo tee /usr/local/share/ca-certificates/pebble-test-root.crt >/dev/null
+          sudo update-ca-certificates
+          docker logs pebble 2>&1 | tail -5
+      - name: Install with a certificate obtained over ACME
+        run: |
+          set -euo pipefail
+          sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \
+            bash scripts/ci/native-install-run.sh first --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" \
+            --acme-email "$ADMIN_EMAIL" --print-credentials --yes
+          # The runner was prepared like a minimal image without the "universe" component, where Certbot lives.
+          grep -q 'switching on the Ubuntu "universe" package component' <(sudo cat /root/auto-install-first.out) ||
+            { echo 'the installer did not have to switch the universe component on'; exit 1; }
+          command -v certbot >/dev/null
+      - name: End-to-end checks
+        run: sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST" "$ALIAS_HOST"
+      - name: Renewal replaces the certificate and Nginx serves the new one
+        run: |
+          set -euo pipefail
+          serial() {
+            openssl s_client -connect 127.0.0.1:443 -servername "$PORTAL_HOST" </dev/null 2>/dev/null |
+              openssl x509 -noout -serial
+          }
+          before=$(serial)
+          sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" certbot renew --force-renewal --non-interactive
+          sleep 2
+          after=$(serial)
+          [[ -n $before && -n $after && $before != "$after" ]] || { echo "the served certificate did not change"; exit 1; }
+          curl --silent --fail --max-time 20 --resolve "$PORTAL_HOST:443:127.0.0.1" -o /dev/null "https://$PORTAL_HOST/readyz"
+      - name: A second run changes nothing and does not print the password again
+        run: |
+          set -euo pipefail
+          sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \
+            bash scripts/ci/native-install-run.sh again --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" \
+            --acme-email "$ADMIN_EMAIL" --yes
+      - name: The certificate can be switched on an installed server (self-signed and back to ACME)
+        run: |
+          set -euo pipefail
+          issuer() {
+            openssl s_client -connect 127.0.0.1:443 -servername "$PORTAL_HOST" </dev/null 2>/dev/null |
+              openssl x509 -noout -issuer
+          }
+          sudo bash scripts/ci/native-install-run.sh again --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" --tls-self-signed --yes
+          sudo grep -qx 'tls=self-signed' /etc/readypackets/site.conf
+          issuer | grep -q "CN *= *$PORTAL_HOST" || { echo "expected the self-signed certificate: $(issuer)"; exit 1; }
+          curl --silent --fail --max-time 20 --cacert <(sudo cat /etc/readypackets/tls/fullchain.pem) \
+            --resolve "$PORTAL_HOST:443:127.0.0.1" -o /dev/null "https://$PORTAL_HOST/readyz"
+          # Without a stored certificate the way back needs a new one, requested while the portal keeps running.
+          sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" certbot delete --cert-name readypackets-portal --non-interactive
+          sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \
+            bash scripts/ci/native-install-run.sh again --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" \
+            --acme-email "$ADMIN_EMAIL" --yes
+          sudo grep -qx 'tls=letsencrypt' /etc/readypackets/site.conf
+          issuer | grep -qi 'pebble' || { echo "expected a certificate from the test authority: $(issuer)"; exit 1; }
+          sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST" "$ALIAS_HOST"
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: |
+          sudo bash scripts/ci/native-install-run.sh diagnostics || true
+          docker logs pebble 2>&1 | tail -80 || true
+          sudo tail -80 /var/log/letsencrypt/letsencrypt.log || true

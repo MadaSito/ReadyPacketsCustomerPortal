@@ -2,6 +2,7 @@
 # Deactivation only: deliberately offers no data-purge operation.
 set -euo pipefail
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
 [[ $# == 0 ]] || die 'usage: uninstall.sh'
 lock_deploy
@@ -16,7 +17,12 @@ for unit in "$web" "$worker" 'readypackets-backup@.service' "$timer"; do
     rm -f -- "$unit_dir/$unit" "$unit_dir/$unit.d/10-runtime.conf"
 done
 systemctl daemon-reload
-rm -f -- "$site" "$acme_site" "$nginx_dir/sites-available/readypackets-portal.conf" "$nginx_dir/snippets/readypackets-tls.conf"
+rm -f -- "$site" "$acme_site" "$nginx_dir/sites-available/readypackets-portal.conf" "$nginx_dir/snippets/readypackets-tls.conf" \
+    "$nginx_dir/snippets/readypackets-edge.conf"
+# Certificates are kept, but nothing answers the renewal challenge any more: the hook goes, and Certbot will
+# report failed renewals for "readypackets-portal" until the portal is installed again or the certificate is
+# deleted (certbot delete --cert-name readypackets-portal).
+rm -f -- /etc/letsencrypt/renewal-hooks/deploy/readypackets-nginx
 nginx -t
 systemctl reload nginx
 printf 'ReadyPackets deactivated. Database, storage, keys, certificates, backups and releases were not deleted.\n'

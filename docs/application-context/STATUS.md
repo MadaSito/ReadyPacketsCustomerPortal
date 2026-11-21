@@ -24,7 +24,7 @@ listed under "Verified" has not been proven and must not be described as working
 | Backup | encrypted backups, offline `.rpbk` restore by operator CLI only | `server/modules/backup`, `docs/operations/BACKUP_AND_RESTORE.md` |
 | Integrations | PostHog and Microsoft Clarity (configurable project id, consent-gated, off by default); Stripe, SAML and SharePoint are disabled scaffolds | `server/modules/integrations`, `client/src/features/integrations` |
 | UI | design system on the brand kit, light/dark/system themes, customer shell with mobile tab bar, console shell, installable PWA shell with offline page | `client/src/{ui,app,styles}`, `client/public` |
-| Deployment | one installer for a VPS (nginx + systemd), upgrade and uninstall scripts, a Docker Compose stack for evaluation and testing (`deploy/docker/`, checked end to end by the `container` workflow), CI and security workflows | `deploy/`, `.github/workflows` |
+| Deployment | native auto-install on fresh Ubuntu 26.04 (prerequisites, optional swap, fixed host and optional alias, switchable certificate mode, one-time temporary admin password display, offerings); manual install on Ubuntu 24.04/26.04; upgrade and deactivation; Docker Compose for evaluation | `deploy/auto-install.sh`, `deploy/install.sh`, `deploy/nginx/*.conf.template`, `deploy/docker/`, `docs/operations/AUTO_INSTALL.md`, `.github/workflows/native-install.yml` |
 | Offerings catalog (increment 02) | Master Offerings Matrix v3.0 as owner-controlled data (`data/catalog/readypackets-offerings-v3.0.json`, 18 products = Packets 1–6 × Basic / Standard / Premium, 112 deliverables), audited `ops:catalog-import`, one tier per packet, server-quoted totals, bundle rule (15% when all six packets are in one order), packet picker in the order wizard, tier / outcome / timeline / deliverables on orders | `data/catalog`, `scripts/ops/catalog*`, `server/modules/orders`, `client/src/features/orders` |
 | Production pipeline (increment 02) | manual Phase I (P101) and Phase II (P201) webhook triggers from the console order page, exact field set of the reference documents, encrypted outbox with fenced retries and reconciliation, destination pinning, pre-send order revalidation, admin settings behind step-up, dispatch list; disabled until configured | `server/modules/integrations/production`, `client/src/features/integrations/production`, `docs/integrations/PRODUCTION_WEBHOOKS.md` |
 | Documentation | 23 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
@@ -90,7 +90,7 @@ Reviewed by a second engineer (not the author): production webhooks, findings PW
   P101 → artifacts → P201 run are untested. Keep the pipeline disabled until an operator has tested it
   with a synthetic order.
 
-- installation on a real host with `deploy/install.sh`, nginx, TLS certificates and systemd
+- installation on a real VPS or issuance through the live Let's Encrypt service; the [native-install CI scope](../operations/AUTO_INSTALL.md#verification-status) uses self-signed and local Pebble certificates. It does not exercise native upgrade or uninstall.
 - outbound mail through a real SMTP server (mail is held in the outbox until configured)
 - delivery to a real SIEM or syslog collector (covered by tests against local fakes only)
 - PostHog and Microsoft Clarity against real projects

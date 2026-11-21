@@ -1,0 +1,28 @@
+#@ TEMPLATE (see readypackets-portal.conf.template).
+# Temporary HTTP-only vhost, used before issuance. Remove once the full site is enabled.
+# Settings are repeated inside each server block: the distribution's nginx.conf sets some of them at http
+# level, where a second copy is a configuration error. Nothing is logged by this temporary site.
+# Any other name, and requests by IP address, are dropped without an answer.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    server_tokens off;
+    access_log off;
+    error_log /var/log/nginx/readypackets-error.log crit;
+    return 444;
+}
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @RP_SERVER_NAMES@;
+    server_tokens off;
+    access_log off;
+    error_log /var/log/nginx/readypackets-error.log crit;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/readypackets-acme;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+    location / { return 404; }
+}
