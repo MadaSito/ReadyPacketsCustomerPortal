@@ -38,6 +38,7 @@ import { createJobsModule, type JobsModule } from "./modules/jobs/index.js";
 import { createPortableModule, type PortableModule } from "./modules/portable/index.js";
 import { createBackupModule, type BackupModule } from "./modules/backup/index.js";
 import { createIntegrationsModule, type IntegrationsModule } from "./modules/integrations/index.js";
+import { createStorageModule, type StorageModule } from "./modules/storage/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -55,6 +56,7 @@ export interface ModuleRegistry {
   portable: PortableModule;
   backup: BackupModule;
   integrations: IntegrationsModule;
+  storageConnections: StorageModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -119,6 +121,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.portable = createPortableModule(deps);
   services.backup = createBackupModule(deps);
   services.integrations = createIntegrationsModule(deps);
+  services.storageConnections = createStorageModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -139,6 +142,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.portable,
     services.backup,
     services.integrations,
+    services.storageConnections,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();
