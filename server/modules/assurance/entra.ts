@@ -47,6 +47,7 @@ export function createEntraAssurance(deps: ModuleDeps) {
         category: "security", eventName: "auth.step_up.verified", action: "authenticate", outcome: "completed",
         actor: { userId: principal.userId, role: principal.role },
         resource: { type: "user", publicId: principal.userPublicId },
+        provider: "entra", attributes: { auth_method: "entra" },
       }, tx);
       return deps.services.identity.sessions.markStepUp(principal.sessionId, { tx });
     },

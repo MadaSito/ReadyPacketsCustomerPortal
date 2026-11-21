@@ -25,7 +25,7 @@ describe("assurance: isolated transactional model", () => {
   let h: TestHarness;
   const issue = vi.fn();
   const notify = vi.fn();
-  const mailReadiness = vi.fn();
+  const mailReadiness = vi.fn<Services["jobAdmin"]["getMailReadiness"]>();
   const markMfaVerified = vi.fn(() => Promise.resolve({
     token: randomBytes(32).toString("base64url"),
     csrfToken: randomBytes(32).toString("base64url"), absoluteExpiresAt: h.clock.now(),
@@ -87,10 +87,13 @@ describe("assurance: isolated transactional model", () => {
     h.services.identity = {
       getUser: (id: number, opts?: { tx?: DbOrTx; forUpdate?: boolean }) => findUser(eq(users.id, id), opts),
       getUserByPublicId: (id: string, opts?: { tx?: DbOrTx; forUpdate?: boolean }) => findUser(eq(users.publicId, id), opts),
-      listLocalAdministratorCandidates: async (tx: Tx) => (await tx.select({ id: users.id }).from(users).where(and(
-        eq(users.role, "admin"), eq(users.status, "active"), eq(users.authSource, "local"),
-        isNotNull(users.passwordHash), isNotNull(users.emailVerifiedAt),
-      )).orderBy(asc(users.id)).for("update")).map(({ id }) => id),
+      listLocalAdministratorCandidates: async (tx: Tx, options: { lock?: boolean } = {}) => {
+        const query = tx.select({ id: users.id }).from(users).where(and(
+          eq(users.role, "admin"), eq(users.status, "active"), eq(users.authSource, "local"),
+          isNotNull(users.passwordHash), isNotNull(users.emailVerifiedAt),
+        )).orderBy(asc(users.id));
+        return (options.lock === false ? await query : await query.for("update")).map(({ id }) => id);
+      },
       verifyPassword: vi.fn().mockResolvedValue(true),
       setPassword: async (id: number, password: string, opts: { mustChange: boolean; tx: Tx }) => {
         if (password.length < 15) throw new DomainError("VALIDATION", "PASSWORD_TOO_SHORT", "Choose a longer password.");

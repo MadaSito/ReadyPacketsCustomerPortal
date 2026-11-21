@@ -12,17 +12,19 @@ export async function lockLocalAdministratorPolicy(tx: Tx): Promise<void> {
     .onDuplicateKeyUpdate({ set: { id: sql`${assuranceLocalAdminPolicy.id}` } });
 }
 
-async function localMfa(tx: Tx, userId: number, includePasskey = false): Promise<{ usable: boolean; passkey: boolean }> {
-  const [account] = await tx.select({
+async function localMfa(tx: Tx, userId: number, options: { includePasskey?: boolean; lock?: boolean } = {}): Promise<{ usable: boolean; passkey: boolean }> {
+  const accountQuery = tx.select({
     secret: assuranceAccounts.totpSecretEnc,
     failures: assuranceAccounts.totpFailures,
-  }).from(assuranceAccounts).where(eq(assuranceAccounts.userId, userId)).limit(1).for("update");
+  }).from(assuranceAccounts).where(eq(assuranceAccounts.userId, userId)).limit(1);
+  const [account] = options.lock === false ? await accountQuery : await accountQuery.for("update");
   if (!account) return { usable: false, passkey: false };
   // A temporary TOTP cooldown does not disqualify an account, but a permanent lock does.
   const totp = account.secret !== null && account.failures < TOTP_FAILURE_LIMIT;
-  if (totp && !includePasskey) return { usable: true, passkey: false };
-  const [passkey] = await tx.select({ id: assurancePasskeys.id }).from(assurancePasskeys)
-    .where(eq(assurancePasskeys.userId, userId)).limit(1).for("update");
+  if (totp && !options.includePasskey) return { usable: true, passkey: false };
+  const passkeyQuery = tx.select({ id: assurancePasskeys.id }).from(assurancePasskeys)
+    .where(eq(assurancePasskeys.userId, userId)).limit(1);
+  const [passkey] = options.lock === false ? await passkeyQuery : await passkeyQuery.for("update");
   return { usable: totp || passkey !== undefined, passkey: passkey !== undefined };
 }
 
@@ -31,6 +33,18 @@ function noLocalMfaAdministrator(): never {
 }
 
 export function createLocalAdministratorPolicy(deps: ModuleDeps) {
+  async function readHealth(tx: Tx): Promise<{ localMfaAdministrators: number; soleLocalMfaAdministratorHasPasskey: boolean | null }> {
+    let localMfaAdministrators = 0;
+    let soleLocalMfaAdministratorHasPasskey: boolean | null = null;
+    for (const id of await deps.services.identity.listLocalAdministratorCandidates(tx, { lock: false })) {
+      const { usable, passkey } = await localMfa(tx, id, { includePasskey: true, lock: false });
+      if (!usable) continue;
+      localMfaAdministrators += 1;
+      soleLocalMfaAdministratorHasPasskey = localMfaAdministrators === 1 ? passkey : null;
+    }
+    return { localMfaAdministrators, soleLocalMfaAdministratorHasPasskey };
+  }
+
   async function wouldLoseLastLocalAdministrator(tx: Tx, userId: number): Promise<boolean> {
     const candidates = await deps.services.identity.listLocalAdministratorCandidates(tx);
     if (!candidates.includes(userId) || !(await localMfa(tx, userId)).usable) return false;
@@ -41,19 +55,9 @@ export function createLocalAdministratorPolicy(deps: ModuleDeps) {
   return {
     lockLocalAdministratorPolicy,
     wouldLoseLastLocalAdministrator,
-    /** Read-only and identifier-free for the step-up-protected SSO administration UI. */
-    async breakGlassHealth(): Promise<{ localMfaAdministrators: number; soleLocalMfaAdministratorHasPasskey: boolean | null }> {
-      return deps.db.transaction(async (tx) => {
-        let localMfaAdministrators = 0;
-        let soleLocalMfaAdministratorHasPasskey: boolean | null = null;
-        for (const id of await deps.services.identity.listLocalAdministratorCandidates(tx)) {
-          const { usable, passkey } = await localMfa(tx, id, true);
-          if (!usable) continue;
-          localMfaAdministrators += 1;
-          soleLocalMfaAdministratorHasPasskey = localMfaAdministrators === 1 ? passkey : null;
-        }
-        return { localMfaAdministrators, soleLocalMfaAdministratorHasPasskey };
-      });
+    /** Read-only and identifier-free. Callers already holding user locks must pass their transaction. */
+    async breakGlassHealth(tx?: Tx) {
+      return tx ? readHealth(tx) : deps.db.transaction(readHealth);
     },
     /** Strict readiness check for SSO enablement; lock the policy first. */
     async assertLocalAdministratorRemains(tx: Tx, excludingUserId?: number): Promise<void> {
