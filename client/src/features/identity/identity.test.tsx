@@ -71,9 +71,12 @@ const customerRow = {
   role: "customer", emailVerified: true, createdAt: date, version: 3,
 };
 
+/** SSO is not configured: the account page's Microsoft card renders nothing. */
+const noSso = { "identity.sso.myLink": () => ({ available: false, linked: false, pendingAdministratorBinding: false, linkedAt: null, lastSignInAt: null, hasPassword: true }) };
+
 describe("Account pages", () => {
   it("shows profile and account details, saves the name", async () => {
-    const { calls } = renderPage(<AccountPage />, { "identity.profile.update": () => ({ ok: true }) }, { role: "customer" });
+    const { calls } = renderPage(<AccountPage />, { "identity.profile.update": () => ({ ok: true }), ...noSso }, { role: "customer" });
     expect(await screen.findByRole("heading", { level: 1, name: "Your account" })).toBeInTheDocument();
     expect(await screen.findByText("RP-ABC1234")).toBeInTheDocument();
     const name = screen.getByLabelText(/Full name/);
@@ -85,13 +88,13 @@ describe("Account pages", () => {
   });
 
   it("validates the password form client-side before calling the server", async () => {
-    const { calls } = renderPage(<AccountPage />, {}, { role: "customer" });
+    const { calls } = renderPage(<AccountPage />, { ...noSso }, { role: "customer" });
     await screen.findByRole("heading", { level: 1, name: "Your account" });
     await userEvent.type(await screen.findByLabelText(/^Current password/), "old passphrase here");
     await userEvent.type(screen.getByLabelText(/^New password/), "too short");
     await userEvent.click(screen.getByRole("button", { name: "Change password" }));
     expect(await screen.findByText(/^Use at least \d+ characters\.$/)).toBeInTheDocument();
-    expect(calls).toHaveLength(0);
+    expect(calls.filter((c) => c.path !== "identity.sso.myLink")).toHaveLength(0);
     await expectNoAxeViolations();
   });
 

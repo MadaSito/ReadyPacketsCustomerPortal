@@ -1,31 +1,70 @@
-/** Console workflow definitions (/admin/workflows). Owner: orders_engineer. Orders stay bound to the version they started on. */
+/**
+ * Console workflows (/admin/workflows). Owner: orders_engineer.
+ * Lists workflows and open drafts; starts drafts (standard, blank, copy) that the designer edits. Publishing happens
+ * in the designer and always creates a new version; orders stay bound to the version they started on.
+ */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Workflow } from "lucide-react";
 import { useState } from "react";
-import { errorMessage, useTRPC } from "@/lib/trpc";
-import { Badge, Button, Callout, Card, Checkbox, DataTable, Dialog, EmptyState, ErrorState, Field, Input, PageHeader, Skeleton, Textarea, useToast } from "@/ui";
+import { Link, useLocation } from "wouter";
+import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
+import { Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, Input, PageHeader, RadioGroup, Select, Skeleton, StepUpCancelledError, useStepUp, useToast } from "@/ui";
 import { OrderStatusBadge } from "../shared";
-
-type WorkflowRow = {
-  publicId: string;
-  workflowKey: string;
-  name: string;
-  isDefault: boolean;
-  rowVersion: number;
-  versionNumber: number;
-  definition: {
-    states: { key: string; label: string; customerLabel: string; kind: string; tone: string }[];
-    transitions: { from: string; to: string; allowedBy: string[]; notifyCustomer: boolean; requiresNote: boolean }[];
-  } | null;
-};
-
-const KIND_LABEL: Record<string, string> = { initial: "Start", active: "In progress", terminal: "Final" };
+import { keyFromLabel, type DraftListRow, type WorkflowListRow } from "./workflows/model";
 
 export default function AdminWorkflowsPage() {
   const trpc = useTRPC();
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const stepUp = useStepUp();
+  const [, navigate] = useLocation();
   const workflows = useQuery(trpc.orders.admin.workflows.list.queryOptions());
-  const [editing, setEditing] = useState<WorkflowRow | null>(null);
-  const header = <PageHeader title="Workflows" description="Order statuses and who may move an order between them. Publishing creates a new version; existing orders keep theirs." />;
+  const drafts = useQuery(trpc.orders.admin.workflows.drafts.list.queryOptions());
+  const install = useMutation(trpc.orders.admin.workflows.installStandard.mutationOptions());
+  const createDraft = useMutation(trpc.orders.admin.workflows.drafts.create.mutationOptions());
+  const [creating, setCreating] = useState(false);
+  const [discarding, setDiscarding] = useState<DraftListRow | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+
+  const refresh = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.list.queryKey() }),
+      queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.drafts.list.queryKey() }),
+    ]);
+
+  const installStandard = async () => {
+    setProblem(null);
+    try {
+      const result = await stepUp.run(() => install.mutateAsync(), { reason: "Installing the standard workflow." });
+      toast.show({ tone: "success", title: result.installed ? "Standard workflow installed" : "The standard workflow was already installed" });
+      await refresh();
+    } catch (err) {
+      if (!(err instanceof StepUpCancelledError)) setProblem(errorMessage(err));
+    }
+  };
+
+  const edit = async (wf: WorkflowListRow) => {
+    setProblem(null);
+    if (wf.draftPublicId) return navigate(`/admin/workflows/drafts/${wf.draftPublicId}`);
+    if (!wf.currentVersionPublicId) return setProblem("This workflow has no published version to start from.");
+    try {
+      const draft = await createDraft.mutateAsync({ from: "copy", copyVersionId: wf.currentVersionPublicId, workflowId: wf.publicId });
+      await refresh();
+      navigate(`/admin/workflows/drafts/${draft.publicId}`);
+    } catch (err) {
+      const existing = (safeError(err)?.details as { draftId?: unknown } | undefined)?.draftId;
+      if (typeof existing === "string") return navigate(`/admin/workflows/drafts/${existing}`);
+      setProblem(errorMessage(err));
+    }
+  };
+
+  const header = (
+    <PageHeader
+      title="Workflows"
+      description="Order statuses and who may move an order between them. Publishing creates a new version; existing orders keep theirs."
+      actions={workflows.data ? <Button onClick={() => setCreating(true)}>New workflow</Button> : null}
+    />
+  );
   if (workflows.isPending)
     return (
       <>
@@ -40,119 +79,229 @@ export default function AdminWorkflowsPage() {
         <ErrorState error={workflows.error} onRetry={() => void workflows.refetch()} />
       </>
     );
-  const rows = workflows.data as WorkflowRow[];
+  const rows = workflows.data;
+  const draftRows = drafts.data ?? [];
   return (
     <>
       {header}
-      {rows.length === 0 ? (
-        <EmptyState icon={Workflow} title="No workflow installed yet" description="The standard workflow is installed automatically when the first order is created." />
-      ) : (
-        <div className="flex flex-col gap-6">
-          {rows.map((wf) => (
-            <Card
-              key={wf.publicId}
-              title={wf.name}
-              description={`${wf.workflowKey} · version ${wf.versionNumber}`}
-              actions={
-                <div className="flex flex-wrap items-center gap-2">
-                  {wf.isDefault ? <Badge tone="brand">Default</Badge> : null}
-                  <Button size="sm" variant="secondary" onClick={() => setEditing(wf)}>
-                    Publish new version{" "}<span className="sr-only">of {wf.name}</span>
-                  </Button>
-                </div>
-              }
-            >
-              {wf.definition ? (
-                <div className="grid gap-6 lg:grid-cols-2">
-                  <DataTable
-                    caption={`Statuses in ${wf.name}`}
-                    showCaption
-                    rows={wf.definition.states}
-                    rowKey={(state) => state.key}
-                    columns={[
-                      { key: "label", header: "Status", primary: true, cell: (state) => <OrderStatusBadge label={state.label} tone={state.tone} /> },
-                      { key: "customer", header: "Customers see", cell: (state) => state.customerLabel },
-                      { key: "kind", header: "Stage", hideOnMobile: true, cell: (state) => KIND_LABEL[state.kind] ?? state.kind },
-                    ]}
-                  />
-                  <DataTable
-                    caption={`Transitions in ${wf.name}`}
-                    showCaption
-                    rows={wf.definition.transitions}
-                    rowKey={(t) => `${t.from}->${t.to}`}
-                    columns={[
-                      { key: "move", header: "Move", primary: true, cell: (t) => `${t.from} → ${t.to}` },
-                      { key: "who", header: "Allowed for", cell: (t) => t.allowedBy.join(", ") },
-                      { key: "note", header: "Note required", hideOnMobile: true, cell: (t) => (t.requiresNote ? "Yes" : "No") },
-                    ]}
-                  />
-                </div>
-              ) : (
-                <p className="text-body">No published version.</p>
-              )}
-            </Card>
-          ))}
-        </div>
-      )}
-      {editing ? <PublishDialog workflow={editing} onClose={() => setEditing(null)} /> : null}
+      <div className="flex flex-col gap-6">
+        {problem ? (
+          <Callout tone="danger" live="assertive">
+            {problem}
+          </Callout>
+        ) : null}
+        {rows.length === 0 ? (
+          <EmptyState
+            icon={Workflow}
+            title="No workflow installed yet"
+            description="Install the standard workflow (Submitted, In review, Waiting on customer, Completed, Cancelled) now, or design your own with New workflow."
+            action={
+              <Button loading={install.isPending} onClick={() => void installStandard()}>
+                Install the standard workflow now
+              </Button>
+            }
+          />
+        ) : (
+          <div className="grid gap-4 lg:grid-cols-2">
+            {rows.map((wf) => (
+              <Card
+                key={wf.publicId}
+                as="article"
+                title={wf.name}
+                description={`${wf.workflowKey} · version ${wf.versionNumber}`}
+                actions={wf.isDefault ? <Badge tone="brand">Default</Badge> : null}
+                footer={
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button size="sm" variant="secondary" aria-label={`${wf.draftPublicId ? "Continue draft" : "Edit"} ${wf.name}`} loading={createDraft.isPending && createDraft.variables?.workflowId === wf.publicId} onClick={() => void edit(wf)}>
+                      {wf.draftPublicId ? "Continue draft" : "Edit"}
+                    </Button>
+                    <Link href={`/admin/workflows/${wf.publicId}/versions`} aria-label={`Versions of ${wf.name}`} className="text-sm font-semibold text-link underline-offset-2 hover:underline">
+                      Versions
+                    </Link>
+                  </div>
+                }
+              >
+                {wf.definition ? (
+                  <ul aria-label={`Statuses in ${wf.name}`} className="flex flex-wrap gap-2">
+                    {wf.definition.states.map((state) => (
+                      <li key={state.key}>
+                        <OrderStatusBadge label={state.label} tone={state.tone} />
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-body">No published version.</p>
+                )}
+              </Card>
+            ))}
+          </div>
+        )}
+        <DataTable
+          caption="Drafts"
+          showCaption
+          rows={draftRows}
+          rowKey={(draft) => draft.publicId}
+          empty={drafts.isPending ? "Loading drafts…" : "No drafts. Edit a workflow or start a new one."}
+          columns={[
+            {
+              key: "name",
+              header: "Draft",
+              primary: true,
+              cell: (draft) => (
+                <Link href={`/admin/workflows/drafts/${draft.publicId}`} className="font-semibold text-link underline-offset-2 hover:underline">
+                  {draft.name}
+                </Link>
+              ),
+            },
+            { key: "kind", header: "For", cell: (draft) => (draft.workflowPublicId ? `New version of ${draft.workflowKey}` : `New workflow ${draft.workflowKey}`) },
+            {
+              key: "issues",
+              header: "Problems",
+              cell: (draft) =>
+                draft.errorCount ? <Badge tone="danger">{`${draft.errorCount} to fix`}</Badge> : draft.warningCount ? <Badge tone="warning">{`${draft.warningCount} warning${draft.warningCount === 1 ? "" : "s"}`}</Badge> : <Badge tone="success">Ready</Badge>,
+            },
+            { key: "updated", header: "Last saved", hideOnMobile: true, cell: (draft) => <DateTime value={draft.updatedAt} /> },
+          ]}
+          rowActions={(draft) => (
+            <Button size="sm" variant="ghost" aria-label={`Discard draft ${draft.name}`} onClick={() => setDiscarding(draft)}>
+              Discard
+            </Button>
+          )}
+        />
+      </div>
+      {creating ? <NewWorkflowDialog workflows={rows} onClose={() => setCreating(false)} onCreated={(id) => void refresh().then(() => navigate(`/admin/workflows/drafts/${id}`))} /> : null}
+      {discarding ? <DiscardDialog draft={discarding} onClose={() => setDiscarding(null)} onDone={() => void refresh()} /> : null}
     </>
   );
 }
 
-function PublishDialog({ workflow, onClose }: { workflow: WorkflowRow; onClose: () => void }) {
+function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: WorkflowListRow[]; onClose: () => void; onCreated: (draftId: string) => void }) {
   const trpc = useTRPC();
-  const queryClient = useQueryClient();
-  const toast = useToast();
-  const publish = useMutation(trpc.orders.admin.workflows.publish.mutationOptions());
-  const [name, setName] = useState(workflow.name);
-  const [json, setJson] = useState(JSON.stringify(workflow.definition, null, 2));
-  const [makeDefault, setMakeDefault] = useState(workflow.isDefault);
-  const [error, setError] = useState<string | null>(null);
+  const create = useMutation(trpc.orders.admin.workflows.drafts.create.mutationOptions());
+  const copyable = workflows.filter((wf) => wf.currentVersionPublicId);
+  const [name, setName] = useState("");
+  const [key, setKey] = useState("");
+  const [keyTouched, setKeyTouched] = useState(false);
+  const [from, setFrom] = useState<"standard" | "blank" | "copy">("standard");
+  const [copyFrom, setCopyFrom] = useState(copyable[0]?.currentVersionPublicId ?? "");
+  const [errors, setErrors] = useState<{ name?: string; key?: string; copy?: string; form?: string }>({});
+  const taken = new Set(workflows.map((wf) => wf.workflowKey));
+
   const submit = async () => {
-    let definition: unknown;
+    const next: typeof errors = {};
+    if (!name.trim()) next.name = "Enter a name.";
+    if (!/^[a-z][a-z0-9_]{1,47}$/.test(key)) next.key = "Use 2 to 48 lowercase letters, digits or underscores, starting with a letter.";
+    else if (taken.has(key)) next.key = "A workflow with this key already exists.";
+    if (from === "copy" && !copyFrom) next.copy = "Choose the workflow to copy.";
+    setErrors(next);
+    if (Object.keys(next).length) return;
     try {
-      definition = JSON.parse(json);
-    } catch {
-      return setError("The definition is not valid JSON.");
-    }
-    setError(null);
-    try {
-      await publish.mutateAsync({ workflowId: workflow.publicId, expectedVersion: workflow.rowVersion, name: name.trim(), definition, makeDefault });
-      toast.show({ tone: "success", title: "New workflow version published" });
-      await queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.list.queryKey() });
+      const draft = await create.mutateAsync({ from, workflowKey: key, name: name.trim(), ...(from === "copy" ? { copyVersionId: copyFrom } : {}) });
       onClose();
+      onCreated(draft.publicId);
     } catch (err) {
-      setError(errorMessage(err));
+      const code = safeError(err)?.reasonCode;
+      setErrors(code === "WORKFLOW_KEY_TAKEN" ? { key: errorMessage(err) } : { form: errorMessage(err) });
     }
   };
+
   return (
     <Dialog
       open
-      size="xl"
+      size="md"
       onOpenChange={(open) => (open ? undefined : onClose())}
-      title={`Publish a new version of ${workflow.name}`}
-      description="The server validates the definition: unique state keys, exactly one start state, and transitions between known states."
+      title="New workflow"
+      description="This starts a draft. Nothing changes for orders until you publish it."
       footer={
         <>
-          <Button variant="secondary" onClick={onClose} disabled={publish.isPending}>
+          <Button variant="secondary" onClick={onClose} disabled={create.isPending}>
             Cancel
           </Button>
-        <Button loading={publish.isPending} onClick={() => void submit()}>
-          Publish
-        </Button>
+          <Button loading={create.isPending} onClick={() => void submit()}>
+            Create draft
+          </Button>
         </>
       }
     >
       <div className="flex flex-col gap-4">
-        {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
-        <Field label="Name">
-          <Input value={name} onChange={(event) => setName(event.target.value)} maxLength={120} />
+        {errors.form ? (
+          <Callout tone="danger" live="assertive">
+            {errors.form}
+          </Callout>
+        ) : null}
+        <Field label="Name" required error={errors.name}>
+          <Input
+            value={name}
+            maxLength={120}
+            onChange={(event) => {
+              setName(event.target.value);
+              if (!keyTouched) setKey(keyFromLabel(event.target.value, taken));
+            }}
+          />
         </Field>
-        <Field label="Definition (JSON)">
-          <Textarea value={json} onChange={(event) => setJson(event.target.value)} rows={16} spellCheck={false} className="font-mono text-sm" />
+        <Field label="Key" required hint="Lowercase letters, digits and underscores. It cannot be changed later." error={errors.key}>
+          <Input
+            value={key}
+            maxLength={48}
+            spellCheck={false}
+            autoCapitalize="none"
+            className="font-mono"
+            onChange={(event) => {
+              setKeyTouched(true);
+              setKey(event.target.value.toLowerCase());
+            }}
+          />
         </Field>
-        <Checkbox label="Use for new orders (default)" checked={makeDefault} onCheckedChange={setMakeDefault} />
+        <RadioGroup
+          legend="Start from"
+          value={from}
+          onValueChange={(value) => setFrom(value as typeof from)}
+          options={[
+            { value: "standard", label: "The standard workflow", description: "Submitted, In review, Waiting on customer, Completed, Cancelled." },
+            { value: "blank", label: "Blank", description: "Only a start status and a final status." },
+            { value: "copy", label: "A copy of an existing workflow", description: "Its current published version.", disabled: copyable.length === 0 },
+          ]}
+        />
+        {from === "copy" ? (
+          <Field label="Workflow to copy" required error={errors.copy}>
+            <Select value={copyFrom} options={copyable.map((wf) => ({ value: wf.currentVersionPublicId!, label: `${wf.name} (version ${wf.versionNumber})` }))} onChange={(event) => setCopyFrom(event.target.value)} />
+          </Field>
+        ) : null}
       </div>
     </Dialog>
+  );
+}
+
+function DiscardDialog({ draft, onClose, onDone }: { draft: DraftListRow; onClose: () => void; onDone: () => void }) {
+  const trpc = useTRPC();
+  const toast = useToast();
+  const discard = useMutation(trpc.orders.admin.workflows.drafts.discard.mutationOptions());
+  const [problem, setProblem] = useState<string | null>(null);
+  return (
+    <ConfirmDialog
+      open
+      onOpenChange={(open) => (open ? undefined : onClose())}
+      title={`Discard the draft “${draft.name}”?`}
+      description="The draft's unpublished changes are deleted. Published versions are not affected."
+      confirmLabel="Discard draft"
+      destructive
+      onConfirm={async () => {
+        try {
+          await discard.mutateAsync({ draftId: draft.publicId, expectedVersion: draft.rowVersion });
+          toast.show({ tone: "success", title: "Draft discarded" });
+          onDone();
+          onClose();
+        } catch (err) {
+          setProblem(errorMessage(err));
+          throw err;
+        }
+      }}
+    >
+      {problem ? (
+        <Callout tone="danger" live="assertive">
+          {problem}
+        </Callout>
+      ) : null}
+    </ConfirmDialog>
   );
 }

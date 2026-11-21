@@ -85,7 +85,7 @@ ReadyPackets dispatches two outbound HTTPS JSON webhooks to the configured produ
 ```
 
 Field validation rules (`validateP101` / `buildP101Payload` in `server/modules/integrations/production/payload.ts`):
-- `customer_id`: Required strict `^RP-[A-Z0-9]{7}$` (`users.customer_ref`; orders whose owner lacks a valid `RP-XXXXXXX` ref are refused with `CUSTOMER_ID_MISSING_OR_INVALID`).
+- `customer_id`: Required, non-empty, at most 120 characters: the customer ID stored in `users.customer_ref`. IDs generated from increment 03 on have the form `RPCUS-` plus nine characters from 0-9 and A-Z (`^RPCUS-[0-9A-Z]{9}$`); customers created earlier keep their `RP-` plus seven characters ID unless an administrator changes it. Orders whose owner has no customer ID are refused with `CUSTOMER_REF_MISSING`.
 - `order_id`: Required trimmed `orders.reference` (`1..64` printable chars, no control characters).
 - `packet`: `"1".."6"` for single-packet orders; `"7"` for multi-packet bundles (`>= 2` distinct packets `1..6`). Duplicate packet numbers are refused (`DUPLICATE_PACKET_NUMBER`).
 - `tier`: `"Basic" | "Standard" | "Premium"` when `packet` is `"1".."6"`; `"Mixed"` when `packet === "7"`.

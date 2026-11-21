@@ -39,6 +39,18 @@ export function NotificationSlot({ area }: { area: "customer" | "console" }) {
 export function GlobalSearchSlot({ className }: { className?: string }) {
   return slot(<GlobalSearchBox className={className} />);
 }
+/**
+ * "Sign in with SSO" (identity feature). Optional like the consent banner: missing module or a failure renders
+ * nothing, and the identity component itself renders nothing unless SSO is configured and enabled.
+ */
+type SsoModule = { SsoSignInButton: (props: { next?: string }) => ReactNode };
+const ssoLoaders = import.meta.glob<SsoModule>("../features/identity/sso/index.tsx");
+const ssoLoader = Object.values(ssoLoaders)[0];
+const SsoSignInImpl = ssoLoader ? lazy(() => ssoLoader().then((m) => ({ default: m.SsoSignInButton }))) : null;
+
+export function SsoSignInSlot({ next }: { next?: string }) {
+  return SsoSignInImpl ? slot(<SsoSignInImpl next={next} />) : null;
+}
 export function AnalyticsConsentSlot() {
   return AnalyticsConsentSlotImpl ? slot(<AnalyticsConsentSlotImpl />) : null;
 }

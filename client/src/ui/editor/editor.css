@@ -1,0 +1,105 @@
+/* ProseMirror / TipTap base rules (copied from @tiptap/core 3.35.0, MIT), shipped as a same-origin stylesheet because the editor runs with injectCSS: false under style-src 'self'. */
+.ProseMirror {
+  position: relative;
+}
+
+.ProseMirror {
+  word-wrap: break-word;
+  white-space: pre-wrap;
+  white-space: break-spaces;
+  -webkit-font-variant-ligatures: none;
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0; /* the above doesn't seem to work in Edge */
+}
+
+.ProseMirror [contenteditable="false"] {
+  white-space: normal;
+}
+
+.ProseMirror [contenteditable="false"] [contenteditable="true"] {
+  white-space: pre-wrap;
+}
+
+.ProseMirror pre {
+  white-space: pre-wrap;
+}
+
+img.ProseMirror-separator {
+  display: inline !important;
+  border: none !important;
+  margin: 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+.ProseMirror-gapcursor {
+  display: none;
+  pointer-events: none;
+  position: absolute;
+  margin: 0;
+}
+
+.ProseMirror-gapcursor:after {
+  content: "";
+  display: block;
+  position: absolute;
+  top: -2px;
+  width: 20px;
+  border-top: 1px solid black;
+  animation: ProseMirror-cursor-blink 1.1s steps(2, start) infinite;
+}
+
+@keyframes ProseMirror-cursor-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+.ProseMirror-hideselection *::selection {
+  background: transparent;
+}
+
+.ProseMirror-hideselection *::-moz-selection {
+  background: transparent;
+}
+
+.ProseMirror-hideselection * {
+  caret-color: transparent;
+}
+
+.ProseMirror-focused .ProseMirror-gapcursor {
+  display: block;
+}
+
+/* ReadyPackets editor content (mirrors the e-mail subset). */
+.rp-editor { outline: none; }
+.rp-editor > * + * { margin-top: 0.75rem; }
+.rp-editor h2 { font-size: 1.25rem; font-weight: 700; color: var(--color-ink); }
+.rp-editor h3 { font-size: 1.0625rem; font-weight: 600; color: var(--color-ink); }
+.rp-editor ul { list-style: disc; padding-left: 1.5rem; }
+.rp-editor ol { list-style: decimal; padding-left: 1.5rem; }
+.rp-editor a { color: var(--color-action); text-decoration: underline; text-underline-offset: 2px; }
+.rp-editor a[data-rp-button] {
+  display: inline-block;
+  border-radius: var(--radius-control);
+  background-color: var(--color-action);
+  color: var(--color-on-action);
+  padding: 0.5rem 1rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+.rp-editor img { max-width: 100%; height: auto; border-radius: var(--radius-control); }
+.rp-editor img.ProseMirror-selectednode { outline: 2px solid var(--color-action); outline-offset: 2px; }
+.rp-editor hr { border: 0; border-top: 1px solid var(--color-line); margin: 1rem 0; }
+.rp-editor .rp-variable-chip {
+  display: inline-block;
+  border: 1px solid var(--color-line);
+  border-radius: 9999px;
+  background-color: var(--color-action-soft);
+  color: var(--color-ink);
+  padding: 0 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+.rp-editor .rp-variable-chip.ProseMirror-selectednode { outline: 2px solid var(--color-action); outline-offset: 1px; }

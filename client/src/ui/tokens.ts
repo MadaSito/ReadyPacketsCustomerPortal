@@ -104,6 +104,7 @@ export const RENDERED_PAIRS: ReadonlyArray<readonly [TokenName, TokenName, numbe
   ["ink", "warning-soft", 4.5],
   ["ink", "danger-soft", 4.5],
   ["ink", "info-soft", 4.5],
+  ["ink", "action-soft", 4.5],
   ["on-navy", "navy", 4.5],
   ["on-navy-muted", "navy", 4.5],
 ];

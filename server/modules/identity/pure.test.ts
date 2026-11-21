@@ -4,6 +4,7 @@ import { TRANSITION_STEPS } from "../../../shared/domain.js";
 import { decodeCursor, encodeCursor } from "./admin.js";
 import { customerRefSchema, deviceSummary, emailSchema, namePrefixes, nameSchema, normalizeEmail } from "./normalize.js";
 import { checkPassword } from "./password/policy.js";
+import { generateCustomerRef } from "./users.js";
 import { deriveSteps, type TransitionFacts } from "./transitions.js";
 
 const STRONG = "copper lantern drifts beyond quiet harbor";
@@ -107,6 +108,30 @@ describe("normalization", () => {
     expect(nameSchema.safeParse("").success).toBe(false);
     expect(customerRefSchema.parse("rp-abc1234")).toBe("RP-ABC1234");
     for (const bad of ["AB", "-ABC", "ABC-", "AB--CD", "AB CD", "A".repeat(33)]) expect(customerRefSchema.safeParse(bad).success).toBe(false);
+  });
+  it("generates customer IDs as RPCUS- plus nine random characters from 0-9 and A-Z", () => {
+    const seen = new Set<string>();
+    const counts = new Map<string, number>();
+    const total = 20_000;
+    for (let i = 0; i < total; i += 1) {
+      const ref = generateCustomerRef();
+      expect(ref).toMatch(/^RPCUS-[0-9A-Z]{9}$/);
+      expect(customerRefSchema.parse(ref)).toBe(ref);
+      seen.add(ref);
+      for (const ch of ref.slice(6)) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+    }
+    // No repeats in a sample this small (a repeat would point at a broken random source).
+    expect(seen.size).toBe(total);
+    // All 36 characters occur, each close to the expected share (5000 per character; wide tolerance).
+    expect(counts.size).toBe(36);
+    for (const n of counts.values()) {
+      expect(n).toBeGreaterThan(4300);
+      expect(n).toBeLessThan(5700);
+    }
+    // Consecutive IDs are unrelated: never numerically adjacent in base 36.
+    const a = BigInt(parseInt(generateCustomerRef().slice(6), 36));
+    const b = BigInt(parseInt(generateCustomerRef().slice(6), 36));
+    expect(a === b + 1n || b === a + 1n).toBe(false);
   });
   it("derives 3-letter name prefixes and coarse device summaries", () => {
     expect(namePrefixes("Ana María López")).toEqual({ first: "ana", last: "lóp" });

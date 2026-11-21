@@ -1,6 +1,6 @@
 # ReadyPackets portal — threat model
 
-Status: first complete draft, 2026-11-20. Owner of this document: orders_engineer. Scope is the self-hosted
+Status: base draft 2026-11-20, with the increment 03 review scope in §10. Owner of this document: orders_engineer. Scope is the self-hosted
 customer portal at `my.readypackets.com` in this repository. It is a design-and-source document. It is not a
 penetration test, an OWASP certification or an ASVS attestation. Controls marked "tested" carry the evidence
 class of their test (see `docs/verification/REQUIREMENTS_REGISTER.md`): unit tests, synthetic MySQL, loopback
@@ -273,11 +273,27 @@ file handle, COMP-01–03, IPv6 transition classification. Client C-01–C-05 an
   tested for specific interleavings, not proven globally.
 - **Supply chain.** No SCA, SBOM, provenance or release signing.
 
-## 10. Non-goals (explicit)
+## 10. Increment 03 trust boundaries and validation gates
+
+Increment 03 adds optional provider and data flows; all are disabled by default under the increment contract.
+Use [the independent findings ledger](INCREMENT_03_REVIEW.md) for current findings and fix verification.
+The controls below are review gates unless labelled verified. No live Entra tenant, audit mailbox, cloud storage
+or SharePoint destination is verified here. The historical base sections above are not a current deployment inventory.
+
+| Boundary | Main abuse case | Control and evidence boundary |
+| --- | --- | --- |
+| Browser and Entra to the portal | Callback replay, login CSRF, takeover via linking or stale step-up | Require exact canonical callback, single-use purpose/session/browser-bound state, PKCE, nonce, strict token claims, and a verified tenant/object link. Apply remediation before access and do not allow an email collision to link identities. Require fresh MFA from the same identity before Entra step-up. Final session issuance serializes with SSO configuration changes (I-A02; three MySQL race regressions passed). Native and container proxy refusal is verified in source; runtime is a separate gate. |
+| Identity administration to local recovery | Unavailable or compromised IdP leaves no usable local administrator | Serialize removal of local credential paths and enforce the last local-MFA administrator invariant across role, status and factor changes. Role/status mutation uses the Assurance policy lock and same-transaction invariant check (I-A01). Host-only recovery must durably audit credential reset and session revocation without logging the temporary password; service tests do not verify the host wrapper. |
+| Mail transports, audit mailbox and stored content | Duplicate sends; secrets in copied, retained or rendered content | Do not replay ambiguous submissions or fail over on a permanent/policy rejection. Graph requires HTTP 202 for acceptance; SMTP uses the same effective sender passed by Jobs. Render redacted copies from masked inputs; verify audit mailbox control; encrypt, expire and audit stored content behind live step-up. The Jobs view uses inert source text. Graph/SMTP local integration tests passed; no live mailbox proof was performed. |
+| Template/editor preview to browser | Stored script, tracking request, navigation or network data exfiltration | Sanitize delivery HTML and validate typed placeholders. Preview semantic HTML only with tokenless sandboxed `srcdoc`, child CSP and no navigation/network sinks; otherwise render text. Do not relax the portal CSP for the canvas or editor. Verify functionality and absence of network/navigation in a real browser. |
+| Audit tap to automation worker and external receivers | Internal event becomes public, recursive automation, duplicate dispatch, escaped audit transaction | Validate catalogue projections and live recipients; carry an origin marker through jobs and mail; deduplicate event/version/action and use fences, limits and signed bounded webhook delivery. Staff-only triggers may produce only in-app notifications: mail and external actions default-deny. Notifications persist the audience, suppress secondary mail and use same-statement live-role predicates on reads and mutations. A missing savepoint must fail closed; see J-A01/J-A02. MySQL/local-fake regression evidence is recorded in the ledger. |
+| Portal to OAuth/storage and SharePoint | Credential substitution, redirect or resumable-session SSRF, revoked assignment still copies customer bytes | Bind OAuth state to actor, session, provider and connection revision. The callback stages only an encrypted code; a first-party CSRF POST with the original persisted session and live authority is required for exchange (G-O01; local MySQL/HTTP tests with synthetic provider transport). Require exact provider lineage and central egress, no Graph bearer on upload-session URLs. Recheck destination generation and scope before each write; an already in-flight upload cannot be recalled. SharePoint also needs dispatch-time settings enforcement and uniqueness across jobs. Local files remain authoritative; remote backups must be verified and encrypted before copy. |
+
+## 11. Non-goals (explicit)
 
 - Native iOS/Android apps (Day-2, MP §3).
 - Public marketing site and its SEO/GEO/AEO (ADR 0010).
-- Enterprise SSO (SAML/Entra) and SharePoint — disabled scaffolds only.
+- SAML and multi-tenant federation. The increment adds optional single-tenant Entra OIDC and SharePoint integrations.
 - Offline authenticated data, background upload, push notifications (MP §3 requires separate threat models).
 - Defending against a compromised host root or a holder of the installation keys.
 - Exactly-once delivery to any external system (at-least-once with idempotency and `unknown` outcomes instead).
@@ -288,3 +304,4 @@ file handle, COMP-01–03, IPv6 transition classification. Client C-01–C-05 an
 
 - 2026-11-20 — first complete draft (orders_engineer).
 - 2026-11-20 — AC-11 (increment 02 pricing and offerings import) added (orders_engineer).
+- 2026-11-21 — Increment 03 boundary, review gates and evidence distinctions added (http_security_engineer).

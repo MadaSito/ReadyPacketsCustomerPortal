@@ -14,6 +14,10 @@ export type RetentionPolicy = Outputs["backup"]["admin"]["retentionPolicy"];
 export type ContinuityMode = RestoreDrill["continuityMode"];
 export type RetentionInput = Inputs["backup"]["admin"]["updateRetentionPolicy"];
 export type RetentionPlan = Outputs["backup"]["admin"]["previewRetention"];
+export type OffsiteConfig = Outputs["backup"]["admin"]["offsiteConfig"];
+export type OffsiteDestination = OffsiteConfig["destinations"][number];
+export type Backup321 = OffsiteConfig["status321"];
+export type RemoteCopy = Archive["remoteCopies"][number];
 
 export const BASE = "/admin/backups";
 export const PUBLIC_ID = /^[A-Za-z0-9_-]{10,64}$/;
@@ -45,6 +49,23 @@ export const KEEP_REASON_LABELS: Record<string, string> = {
   within_retention_count: "Within keep count",
   within_retention_age: "Within maximum age",
   non_terminal_or_unknown: "Not finished or outcome unknown",
+};
+
+export const PROVIDER_KIND_LABELS: Record<string, string> = {
+  local_disk: "Local disk",
+  s3: "S3-compatible object storage",
+  azure_blob: "Azure Blob Storage",
+  dropbox: "Dropbox",
+  google_drive: "Google Drive",
+  sharepoint: "Microsoft SharePoint",
+  onedrive: "Microsoft OneDrive",
+};
+
+export const DIGEST_KIND_LABELS: Record<string, string> = {
+  sha256: "SHA-256 verified",
+  md5: "MD5 transport digest verified",
+  quickxor: "QuickXOR digest verified",
+  size_only: "Byte size verified",
 };
 
 export function formatBytes(bytes: number | null | undefined): string | null {

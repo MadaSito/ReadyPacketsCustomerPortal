@@ -62,7 +62,7 @@ async function environment(t: TestDb, installationId: string) {
         return value ? {
           sessionId, userId: value.userId, userPublicId: value.userPublicId, role: "admin", userStatus: "active", live: true,
           revokedAt: null, mfaVerifiedAt: value.mfaVerifiedAt, stepUpAt: value.stepUpAt,
-          absoluteExpiresAt: new Date(h.clock.now().getTime() + 24 * 60 * 60_000),
+          absoluteExpiresAt: new Date(h.clock.now().getTime() + 24 * 60 * 60_000), authMethod: "local" as const,
         } : null;
       },
     },

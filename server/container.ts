@@ -38,6 +38,11 @@ import { createJobsModule, type JobsModule } from "./modules/jobs/index.js";
 import { createPortableModule, type PortableModule } from "./modules/portable/index.js";
 import { createBackupModule, type BackupModule } from "./modules/backup/index.js";
 import { createIntegrationsModule, type IntegrationsModule } from "./modules/integrations/index.js";
+import { createStorageModule, type StorageModule } from "./modules/storage/index.js";
+import { registerStorageOAuthAdapters } from "./modules/storage/oauth/register.js";
+import { createSharepointModule, type SharepointModule } from "./modules/sharepoint/index.js";
+import { createMailTemplatesModule, type MailTemplatesModule } from "./modules/mailTemplates/index.js";
+import { createAutomationsModule, type AutomationsModule } from "./modules/automations/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -55,6 +60,10 @@ export interface ModuleRegistry {
   portable: PortableModule;
   backup: BackupModule;
   integrations: IntegrationsModule;
+  storageConnections: StorageModule;
+  sharepoint: SharepointModule;
+  mailTemplates: MailTemplatesModule;
+  automations: AutomationsModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -119,6 +128,11 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.portable = createPortableModule(deps);
   services.backup = createBackupModule(deps);
   services.integrations = createIntegrationsModule(deps);
+  services.storageConnections = createStorageModule(deps);
+  registerStorageOAuthAdapters(services);
+  services.sharepoint = createSharepointModule(deps);
+  services.mailTemplates = createMailTemplatesModule(deps);
+  services.automations = createAutomationsModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -139,6 +153,10 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.portable,
     services.backup,
     services.integrations,
+    services.storageConnections,
+    services.sharepoint,
+    services.mailTemplates,
+    services.automations,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();

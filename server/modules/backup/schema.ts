@@ -29,6 +29,9 @@ export type ContinuityMode = (typeof CONTINUITY_MODES)[number];
 export const KEY_READINESS_STATES = ["ready", "missing_data_keys", "unknown"] as const;
 export type KeyReadinessState = (typeof KEY_READINESS_STATES)[number];
 
+export const VERIFIED_DIGEST_KINDS = ["sha256", "md5", "quickxor", "size_only"] as const;
+export type VerifiedDigestKind = (typeof VERIFIED_DIGEST_KINDS)[number];
+
 export interface StoredContinuityReport {
   continuityMode: ContinuityMode;
   sessionsRevoked: number;
@@ -170,3 +173,43 @@ export const backupLegalHolds = mysqlTable(
   (t) => [index("backup_legal_holds_active_idx").on(t.backupId, t.releasedAt)],
 );
 export type BackupLegalHoldRow = typeof backupLegalHolds.$inferSelect;
+
+/**
+ * Per-backup, per-destination off-site copy ledger (Increment 03, Package L).
+ * Stores opaque ReadyPackets ULIDs, safe provider kinds/labels, and digest verification evidence only —
+ * NEVER remote provider IDs, bucket names, URLs, or credentials. Remote copies are never deleted by the portal.
+ */
+export const backupRemoteCopies = mysqlTable(
+  "backup_remote_copies",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    backupId: refColumn("backup_id")
+      .notNull()
+      .references(() => backupArchives.id, { onDelete: "restrict" }),
+    connectionPublicId: varchar("connection_public_id", { length: 64 }).notNull(),
+    providerKind: varchar("provider_kind", { length: 32 }).notNull(),
+    connectionName: varchar("connection_name", { length: 120 }).notNull(),
+    destinationVersion: int("destination_version", { unsigned: true }).notNull().default(1),
+    state: mysqlEnum("state", OPERATION_STATES).notNull().default("queued"),
+    objectName: varchar("object_name", { length: 160 }).notNull(),
+    verifiedBytes: bigint("verified_bytes", { mode: "number", unsigned: true }),
+    archiveSha256: char("archive_sha256", { length: 64 }).notNull(),
+    digestVerified: boolean("digest_verified").notNull().default(false),
+    verifiedDigestKind: varchar("verified_digest_kind", { length: 16 }).$type<VerifiedDigestKind | null>(),
+    attemptCount: int("attempt_count", { unsigned: true }).notNull().default(0),
+    jobPublicId: varchar("job_public_id", { length: 64 }),
+    reasonCode: varchar("reason_code", { length: 64 }),
+    startedAt: utcDateTime("started_at"),
+    completedAt: utcDateTime("completed_at"),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("backup_remote_copies_archive_conn_uq").on(t.backupId, t.connectionPublicId),
+    index("backup_remote_copies_state_updated_idx").on(t.state, t.updatedAt, t.id),
+    index("backup_remote_copies_conn_idx").on(t.connectionPublicId, t.state),
+  ],
+);
+export type BackupRemoteCopyRow = typeof backupRemoteCopies.$inferSelect;
+

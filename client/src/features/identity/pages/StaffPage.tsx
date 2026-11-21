@@ -9,7 +9,7 @@ import {
   PageHeader, RadioGroup, Select, StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { MoreHorizontal } from "lucide-react";
-import { PreviewLinkNotice, ROLE_LABELS, STATUS_FILTER_OPTIONS, UserStatusBadge, type UserStatus } from "../shared";
+import { PreviewLinkNotice, ROLE_LABELS, STATUS_FILTER_OPTIONS, UserStatusBadge, SignInMethodBadges, type UserStatus } from "../shared";
 import { StatusDialog, type StatusTarget } from "./StatusActions";
 
 type Page = Awaited<ReturnType<ReturnType<typeof useTRPCClient>["identity"]["admin"]["staff"]["list"]["query"]>>;
@@ -77,6 +77,7 @@ export default function StaffPage() {
             { key: "email", header: "E-mail", cell: (row) => <span className="break-all">{row.email}</span> },
             { key: "role", header: "Role", cell: (row) => <Badge tone={row.role === "admin" ? "info" : "neutral"}>{ROLE_LABELS[row.role]}</Badge> },
             { key: "status", header: "Status", cell: (row) => <UserStatusBadge status={row.status} /> },
+            { key: "signIn", header: "Sign-in method", hideOnMobile: true, cell: (row) => <SignInMethodBadges methods={row.signInMethods} /> },
             { key: "createdAt", header: "Added", hideOnMobile: true, cell: (row) => <DateTime value={row.createdAt} format="date" /> },
           ]}
           rowActions={(row) =>

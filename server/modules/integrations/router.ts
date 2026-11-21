@@ -3,7 +3,7 @@
  */
 import { z } from "zod";
 import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
-import { EGRESS_PROTOCOLS, EGRESS_PURPOSES } from "./egress.js";
+import { EGRESS_PRESET_KEYS, EGRESS_PROTOCOLS, EGRESS_PURPOSES } from "./egress.js";
 
 const manageProcedure = adminProcedure.use(requireCapability("integrations.manage"));
 const productionTriggerProcedure = staffProcedure.use(requireCapability("orders.production.trigger"));
@@ -18,14 +18,33 @@ const updateSmtpInputSchema = z.strictObject({
   tlsMode: z.enum(["starttls", "implicit"]),
   username: z.string().trim().max(254),
   password: z.string().max(1024).nullable().optional(),
-  fromAddress: z.string().trim().max(254),
-  fromName: z.string().trim().max(120),
+  fromAddress: z.string().trim().max(254).optional(),
+  fromName: z.string().trim().max(120).optional(),
   replyToAddress: z.string().trim().max(254).optional(),
 });
 
-const sendTestSmtpSchema = z.strictObject({
-  toAddress: z.string().trim().min(3).max(254),
+const sendTestSmtpSchema = z
+  .strictObject({
+    toAddress: z.string().trim().min(3).max(254).optional(),
+  })
+  .default({});
+
+const updateGraphInputSchema = z.strictObject({
+  enabled: z.boolean(),
+  tenantId: z.string().trim().max(64),
+  clientId: z.string().trim().max(64),
+  clientSecret: z.string().max(1024).nullable().optional(),
+  senderMailbox: z.string().trim().max(254).optional(),
+  enableEgressPreset: z.boolean().optional(),
 });
+
+const emptyOrOptionalObjectSchema = z.strictObject({}).default({});
+
+const sendTestGraphSchema = z
+  .strictObject({
+    toAddress: z.string().trim().min(3).max(254).optional(),
+  })
+  .default({});
 
 const updateAnalyticsInputSchema = z.strictObject({
   clarityEnabled: z.boolean(),
@@ -82,6 +101,18 @@ const deleteEgressRuleSchema = z.strictObject({
 const checkEgressTargetSchema = z.strictObject({
   target: z.string().trim().min(3).max(2048),
   purpose: z.enum(EGRESS_PURPOSES),
+});
+
+const setEgressPresetSchema = z.strictObject({
+  presetKey: z.enum(EGRESS_PRESET_KEYS),
+  enabled: z.boolean(),
+  params: z
+    .strictObject({
+      region: z.string().trim().max(48).optional(),
+      bucket: z.string().trim().max(64).optional(),
+      accountName: z.string().trim().max(32).optional(),
+    })
+    .optional(),
 });
 
 const productionPhaseSchema = z.enum(["P101", "P201"]);
@@ -149,13 +180,30 @@ export const integrationsRouter = router({
 
     smtp: router({
       get: adminProcedure.query(({ ctx }) => ctx.services.integrations.smtp.getConfig()),
-      update: manageProcedure
+      update: adminProcedure
         .input(updateSmtpInputSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.smtp.updateConfig(ctx.session, input)),
-      sendTest: manageProcedure
+      sendTest: adminProcedure
         .meta({ rateLimit: "expensive" })
         .input(sendTestSmtpSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.smtp.sendTestMessage(ctx.session, input)),
+    }),
+
+    graphReadiness: adminProcedure.query(({ ctx }) => ctx.services.integrations.graphAdmin.getReadiness()),
+
+    graph: router({
+      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.graphAdmin.getConfig()),
+      update: adminProcedure
+        .input(updateGraphInputSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.updateConfig(ctx.session, input)),
+      testConnection: adminProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(emptyOrOptionalObjectSchema)
+        .mutation(({ ctx }) => ctx.services.integrations.graphAdmin.testConnection(ctx.session)),
+      sendTest: adminProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(sendTestGraphSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.sendTestMessage(ctx.session, input)),
     }),
 
     analytics: router({
@@ -185,6 +233,10 @@ export const integrationsRouter = router({
 
     egress: router({
       list: adminProcedure.query(({ ctx }) => ctx.services.integrations.egress.listAllowlist()),
+      presets: adminProcedure.query(({ ctx }) => ctx.services.integrations.egress.listPresets()),
+      setPreset: adminProcedure
+        .input(setEgressPresetSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.egress.setPresetEnabled(ctx.session, input)),
       create: manageProcedure
         .input(createEgressRuleSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.egress.createAllowlistRule(ctx.session, input)),

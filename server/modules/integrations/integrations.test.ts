@@ -205,6 +205,22 @@ describe("integrations module — DB-backed integration suite", () => {
     h.deps.settings = realSettings;
     h.services.settings = realSettings;
     (h.services as unknown as { identity: unknown }).identity = {
+      getUser: async (userId: number, opts?: { tx?: Tx }) => ({
+        id: userId,
+        publicId: "01JADMINUSER00000000000001",
+        role: "admin",
+        status: "active",
+        email: "ops@readypackets.example",
+        name: "Ops Admin",
+        customerRef: null,
+        emailVerified: true,
+        authSource: "local",
+        mustChangePassword: false,
+        hasPassword: true,
+        createdAt: h.clock.now(),
+        version: 1,
+        ...(opts?.tx ? {} : {}),
+      }),
       sessions: {
         assertCurrent: async (p: SessionPrincipal, tx?: Tx) => {
           expect(tx).toBeDefined();
@@ -392,6 +408,7 @@ describe("integrations module — DB-backed integration suite", () => {
     const initialHealth = await mod.health();
     expect(initialHealth.map((c) => [c.component, c.state])).toEqual([
       ["mail.smtp", "not_configured"],
+      ["mail.graph", "not_configured"],
       ["integrations.clarity", "not_configured"],
       ["integrations.posthog", "not_configured"],
       ["integrations.stripe", "disabled"],
@@ -616,6 +633,21 @@ describe("integrations module — DB-backed integration suite", () => {
     expect(sendMailInvocations).toBe(0);
 
     (h.services as unknown as { identity: unknown }).identity = {
+      getUser: async (userId: number) => ({
+        id: userId,
+        publicId: "01JADMINUSER00000000000001",
+        role: "admin",
+        status: "active",
+        email: "ops@readypackets.example",
+        name: "Ops Admin",
+        customerRef: null,
+        emailVerified: true,
+        authSource: "local",
+        mustChangePassword: false,
+        hasPassword: true,
+        createdAt: h.clock.now(),
+        version: 1,
+      }),
       sessions: { assertCurrent: async (p: SessionPrincipal) => p },
     };
     h.audit.failRecords = true;
@@ -1060,6 +1092,22 @@ describe("integrations module — DB-backed integration suite", () => {
 
     // Restore healthy `assertCurrent`
     (h.services as unknown as { identity: unknown }).identity = {
+      getUser: async (userId: number, opts?: { tx?: Tx }) => ({
+        id: userId,
+        publicId: "01JADMINUSER00000000000001",
+        role: "admin",
+        status: "active",
+        email: "ops@readypackets.example",
+        name: "Ops Admin",
+        customerRef: null,
+        emailVerified: true,
+        authSource: "local",
+        mustChangePassword: false,
+        hasPassword: true,
+        createdAt: h.clock.now(),
+        version: 1,
+        ...(opts?.tx ? {} : {}),
+      }),
       sessions: {
         assertCurrent: async (p: SessionPrincipal, tx?: Tx) => {
           expect(tx).toBeDefined();

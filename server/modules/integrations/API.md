@@ -6,14 +6,28 @@ Owner: `integrations_engineer` (`server/modules/integrations/**`, `client/src/fe
 
 ## 1. Module Service Surface (`services.integrations: IntegrationsModule`)
 
-Implements `ModuleLifecycle` (`name: "integrations"`, `start()`, `stop()`, `health()`).
+Implements `ModuleLifecycle` (`init()`, `start()`, `stop()`, `health()`).
 
 ### 1.1 Outbound Egress & SSRF Policy (`services.integrations.egress`)
 
-Every outbound network connection made by the portal (`siem`, `smtp`, `webhook`, `sharepoint`, `stripe`, `antivirus`) **must** call `assertAllowed` first and connect **only** to the returned pinned IP address (`address` + `family`) while passing `servername` for TLS SNI/certificate verification (`createPinnedLookup(pinned)` + `family: pinned.family` + `autoSelectFamily: false` in Node 22).
+Every outbound network connection made by the portal **must** go through `egress` (`assertAllowed` / `resolveAndAssertAllowed` / `fetchPinned`) and connect **only** to the returned pinned IP address (`address` + `family`) while passing `servername` for TLS SNI/certificate verification (`createPinnedLookup(pinned)` + `family: pinned.family` + `autoSelectFamily: false` in Node 22).
 
 ```ts
-export const EGRESS_PURPOSES = ["siem", "smtp", "webhook", "sharepoint", "stripe", "antivirus"] as const;
+export const EGRESS_PURPOSES = [
+  "siem",
+  "smtp",
+  "webhook",
+  "sharepoint",
+  "stripe",
+  "antivirus",
+  "graph",
+  "graph_upload",
+  "entra_oidc",
+  "storage_s3",
+  "storage_azure",
+  "storage_dropbox",
+  "storage_gdrive",
+] as const;
 export type EgressPurpose = (typeof EGRESS_PURPOSES)[number];
 
 export const EGRESS_PROTOCOLS = ["https:", "tls:", "smtp:", "smtps:"] as const;
@@ -21,116 +35,251 @@ export type EgressProtocol = (typeof EGRESS_PROTOCOLS)[number];
 
 export type EgressMatchType = "host" | "ip" | "cidr";
 
-export interface PinnedEgressTarget {
-  hostname: string;
-  port: number;
-  protocol: EgressProtocol;
-  address: string;
-  family: 4 | 6;
-  servername?: string;
-  normalizedUrl?: string;
-  allowlistRulePublicId?: string;
+export interface EgressFetchOptions {
+  method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+  headers?: Record<string, string>;
+  body?: string | Uint8Array | NodeJS.ReadableStream;
+  /** Required when `body` is a `NodeJS.ReadableStream` (`bodyLength` accepted as an alias); safe integer 0..5_368_709_120 (5 GiB). */
+  contentLength?: number;
+  bodyLength?: number;
+  maxRequestBytes?: number;
+  /** Default 10_000 ms; configurable 100..30_000 ms (or up to 600_000 ms when `body` is a stream). */
+  timeoutMs?: number;
+  /** Default 262_144 bytes (256 KiB); configurable 1_024..16_777_216 bytes (16 MiB). */
+  maxResponseBytes?: number;
+  signal?: AbortSignal;
+  requireAllowlistRule?: boolean;
+  publicAddressesOnly?: boolean;
+  /** Optional credential-bound host/suffix lineage guard (`exact` or `.suffix`). */
+  expectedHostSuffixes?: readonly string[];
+  /**
+   * Permits HTTP `308 Resume Incomplete` ONLY when `purpose === "storage_gdrive"` and `method === "PUT"`.
+   * Strips any `Location` header from returned headers and never follows redirects.
+   */
+  acceptUploadIncomplete?: boolean;
+}
+
+export interface EgressFetchResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+export const EGRESS_PRESET_KEYS = [
+  "microsoft_graph",
+  "microsoft_graph_upload",
+  "entra_oidc",
+  "dropbox",
+  "google_drive",
+  "amazon_s3",
+  "wasabi_s3",
+  "backblaze_b2",
+  "azure_blob",
+] as const;
+export type EgressPresetKey = (typeof EGRESS_PRESET_KEYS)[number];
+
+export interface EgressPresetParams {
+  region?: string;
+  bucket?: string;
+  accountName?: string;
+}
+
+export interface EgressPresetView {
+  key: EgressPresetKey;
+  label: string;
+  purpose: EgressPurpose;
+  parameterized: boolean;
+  hosts: readonly string[];
+  enabled: boolean;
+  matchingRulePublicIds: readonly string[];
+}
+
+export interface SetEgressPresetInput {
+  presetKey: EgressPresetKey;
+  enabled: boolean;
+  params?: EgressPresetParams;
 }
 ```
 
-- Refuses loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`, `fe80::/10`), cloud metadata (`169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, `metadata.google.internal`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast/reserved (`240.0.0.0/4`), IPv4-mapped/compatible/SIIT/NAT64/6to4/Teredo transition IPv6 forms (`::ffff:0:0/96`, `::ffff:0:0:0/96`, `64:ff9b::/96`, `2002::/16`, `2001::/32`), RFC 9637 documentation (`3fff::/20`, `2001:db8::/32`), octal/hex/decimal/shorthand IPv4 encodings (`0177.0.0.1`, `0x7f000001`, `2130706433`, `127.1`), and `.localhost` / `.local` / `.internal` hostnames.
-- Refuses private RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), RFC 4193 ULA (`fc00::/7`), CGNAT (`100.64/10`), and non-default ports **unless** an explicit administrator allowlist rule (`integration_egress_allowlist`) matches `(purpose, protocol, port, host/ip/cidr)` and has `allowPrivateAddress = true` when the resolved IP is private. Cloud metadata, link-local, multicast, production loopback, and IPv4-transition IPv6 addresses can **never** be allowlisted.
-- `createPinnedLookup(pinned)` supports both scalar `(address, family)` callbacks and Node >=20 `autoSelectFamily` `{ all: true }` `LookupAddress[]` callbacks without touching OS DNS.
-- Enforces a 5 s DNS lookup deadline (`EGRESS_DNS_TIMEOUT`), a total wall-clock HTTP request deadline (`EGRESS_TIMEOUT`), and refuses all HTTP `3xx` redirects (`EGRESS_REDIRECT_REFUSED`).
-- Supports `requireAllowlistRule?: boolean` (`EGRESS_ALLOWLIST_REQUIRED`) and `publicAddressesOnly?: boolean` (`EGRESS_NON_PUBLIC_ADDRESS_BLOCKED`) inside the single `evaluateTarget` / `fetchPinned` evaluation that returns the actual `PinnedEgressTarget` dial pin (`resolvedAddresses?: readonly string[]`), eliminating any split DNS check-vs-connect TOCTOU window.
+- **Mandatory cloud-purpose policy (`graph`, `graph_upload`, `entra_oidc`, `storage_s3`, `storage_azure`, `storage_dropbox`, `storage_gdrive`)**:
+  - HTTPS (`https:` on port `443`) only.
+  - `requireAllowlistRule = true` and `publicAddressesOnly = true` are **always** enforced inside `egress.ts` regardless of caller options (`allowPrivateAddress: true` rules are rejected for these purposes).
+  - `graph_upload` additionally hard-refuses `Authorization`, `Cookie`, and `Proxy-Authorization` headers (`EGRESS_FORBIDDEN_UPLOAD_HEADER`) and supports curated suffix patterns `*.sharepoint.com` and `*.files.1drv.com` (never broad cloud-compute wildcards).
+  - Streaming uploads (`body: Readable`, `contentLength: number`) pipe without whole-file buffering, enforce exact byte count against `contentLength`, and never follow redirects.
+- **Provider allowlist presets (`egress.listPresets()`, `egress.setPresetEnabled(principal, input)`)**:
+  - Ship **disabled** (`enabled: false`, zero pre-seeded active allowlist rows).
+  - Fixed-host presets:
+    - `microsoft_graph` (`purpose: "graph"`): `login.microsoftonline.com`, `graph.microsoft.com`
+    - `microsoft_graph_upload` (`purpose: "graph_upload"`): `*.sharepoint.com`, `*.files.1drv.com`
+    - `entra_oidc` (`purpose: "entra_oidc"`): `login.microsoftonline.com`
+    - `dropbox` (`purpose: "storage_dropbox"`): `api.dropboxapi.com`, `content.dropboxapi.com`
+    - `google_drive` (`purpose: "storage_gdrive"`): `oauth2.googleapis.com`, `www.googleapis.com`
+  - Parameterized exact-host storage presets (never wildcard `*.amazonaws.com` or `*.blob.core.windows.net`):
+    - `amazon_s3` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.amazonaws.com` (+ `<bucket>.s3.<region>.amazonaws.com` when `bucket` supplied)
+    - `wasabi_s3` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.wasabisys.com` (+ `<bucket>.s3.<region>.wasabisys.com` when `bucket` supplied)
+    - `backblaze_b2` (`purpose: "storage_s3"`, `{ region, bucket? }`): `s3.<region>.backblazeb2.com` (+ `<bucket>.s3.<region>.backblazeb2.com` when `bucket` supplied)
+    - `azure_blob` (`purpose: "storage_azure"`, `{ accountName }`): `<accountName>.blob.core.windows.net`
+  - Custom S3-compatible endpoints use `egress.createAllowlistRule` with `purpose: "storage_s3"`, `matchType: "host"`, `protocol: "https:"`, `port: 443`, `allowPrivateAddress: false`.
+  - `setPresetEnabled` authorizes administrators holding `integrations.manage` or the matching domain step-up capability (`mail.manage`, `storage.manage`, or `identity.sso.manage`), re-validated in-transaction via `identity.sessions.assertCurrent(principal, tx)`.
 
-### 1.2 Provider Registry & Health (`services.integrations.providers`)
+### 1.2 Microsoft Graph Core & Graph Mail (`services.integrations.graph`, `services.integrations.graphAdmin`, `services.integrations.createScopedGraphClient`)
+
+Single Microsoft Graph client implementation (`server/modules/integrations/graph/**`) shared exclusively by Graph Mail, SharePoint document libraries / list sync, and OneDrive for Business.
 
 ```ts
-export type ProviderKey = "smtp" | "clarity" | "posthog" | "stripe" | "saml" | "sharepoint";
-export type ProviderState = "disabled" | "not_configured" | "configured" | "degraded" | "failing";
+export interface GraphCredentialsInput {
+  /** Single-tenant Entra directory GUID only (`common`, `organizations`, `consumers` refused). */
+  tenantId: string;
+  /** Entra application (client) GUID. */
+  clientId: string;
+  clientSecret: string;
+  /** Optional caller version tag bound into the token-cache isolation key. */
+  credentialVersion?: string | number;
+}
 
-export interface ProviderStatus {
-  key: ProviderKey;
-  name: string;
-  state: ProviderState;
-  verified: boolean;
-  scaffoldOnly: boolean;
-  lastCheckedAt: Date | null;
-  summary: string;
+export interface GraphRequestInput {
+  method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+  /** Relative v1.0 Graph path starting with `/` (e.g. `"/sites/root"`, `"/users/ops%40example.com/sendMail"`). */
+  path: string;
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: unknown;
+  rawBody?: Uint8Array;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  signal?: AbortSignal;
+  /** Runs after token acquisition + DNS/allowlist resolution and directly before opening the HTTPS socket (G-02). */
+  beforeSend?: () => Promise<void>;
+}
+
+export interface GraphResponse<T = unknown> {
+  status: number;
+  headers: Record<string, string>;
+  rawBody: Buffer;
+  json<U = T>(): U;
+}
+
+export interface GraphUploadChunkInput {
+  /** Pre-authenticated capability URL returned by Graph `createUploadSession` (`https:` on 443). */
+  uploadUrl: string;
+  bytes: Uint8Array;
+  /** e.g. `"bytes 0-327679/1048576"` */
+  contentRange: string;
+  /** Optional additional host/suffix lineage restriction (e.g. `[siteHostname, "*.files.1drv.com"]`). */
+  allowedHostSuffixes?: readonly string[];
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  beforeSend?: () => Promise<void>;
+}
+
+export interface GraphUploadSessionControlInput {
+  uploadUrl: string;
+  method: "GET" | "DELETE";
+  allowedHostSuffixes?: readonly string[];
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  beforeSend?: () => Promise<void>;
+}
+
+export interface GraphUploadChunkResult {
+  status: number;
+  headers: Record<string, string>;
+  rawBody: Buffer;
+  json<T = unknown>(): T | null;
+}
+
+export class GraphApiError extends DomainError {
+  readonly status: number | null;
+  readonly graphCode: string | null;
+  readonly retryable: boolean;
+  /** True only when the target Graph request may already have been transmitted over the wire. */
+  readonly requestSent: boolean;
+  readonly reason: string;
+}
+
+export interface GraphClient {
+  isConfigured(): Promise<boolean>;
+  request<T = unknown>(input: GraphRequestInput): Promise<GraphResponse<T>>;
+  uploadChunk(input: GraphUploadChunkInput): Promise<GraphUploadChunkResult>;
+  uploadSessionControl(input: GraphUploadSessionControlInput): Promise<GraphUploadChunkResult>;
 }
 ```
+
+- **Token acquisition & isolation**:
+  - `POST https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token` (`grant_type=client_credentials`, `scope=https://graph.microsoft.com/.default`) via `egress.fetchPinned(..., "graph")`.
+  - Single-tenant GUID strictly enforced (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`); `common`, `organizations`, and `consumers` are explicitly rejected.
+  - Access tokens are cached in volatile memory until `expires_in - 60s` (`deps.clock.now()`), isolated per `sha256(tenantId + ":" + clientId + ":" + credentialVersion + ":" + sha256(clientSecret))`, coalesced single-flight per key, cleared on credential/config change and `stop()`, and **never** logged, audited, or included in thrown errors.
+- **`createScopedGraphClient(credentials?: GraphCredentialsInput): GraphClient`**:
+  - When `credentials` is provided (e.g. decrypted per-connection SharePoint/OneDrive credentials), binds a `GraphClient` to those credentials while sharing the module's egress policy and isolated token cache. When omitted, returns `services.integrations.graph` (the installation Graph configuration).
+- **`uploadChunk` capability-URL safety (§4.1)**:
+  - Uses `purpose: "graph_upload"`, enforces host lineage (`*.sharepoint.com` or `*.files.1drv.com`, narrowed further by `allowedHostSuffixes` when supplied), strips/forbids `Authorization` and `Cookie`, and never logs `uploadUrl` paths or query strings.
+- **Graph Mail Transport (`key: "graph"`)**:
+  - Registered during `IntegrationsModule.init()` via `deps.services.jobAdmin.registerMailTransport(graphMailTransport)`.
+  - Calls `POST /v1.0/users/{encodeURIComponent(mailbox)}/sendMail` (`saveToSentItems: false`, application permission `Mail.Send`), using `senderMailbox` if configured on Graph settings or `MailTransportMessage.sender.fromAddress`.
+  - Outcome classification per Decision 8:
+    - Disabled / incomplete settings / `microsoft_graph` egress preset off -> `{ outcome: "not_configured", safeDetail: "graph_not_configured" }`.
+    - Pre-send token failure, DNS/egress denial, or explicit Graph `4xx` rejection (`400`/`401`/`403`/`404` `retryable: false`, `429` `retryable: true`) -> `{ outcome: "rejected", retryable, safeDetail }` (safe for secondary failover).
+    - HTTP `202` / `200` / `204` -> `{ outcome: "accepted", safeDetail: "graph_accepted" }`.
+    - Mid-flight timeout, connection drop, or `5xx` gateway ambiguity on `POST /sendMail` (`requestSent === true`) -> `{ outcome: "unknown", safeDetail: "graph_delivery_uncertain" }` (**never** replayed and **never** failed over).
+- **Restricting `Mail.Send` to a single mailbox in Exchange Online (operator guidance)**:
+  - Microsoft Graph `Mail.Send` application permission is tenant-wide by default unless scoped in Exchange Online RBAC for Applications:
+    1. Connect via `Connect-ExchangeOnline`.
+    2. Register the Entra enterprise app's service principal in Exchange Online: `New-ServicePrincipal -AppId <ClientAppId> -ObjectId <EnterpriseAppServicePrincipalObjectId> -DisplayName "ReadyPackets Portal Graph Mail"`.
+    3. Create a management scope targeting only the dedicated sender mailbox: `New-ManagementScope -Name "ReadyPacketsSenderMailboxOnly" -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'noreply@yourdomain.example'"`.
+    4. Assign `Application Mail.Send` restricted to that scope: `New-ManagementRoleAssignment -Name "ReadyPacketsGraphMailSendScoped" -App <ClientAppId> -Role "Application Mail.Send" -CustomResourceScope "ReadyPacketsSenderMailboxOnly"`.
+    5. Verify with `Test-ServicePrincipalAuthorization -Identity <ClientAppId> -Resource another-user@yourdomain.example` (`InScope: False`).
 
 ### 1.3 Outbound SMTP Transport (`services.integrations.smtp`)
 
-- Enforces TLS (`tlsMode: "starttls" | "implicit"`, `rejectUnauthorized: true`, `minVersion: "TLSv1.2"`, plaintext port 25 unconditionally forbidden with `SMTP_PORT_25_FORBIDDEN`), pins sockets through `egress.assertAllowed(..., "smtp")`, sanitizes CRLF/control header injection, and executes `sendTestMessage` in a 3-phase flow:
-  1. Short DB transaction: `assertIntegrationsManageInTx` (`identity.sessions.assertCurrent`) + read settings/secret + durable `integration.smtp.test_attempted` audit BEFORE revealing credentials or opening network sockets.
-  2. External SMTP send with zero DB connections/locks held.
-  3. Persist check result (`integration_provider_checks`) + `integration.smtp.tested` audit.
+- Enforces TLS (`tlsMode: "starttls" | "implicit"`, `rejectUnauthorized: true`, `minVersion: "TLSv1.2"`, plaintext port 25 unconditionally forbidden with `SMTP_PORT_25_FORBIDDEN`), pins sockets through `egress.assertAllowed(..., "smtp")`, and rejects CRLF/NUL header injection across `sender`, `to`, and `subject`.
+- `SmtpSendInput` accepts optional `sender?: MailSenderIdentity` (`{ fromAddress, fromName, replyToAddress? }`) from `jobs` mail engine, falling back to legacy `integrations.smtp.config` sender fields when omitted.
+- Exposes `smtp.getDefaultSender(): Promise<MailSenderIdentity | null>` (legacy fallback for existing upgrades) and treats SMTP as complete/ready when sender identity is configured either in `jobs` shared sender settings or in `integrations.smtp.config`.
+- Both `smtp.sendTestMessage(principal, input?)` and `graphAdmin.sendTestMessage(principal)` send test mail **exclusively to the signed-in administrator's own email address** (`deps.services.identity.getUser(principal.userId)`). Passing any third-party `toAddress` is refused with `FORBIDDEN / TEST_RECIPIENT_MUST_BE_SELF`.
 
-### 1.4 Consent-Gated Public-Route Analytics (`services.integrations.analytics` & `consent.tsx`)
+### 1.4 Provider Registry & Health (`services.integrations.providers`)
 
-- Disabled by default; exact route allowlist `["/privacy", "/terms"]` with clean query/hash (`location.search === "" && location.hash === ""`) and anonymous visitor session (`session.view.status === "anonymous"`).
+```ts
+export type ProviderKey = "smtp" | "graph" | "clarity" | "posthog" | "stripe" | "saml" | "sharepoint";
+export type ProviderState = "disabled" | "not_configured" | "configured" | "degraded" | "failing";
+```
+
+### 1.5 Consent-Gated Public-Route Analytics (`services.integrations.analytics` & `consent.tsx`)
+
+- Disabled by default; exact route allowlist `["/privacy", "/terms"]` with clean query/hash and anonymous visitor session.
 - Clarity project ID `^[A-Za-z0-9]{6,32}$`; PostHog token `^phc_[A-Za-z0-9_]{12,176}$`; PostHog host restricted to `https://us.i.posthog.com`, `https://eu.i.posthog.com`, or an admin-allowlisted exact HTTPS origin.
-- `consent.tsx` enforces `data-clarity-mask="true"` on `document.documentElement` before mounting Clarity, stores consent exclusively in volatile JS memory (never `localStorage`/`sessionStorage`/cookies), and installs synchronous JS-realm taint guards (`history.pushState`/`replaceState`, capture-phase `popstate`/`hashchange`, and `ME_QUERY_KEY` cache subscription) so non-public navigations abort SPA routing before any private DOM node can commit and trigger a full-document navigation instead.
 
-### 1.5 Disabled Scaffolds (`stripe`, `saml`, `sharepoint`)
+### 1.6 Disabled Scaffolds (`stripe`, `saml`, `sharepoint`) & Production Webhooks (`production`)
 
-- **`stripe` (DISABLED SCAFFOLD in this release)**:
-  - Hard-disabled behind compile-time `STRIPE_LEDGER_MUTATION_ENABLED = false as const`.
-  - `STRIPE_RELEASE_BANNER`: `"Not available in this release — online checkout and automatic ledger booking are disabled; staff record payments manually."`
-  - `services.integrations.stripe.isOnlinePaymentConfigured()` always returns `false`.
-  - `updateConfig({ enabled: true, ... })` throws `NOT_CONFIGURED / STRIPE_NOT_AVAILABLE_IN_RELEASE`.
-  - `POST /api/integrations/webhooks/stripe` verifies `Stripe-Signature` HMAC-SHA256 (`t=...,v1=...`, constant-time compare), durably records the received event in `integration_webhook_events` (`status = "ignored"`) + audit note (`ledgerMutated: false`), and acknowledges (`reasonCode: "STRIPE_DISABLED_IN_RELEASE"`) — **zero compliance ledger calls or payment mutations exist**.
-- **`saml` (DISABLED SCAFFOLD)**:
-  - `SAML_RELEASE_BANNER`: `"Not available in this release — local sign-in with MFA is the only active method"`.
-  - Saves non-active planning metadata only; refuses `enabled: true` (`SAML_NOT_AVAILABLE_IN_RELEASE`) and XML/PEM payloads; exposes `securityRequirements: readonly string[]`.
-- **`sharepoint` (DISABLED SCAFFOLD)**:
-  - Read-only status (`availableInRelease: false`, `state: "disabled"`, `summary`, `targetRequirements: readonly string[]`).
-
-### 1.6 Outbound Production Pipeline Webhooks (`services.integrations.production`)
-
-- Implements `P101` (Order Creation / SharePoint folder tree initialization) and `P201` (Trigger Production Run) per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
-- Ships disabled (`feature.integrations.production = false`) with empty `canonVersion` (`""`); stores `p101_url`, `p201_url`, and `auth_value` via `defineSecret` (`exportable: false`, `FieldCrypto` AES-256-GCM — excluded from generic Platform settings exports) and returns only masked `{ host, last4 }` / `authHeaderValueConfigured` views.
-- Enforces `egress.fetchPinned(..., "webhook", { requireAllowlistRule: true, publicAddressesOnly: true })` (HTTPS-only, mandatory enabled `"webhook"` allowlist rule, public-only DNS answers in the same evaluation as socket pinning, zero redirects, discarded 8 KiB response read with fixed server-generated `responseSummary` only).
-- Pins each dispatch to `expected_owner_user_id`, a keyed HMAC-SHA-256 `destination_fingerprint` (`DESTINATION_CHANGED` cancels on URL/auth/config drift), `job_public_id`, `active_fencing_token`, and bounded 24h `expires_at` (`PRODUCTION_DISPATCH_MAX_TTL_MS`). Revalidates order lock/hold/cancellation/owner/scope immediately before send, encrypts retry payload bodies (`payload_enc`) only during the active retry window, scrubs `payload_enc = NULL` on terminal `delivered` / `failed` / `dead` / `unknown` states, fences stale reconciliation against live worker ownership via `services.jobAdmin.reconcileOutboxJob` (`integrations.production.reconcile`), fences worker finalization on matching `(state = "sending", version, attemptCount, activeFencingToken, jobPublicId)` (`PRODUCTION_FENCE_SUPERSEDED`), and records only controlled `resendReason` codes.
+- **`stripe`**, **`saml`**, **`sharepoint`** remain disabled scaffolds as documented in Increment 01/02 (`STRIPE_LEDGER_MUTATION_ENABLED = false`).
+- **`production`** (`P101` & `P201`) implements fenced outbox webhook delivery per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
 
 ---
 
 ## 2. Exact tRPC Procedures & Return Types (`trpc.integrations.*`)
 
-All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require `adminProcedure.use(requireCapability("integrations.manage"))` (step-up MFA enforced in router + re-validated inside every DB transaction via `identity.sessions.assertCurrent`).
+All `admin.*` queries require `adminProcedure`. Mail mutations (`admin.smtp.*`, `admin.graph.*`) accept administrators holding either `integrations.manage` or `mail.manage` (both step-up MFA capabilities, re-validated inside every DB transaction via `identity.sessions.assertCurrent`).
 
-- **`publicAnalyticsConfig`** (`query`, public) -> `{ clarity: { enabled: boolean; projectId: string | null }; posthog: { enabled: boolean; key: string | null; host: string | null } }`
-- **`admin.providers`** (`query`) -> `ProviderStatus[]` (`smtp`, `clarity`, `posthog`, `stripe`, `saml`, `sharepoint`)
-- **`admin.smtpReadiness`** (`query`) -> `{ enabled: boolean; configured: boolean; verified: boolean; ready: boolean; state: ProviderState; summary: string }`
-- **`admin.smtp.get`** (`query`) -> `SmtpConfigView` (`{ enabled, configured, verified, state, summary, host, port, tlsMode: "starttls"|"implicit", username, passwordConfigured: boolean, fromAddress, fromName, replyToAddress, lastCheckedAt, lastOutcome }`)
-- **`admin.smtp.update`** (`mutation`, step-up) -> input `{ enabled, host, port, tlsMode, username, password?: string | null, fromAddress, fromName, replyToAddress? }` -> `SmtpConfigView`
-- **`admin.smtp.sendTest`** (`mutation`, step-up, `expensive` rate limit) -> input `{ toAddress: string }` -> `SmtpTestResult` (`{ outcome: "accepted"|"rejected"|"unknown", reasonCode: string, safeMessage: string, durationMs: number, checkedAt: Date }`)
-- **`admin.analytics.get`** (`query`) -> `AdminAnalyticsConfig` (`{ clarity: { enabled, configured, projectId }, posthog: { enabled, configured, projectKey, host, cloudHosts, allowedSelfHostedOrigins }, allowedPaths, permanentlyExcludedPrefixes, verificationNote }`)
-- **`admin.analytics.update`** (`mutation`, step-up) -> input `{ clarityEnabled, clarityProjectId, posthogEnabled, posthogProjectKey, posthogHost, allowedSelfHostedOrigins? }` -> `AdminAnalyticsConfig`
-- **`admin.stripe.get`** (`query`) -> `StripeConfigView` (`{ enabled: false, availableInRelease: false, releaseBanner, configured, verified: false, state: "disabled", summary, publishableKey, secretKeyConfigured, webhookSecretConfigured, webhookToleranceSeconds, webhookPath: "/api/integrations/webhooks/stripe", lastCheckedAt, verificationNote }`)
-- **`admin.stripe.update`** (`mutation`, step-up) -> input `{ enabled, publishableKey, webhookToleranceSeconds?, secretKey?, webhookSecret? }` -> `StripeConfigView`
-- **`admin.saml.get`** (`query`) -> `SamlScaffoldView` (`{ state: "disabled", availableInRelease: false, releaseBanner, metadata: { idpEntityId, idpSsoUrl, spEntityId, nameIdFormat }, securityRequirements }`)
-- **`admin.saml.updateMetadata`** (`mutation`, step-up) -> input `{ idpEntityId, idpSsoUrl, spEntityId, nameIdFormat, enabled? }` -> `SamlScaffoldView`
-- **`admin.sharepoint.get`** (`query`) -> `SharePointScaffoldView` (`{ state: "disabled", availableInRelease: false, summary, targetRequirements }`)
+- **`publicAnalyticsConfig`** (`query`, public) -> `PublicAnalyticsConfig`
+- **`admin.providers`** (`query`) -> `ProviderStatus[]` (`smtp`, `graph`, `clarity`, `posthog`, `stripe`, `saml`, `sharepoint`)
+- **`admin.smtpReadiness`** (`query`) -> `SmtpReadiness`
+- **`admin.smtp.get`** (`query`) -> `SmtpConfigView` (`{ enabled, configured, verified, state, summary, host, port, tlsMode, username, passwordConfigured, passwordLast4: string | null, fromAddress, fromName, replyToAddress, lastCheckedAt, lastOutcome }`)
+- **`admin.smtp.update`** (`mutation`, step-up) -> input `{ enabled, host, port, tlsMode, username, password?: string | null, fromAddress?, fromName?, replyToAddress? }` -> `SmtpConfigView`
+- **`admin.smtp.sendTest`** (`mutation`, step-up, `expensive` rate limit) -> input `{ toAddress?: string }` (optional; if omitted sends to signed-in admin; if supplied must match signed-in admin email) -> `SmtpTestResult` (`{ outcome: "accepted"|"rejected"|"unknown", reasonCode, safeMessage, recipientAddress, durationMs, checkedAt }`)
+- **`admin.graph.get`** (`query`) -> `GraphConfigView` (`{ enabled, configured, verified, state, summary, tenantId, clientId, clientSecretConfigured: boolean, clientSecretLast4: string | null, senderMailbox: string, egressPresetEnabled: boolean, lastCheckedAt: Date | null, lastOutcome: "succeeded"|"failed"|"unknown"|null }`)
+- **`admin.graph.update`** (`mutation`, step-up) -> input `{ enabled: boolean, tenantId: string, clientId: string, clientSecret?: string | null, senderMailbox?: string, enableEgressPreset?: boolean }` -> `GraphConfigView`
+- **`admin.graph.testConnection`** (`mutation`, step-up, `expensive` rate limit) -> input `{}` -> `GraphTestResult` (`{ outcome: "succeeded"|"failed", reasonCode, safeMessage, durationMs, checkedAt }`)
+- **`admin.graph.sendTest`** (`mutation`, step-up, `expensive` rate limit) -> input `{}` (sends exclusively to signed-in administrator) -> `GraphMailTestResult` (`{ outcome: "accepted"|"rejected"|"unknown", reasonCode, safeMessage, recipientAddress, durationMs, checkedAt }`)
 - **`admin.egress.list`** (`query`) -> `EgressAllowlistRuleView[]`
-- **`admin.egress.create`** (`mutation`, step-up) -> input `{ purpose, matchType: "host"|"ip"|"cidr", pattern, port, protocol, allowPrivateAddress, enabled?, justification }` -> `EgressAllowlistRuleView`
-- **`admin.egress.update`** (`mutation`, step-up) -> input `{ publicId, expectedVersion, port?, allowPrivateAddress?, enabled?, justification? }` -> `EgressAllowlistRuleView`
-- **`admin.egress.remove`** (`mutation`, step-up) -> input `{ publicId }` -> `void`
-- **`admin.egress.check`** (`mutation`, step-up, `expensive` rate limit) -> input `{ target, purpose }` -> `{ allowed: boolean; pinned?: PinnedEgressTarget; reasonCode?: string; safeMessage: string }`
-- **`production.settings.get`** (`query`, `admin` + `integrations.manage`) -> `ProductionSettingsView`
-- **`production.settings.update`** (`mutation`, `admin` + `integrations.manage` + step-up) -> input `{ enabled, canonVersion, runMode?, timeoutMs?, p101Url?, p201Url?, authHeaderName?, authHeaderValue? }` -> `ProductionSettingsView`
-- **`production.settings.test`** (`mutation`, `admin` + `integrations.manage` + step-up, `expensive` rate limit) -> input `{ phase: "P101" | "P201" }` -> `ProductionDryRunResult` (dry-run URL + allowlist + public-DNS check; never sends HTTP or projects `normalizedUrl`)
-- **`production.order.preview`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus? }` -> `ProductionOrderPreview` (`client_name` / `client_email` masked for `staff`, unmasked for `admin`; `release_status` defaults to `""`)
-- **`production.order.requestP101`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, releaseStatus? }` -> `ProductionDispatchItem`
-- **`production.order.requestP201`** (`mutation`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId, phase1ArtifactsConfirmed }` -> `ProductionDispatchItem`
-- **`production.order.resend`** (`mutation`, `admin` + `orders.production.trigger` + step-up) -> input `{ orderPublicId, phase: "P101" | "P201", reason, releaseStatus?, phase1ArtifactsConfirmed? }` -> `ProductionDispatchItem` (`resendReason` holds controlled code only)
-- **`production.order.history`** (`query`, `staff` + `orders.production.trigger`) -> input `{ orderPublicId }` -> `{ items: ProductionDispatchItem[] }`
-- **`production.admin.listDispatches`** (`query`, `admin` + `orders.production.trigger`) -> input `{ phase?, state?: "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown", orderReference?, fromDate?, toDate?, limit? }` -> `{ items: ProductionDispatchItem[] }`
+- **`admin.egress.presets`** (`query`) -> `EgressPresetView[]`
+- **`admin.egress.setPreset`** (`mutation`, step-up) -> input `{ presetKey: EgressPresetKey, enabled: boolean, params?: { region?: string; bucket?: string; accountName?: string } }` -> `EgressPresetView`
+- **`admin.egress.create`**, **`admin.egress.update`**, **`admin.egress.remove`**, **`admin.egress.check`** — unchanged (`purpose` accepts all 13 `EGRESS_PURPOSES`)
+- **`admin.analytics.*`**, **`admin.stripe.*`**, **`admin.saml.*`**, **`admin.sharepoint.get`**, **`production.*`** — unchanged from Increment 01/02.
 
 ---
 
 ## 3. Raw HTTP Routes (`server/modules/integrations/http.ts`)
 
-- `registerIntegrationsHttpRoutes(router, services)` — mounted at `/api/integrations`.
-- `registerSignedIntegrationWebhooks(router, services)` — mounted at `/api/integrations/webhooks` (raw 256 KiB `application/json`, rate-limited via `rateLimitAddress(req.ip)`):
-  - `POST /stripe`: verifies `Stripe-Signature`, durably logs inert received event in `integration_webhook_events` (`status = "ignored"`, `ledgerMutated = false`), never mutates compliance ledger.
+- `POST /api/integrations/webhooks/stripe` — verifies `Stripe-Signature`, durably logs inert received event (`status = "ignored"`, `ledgerMutated = false`).
 
 ---
 
@@ -138,13 +287,9 @@ All `admin.*` queries require `adminProcedure`. All `admin.*` mutations require 
 
 - **Audit events**:
   - `integration.smtp.updated`, `integration.smtp.test_attempted`, `integration.smtp.tested`
-  - `integration.analytics.updated`
-  - `integration.stripe.updated`, `integration.stripe.enable_refused`, `integration.stripe.webhook.received_disabled`, `integration.stripe.webhook.rejected`
-  - `integration.saml.scaffold_updated`, `integration.saml.enable_refused`
-  - `integration.egress.rule_created`, `integration.egress.rule_updated`, `integration.egress.rule_deleted`, `integration.egress.denied`, `integration.egress.checked`
-  - `integration.production.settings.changed`, `integration.production.dispatch.requested`, `integration.production.dispatch.delivered`, `integration.production.dispatch.failed`, `integration.production.dispatch.dead`, `integration.production.dispatch.resent`, `integration.production.dispatch.refused`
-- **Health components**: `mail.smtp`, `integrations.clarity`, `integrations.posthog`, `integrations.stripe`, `integrations.saml`, `integrations.sharepoint`, `integrations.production`
-- **Tables**: `integration_egress_allowlist`, `integration_provider_checks`, `integration_webhook_events`, `integration_production_dispatches`
-- **Client exports**:
-  - `integrationsFeature` (`client/src/features/integrations/routes.tsx` — spreads `integrationsAdminRoutes`, `productionAdminRoutes`, `integrationsAdminNav`, `productionAdminNav`, and `productionOrderTabs`)
-  - `AnalyticsConsentSlot`, `useAnalyticsConsent`, `ANALYTICS_CONSENT_COPY` (`client/src/features/integrations/consent.tsx`)
+  - `integration.graph.updated`, `integration.graph.connection_test_attempted`, `integration.graph.connection_tested`, `integration.graph.test_attempted`, `integration.graph.tested`
+  - `integration.egress.preset_updated`, `integration.egress.rule_created`, `integration.egress.rule_updated`, `integration.egress.rule_deleted`, `integration.egress.denied`, `integration.egress.checked`
+  - `integration.analytics.updated`, `integration.stripe.*`, `integration.saml.*`, `integration.production.*`
+- **Health components**: `mail.smtp`, `mail.graph`, `integrations.clarity`, `integrations.posthog`, `integrations.stripe`, `integrations.saml`, `integrations.sharepoint`, `integrations.production`
+- **Tables** (no schema migration required — existing tables cover all Increment 03 columns):
+  - `integration_egress_allowlist`, `integration_provider_checks`, `integration_webhook_events`, `integration_production_dispatches`

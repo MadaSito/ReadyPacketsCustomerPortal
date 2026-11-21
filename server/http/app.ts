@@ -32,7 +32,7 @@ import { applySecurityHeaders, newCspNonce, setAnalyticsCsp, type AnalyticsCspPo
 import { rateLimitAddress } from "../security/rateLimitAddress.js";
 import { createTrpcContext } from "../trpc/context.js";
 import { appRouter } from "../trpc/root.js";
-import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, requestHost, routeTemplate } from "./edge.js";
+import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, providerCallbackRoute, requestHost, routeTemplate } from "./edge.js";
 import { createEdgeAdmission } from "./edgeAdmission.js";
 import { sendSafeError, trpcRetryAfter } from "./errors.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
@@ -197,6 +197,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     if (req.originalUrl.length > MAX_REQUEST_TARGET || !req.originalUrl.startsWith("/") || /[\s\\#]/.test(req.originalUrl)) {
       throw validation("INVALID_REQUEST_TARGET", "The request target is invalid.");
     }
+    // Path-pattern test only (no lookup): provider callbacks exist on the canonical host and nowhere else.
+    if (!canonicalHost && providerCallbackRoute(req.path)) throw notFound();
     if (!accepted) {
       if (alias) {
         // Concatenate only an origin-form target to the known origin; never resolve a user-controlled URL.

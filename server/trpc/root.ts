@@ -13,6 +13,10 @@ import { jobsRouter } from "../modules/jobs/router.js";
 import { portableRouter } from "../modules/portable/router.js";
 import { backupRouter } from "../modules/backup/router.js";
 import { integrationsRouter } from "../modules/integrations/router.js";
+import { storageRouter } from "../modules/storage/router.js";
+import { sharepointRouter } from "../modules/sharepoint/router.js";
+import { mailTemplatesRouter } from "../modules/mailTemplates/router.js";
+import { automationsRouter } from "../modules/automations/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -28,6 +32,10 @@ export const appRouter = router({
   portable: portableRouter,
   backup: backupRouter,
   integrations: integrationsRouter,
+  storage: storageRouter,
+  sharepoint: sharepointRouter,
+  mailTemplates: mailTemplatesRouter,
+  automations: automationsRouter,
 });
 
 export type AppRouter = typeof appRouter;

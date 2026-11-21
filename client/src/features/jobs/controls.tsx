@@ -4,7 +4,7 @@ import { Badge, Button, StatusBadge } from "@/ui";
 export const jobStates = ["queued", "running", "completed", "failed", "canceled", "unknown"] as const;
 export const mailStates = ["queued", "sending", "accepted", "held", "captured", "failed", "expired", "unknown", "canceled"] as const;
 export const mailLabels: Record<(typeof mailStates)[number], string> = {
-  queued: "Queued", sending: "Sending", accepted: "SMTP accepted", held: "Held: mail not configured",
+  queued: "Queued", sending: "Sending", accepted: "Provider accepted", held: "Held: mail not configured",
   captured: "Captured only", failed: "Failed", expired: "Expired", unknown: "Unknown outcome", canceled: "Canceled",
 };
 

@@ -55,7 +55,7 @@ const archive = (patch: Partial<Archive> = {}): Archive => ({
   publicId: ID, state: "completed", reasonCode: null, trigger: "scheduled", encryptedSizeBytes: 4096, archiveSha256: "a".repeat(64),
   backupKeyId: "bk-key-2026", keyCustodyMode: "host_file", releaseRef: "test", schemaMigrationCount: 12, lastMigrationHash: "b".repeat(64),
   objectCount: 3, objectTotalBytes: 2048, verificationStatus: "verified", lastVerifiedAt: new Date(NOW.getTime() - 3_600_000),
-  offHostCopyStatus: "local_only", activeHoldCount: 0, isLastKnownGood: true, createdAt: new Date(NOW.getTime() - 3_600_000),
+  offHostCopyStatus: "local_only", remoteCopies: [], activeHoldCount: 0, isLastKnownGood: true, createdAt: new Date(NOW.getTime() - 3_600_000),
   completedAt: new Date(NOW.getTime() - 3_500_000), purgedAt: null, ...patch,
 });
 const verification = (patch: Partial<Verification> = {}): Verification => ({
@@ -78,7 +78,40 @@ const listPage = (items: Archive[], patch: Partial<BackupList> = {}): BackupList
   items, nextCursor: null, keyConfigured: true, keyCustodyWarning: null,
   offHostStatusNote: "Local storage only: off-host independent copy is not configured.", ...patch,
 });
-const detail = (patch: Partial<BackupDetail> = {}): BackupDetail => ({ archive: archive(), verifications: [verification()], restores: [drill()], holds: [], ...patch });
+const detail = (patch: Partial<BackupDetail> = {}): BackupDetail => ({
+  archive: archive(),
+  verifications: [verification()],
+  restores: [drill()],
+  holds: [],
+  remoteCopies: [],
+  ...patch,
+});
+const offsiteConfigDefault = () => ({
+  autoCopyAfterVerify: false,
+  windowDays: 7,
+  destinations: [],
+  status321: {
+    windowDays: 7,
+    evaluatedAt: NOW,
+    evaluatedArchivePublicId: ID,
+    verifiedArchivesInWindow: 1,
+    verifiedCopies: 1,
+    localVerifiedCopies: 1,
+    offsiteVerifiedCopies: 0,
+    storageSystems: 1,
+    storageSystemKinds: ["local_disk"],
+    threeCopiesMet: false,
+    twoSystemsMet: false,
+    oneOffsiteMet: false,
+    overallMet: false,
+    sharedProviderKindWarning: false,
+    configuredOffsiteDestinations: 0,
+    enabledOffsiteDestinations: 0,
+    autoCopyAfterVerify: false,
+    backupKeySeparateReminder:
+      "Only verified encrypted .rpbk archives are copied off-site; the backup encryption key never leaves this host.",
+  },
+});
 const policy = { keepLastCount: 14, maxAgeDays: 90, scheduleEnabled: true, autoPruneEnabled: false, recoverySandboxRoot: "/var/lib/synthetic" };
 
 beforeEach(() => {
@@ -87,6 +120,7 @@ beforeEach(() => {
   handlers["jobs.maintenanceBanner"] = () => ({ active: false, message: null });
   handlers["backup.admin.list"] = () => listPage([archive()]);
   handlers["backup.admin.retentionPolicy"] = () => policy;
+  handlers["backup.admin.offsiteConfig"] = () => offsiteConfigDefault();
   handlers["backup.admin.detail"] = () => detail();
 });
 afterEach(() => { fetchMock.mockReset(); vi.restoreAllMocks(); });
@@ -388,3 +422,182 @@ describe("Backups console widget", () => {
     await expectNoAxeViolations(container);
   });
 });
+
+describe("3-2-1 off-site backup strategy UI", () => {
+  it("renders 3-2-1 conditions, saves off-site destination form, and triggers manual Copy now", async () => {
+    const baseCfg = offsiteConfigDefault();
+    handlers["backup.admin.offsiteConfig"] = () => ({
+      ...baseCfg,
+      destinations: [
+        {
+          connectionPublicId: "sc_s3_synthetic_0000000001",
+          name: "Offsite S3 Vault",
+          kind: "s3",
+          connectionEnabled: true,
+          connectionStatus: "ready",
+          assigned: true,
+          enabled: true,
+          retentionNote: "S3 Object Lock 90d",
+        },
+        {
+          connectionPublicId: "sc_az_synthetic_0000000002",
+          name: "Azure Archive Vault",
+          kind: "azure_blob",
+          connectionEnabled: true,
+          connectionStatus: "ready",
+          assigned: false,
+          enabled: false,
+          retentionNote: "",
+        },
+      ],
+    });
+    const updateOffsite = vi.fn((input: unknown) => input);
+    const copyNow = vi.fn(() => ({ queued: [{ publicId: "brc_1", state: "queued" }] }));
+    handlers["backup.admin.updateOffsiteConfig"] = updateOffsite;
+    handlers["backup.admin.copyOffsiteNow"] = copyNow;
+
+    const { container } = renderUi(<BackupsPage />);
+    expect(await screen.findByRole("heading", { name: "3-2-1 backup strategy status" })).toBeInTheDocument();
+    expect(screen.getByText("Three verified copies")).toBeInTheDocument();
+    expect(screen.getByText("Two different storage systems")).toBeInTheDocument();
+    expect(screen.getByText("At least one copy off-site")).toBeInTheDocument();
+    expect(screen.getByText(/never leaves this host/u)).toBeInTheDocument();
+
+    // Toggle automatic copy after verification and assign second destination, then save.
+    await userEvent.click(screen.getByRole("switch", { name: "Copy after verification automatically" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: /Azure Archive Vault/u }));
+    const azNote = screen.getByLabelText("Remote retention note for Azure Archive Vault (optional)");
+    await userEvent.type(azNote, "Immutable blob 90d");
+    await userEvent.click(screen.getByRole("button", { name: "Save off-site settings" }));
+
+    await waitFor(() =>
+      expect(updateOffsite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          autoCopyAfterVerify: true,
+          windowDays: 7,
+          destinations: expect.arrayContaining([
+            expect.objectContaining({
+              connectionPublicId: "sc_s3_synthetic_0000000001",
+              assigned: true,
+              enabled: true,
+              retentionNote: "S3 Object Lock 90d",
+            }),
+            expect.objectContaining({
+              connectionPublicId: "sc_az_synthetic_0000000002",
+              assigned: true,
+              enabled: true,
+              retentionNote: "Immutable blob 90d",
+            }),
+          ]),
+        }),
+      ),
+    );
+
+    // Trigger row-level manual Copy now on verified archive.
+    await userEvent.click(screen.getAllByRole("button", { name: `Copy verified backup ${ID} off-site now` })[0]!);
+    await waitFor(() => expect(copyNow).toHaveBeenCalledWith({ backupPublicId: ID }));
+    await expectNoAxeViolations(container);
+  });
+
+  it("displays per-destination digest verification and retries failed off-site copies on detail page", async () => {
+    const baseCfg = offsiteConfigDefault();
+    handlers["backup.admin.offsiteConfig"] = () => ({
+      ...baseCfg,
+      autoCopyAfterVerify: true,
+      destinations: [
+        {
+          connectionPublicId: "sc_s3_synthetic_0000000001",
+          name: "Offsite S3 Vault",
+          kind: "s3" as const,
+          connectionEnabled: true,
+          connectionStatus: "ready" as const,
+          assigned: true,
+          enabled: true,
+          retentionNote: "S3 Object Lock 90d",
+        },
+        {
+          connectionPublicId: "sc_az_synthetic_0000000002",
+          name: "Azure Archive Vault",
+          kind: "azure_blob" as const,
+          connectionEnabled: true,
+          connectionStatus: "ready" as const,
+          assigned: true,
+          enabled: true,
+          retentionNote: "Immutable 90d",
+        },
+      ],
+      status321: {
+        ...baseCfg.status321,
+        verifiedCopies: 2,
+        offsiteVerifiedCopies: 1,
+        storageSystems: 2,
+        storageSystemKinds: ["local_disk", "s3"],
+        threeCopiesMet: false,
+        twoSystemsMet: true,
+        oneOffsiteMet: true,
+        overallMet: false,
+        enabledOffsiteDestinations: 2,
+      },
+    });
+    const remoteCopies: BackupDetail["remoteCopies"] = [
+      {
+        publicId: "brc_0000000000000000000001",
+        backupPublicId: ID,
+        connectionPublicId: "sc_s3_synthetic_0000000001",
+        connectionName: "Offsite S3 Vault",
+        providerKind: "s3",
+        state: "completed",
+        objectName: `${ID}.rpbk`,
+        verifiedBytes: 4096,
+        archiveSha256: "a".repeat(64),
+        digestVerified: true,
+        verifiedDigestKind: "sha256",
+        attemptCount: 1,
+        reasonCode: null,
+        startedAt: NOW,
+        completedAt: NOW,
+        updatedAt: NOW,
+      },
+      {
+        publicId: "brc_0000000000000000000002",
+        backupPublicId: ID,
+        connectionPublicId: "sc_az_synthetic_0000000002",
+        connectionName: "Azure Archive Vault",
+        providerKind: "azure_blob",
+        state: "failed",
+        objectName: `${ID}.rpbk`,
+        verifiedBytes: null,
+        archiveSha256: "a".repeat(64),
+        digestVerified: false,
+        verifiedDigestKind: null,
+        attemptCount: 1,
+        reasonCode: "STORAGE_UPSTREAM_FAILURE",
+        startedAt: NOW,
+        completedAt: NOW,
+        updatedAt: NOW,
+      },
+    ];
+    handlers["backup.admin.detail"] = () =>
+      detail({
+        archive: archive({ remoteCopies }),
+        remoteCopies,
+      });
+    const copyNow = vi.fn(() => ({ queued: [{ publicId: "brc_0000000000000000000002", state: "queued" }] }));
+    handlers["backup.admin.copyOffsiteNow"] = copyNow;
+
+    const { container } = renderUi(<BackupDetailRoute />, { path: `/admin/backups/${ID}` });
+    expect((await screen.findAllByText("SHA-256 verified")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("STORAGE_UPSTREAM_FAILURE").length).toBeGreaterThan(0);
+
+    const retryBtn = screen.getAllByRole("button", { name: "Retry off-site copy to Azure Archive Vault" })[0]!;
+    await userEvent.click(retryBtn);
+    await waitFor(() =>
+      expect(copyNow).toHaveBeenCalledWith({
+        backupPublicId: ID,
+        connectionPublicId: "sc_az_synthetic_0000000002",
+      }),
+    );
+    await expectNoAxeViolations(container);
+  });
+});
+

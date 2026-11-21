@@ -1,0 +1,51 @@
+/* FlowCanvas theme: maps @xyflow/react variables to our semantic tokens (light and dark follow the tokens). */
+.rp-flow .react-flow {
+  color-scheme: inherit;
+  --xy-background-color: var(--color-surface-soft);
+  --xy-edge-stroke: var(--color-control-border);
+  --xy-edge-stroke-width: 2;
+  --xy-edge-stroke-selected: var(--color-action);
+  --xy-connectionline-stroke: var(--color-action);
+  --xy-connectionline-stroke-width: 2;
+  --xy-handle-background-color: var(--color-action);
+  --xy-handle-border-color: var(--color-surface);
+  --xy-node-border-radius: var(--radius-card);
+}
+
+.rp-flow .react-flow__node {
+  /* Our NodeCard draws the card; the wrapper stays unstyled. */
+  border: 0;
+  background: transparent;
+  padding: 0;
+  box-shadow: none;
+}
+
+.rp-flow .rp-flow-handle {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--color-surface);
+  background-color: var(--color-action);
+}
+
+.rp-flow .react-flow__edge.selected .react-flow__edge-path,
+.rp-flow .react-flow__edge:focus .react-flow__edge-path {
+  stroke: var(--color-action);
+  stroke-width: 3;
+}
+
+/* Coarse pointers: larger handles so a drag can start reliably (form alternatives exist regardless). */
+@media (pointer: coarse) {
+  .rp-flow .rp-flow-handle {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rp-flow .react-flow__edge-path,
+  .rp-flow .react-flow__viewport,
+  .rp-flow .react-flow__node {
+    transition: none !important;
+    animation: none !important;
+  }
+}

@@ -217,3 +217,38 @@ idempotency key `<emailIndex>:<minute slot>`; `retrySafe: true` (pure DB work + 
 
 ## Health
 `identity.sessions` — ok + active session count.
+
+## Single sign-on (Microsoft Entra ID)
+
+Ships **disabled**. Single tenant only (`common`/`organizations` refused). Never available in the preview profile.
+
+Redirect URI to register in Entra (shown read-only to admins): `{canonicalOrigin}/api/identity/sso/callback`.
+
+### HTTP routes (canonical only; `/api/auth/sso/*`, trailing slashes and case variants are not served)
+| Route | Notes |
+|---|---|
+| `GET /api/identity/sso/start?next=` | Plain sign-in. Sets binder cookie `__Host-rp_sso` (dev `rp_sso_dev`): HttpOnly, Secure, SameSite=Lax, Path=/, 10 min. 303 to Entra (PKCE S256, state, nonce held server-side as hashes / encrypted). |
+| `GET /api/identity/sso/start?ticket=` | Session-bound start (link / step_up / test) from `identity.sso.prepare`; the ticket's session must be the browser's live session. |
+| `GET /api/identity/sso/callback` | Provider redirect (cross-site GET). Consumes state atomically, bound to the binder. `no-store`, `Referrer-Policy: no-referrer`. 303 to `/sso/complete?attempt=<publicId>` or `/sso/refused?reason=<SSO_*>`. |
+| `POST /api/identity/sso/complete` `{attempt}` | CSRF-protected JSON. Burns the attempt first. Returns `{purpose, next, nextStep?, test?}`; sign-in signs out any existing session, then issues the new one. |
+
+Rate-limit category: `auth_high_risk`. Access log uses route templates (no query). nginx: pass `/api/identity/sso/callback` with its raw query to the app unchanged and do not log `$request_uri`/`$args` for it.
+
+### Two-step pattern (G-O01)
+- `sign_in`: code exchanged at the callback; verified claims stored encrypted (≤ 2 min, single use).
+- `link`, `step_up`, `test`: the callback **parks** the code (encrypted, aad `sso_auth_requests.code:<publicId>`, ≤ 2 min) and never exchanges it. `complete` requires the same binder, the live session equal to the initiating session and user, a full session, unchanged config epoch; only then is the code exchanged. Any mismatch fails closed and burns the attempt.
+
+### ID-token validation
+RS256 only (node:crypto), `crit` refused, kid lookup with one bounded refetch per 5 min; iss/aud/azp/tid, exp/nbf/iat (120 s skew, 10 min max age), nonce (hash compare), oid GUID. JWKS/token via egress purpose `entra_oidc` (preset must be enabled).
+
+### Linking
+By (tid, oid) only — never by e-mail. Self link (fresh step-up + Entra re-auth), admin bind by object ID (pending until the first Entra sign-in verifies it), JIT (`off` / `customers` / `staff` with an app role; never admin; daily limit). Deactivated / suspended accounts and pending local remediation (`mustChangePassword`) are refused.
+
+### tRPC
+`identity.sso.publicConfig` (public), `identity.sso.prepare({purpose, next?}) → {startUrl}`, `identity.sso.myLink`, `identity.sso.unlinkSelf`; `identity.admin.sso.{get, update, setEnabled, bindUser, unbindUser}` (capability `identity.sso.manage`). `identity.me.session.authMethod`; staff/customer list items carry `signInMethods {password, sso: "linked"|"pending"|null}`.
+
+### Lock order (I-A02)
+`[assurance policy] → sso_configuration FOR UPDATE → users (ascending id) → user_sessions → sso_identities`. Final completion re-reads the configuration under its lock and re-checks enabled / epoch / tenant / MFA trust; `updateConfig` and `setEnabled` take the same lock before the actor re-validation. A config change either precedes the completion (refused or evaluated under the new policy) or follows it (its revocation covers the new session).
+
+### Break-glass
+Admin view includes `breakGlass {localMfaAdministrators, soleLocalMfaAdministratorHasPasskey}` from assurance; enabling requires `assertLocalAdministratorRemains`. Host recovery: `recoverLocalAdministratorPassword` returns `{sessionsRevoked}`.

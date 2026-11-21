@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { DomainError, notFound } from "../../core/errors.js";
+import { sanitiseAttribute } from "../audit/envelope.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { setHttpState } from "../../http/requestState.js";
@@ -75,6 +76,10 @@ beforeEach(async () => {
   };
   h.services.orders = {
     assertCanReadOrder: read, assertCanWriteOrder: write, assertCanReadOrderById: read, assertCanWriteOrderById: write,
+    async getOrderRefByPublicId(id: string) {
+      if (id !== orderPublicId) return null;
+      return { id: orderId, publicId: id, ownerUserId: orderOwner.userId, lockState: locked };
+    },
     async getOrderRefById(id: number, tx?: Tx, options?: { forUpdate?: boolean }) {
       if (id !== orderId) return null;
       if (tx && options?.forUpdate && holdAtPurgeLock) locked = "legal_hold";
@@ -82,6 +87,7 @@ beforeEach(async () => {
     },
   } as unknown as TestHarness["services"]["orders"];
   h.services.identity = {
+    async getUser(userId: number) { return userId === orderOwner.userId ? { status: "active" } : null; },
     sessions: {
       async assertCurrent(principal: SessionPrincipal) {
         if (principal.sessionId === revokedSession) throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Please sign in again.");
@@ -118,6 +124,35 @@ function appFor(principal: SessionPrincipal) {
 }
 
 describe("private file admission and authorization", () => {
+  it("admits only current customer-visible file versions to automation copy batches", async () => {
+    const first = await add();
+    const latest = await add(owner, { ...upload, versionOf: first.publicId });
+    const privateFile = await add(staff, { ...upload, visibility: "staff_only" });
+    expect(h.audit.named("file.uploaded").map((event) => sanitiseAttribute("file_visibility", event.attributes?.file_visibility)))
+      .toEqual(["customer_visible", "customer_visible", "staff_only"]);
+    await expect(files.getUploadAutomationContext(privateFile.publicId, t.db)).resolves.toBeNull();
+    await expect(files.getUploadAutomationContext(first.publicId, t.db)).resolves.toBeNull();
+    await expect(files.getUploadAutomationContext(latest.publicId, t.db)).resolves.toMatchObject({ orderPublicId, category: "supporting" });
+    await t.db.transaction(async (tx) => {
+      await expect(files.listOrderFileCopyCandidates(orderPublicId, tx)).resolves.toEqual([latest.publicId]);
+      await expect(files.listOrderFileCopyCandidates(orderPublicId, tx, latest.publicId)).resolves.toEqual([latest.publicId]);
+      await expect(files.listOrderFileCopyCandidates(orderPublicId, tx, first.publicId)).resolves.toBeNull();
+      await expect(files.listOrderFileCopyCandidates(orderPublicId, tx, privateFile.publicId)).resolves.toBeNull();
+    });
+  });
+
+  it("stages cloud copy work in the active upload transaction and rolls back admission if staging fails", async () => {
+    const stageOrderFile = vi.fn(async (publicId: string, tx: Tx) => {
+      expect((await tx.select().from(orderFiles)).some((candidate) => candidate.publicId === publicId)).toBe(true);
+      throw new Error("synthetic outbox failure");
+    });
+    h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
+    await expect(add()).rejects.toThrow("synthetic outbox failure");
+    expect(stageOrderFile).toHaveBeenCalledOnce();
+    expect(await t.db.select().from(orderFiles)).toEqual([]);
+    expect(h.storage.objects.size).toBe(0);
+  });
+
   it("binds owner and current order stage before and after a streamed upload", async () => {
     await expect(files.beginUpload(stranger, orderPublicId, upload)).rejects.toMatchObject({ code: "NOT_FOUND" });
     const remediation = { ...owner, state: "remediation" as const };

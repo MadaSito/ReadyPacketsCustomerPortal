@@ -23,6 +23,7 @@ await build({
   entryPoints: {
     migrate: "scripts/ops/migrate.ts",
     "create-admin": "scripts/ops/create-admin.ts",
+    "recover-admin": "scripts/ops/recover-admin.ts",
     "seed-demo": "scripts/ops/seed-demo.ts",
     "catalog-import": "scripts/ops/catalog-import.ts",
     "run-backup": "scripts/ops/backup/run-backup.ts",

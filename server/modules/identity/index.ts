@@ -5,8 +5,10 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, SessionResolver, Tx } from "../../core/types.js";
-import type { TransitionStep, UserRole } from "../../../shared/domain.js";
+import type { AuthMethod, TransitionStep, UserRole } from "../../../shared/domain.js";
 import { createAdminService, type AdminService, type CustomerListItem, type Page } from "./admin.js";
+import { createBreakGlassService } from "./breakGlass.js";
+import { createSsoService, type SsoService } from "./sso/service.js";
 import { createAuthService, PASSWORD_RESET_JOB, type PasswordResetJob, type AuthService } from "./auth.js";
 import { createCredentialService } from "./credentials.js";
 import { IDENTITY_MAIL_TEMPLATES } from "./mail.js";
@@ -39,6 +41,10 @@ export interface IdentityModule extends ModuleLifecycle {
     opts: { tx: Tx; reason: "bootstrap_admin" | "demo_seed" },
   ): Promise<{ userId: number; publicId: string; customerRef: string | null }>;
   isCustomerRefAvailable(reference: string, tx?: DbOrTx): Promise<boolean>;
+  /** Break-glass (assurance): active local admins with verified e-mail + password, FOR UPDATE, ascending id. */
+  listLocalAdministratorCandidates(tx: Tx, options?: { lock?: boolean }): Promise<number[]>;
+  /** Host recovery only (ops; never tRPC/HTTP). See API.md "Break-glass". */
+  recoverLocalAdministratorPassword(userId: number, password: string, opts: { tx: Tx }): Promise<{ sessionsRevoked: number }>;
   sessions: {
     markMfaVerified(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;
     markStepUp(sessionId: string, opts?: { tx?: Tx }): Promise<IssuedSession>;
@@ -56,7 +62,7 @@ export interface IdentityModule extends ModuleLifecycle {
     openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal>;
   };
   transitions: {
-    derive(userId: number, session?: { mfaVerifiedAt: Date | null; tx?: DbOrTx }): Promise<TransitionStep[]>;
+    derive(userId: number, session?: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod; tx?: DbOrTx }): Promise<TransitionStep[]>;
   };
   createPendingCustomer(
     input: { email: string; name: string; customerRef?: string | null; publicId?: string; createdAt?: Date },
@@ -77,6 +83,7 @@ export interface IdentityModule extends ModuleLifecycle {
   /** Router-facing internals (not for other modules). */
   auth: AuthService;
   admin: AdminService;
+  sso: SsoService;
   listSessions(principal: SessionPrincipal): Promise<SessionListItem[]>;
 }
 
@@ -90,6 +97,13 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
   const auth = createAuthService(internals);
   const credentials = createCredentialService(internals);
   const admin = createAdminService(internals, auth);
+  const breakGlass = createBreakGlassService(internals);
+  const sso = createSsoService({ deps, repo, sessions, transitions, auth, authorizeInTx: admin.authorizeInTx });
+  deps.jobs.register("identity.sso.prune", async () => {
+    const removed = await sso.prune();
+    return { outcome: "completed", safeCounts: { removed } };
+  }, { retrySafe: true });
+  deps.jobs.registerSchedule({ name: "identity.sso.prune", type: "identity.sso.prune", everyMs: 60 * 60_000 });
 
   for (const template of IDENTITY_MAIL_TEMPLATES) deps.mailer.registerTemplate(template);
   // Public forgot-password work runs here, off the request path (review ID-04). One transaction of pure
@@ -116,6 +130,8 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     hasActiveAdministrator: () => repo.hasActiveAdministrator(),
     provisionLocalAccount: auth.provisionLocalAccount,
     isCustomerRefAvailable: (reference, tx) => repo.isCustomerRefAvailable(reference, tx),
+    listLocalAdministratorCandidates: breakGlass.listLocalAdministratorCandidates,
+    recoverLocalAdministratorPassword: breakGlass.recoverLocalAdministratorPassword,
     sessions: {
       markMfaVerified: sessions.markMfaVerified,
       markStepUp: sessions.markStepUp,
@@ -131,7 +147,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       async derive(userId, session) {
         const row = await repo.byId(userId, session?.tx ? { tx: session.tx } : {});
         if (!row) return [];
-        return transitions.derive(row, session ? { mfaVerifiedAt: session.mfaVerifiedAt } : undefined, session?.tx);
+        return transitions.derive(row, session ? { mfaVerifiedAt: session.mfaVerifiedAt, authMethod: session.authMethod } : undefined, session?.tx);
       },
     },
     createPendingCustomer: admin.createPendingCustomer,
@@ -140,6 +156,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     searchCustomers: admin.searchCustomers,
     auth,
     admin,
+    sso,
     listSessions: (principal) => sessions.listForUser(principal.userId, principal.sessionId),
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();

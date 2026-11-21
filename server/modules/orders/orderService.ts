@@ -39,6 +39,15 @@ export interface OrderServiceDeps {
 
 export const MAX_PAGE = 100;
 
+/** Increment 03: in-transaction change listeners (e.g. SharePoint order sync). A throwing listener aborts the write. */
+export type OrderChangeKind = "created" | "updated" | "status_changed" | "assigned" | "deleted";
+export interface OrderChangeEvent {
+  orderId: number;
+  orderPublicId: string;
+  kind: OrderChangeKind;
+}
+export type OrderChangeListener = (event: OrderChangeEvent, tx: Tx) => Promise<void>;
+
 export function encodeCursor(id: number): string {
   return Buffer.from(`o:${id}`, "utf8").toString("base64url");
 }
@@ -93,6 +102,12 @@ export function createOrderService(deps: OrderServiceDeps) {
   const assertActorCurrent = (principal: SessionPrincipal, tx: Tx, capability?: Capability) => actorCheck(principal, tx, capability);
 
   const { policy, workflows } = deps;
+
+  const changeListeners: OrderChangeListener[] = [];
+  /** Called inside the business transaction, after the audit record; listeners run in registration order. */
+  async function emitChange(tx: Tx, event: OrderChangeEvent) {
+    for (const listener of changeListeners) await listener(event, tx);
+  }
 
   /**
    * Authorization and projection read from ONE consistent snapshot (O-02): a transfer or grant revoke that
@@ -339,6 +354,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             },
             tx,
           );
+          await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
           return { publicId, reference, created: true };
         });
       } catch (error) {
@@ -578,6 +594,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           },
           tx,
         );
+        await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "updated" });
         return { version: view.version + 1 };
       });
     },
@@ -657,6 +674,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             },
             tx,
           );
+          await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "status_changed" });
           return { view, bound, notify: transition.notifyCustomer, from: view.statusKey };
         });
       } catch (error) {
@@ -739,6 +757,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           },
           tx,
         );
+        await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "updated" });
         return { version: view.version + 1, lockState: input.lockState };
       });
     },
@@ -778,6 +797,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           },
           tx,
         );
+        await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "updated" });
         return { reference, version: view.version + 1 };
       });
     },
@@ -897,6 +917,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             },
             tx,
           );
+          await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "assigned" });
           return { view, toUserId: target.id, revokedGrants: live.length };
         });
       } catch (error) {
@@ -999,6 +1020,87 @@ export function createOrderService(deps: OrderServiceDeps) {
       };
     },
 
+    /** Registers an in-transaction change listener (registration at module wiring time only). */
+    registerChangeListener(listener: OrderChangeListener) {
+      changeListeners.push(listener);
+    },
+
+    /**
+     * Trusted (system sync worker, no principal): every order's publicId in ascending ULID order, keyset paged.
+     * Ids only (no PII). There are no placeholder orders: imported orders are real orders and are included.
+     */
+    async listOrderPublicIdsForSync(input: { afterPublicId?: string | null; limit: number }, tx?: DbOrTx): Promise<{ publicIds: string[]; nextAfter: string | null }> {
+      const limit = Math.max(1, Math.min(500, Math.trunc(input.limit) || 1));
+      const after = input.afterPublicId ?? null;
+      if (after !== null && !ULID_LIKE.test(after)) throw validation("INVALID_CURSOR", "The cursor is not valid.");
+      const db = tx ?? deps.db;
+      const rows = await db
+        .select({ publicId: orders.publicId })
+        .from(orders)
+        .where(after === null ? undefined : sql`${orders.publicId} > ${after}`)
+        .orderBy(asc(orders.publicId))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit).map((row) => row.publicId);
+      return { publicIds: page, nextAfter: rows.length > limit ? (page.at(-1) ?? null) : null };
+    },
+
+    /**
+     * Trusted (caller already authorised — system sync worker): data for one external list item per order.
+     * No locks; uses the caller's tx when given. Customer name / reference belong to identity (ownerUserId).
+     */
+    async getOrderSyncView(orderPublicId: string, tx?: DbOrTx): Promise<OrderSyncView | null> {
+      if (!ULID_LIKE.test(orderPublicId)) return null;
+      const db = tx ?? deps.db;
+      const [order] = await db.select().from(orders).where(eq(orders.publicId, orderPublicId)).limit(1);
+      if (!order) return null;
+      const items = await db
+        .select({ packetNumber: orderLineItems.packetNumber, tier: orderLineItems.tier, name: orderLineItems.name })
+        .from(orderLineItems)
+        .where(eq(orderLineItems.orderId, order.id))
+        .orderBy(asc(orderLineItems.id))
+        .limit(500);
+      const bound = await workflows.byVersionId(db, order.workflowVersionId);
+      const state = findState(bound.definition, order.statusKey);
+      let closedAt: Date | null = null;
+      if (state?.kind === "terminal") {
+        const [entered] = await db
+          .select({ at: orderStatusHistory.occurredAt })
+          .from(orderStatusHistory)
+          .where(and(eq(orderStatusHistory.orderId, order.id), eq(orderStatusHistory.toStatus, order.statusKey)))
+          .orderBy(desc(orderStatusHistory.id))
+          .limit(1);
+        closedAt = entered?.at ?? null;
+      }
+      return {
+        publicId: order.publicId,
+        reference: order.reference,
+        status: { key: order.statusKey, label: state?.label ?? order.statusKey, kind: state?.kind ?? null },
+        ownerUserId: order.ownerUserId,
+        items,
+        currency: order.currency,
+        subtotalMinor: order.subtotalMinor,
+        discountMinor: order.discountMinor,
+        totalMinor: order.totalMinor,
+        createdAt: order.createdAt,
+        submittedAt: order.submittedAt,
+        closedAt,
+        updatedAt: order.updatedAt,
+      };
+    },
+
+    /** Trusted (caller already authorised): like getOrderRefById, by public id; null for unknown or malformed ids. */
+    async getOrderRefByPublicId(orderPublicId: string, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
+      if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
+      if (!ULID_LIKE.test(orderPublicId)) return null;
+      const query = (tx ?? deps.db)
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .from(orders)
+        .where(eq(orders.publicId, orderPublicId))
+        .limit(1);
+      const [row] = options.forUpdate ? await query.for("update") : await query;
+      return row ?? null;
+    },
+
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       const query = (tx ?? deps.db)
@@ -1027,6 +1129,22 @@ export function isDuplicateKey(error: unknown): boolean {
     current = (current as { cause?: unknown }).cause;
   }
   return false;
+}
+
+export interface OrderSyncView {
+  publicId: string;
+  reference: string;
+  status: { key: string; label: string; kind: "initial" | "active" | "terminal" | null };
+  ownerUserId: number;
+  items: { packetNumber: number | null; tier: PacketTier | null; name: string }[];
+  currency: string;
+  subtotalMinor: number;
+  discountMinor: number;
+  totalMinor: number;
+  createdAt: Date;
+  submittedAt: Date | null;
+  closedAt: Date | null;
+  updatedAt: Date;
 }
 
 export type OrderService = ReturnType<typeof createOrderService>;

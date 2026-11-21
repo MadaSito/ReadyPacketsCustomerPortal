@@ -86,6 +86,40 @@ errors, client conventions).
   endpoints through an outbox with retries. It is disabled until an administrator configures the endpoints
   and the canon version. There is no inbound callback. See `docs/integrations/PRODUCTION_WEBHOOKS.md`.
 
+## Administration and integrations (increment 03)
+
+Contract: `docs/engineering/INCREMENT_03_CONTRACT.md`; decisions: ADRs 0024–0028; migration
+`migrations/0002_integrations_mail_sso_automations.sql`. Everything is off until configured.
+
+- **Mail**: one mail engine with SMTP and Microsoft Graph transports and a primary / secondary route. The
+  secondary is tried only when the primary definitely did not accept the message; an unknown outcome is
+  never resent. Sender, reply-to and an audit copy mailbox are settings (`/admin/email-delivery`). Sent
+  content is stored (encrypted, time-limited) only when retention is on; then the Mail page offers "View
+  message" to holders of `mail.content.read`.
+- **Templates** (`/admin/email-templates`): system and custom templates, HTML or text, logic-less
+  `{{placeholder}}` fields that must be declared, sanitized on save and on render.
+- **Workflow designer** (`/admin/workflows`): wizard and canvas edit the same draft; publishing creates a
+  new version; orders keep the version they were created with.
+- **Automations** (`/admin/automations`): trigger → conditions → actions. Events caused by an automation
+  never trigger automations. The portal-wide switch and limits are on the Automations page.
+- **Single sign-on** (`/admin/sso`): OpenID Connect with one Entra ID tenant. Routes
+  `/api/identity/sso/start` and `/api/identity/sso/callback`; the redirect URI to register is
+  `{canonical origin}/api/identity/sso/callback`. Local sign-in with MFA always remains for administrators;
+  `scripts/ops/recover-admin.ts` restores local administrator access from the host. Not available in the
+  preview profile.
+- **Storage connections** (`/admin/storage`) are copy destinations; the local store is the system of record.
+  Purposes: `order_files`, `backups`, `order_data`. Outbound hosts must be allowed first (presets on the
+  same page). **SharePoint order sync** is at `/admin/sharepoint-sync`.
+- **Off-site backups**: verified `.rpbk` archives are copied to the connections assigned to `backups`; the
+  3-2-1 card counts real verified copies only. The backup key never leaves the host.
+- **Customer reference**: `RPCUS-` + nine characters (0-9, A-Z) from the OS random source
+  (`generateCustomerRef()` in `server/modules/identity/users.ts`).
+- **Capabilities added**: `mail.manage`, `mail.content.read`, `automations.read`, `automations.manage`,
+  `storage.manage`, `identity.sso.manage`.
+- **Client API facades**: features that type their own API facade must add it to
+  `client/src/features/facadeContracts.typecheck.ts` so drift from the server router fails the type check.
+- **Upgrading an installed server**: `docs/operations/UPGRADE.md` (`deploy/upgrade.sh`).
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

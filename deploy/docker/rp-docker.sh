@@ -3,6 +3,7 @@
 #
 #   ./rp-docker.sh up --domain portal.example.com [--acme-email you@example.com | --tls-internal]
 #   ./rp-docker.sh admin --email admin@example.com --name "Full Name" [--password-file <file>]
+#   ./rp-docker.sh recover-admin --email admin@example.com
 #   ./rp-docker.sh catalog [--dry-run]
 #   ./rp-docker.sh status | logs [service] | down | destroy
 #
@@ -35,6 +36,8 @@ Usage:
   rp-docker.sh admin --email <email> --name "<full name>" [--password-file <file>]
         Create the first administrator. Without --password-file the password is asked for twice,
         hidden. A password file must be readable only by its owner and is not removed for you.
+  rp-docker.sh recover-admin --email <email>
+        Recover an existing active administrator on an interactive terminal (logging disabled).
   rp-docker.sh catalog [--dry-run]
         Load the shipped ReadyPackets offerings into the catalogue (--dry-run changes nothing).
   rp-docker.sh status          Show the containers and whether the portal reports ready.
@@ -261,6 +264,22 @@ cmd_admin() {
     return "$status"
 }
 
+cmd_recover_admin() {
+    local email=""
+    while (( $# )); do
+        case $1 in
+            --email) [[ $# -ge 2 ]] || die "--email needs a value"; email=$2; shift 2 ;;
+            *) usage >&2; exit 64 ;;
+        esac
+    done
+    [[ -n $email && $email != --* ]] || { usage >&2; exit 64; }
+    [[ -t 0 && -t 1 && -t 2 ]] || die "administrator recovery requires an interactive terminal on stdin, stdout and stderr"
+    need_docker
+    need_env
+    [[ -n $(compose ps --quiet db 2>/dev/null || true) ]] || die "the database container is not running. Start the stack first with: rp-docker.sh up"
+    compose run --rm --no-deps recover-admin node dist/ops/recover-admin.js --email "$email"
+}
+
 cmd_catalog() {
     local args=()
     while (( $# )); do
@@ -329,6 +348,7 @@ main() {
     case $command in
         up) cmd_up "$@" ;;
         admin) cmd_admin "$@" ;;
+        recover-admin) cmd_recover_admin "$@" ;;
         catalog) cmd_catalog "$@" ;;
         status) cmd_status "$@" ;;
         logs) cmd_logs "$@" ;;

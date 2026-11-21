@@ -137,12 +137,29 @@ export function createUserRepo(deps: ModuleDeps) {
 }
 export type UserRepo = ReturnType<typeof createUserRepo>;
 
-const REF_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/** Generated customer references: `RP-` + 7 Crockford characters (≈34 bits). */
+const REF_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+export const CUSTOMER_REF_PREFIX = "RPCUS-";
+const REF_LENGTH = 9;
+/** Largest multiple of 36 that fits in a byte; bytes at or above it are discarded so every character is equally likely. */
+const REF_REJECT_FROM = 252;
+
+/**
+ * Generated customer IDs: `RPCUS-` + 9 characters from 0-9 and A-Z (36^9, about 1.0e14 values, ~46.5 bits).
+ * Every character comes from the operating system's cryptographic random source with rejection sampling
+ * (no modulo bias). Nothing is derived from a counter, a timestamp or the account, so one ID says nothing
+ * about the next. Uniqueness is enforced by the reservation table; the caller retries on a collision.
+ */
 export function generateCustomerRef(): string {
-  const bytes = randomBytes(7);
-  let out = "RP-";
-  for (const byte of bytes) out += REF_ALPHABET[byte % 32]!;
+  let out = CUSTOMER_REF_PREFIX;
+  let produced = 0;
+  while (produced < REF_LENGTH) {
+    for (const byte of randomBytes(16)) {
+      if (byte >= REF_REJECT_FROM) continue;
+      out += REF_ALPHABET[byte % 36]!;
+      produced += 1;
+      if (produced === REF_LENGTH) break;
+    }
+  }
   return out;
 }
 

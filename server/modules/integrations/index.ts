@@ -15,22 +15,47 @@ import {
 import {
   createEgressPolicy,
   createPinnedLookup,
+  EGRESS_PRESET_KEYS,
   EGRESS_PROTOCOLS,
   EGRESS_PURPOSES,
   type CreateEgressRuleInput,
   type EgressAllowlistRuleView,
   type EgressFetchOptions,
   type EgressFetchResponse,
+  type EgressHttpMethod,
   type EgressMatchType,
   type EgressPolicy,
   type EgressPolicyOptions,
+  type EgressPresetKey,
+  type EgressPresetParams,
+  type EgressPresetView,
   type EgressProtocol,
   type EgressPurpose,
   type EgressTargetInput,
   type PinnedEgressTarget,
   type ResolveEgressInput,
+  type SetEgressPresetInput,
   type UpdateEgressRuleInput,
 } from "./egress.js";
+import {
+  createGraphModuleRuntime,
+  createGraphTokenCache,
+  GraphApiError,
+  type GraphAdminService,
+  type GraphClient,
+  type GraphConfigView,
+  type GraphConnectionTestResult,
+  type GraphCredentialsInput,
+  type GraphHttpMethod,
+  type GraphMailTestResult,
+  type GraphReadiness,
+  type GraphRequestInput,
+  type GraphResponse,
+  type GraphUploadChunkInput,
+  type GraphUploadChunkResult,
+  type GraphUploadSessionControlInput,
+  type UpdateGraphConfigInput,
+} from "./graph/index.js";
 import { createProviderChecksStore } from "./providerChecks.js";
 import {
   createScaffoldsService,
@@ -45,6 +70,7 @@ import {
   type ProviderState,
   type SmtpConfigView,
   type SmtpReadiness,
+  type SmtpSenderIdentity,
   type SmtpSendInput,
   type SmtpSendResult,
   type SmtpService,
@@ -92,8 +118,10 @@ import "./settings.js";
 
 export {
   createPinnedLookup,
+  EGRESS_PRESET_KEYS,
   EGRESS_PROTOCOLS,
   EGRESS_PURPOSES,
+  GraphApiError,
   PRODUCTION_DELIVERY_JOB,
   PRODUCTION_DISPATCH_MAX_TTL_MS,
   PRODUCTION_MAX_ATTEMPTS,
@@ -111,12 +139,29 @@ export {
   type EgressAllowlistRuleView,
   type EgressFetchOptions,
   type EgressFetchResponse,
+  type EgressHttpMethod,
   type EgressMatchType,
   type EgressPolicy,
   type EgressPolicyOptions,
+  type EgressPresetKey,
+  type EgressPresetParams,
+  type EgressPresetView,
   type EgressProtocol,
   type EgressPurpose,
   type EgressTargetInput,
+  type GraphAdminService,
+  type GraphClient,
+  type GraphConfigView,
+  type GraphConnectionTestResult,
+  type GraphCredentialsInput,
+  type GraphHttpMethod,
+  type GraphMailTestResult,
+  type GraphReadiness,
+  type GraphRequestInput,
+  type GraphResponse,
+  type GraphUploadChunkInput,
+  type GraphUploadChunkResult,
+  type GraphUploadSessionControlInput,
   type ListProductionDispatchesInput,
   type MaskedWebhookUrlView,
   type P101Payload,
@@ -137,9 +182,11 @@ export {
   type ResolveEgressInput,
   type SamlScaffoldView,
   type ScaffoldsService,
+  type SetEgressPresetInput,
   type SharePointScaffoldView,
   type SmtpConfigView,
   type SmtpReadiness,
+  type SmtpSenderIdentity,
   type SmtpSendInput,
   type SmtpSendResult,
   type SmtpService,
@@ -150,13 +197,14 @@ export {
   type StripeWebhookResult,
   type UpdateAnalyticsConfigInput,
   type UpdateEgressRuleInput,
+  type UpdateGraphConfigInput,
   type UpdateProductionSettingsInput,
   type UpdateSamlScaffoldInput,
   type UpdateSmtpConfigInput,
   type UpdateStripeConfigInput,
 };
 
-export const PROVIDER_KEYS = ["smtp", "clarity", "posthog", "stripe", "saml", "sharepoint"] as const;
+export const PROVIDER_KEYS = ["smtp", "graph", "clarity", "posthog", "stripe", "saml", "sharepoint"] as const;
 export type ProviderKey = (typeof PROVIDER_KEYS)[number];
 
 export interface ProviderStatus {
@@ -180,10 +228,17 @@ export interface IntegrationsModuleOptions {
 }
 
 export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
+  init(): void;
+  stop(): void;
   health(): Promise<ModuleHealth[]>;
   egress: EgressPolicy;
   providers: ProviderRegistry;
   smtp: SmtpService;
+  graph: GraphClient;
+  graphAdmin: GraphAdminService;
+  createScopedGraphClient(
+    credentials?: GraphCredentialsInput | (() => Promise<GraphCredentialsInput | null>),
+  ): GraphClient;
   analytics: AnalyticsService;
   stripe: StripeService;
   scaffolds: ScaffoldsService;
@@ -199,14 +254,17 @@ export function createIntegrationsModule(
   const checks = createProviderChecksStore(deps);
   const egress = createEgressPolicy(deps, options.egress);
   const smtp = createSmtpService(deps, egress, checks, options.smtpTransportFactory);
+  const graphTokenCache = createGraphTokenCache(egress, deps.clock);
+  const graphRuntime = createGraphModuleRuntime(deps, egress, checks, graphTokenCache);
   const analytics = createAnalyticsService(deps);
   const stripe = createStripeService(deps, checks);
   const scaffolds = createScaffoldsService(deps);
   const production = createProductionWebhookService(deps, egress, checks);
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
-    const [smtpView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
+    const [smtpView, graphView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
       smtp.getConfig(),
+      graphRuntime.admin.getConfig(),
       analytics.getAdminConfig(),
       stripe.getConfig(),
       scaffolds.getSamlScaffold(),
@@ -244,6 +302,15 @@ export function createIntegrationsModule(
         scaffoldOnly: false,
         lastCheckedAt: smtpView.lastCheckedAt,
         summary: smtpView.summary,
+      },
+      {
+        key: "graph",
+        name: "Microsoft Graph Mail & Cloud",
+        state: graphView.state,
+        verified: graphView.verified,
+        scaffoldOnly: false,
+        lastCheckedAt: graphView.lastCheckedAt,
+        summary: graphView.summary,
       },
       {
         key: "clarity",
@@ -318,11 +385,22 @@ export function createIntegrationsModule(
     egress,
     providers,
     smtp,
+    graph: graphRuntime.client,
+    graphAdmin: graphRuntime.admin,
+    createScopedGraphClient: graphRuntime.createScopedClient,
     analytics,
     stripe,
     scaffolds,
     production,
     analyticsCsp: (pathname) => analytics.analyticsCsp(pathname),
+
+    init(): void {
+      deps.services.jobAdmin?.registerMailTransport?.(graphRuntime.mailTransport);
+    },
+
+    stop(): void {
+      graphTokenCache.clear();
+    },
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
@@ -332,7 +410,8 @@ export function createIntegrationsModule(
         checks.get("production"),
       ]);
       const base = statuses.map((p): ModuleHealth => {
-        const component = p.key === "smtp" ? "mail.smtp" : `integrations.${p.key}`;
+        const component =
+          p.key === "smtp" ? "mail.smtp" : p.key === "graph" ? "mail.graph" : `integrations.${p.key}`;
         return {
           component,
           state: mapProviderToHealthState(p),

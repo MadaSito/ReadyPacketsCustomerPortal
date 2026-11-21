@@ -16,7 +16,9 @@ import {
   staffProcedure,
 } from "../../trpc/trpc.js";
 import { customerRefSchema, emailSchema, nameSchema } from "./normalize.js";
-import { USER_STATUSES } from "./schema.js";
+import { SSO_JIT_MODES, USER_STATUSES } from "./schema.js";
+import type { SignInMethods } from "./sso/service.js";
+import type { Services } from "../../container.js";
 
 /** Raw bound only (policy is enforced by the service with code-point counting; never truncated). */
 const password = z.string().min(1).max(1024);
@@ -31,6 +33,28 @@ const listInput = z
     limit: z.number().int().min(1).max(100).optional(),
   })
   .optional();
+const guid = z.string().trim().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/, "Enter a GUID.");
+const ssoConfigInput = z.strictObject({
+  expectedVersion: z.number().int().min(1),
+  tenantId: guid.nullable(),
+  clientId: guid.nullable(),
+  /** Write-only: omit = keep, null = clear, string = replace. */
+  clientSecret: z.string().min(1).max(512).nullable().optional(),
+  buttonLabel: z.string().trim().max(60).nullable(),
+  allowedDomains: z.array(z.string().trim().min(1).max(253)).max(50),
+  trustEntraMfa: z.boolean(),
+  jitMode: z.enum(SSO_JIT_MODES),
+  jitStaffAppRole: z.string().trim().max(120).nullable(),
+  jitDailyLimit: z.number().int().min(1).max(500),
+});
+
+/** Adds the sign-in method column (password / Microsoft) to list pages. */
+async function withSignInMethods<T extends { publicId: string }>(services: Services, page: { items: T[]; nextCursor: string | null }) {
+  const methods = await services.identity.sso.signInMethods(page.items.map((item) => item.publicId));
+  const none: SignInMethods = { password: false, sso: null };
+  return { ...page, items: page.items.map((item) => ({ ...item, signInMethods: methods.get(item.publicId) ?? none })) };
+}
+
 const statusInput = z.strictObject({ customerId: publicId, status: z.enum(["active", "suspended", "deactivated"]), reasonCode });
 
 export const identityRouter = router({
@@ -99,7 +123,11 @@ export const identityRouter = router({
       state: ctx.session.state,
       pendingSteps: [...ctx.session.pendingSteps],
       nextStep: ctx.session.pendingSteps[0] ?? null,
-      session: { idleTimeoutSeconds: timing.idleTimeoutSeconds, absoluteExpiresAt: timing.absoluteExpiresAt.toISOString() },
+      session: {
+        idleTimeoutSeconds: timing.idleTimeoutSeconds,
+        absoluteExpiresAt: timing.absoluteExpiresAt.toISOString(),
+        authMethod: ctx.session.authMethod,
+      },
     };
   }),
 
@@ -135,12 +163,48 @@ export const identityRouter = router({
     })),
   }),
 
+  /** Microsoft Entra ID single sign-on (raw start/callback/complete routes live in http.ts). */
+  sso: router({
+    publicConfig: publicProcedure.query(({ ctx }) => ctx.services.identity.sso.publicConfig()),
+    prepare: protectedProcedure
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(z.strictObject({ purpose: z.enum(["link", "step_up", "test"]), next: z.string().max(512).optional() }))
+      .mutation(({ ctx, input }) => ctx.services.identity.sso.prepare(ctx.session, input.purpose, input.next)),
+    myLink: protectedProcedure.query(({ ctx }) => ctx.services.identity.sso.myLink(ctx.session)),
+    unlinkSelf: protectedProcedure.meta({ rateLimit: "auth_high_risk" }).mutation(async ({ ctx }) => {
+      await ctx.services.identity.sso.unlinkSelf(ctx.session);
+      return { ok: true as const };
+    }),
+  }),
+
   admin: router({
+    sso: router({
+      get: adminProcedure.use(requireCapability("identity.sso.manage")).query(({ ctx }) => ctx.services.identity.sso.adminView()),
+      update: adminProcedure
+        .use(requireCapability("identity.sso.manage"))
+        .input(ssoConfigInput)
+        .mutation(({ ctx, input }) => ctx.services.identity.sso.updateConfig(ctx.session, input)),
+      setEnabled: adminProcedure
+        .use(requireCapability("identity.sso.manage"))
+        .input(z.strictObject({ enabled: z.boolean(), expectedVersion: z.number().int().min(1) }))
+        .mutation(({ ctx, input }) => ctx.services.identity.sso.setEnabled(ctx.session, input.enabled, input.expectedVersion)),
+      bindUser: adminProcedure
+        .use(requireCapability("identity.sso.manage"))
+        .input(z.strictObject({ userId: publicId, objectId: guid }))
+        .mutation(({ ctx, input }) => ctx.services.identity.sso.bindUser(ctx.session, input.userId, input.objectId)),
+      unbindUser: adminProcedure
+        .use(requireCapability("identity.sso.manage"))
+        .input(z.strictObject({ userId: publicId }))
+        .mutation(async ({ ctx, input }) => {
+          await ctx.services.identity.sso.unbindUser(ctx.session, input.userId);
+          return { ok: true as const };
+        }),
+    }),
     customers: router({
       list: staffProcedure
         .use(requireCapability("customers.read_all"))
         .input(listInput)
-        .query(({ ctx, input }) => ctx.services.identity.searchCustomers(ctx.session, input ?? {})),
+        .query(async ({ ctx, input }) => withSignInMethods(ctx.services, await ctx.services.identity.searchCustomers(ctx.session, input ?? {}))),
       get: staffProcedure
         .use(requireCapability("customers.read_all"))
         .input(z.strictObject({ customerId: publicId }))
@@ -174,7 +238,7 @@ export const identityRouter = router({
       list: adminProcedure
         .use(requireCapability("staff.manage"))
         .input(listInput)
-        .query(({ ctx, input }) => ctx.services.identity.admin.listStaff(ctx.session, input ?? {})),
+        .query(async ({ ctx, input }) => withSignInMethods(ctx.services, await ctx.services.identity.admin.listStaff(ctx.session, input ?? {}))),
       create: adminProcedure
         .use(requireCapability("staff.manage"))
         .input(z.strictObject({ email: emailSchema, name: nameSchema, role: z.enum(["staff", "admin"]) }))

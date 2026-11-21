@@ -41,11 +41,20 @@ export function isNavigation(req: Request): boolean {
 
 const MODULES = new Set([
   "identity", "assurance", "orders", "files", "engagement", "compliance", "audit", "siem",
-  "platform", "jobs", "portable", "backup", "integrations",
+  "platform", "jobs", "portable", "backup", "integrations", "storage",
 ]);
+
+/** Only fixed labels are emitted; callback paths may carry credentials in their query. */
+export function providerCallbackRoute(path: string): string | undefined {
+  if (/^\/api\/storage\/oauth\/callback(?:\/|$)/i.test(path)) return "/api/storage/oauth/callback/:provider";
+  if (/^\/api\/identity\/sso\/callback\/?$/i.test(path)) return "/api/identity/sso/callback";
+  return undefined;
+}
 
 export function routeTemplate(req: Request): string {
   const path = req.path;
+  const oauth = providerCallbackRoute(path);
+  if (oauth) return oauth;
   if (PROBE_PATHS.has(path) || path === "/robots.txt" || path === "/api/csrf") return path;
   if (path === SIGNED_WEBHOOK_PATH || path.startsWith(`${SIGNED_WEBHOOK_PATH}/`)) return `${SIGNED_WEBHOOK_PATH}/:provider`;
   if (path === TRPC_PATH || path.startsWith(`${TRPC_PATH}/`)) return `${TRPC_PATH}/:procedures`;

@@ -7,10 +7,11 @@ import { useTRPC } from "@/lib/trpc";
 import { Callout, Card, DateTime, ErrorState, PageHeader, Skeleton, buttonClasses } from "@/ui";
 import { INTEGRATION_PATHS, ProviderStatusBadge, type ProviderKey, type ProviderRow } from "../shared";
 
-const ORDER: readonly ProviderKey[] = ["smtp", "clarity", "posthog", "saml", "stripe", "sharepoint"];
+const ORDER: readonly ProviderKey[] = ["smtp", "graph", "clarity", "posthog", "saml", "stripe", "sharepoint"];
 
 const META: Record<ProviderKey, { title: string; icon: typeof Mail; href?: string; manage?: string; blurb: string }> = {
   smtp: { title: "E-mail (SMTP)", icon: Mail, href: INTEGRATION_PATHS.smtp, manage: "Configure e-mail", blurb: "Delivers sign-in codes, invitations, receipts and order notices through your mail relay." },
+  graph: { title: "Microsoft Graph Mail", icon: Mail, href: "/admin/email-delivery", manage: "Configure Graph mail", blurb: "Single-tenant Microsoft 365 application mail delivery and Graph cloud connectivity." },
   clarity: { title: "Microsoft Clarity", icon: ScanEye, href: INTEGRATION_PATHS.analytics, manage: "Configure analytics", blurb: "Optional, consent-gated session analytics on public legal pages only." },
   posthog: { title: "PostHog", icon: BarChart3, href: INTEGRATION_PATHS.analytics, manage: "Configure analytics", blurb: "Optional, consent-gated product analytics on public legal pages only." },
   saml: { title: "SAML single sign-on", icon: KeyRound, blurb: "Federated sign-in. Local sign-in with multi-factor verification stays the only active method." },

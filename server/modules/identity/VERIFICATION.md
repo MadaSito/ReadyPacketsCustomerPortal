@@ -33,3 +33,9 @@ profile cases use production parameters). Fakes: audit, mailer, jobs, rate limit
 | Account, sessions, customers (list, create, detail with role-filtered CUSTOMER_TABS), staff pages; client-side password validation; axe on every page family | `client/src/features/identity/identity.test.tsx` (8 tests, jsdom + axe-core) | automated-test |
 | Real-browser rendering, responsive layout, screen-reader and keyboard walkthrough | not run (contract forbids browsers here) | not-verified |
 | Real browser / assistive technology | not run in this environment | not-verified |
+
+## Single sign-on (Entra ID) — local fakes only
+- `server/modules/identity/sso/sso.test.ts` (36 tests, MySQL): FAKE identity provider (`sso/testing.ts`: synthetic RSA keys, JWKS and token endpoint behind a fake egress `fetchPinned`). No real tenant, no network.
+- Covers replayed state, wrong browser, wrong tenant/audience/issuer, alg none/HS256, bad signature, unknown kid bounded refetch, expiry, nonce mismatch, unlinked, deactivated, e-mail collision, JIT never admin + daily limit, allowed domains, `mustChangePassword`, parked-code negatives (no session, other session, replayed handle, expired park), the I-A02 races (deterministic audit-gate interleaving both orders + epoch bump), no code/state/secret in audit.
+- `tests/integration/sso-http.test.ts` (assembled pipeline, fake IdP): cross-site callback admitted, binder cookie attributes, no-store/no-referrer, CSRF required on completion, replay refused, aliases not served, no auth material in responses or audit rows.
+- Not verified against a real Entra tenant.

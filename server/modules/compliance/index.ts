@@ -13,6 +13,7 @@
  *      import (`importPortableEvidence`).
  */
 import "./settings.js";
+import "./automationTriggers.js";
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, Tx } from "../../core/types.js";
 import { createIntakeService, type IntakeService } from "./intakeService.js";

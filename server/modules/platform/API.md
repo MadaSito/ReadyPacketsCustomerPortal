@@ -71,6 +71,41 @@ These helpers work against the core `SettingsStore` interface, so they also work
 `SETTING_GROUPS`: `general, presentation, security, identity, mail, integrations, observability, backup, jobs,
 files, orders, engagement, compliance, portable, analytics, features`. Ask platform_engineer to add a group.
 
+### 1a. Form descriptions, labels, write capability, owning page (increment 03, package A)
+
+`defineSetting` accepts three optional extras (`defineSecret` accepts the last two):
+
+```ts
+fields?: Record<string, { label?: string; help?: string }>; // dot path into the value; "" = the value itself
+writeCapability?: Capability;  // e.g. "mail.manage": generic writes ALSO need this, re-validated in-tx (+ fresh step-up if in STEP_UP_CAPABILITIES)
+managedBy?: { href: string; label: string }; // "/admin/..." console path; the Settings page links there instead of editing
+```
+
+Every value setting's `SettingView` (from `platform.admin.settings.list`) carries `field?: SettingFieldDescription`,
+derived from its Zod schema by `server/modules/platform/settingFields.ts` (`describeSchema`, pure, never throws;
+input side, so `.default()` keys are `required: false`). Secrets and flags never carry one. Exact type:
+
+```ts
+type SettingFieldScalar = string | number | boolean;
+interface FieldCommon { label: string; help?: string; required: boolean; nullable: boolean; default?: unknown }
+type SettingFieldDescription = FieldCommon & (
+  | { type: "boolean" }
+  | { type: "string"; minLength?: number; maxLength?: number; pattern?: string; format?: string } // format: "email" | "uri" | …
+  | { type: "number" | "integer"; minimum?: number; maximum?: number; exclusiveMinimum?: number; exclusiveMaximum?: number }
+  | { type: "enum"; options: Array<{ value: SettingFieldScalar; label: string }> }          // z.enum / literal unions
+  | { type: "object"; fields: Array<SettingFieldDescription & { key: string }> }            // nested objects
+  | { type: "array"; items: SettingFieldDescription; minItems?: number; maxItems?: number; uniqueItems?: boolean } // items: scalar | enum only
+  | { type: "unsupported" }                                                                  // records, tuples, arrays of objects, mixed unions → JSON editor only
+);
+```
+
+Labels default to the humanised property name (`retention_days` → "Retention days"); help defaults to the
+schema's `.describe()` text. The form is a convenience only: writes are validated by the declared schema on the
+server, and `INVALID_SETTING_VALUE` errors carry `details.fields` (dot paths, `_` = root) that the client maps
+to form fields. `SettingView` also carries `managedBy` / `writeCapability` when declared. The form renderer
+lives in `client/src/features/platform/SettingFieldsForm.tsx` (feature-local; ask ui_foundation to promote it
+to `@/ui` if another feature needs it).
+
 ## 2. Service interface — `deps.services.platform: PlatformModule`
 
 ```ts

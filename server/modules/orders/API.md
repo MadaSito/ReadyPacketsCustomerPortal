@@ -171,3 +171,28 @@ Reads (O-02): `orders.get`, `getOrderSummary` and `sharing.list` authorize and p
 - Settings: `orders.reference.prefix` (default `RP`), `orders.notify.mail` (default false — in-app notifications always), `orders.sharing.invite_ttl_days` (default 14), `orders.bundle_rule` `{ enabled, requiredPacketNumbers, discountPercent, label }` (default disabled). Discount = round-half-up(subtotal × percent / 100) in minor units on the whole order subtotal, applied only when every required packet is present; capped at the subtotal.
 - Health: `orders.catalog` (`not_configured` while the catalog is empty), `orders.workflow` (`failing` if no default workflow).
 - Demo seed: `seedOrdersDemo(ordersModule, adminPrincipal, { currency? })` exported from `server/modules/orders/demoSeed.ts` — clearly synthetic, never run automatically, and only when the catalog is empty. For a packet demo, import the offerings file through `catalog.upsertFromOfferings` and create orders with `orders.create` using `{ productPublicId, quantity: 1 }` per packet.
+
+## Increment 03 — workflow designer
+
+All procedures are under `orders.admin.workflows.*`, need an admin session with the `workflows.manage` capability (re-validated in-transaction by `assertDesigner`), and are audited inside the transaction. Ids are ULID `publicId`s. Every write takes `expectedVersion` (optimistic concurrency).
+
+| Procedure | Kind | Input | Output | Step-up |
+| --- | --- | --- | --- | --- |
+| `list` | query | — | `{ publicId, workflowKey, name, isDefault, rowVersion, versionNumber, currentVersionPublicId, draftPublicId, definition }[]` | no |
+| `installStandard` | mutation | — | `{ installed, workflowPublicId, versionNumber }` (idempotent; audit reason `STANDARD_INSTALLED`) | yes |
+| `versions` | query | `{ workflowId }` | `{ workflow, versions: { publicId, versionNumber, isCurrent, createdAt, changeNote, stateCount, transitionCount, orderCount }[] }` | no |
+| `version` | query | `{ versionId }` | `{ publicId, workflowPublicId, workflowName, versionNumber, isCurrent, createdAt, definition, layout, changeNote }` (read-only) | no |
+| `drafts.list` | query | — | `{ publicId, workflowPublicId, workflowKey, name, source, rowVersion, updatedAt, errorCount, warningCount }[]` | no |
+| `drafts.get` | query | `{ draftId }` | `{ …draft, definition, layout, rowVersion, issues, publishable, baseVersionNumber }` | no |
+| `drafts.create` | mutation | `{ from: "standard" \| "blank" \| "copy", copyVersionId?, workflowId?, workflowKey?, name? }` | `{ publicId, rowVersion }` | no |
+| `drafts.save` | mutation | `{ draftId, expectedVersion, name, definition, layout? }` | `{ rowVersion, issues, publishable }` | no |
+| `drafts.validate` | mutation (POST, no write, no audit) | `{ definition }` | `{ issues, publishable }` | no |
+| `drafts.discard` | mutation | `{ draftId, expectedVersion }` | `{ discarded: true }` | no |
+| `drafts.publish` | mutation | `{ draftId, expectedVersion, makeDefault, changeNote? (≤500) }` | `{ workflowPublicId, versionNumber, isDefault }` | yes (fresh, persisted) |
+
+- Draft `definition`: `{ states: { key, label, customerLabel, kind: initial|active|terminal, tone }[] (≤30), transitions: { from, to, allowedBy: (customer|staff|admin)[], notifyCustomer, requiresNote, actionLabel? }[] (≤200) }`. Drafts may be incomplete; `issues` are `{ severity: "error"|"warning", code, path (e.g. "states.2.key"), message }`.
+- `layout` (canvas positions): `{ nodes: { key, x, y }[] }`, integer coordinates within ±10000, pruned to existing state keys; stored per draft and copied to the published version.
+- Publish: lock order users row → draft → workflow; creates a NEW immutable version (existing orders keep their bound version); the first workflow becomes default only if none exists; deletes the draft. Audit: `workflow.changed` (action `publish`, attributes `version_number`, `make_default`, `source`, `draft_id`, `warnings`) and `workflow.draft.changed` (create/update/delete).
+- Error codes: `WORKFLOW_DRAFT_EXISTS` (details.draftId), `WORKFLOW_KEY_TAKEN`, `WORKFLOW_NAME_REQUIRED`, `COPY_VERSION_REQUIRED`, `STALE_VERSION`, `WORKFLOW_CHANGED_SINCE_DRAFT`, `WORKFLOW_DRAFT_INVALID` (details `issues`, `issuePaths`, `issueCodes`), `INVALID_WORKFLOW_DRAFT`, `INVALID_WORKFLOW_LAYOUT`, `WORKFLOW_DRAFT_NOT_FOUND`, `WORKFLOW_VERSION_NOT_FOUND`, `WORKFLOW_NOT_FOUND`, `STEP_UP_REQUIRED`, `ACTOR_NOT_AUTHORIZED`.
+- The former direct `admin.workflows.create` / `admin.workflows.publish` procedures are no longer mounted (bc092eb). The internal service methods remain with the same gates as `drafts.publish` (admin, fresh step-up, designer validation).
+- Internal ports (no principal, system callers only): `registerChangeListener(listener)` (runs in-tx after audit on create/update/setLock/changeReference/transition/reassign; a throw aborts the write), `getOrderSyncView(orderPublicId, tx?)`, `getOrderRefByPublicId(id, tx?, { forUpdate? })`, `listOrderPublicIdsForSync({ afterPublicId?, limit ≤500 }, tx?)` (ascending publicId keyset, ids only). Automation triggers `order.created`, `order.status_changed`, `order.assigned` (context `order_reference`, `order_status_label`, `order_link`).

@@ -65,7 +65,7 @@ case $mode in
         ;;
     diagnostics)
         systemctl --no-pager --full status readypackets-portal.service readypackets-worker.service nginx.service mysql.service | tail -n 80 || true
-        for unit in readypackets-portal.service readypackets-worker.service readypackets-backup@cli.service nginx.service mysql.service; do
+        for unit in readypackets-portal.service readypackets-worker.service readypackets-backup@pre_upgrade.service readypackets-backup@cli.service nginx.service mysql.service; do
             printf '\n--- journal: %s\n' "$unit"
             journalctl --unit="$unit" --no-pager --lines=60 --output=cat || true
         done

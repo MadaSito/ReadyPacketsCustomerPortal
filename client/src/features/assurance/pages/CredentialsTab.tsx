@@ -22,11 +22,10 @@ export default function CredentialsTab({ customerId }: { customerId: string }) {
   const trpc = useTRPC();
   const client = useTRPCClient().assurance.admin;
   const stepUp = useStepUp();
-  const smtp = useQuery(trpc.integrations.admin.smtpReadiness.queryOptions());
+  const mail = useQuery(trpc.assurance.admin.mailReadiness.queryOptions());
   return <CredentialAdmin key={customerId} customerId={customerId} stepUp={stepUp}
     email={{
-      state: smtp.isPending ? "checking" : smtp.data?.ready ? "ready" : "unavailable",
-      summary: smtp.data?.summary,
+      state: mail.isPending ? "checking" : mail.data?.ready ? "ready" : "unavailable",
     }}
     actions={{
       // A plaintext temporary password must not enter a retained mutation-cache entry.
@@ -121,7 +120,7 @@ export function CredentialAdmin({
           {email.state !== "ready" ? <Callout tone={email.state === "checking" ? "info" : "warning"}
             title={email.state === "checking" ? "Checking email delivery" : "Set-password email unavailable"}>
             {email.summary ?? (email.state === "checking" ? "Temporary password methods are still available."
-              : "Temporary password methods are available. An administrator can configure email delivery in Integrations.")}
+              : "Temporary password methods are available. An administrator can configure a sender and delivery route in Email Delivery.")}
           </Callout> : null}
           {mode === "enter_temporary" ? (
             <Field label="Temporary password" required error={validationError}

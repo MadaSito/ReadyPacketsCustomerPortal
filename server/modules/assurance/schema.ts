@@ -2,6 +2,11 @@ import { char, index, int, mysqlEnum, mysqlTable, text, uniqueIndex, varchar } f
 import { createdAtColumn, idColumn, publicIdColumn, refColumn, updatedAtColumn, utcDateTime } from "../../db/columns.js";
 import { users } from "../identity/schema.js";
 
+/** Singleton inserted on first use; held across transactions that can reduce local admin coverage. */
+export const assuranceLocalAdminPolicy = mysqlTable("assurance_local_admin_policy", {
+  id: int("id", { unsigned: true }).primaryKey(),
+});
+
 /** One serialization point per account for credential lifecycle and one-time proof use. */
 export const assuranceAccounts = mysqlTable("assurance_accounts", {
   id: idColumn(),

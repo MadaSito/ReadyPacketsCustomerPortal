@@ -4,7 +4,7 @@
  * + LocalObjectStorage. SYNTHETIC DATA ONLY (`*.example.test`).
  */
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -61,9 +61,16 @@ import { backupRouter } from "./router.js";
 import {
   backupArchives,
   backupLegalHolds,
+  backupRemoteCopies,
   backupRestoreDrills,
   backupVerifications,
 } from "./schema.js";
+import { z } from "zod";
+import { entriesForEvent } from "../audit/triggerCatalogue.js";
+import { getStaticAutomationRegistrations } from "../automations/contracts.js";
+import { createStorageModule } from "../storage/index.js";
+import { storageAssignments, storageConnections, storageFileCopies } from "../storage/schema.js";
+import { BACKUP_JOB_REMOTE_COPY, BACKUP_JOB_REMOTE_SWEEP } from "./offsite.js";
 // Side-effect import ensures backup setting definitions are registered in the platform settings registry.
 import "./settings.js";
 
@@ -87,10 +94,14 @@ const TEST_SCHEMA = {
   auditChainHead,
   auditCheckpoints,
   auditTombstones,
+  storageConnections,
+  storageAssignments,
+  storageFileCopies,
   backupArchives,
   backupVerifications,
   backupRestoreDrills,
   backupLegalHolds,
+  backupRemoteCopies,
 };
 
 const baseMysqlUrl = () => process.env.RP_DEV_MYSQL_URL ?? "mysql://rp_dev:rp_dev_local_only@127.0.0.1:3306";
@@ -1534,5 +1545,370 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
     } finally {
       realStorage.delete = origDelete;
     }
+  });
+
+  it("supports multi-destination 3-2-1 off-site copies, digest verification, retry/Copy now, non-deletion, and automation triggers", async () => {
+    await tdb.db.delete(backupRemoteCopies);
+    await tdb.db.delete(backupLegalHolds);
+    await tdb.db.delete(backupVerifications);
+    await tdb.db.delete(backupRestoreDrills);
+    await tdb.db.delete(backupArchives);
+    await tdb.db.delete(storageAssignments);
+    await tdb.db.delete(storageConnections);
+
+    const env: NodeJS.ProcessEnv = {
+      RP_BACKUP_KEY_FILE: keyFilePath,
+      RP_BACKUP_KEY_ID: "bk-321-2026",
+      RP_RECOVERY_SANDBOX_DIR: sandboxRootDir,
+    };
+    const { harness, deps, mod, realStorage } = buildRealStorageHarness(env);
+    mod.init?.();
+
+    // 1. Verify all 6 backup triggers are registered in the automation registry.
+    const registeredTriggers = getStaticAutomationRegistrations().triggers;
+    for (const expectedKey of [
+      "backup.completed",
+      "backup.failed",
+      "backup.verify_failed",
+      "backup.remote_copy_completed",
+      "backup.remote_copy_failed",
+      "backup.policy_unmet",
+    ]) {
+      expect(registeredTriggers.has(expectedKey)).toBe(true);
+    }
+
+    // Wire real StorageModule with local in-memory fake cloud adapters (OneDrive + SharePoint + Dropbox; zero real cloud egress).
+    const storageMod = createStorageModule(deps);
+    (deps.services as unknown as Record<string, unknown>).storageConnections = storageMod;
+
+    interface StoredRemoteBlob {
+      connectionId: string;
+      path: readonly string[];
+      name: string;
+      bytes: Buffer;
+      sha256: string;
+    }
+    const remoteObjects = new Map<string, StoredRemoteBlob>();
+    let failSecondDestPutOnce = false;
+
+    const fakeConfigSchema = z.strictObject({ bucketLabel: z.string().min(1) });
+    const fakeCredSchema = z.strictObject({ clientSecret: z.string().min(4) });
+
+    for (const kind of ["onedrive", "sharepoint", "dropbox"] as const) {
+      storageMod.registerAdapter(kind, {
+        configSchema: fakeConfigSchema,
+        credentialsSchema: fakeCredSchema,
+        purposes: ["order_files", "backups"],
+        create: ({ publicId }) => ({
+          async test() {
+            return { ok: true, code: "OK" as const };
+          },
+          async ensureFolder() {},
+          async remove() {},
+          async put(input) {
+            const chunks: Buffer[] = [];
+            for await (const chunk of input.body) {
+              chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+            }
+            const bytes = Buffer.concat(chunks);
+            if (kind === "sharepoint" && failSecondDestPutOnce) {
+              failSecondDestPutOnce = false;
+              throw new DomainError("UNAVAILABLE", "STORAGE_UPSTREAM_FAILURE", "Simulated transient upstream 503");
+            }
+            const digest = createHash("sha256").update(bytes).digest("hex");
+            const remoteKey = `${publicId}:${input.path.join("/")}/${input.name}`;
+            remoteObjects.set(remoteKey, {
+              connectionId: publicId,
+              path: input.path,
+              name: input.name,
+              bytes,
+              sha256: digest,
+            });
+            return {
+              remoteId: `secret-provider-uri://${kind}/${remoteKey}`,
+              size: bytes.length,
+              ...(kind === "sharepoint"
+                ? { verifiedTransportDigest: "quickxor" as const }
+                : { sha256: digest }),
+            };
+          },
+        }),
+      });
+    }
+
+    const admin = makeAdminPrincipal({ stepUpAt: deps.clock.now() });
+
+    // 2. Shipped disabled by default: 0 destinations, autoCopyAfterVerify false, 3-2-1 unmet.
+    const initialCfg = await mod.getOffsiteConfig(admin);
+    expect(initialCfg.autoCopyAfterVerify).toBe(false);
+    expect(initialCfg.destinations).toHaveLength(0);
+    expect(initialCfg.status321.overallMet).toBe(false);
+
+    // Create 3 local-fake cloud storage connections, test them, and enable them.
+    const s3Created = await storageMod.connections.create(admin, {
+      kind: "onedrive",
+      name: "Offsite OneDrive Vault",
+      config: { bucketLabel: "vault-a" },
+      credentials: { clientSecret: "tok-od-synthetic" },
+    });
+    const s3Tested = await storageMod.connections.test(admin, {
+      publicId: s3Created.publicId,
+      expectedVersion: s3Created.version,
+    });
+    const s3Conn = await storageMod.connections.update(admin, {
+      publicId: s3Tested.publicId,
+      expectedVersion: s3Tested.version,
+      enabled: true,
+    });
+
+    const azCreated = await storageMod.connections.create(admin, {
+      kind: "sharepoint",
+      name: "Offsite SharePoint Archive",
+      config: { bucketLabel: "vault-b" },
+      credentials: { clientSecret: "tok-sp-synthetic" },
+    });
+    const azTested = await storageMod.connections.test(admin, {
+      publicId: azCreated.publicId,
+      expectedVersion: azCreated.version,
+    });
+    const azureConn = await storageMod.connections.update(admin, {
+      publicId: azTested.publicId,
+      expectedVersion: azTested.version,
+      enabled: true,
+    });
+
+    const dbxCreated = await storageMod.connections.create(admin, {
+      kind: "dropbox",
+      name: "Secondary Dropbox Hold",
+      config: { bucketLabel: "vault-c" },
+      credentials: { clientSecret: "tok-dbx-synthetic" },
+    });
+    const dbxTested = await storageMod.connections.test(admin, {
+      publicId: dbxCreated.publicId,
+      expectedVersion: dbxCreated.version,
+    });
+    const dropboxConn = await storageMod.connections.update(admin, {
+      publicId: dbxTested.publicId,
+      expectedVersion: dbxTested.version,
+      enabled: true,
+    });
+
+    // 3. Configure Off-site copies (S3 enabled, Azure enabled, Dropbox assigned but toggled OFF, autoCopyAfterVerify ON).
+    // Configuration alone MUST NOT satisfy any 3-2-1 condition!
+    const savedCfg = await mod.updateOffsiteConfig(admin, {
+      autoCopyAfterVerify: true,
+      windowDays: 7,
+      destinations: [
+        {
+          connectionPublicId: s3Conn.publicId,
+          assigned: true,
+          enabled: true,
+          retentionNote: "S3 Object Lock Compliance 90 days",
+        },
+        {
+          connectionPublicId: azureConn.publicId,
+          assigned: true,
+          enabled: true,
+          retentionNote: "Azure immutable blob policy 90 days",
+        },
+        {
+          connectionPublicId: dropboxConn.publicId,
+          assigned: true,
+          enabled: false,
+          retentionNote: "Paused secondary destination",
+        },
+      ],
+    });
+    expect(savedCfg.autoCopyAfterVerify).toBe(true);
+    expect(savedCfg.status321.overallMet).toBe(false);
+    expect(savedCfg.status321.threeCopiesMet).toBe(false);
+    expect(savedCfg.status321.twoSystemsMet).toBe(false);
+    expect(savedCfg.status321.oneOffsiteMet).toBe(false);
+
+    // 4. Unverified archive MUST be refused by manual Copy now (`ARCHIVE_NOT_VERIFIED`).
+    const createdArchive = await mod.runBackupDirect({
+      actorUserId: adminUserId,
+      correlationId: "automation:run_origin_preserved_01",
+    });
+    await expect(
+      mod.copyOffsiteNow(admin, { backupPublicId: createdArchive.publicId }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ARCHIVE_NOT_VERIFIED" });
+    expect(remoteObjects.size).toBe(0);
+
+    // 5. Verify archive -> automatically stages remote copy jobs for OneDrive + SharePoint (not disabled Dropbox), preserving correlationId!
+    failSecondDestPutOnce = true;
+    await mod.verifyBackupDirect(createdArchive.publicId, {
+      actorUserId: adminUserId,
+      correlationId: "automation:run_origin_preserved_01",
+    });
+
+    const remoteJobs = harness.jobs.enqueued.filter((j) => j.type === BACKUP_JOB_REMOTE_COPY);
+    expect(remoteJobs).toHaveLength(2);
+    for (const j of remoteJobs) {
+      expect(j.options?.correlationId).toBe("automation:run_origin_preserved_01");
+    }
+
+    // Run both queued remote copy jobs: S3 succeeds (SHA-256 verified), Azure fails transiently (triggers backup.remote_copy.failed + backup.policy.unmet).
+    await harness.jobs.runAll(BACKUP_JOB_REMOTE_COPY);
+
+    const afterPartial = await mod.getOffsiteConfig(admin);
+    expect(afterPartial.status321.verifiedCopies).toBe(2); // 1 local + 1 S3
+    expect(afterPartial.status321.twoSystemsMet).toBe(true); // local_disk + s3
+    expect(afterPartial.status321.oneOffsiteMet).toBe(true); // 1 off-site
+    expect(afterPartial.status321.threeCopiesMet).toBe(false); // 2 < 3!
+    expect(afterPartial.status321.overallMet).toBe(false);
+
+    // Confirm audit events match TRIGGER_CATALOGUE (`backup.remote_copy_completed`, `backup.remote_copy_failed`, `backup.policy_unmet`)
+    // and never expose `secret-provider-uri://`!
+    const serializedAudit = JSON.stringify(harness.audit.events);
+    expect(serializedAudit).not.toContain("secret-provider-uri://");
+
+    const completedCopyAudit = harness.audit.events.find((e) => e.eventName === "backup.remote_copy.completed");
+    expect(completedCopyAudit).toBeDefined();
+    expect(completedCopyAudit?.correlationId).toBe("automation:run_origin_preserved_01");
+    expect(
+      entriesForEvent({
+        eventId: "ae_1",
+        eventName: completedCopyAudit!.eventName,
+        category: "backup",
+        action: "remote_copy.completed",
+        outcome: completedCopyAudit!.outcome,
+        reasonCode: completedCopyAudit!.reasonCode ?? null,
+        occurredAt: new Date().toISOString(),
+        actor: {
+          userId: completedCopyAudit!.actor?.userId ?? null,
+          role: completedCopyAudit!.actor?.role ?? "system",
+        },
+        resource: completedCopyAudit!.resource
+          ? { type: completedCopyAudit!.resource.type, publicId: completedCopyAudit!.resource.publicId ?? null }
+          : null,
+        correlationId: completedCopyAudit!.correlationId ?? "corr",
+        jobId: null,
+        attributes: (completedCopyAudit!.attributes ?? {}) as Record<string, string | number | boolean | null>,
+        safeCounts: completedCopyAudit!.safeCounts ?? {},
+      }).map((e) => e.key),
+    ).toContain("backup.remote_copy_completed");
+
+    const unmetAudit = harness.audit.events.find((e) => e.eventName === "backup.policy.unmet");
+    expect(unmetAudit).toBeDefined();
+    expect(
+      entriesForEvent({
+        eventId: "ae_2",
+        eventName: unmetAudit!.eventName,
+        category: "backup",
+        action: "policy.unmet",
+        outcome: unmetAudit!.outcome,
+        reasonCode: unmetAudit!.reasonCode ?? null,
+        occurredAt: new Date().toISOString(),
+        actor: { userId: null, role: "system" },
+        resource: { type: "backup_policy", publicId: null },
+        correlationId: "corr",
+        jobId: null,
+        attributes: (unmetAudit!.attributes ?? {}) as Record<string, string | number | boolean | null>,
+        safeCounts: unmetAudit!.safeCounts ?? {},
+      }).map((e) => e.key),
+    ).toContain("backup.policy_unmet");
+
+    // 6. Retry failed Azure destination via `copyOffsiteNow` -> reaches 3 verified copies across 3 systems -> 3-2-1 MET!
+    const retryQueued = await mod.copyOffsiteNow(admin, {
+      backupPublicId: createdArchive.publicId,
+      connectionPublicId: azureConn.publicId,
+    });
+    expect(retryQueued.queued).toHaveLength(1);
+    expect(retryQueued.queued[0]?.state).toBe("queued");
+
+    const [retryResult] = await harness.jobs.runAll(BACKUP_JOB_REMOTE_COPY);
+    expect(retryResult?.outcome).toBe("completed");
+
+    const afterRetry = await mod.getOffsiteConfig(admin);
+    expect(afterRetry.status321.verifiedCopies).toBe(3);
+    expect(afterRetry.status321.storageSystems).toBe(3);
+    expect(afterRetry.status321.offsiteVerifiedCopies).toBe(2);
+    expect(afterRetry.status321.threeCopiesMet).toBe(true);
+    expect(afterRetry.status321.twoSystemsMet).toBe(true);
+    expect(afterRetry.status321.oneOffsiteMet).toBe(true);
+    expect(afterRetry.status321.overallMet).toBe(true);
+
+    const detailView = await mod.getBackup(admin, createdArchive.publicId);
+    expect(detailView.remoteCopies).toHaveLength(2);
+    expect(JSON.stringify(detailView)).not.toContain("secret-provider-uri://");
+    const s3Summary = detailView.remoteCopies.find((c) => c.connectionPublicId === s3Conn.publicId)!;
+    const azSummary = detailView.remoteCopies.find((c) => c.connectionPublicId === azureConn.publicId)!;
+    expect(s3Summary).toMatchObject({ state: "completed", digestVerified: true, verifiedDigestKind: "sha256" });
+    expect(azSummary).toMatchObject({
+      state: "completed",
+      digestVerified: true,
+      verifiedDigestKind: "quickxor",
+      attemptCount: 2,
+    });
+
+    // Verify uploaded bytes start with `RPBK0001` encrypted magic (never plaintext)!
+    for (const stored of remoteObjects.values()) {
+      expect(stored.bytes.subarray(0, 8).toString("ascii")).toBe("RPBK0001");
+      expect(stored.sha256).toBe(createdArchive.archiveSha256);
+    }
+
+    // 7. Wire-level unencrypted guard: if a local object is overwritten with plaintext bytes after verification,
+    // remote copy refuses with `UNENCRYPTED_OR_INVALID_ARCHIVE` BEFORE calling StorageAdapter.put!
+    await mod.updateOffsiteConfig(admin, {
+      autoCopyAfterVerify: false,
+      windowDays: 7,
+      destinations: [
+        { connectionPublicId: s3Conn.publicId, assigned: true, enabled: true },
+        { connectionPublicId: azureConn.publicId, assigned: true, enabled: true },
+        { connectionPublicId: dropboxConn.publicId, assigned: true, enabled: true },
+      ],
+    });
+    const secondArchive = await mod.runBackupDirect({ actorUserId: adminUserId });
+    await mod.verifyBackupDirect(secondArchive.publicId, { actorUserId: adminUserId });
+    const [secondRow] = await tdb.db
+      .select()
+      .from(backupArchives)
+      .where(eq(backupArchives.publicId, secondArchive.publicId));
+    // Overwrite local file on disk with unencrypted bytes to test the wire-level RPBK0001 gate:
+    await realStorage.delete(secondRow!.storageKey!);
+    await realStorage.put(secondRow!.storageKey!, Readable.from([Buffer.from("PLAINTEXT_SQL_DUMP_FORBIDDEN!", "utf8")]));
+
+    const objectsBeforeTamperedCopy = remoteObjects.size;
+    await mod.copyOffsiteNow(admin, {
+      backupPublicId: secondArchive.publicId,
+      connectionPublicId: dropboxConn.publicId,
+    });
+    const [tamperRes] = await harness.jobs.runAll(BACKUP_JOB_REMOTE_COPY);
+    expect(tamperRes).toMatchObject({ outcome: "failed", reasonCode: "UNENCRYPTED_OR_INVALID_ARCHIVE" });
+    expect(remoteObjects.size).toBe(objectsBeforeTamperedCopy);
+
+    // 8. Worker sweep picks up CLI-verified backups when autoCopyAfterVerify is true, and local retention pruning NEVER deletes remote copies!
+    await mod.updateOffsiteConfig(admin, {
+      autoCopyAfterVerify: true,
+      windowDays: 7,
+      destinations: [
+        { connectionPublicId: s3Conn.publicId, assigned: true, enabled: true },
+        { connectionPublicId: azureConn.publicId, assigned: true, enabled: true },
+      ],
+    });
+    await harness.jobs.enqueue(BACKUP_JOB_REMOTE_SWEEP, {});
+    const [sweepRes] = await harness.jobs.runAll(BACKUP_JOB_REMOTE_SWEEP);
+    expect(sweepRes?.outcome).toBe("completed");
+
+    // Advance clock & prune old archive locally -> remoteObjects and backup_remote_copies rows remain 100% intact!
+    const remoteCountBeforePrune = remoteObjects.size;
+    harness.clock.advance(86_400_000 * 20);
+    const freshAdmin = makeAdminPrincipal({ stepUpAt: deps.clock.now() });
+    const newestArchive = await mod.runBackupDirect({ actorUserId: adminUserId });
+    await mod.verifyBackupDirect(newestArchive.publicId, { actorUserId: adminUserId });
+    await mod.updateRetentionPolicy(freshAdmin, {
+      keepLastCount: 1,
+      maxAgeDays: 5,
+      scheduleEnabled: true,
+      autoPruneEnabled: true,
+    });
+    await mod.runRetention(freshAdmin, { dryRun: false });
+    expect(remoteObjects.size).toBeGreaterThanOrEqual(remoteCountBeforePrune);
+    const [preservedCopyRows] = await tdb.db
+      .select()
+      .from(backupRemoteCopies)
+      .where(eq(backupRemoteCopies.backupId, secondRow!.id));
+    expect(preservedCopyRows).toBeDefined();
   });
 });

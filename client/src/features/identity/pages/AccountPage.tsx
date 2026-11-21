@@ -7,6 +7,7 @@ import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Button, Callout, Card, ErrorState, Field, Input, KeyValueList, PageHeader, Skeleton, useToast } from "@/ui";
 import { PASSWORD_POLICY, countCodePoints } from "@shared/domain";
 import { ROLE_LABELS, UserStatusBadge } from "../shared";
+import { SsoLinkCard } from "../sso/SsoLinkCard";
 
 const header = <PageHeader title="Your account" description="Your profile, sign-in password and active sessions." />;
 
@@ -40,6 +41,7 @@ export default function AccountPage() {
             <Button asChild variant="secondary"><Link href="/account/security">Verification methods</Link></Button>
           </div>
         </Card>
+        <SsoLinkCard />
       </div>
     </>
   );

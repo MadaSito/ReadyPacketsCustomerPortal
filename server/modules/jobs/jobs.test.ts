@@ -1,5 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { forbidden } from "../../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
 import { createCallerFactory } from "../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
@@ -7,19 +8,24 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
+import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
+import type { MailTransportMessage } from "./mailPorts.js";
+import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
 import { createJobQueue, createMailer, engineFor } from "./queue.js";
 import { jobsRouter } from "./router.js";
-import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailOutbox } from "./schema.js";
+import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailOutbox, mailTransportAttempts } from "./schema.js";
 import { startWorker } from "./worker.js";
 
 let t: TestDb;
 beforeAll(async () => {
-  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, mailOutbox, mailAttempts, auditEvents } });
+  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailAuditVerification, auditEvents } });
 });
 afterAll(async () => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [jobAttempts, mailAttempts, mailOutbox, jobRuns, jobMaintenance, auditEvents]) await t.db.delete(table);
+  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, auditEvents]) {
+    await t.db.delete(table);
+  }
 });
 
 const done = async () => ({ outcome: "completed" as const });
@@ -33,16 +39,20 @@ function latch(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function fixture(profile: Parameters<typeof createTestDeps>[0] = {}) {
+function fixture(profile: Parameters<typeof createTestDeps>[0] = {}, useDurableAudit = false) {
   const h = createTestDeps({ db: t.db, ...profile });
-  const jobs = createJobQueue(h.deps);
-  const mailer = createMailer({ ...h.deps, jobs });
-  const deps = { ...h.deps, jobs, mailer };
+  const durableAudit = useDurableAudit ? createAuditEmitter(h.deps) : undefined;
+  const core = { ...h.deps, audit: durableAudit ?? h.audit };
+  const jobs = createJobQueue(core);
+  const mailer = createMailer({ ...core, jobs });
+  const deps = { ...core, jobs, mailer };
   const admin = createJobsAdmin(deps);
   const engine = engineFor(jobs)!;
   const mail = mailEngineFor(mailer)!;
   const operator = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
-  return { h, jobs, engine, mailer, mail, admin, operator };
+  const assertCurrent = vi.fn(async () => ({ pendingSteps: [], role: operator.role, stepUpAt: h.clock.now(), mfaVerifiedAt: h.clock.now() }));
+  h.services.identity = { sessions: { assertCurrent } } as unknown as typeof h.services.identity;
+  return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent, durableAudit };
 }
 
 describe("MySQL durable job leases", () => {
@@ -341,7 +351,11 @@ describe("MySQL durable job leases", () => {
 
   it("enforces router validation and keeps the public maintenance response free of operational details", async () => {
     const f = fixture();
-    f.h.services.jobAdmin = { ...f.admin, startWorker: async () => { throw new Error("unexpected worker start"); } };
+    f.h.services.jobAdmin = {
+      ...f.admin, startWorker: async () => { throw new Error("unexpected worker start"); },
+      registerMailTransport: () => {}, registerMailTemplateStore: () => {},
+      getBuiltinMailTemplates: () => [], getMailSenderIdentity: async () => null, getMailReadiness: async () => ({ ready: false }),
+    };
     const caller = createCallerFactory(jobsRouter);
     const publicContext = {
       services: f.h.services, request: newRequestContext("test"),
@@ -439,14 +453,16 @@ describe("MySQL durable job leases", () => {
 });
 
 describe("MySQL transactional mail outbox", () => {
+  const sender = { fromAddress: "legacy@example.test", fromName: "ReadyPackets" };
   const input = {
     template: "test.mail", to: { userId: 22 },
     vars: { link: "https://portal.example.test/preview-only", name: "<img onerror=example>" }, idempotencyKey: "mail-key",
   };
-  function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"]) {
-    const send = vi.fn(async () => ({ outcome }));
+  function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"], retryable?: boolean) {
+    const send = vi.fn(async (_message: MailTransportMessage): Promise<SmtpDeliveryResult> => ({ outcome, retryable }));
     const findRecipient = vi.fn(async () => ({ email: "current@example.test", status: "active" }));
-    f.mail.registerDelivery({ send, findRecipient });
+    f.mail.registerDelivery({ findRecipient, getLegacySender: async () => sender });
+    f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });
     f.mailer.registerTemplate({
       key: "test.mail", vars: ["link", "name"], sensitiveVars: ["link"],
       subject: () => "Test notification", text: ({ name, link }) => `${name}\n${link}`,
@@ -480,6 +496,27 @@ describe("MySQL transactional mail outbox", () => {
     expect(await t.db.select().from(mailOutbox)).toHaveLength(0);
   });
 
+  it("wires the configured sender and legacy upgrade fallback through the Jobs SMTP adapter", async () => {
+    const f = fixture();
+    const send = vi.fn(async (_message: MailTransportMessage) => ({ outcome: "accepted" as const }));
+    f.h.services.integrations = {
+      smtp: {
+        getConfig: async () => ({ ...sender, replyToAddress: "" }),
+        getReadiness: async () => ({ enabled: true, configured: true, ready: true, state: "configured" }),
+        send,
+      },
+    } as unknown as typeof f.h.services.integrations;
+    const jobs = createJobsModule({ ...f.h.deps, jobs: f.jobs, mailer: f.mailer });
+    await expect(jobs.getMailSenderIdentity()).resolves.toEqual(sender);
+    const shared = { fromAddress: "shared@example.test", fromName: "Shared Ops", replyToAddress: "reply@example.test" };
+    await f.h.settings.set(MAIL_SENDER.key, shared);
+    await expect(jobs.getMailReadiness()).resolves.toEqual({ ready: true });
+    f.mailer.registerTemplate({ key: input.template, vars: ["name", "link"], sensitiveVars: ["link"], subject: () => "Test", text: () => "Body" });
+    await f.mailer.enqueue({ ...input, to: { address: "recipient@example.test" } });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ sender: shared, to: "recipient@example.test" }));
+  });
+
   it("records SMTP acceptance, not delivery, with escaped HTML and purged data", async () => {
     const f = fixture();
     const ports = setDelivery(f, "accepted");
@@ -502,12 +539,44 @@ describe("MySQL transactional mail outbox", () => {
     await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
   });
 
+  it("preserves automation origin through a failed submission and operator resend, suppressing only those tap events", async () => {
+    const f = fixture({}, true);
+    setDelivery(f, "rejected", true);
+    const onRecorded = vi.fn(async () => undefined);
+    const audit = f.durableAudit!;
+    audit.setTap({ listens: (name) => name === "job.mail.failed", onRecorded });
+    const marker = "automation:01JD0000000000000000000001";
+    const run = async () => { await f.engine.execute((await f.engine.claim())!); };
+
+    await runWithRequestContext(newRequestContext("worker", { correlationId: marker }), () => f.mailer.enqueue(input));
+    const [mail] = await t.db.select().from(mailOutbox);
+    expect(mail?.correlationId).toBe(marker);
+    await run(); // Separate async execution from the originating automation context.
+    const resend = await runWithRequestContext(newRequestContext("http", { correlationId: "operator-request" }),
+      () => f.admin.resend(f.operator, mail!.publicId));
+    const [resendJob] = await t.db.select().from(jobRuns).where(eq(jobRuns.publicId, resend.jobId));
+    expect(resendJob?.correlationId).toBe(marker);
+    await run();
+    const failures = await t.db.select().from(auditEvents).where(eq(auditEvents.eventName, "job.mail.failed"));
+    expect(failures.map((event) => event.correlationId)).toEqual([marker, marker]);
+    expect(onRecorded).not.toHaveBeenCalled();
+    expect(audit.tapStats().suppressedAutomationOrigin).toBe(2);
+
+    await f.mailer.enqueue({ ...input, idempotencyKey: "non-automation-control" });
+    await run();
+    expect(onRecorded).toHaveBeenCalledTimes(1);
+  });
+
   it("fences a late SMTP success after reaping an interrupted provider call", async () => {
     const f = fixture();
     const entered = latch();
     const release = latch();
     f.mail.registerDelivery({
       findRecipient: async () => ({ email: "current@example.test", status: "active" }),
+      getLegacySender: async () => sender,
+    });
+    f.mail.registerMailTransport({
+      key: "smtp", isConfigured: async () => true,
       send: async () => {
         entered.resolve();
         await release.promise;
@@ -530,6 +599,192 @@ describe("MySQL transactional mail outbox", () => {
     expect(active.job.signal.aborted).toBe(true);
     expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
     expect((await f.admin.mailDetail(f.operator, row!.publicId)).attempts[0]?.state).toBe("unknown");
+  });
+
+  it.each([
+    ["rejected", true, true], ["rejected", false, false], ["not_configured", false, true],
+    ["unknown", false, false], ["accepted", false, false],
+  ] as const)(
+    "checks %s (retryable %s) before selecting the secondary and records each route",
+    async (primary, retryable, switched) => {
+      const f = fixture();
+      const smtp = setDelivery(f, primary, retryable);
+      const graph = vi.fn(async (_message: MailTransportMessage) => ({ outcome: "accepted" as const }));
+      f.mail.registerMailTransport({ key: "graph", isConfigured: async () => true, send: graph });
+      await f.h.settings.set(MAIL_ROUTING.key, { primary: "smtp", secondary: "graph" });
+      const configured = { fromAddress: "configured@example.test", fromName: "ReadyPackets Ops", replyToAddress: "reply@example.test" };
+      await f.h.settings.set(MAIL_SENDER.key, configured);
+      await f.mailer.enqueue(input);
+      await f.engine.execute((await f.engine.claim())!);
+      expect(smtp.send).toHaveBeenCalledWith(expect.objectContaining({ sender: configured }));
+      expect(graph).toHaveBeenCalledTimes(switched ? 1 : 0);
+      if (switched) expect(graph).toHaveBeenCalledWith(expect.objectContaining({ sender: configured }));
+      const [row] = await t.db.select().from(mailOutbox);
+      expect(row).toMatchObject({ state: primary === "unknown" ? "unknown" : primary === "rejected" && !switched ? "failed" : "accepted", payloadEnc: null });
+      const { attempts } = await f.admin.mailDetail(f.operator, row!.publicId);
+      expect(attempts).toHaveLength(switched ? 2 : 1);
+      expect(attempts).toContainEqual(expect.objectContaining({
+        purpose: "primary", transport: "smtp", state: primary === "not_configured" ? "held" : primary === "rejected" ? "failed" : primary,
+      }));
+      if (switched) expect(attempts).toContainEqual(expect.objectContaining({ purpose: "secondary", transport: "graph", state: "accepted" }));
+    },
+  );
+
+  it("does not route around an unexpected readiness failure", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    const readiness = vi.fn(async () => { throw new Error("synthetic policy failure"); });
+    const graph = vi.fn(async () => ({ outcome: "accepted" as const }));
+    f.mail.registerMailTransport({ key: "graph", isConfigured: readiness, send: graph });
+    await f.h.settings.set(MAIL_ROUTING.key, { primary: "graph", secondary: "smtp" });
+    await f.mailer.enqueue(input);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(readiness).toHaveBeenCalledTimes(1);
+    expect(graph).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ state: "failed", payloadEnc: null });
+  });
+
+  it("rechecks single-use expiry immediately before submission, after transport readiness", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    const graph = vi.fn(async () => ({ outcome: "accepted" as const }));
+    f.mail.registerMailTransport({
+      key: "graph",
+      isConfigured: async () => { f.h.clock.advance(2_000); return true; },
+      send: graph,
+    });
+    await f.h.settings.set(MAIL_ROUTING.key, { primary: "graph", secondary: "smtp" });
+    await f.mailer.enqueue({ ...input, expiresAt: new Date(f.h.clock.now().getTime() + 1_000) });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(graph).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ state: "expired", reasonCode: "MAIL_EXPIRED", payloadEnc: null });
+  });
+
+  it("does not turn a known customer acceptance into an unknown customer send when the copy loses its lease", async () => {
+    const f = fixture();
+    const auditTo = "audit@example.test";
+    const entered = latch();
+    const release = latch();
+    const send = vi.fn(async ({ to }: MailTransportMessage) => {
+      if (to === auditTo) {
+        entered.resolve();
+        await release.promise;
+      }
+      return { outcome: "accepted" as const };
+    });
+    f.mail.registerDelivery({
+      findRecipient: async () => ({ email: "current@example.test", status: "active" }),
+      getLegacySender: async () => sender,
+    });
+    f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });
+    f.mailer.registerTemplate({ key: input.template, vars: ["name", "link"], sensitiveVars: ["link"],
+      subject: () => "Test", text: ({ link }) => String(link) });
+    await f.h.settings.set(MAIL_AUDIT_COPY.key, { enabled: true, address: auditTo });
+    await t.db.insert(mailAuditVerification).values({
+      id: 1, addressHash: f.h.deps.crypto.blindIndex(auditTo, "mail.audit_copy.address"), verifiedAt: f.h.clock.now(),
+    });
+    await f.mailer.enqueue(input);
+    const claim = (await f.engine.claim())!;
+    const execution = f.engine.execute(claim);
+    try {
+      await entered.promise;
+      await expireLease(claim.job.jobId);
+      expect(await f.engine.reap()).toBe(1);
+    } finally {
+      release.resolve();
+      await execution;
+    }
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ state: "accepted", payloadEnc: null });
+    expect((await f.admin.mailDetail(f.operator, row!.publicId)).attempts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ purpose: "primary", state: "accepted" }),
+      expect.objectContaining({ purpose: "audit_copy", state: "unknown" }),
+    ]));
+    await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+  });
+
+  it("binds audit confirmation to the saved address, consumes it once, and retains only a separately redacted render", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    const auditTo = "audit@example.test";
+    await f.h.settings.set(MAIL_AUDIT_COPY.key, { enabled: true, address: auditTo });
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.h.settings.set(MAIL_RETENTION_DAYS.key, 1);
+    const publishedKey = "test.published_only";
+    let declared: readonly string[] = ["link"];
+    const render = ({ link }: Record<string, unknown>) => ({
+      subject: "Template override",
+      text: `Encoded: ${encodeURIComponent(String(link))}`,
+      html: `<p>${encodeURIComponent(String(link))}</p>`,
+    });
+    f.mail.registerMailTemplateStore({ resolve: async (key) => key === input.template || key === publishedKey
+      ? { key, vars: ["name", "link"], sensitiveVars: declared, render }
+      : null });
+    const run = async () => { await f.engine.execute((await f.engine.claim())!); };
+
+    await f.mailer.enqueue(input);
+    await run();
+    expect(send.mock.calls.map(([mail]) => mail.to)).toEqual(["current@example.test"]);
+    await expect(f.admin.auditCopyStatus(f.operator)).resolves.toEqual({ verified: false });
+    f.assertCurrent.mockRejectedValueOnce(forbidden("SESSION_NOT_CURRENT"));
+    await expect(f.admin.requestAuditCopyVerification(f.operator)).rejects.toMatchObject({ reasonCode: "SESSION_NOT_CURRENT" });
+    expect(await t.db.select().from(mailAuditVerification)).toHaveLength(0);
+    await expect(f.admin.requestAuditCopyVerification(f.operator)).resolves.toEqual({ queued: true });
+    await run();
+    const challenge = send.mock.calls[1]![0];
+    const code = challenge.text.match(/^[\w-]{22}$/m)![0];
+    expect(challenge.to).toBe(auditTo);
+    const [proof] = await t.db.select().from(mailAuditVerification);
+    expect(JSON.stringify(proof)).not.toContain(code);
+    expect(JSON.stringify(proof)).not.toContain(auditTo);
+    await f.h.settings.set(MAIL_AUDIT_COPY.key, { enabled: true, address: "changed@example.test" });
+    await expect(f.admin.confirmAuditCopyVerification(f.operator, code)).rejects.toMatchObject({ reasonCode: "MAIL_AUDIT_CODE_INVALID" });
+    await f.h.settings.set(MAIL_AUDIT_COPY.key, { enabled: true, address: auditTo });
+    await expect(f.admin.confirmAuditCopyVerification(f.operator, code)).resolves.toEqual({ verified: true });
+    await expect(f.admin.confirmAuditCopyVerification(f.operator, code)).rejects.toMatchObject({ reasonCode: "MAIL_AUDIT_CODE_INVALID" });
+
+    f.mailer.registerTemplate({ key: "test.control", vars: [], subject: () => "Control", text: () => "Only built in" });
+    await f.mailer.enqueue({ ...input, template: "test.control", vars: {}, idempotencyKey: "control-key" });
+    await run();
+    await expect(f.mailer.enqueue({ ...input, template: "test.missing", idempotencyKey: "missing-key" }))
+      .rejects.toMatchObject({ reasonCode: "INVALID_MAIL_INPUT" });
+    await f.mailer.enqueue({ ...input, template: publishedKey, idempotencyKey: "mail-with-verified-copy" });
+    declared = []; // A subsequent publish must not remove the queued secret classification.
+    await run();
+    const actual = send.mock.calls.at(-2)![0];
+    const copy = send.mock.calls.at(-1)![0];
+    expect(actual.text).toContain(encodeURIComponent(input.vars.link));
+    expect(copy).toMatchObject({ to: auditTo, text: "Encoded: %5BREDACTED%5D", html: "<p>%5BREDACTED%5D</p>" });
+    const [outbox] = await t.db.select().from(mailOutbox).where(eq(mailOutbox.template, publishedKey));
+    expect(outbox?.contentEnc).toBeTruthy();
+    expect(outbox?.contentEnc).not.toContain("%5BREDACTED%5D");
+    expect((await f.admin.mailDetail(f.operator, outbox!.publicId)).attempts).toContainEqual(expect.objectContaining({
+      purpose: "audit_copy", transport: "smtp", state: "accepted",
+    }));
+    await expect(f.admin.mailContent(fakePrincipal({ role: "staff" }), outbox!.publicId)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(f.admin.mailContent(fakePrincipal({ role: "admin" }), outbox!.publicId)).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    f.assertCurrent.mockRejectedValueOnce(forbidden("SESSION_NOT_CURRENT"));
+    await expect(f.admin.mailContent(f.operator, outbox!.publicId)).rejects.toMatchObject({ reasonCode: "SESSION_NOT_CURRENT" });
+    await expect(f.admin.mailContent(f.operator, outbox!.publicId)).resolves.toMatchObject({
+      to: "current@example.test", subject: "Template override", html: copy.html,
+    });
+    expect(f.h.audit.named("mail.content.viewed")).toHaveLength(1);
+    const audit = JSON.stringify(f.h.audit.events);
+    expect(audit).not.toContain(code);
+    expect(audit).not.toContain(input.vars.link);
+    expect(audit).not.toContain(auditTo);
+
+    f.h.clock.advance(24 * 60 * 60_000);
+    const renewed = fakePrincipal({ role: "admin", stepUpAt: f.h.clock.now() });
+    await expect(f.admin.mailContent(renewed, outbox!.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await f.engine.scheduleTick();
+    await run();
+    const [purged] = await t.db.select().from(mailOutbox).where(eq(mailOutbox.id, outbox!.id));
+    expect(purged).toMatchObject({ contentEnc: null, contentExpiresAt: null });
   });
 
   it("allows an explicit capture in test, encrypts it, and denies expired data", async () => {

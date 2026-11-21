@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useSearch } from "wouter";
 import { useAuthApi } from "@/lib/authApi";
 import { errorMessage, safeError } from "@/lib/trpc";
+import { SsoSignInSlot } from "@/app/slots";
 import { Button, Callout, Field, Input } from "@/ui";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, useFocusOnError } from "../components/bits";
@@ -79,6 +80,10 @@ export default function SignInPage() {
           Sign in
         </Button>
       </form>
+      {/* Renders nothing unless single sign-on is configured and enabled. */}
+      <div className="mt-4 empty:hidden">
+        <SsoSignInSlot next={new URLSearchParams(search).get("next") ?? undefined} />
+      </div>
       <p className="mt-5 text-xs text-muted">Every account is protected by multi-factor authentication.</p>
     </AuthLayout>
   );

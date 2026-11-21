@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-20 (end of session 01, after increment 02). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-21 (after increment 03). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -22,12 +22,22 @@ listed under "Verified" has not been proven and must not be described as working
 | Platform | health, setup checklist, settings, admin overview widgets | `server/modules/platform`, `client/src/features/{platform,dashboard}` |
 | Portable data | vendor-neutral export/import package, verifier CLI, reference importer | `portable/`, `server/modules/portable` |
 | Backup | encrypted backups, offline `.rpbk` restore by operator CLI only | `server/modules/backup`, `docs/operations/BACKUP_AND_RESTORE.md` |
-| Integrations | PostHog and Microsoft Clarity (configurable project id, consent-gated, off by default); Stripe, SAML and SharePoint are disabled scaffolds | `server/modules/integrations`, `client/src/features/integrations` |
+| Integrations | PostHog and Microsoft Clarity (configurable project id, consent-gated, off by default); Microsoft Graph (mail, SharePoint, OneDrive) and outbound allow-list presets (increment 03); Stripe is a disabled scaffold | `server/modules/integrations`, `client/src/features/integrations` |
 | UI | design system on the brand kit, light/dark/system themes, customer shell with mobile tab bar, console shell, installable PWA shell with offline page | `client/src/{ui,app,styles}`, `client/public` |
 | Deployment | native auto-install on fresh Ubuntu 26.04 (prerequisites, optional swap, fixed host and optional alias, switchable certificate mode, one-time temporary admin password display, offerings); manual install on Ubuntu 24.04/26.04; upgrade and deactivation; Docker Compose for evaluation | `deploy/auto-install.sh`, `deploy/install.sh`, `deploy/nginx/*.conf.template`, `deploy/docker/`, `docs/operations/AUTO_INSTALL.md`, `.github/workflows/native-install.yml` |
 | Offerings catalog (increment 02) | Master Offerings Matrix v3.0 as owner-controlled data (`data/catalog/readypackets-offerings-v3.0.json`, 18 products = Packets 1–6 × Basic / Standard / Premium, 112 deliverables), audited `ops:catalog-import`, one tier per packet, server-quoted totals, bundle rule (15% when all six packets are in one order), packet picker in the order wizard, tier / outcome / timeline / deliverables on orders | `data/catalog`, `scripts/ops/catalog*`, `server/modules/orders`, `client/src/features/orders` |
 | Production pipeline (increment 02) | manual Phase I (P101) and Phase II (P201) webhook triggers from the console order page, exact field set of the reference documents, encrypted outbox with fenced retries and reconciliation, destination pinning, pre-send order revalidation, admin settings behind step-up, dispatch list; disabled until configured | `server/modules/integrations/production`, `client/src/features/integrations/production`, `docs/integrations/PRODUCTION_WEBHOOKS.md` |
-| Documentation | 23 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
+| E-mail delivery (increment 03) | sender and reply-to, audit copy mailbox, SMTP and Microsoft Graph transports with primary / secondary routing, optional encrypted retention of sent content with "View message", form-based configuration | `server/modules/jobs` (mail), `server/modules/integrations/graph`, `client/src/features/mail` |
+| E-mail templates (increment 03) | system and custom templates, rich HTML or plain text, declared placeholders, own HTML sanitizer, versions, inert preview, test send | `server/modules/mailTemplates`, `client/src/features/mailTemplates` |
+| Settings forms (increment 03) | every setting editable through a generated form; JSON editor kept as a second tab | `client/src/features/platform` |
+| Workflow designer (increment 03) | wizard and canvas over one draft, validation, "Tidy layout", versioned publish (existing orders keep their version) | `server/modules/orders`, `client/src/features/orders/pages/workflows` |
+| Automations (increment 03) | event / schedule / manual triggers, conditions, actions (templated e-mail, in-app notice, webhook), wizard and canvas, test without sending, run history, portal-wide switch and limits; off by default | `server/modules/automations`, `client/src/features/automations` |
+| Entra ID single sign-on (increment 03) | OpenID Connect against one tenant, "Sign in with SSO" button when enabled, linking, optional first-sign-in provisioning (never administrators), local break-glass for administrators, `recover-admin` host command | `server/modules/identity/sso`, `client/src/features/identity/sso`, `scripts/ops/recover-admin.ts` |
+| Storage connections (increment 03) | Amazon S3, Wasabi, Backblaze B2, custom S3, Azure Blob, Dropbox, Google Drive, SharePoint library, OneDrive for Business as copy destinations (local storage stays the system of record); assignments for order files, backups and order data | `server/modules/storage`, `client/src/features/storage` |
+| SharePoint order sync (increment 03) | one-way mirror of order rows to a SharePoint list, backfill, per-order status | `server/modules/sharepoint`, `client/src/features/storage` |
+| Off-site backups (increment 03) | copies of verified encrypted backups to assigned storage connections, 3-2-1 status computed from real verified copies; the backup key never leaves the host | `server/modules/backup`, `client/src/features/backup` |
+| Native upgrade (increment 03) | `deploy/upgrade.sh` with typed confirmations, verified pre-upgrade backup, guide | `deploy/upgrade.sh`, `docs/operations/UPGRADE.md` |
+| Documentation | 28 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
 
@@ -83,7 +93,76 @@ In a real browser against the preview build with synthetic data:
 Reviewed by a second engineer (not the author): production webhooks, findings PW-01 to PW-08, all closed
 (`docs/security/REVIEW-production-webhooks.md`).
 
+## Verified for increment 03 (integrator's own runs)
+
+Automated, whole project, at the head of `feat/increment-03` before merge:
+
+- type check clean, including a compile-time check that the hand-written client API facades for mail,
+  storage and automations match the server router (`client/src/features/facadeContracts.typecheck.ts`);
+  ESLint clean
+- full test run: 117 files, 1363 tests passed, 5 placeholders (`todo`), no failures
+- migration `0002_integrations_mail_sso_automations.sql` applies on a database that already holds rows
+- preview build and production client build succeed
+- native upgrade on a GitHub-hosted Ubuntu 26.04 runner (`native-install` workflow, job "upgrade from
+  d964a3b"), passed at commit `35b0d0b`, tested as the pull request merge with `main` ([run 44947983659](https://github.com/MadaSito/ReadyPacketsCustomerPortal/actions/runs/44947983659)): the previous release is installed, an
+  administrator enrols an authenticator, a customer and an order are created, maintenance is drained,
+  `deploy/upgrade.sh --yes` runs, and afterwards the sign-in, the customer (old `RP-` reference kept), the
+  order, the verified pre-upgrade archive, a new customer with an `RPCUS-` reference and the full install
+  smoke test are checked. The first runs of this job failed and found a real defect in `deploy/upgrade.sh`:
+  it disabled the services before reading their exit record, systemd had already dropped that record, and
+  the upgrade stopped at the draining phase with the services down. Fixed in `35b0d0b` (stop, check, then
+  disable); the behaviour was reproduced separately on systemd 259. Three wrong field / procedure names in
+  the job's own script were corrected as well.
+
+In a real browser (Chromium) with synthetic data. Preview profile unless stated:
+
+- administrator sign-in with authenticator enrolment and recovery codes; the new "Integrations" navigation group
+- E-mail delivery: sender and routing saved, retention saved, audit mailbox saved (pending verification),
+  SMTP and Microsoft Graph tabs with their fields and test buttons
+- template centre: 17 system templates listed; custom template created; `<script>` and an undeclared
+  placeholder refused; toolbar reachable by arrow keys; preview in a sandboxed frame; version 1 published;
+  no request left the page
+- workflow designer: wizard (five steps) and canvas on the same draft; arrow-key move keeps focus; C then
+  Enter connects; "Tidy layout" produced seven steps with no overlap; publish created version 2 while the
+  five existing orders stayed on version 1
+- automations: recipes, wizard, canvas, "Test without sending", save, detail page; the portal-wide switch
+  was turned on from the Automations page and the Settings row points there
+- Mail page: attempts dialog; the notice that explains where "View message" is turned on
+- Storage connections: page loads; Amazon S3 preset allowed (step-up); nine providers in the wizard with
+  their own field names; a connection saved with invented credentials, its test reported "Access denied"
+  and "Enable" stayed unavailable
+- SharePoint order sync, Backups (off-site copies and 3-2-1 card show "not met" with no destinations),
+  Settings (form and JSON tabs; a numeric setting saved through the form)
+- 390 px and 320 px: ten new or changed console pages have one `h1` and no horizontal overflow
+- no `<style>` element and no Content-Security-Policy violation on these pages after the dialog fix
+- development profile (cookie sessions, production client build, a fresh database): bootstrap administrator →
+  authenticator enrolment → forced password change → console; single sign-on configured with an invented
+  tenant and enabled; the "Sign in with SSO" button appeared under "Sign in" (absent before); pressing it
+  redirected to Microsoft's authorize address with `state`, `nonce` and a PKCE S256 challenge (Microsoft
+  answered "tenant not found", as expected); a forged callback landed on the "attempt expired" page
+- new customer references in the seeded database have the form `RPCUS-` plus nine characters
+
+Found and fixed during this pass: dialogs triggered a Content-Security-Policy report (scroll lock added a
+`<style>` element); the Storage connections page crashed because its client facade had drifted from the
+server (now covered by the compile-time check); the automations switch could not be reached from any page;
+canvas fit padding, focus loss after a keyboard move and cramped default spacing; unclear "View message"
+availability; a preset label that said "Active" while off.
+
+Reported by the engineers, not rerun individually by the integrator beyond the full suite: the per-module
+checks listed in each module's `VERIFICATION.md`, and the second-engineer security review
+(`docs/security/INCREMENT_03_REVIEW.md`).
+
 ## Not verified
+
+- increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
+  tenant (Graph mail, SharePoint, OneDrive, sign-in completion), Amazon S3, Wasabi, Backblaze B2, Azure
+  Blob, Dropbox or Google Drive. These are covered by tests against local protocol fakes only. A complete
+  single sign-on round trip (code exchange, token validation, session) was not run in a browser.
+- "View message" for a delivered e-mail and an off-site backup copy were not exercised in a browser (both
+  need a working external service); they are covered by the module tests.
+- the native upgrade on a real server. The runner check above uses a fresh machine, a self-signed
+  certificate, one customer and one order, and the unattended `--yes` mode; the typed confirmations of the
+  interactive mode and an installation older than `d964a3b` were not exercised.
 
 - production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to any real
   receiver; TLS to the real host, receiver-side de-duplication across retries, and a full
@@ -119,7 +198,13 @@ Reviewed by a second engineer (not the author): production webhooks, findings PW
   for extra handling; voiding an invoice has no idempotency key.
 - Privacy notice and terms of use are drafts pending legal review.
 - Analytics is off by default; the accepted residual risk is recorded in ADR 0021.
-- Stripe is hard-disabled (payments are recorded manually); SAML and SharePoint are scaffolds only.
+- Stripe is hard-disabled (payments are recorded manually). Single sign-on is OpenID Connect against one
+  Entra ID tenant; SAML is not implemented.
+- Increment 03 decisions the owner should confirm: cloud storage holds copies only and local storage stays
+  the system of record; the audit copy mailbox also receives password-reset and activation mail with the
+  one-time link removed; a message whose outcome is unknown is never resent or failed over automatically;
+  automations cannot change order status or permissions; publishing a workflow creates a new version and
+  existing orders keep theirs; retention of sent content and the automations engine are off by default.
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).

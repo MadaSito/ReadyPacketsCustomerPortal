@@ -247,6 +247,27 @@ services:
     pids_limit: 256
     restart: "no"
 
+  # Console-only administrator recovery. Identical to "ops" except container log capture is off so the
+  # one-time temporary password shown on the operator terminal is never written to Docker host logs.
+  recover-admin:
+    <<: [*app, *hardening]
+    profiles: [ops]
+    init: true
+    logging:
+      driver: none
+    environment:
+      <<: *app-environment
+      RP_ROLE: web
+      TMPDIR: /tmp
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    volumes:
+      - app-secrets:/run/readypackets/secrets:ro
+      - storage:/var/lib/readypackets/storage
+    networks: [data]
+    pids_limit: 256
+    restart: "no"
+
 networks:
   # Caddy and web only. Certificates are requested from here.
   edge:

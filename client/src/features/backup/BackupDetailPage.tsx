@@ -11,6 +11,7 @@ import {
   StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
 import { ArchiveFacts, DrillReport, HoldDialog, useCan, VerificationsTable } from "./BackupParts";
+import { RemoteCopiesSection } from "./OffsiteParts";
 import { BASE, CONTINUITY_LABELS, RELEASE_REASONS, formatDuration, PUBLIC_ID, type Archive, type BackupDetail, type Hold, type RestoreDrill } from "./model";
 
 /** Archives above this size are better copied with the host CLI; the browser holds the whole file in memory. */
@@ -77,8 +78,14 @@ export default function BackupDetailPage() {
   const detail = useQuery({
     ...trpc.backup.admin.detail.queryOptions({ backupPublicId: backupId }),
     enabled: valid,
-    refetchInterval: (q) => (q.state.data?.archive.state === "queued" || q.state.data?.archive.state === "running" ? 5000 : false),
+    refetchInterval: (q) =>
+      q.state.data?.archive.state === "queued" ||
+      q.state.data?.archive.state === "running" ||
+      (q.state.data?.remoteCopies ?? []).some((c) => c.state === "queued" || c.state === "running")
+        ? 5000
+        : false,
   });
+  const offsite = useQuery({ ...trpc.backup.admin.offsiteConfig.queryOptions(), enabled: valid });
   const verify = useMutation(trpc.backup.admin.verify.mutationOptions());
   const [report, setReport] = useState<RestoreDrill | null>(null);
   const [downloading, setDownloading] = useState(false);
@@ -88,7 +95,7 @@ export default function BackupDetailPage() {
   if (detail.isPending) return (<><PageHeader title="Backup" breadcrumbs={crumbs} /><Skeleton lines={8} /></>);
   if (detail.error || !detail.data) return (<><PageHeader title="Backup" breadcrumbs={crumbs} /><ErrorState error={detail.error} onRetry={() => detail.refetch()} /></>);
 
-  const { archive, verifications, restores, holds } = detail.data;
+  const { archive, verifications, restores, holds, remoteCopies = [] } = detail.data;
 
   const runVerify = async () => {
     try {
@@ -177,6 +184,7 @@ export default function BackupDetailPage() {
         {archive.state === "unknown" ? <Callout tone="warning" title="Outcome unknown">The backup job stopped without a definite result. Do not rely on this backup; run a new one.</Callout> : null}
         {tooLarge ? <Callout tone="info" title="Copy with the host tools">This backup is too large to download in a browser. Copy the encrypted file from the server with the backup scripts in scripts/ops/backup.</Callout> : null}
         <Section title="Details"><ArchiveFacts archive={archive} /></Section>
+        <RemoteCopiesSection archive={archive} copies={remoteCopies} offsiteConfig={offsite.data} />
         <Section title="Verification history"><VerificationsTable rows={verifications} /></Section>
         <Section title="Restore drills" description="Continuity record from operator restores: each drill proves this backup can be restored, and how long it took."><DrillsTable rows={restores} onOpen={setReport} /></Section>
         <Section title="Legal holds" description="A held backup is never removed by retention."><HoldsList holds={holds} onRelease={canHold && archive.purgedAt === null ? setReleasing : undefined} /></Section>

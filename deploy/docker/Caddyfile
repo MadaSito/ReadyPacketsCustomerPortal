@@ -107,9 +107,35 @@
 	}
 }
 
-# Any other host name on port 80 is refused. Requests for RP_DOMAIN are redirected to HTTPS by Caddy's
-# automatic redirect, which takes precedence over this catch-all. On port 443 an unknown name has no
-# certificate, so the TLS handshake fails.
+# Plain HTTP for RP_DOMAIN redirects to HTTPS except OAuth/OIDC callback paths, which are refused with 404
+# and no Location header so authorization codes/state are never echoed into a redirect. Caddy's built-in ACME
+# HTTP-01 solver still intercepts /.well-known/acme-challenge/* ahead of these handlers.
+http://{$RP_DOMAIN} {
+	header {
+		-Server
+		-Via
+	}
+
+	@other_http_port {
+		header_regexp Host :[0-9]*$
+		not header_regexp Host :80$
+	}
+	handle @other_http_port {
+		respond 421
+	}
+
+	@oauth_callback path_regexp (?i)^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$))
+	handle @oauth_callback {
+		respond 404
+	}
+
+	handle {
+		redir https://{$RP_DOMAIN}{uri} 308
+	}
+}
+
+# Any other host name on port 80 is refused. On port 443 an unknown name has no certificate, so the TLS
+# handshake fails.
 http:// {
 	respond 421
 }

@@ -9,7 +9,7 @@
  */
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx } from "../../core/types.js";
-import { TRANSITION_STEPS, type TransitionStep } from "../../../shared/domain.js";
+import { TRANSITION_STEPS, type AuthMethod, type TransitionStep } from "../../../shared/domain.js";
 
 export interface TransitionFacts {
   emailVerified: boolean;
@@ -18,6 +18,12 @@ export interface TransitionFacts {
   recoveryCodesAcknowledged: boolean;
   /** The current session has passed an MFA challenge (or proved possession during enrollment). */
   sessionMfaVerified: boolean;
+  /**
+   * The session was established through Entra ID and its multi-factor assertion was trusted at sign-in
+   * (decision 4). Such a session does not need a LOCAL factor — unless a forced password change is pending
+   * (host recovery), which always requires local enrolment.
+   */
+  entraMfaSession?: boolean;
 }
 
 /** Pure derivation — every ordering is unit tested. Output order always follows TRANSITION_STEPS. */
@@ -25,8 +31,9 @@ export function deriveSteps(facts: TransitionFacts): TransitionStep[] {
   const pending = new Set<TransitionStep>();
   if (!facts.emailVerified) pending.add("verify_email");
   if (facts.mfaEnrolled && !facts.sessionMfaVerified) pending.add("mfa_challenge");
-  if (!facts.mfaEnrolled) pending.add("enroll_mfa");
-  if (facts.mfaEnrolled && !facts.recoveryCodesAcknowledged) pending.add("acknowledge_recovery_codes");
+  const entraWaiver = facts.entraMfaSession === true && facts.sessionMfaVerified && !facts.mustChangePassword;
+  if (!facts.mfaEnrolled && !entraWaiver) pending.add("enroll_mfa");
+  if (facts.mfaEnrolled && !facts.recoveryCodesAcknowledged && !entraWaiver) pending.add("acknowledge_recovery_codes");
   if (facts.mustChangePassword) pending.add("change_password");
   return TRANSITION_STEPS.filter((step) => pending.has(step));
 }
@@ -35,7 +42,7 @@ export function createTransitionService(deps: ModuleDeps) {
   return {
     async facts(
       user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean },
-      session: { mfaVerifiedAt: Date | null } | undefined,
+      session: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod } | undefined,
       tx?: DbOrTx,
     ): Promise<TransitionFacts> {
       // Fail closed: if assurance state cannot be read, this throws and the caller refuses the session/action.
@@ -46,11 +53,12 @@ export function createTransitionService(deps: ModuleDeps) {
         mfaEnrolled: assurance.mfaEnrolled === true,
         recoveryCodesAcknowledged: assurance.recoveryCodesAcknowledged === true,
         sessionMfaVerified: session?.mfaVerifiedAt !== null && session?.mfaVerifiedAt !== undefined,
+        entraMfaSession: session?.authMethod === "entra",
       };
     },
     async derive(
       user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean },
-      session: { mfaVerifiedAt: Date | null } | undefined,
+      session: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod } | undefined,
       tx?: DbOrTx,
     ): Promise<TransitionStep[]> {
       return deriveSteps(await this.facts(user, session, tx));

@@ -22,7 +22,7 @@ import SystemHealthWidget from "./widgets/SystemHealthWidget";
 const date = new Date("2026-11-20T12:00:00.000Z");
 type Handler = (input: unknown) => unknown;
 class Refuse {
-  constructor(readonly code: string, readonly httpStatus: number) {}
+  constructor(readonly code: string, readonly httpStatus: number, readonly safe?: Record<string, unknown>) {}
 }
 
 function renderConsole(page: ReactElement, records: Record<string, Handler>, calls: { path: string; input: unknown }[] = [], role?: "admin" | "staff") {
@@ -42,7 +42,7 @@ function renderConsole(page: ReactElement, records: Record<string, Handler>, cal
           calls.push({ path, input });
           const value = respond(input);
           if (value instanceof Refuse) {
-            return { error: superjson.serialize({ message: "Refused", code: -32603, data: { code: value.code, httpStatus: value.httpStatus } }) };
+            return { error: superjson.serialize({ message: "Refused", code: -32603, data: { code: value.code, httpStatus: value.httpStatus, ...(value.safe ? { safe: value.safe } : {}) } }) };
           }
           return { result: { data: superjson.serialize(value) } };
         });
@@ -86,7 +86,7 @@ describe("platform console", () => {
 
     await userEvent.click(screen.getAllByRole("button", { name: "Edit Max items" })[0]!);
     const dialog = await screen.findByRole("dialog");
-    const input = within(dialog).getByLabelText("Value");
+    const input = within(dialog).getByLabelText(/^Value/);
     await userEvent.clear(input);
     await userEvent.type(input, "abc");
     await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
@@ -96,6 +96,90 @@ describe("platform console", () => {
     await userEvent.type(input, "40");
     await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls.find((c) => c.path === "platform.admin.settings.update")?.input).toEqual({ key: "general.max_items", value: 40, expectedVersion: 3 }));
+  });
+
+  it("settings edit dialog: Form tab from the schema description, JSON tab on the same value, server field errors", async () => {
+    const calls: { path: string; input: unknown }[] = [];
+    let refuse = true;
+    const field = {
+      type: "object", label: "Retention", required: true, nullable: false,
+      fields: [
+        { key: "days", type: "integer", label: "Days", help: "How long to keep.", required: true, nullable: false, minimum: 1, maximum: 30 },
+        { key: "mode", type: "enum", label: "Mode", required: true, nullable: false, options: [{ value: "soft", label: "Soft" }, { value: "hard", label: "Hard" }] },
+        { key: "domains", type: "array", label: "Domains", required: false, nullable: false, maxItems: 3, items: { type: "string", label: "Domains", required: true, nullable: false, maxLength: 20 } },
+      ],
+    };
+    renderConsole(<SettingsPage />, {
+      "platform.admin.settings.list": () => [view({ key: "general.retention", label: "Retention", value: { days: 7, mode: "soft", domains: [] }, defaultValue: { days: 7, mode: "soft" }, version: 2, field })],
+      "platform.admin.settings.update": (input) => {
+        if (refuse) {
+          refuse = false;
+          return new Refuse("BAD_REQUEST", 400, { domainCode: "VALIDATION", reasonCode: "INVALID_SETTING_VALUE", safeMessage: "The value is not valid for this setting.", details: { fields: ["domains.0"] }, requestId: "r1" });
+        }
+        return { ...view({}), ...(input as object) };
+      },
+    }, calls, "admin");
+    await userEvent.click((await screen.findAllByRole("button", { name: "Edit Retention" }))[0]!);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("tab", { name: "Form", selected: true })).toBeInTheDocument();
+    const days = within(dialog).getByLabelText(/^Days/);
+    expect(days).toHaveValue("7");
+    await expectNoAxeViolations();
+
+    await userEvent.clear(days);
+    await userEvent.type(days, "45");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByText("1 field needs attention")).toBeInTheDocument();
+    expect(days).toHaveAttribute("aria-invalid", "true");
+    expect(calls.some((c) => c.path === "platform.admin.settings.update")).toBe(false);
+    await userEvent.clear(days);
+    await userEvent.type(days, "14");
+    await userEvent.selectOptions(within(dialog).getByLabelText(/^Mode/), "Hard");
+    await userEvent.click(within(dialog).getByRole("button", { name: /Add domains/i }));
+    await userEvent.type(within(dialog).getByLabelText(/^Domains 1/), "example.test");
+
+    // The JSON tab shows the same draft value.
+    await userEvent.click(within(dialog).getByRole("tab", { name: "JSON" }));
+    const json = within(dialog).getByLabelText(/Value \(JSON\)/) as HTMLTextAreaElement;
+    expect(JSON.parse(json.value)).toEqual({ days: 14, mode: "hard", domains: ["example.test"] });
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Form" }));
+
+    // A server refusal maps its dot paths back onto the fields.
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByText("The server did not accept this value.")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/^Domains 1/)).toHaveAttribute("aria-invalid", "true");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.path === "platform.admin.settings.update").at(-1)?.input).toEqual({ key: "general.retention", value: { days: 14, mode: "hard", domains: ["example.test"] }, expectedVersion: 2 }),
+    );
+  });
+
+  it("settings page searches, collapses groups, and links settings owned by dedicated pages", async () => {
+    renderConsole(<SettingsPage />, {
+      "platform.admin.settings.list": () => [
+        view({}),
+        view({ key: "integrations.smtp.config", group: "integrations", label: "SMTP relay", description: "Outgoing mail relay.", value: { host: "x" } }),
+        view({ key: "identity.sso.entra", group: "identity", label: "Entra", description: "Sign-in.", managedBy: { href: "/admin/sso", label: "Single sign-on" } }),
+      ],
+    });
+    for (const link of await screen.findAllByRole("link", { name: "Open E-mail delivery to change SMTP relay" })) expect(link).toHaveAttribute("href", "/admin/email-delivery");
+    for (const link of screen.getAllByRole("link", { name: "Open Single sign-on to change Entra" })) expect(link).toHaveAttribute("href", "/admin/sso");
+    expect(screen.queryByRole("button", { name: "Edit SMTP relay" })).not.toBeInTheDocument();
+    await expectNoAxeViolations();
+
+    const general = screen.getByRole("button", { name: /General/ });
+    expect(general).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(general);
+    expect(general).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Edit Site name" })).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByRole("searchbox", { name: /Search settings/ }), "site");
+    expect(await screen.findByText("1 setting matches")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Edit Site name" }).length).toBeGreaterThan(0);
+    expect(screen.queryByText("SMTP relay")).not.toBeInTheDocument();
+    await userEvent.clear(screen.getByRole("searchbox", { name: /Search settings/ }));
+    await userEvent.type(screen.getByRole("searchbox", { name: /Search settings/ }), "zzz");
+    expect(await screen.findByText("No matching settings")).toBeInTheDocument();
   });
 
   it("settings page shows an error state when the server refuses", async () => {

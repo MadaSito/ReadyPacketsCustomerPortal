@@ -1538,11 +1538,180 @@ export function createTicketsService(deps: ModuleDeps, notifications: Notificati
     return buildDetailView(principal, updatedTicket, true);
   }
 
+  /**
+   * Server-internal helper for `automations` (`support.create_ticket` action).
+   * Idempotent on `(requesterUserId, idempotencyKey)`. Caller runs inside `automation:<runPublicId>` request context
+   * so `engagement.ticket.created` carries the automation-origin correlation marker and never loops.
+   */
+  async function createFromAutomation(input: {
+    requesterUserId: number;
+    category: TicketCategory;
+    priority: TicketPriority;
+    subject: string;
+    body: string;
+    relatedOrderPublicId?: string | null;
+    idempotencyKey: string;
+  }): Promise<{ publicId: string; ticketNumber: string; created: boolean }> {
+    const subject = normalizePlainText(input.subject, {
+      min: 3,
+      max: 160,
+      field: "subject",
+      label: "ticket subject",
+      singleLine: true,
+    });
+    const body = normalizePlainText(input.body, {
+      min: 1,
+      max: 8000,
+      field: "body",
+      label: "ticket body",
+    });
+    const idempotencyKey = normalizePlainText(input.idempotencyKey, {
+      min: 1,
+      max: 128,
+      field: "idempotencyKey",
+      label: "idempotency key",
+      singleLine: true,
+    });
+    const tokenHashes = computeSearchTokenHashes(crypto, [subject, body]);
+
+    return db.transaction(async (tx) => {
+      const [requester] = await tx
+        .select({
+          id: users.id,
+          publicId: users.publicId,
+          role: users.role,
+          status: users.status,
+        })
+        .from(users)
+        .where(eq(users.id, input.requesterUserId))
+        .limit(1)
+        .for("share");
+
+      if (!requester || requester.status !== "active") {
+        throw validation("AUTOMATION_TICKET_REQUESTER_INACTIVE", "Target requester account is not active.");
+      }
+
+      const [existing] = await tx
+        .select({
+          publicId: engagementSupportTickets.publicId,
+          ticketNumber: engagementSupportTickets.ticketNumber,
+        })
+        .from(engagementSupportTickets)
+        .where(
+          and(
+            eq(engagementSupportTickets.requesterUserId, requester.id),
+            eq(engagementSupportTickets.idempotencyKey, idempotencyKey),
+          ),
+        )
+        .limit(1);
+      if (existing) {
+        return { publicId: existing.publicId, ticketNumber: existing.ticketNumber, created: false };
+      }
+
+      let relatedOrder: { id: number; publicId: string; reference: string } | null = null;
+      if (input.relatedOrderPublicId) {
+        const orders = getOrdersPeer(deps);
+        const summary = await orders.getOrderRefByPublicId?.(input.relatedOrderPublicId, tx);
+        if (summary) {
+          relatedOrder = {
+            id: summary.id,
+            publicId: summary.publicId,
+            reference: summary.reference,
+          };
+        }
+      }
+
+      const now = clock.now();
+      const ticketPublicId = ulid(now.getTime());
+      const ticketNumber = await allocateUniqueTicketNumber(tx, now);
+      const subjectEnc = crypto.encrypt(subject, `engagement_support_tickets.subject:${ticketPublicId}`);
+
+      const [ticketHeader] = await tx.insert(engagementSupportTickets).values({
+        publicId: ticketPublicId,
+        ticketNumber,
+        requesterUserId: requester.id,
+        requesterUserPublicId: requester.publicId,
+        relatedOrderId: relatedOrder?.id ?? null,
+        relatedOrderPublicId: relatedOrder?.publicId ?? null,
+        relatedOrderReference: relatedOrder ? relatedOrder.reference.trim().toUpperCase() : null,
+        assigneeUserId: null,
+        assigneeUserPublicId: null,
+        category: input.category,
+        status: "open",
+        priority: input.priority,
+        subjectEnc,
+        idempotencyKey,
+        origin: "portal",
+        lastMessageAt: now,
+        resolvedAt: null,
+        closedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      const ticketId = Number(ticketHeader.insertId);
+
+      const messagePublicId = ulid(now.getTime());
+      await tx.insert(engagementSupportTicketMessages).values({
+        publicId: messagePublicId,
+        ticketId,
+        authorUserId: requester.id,
+        authorUserPublicId: requester.publicId,
+        authorRole: requester.role,
+        internalOnly: false,
+        bodyEnc: crypto.encrypt(body, `engagement_support_ticket_messages.body:${messagePublicId}`),
+        idempotencyKey,
+        createdAt: now,
+      });
+
+      await tx.insert(engagementSupportTicketHistory).values({
+        publicId: ulid(now.getTime()),
+        ticketId,
+        actorUserId: requester.id,
+        actorRole: "system",
+        fromStatus: null,
+        toStatus: "open",
+        reasonCode: "TICKET_CREATED_BY_AUTOMATION",
+        occurredAt: now,
+      });
+
+      if (tokenHashes.length > 0) {
+        await tx.insert(engagementSearchTokens).values(
+          tokenHashes.map((tokenHash) => ({
+            domain: "ticket" as const,
+            recordId: ticketId,
+            customerVisible: true,
+            tokenHash,
+          })),
+        );
+      }
+
+      await audit.record(
+        {
+          category: "business",
+          eventName: "engagement.ticket.created",
+          action: "create",
+          outcome: "completed",
+          actor: { role: "system" },
+          resource: { type: "ticket", publicId: ticketPublicId },
+          attributes: {
+            ticket_number: ticketNumber,
+            category: input.category,
+            has_related_order: relatedOrder !== null,
+          },
+        },
+        tx,
+      );
+
+      return { publicId: ticketPublicId, ticketNumber, created: true };
+    });
+  }
+
   return {
     list,
     openSummary,
     get,
     create,
+    createFromAutomation,
     reply,
     close,
     reopen,

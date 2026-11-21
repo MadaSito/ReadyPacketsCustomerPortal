@@ -33,6 +33,7 @@ import {
 } from "../../db/columns.js";
 import { users } from "../identity/schema.js";
 import type { WorkflowDefinition } from "./workflowTypes.js";
+import type { WorkflowDraftDefinition, WorkflowLayout } from "./workflowDesign.js";
 
 export const ORDER_LOCK_STATES = ["none", "review", "finalized", "legal_hold", "imported_read_only"] as const;
 export const GRANT_ROLES = ["viewer", "contributor"] as const;
@@ -153,6 +154,49 @@ export const orderWorkflowVersions = mysqlTable(
   (t) => [uniqueIndex("order_workflow_versions_uq").on(t.workflowId, t.versionNumber)],
 );
 
+/** Increment 03: canvas positions and an optional change note per published version (nullable, additive). */
+export const orderWorkflowVersionLayouts = mysqlTable(
+  "order_workflow_version_layouts",
+  {
+    id: idColumn(),
+    versionId: refColumn("version_id").notNull(),
+    layout: json("layout").$type<WorkflowLayout>(),
+    changeNote: varchar("change_note", { length: 500 }),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [uniqueIndex("order_workflow_version_layouts_uq").on(t.versionId)],
+);
+
+export const WORKFLOW_DRAFT_SOURCES = ["standard", "copy", "blank"] as const;
+export type WorkflowDraftSource = (typeof WORKFLOW_DRAFT_SOURCES)[number];
+
+/**
+ * Increment 03: editable drafts (wizard and canvas edit the same row). A draft either edits an existing
+ * workflow (`workflowId` set, at most one draft per workflow) or proposes a new one (`workflowId` null,
+ * `workflowKey` reserved). Drafts may be invalid; publishing validates and writes a new immutable version.
+ */
+export const orderWorkflowDrafts = mysqlTable(
+  "order_workflow_drafts",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    workflowId: refColumn("workflow_id"),
+    workflowKey: varchar("workflow_key", { length: 64 }).notNull(),
+    name: varchar("name", { length: 120 }).notNull(),
+    source: mysqlEnum("source", WORKFLOW_DRAFT_SOURCES).notNull(),
+    /** Version the draft was started from (copy / existing workflow); publish refuses if the workflow moved on. */
+    baseVersionId: refColumn("base_version_id"),
+    definition: json("definition").$type<WorkflowDraftDefinition>().notNull(),
+    layout: json("layout").$type<WorkflowLayout>(),
+    createdByUserId: refColumn("created_by_user_id").references(() => users.id),
+    updatedByUserId: refColumn("updated_by_user_id").references(() => users.id),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [uniqueIndex("order_workflow_drafts_workflow_uq").on(t.workflowId), uniqueIndex("order_workflow_drafts_key_uq").on(t.workflowKey)],
+);
+
 /* ------------------------------------------------------------------- orders */
 
 export const orders = mysqlTable(
@@ -191,6 +235,8 @@ export const orders = mysqlTable(
     index("orders_owner_idx").on(t.ownerUserId, t.id),
     index("orders_status_idx").on(t.statusKey, t.id),
     index("orders_created_idx").on(t.createdAt, t.id),
+    /** Increment 03: order counts per workflow version (designer version list). */
+    index("orders_workflow_version_idx").on(t.workflowVersionId),
   ],
 );
 

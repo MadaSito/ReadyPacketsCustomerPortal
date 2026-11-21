@@ -141,3 +141,50 @@ All lazy, `access: "admin"`; capability shown per route (server re-checks every 
 | `/admin/audit/retention` | `audit.retention.manage` | Policies, legal holds, preview and real run (typed `REMOVE`), all under step-up. |
 
 Other features may link to `/admin/audit?correlationId=<workflow correlation id>`.
+
+## Increment 03 — audit tap and trigger catalogue (package J)
+
+Consumers: the automations module (engagement engineer). Source: `tap.ts`, `triggerCatalogue.ts`.
+
+```ts
+import { type AuditTap, type AuditTapEvent, TRIGGER_CATALOGUE, automationCorrelationId, isAutomationOrigin } from "../audit/index.js";
+// in your module's init():
+const detach = deps.services.auditCenter.registerTap(tap);   // one tap per process; throws on a non-durable emitter
+deps.services.auditCenter.triggerCatalogue();                // readonly TriggerCatalogueEntry[]
+deps.services.auditCenter.tapStats();                        // { offered, suppressedAutomationOrigin, failures, lastFailureAt }
+```
+
+`AuditTap = { listens(eventName): boolean; onRecorded(event: AuditTapEvent, tx: Tx | undefined): Promise<void> }`.
+Helpers from `triggerCatalogue.ts` (re-exported later if you need them): `CATALOGUE_EVENT_NAMES`, `entriesForEvent(event)`
+(applies event name + outcome + resource type + fixed matches), `eventFieldValue(event, key)`, `catalogueEntry(key)`.
+
+Guarantees:
+- Called after every successful DURABLE `record()` (never for `note()`), inside the caller's transaction when there is one.
+- Nothing listens → exactly one synchronous `listens()` call; no event object, no await, no database work. Keep `listens`
+  a `Set.has` over the event names of ENABLED automations (refresh it on save / enable and on a short timer for other
+  processes); a throwing `listens` counts as "not listening".
+- `AuditTapEvent` holds only validated envelope data: ids, name, category, action, outcome, reason code, actor role / user
+  id, resource type / public id, correlation and job ids, the validated attributes and safe counts. Frozen. No source
+  address, session reference or dropped attributes.
+- **Automation-origin marker (gate 4.1 J):** run every automation with correlation id `automationCorrelationId(runPublicId)`
+  (`automation:<runPublicId>`). Jobs and mail rows persist the correlation id and the worker restores it, so every
+  descendant (jobs, mails, webhooks, `job.mail.failed`, …) carries it; events whose correlation id OR parent correlation
+  id has the marker are never offered (counted as `suppressedAutomationOrigin`). Action providers must not pass an
+  explicit `correlationId` that replaces the marker.
+- Errors from `onRecorded` are logged and counted and do NOT fail the business transaction — except MySQL 1213 / 1205
+  (InnoDB has rolled back or may have rolled back the transaction): then `AuditUnavailableError` is thrown, because
+  continuing would commit the rest outside the transaction. So make `onRecorded` a single INSERT (statement-level
+  rollback leaves the transaction intact). Do all reads / preflights from the in-memory listener set, not the pool.
+
+Trigger catalogue rules (`TriggerCatalogueEntry`): `eventName` + `outcomes` (+ optional `match` on safe attributes or
+`reason_code`, + `resourceType`) define when an entry fires — a refused registration for an existing address never fires.
+`fields[].from = "event"` come from the tap event; `"context"` fields are resolved in the worker by the owning module's
+context resolver; `personal: true` fields are template-only (never conditions, run records, logs or audit).
+`recipients` are resolved to user ids by the owning module; never take an address from the event.
+`staffOnly: true` (internal order note): actions may address staff / administrators only — no customer, fixed external
+address or webhook; enforce on save and at run time. A tap with several writes runs in a savepoint (`tx` you receive is it).
+Initial entries: account registered / activated / password reset requested / password changed, order created / status
+changed / reassigned, file uploaded, order message posted (customer-visible only) / internal order note (staff only), ticket opened / replied (public) / closed, invoice issued / paid,
+maintenance switched on (`job.maintenance.changed` + `MAINTENANCE_ENABLED`; there is no separate "maintenance window
+announced" event yet), backup completed / failed / verification failed / off-host copy completed / failed, e-mail delivery failed.
+Tests: `tap.test.ts` (real MySQL).

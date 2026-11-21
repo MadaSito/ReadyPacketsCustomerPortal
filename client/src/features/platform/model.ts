@@ -92,3 +92,41 @@ export function parseEditorValue(kind: EditorKind, raw: string | boolean): Parse
 
 /** Strength hint only — the server enforces the real passphrase policy. */
 export const MIN_PASSPHRASE = 12;
+
+/** Console page that owns a setting (server `managedBy`, else the increment-03 key-prefix fallback). */
+export interface ManagedPage {
+  href: string;
+  label: string;
+}
+const MANAGED_PREFIXES: ReadonlyArray<readonly [prefix: string, page: ManagedPage]> = [
+  ["integrations.smtp.", { href: "/admin/email-delivery", label: "E-mail delivery" }],
+  ["jobs.mail.", { href: "/admin/email-delivery", label: "E-mail delivery" }],
+  ["integrations.sharepoint.", { href: "/admin/sharepoint-sync", label: "SharePoint order sync" }],
+  ["storage.", { href: "/admin/storage", label: "Storage connections" }],
+  ["integrations.storage.", { href: "/admin/storage", label: "Storage connections" }],
+  ["identity.sso.", { href: "/admin/sso", label: "Single sign-on" }],
+  ["identity.entra.", { href: "/admin/sso", label: "Single sign-on" }],
+  ["integrations.saml.", { href: "/admin/sso", label: "Single sign-on" }],
+];
+export function managedPage(view: Pick<SettingView, "key" | "managedBy">): ManagedPage | undefined {
+  if (view.managedBy) return view.managedBy;
+  return MANAGED_PREFIXES.find(([prefix]) => view.key.startsWith(prefix))?.[1];
+}
+
+/** Case-insensitive match on label, description, key and group label. */
+export function matchesSearch(view: Pick<SettingView, "key" | "label" | "description" | "group">, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return [view.label, view.description, view.key, groupLabel(view.group)].some((text) => text.toLowerCase().includes(q));
+}
+
+/** Field description for views from a server without `field` (scalar values only; JSON otherwise). */
+export function viewField(view: SettingView): NonNullable<SettingView["field"]> {
+  if (view.field) return view.field;
+  const kind = editorKind(view);
+  const common = { label: "Value", required: true, nullable: false } as const;
+  if (kind === "boolean") return { ...common, label: view.label, type: "boolean" };
+  if (kind === "number") return { ...common, type: "number" };
+  if (kind === "text") return { ...common, type: "string" };
+  return { ...common, type: "unsupported" };
+}

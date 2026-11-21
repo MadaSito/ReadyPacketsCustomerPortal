@@ -37,3 +37,9 @@ Executed in `/home/user/workspace/readypackets-portal` via `scripts/dev/*` wrapp
      6. Recovery MySQL credential privilege isolation (`SHOW GRANTS` rejects live-schema write privileges and live credential reuse).
      7. Secret-file permission & symlink rejection (`0644` world-readable key file refused; `0600` owner-only key file accepted).
      8. Job lease-loss (`JOB_LEASE_LOST`) propagation during backup execution without corrupting ledger state.
+     9. **Increment 03 — 3-2-1 Multi-Destination Off-Site Replication & Automation Triggers**:
+        - Tested end-to-end against **local in-memory protocol/adapter fakes** (`s3`, `azure_blob`, `dropbox` registered on `createStorageModule(deps)`) — **no real cloud provider or external network credentials are used in the sandbox** (`INCREMENT_03_CONTRACT.md` §4.1).
+        - Verifies default-disabled posture, configuration-alone never satisfying 3-2-1, automatic post-verification copy across distinct provider kinds, SHA-256 and transport digest verification, zero `remoteId` leakage in DB/tRPC/audit, wire-level `RPBK0001` encrypted-header inspection refusing unencrypted bytes (`UNENCRYPTED_OR_INVALID_ARCHIVE`) before calling `StorageAdapter.put`, `automation:<runId>` correlation survival across async jobs, `backup.remote_copy.failed` + `backup.policy.unmet` transition audit emission, manual retry / `copyOffsiteNow`, non-deletion of remote copies during local retention pruning, and registration of all 6 `"backup"` automation triggers.
+4. **Admin UI & Accessibility Suite (`scripts/dev/test.sh client/src/features/backup/backup.test.tsx`)**:
+   - Exercises `Status321Card`, `OffsiteCopiesForm`, `RemoteCopiesSection` (digest badge, failed destination `Retry`, manual `Copy now`), and `axe-core` WCAG accessibility with zero `dangerouslySetInnerHTML`.
+

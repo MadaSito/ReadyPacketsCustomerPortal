@@ -67,6 +67,8 @@ export const mailOutbox = mysqlTable("mail_outbox", {
   correlationId: varchar("correlation_id", { length: 64 }).notNull(),
   payloadEnc: mediumtext("payload_enc"),
   captureEnc: mediumtext("capture_enc"),
+  contentEnc: mediumtext("content_enc"),
+  contentExpiresAt: utcDateTime("content_expires_at"),
   state: mysqlEnum("state", MAIL_STATES).notNull().default("queued"),
   reasonCode: varchar("reason_code", { length: 64 }),
   jobPublicId: char("job_public_id", { length: 26 }),
@@ -79,6 +81,7 @@ export const mailOutbox = mysqlTable("mail_outbox", {
   index("mail_outbox_state_ix").on(t.state, t.publicId),
   index("mail_outbox_expiry_ix").on(t.expiresAt, t.id),
   index("mail_outbox_job_ix").on(t.jobPublicId),
+  index("mail_outbox_content_expiry_ix").on(t.contentExpiresAt, t.id),
 ]);
 
 export const mailAttempts = mysqlTable("mail_attempts", {
@@ -90,3 +93,24 @@ export const mailAttempts = mysqlTable("mail_attempts", {
   startedAt: utcDateTime("started_at").notNull(),
   finishedAt: utcDateTime("finished_at"),
 }, (t) => [uniqueIndex("mail_attempts_generation_uq").on(t.mailId, t.generation)]);
+
+// Keep the legacy attempt table and its unique key intact for in-place upgrades.
+export const mailTransportAttempts = mysqlTable("mail_transport_attempts", {
+  id: idColumn(),
+  mailId: refColumn("mail_id").notNull().references(() => mailOutbox.id),
+  generation: int("generation", { unsigned: true }).notNull(),
+  purpose: mysqlEnum("purpose", ["primary", "secondary", "audit_copy"]).notNull(),
+  transport: mysqlEnum("transport", ["smtp", "graph"]).notNull(),
+  state: mysqlEnum("state", MAIL_ATTEMPT_STATES).notNull(),
+  reasonCode: varchar("reason_code", { length: 64 }),
+  startedAt: utcDateTime("started_at").notNull(),
+  finishedAt: utcDateTime("finished_at"),
+}, (t) => [uniqueIndex("mail_transport_attempts_slot_uq").on(t.mailId, t.generation, t.purpose)]);
+
+export const mailAuditVerification = mysqlTable("mail_audit_verification", {
+  id: int("id", { unsigned: true }).primaryKey(),
+  addressHash: char("address_hash", { length: 64 }).notNull(),
+  codeHash: char("code_hash", { length: 64 }),
+  expiresAt: utcDateTime("expires_at"),
+  verifiedAt: utcDateTime("verified_at"),
+});

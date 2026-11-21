@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { and, asc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DeploymentProfile } from "../../config/env.js";
@@ -5,8 +6,10 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, Tx } from "../../core/types.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
+import type { MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportResult, PublishedMailTemplate } from "./mailPorts.js";
+import { HEADER_CONTROL, MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER, mailAddress as address } from "./mailSettings.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
-import { mailAttempts, mailOutbox } from "./schema.js";
+import { mailAttempts, mailAuditVerification, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 const DELIVER = "jobs.mail.deliver";
 const EXPIRE = "jobs.mail.expire";
@@ -14,24 +17,30 @@ const MAX_TTL = 72 * 60 * 60_000;
 const CAPTURE_TTL = 15 * 60_000;
 const ONE_DAY = 24 * 60 * 60_000;
 const VAR_NAME = /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/;
-const HEADER_CONTROL = /[\p{Cc}\u2028\u2029]/u;
-const address = z.email().max(254).refine((value) => !HEADER_CONTROL.test(value));
+const VERIFY_AUDIT = "jobs.mail.verify_audit_copy";
+const VERIFY_TTL = 30 * 60_000;
+const REDACTED = "[REDACTED]";
 const varsSchema = z.record(z.string().regex(VAR_NAME), z.union([z.string().max(16_384), z.number(), z.boolean()]));
 const payloadSchema = z.strictObject({
   to: z.union([z.strictObject({ userId: z.number().int().positive() }), z.strictObject({ address })]),
   vars: varsSchema,
+  sensitiveVars: z.array(z.string().regex(VAR_NAME)).max(40).optional(),
 });
 const jobPayload = z.strictObject({ mailId: z.string().regex(ULID_PATTERN), generation: z.number().int().min(1).max(20) });
 const captureSchema = z.strictObject({ to: address, subject: z.string().max(255), text: z.string().max(65_536) });
+const contentSchema = captureSchema.extend({ html: z.string().max(512 * 1024) });
 type MailRow = typeof mailOutbox.$inferSelect;
 type RenderedMail = z.infer<typeof captureSchema>;
+type MessageContent = z.infer<typeof contentSchema>;
 type DeliveryJob = z.infer<typeof jobPayload>;
 type MailAttemptOutcome = "accepted" | "held" | "failed" | "unknown" | "captured";
-export type SmtpDeliveryResult = { outcome: "accepted" | "not_configured" | "rejected" | "unknown"; retryable?: boolean };
+type AttemptPurpose = typeof mailTransportAttempts.$inferSelect.purpose;
+type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?: never };
+export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
 type DeliveryDeps = {
   findRecipient(userId: number): Promise<{ email: string; status: string } | null>;
-  send(input: RenderedMail & { html: string; signal: AbortSignal }): Promise<SmtpDeliveryResult>;
+  getLegacySender(): Promise<MailSenderIdentity | null>;
 };
 
 export function allowsMailCapture(profile: DeploymentProfile): boolean {
@@ -77,8 +86,38 @@ function htmlAlternative(text: string): string {
 
 export class MailEngine implements Mailer {
   readonly #templates = new Map<string, MailTemplate>();
+  readonly #transports = new Map<MailTransportKey, MailTransport>();
+  #templateStore: MailTemplateStore | undefined;
 
-  constructor(readonly deps: MailDeps) {}
+  constructor(readonly deps: MailDeps) {
+    this.registerTemplate({
+      key: VERIFY_AUDIT,
+      vars: ["code"],
+      sensitiveVars: ["code"],
+      subject: () => "Confirm the ReadyPackets audit mailbox",
+      text: ({ code }) => `Enter this one-time confirmation code in the ReadyPackets E-mail delivery settings:\n\n${code}\n\nIt expires in 30 minutes. Ignore this message if you did not expect it.`,
+    });
+  }
+
+  registerMailTransport(transport: MailTransport): void {
+    if ((transport.key !== "smtp" && transport.key !== "graph") || this.#transports.has(transport.key)) {
+      throw new Error("INVALID_OR_DUPLICATE_MAIL_TRANSPORT");
+    }
+    this.#transports.set(transport.key, transport);
+  }
+
+  registerMailTemplateStore(store: MailTemplateStore): void {
+    if (this.#templateStore) throw new Error("DUPLICATE_MAIL_TEMPLATE_STORE");
+    this.#templateStore = store;
+  }
+
+  getBuiltinMailTemplates(): readonly MailTemplate[] {
+    return [...this.#templates.values()].filter(({ key }) => key !== VERIFY_AUDIT).map((template) => ({
+      ...template,
+      vars: [...template.vars],
+      sensitiveVars: [...(template.sensitiveVars ?? [])],
+    }));
+  }
 
   registerTemplate(template: MailTemplate): void {
     if (!JOB_TYPE.test(template.key) || template.key.length > 100 || this.#templates.size >= 250
@@ -91,14 +130,64 @@ export class MailEngine implements Mailer {
   }
 
   registerDelivery(delivery: DeliveryDeps): void {
+    this.#getLegacySender = delivery.getLegacySender;
     this.deps.jobs.register(DELIVER, (job) => this.#deliver(job, delivery));
     this.deps.jobs.register(EXPIRE, (job) => this.#expire(job), { retrySafe: true });
     this.deps.jobs.registerSchedule({ name: EXPIRE, type: EXPIRE, everyMs: 60_000 });
   }
 
+  #getLegacySender: DeliveryDeps["getLegacySender"] = async () => null;
+
+  async getMailSenderIdentity(): Promise<MailSenderIdentity | null> {
+    const configured = await readSetting(this.deps.settings, MAIL_SENDER);
+    if (!configured.fromAddress) return this.#getLegacySender();
+    return {
+      fromAddress: configured.fromAddress, fromName: configured.fromName,
+      ...(configured.replyToAddress ? { replyToAddress: configured.replyToAddress } : {}),
+    };
+  }
+
+  async getMailReadiness(smtpReady: () => Promise<boolean>): Promise<{ ready: boolean }> {
+    if (!await this.getMailSenderIdentity()) return { ready: false };
+    const { primary, secondary } = await readSetting(this.deps.settings, MAIL_ROUTING);
+    async function isConfigured(key: MailTransportKey, transport?: MailTransport) {
+      if (key === "smtp") return smtpReady();
+      return !!transport && transport.isConfigured();
+    }
+    if (await isConfigured(primary, this.#transports.get(primary))) return { ready: true };
+    return { ready: secondary !== "none" && await isConfigured(secondary, this.#transports.get(secondary)) };
+  }
+
+  async retentionDays(tx?: Tx): Promise<number> {
+    if (!await readSetting(this.deps.settings, MAIL_RETAIN_CONTENT, tx)) return 0;
+    return readSetting(this.deps.settings, MAIL_RETENTION_DAYS, tx);
+  }
+
+  async #template(key: string, tx?: Tx): Promise<PublishedMailTemplate | null> {
+    const builtin = this.#templates.get(key);
+    const published = key === VERIFY_AUDIT ? null : await this.#templateStore?.resolve(key, tx);
+    if (published) {
+      if (published.key !== key || builtin?.sensitiveVars?.some((name) => !published.vars.includes(name))) {
+        throw validation("INVALID_MAIL_RENDER", "The message template could not be rendered safely.");
+      }
+      return {
+        ...published,
+        sensitiveVars: [...new Set([...(builtin?.sensitiveVars ?? []), ...(published.sensitiveVars ?? [])])],
+        render: (vars) => published.render(vars),
+      };
+    }
+    if (!builtin) return null;
+    return { ...builtin, render: (vars) => ({ subject: builtin.subject(vars), text: builtin.text(vars) }) };
+  }
+
   async enqueue(mail: OutboundMail, tx?: Tx): Promise<void> {
+    if (mail.template === VERIFY_AUDIT) throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
+    await this.#enqueue(mail, tx);
+  }
+
+  async #enqueue(mail: OutboundMail, tx?: Tx): Promise<void> {
     const { deps } = this;
-    const template = this.#templates.get(mail.template);
+    const template = await this.#template(mail.template, tx);
     const parsed = payloadSchema.safeParse({ to: mail.to, vars: mail.vars });
     if (!template || !parsed.success || !validKey(mail.idempotencyKey)
       || Object.keys(parsed.data.vars).some((name) => !template.vars.includes(name))) {
@@ -113,7 +202,7 @@ export class MailEngine implements Mailer {
       throw validation("INVALID_MAIL_EXPIRY", "The mail expiry is not valid.");
     }
     const expiresAt = new Date(Math.min(now.getTime() + MAX_TTL, requestedExpiry));
-    const serialized = JSON.stringify(parsed.data);
+    const serialized = JSON.stringify({ ...parsed.data, sensitiveVars: template.sensitiveVars });
     if (Buffer.byteLength(serialized) > 96 * 1024) throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
     const run = async (inner: Tx) => {
       const publicId = ulid(now.getTime());
@@ -170,6 +259,67 @@ export class MailEngine implements Mailer {
     return value;
   }
 
+  async viewContent(tx: Tx, publicId: string): Promise<MessageContent> {
+    if (!await this.retentionDays(tx)) throw notFound();
+    const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("share");
+    if (!row?.contentEnc || !row.contentExpiresAt || row.contentExpiresAt <= this.deps.clock.now()) throw notFound();
+    const value = contentSchema.parse(JSON.parse(this.deps.crypto.decrypt(row.contentEnc, `mail_outbox.content_enc:${row.publicId}`)));
+    await mailAudit(this.deps, tx, row, "mail.content.viewed", "completed", undefined, false, "read");
+    return value;
+  }
+
+  #addressHash(to: string): string {
+    return this.deps.crypto.blindIndex(to, "mail.audit_copy.address");
+  }
+
+  async auditCopyStatus(): Promise<{ verified: boolean }> {
+    const { deps } = this;
+    const { address: to } = await readSetting(deps.settings, MAIL_AUDIT_COPY);
+    if (!to) return { verified: false };
+    const [row] = await deps.db.select({ verifiedAt: mailAuditVerification.verifiedAt }).from(mailAuditVerification)
+      .where(and(eq(mailAuditVerification.id, 1), eq(mailAuditVerification.addressHash, this.#addressHash(to)))).limit(1);
+    return { verified: !!row?.verifiedAt };
+  }
+
+  async requestAuditCopyVerification(tx: Tx): Promise<{ queued: true }> {
+    const { deps } = this;
+    const { address: to } = await readSetting(deps.settings, MAIL_AUDIT_COPY, tx);
+    if (!to) throw validation("MAIL_AUDIT_ADDRESS_REQUIRED", "Configure an audit mailbox address first.");
+    const code = randomBytes(16).toString("base64url");
+    const now = deps.clock.now();
+    const expiresAt = new Date(now.getTime() + VERIFY_TTL);
+    const proof = { addressHash: this.#addressHash(to), codeHash: deps.crypto.hashToken(code), expiresAt, verifiedAt: null };
+    await tx.insert(mailAuditVerification).values({ id: 1, ...proof }).onDuplicateKeyUpdate({ set: proof });
+    await this.#enqueue({
+      template: VERIFY_AUDIT, to: { address: to }, vars: { code }, idempotencyKey: `audit-copy:${ulid(now.getTime())}`, expiresAt,
+    }, tx);
+    await deps.audit.record({
+      category: "job", eventName: "mail.audit_copy.verification.requested", action: "create", outcome: "completed",
+      resource: { type: "mail_audit_copy" },
+    }, tx);
+    return { queued: true };
+  }
+
+  async confirmAuditCopyVerification(tx: Tx, code: string): Promise<{ verified: boolean }> {
+    const { deps } = this;
+    const { address: to } = await readSetting(deps.settings, MAIL_AUDIT_COPY, tx);
+    const [row] = await tx.select().from(mailAuditVerification).where(eq(mailAuditVerification.id, 1)).limit(1).for("update");
+    const now = deps.clock.now();
+    const candidate = Buffer.from(deps.crypto.hashToken(code), "hex");
+    const verified = !!(to && row?.codeHash && row.expiresAt && row.expiresAt > now && row.addressHash === this.#addressHash(to)
+      && timingSafeEqual(Buffer.from(row.codeHash, "hex"), candidate));
+    if (verified) {
+      await tx.update(mailAuditVerification).set({ codeHash: null, expiresAt: null, verifiedAt: now })
+        .where(eq(mailAuditVerification.id, 1));
+    }
+    await deps.audit.record({
+      category: "job", eventName: "mail.audit_copy.verification.confirmed", action: "verify",
+      outcome: verified ? "completed" : "denied", reasonCode: verified ? undefined : "MAIL_AUDIT_CODE_INVALID",
+      resource: { type: "mail_audit_copy" },
+    }, tx);
+    return { verified };
+  }
+
   async #queue(tx: Tx, row: MailRow, generation: number): Promise<string> {
     const { jobId } = await this.deps.jobs.enqueue(DELIVER, { mailId: row.publicId, generation }, {
       idempotencyKey: `${row.publicId}:${generation}`, correlationId: row.correlationId, maxAttempts: 1,
@@ -177,13 +327,13 @@ export class MailEngine implements Mailer {
     return jobId;
   }
 
-  #content(template: MailTemplate, vars: OutboundMail["vars"]): Omit<RenderedMail, "to"> {
+  #content(template: PublishedMailTemplate, vars: OutboundMail["vars"]): Omit<MessageContent, "to"> {
     try {
-      const subject = template.subject(vars);
-      const text = template.text(vars);
+      const { subject, text, html = htmlAlternative(text) } = template.render(vars);
       if (typeof subject === "string" && subject.length >= 1 && subject.length <= 255 && !HEADER_CONTROL.test(subject)
-        && typeof text === "string" && text.length >= 1 && text.length <= 65_536 && !text.includes("\0")) {
-        return { subject, text };
+        && typeof text === "string" && text.length >= 1 && text.length <= 65_536 && !text.includes("\0")
+        && typeof html === "string" && html.length <= 512 * 1024 && !html.includes("\0")) {
+        return { subject, text, html };
       }
     } catch { /* never echo variables or raw renderer errors */ }
     throw validation("INVALID_MAIL_RENDER", "The message template could not be rendered safely.");
@@ -201,24 +351,43 @@ export class MailEngine implements Mailer {
     if (!row) return { outcome: "completed" };
 
     let mode: boolean;
-    let data: RenderedMail;
+    let data: MessageContent;
+    let redacted: MessageContent | undefined;
+    let retainDays = 0;
+    let redactionFailed = false;
+    let sender: MailSenderIdentity | null = null;
+    let routing: { primary: MailTransportKey; secondary: "none" | MailTransportKey } = { primary: "smtp", secondary: "none" };
     try {
       mode = await this.captureEnabled();
-      const template = this.#templates.get(row.template);
+      if (mode && row.template === VERIFY_AUDIT) return this.#preSendFailure(job, ids, "MAIL_VERIFICATION_CAPTURE_BLOCKED", true);
+      const template = await this.#template(row.template);
       if (!row.payloadEnc || !template) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
       const payload = payloadSchema.parse(JSON.parse(deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
+      if (Object.keys(payload.vars).some((name) => !template.vars.includes(name))) throw new Error("MAIL_TEMPLATE_VARS_CHANGED");
       const recipient = "userId" in payload.to ? await delivery.findRecipient(payload.to.userId) : { email: payload.to.address, status: "active" };
       if (!recipient || !["active", "pending_activation"].includes(recipient.status)) {
         return this.#preSendFailure(job, ids, "MAIL_RECIPIENT_UNAVAILABLE", true);
       }
       data = { ...this.#content(template, payload.vars), to: address.parse(recipient.email) };
+      if (!mode) {
+        [sender, routing, retainDays] = await Promise.all([
+          this.getMailSenderIdentity(), readSetting(deps.settings, MAIL_ROUTING), this.retentionDays(),
+        ]);
+        if (row.template !== VERIFY_AUDIT) {
+          try {
+            const masked = { ...payload.vars };
+            for (const key of new Set([...(template.sensitiveVars ?? []), ...(payload.sensitiveVars ?? [])])) masked[key] = REDACTED;
+            redacted = { ...this.#content(template, masked), to: data.to };
+          } catch { redactionFailed = true; }
+        }
+      }
     } catch (error) {
       return this.#preSendFailure(job, ids,
         error instanceof DomainError && error.reasonCode === "MAIL_CAPTURE_FORBIDDEN"
           ? "MAIL_CAPTURE_FORBIDDEN" : "MAIL_PREPARATION_FAILED", false);
     }
 
-    const begin = await deps.db.transaction(async (tx) => {
+    const started = await deps.db.transaction(async (tx) => {
       const current = await this.#lockedMail(tx, job, ids, "queued");
       if (!current) return false;
       const now = deps.clock.now();
@@ -230,56 +399,139 @@ export class MailEngine implements Mailer {
         return false;
       }
       if (mode) {
+        const { to, subject, text } = data;
         await tx.insert(mailAttempts).values({
           mailId: current.id, generation: current.generation, state: "captured", startedAt: now, finishedAt: now,
         });
         await tx.update(mailOutbox).set({
           state: "captured", payloadEnc: null,
-          captureEnc: deps.crypto.encrypt(JSON.stringify(data), `mail_outbox.capture_enc:${current.publicId}`),
+          captureEnc: deps.crypto.encrypt(JSON.stringify({ to, subject, text }), `mail_outbox.capture_enc:${current.publicId}`),
           expiresAt: new Date(Math.min(current.expiresAt.getTime(), now.getTime() + CAPTURE_TTL)), updatedAt: now,
         }).where(eq(mailOutbox.id, current.id));
         await mailAudit(deps, tx, current, "job.mail.captured", "completed", "MAIL_CAPTURE_ONLY", true);
         return false;
       }
-      await tx.update(mailOutbox).set({ state: "sending", updatedAt: now }).where(eq(mailOutbox.id, current.id));
-      await tx.insert(mailAttempts).values({ mailId: current.id, generation: current.generation, state: "sending", startedAt: now });
+      await tx.update(mailOutbox).set({
+        state: "sending", updatedAt: now,
+        ...(redacted && retainDays > 0 ? {
+          contentEnc: deps.crypto.encrypt(JSON.stringify(redacted), `mail_outbox.content_enc:${current.publicId}`),
+          contentExpiresAt: new Date(now.getTime() + retainDays * ONE_DAY),
+        } : {}),
+      }).where(eq(mailOutbox.id, current.id));
+      await this.#startAttempt(tx, current, routing.primary, "primary");
+      if (redactionFailed) await mailAudit(deps, tx, current, "job.mail.redaction.failed", "failed", "MAIL_REDACTION_FAILED", true);
       await mailAudit(deps, tx, current, "job.mail.sending", "attempted", undefined, true);
       return true;
     });
-    if (!begin) return { outcome: "completed" };
+    if (!started) return { outcome: "completed" };
 
-    await job.assertStillOwned();
-    let deliveryResult: SmtpDeliveryResult;
-    try {
-      deliveryResult = await delivery.send({ ...data, html: htmlAlternative(data.text), signal: job.signal });
-    } catch {
-      deliveryResult = { outcome: "unknown" };
+    let key = routing.primary;
+    let purpose: AttemptPurpose = "primary";
+    let result = await this.#send(job, key, sender, data, row.expiresAt);
+    if (routing.secondary !== "none" && (result.outcome === "not_configured" || (result.outcome === "rejected" && result.retryable === true))) {
+      const secondary = routing.secondary;
+      const next = await deps.db.transaction(async (tx) => {
+        const current = await this.#lockedMail(tx, job, ids, "sending");
+        if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");
+        if (current.expiresAt <= deps.clock.now()) return false;
+        await this.#finishAttempt(tx, current, key, purpose, result);
+        await this.#startAttempt(tx, current, secondary, "secondary");
+        await mailAudit(deps, tx, current, "job.mail.failover.started", "attempted", undefined, true);
+        return true;
+      });
+      if (next) {
+        key = secondary;
+        purpose = "secondary";
+        result = await this.#send(job, key, sender, data, row.expiresAt);
+      }
     }
-    const outcome: MailAttemptOutcome = deliveryResult.outcome === "accepted" ? "accepted"
-      : deliveryResult.outcome === "not_configured" ? "held" : deliveryResult.outcome === "rejected" ? "failed" : "unknown";
-    const reasonCode = outcome === "accepted" ? "MAIL_SMTP_ACCEPTED"
-      : outcome === "held" ? "MAIL_NOT_CONFIGURED"
-        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : "MAIL_PROVIDER_REJECTED";
-    await deps.db.transaction(async (tx) => {
+    const { outcome, reasonCode } = await deps.db.transaction(async (tx) => {
       const current = await this.#lockedMail(tx, job, ids, "sending");
       if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");
+      const status = await this.#finishAttempt(tx, current, key, purpose, result);
       const now = deps.clock.now();
-      await tx.update(mailAttempts).set({ state: outcome, reasonCode, finishedAt: now })
-        .where(and(eq(mailAttempts.mailId, current.id), eq(mailAttempts.generation, current.generation)));
+      const expired = (status.outcome === "held" || status.outcome === "failed") && current.expiresAt <= now;
+      const outcome = expired ? "expired" : status.outcome;
+      const reasonCode = expired ? "MAIL_EXPIRED" : status.reasonCode;
       await tx.update(mailOutbox).set({
         state: outcome, reasonCode, updatedAt: now,
-        ...(outcome === "accepted" || outcome === "unknown" || (outcome === "failed" && !deliveryResult.retryable) ? { payloadEnc: null } : {}),
+        ...(outcome === "accepted" || outcome === "unknown" || expired
+          || (outcome === "failed" && !result.retryable) ? { payloadEnc: null } : {}),
       }).where(eq(mailOutbox.id, current.id));
-      const name = outcome === "accepted" ? "job.mail.accepted" : outcome === "held" ? "job.mail.held"
-        : outcome === "failed" ? "job.mail.failed" : "job.mail.unknown";
-      await mailAudit(deps, tx, current, name, outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome, reasonCode, true);
+      await mailAudit(deps, tx, current, `job.mail.${outcome}`,
+        outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome === "expired" ? "canceled" : outcome, reasonCode, true);
+      return { outcome, reasonCode };
     });
+    if (outcome === "accepted" && redacted) await this.#auditCopy(job, ids, key, sender, redacted);
     if (outcome === "unknown") return { outcome: "unknown", reasonCode };
     if (outcome === "failed") return { outcome: "failed", reasonCode, retryable: false };
+    if (outcome === "expired") return { outcome: "canceled", reasonCode };
     return { outcome: "completed" };
   }
 
-  async #lockedMail(tx: Tx, job: ClaimedJob, ids: DeliveryJob, expected: "queued" | "sending") {
+  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: MessageContent, expiresAt?: Date): Promise<MailDeliveryResult> {
+    const adapter = this.#transports.get(key);
+    if (!adapter || !sender) return { outcome: "not_configured" };
+    try {
+      if (!await adapter.isConfigured()) return { outcome: "not_configured" };
+    } catch { return { outcome: "rejected", retryable: false }; }
+    await job.assertStillOwned();
+    job.signal.throwIfAborted();
+    if (expiresAt && expiresAt <= this.deps.clock.now()) return { outcome: "expired" };
+    try {
+      const result = await adapter.send({ ...data, sender, signal: job.signal });
+      if (["accepted", "not_configured", "rejected", "unknown"].includes(result.outcome)) return result;
+    } catch { /* Submission may have reached the provider. */ }
+    return { outcome: "unknown" };
+  }
+
+  async #startAttempt(tx: Tx, mail: MailRow, transport: MailTransportKey, purpose: AttemptPurpose): Promise<void> {
+    await tx.insert(mailTransportAttempts).values({
+      mailId: mail.id, generation: mail.generation, transport, purpose, state: "sending", startedAt: this.deps.clock.now(),
+    });
+  }
+
+  async #finishAttempt(tx: Tx, mail: MailRow, key: MailTransportKey, purpose: AttemptPurpose, result: MailDeliveryResult):
+    Promise<{ outcome: Exclude<MailAttemptOutcome, "captured">; reasonCode: string }> {
+    const outcome = result.outcome === "accepted" ? "accepted"
+      : result.outcome === "not_configured" ? "held" : result.outcome === "unknown" ? "unknown" : "failed";
+    const reasonCode = outcome === "accepted" ? key === "smtp" ? "MAIL_SMTP_ACCEPTED" : "MAIL_GRAPH_ACCEPTED"
+      : outcome === "held" ? "MAIL_NOT_CONFIGURED"
+        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : result.outcome === "expired" ? "MAIL_EXPIRED" : "MAIL_PROVIDER_REJECTED";
+    await tx.update(mailTransportAttempts).set({ state: outcome, reasonCode, finishedAt: this.deps.clock.now() }).where(and(
+      eq(mailTransportAttempts.mailId, mail.id), eq(mailTransportAttempts.generation, mail.generation),
+      eq(mailTransportAttempts.purpose, purpose), eq(mailTransportAttempts.state, "sending"),
+    ));
+    return { outcome, reasonCode };
+  }
+
+  async #auditCopy(job: ClaimedJob, ids: DeliveryJob, key: MailTransportKey, sender: MailSenderIdentity | null, redacted: MessageContent) {
+    const { deps } = this;
+    const to = await deps.db.transaction(async (tx) => {
+      const current = await this.#lockedMail(tx, job, ids, "accepted");
+      if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");
+      const setting = await readSetting(deps.settings, MAIL_AUDIT_COPY, tx);
+      if (!setting.enabled || setting.address.toLowerCase() === redacted.to.toLowerCase()) return null;
+      const [proof] = await tx.select({ verifiedAt: mailAuditVerification.verifiedAt }).from(mailAuditVerification)
+        .where(and(eq(mailAuditVerification.id, 1), eq(mailAuditVerification.addressHash, this.#addressHash(setting.address))))
+        .limit(1).for("share");
+      if (!proof?.verifiedAt) return null;
+      await this.#startAttempt(tx, current, key, "audit_copy");
+      await mailAudit(deps, tx, current, "job.mail.audit_copy.sending", "attempted", undefined, true);
+      return setting.address;
+    });
+    if (!to) return;
+    const result = await this.#send(job, key, sender, { ...redacted, to });
+    await deps.db.transaction(async (tx) => {
+      const current = await this.#lockedMail(tx, job, ids, "accepted");
+      if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");
+      const { outcome, reasonCode } = await this.#finishAttempt(tx, current, key, "audit_copy", result);
+      await mailAudit(deps, tx, current, `job.mail.audit_copy.${outcome}`,
+        outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome, reasonCode, true);
+    });
+  }
+
+  async #lockedMail(tx: Tx, job: ClaimedJob, ids: DeliveryJob, expected: "queued" | "sending" | "accepted") {
     await job.assertStillOwned(tx);
     const [current] = await tx.select().from(mailOutbox).where(and(
       eq(mailOutbox.publicId, ids.mailId), eq(mailOutbox.generation, ids.generation),
@@ -328,6 +580,22 @@ export class MailEngine implements Mailer {
       purged += changed;
       if (changed < 50) break;
     }
-    return { outcome: "completed", safeCounts: { purged } };
+    let contentPurged = 0;
+    for (let batch = 0; batch < 8; batch += 1) {
+      const changed = await deps.db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
+        const enabled = await this.retentionDays(tx);
+        const now = deps.clock.now();
+        const rows = await tx.select({ id: mailOutbox.id }).from(mailOutbox).where(and(
+          isNotNull(mailOutbox.contentExpiresAt), enabled ? lte(mailOutbox.contentExpiresAt, now) : undefined,
+        )).orderBy(asc(mailOutbox.contentExpiresAt), asc(mailOutbox.id)).limit(50).for("update", { skipLocked: true });
+        if (rows.length) await tx.update(mailOutbox).set({ contentEnc: null, contentExpiresAt: null })
+          .where(inArray(mailOutbox.id, rows.map(({ id }) => id)));
+        return rows.length;
+      }, { isolationLevel: "read committed" });
+      contentPurged += changed;
+      if (changed < 50) break;
+    }
+    return { outcome: "completed", safeCounts: { purged, content_purged: contentPurged } };
   }
 }

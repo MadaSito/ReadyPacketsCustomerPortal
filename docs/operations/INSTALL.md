@@ -128,7 +128,9 @@ run_catalog_import
 
 ## Upgrade and rollback
 
-Fetch and review the candidate in a trusted checkout. Ensure new migrations were reviewed and exercised on a restored copy. The script builds before quiescing, so defer enabling Jobs maintenance until it prompts. After switching releases, with traffic still fenced, it installs the candidate's managed units and drop-ins, renders the edge and TLS snippets and portal site from the kit, then runs `nginx -t` and reloads Nginx. Review these files before upgrading. The `native-install` workflow does not run this upgrade path; exercise it on a staging copy before production. Apply unrelated ingress or grant changes separately, and ensure the old pre-upgrade backup unit still works before migration.
+For exact copy-pasteable operator commands from `/opt/readypackets-src`, see [UPGRADE.md](UPGRADE.md); for locked-out administrator host recovery, see [ADMIN-RECOVERY.md](ADMIN-RECOVERY.md).
+
+Fetch and review the candidate in a trusted checkout (root-owned, `umask 022`, checked out at the exact target commit). Ensure new migrations were reviewed and exercised on a restored copy. After switching releases, with traffic still fenced, `deploy/upgrade.sh` installs the candidate's managed units and drop-ins, renders the edge and TLS snippets and portal site from the kit, then runs `nginx -t` and reloads Nginx. The `native-install` CI workflow exercises this path from the prior release (`d964a3b`) through live data creation, `deploy/upgrade.sh`, and the full smoke suite. Apply unrelated ingress or grant changes separately, and ensure the old pre-upgrade backup unit still works before migration.
 
 ```bash
 sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>

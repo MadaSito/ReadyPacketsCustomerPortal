@@ -54,3 +54,16 @@ export function PreviewLinkNotice({ path, what }: { path: string | undefined; wh
     </Callout>
   );
 }
+
+/** Sign-in methods shown on the staff and customer lists. */
+export function SignInMethodBadges({ methods }: { methods: { password: boolean; sso: "linked" | "pending" | null } | undefined }) {
+  if (!methods) return null;
+  return (
+    <span className="flex flex-wrap gap-1">
+      {methods.password ? <Badge tone="neutral">Password</Badge> : null}
+      {methods.sso === "linked" ? <Badge tone="info">Microsoft SSO</Badge> : null}
+      {methods.sso === "pending" ? <Badge tone="warning">SSO pending</Badge> : null}
+      {!methods.password && !methods.sso ? <Badge tone="neutral">Not set</Badge> : null}
+    </span>
+  );
+}
