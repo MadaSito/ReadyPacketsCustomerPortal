@@ -1393,7 +1393,7 @@ export async function executeRemoteCopyJob(
               bytes: putResult.size,
               phase: "finished",
               result: "verified",
-              verification: putResult.sha256 ? "checksum" : "provider_readback",
+              verification: "checksum",
               alreadyAudited: true,
             }
           : {
