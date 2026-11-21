@@ -1,6 +1,7 @@
-import { boolean, char, index, int, json, mysqlEnum, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { bigint, boolean, char, index, int, json, mysqlEnum, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 import { createdAtColumn, idColumn, publicIdColumn, updatedAtColumn, utcDateTime, versionColumn } from "../../db/columns.js";
 import { STORAGE_PROVIDER_KINDS, STORAGE_PURPOSES, type StorageConfig, type StorageTestCode } from "./contracts.js";
+import { COPY_KINDS, COPY_STATES, COPY_VERIFICATIONS } from "./copyLogTypes.js";
 
 export const storageConnections = mysqlTable("storage_connections", {
   id: idColumn(),
@@ -44,4 +45,29 @@ export const storageFileCopies = mysqlTable("storage_file_copies", {
 }, (t) => [
   uniqueIndex("storage_file_copies_file_connection_uq").on(t.filePublicId, t.connectionPublicId),
   index("storage_file_copies_state_idx").on(t.state, t.updatedAt),
+]);
+
+/** Operational history. Deliberately no FK to the source, connection, or job retention lifecycle. */
+export const storageCopyAttempts = mysqlTable("storage_copy_attempts", {
+  id: idColumn(),
+  publicId: publicIdColumn(),
+  kind: mysqlEnum("kind", COPY_KINDS).notNull(),
+  sourcePublicId: char("source_public_id", { length: 26 }).notNull(),
+  connectionPublicId: char("connection_public_id", { length: 26 }).notNull(),
+  jobPublicId: varchar("job_public_id", { length: 64 }).notNull(),
+  attempt: int("attempt", { unsigned: true }).notNull(),
+  correlationId: varchar("correlation_id", { length: 64 }),
+  bytes: bigint("bytes", { mode: "number", unsigned: true }),
+  state: mysqlEnum("state", COPY_STATES).notNull().default("queued"),
+  verification: mysqlEnum("verification", COPY_VERIFICATIONS),
+  errorCode: varchar("error_code", { length: 64 }),
+  startedAt: utcDateTime("started_at"),
+  finishedAt: utcDateTime("finished_at"),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex("storage_copy_attempt_job_uq").on(t.jobPublicId, t.attempt),
+  index("storage_copy_attempt_time_idx").on(t.createdAt, t.id),
+  index("storage_copy_attempt_conn_idx").on(t.connectionPublicId, t.createdAt, t.id),
+  index("storage_copy_attempt_kind_idx").on(t.kind, t.createdAt, t.id),
+  index("storage_copy_attempt_state_idx").on(t.state, t.createdAt, t.id),
 ]);
