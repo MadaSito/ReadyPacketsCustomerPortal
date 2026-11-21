@@ -8,7 +8,7 @@ import {
   Button, Callout, DataTable, DateTime, Dialog, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select,
   StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
-import { PreviewLinkNotice, STATUS_FILTER_OPTIONS, UserStatusBadge, type UserStatus } from "../shared";
+import { PreviewLinkNotice, STATUS_FILTER_OPTIONS, UserStatusBadge, SignInMethodBadges, type UserStatus } from "../shared";
 
 type Page = Awaited<ReturnType<ReturnType<typeof useTRPCClient>["identity"]["admin"]["customers"]["list"]["query"]>>;
 type Row = Page["items"][number];
@@ -65,6 +65,7 @@ export default function CustomersPage() {
           { key: "reference", header: "Reference", cell: (row) => row.customerRef ?? "—" },
           { key: "email", header: "E-mail", cell: (row) => <span className="break-all">{row.email}</span> },
           { key: "status", header: "Status", cell: (row) => <UserStatusBadge status={row.status} /> },
+            { key: "signIn", header: "Sign-in method", hideOnMobile: true, cell: (row) => <SignInMethodBadges methods={row.signInMethods} /> },
           { key: "createdAt", header: "Created", hideOnMobile: true, cell: (row) => <DateTime value={row.createdAt} format="date" /> },
         ]}
         empty={
@@ -150,7 +151,7 @@ function CreateCustomerDialog({ open, onOpenChange, onCreated }: { open: boolean
           <Field label="Full name" required error={errors.name}>
             <Input value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" maxLength={120} />
           </Field>
-          <Field label="Customer reference" hint="Optional. Leave blank to generate one. Letters, digits and single hyphens." error={errors.customerRef}>
+          <Field label="Customer reference" hint="Optional. Leave blank to generate one (format RPCUS- followed by 9 letters or digits). Letters, digits and single hyphens." error={errors.customerRef}>
             <Input value={reference} onChange={(e) => setReference(e.target.value.toUpperCase())} autoComplete="off" maxLength={32} />
           </Field>
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
