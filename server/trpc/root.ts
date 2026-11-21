@@ -23,6 +23,7 @@ import { communityRouter } from "../modules/community/router.js";
 import { referralsRouter } from "../modules/referrals/router.js";
 import { cartRouter } from "../modules/cart/router.js";
 import { knowledgeRouter } from "../modules/knowledge/router.js";
+import { paymentsRouter } from "../modules/payments/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -48,6 +49,7 @@ export const appRouter = router({
   referrals: referralsRouter,
   cart: cartRouter,
   knowledge: knowledgeRouter,
+  payments: paymentsRouter,
 });
 
 export type AppRouter = typeof appRouter;
