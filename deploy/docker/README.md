@@ -111,7 +111,7 @@ control, for example:
 Treat that file like the keys themselves. A copy of the database volume is only usable together with the
 `migrator-secrets` and `db-secrets` volumes, so export those the same way if you copy `db-data`. If one of
 the three secret volumes goes missing, the stack refuses to start and names the incomplete volume rather
-than creating new keys.
+than creating new keys. If all administrators lose their password or second factors, run `./rp-docker.sh recover-admin --email <admin-email>` on an interactive host terminal (see [`docs/operations/ADMIN-RECOVERY.md`](../../docs/operations/ADMIN-RECOVERY.md)).
 
 ## Differences from the native kit
 

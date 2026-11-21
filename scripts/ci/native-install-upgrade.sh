@@ -26,7 +26,8 @@ readonly origin="https://$host"
 readonly repo_dir=/opt/readypackets-src
 readonly ca_cert=/etc/readypackets/tls/fullchain.pem
 readonly credentials=/root/readypackets-initial-admin.txt
-readonly ci_scripts_dir=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+ci_scripts_dir=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+readonly ci_scripts_dir
 
 umask 077
 work=$(mktemp -d)
