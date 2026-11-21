@@ -4,7 +4,7 @@ import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/re
 import type { MeResult } from "@/lib/authApi";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import type {
-  EgressPresetStatus,
+  EgressPresetView,
   OrderSyncSettingsView,
   OrderSyncStatusRow,
   StorageAssignmentView,
@@ -110,24 +110,24 @@ const sampleAssignments: StorageAssignmentView[] = [
   { purpose: "order_data", connectionPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZSP" },
 ];
 
-const samplePresets: EgressPresetStatus[] = [
+const samplePresets: EgressPresetView[] = [
   {
-    presetKey: "amazon_s3",
-    title: "Amazon S3",
-    description: "Regional AWS S3 HTTPS endpoints.",
+    key: "amazon_s3",
+    label: "Amazon S3 Regional Endpoint",
+    purpose: "storage_s3",
+    parameterized: true,
     hosts: ["s3.us-east-1.amazonaws.com"],
-    requiredParams: ["region"],
     enabled: true,
-    activeHosts: ["s3.us-east-1.amazonaws.com"],
+    matchingRulePublicIds: ["01JAFJ8VEGZ9GPVRR2S9KTYZRL"],
   },
   {
-    presetKey: "dropbox",
-    title: "Dropbox API",
-    description: "Dropbox API & content upload endpoints.",
+    key: "dropbox",
+    label: "Dropbox API & Content Upload",
+    purpose: "storage_dropbox",
+    parameterized: false,
     hosts: ["api.dropboxapi.com", "content.dropboxapi.com"],
-    requiredParams: [],
     enabled: true,
-    activeHosts: ["api.dropboxapi.com", "content.dropboxapi.com"],
+    matchingRulePublicIds: ["01JAFJ8VEGZ9GPVRR2S9KTYZRM"],
   },
 ];
 
@@ -164,6 +164,14 @@ const sampleSyncRows: OrderSyncStatusRow[] = [
     attempts: 1,
     lastSyncedAt: "2026-11-21T09:50:00Z",
     reasonCode: null,
+  },
+  {
+    orderPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZUK",
+    reference: "ORD-2026-1043",
+    state: "unknown",
+    attempts: 1,
+    lastSyncedAt: null,
+    reasonCode: "SHAREPOINT_WRITE_OUTCOME_UNKNOWN",
   },
 ];
 
@@ -227,7 +235,7 @@ vi.mock("@/lib/trpc", () => {
             queryKey: ["storage.assignments.list"] as const,
             queryFn: async () => {
               failIfBroken();
-              return { items: sampleAssignments };
+              return sampleAssignments;
             },
           }),
         },
@@ -243,7 +251,7 @@ vi.mock("@/lib/trpc", () => {
               queryKey: ["integrations.admin.egress.presets"] as const,
               queryFn: async () => {
                 failIfBroken();
-                return { items: samplePresets };
+                return samplePresets;
               },
             }),
           },
@@ -370,9 +378,12 @@ describe("Storage connections & SharePoint order sync UI", () => {
     window.history.replaceState(null, "", "/");
     createConnection.mockReset();
     updateConnection.mockReset().mockResolvedValue(sampleConnections[0]);
-    testConnection.mockReset().mockResolvedValue({ ok: true, code: "OK" });
-    setAssignment.mockReset().mockResolvedValue({ items: sampleAssignments });
-    setEgressPreset.mockReset().mockResolvedValue({ presetKey: "amazon_s3", enabled: true, activeHosts: [] });
+    testConnection.mockReset().mockResolvedValue({
+      ...sampleConnections[0]!,
+      lastTest: { ok: true, code: "OK", checkedAt: "2026-11-21T10:05:00Z" },
+    });
+    setAssignment.mockReset().mockResolvedValue(sampleAssignments);
+    setEgressPreset.mockReset().mockResolvedValue(samplePresets[0]!);
     discoverSite.mockReset().mockResolvedValue({
       siteId: "contoso.sharepoint.com,site-1,web-1",
       displayName: "Contoso Operations",
@@ -527,7 +538,7 @@ describe("Storage connections & SharePoint order sync UI", () => {
       updatedAt: "2026-11-21T10:00:00Z",
     };
     createConnection.mockResolvedValueOnce(createdSharePoint);
-    updateConnection.mockResolvedValueOnce({
+    const updatedSharePoint: StorageConnectionView = {
       ...createdSharePoint,
       version: 2,
       config: {
@@ -537,6 +548,11 @@ describe("Storage connections & SharePoint order sync UI", () => {
         driveName: "Documents",
         rootFolderPath: "ReadyPackets",
       },
+    };
+    updateConnection.mockResolvedValueOnce(updatedSharePoint);
+    testConnection.mockResolvedValueOnce({
+      ...updatedSharePoint,
+      lastTest: { ok: true, code: "OK", checkedAt: "2026-11-21T10:06:00Z" },
     });
 
     const stepUp = vi.fn().mockResolvedValue(undefined);
@@ -610,6 +626,10 @@ describe("Storage connections & SharePoint order sync UI", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
     expect(await screen.findByText("Connection test passed")).toBeTruthy();
+    expect(testConnection).toHaveBeenCalledWith({
+      publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZNW",
+      expectedVersion: 2,
+    });
   });
 
   it("renders SharePointOrderSyncPage, supports Resume/Restart backfill, list creation, and passes axe", async () => {
@@ -622,6 +642,7 @@ describe("Storage connections & SharePoint order sync UI", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: "SharePoint order sync" })).toBeTruthy();
     expect((await screen.findAllByText("ORD-2026-1042")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("Outcome unknown")).length).toBeGreaterThan(0);
     await expectNoAxeViolations(container);
 
     // Failed backfill exposes both Resume and Restart buttons

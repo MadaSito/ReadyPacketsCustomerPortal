@@ -358,18 +358,17 @@ export function StorageConnectionWizardPage() {
     if (!activeConnection) return;
     setTesting(true);
     try {
-      const res = await stepUp.run(
-        () => storageClient.testConnection({ publicId: activeConnection.publicId }),
+      const updated = await stepUp.run(
+        () =>
+          storageClient.testConnection({
+            publicId: activeConnection.publicId,
+            expectedVersion: activeConnection.version,
+          }),
         { reason: "Testing a storage connection requires verification." },
       );
-      setTestOutcome(res);
-      setSavedConn((prev) =>
-        prev
-          ? {
-              ...prev,
-              lastTest: { ...res, checkedAt: new Date().toISOString() },
-            }
-          : prev,
+      setSavedConn(updated);
+      setTestOutcome(
+        updated.lastTest ? { ok: updated.lastTest.ok, code: updated.lastTest.code } : null,
       );
       await queryClient.invalidateQueries({ queryKey: api.connectionsList.queryKey() });
     } catch (err) {

@@ -79,14 +79,62 @@ export type EgressPresetKey =
   | "backblaze_b2"
   | "azure_blob";
 
-export interface EgressPresetStatus {
-  presetKey: EgressPresetKey;
-  title: string;
-  description: string;
-  hosts: string[];
-  requiredParams: ("region" | "bucket" | "accountName")[];
+export interface EgressPresetView {
+  key: EgressPresetKey;
+  label: string;
+  purpose: string;
+  parameterized: boolean;
+  hosts: readonly string[];
   enabled: boolean;
-  activeHosts: string[];
+  matchingRulePublicIds: readonly string[];
+}
+
+export interface EgressPresetClientMeta {
+  description: string;
+  requiredParams: readonly ("region" | "bucket" | "accountName")[];
+}
+
+const EGRESS_PRESET_CLIENT_META: Record<EgressPresetKey, EgressPresetClientMeta> = {
+  microsoft_graph: {
+    description: "Microsoft Graph v1.0 API and Entra OAuth2 token endpoints.",
+    requiredParams: [],
+  },
+  microsoft_graph_upload: {
+    description: "Microsoft SharePoint and OneDrive chunked upload session hosts.",
+    requiredParams: [],
+  },
+  entra_oidc: {
+    description: "Microsoft Entra ID OIDC token and JWKS discovery endpoints.",
+    requiredParams: [],
+  },
+  dropbox: {
+    description: "Dropbox OAuth2 API and content upload endpoints.",
+    requiredParams: [],
+  },
+  google_drive: {
+    description: "Google OAuth2 token and Google Drive v3 API endpoints.",
+    requiredParams: [],
+  },
+  amazon_s3: {
+    description: "Amazon S3 regional HTTPS endpoint (and optional virtual-host bucket).",
+    requiredParams: ["region", "bucket"],
+  },
+  wasabi_s3: {
+    description: "Wasabi Hot Cloud Storage regional S3-compatible HTTPS endpoint.",
+    requiredParams: ["region", "bucket"],
+  },
+  backblaze_b2: {
+    description: "Backblaze B2 S3-compatible regional HTTPS endpoint.",
+    requiredParams: ["region", "bucket"],
+  },
+  azure_blob: {
+    description: "Azure Blob Storage account HTTPS endpoint (<account>.blob.core.windows.net).",
+    requiredParams: ["accountName"],
+  },
+};
+
+export function describeEgressPreset(key: EgressPresetKey): EgressPresetClientMeta {
+  return EGRESS_PRESET_CLIENT_META[key];
 }
 
 export interface ProviderChoiceOption {
@@ -281,7 +329,7 @@ export function describeConnectionStatus(conn: StorageConnectionView): Connectio
 // SharePoint discovery & order-data sync types
 // ---------------------------------------------------------------------------
 
-export type SharePointSyncRowState = "pending" | "synced" | "failed";
+export type SharePointSyncRowState = "pending" | "synced" | "failed" | "unknown";
 
 export type OrderSyncTestCode =
   | "OK"
@@ -310,7 +358,7 @@ export interface OrderSyncBackfillStatus {
   state: "running" | "completed" | "failed";
   enqueued: number;
   reasonCode: string | null;
-  startedAt: Date | string;
+  startedAt: Date | string | null;
   finishedAt: Date | string | null;
 }
 
@@ -326,7 +374,7 @@ export interface OrderSyncSettingsView {
   state: "disabled" | "not_configured" | "ready" | "error";
   lastError: { reasonCode: string; at: Date | string } | null;
   counts: { pending: number; synced: number; failed: number };
-  backfill?: OrderSyncBackfillStatus | null;
+  backfill: OrderSyncBackfillStatus | null;
 }
 
 export interface SharePointDiscoveredSite {

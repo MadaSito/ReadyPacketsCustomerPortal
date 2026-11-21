@@ -354,9 +354,21 @@ export function SharePointOrderSyncPage() {
       header: "Sync state",
       cell: (row) => (
         <Badge
-          tone={row.state === "synced" ? "success" : row.state === "failed" ? "danger" : "warning"}
+          tone={
+            row.state === "synced"
+              ? "success"
+              : row.state === "failed"
+                ? "danger"
+                : "warning"
+          }
         >
-          {row.state === "synced" ? "Synced" : row.state === "failed" ? "Failed" : "Pending"}
+          {row.state === "synced"
+            ? "Synced"
+            : row.state === "failed"
+              ? "Failed"
+              : row.state === "unknown"
+                ? "Outcome unknown"
+                : "Pending"}
         </Badge>
       ),
     },
@@ -393,7 +405,7 @@ export function SharePointOrderSyncPage() {
     <>
       <PageHeader
         title="SharePoint order sync"
-        description="One-way mirror of ReadyPackets order rows into a compatible Microsoft 365 SharePoint list. PostgreSQL always remains the system of record."
+        description="One-way mirror of ReadyPackets order rows into a compatible Microsoft 365 SharePoint list. The portal database always remains the system of record."
         meta={stateBadge}
         actions={
           <Button asChild variant="secondary" size="sm">
@@ -610,8 +622,13 @@ export function SharePointOrderSyncPage() {
                 live="polite"
               >
                 <p>
-                  Orders staged: <strong>{backfill.enqueued}</strong> · Started{" "}
-                  <DateTime value={backfill.startedAt} />
+                  Orders staged: <strong>{backfill.enqueued}</strong>
+                  {backfill.startedAt ? (
+                    <>
+                      {" "}
+                      · Started <DateTime value={backfill.startedAt} />
+                    </>
+                  ) : null}
                   {backfill.finishedAt ? (
                     <>
                       {" "}
@@ -691,6 +708,7 @@ export function SharePointOrderSyncPage() {
                     { value: "pending", label: "Pending" },
                     { value: "synced", label: "Synced" },
                     { value: "failed", label: "Failed" },
+                    { value: "unknown", label: "Outcome unknown" },
                   ]}
                 />
               </Field>

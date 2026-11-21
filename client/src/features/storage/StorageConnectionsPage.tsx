@@ -38,12 +38,13 @@ import {
 import { useStorageApi, useStorageDirectClient, type OAuthProvider } from "./api";
 import {
   describeConnectionStatus,
+  describeEgressPreset,
   parseOAuthAttemptHandle,
   PURPOSE_META,
   resolveProviderChoice,
   STORAGE_TEST_CODE_LABELS,
   type EgressPresetKey,
-  type EgressPresetStatus,
+  type EgressPresetView,
   type StorageConnectionView,
   type StoragePurpose,
 } from "./model";
@@ -197,7 +198,7 @@ export function StorageConnectionsPage() {
   }
 
   const connections = connectionsQuery.data.items;
-  const assignments = assignmentsQuery.data.items;
+  const assignments = assignmentsQuery.data;
 
   const assignedFor = (purpose: StoragePurpose) =>
     assignments.filter((a) => a.purpose === purpose).map((a) => a.connectionPublicId);
@@ -209,13 +210,15 @@ export function StorageConnectionsPage() {
   const handleTestConnection = async (conn: StorageConnectionView) => {
     setBusyRowId(conn.publicId);
     try {
-      const result = await stepUp.run(() => storageClient.testConnection({ publicId: conn.publicId }), {
-        reason: "Testing a storage connection requires verification.",
-      });
+      const updated = await stepUp.run(
+        () => storageClient.testConnection({ publicId: conn.publicId, expectedVersion: conn.version }),
+        { reason: "Testing a storage connection requires verification." },
+      );
+      const outcome = updated.lastTest;
       toast.show({
-        tone: result.ok ? "success" : "warning",
-        title: result.ok ? `${conn.name}: connection verified` : `${conn.name}: test did not pass`,
-        description: STORAGE_TEST_CODE_LABELS[result.code],
+        tone: outcome?.ok ? "success" : "warning",
+        title: outcome?.ok ? `${conn.name}: connection verified` : `${conn.name}: test did not pass`,
+        description: outcome ? STORAGE_TEST_CODE_LABELS[outcome.code] : undefined,
       });
       await refreshAll();
     } catch (err) {
@@ -357,20 +360,21 @@ export function StorageConnectionsPage() {
     }
   };
 
-  const handleTogglePreset = async (preset: EgressPresetStatus, nextEnabled: boolean) => {
+  const handleTogglePreset = async (preset: EgressPresetView, nextEnabled: boolean) => {
+    const meta = describeEgressPreset(preset.key);
     const params: { region?: string; bucket?: string; accountName?: string } = {};
     if (nextEnabled) {
-      if (preset.requiredParams.includes("region")) {
+      if (meta.requiredParams.includes("region")) {
         if (!presetRegion.trim()) {
           toast.show({ tone: "warning", title: "Enter a cloud region before enabling this preset" });
           return;
         }
         params.region = presetRegion.trim();
       }
-      if (preset.requiredParams.includes("bucket") && presetBucket.trim()) {
+      if (meta.requiredParams.includes("bucket") && presetBucket.trim()) {
         params.bucket = presetBucket.trim();
       }
-      if (preset.requiredParams.includes("accountName")) {
+      if (meta.requiredParams.includes("accountName")) {
         if (!presetAccount.trim()) {
           toast.show({ tone: "warning", title: "Enter the Azure storage account name before enabling this preset" });
           return;
@@ -378,12 +382,12 @@ export function StorageConnectionsPage() {
         params.accountName = presetAccount.trim();
       }
     }
-    setTogglingPreset(preset.presetKey);
+    setTogglingPreset(preset.key);
     try {
       await stepUp.run(
         () =>
           storageClient.setEgressPreset({
-            presetKey: preset.presetKey,
+            presetKey: preset.key,
             enabled: nextEnabled,
             ...(Object.keys(params).length > 0 ? { params } : {}),
           }),
@@ -391,7 +395,7 @@ export function StorageConnectionsPage() {
       );
       toast.show({
         tone: "success",
-        title: nextEnabled ? `${preset.title} allowlist enabled` : `${preset.title} allowlist disabled`,
+        title: nextEnabled ? `${preset.label} allowlist enabled` : `${preset.label} allowlist disabled`,
       });
       await refreshAll();
     } catch (err) {
@@ -536,7 +540,7 @@ export function StorageConnectionsPage() {
   );
   const eligibleSharePoint = connections.filter((c) => c.enabled && c.kind === "sharepoint");
 
-  const storagePresets = egressQuery.data.items.filter((p) => p.presetKey !== "entra_oidc");
+  const storagePresets = egressQuery.data.filter((p) => p.key !== "entra_oidc");
 
   return (
     <>
@@ -601,7 +605,7 @@ export function StorageConnectionsPage() {
         {/* Connections Table */}
         <Card
           title="Configured destinations"
-          description="PostgreSQL and local primary file storage always remain authoritative. External destinations receive asynchronous verified copies only after testing and explicit enablement."
+          description="The portal database and local primary file storage always remain authoritative. External destinations receive asynchronous verified copies only after testing and explicit enablement."
         >
           {connections.length === 0 ? (
             <EmptyState
@@ -774,28 +778,31 @@ export function StorageConnectionsPage() {
             </div>
 
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {storagePresets.map((preset) => (
-                <div
-                  key={preset.presetKey}
-                  className="flex items-start justify-between gap-3 rounded-[var(--radius-card)] border border-line p-3"
-                >
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-ink">{preset.title}</p>
-                    <p className="mt-0.5 text-xs text-muted">{preset.description}</p>
-                    {preset.activeHosts.length > 0 ? (
-                      <p className="mt-1 font-mono text-xs text-body break-all">
-                        Active: {preset.activeHosts.join(", ")}
-                      </p>
-                    ) : null}
+              {storagePresets.map((preset) => {
+                const meta = describeEgressPreset(preset.key);
+                return (
+                  <div
+                    key={preset.key}
+                    className="flex items-start justify-between gap-3 rounded-[var(--radius-card)] border border-line p-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-ink">{preset.label}</p>
+                      <p className="mt-0.5 text-xs text-muted">{meta.description}</p>
+                      {preset.hosts.length > 0 ? (
+                        <p className="mt-1 font-mono text-xs text-body break-all">
+                          Active: {preset.hosts.join(", ")}
+                        </p>
+                      ) : null}
+                    </div>
+                    <Switch
+                      label={`Allow ${preset.label}`}
+                      checked={preset.enabled}
+                      disabled={togglingPreset === preset.key}
+                      onCheckedChange={(next) => void handleTogglePreset(preset, next)}
+                    />
                   </div>
-                  <Switch
-                    label={`Allow ${preset.title}`}
-                    checked={preset.enabled}
-                    disabled={togglingPreset === preset.presetKey}
-                    onCheckedChange={(next) => void handleTogglePreset(preset, next)}
-                  />
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </Card>

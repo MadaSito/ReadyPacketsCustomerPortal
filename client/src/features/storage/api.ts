@@ -13,7 +13,7 @@ import { sessionFetch } from "@/lib/sessionTransport";
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
 import type {
   EgressPresetKey,
-  EgressPresetStatus,
+  EgressPresetView,
   OrderSyncSettingsView,
   OrderSyncStatusRow,
   OrderSyncTestCode,
@@ -28,7 +28,6 @@ import type {
   StorageCredentials,
   StorageProviderKind,
   StoragePurpose,
-  StorageTestResult,
 } from "./model";
 
 export type OAuthProvider = "dropbox" | "google_drive";
@@ -68,8 +67,8 @@ export interface StorageUpdateInput {
 export interface StorageQueryApi {
   connectionsList: QueryProc<{ cursor?: string; limit?: number }, { items: StorageConnectionView[]; nextCursor: string | null }>;
   connectionGet: QueryProc<{ publicId: string }, StorageConnectionView>;
-  assignmentsList: QueryProcNoInput<{ items: StorageAssignmentView[] }>;
-  egressPresets: QueryProcNoInput<{ items: EgressPresetStatus[] }>;
+  assignmentsList: QueryProcNoInput<StorageAssignmentView[]>;
+  egressPresets: QueryProcNoInput<EgressPresetView[]>;
   orderSyncGet: QueryProcNoInput<OrderSyncSettingsView>;
   orderSyncStatus: QueryProc<
     { cursor?: string | null; limit?: number; state?: SharePointSyncRowState },
@@ -77,20 +76,20 @@ export interface StorageQueryApi {
   >;
   connectionCreate: MutationProc<StorageCreateInput, StorageConnectionView>;
   connectionUpdate: MutationProc<StorageUpdateInput, StorageConnectionView>;
-  connectionTest: MutationProc<{ publicId: string }, StorageTestResult>;
-  assignmentSet: MutationProc<{ purpose: StoragePurpose; connectionPublicIds: string[] }, { items: StorageAssignmentView[] }>;
+  connectionTest: MutationProc<{ publicId: string; expectedVersion: number }, StorageConnectionView>;
+  assignmentSet: MutationProc<{ purpose: StoragePurpose; connectionPublicIds: string[] }, StorageAssignmentView[]>;
 }
 
 export interface StorageDirectClient {
   createConnection(input: StorageCreateInput): Promise<StorageConnectionView>;
   updateConnection(input: StorageUpdateInput): Promise<StorageConnectionView>;
-  testConnection(input: { publicId: string }): Promise<StorageTestResult>;
-  setAssignment(input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<{ items: StorageAssignmentView[] }>;
+  testConnection(input: { publicId: string; expectedVersion: number }): Promise<StorageConnectionView>;
+  setAssignment(input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<StorageAssignmentView[]>;
   setEgressPreset(input: {
     presetKey: EgressPresetKey;
     enabled: boolean;
     params?: { region?: string; bucket?: string; accountName?: string };
-  }): Promise<{ presetKey: EgressPresetKey; enabled: boolean; activeHosts: string[] }>;
+  }): Promise<EgressPresetView>;
   // SharePoint / OneDrive discovery
   discoverSite(input: {
     connectionPublicId: string;
@@ -232,17 +231,17 @@ export function useStorageApi(): StorageQueryApi {
         get: QueryProc<{ publicId: string }, StorageConnectionView>;
         create: MutationProc<StorageCreateInput, StorageConnectionView>;
         update: MutationProc<StorageUpdateInput, StorageConnectionView>;
-        test: MutationProc<{ publicId: string }, StorageTestResult>;
+        test: MutationProc<{ publicId: string; expectedVersion: number }, StorageConnectionView>;
       };
       assignments: {
-        list: QueryProcNoInput<{ items: StorageAssignmentView[] }>;
-        set: MutationProc<{ purpose: StoragePurpose; connectionPublicIds: string[] }, { items: StorageAssignmentView[] }>;
+        list: QueryProcNoInput<StorageAssignmentView[]>;
+        set: MutationProc<{ purpose: StoragePurpose; connectionPublicIds: string[] }, StorageAssignmentView[]>;
       };
     };
     integrations: {
       admin: {
         egress: {
-          presets: QueryProcNoInput<{ items: EgressPresetStatus[] }>;
+          presets: QueryProcNoInput<EgressPresetView[]>;
         };
       };
     };
@@ -279,10 +278,10 @@ export function useStorageDirectClient(): StorageDirectClient {
       connections: {
         create: { mutate(input: StorageCreateInput): Promise<StorageConnectionView> };
         update: { mutate(input: StorageUpdateInput): Promise<StorageConnectionView> };
-        test: { mutate(input: { publicId: string }): Promise<StorageTestResult> };
+        test: { mutate(input: { publicId: string; expectedVersion: number }): Promise<StorageConnectionView> };
       };
       assignments: {
-        set: { mutate(input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<{ items: StorageAssignmentView[] }> };
+        set: { mutate(input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<StorageAssignmentView[]> };
       };
     };
     integrations: {
@@ -293,7 +292,7 @@ export function useStorageDirectClient(): StorageDirectClient {
               presetKey: EgressPresetKey;
               enabled: boolean;
               params?: { region?: string; bucket?: string; accountName?: string };
-            }): Promise<{ presetKey: EgressPresetKey; enabled: boolean; activeHosts: string[] }>;
+            }): Promise<EgressPresetView>;
           };
         };
       };
