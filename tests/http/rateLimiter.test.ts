@@ -39,7 +39,7 @@ describe("database rate limiter", () => {
     expect(h.jobs.schedules).toContainEqual({
       name: "http.rate_limit.cleanup", type: "http.rate_limit.cleanup", everyMs: 60_000,
     });
-    await h.settings.set("http.rate_limit.expensive", { maxRequests: 2, windowSeconds: 1 });
+    await h.settings.set("http.rate_limit.expensive", { maxRequests: 6, windowSeconds: 1 });
     await limiter.consume("expensive", "ip:198.51.100.42");
     h.clock.advance(1001);
     await limiter.consume("expensive", "ip:198.51.100.43");
@@ -47,22 +47,22 @@ describe("database rate limiter", () => {
     expect(await h.jobs.runAll()).toEqual([{ outcome: "completed", safeCounts: { deleted: 1 } }]);
     const [row] = await database.db.select({ total: count() }).from(rateLimitCounters);
     expect(row?.total).toBeGreaterThan(0);
-    expect(await limiter.consume("expensive", "ip:198.51.100.43", 2)).toMatchObject({ allowed: false });
+    expect(await limiter.consume("expensive", "ip:198.51.100.43", 6)).toMatchObject({ allowed: false });
   });
 
   it("shares normalized address counters for replicas with the same root and separates a different root", async () => {
     const h = createTestDeps({ db: database.db });
-    await h.settings.set("http.rate_limit.form_submission", { maxRequests: 1, windowSeconds: 60 });
+    await h.settings.set("http.rate_limit.form_submission", { maxRequests: 8, windowSeconds: 60 });
     const deps = { ...h.deps, tokenHashKey: h.config.tokenHashKey };
     const first = createRateLimiter(deps);
     const replica = createRateLimiter(deps);
     const otherRoot = createRateLimiter({ ...deps, tokenHashKey: Buffer.alloc(32, 213).toString("base64") });
-    await expect(first.consume("form_submission", "edge:ip:2001:db8:17:2::1")).resolves.toMatchObject({ allowed: true });
+    await expect(first.consume("form_submission", "edge:ip:2001:db8:17:2::1", 8)).resolves.toMatchObject({ allowed: true });
     await expect(replica.consume("form_submission", "edge:ip:2001:0DB8:17:2:abcd:1234:5678:9abc"))
       .resolves.toMatchObject({ allowed: false });
     await expect(replica.consume("form_submission", "edge:ip:2001:db8:17:3::1")).resolves.toMatchObject({ allowed: true });
     await expect(otherRoot.consume("form_submission", "edge:ip:2001:db8:17:2::1")).resolves.toMatchObject({ allowed: true });
-    await expect(first.consume("form_submission", "ip:::ffff:c000:20a")).resolves.toMatchObject({ allowed: true });
+    await expect(first.consume("form_submission", "ip:::ffff:c000:20a", 8)).resolves.toMatchObject({ allowed: true });
     await expect(replica.consume("form_submission", "ip:192.0.2.10")).resolves.toMatchObject({ allowed: false });
   });
 
