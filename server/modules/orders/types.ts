@@ -60,6 +60,8 @@ export interface OrderRef {
   ownerUserId: number;
   lockState: OrderLockState;
   statusKey: string;
+  /** Increment 04: pinned workflow version (for phase checks via isStatusPhaseLocked). */
+  workflowVersionId: number;
 }
 
 export type AccessibleOrderIds = { all: true } | { all: false; orderIds: number[]; truncated: boolean };

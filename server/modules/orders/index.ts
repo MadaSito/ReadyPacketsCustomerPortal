@@ -28,8 +28,9 @@ import type {
   OrderProductionScope,
 } from "./types.js";
 import { createWorkflowService, type WorkflowService } from "./workflows.js";
-import { createRequirementsService, type FileUploadSlots, type RequirementsService } from "./requirements.js";
-export type { FileUploadSlots, RequirementsView } from "./requirements.js";
+import { createAccessService, type AccessService } from "./access.js";
+import { createRequirementsService, type FileUploadSlot, type FileUploadSlots, type RequirementsService } from "./requirements.js";
+export type { FileUploadSlot, FileUploadSlots, RequirementsView } from "./requirements.js";
 import { readSetting } from "../platform/index.js";
 import { ORDER_WORKFLOW_RULES_ENABLED } from "./settings.js";
 
@@ -73,11 +74,17 @@ export interface OrdersModule extends ModuleLifecycle {
   getFileUploadSlots(principal: SessionPrincipal, orderPublicId: string, tx?: Tx): Promise<FileUploadSlots>;
   /** Increment 04 (Files port): throws PHASE_LOCKED / ORDER_LOCKED for writes tied to a read-only status. */
   assertFileStatusWritable(principal: SessionPrincipal, orderPublicId: string, statusKey: string, tx?: Tx): Promise<void>;
+  /** Increment 04 (Files custody, trusted): slot definition from the pinned version; no actor filtering. */
+  getFileSlotForCustody(orderPublicId: string, statusKey: string, slotKey: string, tx: Tx): Promise<FileUploadSlot | null>;
   /** Increment 04: is data tied to `statusKey` read-only because its phase is locked (trusted, in-tx). */
   isStatusPhaseLocked(orderId: number, workflowVersionId: number, statusKey: string, tx: Tx): Promise<boolean>;
 
+  /** Increment 04 (cart checkout): customer order creation inside the caller's transaction. */
+  createOrderFromCheckoutInTx: OrderService["createOrderFromCheckoutInTx"];
+
   /* ---- services used by the router ---- */
   requirements: RequirementsService;
+  access: AccessService;
   catalog: CatalogService;
   workflows: WorkflowService;
   orders: OrderService;
@@ -97,7 +104,8 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
   });
   const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck });
-  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements });
+  const access = createAccessService({ ...deps, policy, actorCheck });
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
 
@@ -124,7 +132,10 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     getFileUploadSlots: requirements.getFileUploadSlots,
     assertFileStatusWritable: requirements.assertFileStatusWritable,
     isStatusPhaseLocked: requirements.isStatusPhaseLocked,
+    getFileSlotForCustody: requirements.getFileSlotForCustody,
+    createOrderFromCheckoutInTx: orders.createOrderFromCheckoutInTx,
     requirements,
+    access,
     catalog,
     workflows,
     orders,

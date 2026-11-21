@@ -17,7 +17,7 @@ import type { Services } from "../../container.js";
 import type { ActorCheck } from "./actor.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { engagementPort } from "./ports.js";
-import { orderAcknowledgements, orderNotes, orderPhaseLocks } from "./schema.js";
+import { orderAcknowledgements, orderNotes, orderPhaseLocks, orders } from "./schema.js";
 import type { OrderAccessView } from "./types.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import {
@@ -57,9 +57,17 @@ export interface RequirementsView {
   canUnlock: boolean;
 }
 
+export interface FileUploadSlot {
+  key: string;
+  label: string;
+  kind: "document" | "audio";
+  maxCount: number;
+  allowedTypes: string[];
+}
+
 export interface FileUploadSlots {
   statusKey: string;
-  slots: { key: string; label: string; kind: "document" | "audio"; maxCount: number; allowedTypes: string[] }[];
+  slots: FileUploadSlot[];
 }
 
 const actorOf = (principal: SessionPrincipal) => ({ userId: principal.userId, role: principal.role });
@@ -446,6 +454,18 @@ export function createRequirementsService(deps: RequirementsDeps) {
         if (lockedPhaseOfStatus(bound.definition, statusKey, rows)) throw phaseLocked();
       };
       return tx ? run(tx) : deps.db.transaction(run);
+    },
+
+    /**
+     * Files custody port (trusted, no actor filtering): the slot definition from the order's pinned version, or
+     * null when the status or slot does not exist. Files checks the staff capability, phase lock and order lock.
+     */
+    async getFileSlotForCustody(orderPublicId: string, statusKey: string, slotKey: string, tx: Tx): Promise<FileUploadSlot | null> {
+      const [row] = await tx.select({ workflowVersionId: orders.workflowVersionId }).from(orders).where(eq(orders.publicId, orderPublicId)).limit(1);
+      if (!row) return null;
+      const bound = await workflows.byVersionId(tx, row.workflowVersionId);
+      const slot = findState(bound.definition, statusKey)?.requirements?.uploads.find((candidate) => candidate.key === slotKey);
+      return slot ? { key: slot.key, label: slot.label, kind: slot.kind, maxCount: slot.maxCount, allowedTypes: [...slot.allowedTypes] } : null;
     },
 
     /** Other modules (intake): is data tied to `statusKey` read-only because its phase is locked? */

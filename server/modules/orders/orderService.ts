@@ -38,6 +38,8 @@ export interface OrderServiceDeps {
   workflows: WorkflowService;
   /** Increment 04: requirement guard + phase bookkeeping, run inside the transition tx. */
   requirements: Pick<RequirementsService, "onTransition">;
+  /** Increment 04: copies active customer-wide console grants onto a new order (inside the create tx). */
+  access: { onOrderCreated(tx: Tx, input: { orderId: number; ownerUserId: number; now: Date }): Promise<number> };
 }
 
 export const MAX_PAGE = 100;
@@ -191,6 +193,106 @@ export function createOrderService(deps: OrderServiceDeps) {
     }
   }
 
+  /** Creates the order rows inside `tx` (actor already re-validated by the caller). */
+  async function createInTx(
+    tx: Tx,
+    principal: SessionPrincipal,
+    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+    ownerUserId: number,
+    prefix: string,
+  ) {
+    const now = deps.clock.now();
+    const workflow = await workflows.ensureDefault(tx);
+    const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
+    const currency = lineItems[0]!.currency;
+    const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+    const totalMinor = pricing.totalMinor;
+    const reference = await allocateReference(tx, prefix, now);
+    const publicId = ulid(now.getTime());
+    const initial = initialState(workflow.definition);
+    await tx.insert(orders).values({
+      publicId,
+      reference,
+      ownerUserId,
+      projectName: input.projectName,
+      workflowVersionId: workflow.versionId,
+      statusKey: initial.key,
+      subtotalMinor: pricing.subtotalMinor,
+      discountMinor: pricing.discountMinor,
+      discountLabel: pricing.discountLabel,
+      totalMinor,
+      currency,
+      origin: "portal",
+      createdByUserId: principal.userId,
+      createKey: input.idempotencyKey,
+      submittedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const [order] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, publicId));
+    const orderId = order!.id;
+    await tx.insert(orderLineItems).values(
+      lineItems.map((item, index) => ({
+        publicId: ulid(now.getTime()),
+        orderId,
+        productId: item.productId,
+        productVersionId: item.productVersionId,
+        productPublicId: item.productPublicId,
+        productVersionNumber: item.productVersionNumber,
+        name: item.name,
+        description: item.description,
+        features: item.features,
+        packetNumber: item.packetNumber,
+        tier: item.tier,
+        outcome: item.outcome,
+        timeline: item.timeline,
+        deliverables: item.deliverables,
+        unitPriceMinor: item.unitPriceMinor,
+        currency: item.currency,
+        quantity: item.quantity,
+        lineTotalMinor: item.lineTotalMinor,
+        sortOrder: index,
+        createdAt: now,
+      })),
+    );
+    await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal.userId, now });
+    const note = input.note ? await insertNote(tx, { orderId, principal, visibility: "customer", body: input.note }) : null;
+    await tx.insert(orderStatusHistory).values({
+      publicId: ulid(now.getTime()),
+      orderId,
+      fromStatus: null,
+      toStatus: initial.key,
+      actorUserId: principal.userId,
+      actorRole: principal.role,
+      reasonCode: "CREATED",
+      noteId: note?.id ?? null,
+      occurredAt: now,
+    });
+    const inherited = await deps.access.onOrderCreated(tx, { orderId, ownerUserId, now });
+    await deps.audit.record(
+      {
+        category: "business",
+        eventName: "order.created",
+        action: "create",
+        outcome: "completed",
+        actor: actorOf(principal),
+        resource: { type: "order", publicId },
+        attributes: {
+          currency,
+          total_minor: totalMinor,
+          discount_minor: pricing.discountMinor,
+          on_behalf: ownerUserId !== principal.userId,
+          workflow_version: workflow.versionNumber,
+          inherited_grants: inherited,
+        },
+        safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
+      },
+      tx,
+    );
+    await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
+    return { orderId, publicId, reference, currency, pricing, lineItems };
+  }
+
   async function ownerUser(publicId: string, tx?: DbOrTx) {
     const user = await identityPort(deps.services).getUserByPublicId(publicId, { tx });
     if (!user || user.role !== "customer" || user.status !== "active") return null;
@@ -277,88 +379,8 @@ export function createOrderService(deps: OrderServiceDeps) {
           // No existing order row is locked here, so the actor check is the first statement.
           const actor = await assertActorCurrent(principal, tx, "orders.create");
           if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
-          const now = deps.clock.now();
-          const workflow = await workflows.ensureDefault(tx);
-          const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
-          const currency = lineItems[0]!.currency;
-          const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
-          const totalMinor = pricing.totalMinor;
-          const reference = await allocateReference(tx, prefix, now);
-          const publicId = ulid(now.getTime());
-          const initial = initialState(workflow.definition);
-          await tx.insert(orders).values({
-            publicId,
-            reference,
-            ownerUserId,
-            projectName: input.projectName,
-            workflowVersionId: workflow.versionId,
-            statusKey: initial.key,
-            subtotalMinor: pricing.subtotalMinor,
-            discountMinor: pricing.discountMinor,
-            discountLabel: pricing.discountLabel,
-            totalMinor,
-            currency,
-            origin: "portal",
-            createdByUserId: principal.userId,
-            createKey: input.idempotencyKey,
-            submittedAt: now,
-            createdAt: now,
-            updatedAt: now,
-          });
-          const [order] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, publicId));
-          const orderId = order!.id;
-          await tx.insert(orderLineItems).values(
-            lineItems.map((item, index) => ({
-              publicId: ulid(now.getTime()),
-              orderId,
-              productId: item.productId,
-              productVersionId: item.productVersionId,
-              productPublicId: item.productPublicId,
-              productVersionNumber: item.productVersionNumber,
-              name: item.name,
-              description: item.description,
-              features: item.features,
-              packetNumber: item.packetNumber,
-              tier: item.tier,
-              outcome: item.outcome,
-              timeline: item.timeline,
-              deliverables: item.deliverables,
-              unitPriceMinor: item.unitPriceMinor,
-              currency: item.currency,
-              quantity: item.quantity,
-              lineTotalMinor: item.lineTotalMinor,
-              sortOrder: index,
-              createdAt: now,
-            })),
-          );
-          await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal.userId, now });
-          const note = input.note ? await insertNote(tx, { orderId, principal, visibility: "customer", body: input.note }) : null;
-          await tx.insert(orderStatusHistory).values({
-            publicId: ulid(now.getTime()),
-            orderId,
-            fromStatus: null,
-            toStatus: initial.key,
-            actorUserId: principal.userId,
-            actorRole: principal.role,
-            reasonCode: "CREATED",
-            noteId: note?.id ?? null,
-            occurredAt: now,
-          });
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "order.created",
-              action: "create",
-              outcome: "completed",
-              actor: actorOf(principal),
-              resource: { type: "order", publicId },
-              attributes: { currency, total_minor: totalMinor, discount_minor: pricing.discountMinor, on_behalf: ownerUserId !== principal.userId, workflow_version: workflow.versionNumber },
-              safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
-            },
-            tx,
-          );
-          await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
-          return { publicId, reference, created: true };
+          const result = await createInTx(tx, principal, input, ownerUserId, prefix);
+          return { publicId: result.publicId, reference: result.reference, created: true };
         });
       } catch (error) {
         // A concurrent duplicate submit with the same idempotency key resolves to the first order.
@@ -372,6 +394,51 @@ export function createOrderService(deps: OrderServiceDeps) {
         }
         throw error;
       }
+    },
+
+    /**
+     * Increment 04 (cart checkout, Decision 13): customer order creation inside the CALLER's transaction. Same
+     * validation, pricing, bundle rule and audit as `create`; the caller must not open another connection.
+     */
+    async createOrderFromCheckoutInTx(
+      principal: SessionPrincipal,
+      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+      tx: Tx,
+    ) {
+      if (principal.state !== "full" || principal.pendingSteps.length > 0) throw ORDER_NOT_FOUND();
+      if (principal.role !== "customer" || !roleHasCapability(principal.role, "orders.create")) throw forbidden("CAPABILITY_NOT_GRANTED");
+      await assertActorCurrent(principal, tx, "orders.create");
+      await compliancePort(deps.services)?.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+      const [existing] = await tx
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, totalMinor: orders.totalMinor })
+        .from(orders)
+        .where(and(eq(orders.ownerUserId, principal.userId), eq(orders.createKey, input.idempotencyKey)))
+        .limit(1);
+      const afterCommit = async () => undefined;
+      if (existing) {
+        const lines = await tx.select().from(orderLineItems).where(eq(orderLineItems.orderId, existing.id)).orderBy(asc(orderLineItems.sortOrder));
+        return {
+          ...existing,
+          created: false,
+          lineItems: lines.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
+          afterCommit,
+        };
+      }
+      const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx);
+      const result = await createInTx(tx, principal, input, principal.userId, prefix);
+      return {
+        id: result.orderId,
+        publicId: result.publicId,
+        reference: result.reference,
+        created: true,
+        currency: result.currency,
+        subtotalMinor: result.pricing.subtotalMinor,
+        discountMinor: result.pricing.discountMinor,
+        discountLabel: result.pricing.discountLabel,
+        totalMinor: result.pricing.totalMinor,
+        lineItems: result.lineItems.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
+        afterCommit,
+      };
     },
 
     /* ------------------------------------------------------------------ list */
@@ -1097,7 +1164,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       if (!ULID_LIKE.test(orderPublicId)) return null;
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.publicId, orderPublicId))
         .limit(1);
@@ -1108,7 +1175,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.id, orderId))
         .limit(1);
