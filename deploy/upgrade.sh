@@ -180,15 +180,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 touch "$maintenance"
 systemctl disable --now "$timer"
-systemctl disable "$web" "$worker"
+# Stop first, read the exit record, disable afterwards. systemd forgets the exit record of a stopped unit as
+# soon as nothing refers to it any more, and "disable" removes the last reference (multi-user.target).
 systemctl stop "$web" "$worker"
 for unit in "$web" "$worker"; do
-    [[ $(systemctl show "$unit" -p ActiveState --value) == inactive &&
-       $(systemctl show "$unit" -p Result --value) == success &&
-       $(systemctl show "$unit" -p ExecMainCode --value) == 1 &&
-       $(systemctl show "$unit" -p ExecMainStatus --value) == 0 ]] ||
-        die "clean shutdown not proved for $unit; inspect its journal and fenced jobs"
+    stop_record=$(systemctl show "$unit" -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus | sort | tr '\n' ' ')
+    # ExecMainCode=1 is "exited by itself" (not killed by a signal); ExecMainStatus=0 is its exit status.
+    [[ $stop_record == 'ActiveState=inactive ExecMainCode=1 ExecMainStatus=0 Result=success ' ]] ||
+        die "clean shutdown not proved for $unit (${stop_record% }); inspect its journal and fenced jobs"
 done
+systemctl disable "$web" "$worker"
 running_jobs=$(mysql_schema -e "SELECT COUNT(*) FROM job_runs WHERE state = 'running'")
 unknown_jobs=$(mysql_schema -e "SELECT COUNT(*) FROM job_runs WHERE state = 'unknown' AND reconciled_at IS NULL")
 ((running_jobs == 0 && unknown_jobs == 0)) ||
