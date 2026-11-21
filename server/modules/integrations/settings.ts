@@ -93,10 +93,10 @@ export function isAllowedAnalyticsPathname(pathname: string): pathname is Allowe
 
 /* ----------------------------------------------------- SMTP header-safe field validators */
 
-const NO_HEADER_CONTROL_CHARS = /^[^\r\n\0]+$/;
+const HEADER_CONTROL_CHARS = /[\p{Cc}\u2028\u2029]/u;
 
 export function hasNoHeaderInjection(value: string): boolean {
-  return NO_HEADER_CONTROL_CHARS.test(value);
+  return value.length > 0 && !HEADER_CONTROL_CHARS.test(value);
 }
 
 export const safeEmailAddressSchema = z
@@ -124,6 +124,7 @@ export const smtpConfigSettingSchema = z.strictObject({
     .max(120)
     .refine((v) => v === "" || hasNoHeaderInjection(v), "Control characters are not permitted."),
   replyToAddress: z.string().trim().max(254),
+  passwordLast4: z.string().max(4).nullable().optional(),
 });
 export type SmtpConfigSetting = z.infer<typeof smtpConfigSettingSchema>;
 
@@ -135,6 +136,59 @@ export const DEFAULT_SMTP_CONFIG: SmtpConfigSetting = {
   fromAddress: "",
   fromName: "ReadyPackets Portal",
   replyToAddress: "",
+  passwordLast4: null,
+};
+
+/* ----------------------------------------------------- Microsoft Graph constants & validators */
+
+export const ENTRA_GUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+export const FORBIDDEN_MULTI_TENANT_ALIASES = new Set(["common", "organizations", "consumers"]);
+
+export function isValidSingleTenantGuid(value: string): boolean {
+  const trimmed = value.trim().toLowerCase();
+  if (FORBIDDEN_MULTI_TENANT_ALIASES.has(trimmed)) return false;
+  return ENTRA_GUID_REGEX.test(trimmed);
+}
+
+export function isValidEntraClientGuid(value: string): boolean {
+  return ENTRA_GUID_REGEX.test(value.trim());
+}
+
+export function extractSecretLast4(secret: string): string {
+  const trimmed = secret.trim();
+  return trimmed.length <= 4 ? trimmed : trimmed.slice(-4);
+}
+
+export const graphConfigSettingSchema = z.strictObject({
+  tenantId: z
+    .string()
+    .trim()
+    .max(64)
+    .refine(
+      (v) => v === "" || isValidSingleTenantGuid(v),
+      "Enter a single-tenant Entra directory GUID (multi-tenant aliases common/organizations/consumers are forbidden).",
+    ),
+  clientId: z
+    .string()
+    .trim()
+    .max(64)
+    .refine((v) => v === "" || isValidEntraClientGuid(v), "Enter a valid Entra application (client) GUID."),
+  senderMailbox: z
+    .string()
+    .trim()
+    .max(254)
+    .refine((v) => v === "" || safeEmailAddressSchema.safeParse(v).success, "Enter a valid mailbox email address."),
+  clientSecretLast4: z.string().max(4).nullable().optional(),
+  credentialVersion: z.number().int().min(1).optional(),
+});
+export type GraphConfigSetting = z.infer<typeof graphConfigSettingSchema>;
+
+export const DEFAULT_GRAPH_CONFIG: GraphConfigSetting = {
+  tenantId: "",
+  clientId: "",
+  senderMailbox: "",
+  clientSecretLast4: null,
+  credentialVersion: 1,
 };
 
 /* ----------------------------------------------------- Stripe & SAML setting schemas */
@@ -251,12 +305,15 @@ export const DEFAULT_PRODUCTION_CONFIG: ProductionConfigSetting = {
 
 /* ----------------------------------------------------- Platform setting registrations */
 
+const MAIL_MANAGED_BY = { href: "/admin/email-delivery", label: "E-mail delivery" } as const;
+
 export const INTEGRATIONS_SMTP_FLAG = defineFeatureFlag({
   flag: "integrations.smtp",
   owner: "integrations",
   group: "mail",
   label: "Outbound SMTP mail",
   description: "Enable TLS-verified SMTP delivery for queued outbound portal messages.",
+  managedBy: MAIL_MANAGED_BY,
 });
 
 export const INTEGRATIONS_CLARITY_FLAG = defineFeatureFlag({
@@ -292,6 +349,7 @@ export const INTEGRATIONS_SMTP_CONFIG = defineSetting({
   schema: smtpConfigSettingSchema,
   default: DEFAULT_SMTP_CONFIG,
   sensitivity: "internal",
+  managedBy: MAIL_MANAGED_BY,
 });
 
 export const INTEGRATIONS_SMTP_PASSWORD = defineSecret({
@@ -301,6 +359,39 @@ export const INTEGRATIONS_SMTP_PASSWORD = defineSecret({
   label: "SMTP password",
   description: "Encrypted SMTP authentication secret.",
   schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid secret characters."),
+  managedBy: MAIL_MANAGED_BY,
+});
+
+export const INTEGRATIONS_GRAPH_FLAG = defineFeatureFlag({
+  flag: "integrations.graph",
+  owner: "integrations",
+  group: "mail",
+  label: "Microsoft Graph mail & cloud integration",
+  description: "Enable single-tenant Microsoft Graph client-credentials integration and outbound Graph mail.",
+  managedBy: MAIL_MANAGED_BY,
+});
+
+export const INTEGRATIONS_GRAPH_CONFIG = defineSetting({
+  key: "integrations.graph.config",
+  owner: "integrations",
+  group: "mail",
+  label: "Microsoft Graph configuration",
+  description: "Single-tenant Entra directory ID, application client ID, and optional dedicated sender mailbox.",
+  schema: graphConfigSettingSchema,
+  default: DEFAULT_GRAPH_CONFIG,
+  sensitivity: "internal",
+  managedBy: MAIL_MANAGED_BY,
+});
+
+export const INTEGRATIONS_GRAPH_CLIENT_SECRET = defineSecret({
+  key: "integrations.graph.client_secret",
+  owner: "integrations",
+  group: "mail",
+  label: "Microsoft Graph client secret",
+  description: "Encrypted Entra application client secret (write-only).",
+  exportable: false,
+  schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid client secret characters."),
+  managedBy: MAIL_MANAGED_BY,
 });
 
 export const INTEGRATIONS_CLARITY_PROJECT_ID = defineSetting({

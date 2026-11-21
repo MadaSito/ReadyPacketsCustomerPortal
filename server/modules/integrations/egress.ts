@@ -134,6 +134,11 @@ export interface EgressFetchOptions {
    * Any `Location` header is stripped from the returned headers and redirects are never followed.
    */
   acceptUploadIncomplete?: boolean;
+  /**
+   * Optional pre-wire fence invoked AFTER DNS & allowlist resolution and immediately BEFORE `requester()`
+   * opens the outbound socket. Any thrown error propagates unchanged so job-lease fences abort cleanly.
+   */
+  beforeSend?: () => Promise<void>;
 }
 
 export interface EgressFetchResponse {
@@ -1170,9 +1175,14 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         expectedHostSuffixes: fetchOptions.expectedHostSuffixes,
       });
       const parsedUrl = new URL(pinned.normalizedUrl ?? String(url));
-      const maxTimeoutCap = streaming ? 600_000 : 30_000;
+      const maxTimeoutCap =
+        streaming || (EXTENDED_URL_PURPOSES.has(purpose) && method === "PUT") ? 600_000 : 30_000;
       const allowStatus308 =
         fetchOptions.acceptUploadIncomplete === true && purpose === "storage_gdrive" && method === "PUT";
+
+      if (fetchOptions.beforeSend) {
+        await fetchOptions.beforeSend();
+      }
 
       const resp = await requester(pinned, parsedUrl, {
         method,
