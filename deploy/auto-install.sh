@@ -38,22 +38,23 @@ if [[ $EUID == 0 ]]; then
     custody_top=$(realpath -- "$deploy_src/..")
     custody_dir=$custody_top
     while :; do
-        [[ $(stat -c '%u' -- "$custody_dir") == 0 && ! $(stat -c '%A' -- "$custody_dir") =~ ^d....w..w. ]] || {
-            if [[ $custody_dir == "$custody_top" || $(stat -c '%u' -- "$custody_dir") != 0 ||
-                  ! $(stat -c '%A' -- "$custody_dir") =~ [tT]$ ]]; then
-                printf 'ReadyPackets: %s must belong to root and must not be writable by anyone else.\nClone the repository as root into a root-owned directory, for example /opt/readypackets-src.\n' "$custody_dir" >&2
-                exit 1
-            fi
-        }
+        custody_mode=$(stat -c '%u:%A' -- "$custody_dir")
+        # Root-owned and not writable by group or others. Above the clone, a root-owned sticky directory
+        # (such as /tmp) is also acceptable.
+        if [[ ! $custody_mode =~ ^0:d....-..-.$ ]] &&
+           [[ $custody_dir == "$custody_top" || ! $custody_mode =~ ^0:d........[tT]$ ]]; then
+            printf 'ReadyPackets: %s (owner:mode %s) must belong to root and must not be writable by anyone else.\nClone the repository as root into a root-owned directory:\n  sudo sh -c "umask 022 && git clone <url> /opt/readypackets-src"\n' "$custody_dir" "$custody_mode" >&2
+            exit 1
+        fi
         [[ $custody_dir != / ]] || break
         custody_dir=$(dirname -- "$custody_dir")
     done
     custody_bad=$(find "$custody_top" -xdev \( ! -user root -o \( ! -type l -perm /022 \) \) -print -quit)
     if [[ -n $custody_bad ]]; then
-        printf 'ReadyPackets: the clone holds files that do not belong to root or that others can change (for example %s).\nClone the repository again as root: sudo git clone <url> /opt/readypackets-src\n' "$custody_bad" >&2
+        printf 'ReadyPackets: the clone holds files that do not belong to root or that others can change\n(for example %s, owner:mode %s).\nClone the repository again as root:\n  sudo sh -c "umask 022 && git clone <url> /opt/readypackets-src"\n' "$custody_bad" "$(stat -c '%u:%A' -- "$custody_bad")" >&2
         exit 1
     fi
-    unset custody_top custody_dir custody_bad
+    unset custody_top custody_dir custody_bad custody_mode
 fi
 # shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"

@@ -37,9 +37,11 @@ printf '127.0.0.1 %s %s\n' "$1" "$2" >> /etc/hosts
 chown root:root /opt
 chmod 0755 /opt
 rm -rf -- "$target"
+umask 022
 git -c safe.directory="$source_dir" clone --quiet --no-hardlinks "$source_dir" "$target"
 git -C "$target" -c advice.detachedHead=false checkout --quiet --detach "$(git -c safe.directory="$source_dir" -C "$source_dir" rev-parse HEAD)"
 chown -R root:root "$target"
+stat -c 'clone: %U:%G %A %n' /opt "$target" "$target/deploy/auto-install.sh"
 printf 'Prepared: %s, %s, commit %s\n' "$(. /etc/os-release; echo "$PRETTY_NAME")" "$(uname -m)" "$(git -C "$target" rev-parse HEAD)"
 free -m | sed -n '1,3p'
 df -h / | tail -1
