@@ -10,12 +10,13 @@ import { and, eq, isNull } from "drizzle-orm";
 import type { Services } from "../../../container.js";
 import { DomainError } from "../../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../../core/types.js";
-import type { AuditEventInput } from "../../../core/audit.js";
+import type { AuditEventInput } from "../../../core/types.js";
+import type { AppConfig } from "../../../config/env.js";
 import { createTestDeps, type TestHarness } from "../../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import { createEntraAssurance } from "../../assurance/entra.js";
 import { createIdentityModule, type IdentityModule } from "../index.js";
-import { identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
 import { authorizationUrl, entraEndpoints, OidcValidationError, peekKeyId, verifyIdToken } from "./oidc.js";
 import { createFakeEntra, type FakeEntra, type FakeEntraIdentity } from "./testing.js";
 import type { SsoConfigInput } from "./service.js";
@@ -44,11 +45,11 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
 
   const sso = () => identity.sso;
 
-  async function build() {
+  async function build(config: Partial<AppConfig> = {}) {
     await db.db.delete(ssoAuthRequests);
     await db.db.delete(ssoIdentities);
     await db.db.delete(ssoConfiguration);
-    h = createTestDeps({ db: db.db, config: { canonicalOrigin: "https://portal.example.test" } });
+    h = createTestDeps({ db: db.db, config: { canonicalOrigin: "https://portal.example.test", ...config } });
     const entra = createEntraAssurance(h.deps);
     h.services.assurance = {
       getAssuranceState: async (userId: number) => ({ mfaEnrolled: mfa.get(userId) ?? false, recoveryCodesAcknowledged: mfa.get(userId) ?? false, passkeyCount: 0, totpEnrolled: mfa.get(userId) ?? false }),
@@ -129,7 +130,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     db.db.select().from(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)));
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(async () => build());
@@ -151,8 +152,8 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     });
 
     it("cannot be enabled in the preview deployment", async () => {
+      await build({ deploymentProfile: "preview" });
       await configure({}, false);
-      h.deps.config.deploymentProfile = "preview";
       const view = await sso().adminView();
       expect(view.availableInThisDeployment).toBe(false);
       await rejects(sso().setEnabled(admin, true, view.version), "SSO_NOT_AVAILABLE_IN_PREVIEW");
@@ -239,11 +240,12 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     for (const [name, claims, header, reason] of invalidTokens) {
       it(`refuses an ID token: ${name}`, async () => {
         await configure();
+        const before = (await db.db.select().from(userSessions).where(eq(userSessions.authMethod, "entra"))).length;
         const run = await signIn({ oid: oid(), claims, header });
         expect(reasonOf(run.location)).toBe("SSO_FAILED");
         const refused = h.audit.named("identity.sso.callback_refused").at(-1);
         expect(refused?.reasonCode).toMatch(reason === "TOKEN_ALGORITHM_REFUSED" ? /^TOKEN_/ : new RegExp(`^${reason}$`));
-        expect(await db.db.select().from(userSessions).where(eq(userSessions.authMethod, "entra"))).toHaveLength(0);
+        expect(await db.db.select().from(userSessions).where(eq(userSessions.authMethod, "entra"))).toHaveLength(before);
       });
     }
 
@@ -291,14 +293,14 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     });
 
     it("never links by e-mail: a matching address without a link is refused", async () => {
-      await configure({ jitMode: "customer" });
+      await configure({ jitMode: "customers" });
       const existing = await makeUser();
       await rejects((await signIn({ oid: oid(), email: existing.email })).finish(), "SSO_ACCOUNT_EXISTS");
       expect(await db.db.select().from(ssoIdentities).where(eq(ssoIdentities.userId, existing.id))).toHaveLength(0);
     });
 
     it("enforces the allowed domains", async () => {
-      await configure({ allowedDomains: ["fabrikam.test"], jitMode: "customer" });
+      await configure({ allowedDomains: ["fabrikam.test"], jitMode: "customers" });
       await rejects((await signIn({ oid: oid(), email: "someone@contoso.test" })).finish(), "SSO_DOMAIN_NOT_ALLOWED");
       const ok = await (await signIn({ oid: oid(), email: "someone@fabrikam.test" })).finish();
       expect(ok.purpose).toBe("sign_in");
@@ -322,7 +324,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     });
 
     it("stops at the daily limit", async () => {
-      await configure({ jitMode: "customer", jitDailyLimit: 1 });
+      await configure({ jitMode: "customers", jitDailyLimit: 1 });
       await (await signIn({ oid: oid() })).finish();
       await rejects((await signIn({ oid: oid() })).finish(), "SSO_PROVISIONING_LIMIT");
     });
