@@ -223,24 +223,14 @@ export function createGraphModuleRuntime(
     async () => (await resolvePlatformGraphCredentials()) !== null,
   );
 
-  async function resolveEffectiveMailSenderOutsideTx(cfg: GraphConfigSetting): Promise<MailSenderIdentity | null> {
+  async function resolveAuthoritativeSenderOutsideTx(): Promise<MailSenderIdentity | null> {
     const sharedStore = await readSharedMailSenderFromStore(deps.settings);
-    const getShared = deps.services.jobAdmin?.getMailSenderIdentity;
-    let jobSender: MailSenderIdentity | null = null;
-    if (!sharedStore && typeof getShared === "function") {
-      const candidate = await getShared.call(deps.services.jobAdmin);
-      if (isValidSender(candidate)) jobSender = candidate;
-    }
-    if (cfg.senderMailbox && safeEmailAddressSchema.safeParse(cfg.senderMailbox).success) {
-      const base = sharedStore ?? jobSender;
-      return {
-        fromAddress: cfg.senderMailbox.trim(),
-        fromName: base?.fromName || "ReadyPackets Portal",
-        ...(base?.replyToAddress ? { replyToAddress: base.replyToAddress } : {}),
-      };
-    }
     if (sharedStore) return sharedStore;
-    if (jobSender) return jobSender;
+    const getShared = deps.services.jobAdmin?.getMailSenderIdentity;
+    if (typeof getShared === "function") {
+      const candidate = await getShared.call(deps.services.jobAdmin);
+      if (isValidSender(candidate)) return candidate;
+    }
     const smtpCfg = await readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG);
     if (safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success) {
       return {
@@ -250,6 +240,12 @@ export function createGraphModuleRuntime(
       };
     }
     return null;
+  }
+
+  function isMailboxConstraintSatisfied(senderMailbox: string, fromAddress: string): boolean {
+    const trimmed = senderMailbox.trim();
+    if (trimmed === "") return true;
+    return trimmed.toLowerCase() === fromAddress.trim().toLowerCase();
   }
 
   async function loadConfigView(includeJobAdminSender = false): Promise<GraphConfigView> {
@@ -263,18 +259,26 @@ export function createGraphModuleRuntime(
       checks.get("graph"),
     ]);
 
-    let hasSender =
-      safeEmailAddressSchema.safeParse(cfg.senderMailbox).success ||
-      Boolean(sharedInStore) ||
-      safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success;
+    let authoritativeSender: MailSenderIdentity | null =
+      sharedInStore ??
+      (safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success
+        ? {
+            fromAddress: smtpCfg.fromAddress.trim(),
+            fromName: smtpCfg.fromName.trim() || "ReadyPackets Portal",
+          }
+        : null);
 
-    if (!hasSender && includeJobAdminSender && typeof deps.services.jobAdmin?.getMailSenderIdentity === "function") {
+    if (!authoritativeSender && includeJobAdminSender && typeof deps.services.jobAdmin?.getMailSenderIdentity === "function") {
       const fromJobAdmin = await deps.services.jobAdmin.getMailSenderIdentity();
-      hasSender = isValidSender(fromJobAdmin);
+      if (isValidSender(fromJobAdmin)) authoritativeSender = fromJobAdmin;
     }
 
+    const mailboxMatches = authoritativeSender
+      ? isMailboxConstraintSatisfied(cfg.senderMailbox, authoritativeSender.fromAddress)
+      : false;
+
     const credentialsReady = isCompleteGraphCredentials(cfg, secretConfigured);
-    const configured = credentialsReady && hasSender && presetEnabled;
+    const configured = credentialsReady && Boolean(authoritativeSender) && mailboxMatches && presetEnabled;
     const derived = deriveGraphState(enabled, configured, presetEnabled, credentialsReady, check);
 
     return {
@@ -282,7 +286,10 @@ export function createGraphModuleRuntime(
       configured,
       verified: derived.verified,
       state: derived.state,
-      summary: derived.summary,
+      summary:
+        authoritativeSender && !mailboxMatches
+          ? "Configured Graph sender mailbox constraint does not match the shared mail From address."
+          : derived.summary,
       tenantId: cfg.tenantId,
       clientId: cfg.clientId,
       clientSecretConfigured: secretConfigured,
@@ -439,12 +446,25 @@ export function createGraphModuleRuntime(
           credentialVersion: nextVersion,
         };
 
-        const hasSender =
-          safeEmailAddressSchema.safeParse(nextSenderMailbox).success ||
-          Boolean(sharedSender) ||
-          safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success;
+        const authoritativeFrom =
+          sharedSender?.fromAddress ||
+          (safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success ? smtpCfg.fromAddress.trim() : "");
 
-        const complete = isCompleteGraphCredentials(nextCfg, nextHasSecret) && hasSender && presetEnabled;
+        const mailboxMatches =
+          authoritativeFrom !== "" && isMailboxConstraintSatisfied(nextSenderMailbox, authoritativeFrom);
+
+        if (nextSenderMailbox !== "" && authoritativeFrom !== "" && !mailboxMatches) {
+          throw validation(
+            "GRAPH_SENDER_MAILBOX_MISMATCH",
+            "The optional Graph sender mailbox constraint must match the shared sender From address.",
+          );
+        }
+
+        const complete =
+          isCompleteGraphCredentials(nextCfg, nextHasSecret) &&
+          authoritativeFrom !== "" &&
+          mailboxMatches &&
+          presetEnabled;
         if (input.enabled && !complete) {
           if (!presetEnabled) {
             throw validation(
@@ -454,7 +474,7 @@ export function createGraphModuleRuntime(
           }
           throw validation(
             "GRAPH_CONFIG_INCOMPLETE",
-            "Complete the single-tenant directory GUID, client GUID, client secret, and sender mailbox before enabling Microsoft Graph.",
+            "Configure the shared mail sender identity and complete single-tenant Entra credentials before enabling Microsoft Graph.",
           );
         }
 
@@ -605,7 +625,7 @@ export function createGraphModuleRuntime(
         const sharedSender = await readSharedMailSenderFromStore(deps.settings, tx);
         const smtpCfg = await readSetting(deps.settings, INTEGRATIONS_SMTP_CONFIG, tx);
 
-        const fallbackSender: MailSenderIdentity | null =
+        const authoritativeSender: MailSenderIdentity | null =
           sharedSender ??
           (safeEmailAddressSchema.safeParse(smtpCfg.fromAddress).success
             ? {
@@ -615,16 +635,17 @@ export function createGraphModuleRuntime(
               }
             : null);
 
-        const resolvedMailbox =
-          cfg.senderMailbox && safeEmailAddressSchema.safeParse(cfg.senderMailbox).success
-            ? cfg.senderMailbox.trim()
-            : (fallbackSender?.fromAddress ?? "");
-
-        if (!secret || !isCompleteGraphCredentials(cfg, true) || !resolvedMailbox) {
+        if (!secret || !isCompleteGraphCredentials(cfg, true) || !authoritativeSender) {
           throw new DomainError(
             "NOT_CONFIGURED",
             "GRAPH_NOT_CONFIGURED",
-            "Save complete Microsoft Graph credentials and a sender mailbox before sending a test message.",
+            "Configure the shared mail sender identity and save complete Microsoft Graph credentials before sending a test message.",
+          );
+        }
+        if (!isMailboxConstraintSatisfied(cfg.senderMailbox, authoritativeSender.fromAddress)) {
+          throw validation(
+            "GRAPH_SENDER_MAILBOX_MISMATCH",
+            "The configured Graph sender mailbox constraint does not match the shared sender From address.",
           );
         }
         if (!presetEnabled) {
@@ -635,11 +656,8 @@ export function createGraphModuleRuntime(
           );
         }
 
-        const effectiveSender: MailSenderIdentity = {
-          fromAddress: resolvedMailbox,
-          fromName: fallbackSender?.fromName || "ReadyPackets Portal",
-          ...(fallbackSender?.replyToAddress ? { replyToAddress: fallbackSender.replyToAddress } : {}),
-        };
+        const resolvedMailbox = authoritativeSender.fromAddress.trim();
+        const effectiveSender: MailSenderIdentity = authoritativeSender;
 
         await deps.audit.record(
           {
@@ -681,15 +699,22 @@ export function createGraphModuleRuntime(
           "This is a synthetic administrative test message verifying ReadyPackets outbound mail via Microsoft Graph.",
           "<p>This is a synthetic administrative test message verifying ReadyPackets outbound mail via Microsoft Graph.</p>",
         );
-        await testClient.request({
+        const res = await testClient.request({
           method: "POST",
           path: `/users/${encodeURIComponent(mailbox)}/sendMail`,
           body,
         });
-        outcome = "accepted";
-        reasonCode = "GRAPH_MAIL_ACCEPTED";
-        safeMessage =
-          "Microsoft Graph accepted the test message to your administrator address over verified TLS (transport acceptance, not inbox delivery proof).";
+        if (res.status === 202) {
+          outcome = "accepted";
+          reasonCode = "GRAPH_MAIL_ACCEPTED";
+          safeMessage =
+            "Microsoft Graph accepted the test message (HTTP 202) to your administrator address over verified TLS (transport acceptance, not inbox delivery proof).";
+        } else {
+          outcome = "unknown";
+          reasonCode = "GRAPH_UNEXPECTED_STATUS";
+          safeMessage =
+            "Microsoft Graph returned an unexpected non-202 response status; delivery outcome is unknown.";
+        }
       } catch (error) {
         const classified = classifyGraphSendError(error);
         outcome = classified.outcome;
@@ -748,8 +773,9 @@ export function createGraphModuleRuntime(
       if (!enabled || !presetEnabled || !isCompleteGraphCredentials(cfg, secretConfigured)) {
         return false;
       }
-      const effectiveSender = await resolveEffectiveMailSenderOutsideTx(cfg);
-      return effectiveSender !== null;
+      const authoritativeSender = await resolveAuthoritativeSenderOutsideTx();
+      if (!authoritativeSender) return false;
+      return isMailboxConstraintSatisfied(cfg.senderMailbox, authoritativeSender.fromAddress);
     },
 
     async send(message: MailTransportMessage): Promise<MailTransportResult> {
@@ -776,13 +802,10 @@ export function createGraphModuleRuntime(
         return { outcome: "not_configured", safeDetail: "graph_not_configured" };
       }
 
-      const mailbox =
-        cfg.senderMailbox && safeEmailAddressSchema.safeParse(cfg.senderMailbox).success
-          ? cfg.senderMailbox.trim()
-          : message.sender.fromAddress.trim();
-
-      if (!safeEmailAddressSchema.safeParse(mailbox).success) {
-        return { outcome: "rejected", retryable: false, safeDetail: "graph_invalid_sender_mailbox" };
+      const mailbox = message.sender.fromAddress.trim();
+      if (!isMailboxConstraintSatisfied(cfg.senderMailbox, mailbox)) {
+        await checks.recordOutcome("graph", "failed", "GRAPH_SENDER_MAILBOX_MISMATCH").catch(() => {});
+        return { outcome: "rejected", retryable: false, safeDetail: "graph_sender_mailbox_mismatch" };
       }
 
       const scopedClient = createGraphClientFromResolver(egress, tokenCache, async () => ({
@@ -801,12 +824,16 @@ export function createGraphModuleRuntime(
           message.text,
           message.html,
         );
-        await scopedClient.request({
+        const res = await scopedClient.request({
           method: "POST",
           path: `/users/${encodeURIComponent(mailbox)}/sendMail`,
           body,
           signal: message.signal,
         });
+        if (res.status !== 202) {
+          await checks.recordOutcome("graph", "unknown", "GRAPH_UNEXPECTED_STATUS").catch(() => {});
+          return { outcome: "unknown", safeDetail: "graph_unexpected_status" };
+        }
         await checks.recordOutcome("graph", "succeeded", "GRAPH_MAIL_ACCEPTED").catch(() => {});
         return { outcome: "accepted", safeDetail: "graph_accepted" };
       } catch (error) {

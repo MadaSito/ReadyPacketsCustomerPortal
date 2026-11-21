@@ -72,7 +72,7 @@ function buildGraphV1Url(
 
   const decodedSegments = rawPath.split("/").slice(1);
   for (const segment of decodedSegments) {
-    let decoded = segment;
+    let decoded: string;
     try {
       decoded = decodeURIComponent(segment);
     } catch {

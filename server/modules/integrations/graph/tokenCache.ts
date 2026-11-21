@@ -181,7 +181,7 @@ export function createGraphTokenCache(egress: EgressPolicy, clock: Clock): Graph
       });
     }
 
-    let parsed: { access_token?: unknown; token_type?: unknown; expires_in?: unknown } | null = null;
+    let parsed: { access_token?: unknown; token_type?: unknown; expires_in?: unknown };
     try {
       parsed = JSON.parse(response.body.toString("utf8")) as {
         access_token?: unknown;
