@@ -2,6 +2,7 @@ import { getTRPCErrorFromUnknown } from "@trpc/server";
 import { TRPC_ERROR_CODES_BY_KEY } from "@trpc/server/rpc";
 import type { Request, Response } from "express";
 import { DomainError, type DomainErrorCode } from "../core/errors.js";
+import { getRequestContext } from "../core/requestContext.js";
 import type { SafeErrorData } from "../trpc/trpc.js";
 
 const STATUS: Record<DomainErrorCode, number> = {
@@ -62,6 +63,14 @@ export function sendSafeError(
   res.setHeader("Cache-Control", "no-store");
   const retry = retryAfter(error);
   if (retry !== undefined) res.setHeader("Retry-After", String(retry));
+  if (/^\/api\/v1(?:\/|$)/i.test(req.originalUrl.split("?", 1)[0] ?? "")) {
+    res.setHeader("X-Correlation-Id", getRequestContext()?.correlationId ?? requestId);
+    res.status(status).type("application/problem+json").json({
+      type: `urn:readypackets:problem:${safe.reasonCode.toLowerCase()}`,
+      title: safe.safeMessage, status, code: safe.reasonCode, request_id: requestId,
+    });
+    return;
+  }
   if (!/^\/api\/trpc(?:\/|$)/.test(req.originalUrl.split("?")[0] ?? "")) {
     res.status(status).json({ safe });
     return;

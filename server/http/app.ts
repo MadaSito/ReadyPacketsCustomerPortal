@@ -24,7 +24,7 @@ import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
-import type { ProtectionModule } from "../modules/protection/index.js";
+import { createPublicApiHttpRouter } from "../modules/publicApi/http.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
   issueAnonymousCsrfToken, matchesSessionCsrfToken, secureEqual,
@@ -227,14 +227,14 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   });
 
   app.use(async (req, _res, next) => {
-    const protection = (services as Services & { protection?: ProtectionModule }).protection;
+    const { protection } = services;
     if (protection && (await protection.inspect(req)).action === "block") {
       throw new DomainError("FORBIDDEN", "PROTECTION_BLOCKED", "This request was refused by the portal's protection policy.");
     }
     next();
   });
 
-  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? {}, async (_req, _res, next) => {
+  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? { publicApi: createPublicApiHttpRouter }, async (_req, _res, next) => {
     await applyRateLimit(services, "api", `ip:${currentAddress()}`);
     next();
   }));

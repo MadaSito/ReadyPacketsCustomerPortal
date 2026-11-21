@@ -410,7 +410,9 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("text").send(raw).expect(400);
     await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("json").send({ huge: "a".repeat(270_000) }).expect(413);
     await h.http.get("/api/webhooks/inbound/hook").set("Host", HOST).expect(404);
-    await h.http.post("/api/v1/missing").set("Host", HOST).type("json").send(raw).expect(404);
+    const missing = await h.http.post("/api/v1/missing").set("Host", HOST).type("json").send(raw)
+      .expect("Content-Type", /application\/problem\+json/u).expect(404);
+    expect(missing.body).toMatchObject({ status: 404, request_id: missing.headers["x-request-id"] });
     await h.http.post("/API/V1/orders").set("Host", HOST).type("json").send(raw).expect(404);
     await h.http.get("/api/payments/return/example").set("Host", HOST).expect(204);
     const alias = await h.http.get("/Api/Payments/Return/example?state=synthetic-query").set("Host", "portal.readypackets.test").expect(404);
@@ -420,6 +422,20 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(h.sessionResolver).not.toHaveBeenCalled();
     const preview = harness({ isolatedRouters: { publicApi } }, { deploymentProfile: "preview" });
     await preview.http.post("/api/v1/orders").set("Host", HOST).type("json").send(raw).expect(404);
+  });
+
+  it("mounts the default Public API adapter without resolving browser cookies", async () => {
+    const h = harness();
+    const handle = vi.fn(async () => ({
+      status: 200, headers: { "content-type": "application/json" }, body: '{"openapi":"3.1.0"}',
+    }));
+    h.services.publicApi = { handle } as unknown as typeof h.services.publicApi;
+    await h.http.get("/api/v1/openapi.json").set("Host", HOST)
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).expect(200, { openapi: "3.1.0" });
+    expect(handle).toHaveBeenCalledWith(expect.objectContaining({
+      method: "GET", target: "/openapi.json", body: Buffer.alloc(0),
+    }));
+    expect(h.sessionResolver).not.toHaveBeenCalled();
   });
 
   it("passes only narrow webhook bytes ahead of JSON parsing and enforces request body limits", async () => {
