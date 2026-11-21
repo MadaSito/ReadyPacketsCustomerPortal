@@ -96,6 +96,7 @@ describe("consent store", () => {
     const off = consent.subscribe((s) => seen.push(s.choices.session_replay));
     expect(consent.has("session_replay")).toBe(true);
     const withdrawn = JSON.stringify({ v: 1, receipt: RECEIPT, policyVersion: 1, choices: NONE, decidedAt: new Date().toISOString(), bySignal: false });
+    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
     window.localStorage.setItem(CONSENT_STORAGE_KEY, withdrawn);
     window.dispatchEvent(new StorageEvent("storage", { key: CONSENT_STORAGE_KEY, newValue: withdrawn }));
     expect(consent.has("session_replay")).toBe(false);
@@ -142,6 +143,7 @@ describe("consent store", () => {
   });
 
   it("ignores tampered storage", () => {
+    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
     window.localStorage.setItem(CONSENT_STORAGE_KEY, JSON.stringify({ v: 2, choices: ALL }));
     configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
     expect(consent.has("analytics")).toBe(false);

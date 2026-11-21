@@ -70,6 +70,7 @@ const openListeners = new Set<() => void>();
 function storageAvailable(): Storage | null {
   if (RUNTIME.preview || typeof window === "undefined") return null;
   try {
+    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
     return window.localStorage;
   } catch {
     return null;
@@ -192,6 +193,7 @@ export function removeVendorData(category: "analytics" | "session_replay"): void
 
 function safeSession(): Storage | null {
   try {
+    // eslint-disable-next-line no-restricted-properties -- consent choice (strictly necessary, no session material) / vendor clean-up; agreed exception, see API.md §9
     return typeof window === "undefined" ? null : window.sessionStorage;
   } catch {
     return null;
