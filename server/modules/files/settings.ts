@@ -40,7 +40,7 @@ export const audioRulesSchema = z.strictObject({
   keepOriginal: z.literal(true),
 });
 export type AudioRules = z.infer<typeof audioRulesSchema>;
-export const audioRulesSetting = defineSetting({
+export const audioRulesSetting = defineSetting<AudioRules>({
   key: "files.audio_conversion",
   owner: "files",
   group: "files",
@@ -49,6 +49,7 @@ export const audioRulesSetting = defineSetting({
   schema: audioRulesSchema,
   default: { enabled: false, maxMinutes: 5, bitrateKbps: 48, keepOriginal: true },
   sensitivity: "internal",
+  managedBy: { href: "/admin/files", label: "File administration" },
 });
 
 export const slotKeySchema = z.string().min(1).max(64).regex(/^[a-z][a-z0-9_-]*$/u);

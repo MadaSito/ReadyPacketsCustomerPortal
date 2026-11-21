@@ -2,6 +2,9 @@ import express from "express";
 import request from "supertest";
 import { Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
@@ -12,8 +15,9 @@ import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { setHttpState } from "../../http/requestState.js";
 import { registerFilesHttpRoutes } from "./http.js";
 import { createFilesModule, type FilesModule, type UploadOptions } from "./index.js";
+import { createObjectStorage } from "./storage.js";
 import { fileAccessLog, fileDownloadTickets, orderFiles } from "./schema.js";
-import { exampleWav, exampleWebm } from "./fixtures.test-support.js";
+import { examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
 
 const orderPublicId = `01JTEST${"0".repeat(19)}`;
 const userPublicId = `01JTEST${"0".repeat(18)}1`;
@@ -34,6 +38,8 @@ let orderOrigin: "portal" | "import";
 let revokedSession: string | null;
 let persistedAdminStepUp: Date | null | undefined;
 let holdAtPurgeLock: boolean;
+let slotEnabled: boolean;
+let phaseLocked: boolean;
 
 beforeAll(async () => {
   t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, fileAccessLog } });
@@ -56,6 +62,8 @@ beforeEach(async () => {
   revokedSession = null;
   persistedAdminStepUp = undefined;
   holdAtPurgeLock = false;
+  slotEnabled = false;
+  phaseLocked = false;
   const read = async (principal: SessionPrincipal, id: number | string) => {
     if (id !== orderPublicId && id !== orderId) throw notFound("ORDER_NOT_FOUND");
     const accessRole = principal.role !== "customer" ? principal.role
@@ -83,7 +91,15 @@ beforeEach(async () => {
     async getOrderRefById(id: number, tx?: Tx, options?: { forUpdate?: boolean }) {
       if (id !== orderId) return null;
       if (tx && options?.forUpdate && holdAtPurgeLock) locked = "legal_hold";
-      return { id, publicId: orderPublicId, lockState: locked };
+      return { id, publicId: orderPublicId, ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage };
+    },
+    async getFileUploadSlots(principal: SessionPrincipal, id: string) {
+      await write(principal, id);
+      return { statusKey: orderStage, slots: !slotEnabled || phaseLocked || principal.role !== "customer" ? [] :
+        [{ key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav", "webm"] }] };
+    },
+    async assertFileStatusWritable() {
+      if (phaseLocked) throw new DomainError("FORBIDDEN", "PHASE_LOCKED", "This phase is locked.");
     },
   } as unknown as TestHarness["services"]["orders"];
   h.services.identity = {
@@ -124,6 +140,61 @@ function appFor(principal: SessionPrincipal) {
 }
 
 describe("private file admission and authorization", () => {
+  it("enforces scope, actor, classified slot kind, capacity and phase policy before and after staging", async () => {
+    slotEnabled = true;
+    const slot = { ...upload, statusKey: "intake", slotKey: "voice_evidence" } as const;
+    await expect(files.beginUpload(stranger, orderPublicId, slot)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(files.beginUpload(staff, orderPublicId, slot)).rejects.toMatchObject({ reasonCode: "UPLOAD_SLOT_UNAVAILABLE" });
+    await expect(files.beginUpload(owner, orderPublicId, { ...slot, statusKey: "different" }))
+      .rejects.toMatchObject({ reasonCode: "UPLOAD_SLOT_STATUS_CHANGED" });
+    const plan = await files.beginUpload(owner, orderPublicId, slot);
+    await expect(files.stageUpload("not-audio.pdf", Readable.from([examplePdf()]), plan.rules)).rejects.toMatchObject({ reasonCode: "FILE_TYPE_DISABLED" });
+    const staged = await files.stageUpload("slot.wav", Readable.from([exampleWav()]), plan.rules);
+    phaseLocked = true;
+    await expect(files.commitUpload(owner, plan, staged)).rejects.toMatchObject({ reasonCode: "PHASE_LOCKED" });
+    phaseLocked = false;
+    const original = await files.commitUpload(owner, plan, staged);
+    expect(original).toMatchObject({ slotKey: "voice_evidence", statusKey: "intake", conversionState: null });
+    expect(h.jobs.enqueued).toHaveLength(0);
+    await expect(files.countFilesInSlot(orderId, "voice_evidence", undefined, { statusKey: "intake" })).resolves.toBe(1);
+    await expect(files.countFilesInSlot(orderId, "voice_evidence", undefined, { statusKey: "new_status" })).resolves.toBe(0);
+    await expect(add(owner, slot)).rejects.toMatchObject({ reasonCode: "UPLOAD_SLOT_FULL" });
+    await expect(add(owner, { ...slot, versionOf: original.publicId })).resolves.toMatchObject({ version: 2, slotKey: slot.slotKey });
+    await expect(files.countFilesInSlot(orderId, "voice_evidence")).resolves.toBe(1);
+  });
+
+  it("keeps the original, adds one verified derivative, and applies custody changes to both", async () => {
+    const root = await mkdtemp(join(tmpdir(), "rp-files-audio-"));
+    try {
+      h.deps.storage = createObjectStorage({ config: { storageDir: root }, logger: h.deps.logger });
+      files = createFilesModule(h.deps);
+      h.services.files = files;
+      const rules = { enabled: true, maxMinutes: 1, bitrateKbps: 48, keepOriginal: true } as const;
+      await expect(files.setAudioRules(staff, rules)).rejects.toMatchObject({ code: "FORBIDDEN" });
+      const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
+      await expect(files.setAudioRules(admin, rules)).resolves.toEqual(rules);
+      expect(h.audit.named("file.audio.rules.changed")).toHaveLength(1);
+      slotEnabled = true;
+      const result = await request(appFor(owner)).post(`/api/files/upload/${orderPublicId}?statusKey=intake&slotKey=voice_evidence`)
+        .field("transcript", "Synthetic audio transcript").attach("files", exampleWav(8000), "source.wav").expect(200);
+      const id = result.body.results[0].file.publicId as string;
+      expect(result.body.results[0]).toMatchObject({ outcome: "completed", file: { conversionState: "converting" } });
+      await expect(files.readTranscript(stranger, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
+      await expect(files.readTranscript(owner, id)).resolves.toEqual({ transcript: "Synthetic audio transcript" });
+      expect((await t.db.select().from(orderFiles))[0]?.transcriptEnc).not.toContain("Synthetic audio transcript");
+      await expect(h.jobs.runAll("files.audio_conversion")).resolves.toEqual([{ outcome: "completed", safeCounts: { converted: 1 } }]);
+      const found = await files.list(owner, orderPublicId, {});
+      const derived = found.items.find((item) => item.derivedFromPublicId === id)!;
+      expect(derived).toMatchObject({ contentType: "audio/webm", extension: "webm", slotKey: "voice_evidence" });
+      expect(found.items.find((item) => item.publicId === id)).toMatchObject({ extension: "wav", conversionState: "converted" });
+      await expect(files.countFilesInSlot(orderId, "voice_evidence")).resolves.toBe(1);
+      await expect(files.remove(staff, derived.publicId)).rejects.toMatchObject({ reasonCode: "AUDIO_DERIVATIVE_READ_ONLY" });
+      await files.setVisibility(staff, id, "staff_only");
+      await expect(files.assertCanReadFile(owner, derived.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
+      await expect(files.readTranscript(owner, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
+      expect(h.audit.named("file.audio.conversion").map((event) => event.outcome)).toEqual(["attempted", "completed"]);
+    } finally { await rm(root, { force: true, recursive: true }); }
+  });
   it("admits only current customer-visible file versions to automation copy batches", async () => {
     const first = await add();
     const latest = await add(owner, { ...upload, versionOf: first.publicId });

@@ -6,7 +6,7 @@ import { z } from "zod";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { fileVisibilities } from "./schema.js";
-import { fileRulesSchema } from "./settings.js";
+import { audioRulesSchema, fileRulesSchema } from "./settings.js";
 
 const id = z.string().length(26).regex(ULID_PATTERN);
 const file = z.strictObject({ fileId: id });
@@ -21,6 +21,8 @@ export const filesRouter = router({
   })).query(({ ctx, input }) => ctx.services.files.list(ctx.session, input.orderId, input)),
   issueDownloadTicket: protectedProcedure.meta({ rateLimit: "expensive" }).input(file)
     .mutation(({ ctx, input }) => ctx.services.files.issueDownloadTicket(ctx.session, input.fileId)),
+  readTranscript: protectedProcedure.meta({ rateLimit: "expensive" }).input(file)
+    .mutation(({ ctx, input }) => ctx.services.files.readTranscript(ctx.session, input.fileId)),
   setVisibility: staffProcedure.use(requireCapability("files.visibility.change"))
     .input(z.strictObject({ fileId: id, visibility: z.enum(fileVisibilities) }))
     .mutation(({ ctx, input }) => ctx.services.files.setVisibility(ctx.session, input.fileId, input.visibility)),
@@ -32,5 +34,7 @@ export const filesRouter = router({
     get: adminProcedure.query(({ ctx }) => ctx.services.files.adminOverview(ctx.session)),
     setTypeRules: adminProcedure.use(requireCapability("platform.settings.manage")).input(fileRulesSchema)
       .mutation(({ ctx, input }) => ctx.services.files.setTypeRules(ctx.session, input)),
+    setAudioRules: adminProcedure.use(requireCapability("platform.settings.manage")).input(audioRulesSchema)
+      .mutation(({ ctx, input }) => ctx.services.files.setAudioRules(ctx.session, input)),
   }),
 });
