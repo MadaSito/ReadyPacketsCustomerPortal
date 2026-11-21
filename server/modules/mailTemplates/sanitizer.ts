@@ -5,20 +5,17 @@
  * Security invariants (ADR 0025, Contract §2.D, §4, §4.1):
  *  1. Zero third-party HTML parser dependencies and zero pass-through markup: input HTML is
  *     tokenized into a bounded AST of compile-time literal tag names (via `Map`, immune to
- *     `Object.prototype` keys like `constructor`) and text nodes, enforcing HTML5 content-model
- *     nesting (no nested `<a>`, no block-in-`<p>`, strict `table > thead|tbody > tr > th|td` so
- *     standards parsers never foster-parent), then re-serialized from scratch.
+ *     `Object.prototype` keys like `constructor`) and text fragment lists finalized in one O(n)
+ *     pass (`join` -> entity decode -> `NFC` -> placeholder check), enforcing HTML5 content-model
+ *     nesting (no nested `<a>`, no block-in-`<p>`, strict `table > thead|tbody > tr > th|td`),
+ *     then re-serialized from scratch.
  *  2. Opaque dangerous subtrees (`script`, `style`, `svg`, `math`, `iframe`, `form`, `meta`,
- *     `base`, `link`, `object`, `embed`, etc.) are rejected in strict mode and fail closed to
- *     empty projection (`""`, falling back to plain text) in lenient preview mode.
- *  3. Delivery HTML allow-list accepts the RichTextEditor subset (`p, h2, h3, strong, em, ul,
- *     ol, li, br, hr, a[href], a[href][data-rp-button="primary"], img[src][alt]`) plus semantic
- *     headings/tables/code (`h1, h4, blockquote, pre, code, table, thead, tbody, tr, th, td, span`).
- *     Links require `https:`, single-recipient `mailto:` (percent-decoded verified), or an exact
- *     `{{varName}}` placeholder; images require `https:` `src` and non-empty `alt`.
- *  4. Placeholders are strictly typed (`{{[a-zA-Z][a-zA-Z0-9_]{0,63}}}`) and allowed ONLY in
- *     text nodes and as the entire `a[href]` attribute value.
- *  5. Inert preview projection (`projectInertMailPreviewHtml`) never throws, drops malformed EOF
+ *     `base`, `link`, `title`, `object`, `embed`, etc.) are rejected in strict mode and fail
+ *     closed to empty projection (`""`, falling back to plain text) in lenient preview mode.
+ *  3. Placeholders are strictly typed (`{{[a-zA-Z][a-zA-Z0-9_]{0,63}}}`), validated BOTH on raw
+ *     comments/attributes AND on finalized merged AST text nodes (catching split `{<!-- -->{x}}`),
+ *     and allowed ONLY in text nodes and as the entire `a[href]` attribute value.
+ *  4. Inert preview projection (`projectInertMailPreviewHtml`) never throws, drops malformed EOF
  *     remainders, fails closed to `""` on dangerous/over-limit HTML, and emits semantic text
  *     structure ONLY — zero `<a>`, zero `<img>`, zero `href`/`src`/`srcset`/`style`/`class`/`id`.
  */
@@ -152,7 +149,6 @@ const BLOCK_TAGS = new Set<AllowedTag>([
 const HEADING_TAGS = new Set<AllowedTag>(["h1", "h2", "h3", "h4"]);
 const TABLE_PART_TAGS = new Set<AllowedTag>(["thead", "tbody", "tr", "th", "td"]);
 
-/** Dangerous / foreign / executable / form / metadata elements — never allowed in delivery or preview. */
 const OPAQUE_DANGEROUS_TAGS = new Set<string>([
   "script",
   "style",
@@ -173,6 +169,7 @@ const OPAQUE_DANGEROUS_TAGS = new Set<string>([
   "optgroup",
   "base",
   "link",
+  "title",
   "template",
   "noscript",
   "audio",
@@ -199,6 +196,23 @@ const NAMED_ENTITIES = new Map<string, string>([
   ["copy", "\u00a9"],
   ["reg", "\u00ae"],
 ]);
+
+type MutableAstNode =
+  | { kind: "text"; fragments: string[]; text: string }
+  | {
+      kind: "element";
+      tag: AllowedTag;
+      attrs: {
+        href?: { kind: "url"; url: string } | { kind: "var"; varName: string };
+        buttonPrimary?: boolean;
+        src?: string;
+        alt?: string;
+        scope?: "col" | "row";
+        colspan?: number;
+        rowspan?: number;
+      };
+      children: MutableAstNode[];
+    };
 
 type AstNode =
   | { kind: "text"; text: string }
@@ -264,10 +278,6 @@ function hasAnyCurlyBraces(value: string): boolean {
   return value.includes("{{") || value.includes("}}");
 }
 
-/**
- * Validates all `{{...}}` placeholders in a plain-text or text-node segment and returns the
- * insertion-ordered unique variable names referenced using `Set` (O(1) per placeholder).
- */
 export function extractTextPlaceholders(input: string): string[] {
   const found = new Set<string>();
   let cursor = 0;
@@ -326,11 +336,6 @@ export function substitutePlainText(
     .normalize("NFC");
 }
 
-/**
- * Validates and canonicalizes an allowed link URL (`https:` or single-address `mailto:`) or image
- * URL (`https:` only). Enforces `MAX_URL_LENGTH` on both raw and canonicalized URL output, and
- * rejects percent-encoded control/header/delimiter characters in `mailto:` targets.
- */
 export function parseAllowedTemplateUrl(
   rawUrl: string,
   options: { allowMailto: boolean; canonicalOrigin?: string },
@@ -443,7 +448,7 @@ function parseAttributes(
 
 interface StackEntry {
   rawTag: string;
-  node: Extract<AstNode, { kind: "element" }> | null;
+  node: Extract<MutableAstNode, { kind: "element" }> | null;
 }
 
 interface ParsedHtmlResult {
@@ -460,8 +465,8 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     throw validation("HTML_TEMPLATE_TOO_LARGE", "HTML template exceeds maximum size of 128 KB.");
   }
 
-  const normalizedInput = rawHtml.normalize("NFC").replace(/\r\n?/g, "\n");
-  const rootChildren: AstNode[] = [];
+  const normalizedInput = rawHtml.replace(/\r\n?/g, "\n");
+  const rootChildren: MutableAstNode[] = [];
   const stack: StackEntry[] = [];
   const referencedVars = new Set<string>();
   const hrefVars = new Set<string>();
@@ -485,7 +490,14 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     if (isHref) hrefVars.add(name);
   };
 
-  const currentElementEntry = (): Extract<AstNode, { kind: "element" }> | null => {
+  const isInsideHead = (): boolean => {
+    for (let idx = stack.length - 1; idx >= 0; idx--) {
+      if (stack[idx]!.rawTag === "head") return true;
+    }
+    return false;
+  };
+
+  const currentElementEntry = (): Extract<MutableAstNode, { kind: "element" }> | null => {
     for (let idx = stack.length - 1; idx >= 0; idx--) {
       const entry = stack[idx]!;
       if (entry.node) return entry.node;
@@ -493,7 +505,7 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     return null;
   };
 
-  const currentTarget = (): AstNode[] => {
+  const currentTarget = (): MutableAstNode[] => {
     const parent = currentElementEntry();
     return parent ? parent.children : rootChildren;
   };
@@ -519,59 +531,46 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         stack.length = idx;
         return;
       }
-      // Do not auto-close across table boundaries
       const openTag = stack[idx]!.node?.tag;
-      if (openTag === "table" || openTag === "thead" || openTag === "tbody" || openTag === "tr" || openTag === "td" || openTag === "th") {
+      if (
+        openTag === "table" ||
+        openTag === "thead" ||
+        openTag === "tbody" ||
+        openTag === "tr" ||
+        openTag === "td" ||
+        openTag === "th" ||
+        openTag === "li" ||
+        openTag === "blockquote"
+      ) {
         return;
       }
     }
   };
 
-  const appendText = (rawSegment: string) => {
+  /**
+   * Appends a raw text segment in O(1) amortized time (`fragments.push`) without repeated
+   * string concatenation or repeated `.normalize("NFC")`. Entity decoding, NFC normalization,
+   * foster-parenting checks, and placeholder extraction run once per finished text node in
+   * `finalizeAstNodes`.
+   */
+  const appendRawTextFragment = (rawSegment: string) => {
     if (!rawSegment) return;
-    const decoded = decodeHtmlEntities(rawSegment);
-    if (!decoded) return;
-
-    const parentElem = currentElementEntry();
-    // Prevent HTML5 table foster parenting: non-whitespace text directly inside table/thead/tbody/tr/ul/ol
-    const inContainerForbiddingBareText =
-      parentElem !== null &&
-      (parentElem.tag === "table" ||
-        parentElem.tag === "thead" ||
-        parentElem.tag === "tbody" ||
-        parentElem.tag === "tr" ||
-        parentElem.tag === "ul" ||
-        parentElem.tag === "ol");
-
-    if (inContainerForbiddingBareText) {
-      if (!decoded.trim()) {
-        // Pure formatting whitespace between table rows/cells or list items is dropped cleanly
-        return;
+    if (isInsideHead()) {
+      if (rawSegment.trim().length > 0) {
+        throw validation("DISALLOWED_HTML_ELEMENT", "Text content is not permitted inside <head>.");
       }
-      if (options.mode === "strict") {
-        throw validation(
-          "INVALID_HTML_STRUCTURE",
-          `Bare text is not permitted directly inside <${parentElem.tag}>.`,
-        );
-      }
-      // In lenient preview mode, drop foster-parented bare text rather than corrupting table tree
       return;
     }
-
-    if (options.mode === "strict" && options.allowPlaceholders) {
-      for (const v of extractTextPlaceholders(decoded)) recordVar(v, false);
-    }
-
     const target = currentTarget();
     const prev = target[target.length - 1];
     if (prev && prev.kind === "text") {
-      prev.text = (prev.text + decoded).normalize("NFC");
+      prev.fragments.push(rawSegment);
     } else {
       nodeCount++;
       if (nodeCount > MAX_AST_NODES) {
         throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template contains too many elements.");
       }
-      target.push({ kind: "text", text: decoded });
+      target.push({ kind: "text", fragments: [rawSegment], text: "" });
     }
   };
 
@@ -581,21 +580,19 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
   while (i < len) {
     const lt = normalizedInput.indexOf("<", i);
     if (lt === -1) {
-      appendText(normalizedInput.slice(i));
+      appendRawTextFragment(normalizedInput.slice(i));
       break;
     }
     if (lt > i) {
-      appendText(normalizedInput.slice(i, lt));
+      appendRawTextFragment(normalizedInput.slice(i, lt));
     }
 
-    // Comments: <!-- ... -->
     if (normalizedInput.startsWith("<!--", lt)) {
       const endComment = normalizedInput.indexOf("-->", lt + 4);
       if (endComment === -1) {
         if (options.mode === "strict") {
           throw validation("INVALID_HTML_INPUT", "Unclosed HTML comment in template.");
         }
-        // Drop malformed comment remainder in lenient preview mode
         break;
       }
       const commentBody = normalizedInput.slice(lt + 4, endComment);
@@ -606,7 +603,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       continue;
     }
 
-    // CDATA / processing instructions fail closed in both modes; only clean <!doctype html> is skipped in lenient preview
     if (normalizedInput[lt + 1] === "!" || normalizedInput[lt + 1] === "?") {
       if (normalizedInput[lt + 1] === "?" || normalizedInput.slice(lt, lt + 9).toUpperCase() === "<![CDATA[") {
         throw validation("DISALLOWED_HTML_DECLARATION", "XML processing instructions and CDATA sections are not permitted.");
@@ -629,7 +625,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       continue;
     }
 
-    // Find closing `>` respecting quoted attribute values
     let gt = lt + 1;
     let quote: string | null = null;
     while (gt < len) {
@@ -648,7 +643,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       if (options.mode === "strict") {
         throw validation("INVALID_HTML_INPUT", "Malformed unclosed HTML tag in template.");
       }
-      // Drop malformed trailing tag remainder in lenient preview mode (never emit raw `<...` text)
       break;
     }
 
@@ -657,7 +651,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
 
     if (!insideTag) continue;
 
-    // Closing tag: </tag>
     if (insideTag.startsWith("/")) {
       if (options.mode === "strict" && hasAnyCurlyBraces(insideTag)) {
         throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed in closing tags.");
@@ -690,7 +683,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       continue;
     }
 
-    // Fail closed on ANY dangerous / foreign / executable / form / style element in BOTH modes!
     if (OPAQUE_DANGEROUS_TAGS.has(rawTagName)) {
       throw validation(
         "DISALLOWED_HTML_ELEMENT",
@@ -698,12 +690,16 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       );
     }
 
-    // Allow harmless `<head><meta charset="utf-8"></head>` wrapper produced by `wrapDeliveryHtmlDocument` in lenient preview only
-    if (rawTagName === "head" || rawTagName === "meta" || rawTagName === "title") {
+    // In lenient preview only, allow `<head><meta charset="utf-8"></head>` from `wrapDeliveryHtmlDocument`;
+    // any other element inside `<head>` or `<meta>` outside `<head>` fails closed.
+    if (rawTagName === "head" || rawTagName === "meta") {
       if (options.mode === "strict") {
         throw validation("DISALLOWED_HTML_ELEMENT", `HTML element <${rawTagName}> is not permitted in mail templates.`);
       }
       if (rawTagName === "meta") {
+        if (!isInsideHead()) {
+          throw validation("DISALLOWED_HTML_ELEMENT", "<meta> outside <head> is not permitted.");
+        }
         const metaAttrs = parseAttributes(rawAttrPart, false);
         const onlyUtf8Charset =
           metaAttrs.length === 1 &&
@@ -714,29 +710,20 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         }
         continue;
       }
-      if (rawTagName === "title") {
-        if (selfClosing) {
-          throw validation("DISALLOWED_HTML_ELEMENT", "Ambiguous self-closing <title/> is not permitted.");
-        }
-        const closeTitle = normalizedInput.indexOf("</title>", i);
-        const closeTitleUpper = closeTitle === -1 ? normalizedInput.toLowerCase().indexOf("</title>", i) : closeTitle;
-        if (closeTitleUpper === -1) {
-          throw validation("INVALID_HTML_INPUT", "Unclosed <title> element.");
-        }
-        i = closeTitleUpper + "</title>".length;
-        continue;
+      if (isInsideHead() || selfClosing) {
+        throw validation("DISALLOWED_HTML_ELEMENT", "Nested or self-closing <head> is not permitted.");
       }
-      // `head`: unwrap only if non-self-closing; children inside `<head>` other than `<meta charset="utf-8">` / `<title>` will fail closed
-      if (!selfClosing) {
-        pushStack({ rawTag: "head", node: null });
-      }
+      pushStack({ rawTag: "head", node: null });
       continue;
+    }
+
+    if (isInsideHead()) {
+      throw validation("DISALLOWED_HTML_ELEMENT", `Element <${rawTagName}> is not permitted inside <head>.`);
     }
 
     const parsedAttrs = parseAttributes(rawAttrPart, options.mode === "strict" && options.allowPlaceholders);
     const mappedTag = ALLOWED_TAG_MAP.get(rawTagName);
 
-    // Neutral structural wrappers (`html`, `body`, `div`, `section`, `article`, `main`, `header`, `footer`)
     if (!mappedTag) {
       if (options.mode === "strict") {
         for (const attr of parsedAttrs) {
@@ -751,7 +738,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
           throw validation("DISALLOWED_HTML_ELEMENT", `HTML element <${rawTagName}> is not permitted in mail templates.`);
         }
       } else if (!NEUTRAL_WRAPPER_TAGS.has(rawTagName)) {
-        // Unknown unknown/custom element in lenient preview: fail closed
         throw validation("DISALLOWED_HTML_ELEMENT", `Unknown HTML element <${rawTagName}>.`);
       }
       if (!selfClosing && !VOID_TAGS.has(rawTagName)) {
@@ -760,13 +746,10 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       continue;
     }
 
-    // HTML5 content-model enforcement to prevent implicit tree repair / foster parenting:
-    // 1. Auto-close open `<p>` before opening another block element (matches HTML5 `<p>` end-tag omission)
     if (BLOCK_TAGS.has(mappedTag) && hasOpenElement("p")) {
       closeTopMatchingElement("p");
     }
 
-    // 2. Forbid nested `<a>` inside `<a>` and block elements inside `<a>` or `<h1-h4>`
     if (mappedTag === "a" && hasOpenElement("a")) {
       if (options.mode === "strict") {
         throw validation("INVALID_HTML_STRUCTURE", "Nested links are not permitted in mail templates.");
@@ -774,21 +757,14 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       closeTopMatchingElement("a");
     }
     if (BLOCK_TAGS.has(mappedTag) && (hasOpenElement("a") || hasOpenHeading())) {
-      if (options.mode === "strict") {
-        throw validation("INVALID_HTML_STRUCTURE", `Block element <${mappedTag}> cannot be nested inside a heading or link.`);
-      }
-      throw validation("INVALID_HTML_STRUCTURE", "Ambiguous block-in-inline nesting.");
+      throw validation("INVALID_HTML_STRUCTURE", `Block element <${mappedTag}> cannot be nested inside a heading or link.`);
     }
 
-    // 3. Enforce strict list hierarchy (`ul|ol > li`) and table hierarchy (`table > thead|tbody > tr > th|td`)
     const parentElem = currentElementEntry();
     const parentTag = parentElem?.tag ?? null;
 
     if (mappedTag === "li" && parentTag !== "ul" && parentTag !== "ol") {
-      if (options.mode === "strict") {
-        throw validation("INVALID_HTML_STRUCTURE", "<li> must be placed directly inside <ul> or <ol>.");
-      }
-      throw validation("INVALID_HTML_STRUCTURE", "Orphan <li> element.");
+      throw validation("INVALID_HTML_STRUCTURE", "<li> must be placed directly inside <ul> or <ol>.");
     }
     if ((parentTag === "ul" || parentTag === "ol") && mappedTag !== "li") {
       throw validation("INVALID_HTML_STRUCTURE", `Only <li> elements are permitted directly inside <${parentTag}>.`);
@@ -800,13 +776,12 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         (mappedTag === "tr" && (parentTag === "thead" || parentTag === "tbody")) ||
         ((mappedTag === "th" || mappedTag === "td") && parentTag === "tr");
 
-      // Support `<table><tr>...` shorthand by synthesizing `<tbody>` so standards HTML5 parser matches 1:1
       if (mappedTag === "tr" && parentTag === "table" && parentElem) {
         nodeCount++;
         if (nodeCount > MAX_AST_NODES) {
           throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template contains too many elements.");
         }
-        const synthTbody: Extract<AstNode, { kind: "element" }> = {
+        const synthTbody: Extract<MutableAstNode, { kind: "element" }> = {
           kind: "element",
           tag: "tbody",
           attrs: {},
@@ -829,8 +804,7 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       );
     }
 
-    // Build sanitized attributes for `mappedTag`
-    const cleanAttrs: Extract<AstNode, { kind: "element" }>["attrs"] = {};
+    const cleanAttrs: Extract<MutableAstNode, { kind: "element" }>["attrs"] = {};
 
     for (const attr of parsedAttrs) {
       if (mappedTag === "a" && attr.name === "href") {
@@ -891,7 +865,6 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
         if (options.mode === "strict" && hasAnyCurlyBraces(attr.value)) {
           throw validation("UNSAFE_PLACEHOLDER_CONTEXT", "Placeholders are not allowed in image alt attributes.");
         }
-        // Trim both before and AFTER slicing so second-pass sanitization is 100% byte-idempotent
         const normalizedAlt = attr.value
           .normalize("NFC")
           .replace(/[\p{Cc}\u2028\u2029]+/gu, " ")
@@ -949,7 +922,7 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       throw validation("HTML_TEMPLATE_TOO_COMPLEX", "HTML template contains too many elements.");
     }
 
-    const elemNode: Extract<AstNode, { kind: "element" }> = {
+    const elemNode: Extract<MutableAstNode, { kind: "element" }> = {
       kind: "element",
       tag: mappedTag,
       attrs: cleanAttrs,
@@ -962,8 +935,72 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
     }
   }
 
+  if (isInsideHead()) {
+    throw validation("INVALID_HTML_INPUT", "Unclosed <head> element.");
+  }
+
+  /**
+   * Single linear post-pass: joins accumulated text fragments once, entity-decodes + NFC-normalizes
+   * once, drops inter-row/inter-item whitespace inside table/list containers (preventing foster
+   * parenting), and validates placeholders on the FINAL merged text node (catching split braces
+   * such as `{<!-- -->{secret}}` or `{<div></div>{secret}}`).
+   */
+  const finalizeNodes = (nodes: readonly MutableAstNode[], parentTag: AllowedTag | null): AstNode[] => {
+    const out: AstNode[] = [];
+    const forbidsBareText =
+      parentTag === "table" ||
+      parentTag === "thead" ||
+      parentTag === "tbody" ||
+      parentTag === "tr" ||
+      parentTag === "ul" ||
+      parentTag === "ol";
+
+    for (const node of nodes) {
+      if (node.kind === "text") {
+        const joinedRaw = node.fragments.length === 1 ? node.fragments[0]! : node.fragments.join("");
+        const decoded = decodeHtmlEntities(joinedRaw);
+        if (!decoded) continue;
+        if (forbidsBareText) {
+          if (!decoded.trim()) continue;
+          if (options.mode === "strict") {
+            throw validation("INVALID_HTML_STRUCTURE", `Bare text is not permitted directly inside <${parentTag}>.`);
+          }
+          continue;
+        }
+        const prev = out[out.length - 1];
+        if (prev && prev.kind === "text") {
+          prev.text = (prev.text + decoded).normalize("NFC");
+        } else {
+          out.push({ kind: "text", text: decoded });
+        }
+      } else {
+        const finalizedChildren = finalizeNodes(node.children, node.tag);
+        out.push({
+          kind: "element",
+          tag: node.tag,
+          attrs: node.attrs,
+          children: finalizedChildren,
+        });
+      }
+    }
+
+    if (options.mode === "strict" && options.allowPlaceholders) {
+      for (const finalized of out) {
+        if (finalized.kind === "text") {
+          for (const v of extractTextPlaceholders(finalized.text)) {
+            recordVar(v, false);
+          }
+        }
+      }
+    }
+
+    return out;
+  };
+
+  const finalizedRoots = finalizeNodes(rootChildren, null);
+
   return {
-    roots: rootChildren,
+    roots: finalizedRoots,
     referencedVars: [...referencedVars],
     hrefVars: [...hrefVars],
   };
@@ -1144,11 +1181,6 @@ function astToPlainText(nodes: readonly AstNode[], listKind?: "ul" | "ol"): stri
   return chunks.join("");
 }
 
-/**
- * Server-side HTML allow-list sanitizer for template authoring & persistence.
- * Enforces canonical HTML size bound (`<= MAX_HTML_INPUT_BYTES`) after serialization so
- * subsequent strict render passes are guaranteed to accept saved canonical HTML.
- */
 export function sanitizeTemplateHtmlOnSave(
   rawHtml: string,
   declaredVars?: ReadonlySet<string>,
@@ -1177,12 +1209,6 @@ export function sanitizeTemplateHtmlOnSave(
   };
 }
 
-/**
- * Reusable server-side inert HTML preview projection.
- *
- * Never throws: any input exceeding size/depth/node limits or containing dangerous/foreign/form
- * elements fails closed to `""` so `<InertMailPreview>` cleanly displays only the plain-text tab.
- */
 export function projectInertMailPreviewHtml(rawOrRenderedHtml: string): string {
   if (!rawOrRenderedHtml || Buffer.byteLength(rawOrRenderedHtml, "utf8") > MAX_HTML_INPUT_BYTES) {
     return "";
