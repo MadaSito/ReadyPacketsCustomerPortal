@@ -216,8 +216,11 @@ interface RichTextEditorProps {
   disabled?: boolean;
 }
 ```
-Toolbar: Heading 2 / Heading 3 / Paragraph, Bold, Italic, Bulleted list, Numbered list, Link, Image, Button,
-Insert variable, Undo, Redo (all buttons with names and `aria-pressed`; Ctrl/Cmd+B / I / Z work).
+Toolbar (`role="toolbar"`, one Tab stop, arrows / Home / End move between tools): Paragraph, Heading 2, Heading 3,
+Bold, Italic, Bulleted list, Numbered list, Link (+ Remove link), Button, Image, Insert variable, Undo, Redo
+(names + `aria-pressed`; Ctrl/Cmd+B / I / Z work). Link / Button / Image open a dialog that validates the address
+(Image also requires alt text). Helpers `isAllowedMailHref(url)` and `isAllowedMailImageSrc(url)` are exported for
+your own forms. The editable element is `role="textbox" aria-multiline` labelled by `label`.
 Output HTML subset (the server sanitiser must accept exactly this and drop the rest):
 `p, h2, h3, strong, em, ul, ol, li, br, hr`, `a[href]` (href `https:`, `mailto:` or exactly `{{variable}}`),
 `a[href][data-rp-button="primary"]` (button), `img[src][alt]` (src `https:` only; alt required).
