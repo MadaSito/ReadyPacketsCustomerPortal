@@ -14,7 +14,7 @@ const providerId = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
 const portalId = z.string().length(26).regex(ULID_PATTERN);
 const currencyCode = z.string().regex(/^[A-Z]{3}$/u);
 const money = z.object({ amount: z.number().int().nonnegative(), currency: currencyCode });
-const eventShape = z.object({ event_id: providerId, type: z.string().regex(/^[a-z][a-z0-9_.]{1,99}$/u),
+const eventShape = z.object({ event_id: providerId, type: z.string().regex(/^[a-z][a-z0-9_.]{1,95}$/u),
   created_at: z.iso.datetime({ offset: true }), data: z.unknown().optional() });
 const eventPayment = z.object({ data: z.object({ type: z.literal("payment"), id: providerId,
   object: z.object({ payment: z.object({ id: providerId, order_id: providerId.optional(), status: z.string().max(32) }) }),
