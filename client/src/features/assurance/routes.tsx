@@ -8,6 +8,6 @@ const CredentialsTab = lazy(() => import("./pages/CredentialsTab"));
 
 export const assuranceFeature: FeatureRoutes = {
   routes: [{ path: "/account/security", access: "customer", title: "Account security", component: SecurityPage }],
-  nav: [{ label: "Account security", href: "/account/security", icon: ShieldCheck, area: "customer", access: "customer", order: 90 }],
+  nav: [{ label: "Security", href: "/account/security", icon: ShieldCheck, area: "customer", access: "customer", group: "Account", order: 220, placement: "account" }],
   customerTabs: [{ key: "credentials", label: "Credentials", access: "admin", component: CredentialsTab, order: 90 }],
 };
