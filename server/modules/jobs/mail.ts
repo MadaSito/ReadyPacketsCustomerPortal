@@ -35,6 +35,7 @@ type MessageContent = z.infer<typeof contentSchema>;
 type DeliveryJob = z.infer<typeof jobPayload>;
 type MailAttemptOutcome = "accepted" | "held" | "failed" | "unknown" | "captured";
 type AttemptPurpose = typeof mailTransportAttempts.$inferSelect.purpose;
+type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?: never };
 export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
 type DeliveryDeps = {
@@ -426,7 +427,7 @@ export class MailEngine implements Mailer {
 
     let key = routing.primary;
     let purpose: AttemptPurpose = "primary";
-    let result = await this.#send(job, key, sender, data);
+    let result = await this.#send(job, key, sender, data, row.expiresAt);
     if (routing.secondary !== "none" && (result.outcome === "not_configured" || (result.outcome === "rejected" && result.retryable === true))) {
       const secondary = routing.secondary;
       const next = await deps.db.transaction(async (tx) => {
@@ -441,28 +442,34 @@ export class MailEngine implements Mailer {
       if (next) {
         key = secondary;
         purpose = "secondary";
-        result = await this.#send(job, key, sender, data);
+        result = await this.#send(job, key, sender, data, row.expiresAt);
       }
     }
     const { outcome, reasonCode } = await deps.db.transaction(async (tx) => {
       const current = await this.#lockedMail(tx, job, ids, "sending");
       if (!current) throw new Error("MAIL_FENCE_INCONSISTENT");
       const status = await this.#finishAttempt(tx, current, key, purpose, result);
-      const { outcome, reasonCode } = status;
+      const now = deps.clock.now();
+      const expired = (status.outcome === "held" || status.outcome === "failed") && current.expiresAt <= now;
+      const outcome = expired ? "expired" : status.outcome;
+      const reasonCode = expired ? "MAIL_EXPIRED" : status.reasonCode;
       await tx.update(mailOutbox).set({
-        state: outcome, reasonCode, updatedAt: deps.clock.now(),
-        ...(outcome === "accepted" || outcome === "unknown" || (outcome === "failed" && !result.retryable) ? { payloadEnc: null } : {}),
+        state: outcome, reasonCode, updatedAt: now,
+        ...(outcome === "accepted" || outcome === "unknown" || expired
+          || (outcome === "failed" && !result.retryable) ? { payloadEnc: null } : {}),
       }).where(eq(mailOutbox.id, current.id));
-      await mailAudit(deps, tx, current, `job.mail.${outcome}`, outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome, reasonCode, true);
-      return status;
+      await mailAudit(deps, tx, current, `job.mail.${outcome}`,
+        outcome === "accepted" ? "completed" : outcome === "held" ? "refused" : outcome === "expired" ? "canceled" : outcome, reasonCode, true);
+      return { outcome, reasonCode };
     });
     if (outcome === "accepted" && redacted) await this.#auditCopy(job, ids, key, sender, redacted);
     if (outcome === "unknown") return { outcome: "unknown", reasonCode };
     if (outcome === "failed") return { outcome: "failed", reasonCode, retryable: false };
+    if (outcome === "expired") return { outcome: "canceled", reasonCode };
     return { outcome: "completed" };
   }
 
-  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: MessageContent): Promise<MailTransportResult> {
+  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: MessageContent, expiresAt?: Date): Promise<MailDeliveryResult> {
     const adapter = this.#transports.get(key);
     if (!adapter || !sender) return { outcome: "not_configured" };
     try {
@@ -470,6 +477,7 @@ export class MailEngine implements Mailer {
     } catch { return { outcome: "rejected", retryable: false }; }
     await job.assertStillOwned();
     job.signal.throwIfAborted();
+    if (expiresAt && expiresAt <= this.deps.clock.now()) return { outcome: "expired" };
     try {
       const result = await adapter.send({ ...data, sender, signal: job.signal });
       if (["accepted", "not_configured", "rejected", "unknown"].includes(result.outcome)) return result;
@@ -483,13 +491,13 @@ export class MailEngine implements Mailer {
     });
   }
 
-  async #finishAttempt(tx: Tx, mail: MailRow, key: MailTransportKey, purpose: AttemptPurpose, result: MailTransportResult):
+  async #finishAttempt(tx: Tx, mail: MailRow, key: MailTransportKey, purpose: AttemptPurpose, result: MailDeliveryResult):
     Promise<{ outcome: Exclude<MailAttemptOutcome, "captured">; reasonCode: string }> {
     const outcome = result.outcome === "accepted" ? "accepted"
-      : result.outcome === "not_configured" ? "held" : result.outcome === "rejected" ? "failed" : "unknown";
+      : result.outcome === "not_configured" ? "held" : result.outcome === "unknown" ? "unknown" : "failed";
     const reasonCode = outcome === "accepted" ? key === "smtp" ? "MAIL_SMTP_ACCEPTED" : "MAIL_GRAPH_ACCEPTED"
       : outcome === "held" ? "MAIL_NOT_CONFIGURED"
-        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : "MAIL_PROVIDER_REJECTED";
+        : outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : result.outcome === "expired" ? "MAIL_EXPIRED" : "MAIL_PROVIDER_REJECTED";
     await tx.update(mailTransportAttempts).set({ state: outcome, reasonCode, finishedAt: this.deps.clock.now() }).where(and(
       eq(mailTransportAttempts.mailId, mail.id), eq(mailTransportAttempts.generation, mail.generation),
       eq(mailTransportAttempts.purpose, purpose), eq(mailTransportAttempts.state, "sending"),

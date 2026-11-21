@@ -8,6 +8,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
+import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
@@ -493,6 +494,27 @@ describe("MySQL transactional mail outbox", () => {
     expect(await t.db.select().from(mailOutbox)).toHaveLength(0);
   });
 
+  it("wires the configured sender and legacy upgrade fallback through the Jobs SMTP adapter", async () => {
+    const f = fixture();
+    const send = vi.fn(async (_message: MailTransportMessage) => ({ outcome: "accepted" as const }));
+    f.h.services.integrations = {
+      smtp: {
+        getConfig: async () => ({ ...sender, replyToAddress: "" }),
+        getReadiness: async () => ({ enabled: true, configured: true, ready: true, state: "configured" }),
+        send,
+      },
+    } as unknown as typeof f.h.services.integrations;
+    const jobs = createJobsModule({ ...f.h.deps, jobs: f.jobs, mailer: f.mailer });
+    await expect(jobs.getMailSenderIdentity()).resolves.toEqual(sender);
+    const shared = { fromAddress: "shared@example.test", fromName: "Shared Ops", replyToAddress: "reply@example.test" };
+    await f.h.settings.set(MAIL_SENDER.key, shared);
+    await expect(jobs.getMailReadiness()).resolves.toEqual({ ready: true });
+    f.mailer.registerTemplate({ key: input.template, vars: ["name", "link"], sensitiveVars: ["link"], subject: () => "Test", text: () => "Body" });
+    await f.mailer.enqueue({ ...input, to: { address: "recipient@example.test" } });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ sender: shared, to: "recipient@example.test" }));
+  });
+
   it("records SMTP acceptance, not delivery, with escaped HTML and purged data", async () => {
     const f = fixture();
     const ports = setDelivery(f, "accepted");
@@ -592,6 +614,24 @@ describe("MySQL transactional mail outbox", () => {
     expect(send).not.toHaveBeenCalled();
     const [row] = await t.db.select().from(mailOutbox);
     expect(row).toMatchObject({ state: "failed", payloadEnc: null });
+  });
+
+  it("rechecks single-use expiry immediately before submission, after transport readiness", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    const graph = vi.fn(async () => ({ outcome: "accepted" as const }));
+    f.mail.registerMailTransport({
+      key: "graph",
+      isConfigured: async () => { f.h.clock.advance(2_000); return true; },
+      send: graph,
+    });
+    await f.h.settings.set(MAIL_ROUTING.key, { primary: "graph", secondary: "smtp" });
+    await f.mailer.enqueue({ ...input, expiresAt: new Date(f.h.clock.now().getTime() + 1_000) });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(graph).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ state: "expired", reasonCode: "MAIL_EXPIRED", payloadEnc: null });
   });
 
   it("does not turn a known customer acceptance into an unknown customer send when the copy loses its lease", async () => {
