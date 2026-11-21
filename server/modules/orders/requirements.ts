@@ -160,7 +160,7 @@ export function createRequirementsService(deps: RequirementsDeps) {
      * re-check and the transition lookup, before the status update. Cancellation targets bypass the
      * requirement check (an order can always be canceled where the workflow allows it) but still lock phases.
      */
-    async onTransition(tx: Tx, principal: SessionPrincipal, view: OrderAccessView, bound: BoundWorkflow, toStatus: string): Promise<void> {
+    async onTransition(tx: Tx, principal: SessionPrincipal | null, view: OrderAccessView, bound: BoundWorkflow, toStatus: string): Promise<void> {
       const definition = bound.definition;
       const target = findState(definition, toStatus);
       if (!(target && isCancelState(target))) {
@@ -204,7 +204,7 @@ export function createRequirementsService(deps: RequirementsDeps) {
       if (toPhase && toPhase !== fromPhase) {
         const existing = rows.find((row) => row.phaseKey === toPhase && row.state === "locked");
         if (existing) {
-          await tx.update(orderPhaseLocks).set({ state: "unlocked", unlockedAt: now, unlockedByUserId: principal.userId, version: existing.version + 1, updatedAt: now }).where(eq(orderPhaseLocks.id, existing.id));
+          await tx.update(orderPhaseLocks).set({ state: "unlocked", unlockedAt: now, unlockedByUserId: principal?.userId ?? null, version: existing.version + 1, updatedAt: now }).where(eq(orderPhaseLocks.id, existing.id));
           events.push({ eventName: "order.phase.reopened", phase: toPhase });
         }
       }
@@ -215,7 +215,7 @@ export function createRequirementsService(deps: RequirementsDeps) {
             eventName: event.eventName,
             action: event.eventName === "order.phase.reopened" ? "unlock" : "lock",
             outcome: "completed",
-            actor: actorOf(principal),
+            actor: principal ? actorOf(principal) : { role: "system" },
             resource: { type: "order", publicId: view.publicId },
             attributes: { phase_key: event.phase, from_status: view.statusKey, to_status: toStatus, workflow_version: bound.versionNumber },
           },

@@ -3,7 +3,8 @@
  */
 import { z } from "zod";
 
-export const WORKFLOW_ACTORS = ["customer", "staff", "admin"] as const;
+/** `api` (increment 04): an integration calling /api/v1 with an `orders:write` key. */
+export const WORKFLOW_ACTORS = ["customer", "staff", "admin", "api"] as const;
 export type WorkflowActor = (typeof WORKFLOW_ACTORS)[number];
 export const STATE_KINDS = ["initial", "active", "terminal"] as const;
 export const STATE_TONES = ["neutral", "info", "success", "warning", "danger"] as const;
@@ -49,7 +50,7 @@ export const uploadRequirementSchema = z
     minCount: z.number().int().min(0).max(MAX_SLOT_COUNT),
     maxCount: z.number().int().min(1).max(MAX_SLOT_COUNT),
     allowedTypes: z.array(z.string().regex(/^[a-z0-9]{1,10}$/, "Use a lowercase extension without a dot.")).max(20),
-    uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(3),
+    uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(4),
   })
   .refine((slot) => slot.minCount <= slot.maxCount, { message: "Minimum cannot exceed maximum.", path: ["minCount"] });
 
@@ -79,7 +80,7 @@ export const workflowStateSchema = z.strictObject({
 export const workflowTransitionSchema = z.strictObject({
   from: key,
   to: key,
-  allowedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(3),
+  allowedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(4),
   notifyCustomer: z.boolean(),
   requiresNote: z.boolean().default(false),
   /** Optional verb phrase for the action button (e.g. "Start review"). Derived from the target state when absent. */

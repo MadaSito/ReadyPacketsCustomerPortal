@@ -367,3 +367,40 @@ describe("checkout-in-tx port", () => {
     );
   });
 });
+
+describe("public API orders provider (package H)", () => {
+  const caller = { kind: "api_key" as const, keyPublicId: "01JDTESTKEY000000000000000", scopes: ["orders:read", "orders:write"], requestId: "01JDTESTREQ000000000000000", replay: false, idempotencyKey: "abc123def456ghi789" };
+  const provider = () => {
+    let registered: Record<string, (...args: never[]) => Promise<unknown>> | null = null;
+    const saved = (h.services as unknown as Record<string, unknown>).publicApi;
+    (h.services as unknown as Record<string, unknown>).publicApi = { registerProvider: (_key: string, impl: typeof registered) => (registered = impl) };
+    mod.init?.();
+    (h.services as unknown as Record<string, unknown>).publicApi = saved;
+    return registered! as unknown as {
+      list(q: unknown, c: unknown): Promise<{ items: { id: string; customerId: string; status: { key: string } }[]; nextCursor: string | null }>;
+      get(id: string, c: unknown): Promise<{ id: string; version: number } | null>;
+      create(i: unknown, c: unknown): Promise<{ id: string; customerId: string; totalMinor: number }>;
+      transition(id: string, i: unknown, c: unknown): Promise<unknown>;
+    };
+  };
+
+  it("lists, gets, creates as system and refuses transitions the workflow does not give to api", async () => {
+    const api = provider();
+    await expectError(api.create({ customerId: alice.publicId, items: [{ productId, tierKey: "premium", quantity: 1 }] }, caller), "VALIDATION:TIER_MISMATCH");
+    await expectError(api.create({ customerId: staff.publicId, items: [{ productId, tierKey: "default", quantity: 1 }] }, caller), "VALIDATION:CUSTOMER_NOT_ELIGIBLE");
+    h.audit.events.length = 0;
+    const created = await api.create({ customerId: alice.publicId, items: [{ productId, tierKey: "default", quantity: 3 }] }, caller);
+    expect(created).toMatchObject({ customerId: alice.publicId, totalMinor: 3000 });
+    expect(h.audit.events.find((event) => event.eventName === "order.created")).toMatchObject({ actor: { role: "system" }, correlationId: caller.requestId });
+    const again = await api.create({ customerId: alice.publicId, items: [{ productId, tierKey: "default", quantity: 3 }] }, caller);
+    expect(again.id).toBe(created.id);
+    const page = await api.list({ cursor: null, limit: 2, filter: { customerId: alice.publicId } }, caller);
+    expect(page.items).toHaveLength(2);
+    expect(page.items.every((item) => item.customerId === alice.publicId)).toBe(true);
+    expect(page.nextCursor).not.toBeNull();
+    expect((await api.list({ cursor: null, limit: 5, filter: { customerId: bob.publicId } }, caller)).items).toEqual([]);
+    expect(await api.get("not-a-ulid", caller)).toBeNull();
+    const got = await api.get(created.id, caller);
+    await expectError(api.transition(created.id, { toStatusKey: "in_review", expectedVersion: got!.version }, caller), "FORBIDDEN:TRANSITION_NOT_ALLOWED");
+  });
+});

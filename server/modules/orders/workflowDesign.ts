@@ -37,7 +37,7 @@ export const draftUploadSchema = z.strictObject({
   minCount: z.number().int().min(0).max(MAX_SLOT_COUNT),
   maxCount: z.number().int().min(0).max(MAX_SLOT_COUNT),
   allowedTypes: z.array(z.string().max(10)).max(20),
-  uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(3),
+  uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(4),
 });
 
 export const draftAcknowledgementSchema = z.strictObject({
@@ -66,7 +66,7 @@ export const draftStateSchema = z.strictObject({
 export const draftTransitionSchema = z.strictObject({
   from: draftText(48),
   to: draftText(48),
-  allowedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(3),
+  allowedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(4),
   notifyCustomer: z.boolean(),
   requiresNote: z.boolean(),
   actionLabel: draftText(60).optional(),
@@ -153,7 +153,7 @@ export function validateDraft(definition: WorkflowDraftDefinition): WorkflowIssu
     if (transition.from.trim() && transition.from.trim() === transition.to.trim())
       error("TRANSITION_SELF", `transitions.${index}.to`, `${name}: a transition must move to a different status.`);
     if (transition.allowedBy.length === 0)
-      error("TRANSITION_NOBODY", `transitions.${index}.allowedBy`, `${name}: choose who may make this move (customer, staff or administrator).`);
+      error("TRANSITION_NOBODY", `transitions.${index}.allowedBy`, `${name}: choose who may make this move (customer, staff, administrator or API integration).`);
     if (new Set(transition.allowedBy).size !== transition.allowedBy.length)
       error("TRANSITION_ACTOR_DUPLICATE", `transitions.${index}.allowedBy`, `${name}: each role can be listed only once.`);
     if (transition.actionLabel !== undefined && !transition.actionLabel.trim())

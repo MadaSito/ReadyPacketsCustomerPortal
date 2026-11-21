@@ -3,7 +3,7 @@
  * Other modules import TYPES from here and reach the instance through `deps.services.orders` at call time.
  * See ./API.md for the contract (access policy, hooks, procedures, audit events).
  */
-import type { ModuleDeps } from "../../container.js";
+import type { ModuleDeps, Services } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import { createActorCheck } from "./actor.js";
 import { createCatalogService, type CatalogService } from "./catalog.js";
@@ -28,6 +28,7 @@ import type {
   OrderProductionScope,
 } from "./types.js";
 import { createWorkflowService, type WorkflowService } from "./workflows.js";
+import { createOrdersApiProvider } from "./publicApiProvider.js";
 import { createAccessService, type AccessService } from "./access.js";
 import { createRequirementsService, type FileUploadSlot, type FileUploadSlots, type RequirementsService } from "./requirements.js";
 export type { FileUploadSlot, FileUploadSlots, RequirementsView } from "./requirements.js";
@@ -109,7 +110,14 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
 
+  const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
+
   return {
+    init() {
+      // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
+      const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
+      publicApi?.registerProvider?.("orders", apiProvider);
+    },
     assertCanReadOrder: policy.assertCanReadOrder,
     assertCanWriteOrder: policy.assertCanWriteOrder,
     assertCanReadOrderById: policy.assertCanReadOrderById,

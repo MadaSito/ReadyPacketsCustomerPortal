@@ -196,10 +196,11 @@ export function createOrderService(deps: OrderServiceDeps) {
   /** Creates the order rows inside `tx` (actor already re-validated by the caller). */
   async function createInTx(
     tx: Tx,
-    principal: SessionPrincipal,
+    principal: SessionPrincipal | null,
     input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
     ownerUserId: number,
     prefix: string,
+    system?: { correlationId: string; channel: string },
   ) {
     const now = deps.clock.now();
     const workflow = await workflows.ensureDefault(tx);
@@ -223,7 +224,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       totalMinor,
       currency,
       origin: "portal",
-      createdByUserId: principal.userId,
+      createdByUserId: principal?.userId ?? null,
       createKey: input.idempotencyKey,
       submittedAt: now,
       createdAt: now,
@@ -255,15 +256,15 @@ export function createOrderService(deps: OrderServiceDeps) {
         createdAt: now,
       })),
     );
-    await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal.userId, now });
+    await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal?.userId ?? null, now });
     const note = input.note ? await insertNote(tx, { orderId, principal, visibility: "customer", body: input.note }) : null;
     await tx.insert(orderStatusHistory).values({
       publicId: ulid(now.getTime()),
       orderId,
       fromStatus: null,
       toStatus: initial.key,
-      actorUserId: principal.userId,
-      actorRole: principal.role,
+      actorUserId: principal?.userId ?? null,
+      actorRole: principal?.role ?? "system",
       reasonCode: "CREATED",
       noteId: note?.id ?? null,
       occurredAt: now,
@@ -275,13 +276,15 @@ export function createOrderService(deps: OrderServiceDeps) {
         eventName: "order.created",
         action: "create",
         outcome: "completed",
-        actor: actorOf(principal),
+        actor: principal ? actorOf(principal) : { role: "system" },
+        ...(system ? { correlationId: system.correlationId } : {}),
         resource: { type: "order", publicId },
         attributes: {
           currency,
           total_minor: totalMinor,
           discount_minor: pricing.discountMinor,
-          on_behalf: ownerUserId !== principal.userId,
+          on_behalf: ownerUserId !== principal?.userId,
+          ...(system ? { channel: system.channel } : {}),
           workflow_version: workflow.versionNumber,
           inherited_grants: inherited,
         },
@@ -778,6 +781,112 @@ export function createOrderService(deps: OrderServiceDeps) {
         });
       }
       return { version: view.version + 1, statusKey: input.toStatus };
+    },
+
+    /**
+     * Increment 04 (public API, package H): a transition by an integration (service principal, no user). Allowed
+     * only where the pinned workflow lists actor `api`, only on unlocked orders, with the same requirement guard,
+     * phase bookkeeping, audit (actor system, correlated to the API request) and notifications.
+     */
+    async transitionAsSystem(input: { orderPublicId: string; expectedVersion: number; toStatus: string; note?: string; correlationId: string }) {
+      const outcome = await deps.db.transaction(async (tx) => {
+        const [row] = await tx.select().from(orders).where(eq(orders.publicId, input.orderPublicId)).limit(1).for("update");
+        if (!row) throw ORDER_NOT_FOUND();
+        if (row.lockState !== "none") throw orderLocked(row.lockState);
+        if (row.version !== input.expectedVersion) throw staleVersion();
+        const bound = await workflows.byVersionId(tx, row.workflowVersionId);
+        const transition = transitionsFrom(bound.definition, row.statusKey, "api").find((candidate) => candidate.to === input.toStatus);
+        if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
+        if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+        const owner = await identityPort(deps.services).getUser(row.ownerUserId, { tx });
+        const view: OrderAccessView = {
+          id: row.id,
+          publicId: row.publicId,
+          reference: row.reference,
+          ownerUserId: row.ownerUserId,
+          ownerPublicId: owner?.publicId ?? "",
+          statusKey: row.statusKey,
+          lockState: row.lockState,
+          locked: false,
+          readOnlyImported: false,
+          accessRole: "staff",
+          canWrite: true,
+          origin: row.origin,
+          version: row.version,
+          workflowVersionId: row.workflowVersionId,
+        };
+        await deps.requirements.onTransition(tx, null, view, bound, transition.to);
+        const now = deps.clock.now();
+        const note = input.note ? await insertNote(tx, { orderId: row.id, principal: null, visibility: "customer", body: input.note }) : null;
+        const result = await tx
+          .update(orders)
+          .set({ statusKey: transition.to, version: row.version + 1, updatedAt: now })
+          .where(and(eq(orders.id, row.id), eq(orders.version, row.version)));
+        if (affectedRows(result) !== 1) throw staleVersion();
+        await tx.insert(orderStatusHistory).values({
+          publicId: ulid(now.getTime()),
+          orderId: row.id,
+          fromStatus: row.statusKey,
+          toStatus: transition.to,
+          actorUserId: null,
+          actorRole: "system",
+          reasonCode: "API_TRANSITION",
+          noteId: note?.id ?? null,
+          occurredAt: now,
+        });
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "order.status.changed",
+            action: "transition",
+            outcome: "completed",
+            actor: { role: "system" },
+            correlationId: input.correlationId,
+            resource: { type: "order", publicId: row.publicId },
+            attributes: { from_status: row.statusKey, to_status: transition.to, workflow_version: bound.versionNumber, channel: "api" },
+          },
+          tx,
+        );
+        await emitChange(tx, { orderId: row.id, orderPublicId: row.publicId, kind: "status_changed" });
+        return { view, bound, notify: transition.notifyCustomer };
+      });
+      if (outcome.notify) {
+        const state = findState(outcome.bound.definition, input.toStatus);
+        const statusLabel = state?.customerLabel ?? input.toStatus;
+        await notifyParticipants(outcome.view, null, "order.status_changed", `${outcome.view.reference}: ${statusLabel}`, `Your order status is now “${statusLabel}”.`, {
+          template: "orders.status_changed",
+          vars: { reference: outcome.view.reference, statusLabel, link: `/orders/${outcome.view.publicId}` },
+          idempotencyKey: `order-status:${outcome.view.publicId}:${outcome.view.version + 1}`,
+        });
+      }
+      return { version: outcome.view.version + 1, statusKey: input.toStatus };
+    },
+
+    /** Increment 04 (public API): create for a customer by an integration (system actor, same pricing rules). */
+    async createAsSystem(input: { ownerPublicId: string; projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; correlationId: string }) {
+      const owner = await ownerUser(input.ownerPublicId);
+      if (!owner) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+      const [existing] = await deps.db
+        .select({ publicId: orders.publicId })
+        .from(orders)
+        .where(and(eq(orders.ownerUserId, owner.id), eq(orders.createKey, input.idempotencyKey)))
+        .limit(1);
+      if (existing) return { publicId: existing.publicId, created: false };
+      const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX);
+      try {
+        return await deps.db.transaction(async (tx) => {
+          const fresh = await ownerUser(input.ownerPublicId, tx);
+          if (!fresh) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+          const result = await createInTx(tx, null, input, fresh.id, prefix, { correlationId: input.correlationId, channel: "api" });
+          return { publicId: result.publicId, created: true };
+        });
+      } catch (error) {
+        if (isDuplicateKey(error)) {
+          const [again] = await deps.db.select({ publicId: orders.publicId }).from(orders).where(and(eq(orders.ownerUserId, owner.id), eq(orders.createKey, input.idempotencyKey))).limit(1);
+          if (again) return { publicId: again.publicId, created: false };
+        }
+        throw error;
+      }
     },
 
     /* ----------------------------------------------------------------- locks */
