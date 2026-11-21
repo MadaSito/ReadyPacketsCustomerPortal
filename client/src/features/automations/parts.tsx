@@ -3,7 +3,8 @@
  * Owner: audit engineer. Every control has a visible label; errors are tied to their fields.
  */
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
-import { Badge, Button, Callout, Checkbox, Field, IconButton, Input, KeyValueList, RadioGroup, Select, Textarea } from "@/ui";
+import type { SelectHTMLAttributes } from "react";
+import { Badge, Button, Callout, Checkbox, Field, IconButton, Input, KeyValueList, RadioGroup, Select, Textarea, useFieldControl } from "@/ui";
 import {
   OPERATOR_LABELS, RUN_STATE, STEP_STATE, addAction, addCondition, addGroup, conditionFields, formatDuration, moveAction, operatorNeedsValue,
   operatorsFor, recipientOptions, removeAction, removeCondition, setTrigger, templateFields, triggerEntry, triggerLabel, updateAction,
@@ -22,6 +23,12 @@ export function EnabledBadge({ enabled }: { enabled: boolean }) {
 }
 
 /* ------------------------------------------------------------------ trigger */
+
+/** Native select with <optgroup>s, wired to its Field label, hint and error like the kit Select. */
+function GroupedSelect(props: SelectHTMLAttributes<HTMLSelectElement>) {
+  const wiring = useFieldControl();
+  return <select className="min-h-11 w-full min-w-0 rounded-[var(--radius-control)] border border-control-border bg-surface px-3 py-2 text-ink hover:border-ink/60 focus-visible:border-action aria-invalid:border-2 aria-invalid:border-danger" {...wiring} {...props} />;
+}
 
 export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: Draft; onChange: Change; catalogue: Catalogue; errors: Errors }) {
   const kind = draft.trigger?.kind ?? "";
@@ -52,8 +59,7 @@ export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: D
       />
       {draft.trigger?.kind === "event" ? (
         <Field label="Event" required error={errors.triggerKey} hint={entry?.description}>
-          <select
-            className="min-h-11 w-full rounded-[var(--radius-control)] border border-line bg-surface px-3 py-2 text-ink"
+          <GroupedSelect
             value={draft.trigger.triggerKey}
             onChange={(e) => onChange(setTrigger(draft, { kind: "event", triggerKey: e.target.value }, catalogue))}
           >
@@ -63,7 +69,7 @@ export function TriggerEditor({ draft, onChange, catalogue, errors }: { draft: D
                 {catalogue.triggers.filter((t) => t.group === group).map((t) => <option key={t.key} value={t.key}>{t.label}</option>)}
               </optgroup>
             ))}
-          </select>
+          </GroupedSelect>
         </Field>
       ) : null}
       {entry?.staffOnly ? <Callout tone="info" title="Staff-only event">Actions can address staff and administrators only.</Callout> : null}

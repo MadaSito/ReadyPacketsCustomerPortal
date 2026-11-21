@@ -4,7 +4,7 @@
  * The canvas has button alternatives for everything drag does (add, move earlier/later, remove).
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useLocation, useParams, useSearch } from "wouter";
 import { errorMessage } from "@/lib/trpc";
 import {
@@ -77,8 +77,7 @@ export function Editor({ catalogue, initial, publicId, expectedVersion }: { cata
   const visible = (id: Exclude<StepId, "review">) => (shown.has(id) ? errors[id] : {});
   const index = STEPS.findIndex((s) => s.id === step);
   const allValid = !hasErrors(errors.trigger) && !hasErrors(errors.conditions) && !hasErrors(errors.actions);
-  const change = (next: Draft) => { setDraft(next); setTest(null); };
-  useEffect(() => setSaveError(null), [draft]);
+  const change = (next: Draft) => { setDraft(next); setTest(null); setSaveError(null); };
 
   const next = () => {
     if (step === "review") { void save(); return; }
