@@ -77,7 +77,7 @@ describe("assurance: isolated transactional model", () => {
     h.services.assurance = createAssuranceModule(h.deps);
     h.services.engagement = { notify } as unknown as Services["engagement"];
     mailReadiness.mockResolvedValue({ ready: true });
-    h.services.jobAdmin = { getMailReadiness: mailReadiness } as Services["jobAdmin"];
+    h.services.jobAdmin = { getMailReadiness: () => mailReadiness() } as Services["jobAdmin"];
     async function findUser(where: ReturnType<typeof eq>, opts?: { tx?: DbOrTx; forUpdate?: boolean }) {
       const query = (opts?.tx ?? db.db).select().from(users).where(where).limit(1);
       const [row] = await (opts?.forUpdate ? query.for("update") : query);

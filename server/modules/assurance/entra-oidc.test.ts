@@ -21,6 +21,7 @@ const oid = "44444444-4444-4444-8444-444444444444";
 const nonce = "synthetic-nonce";
 const nowSeconds = 1_800_000_000;
 const expected = { tenantId, clientId, nonce, nowSeconds };
+const completionPath = /^\/sso\/complete\?attempt=[0-9A-HJKMNP-TV-Z]{26}$/;
 const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwk = publicKey.export({ format: "jwk" });
 const encode = (value: Record<string, unknown>) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -125,8 +126,13 @@ describe("Assurance through the Entra callback and completion service", () => {
       token: token({ nonce: params.get("nonce"), ...options.claims }, options.alg, options.signed),
     });
     const state = params.get("state")!;
-    const callback = (binding = browser) => service.callback({ browser: binding, state, code, error: undefined });
-    const complete = (session: SessionPrincipal | null = null) => service.complete({ browser, session });
+    let attempt = "";
+    const callback = async (binding = browser) => {
+      const path = await service.callback({ browser: binding, state, code, error: undefined });
+      if (completionPath.test(path)) attempt = new URL(path, h.deps.config.canonicalOrigin).searchParams.get("attempt")!;
+      return path;
+    };
+    const complete = (session: SessionPrincipal | null = null, binding = browser) => service.complete({ attempt, browser: binding, session });
     return { callback, complete };
   }
 
@@ -136,8 +142,9 @@ describe("Assurance through the Entra callback and completion service", () => {
     await expect(flow.callback(randomToken(32))).resolves.toBe("/sso/refused?reason=SSO_EXPIRED");
     expect(fetchPinned).not.toHaveBeenCalled();
     const results = await Promise.all([flow.callback(), flow.callback()]);
-    expect(results.sort()).toEqual(["/sso/complete", "/sso/refused?reason=SSO_EXPIRED"]);
+    expect(results.sort()).toEqual([expect.stringMatching(completionPath), "/sso/refused?reason=SSO_EXPIRED"]);
     expect(fetchPinned.mock.calls.filter(([url]) => url === endpoint.token)).toHaveLength(1);
+    await expect(flow.complete(null, randomToken(32))).rejects.toMatchObject({ reasonCode: "SSO_EXPIRED" });
     const completed = await flow.complete();
     expect(completed).toMatchObject({ purpose: "sign_in", provisioned: false, nextStep: null });
     await expect(flow.complete()).rejects.toMatchObject({ reasonCode: "SSO_EXPIRED" });
@@ -159,13 +166,13 @@ describe("Assurance through the Entra callback and completion service", () => {
     const inactive = await seed({ linked: true, status: "deactivated" });
     for (const [user, reasonCode] of [[unlinked, "SSO_NOT_LINKED"], [inactive, "SSO_ACCOUNT_INACTIVE"]] as const) {
       const flow = await prepare({ claims: { oid: user.objectId, email: user.email } });
-      await expect(flow.callback()).resolves.toBe("/sso/complete");
+      await expect(flow.callback()).resolves.toMatch(completionPath);
       await expect(flow.complete()).rejects.toMatchObject({ reasonCode });
       expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, user.id))).toHaveLength(0);
     }
     await db.db.update(ssoConfiguration).set({ jitMode: "customers" }).where(eq(ssoConfiguration.id, 1));
     const flow = await prepare({ claims: { oid: unlinked.objectId, email: unlinked.email } });
-    await expect(flow.callback()).resolves.toBe("/sso/complete");
+    await expect(flow.callback()).resolves.toMatch(completionPath);
     await expect(flow.complete()).rejects.toMatchObject({ reasonCode: "SSO_ACCOUNT_EXISTS" });
     expect(await db.db.select().from(ssoIdentities).where(eq(ssoIdentities.userId, unlinked.id))).toHaveLength(0);
     expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, unlinked.id))).toHaveLength(0);
@@ -176,13 +183,13 @@ describe("Assurance through the Entra callback and completion service", () => {
     const identity = { oid: user.objectId, email: user.email };
     await db.db.update(ssoConfiguration).set({ trustEntraMfa: false }).where(eq(ssoConfiguration.id, 1));
     const fallback = await prepare({ claims: identity });
-    await expect(fallback.callback()).resolves.toBe("/sso/complete");
+    await expect(fallback.callback()).resolves.toMatch(completionPath);
     await expect(fallback.complete()).resolves.toMatchObject({ purpose: "sign_in", nextStep: "enroll_mfa" });
 
     await db.db.update(users).set({ mustChangePassword: true }).where(eq(users.id, user.id));
     await db.db.update(ssoConfiguration).set({ trustEntraMfa: true }).where(eq(ssoConfiguration.id, 1));
     const forcedChange = await prepare({ claims: identity });
-    await expect(forcedChange.callback()).resolves.toBe("/sso/complete");
+    await expect(forcedChange.callback()).resolves.toMatch(completionPath);
     await expect(forcedChange.complete()).rejects.toMatchObject({ reasonCode: "SSO_LOCAL_SIGN_IN_REQUIRED" });
     expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, user.id))).toHaveLength(1);
   });
@@ -191,7 +198,7 @@ describe("Assurance through the Entra callback and completion service", () => {
     const user = await seed({ linked: true });
     const another = await seed({ linked: true });
     const login = await prepare({ claims: { oid: user.objectId, email: user.email } });
-    await expect(login.callback()).resolves.toBe("/sso/complete");
+    await expect(login.callback()).resolves.toMatch(completionPath);
     const signedIn = await login.complete();
     if (signedIn.purpose !== "sign_in") throw new Error("expected sign-in");
     const resolve = (token: string) => h.services.identity.sessionResolver.resolve({ token, transport: "cookie" });
@@ -204,12 +211,18 @@ describe("Assurance through the Entra callback and completion service", () => {
       [{ oid: user.objectId }, "SSO_SESSION_CHANGED", { ...principal, sessionId: ulid() }],
     ] as const) {
       const flow = await prepare({ session: principal, claims: proof });
-      await expect(flow.callback()).resolves.toBe("/sso/complete");
+      const exchanges = fetchPinned.mock.calls.filter(([url]) => url === endpoint.token).length;
+      await expect(flow.callback()).resolves.toMatch(completionPath);
+      expect(fetchPinned.mock.calls.filter(([url]) => url === endpoint.token)).toHaveLength(exchanges);
       await expect(flow.complete(session)).rejects.toMatchObject({ reasonCode });
+      if (reasonCode === "SSO_SESSION_CHANGED") {
+        expect(fetchPinned.mock.calls.filter(([url]) => url === endpoint.token)).toHaveLength(exchanges);
+        await expect(flow.complete(principal)).rejects.toMatchObject({ reasonCode: "SSO_EXPIRED" });
+      }
       await expect(resolve(signedIn.issued.token)).resolves.toMatchObject({ stepUpAt: null });
     }
     const verified = await prepare({ session: principal, claims: { oid: user.objectId } });
-    await expect(verified.callback()).resolves.toBe("/sso/complete");
+    await expect(verified.callback()).resolves.toMatch(completionPath);
     const elevated = await verified.complete(principal);
     if (elevated.purpose !== "step_up") throw new Error("expected step-up");
     await expect(resolve(signedIn.issued.token)).resolves.toBeNull();
