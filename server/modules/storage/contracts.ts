@@ -1,6 +1,7 @@
 import type { Readable } from "node:stream";
 import type { z } from "zod";
 import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import type { CopyLogService } from "./copyLog.js";
 
 export const STORAGE_PROVIDER_KINDS = ["s3", "azure_blob", "dropbox", "google_drive", "sharepoint", "onedrive"] as const;
 export type StorageProviderKind = (typeof STORAGE_PROVIDER_KINDS)[number];
@@ -121,6 +122,7 @@ export interface StorageCopyInput extends StoragePutInput {
 }
 
 export interface StorageModule extends ModuleLifecycle {
+  copies: CopyLogService;
   registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
     kind: StorageProviderKind, definition: StorageAdapterDefinition<C, S>,
   ): void;

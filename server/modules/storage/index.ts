@@ -13,6 +13,7 @@ import type {
   StorageModule, StorageProviderKind, StoragePurpose, StorageTestResult,
 } from "./contracts.js";
 import { StorageAdapterError } from "./contracts.js";
+import { copyLogHealth, createCopyLogService } from "./copyLog.js";
 import { registerFileCopies } from "./fileCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
 import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storagePublicId, storageTest, storageUpdate } from "./validation.js";
@@ -164,6 +165,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
   }
 
   const service: StorageModule = {
+    copies: createCopyLogService(deps),
     registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
       kind: StorageProviderKind, def: StorageAdapterDefinition<C, S>,
     ) {
@@ -182,7 +184,8 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
       const [row] = await db.select({ enabled: count() }).from(storageConnections).where(eq(storageConnections.enabled, true));
       const enabled = row?.enabled ?? 0;
       return [{ component: "storage.connections", state: enabled ? "ok" : "disabled", metrics: { enabled },
-        summary: enabled ? "Cloud copy destinations are enabled." : "Cloud copy destinations are disabled.", checkedAt: clock.now() }];
+        summary: enabled ? "Cloud copy destinations are enabled." : "Cloud copy destinations are disabled.", checkedAt: clock.now() },
+      await copyLogHealth(deps)];
     },
     connections: {
       async list(principal, raw) {

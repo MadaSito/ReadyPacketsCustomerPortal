@@ -188,13 +188,20 @@ describe("fenced order-file copy jobs", () => {
     await module.assignments.set(admin, { purpose: "order_files", connectionPublicIds: [first.publicId, second.publicId] });
     const { storageKey } = await stage();
     expect(h.jobs.enqueued).toHaveLength(2);
+    const queued = await db.db.select().from(storageCopyAttempts);
+    expect(queued).toHaveLength(2);
+    expect(queued.every((row) => row.kind === "order_file" && row.state === "queued")).toBe(true);
     expect(await h.jobs.runAll(jobType)).toEqual([
       { outcome: "completed", safeCounts: { files: 1, digestVerified: 1 } },
       { outcome: "completed", safeCounts: { files: 1, digestVerified: 1 } },
     ]);
     const copies = await db.db.select().from(storageFileCopies);
     expect(copies.every((row) => row.state === "copied" && row.digestVerified)).toBe(true);
-    expect(JSON.stringify([copies, h.audit.events])).not.toMatch(/Beispiel|RPCUS-|synthetic-remote-reference/u);
+    const attempts = await db.db.select().from(storageCopyAttempts);
+    expect(attempts.map((row) => row.publicId).sort()).toEqual(queued.map((row) => row.publicId).sort());
+    expect(attempts.every((row) => row.state === "verified" && row.verification === "checksum" && row.bytes === sourceBytes.length)).toBe(true);
+    expect(h.audit.named("storage.copy_result")).toHaveLength(0);
+    expect(JSON.stringify([copies, attempts, h.audit.events])).not.toMatch(/Beispiel|RPCUS-|synthetic-remote-reference/u);
     expect(adapterPuts.mock.calls[0]?.[0]?.[1]).toMatch(/^Él Beispiel RPCUS-TEST00001/u);
     expect(h.storage.objects.get(storageKey)).toEqual(sourceBytes);
     expect(adapterRemovals).not.toHaveBeenCalled();
@@ -209,6 +216,9 @@ describe("fenced order-file copy jobs", () => {
     expect(adapterPuts).not.toHaveBeenCalled();
     expect((await db.db.select().from(storageFileCopies))[0]).toMatchObject({
       state: "skipped", reasonCode: "STORAGE_ASSIGNMENT_INACTIVE",
+    });
+    expect((await db.db.select().from(storageCopyAttempts))[0]).toMatchObject({
+      state: "not_written", verification: null, errorCode: "STORAGE_ASSIGNMENT_INACTIVE",
     });
   });
 
