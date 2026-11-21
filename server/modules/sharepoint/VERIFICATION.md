@@ -27,3 +27,17 @@ Not verified:
 - Real Graph behaviour, including `enforceUniqueValues` on list columns, `$filter` on indexed columns, upload-session semantics and throttling.
 - Container start-up wiring, which is only covered by typechecking.
 - The UI.
+
+## Backfill and claim liveness (local fakes only)
+
+These tests run in `sharepoint.test.ts` against a fake orders listing and FakeGraph:
+
+- "dispatches a newer version whose own job exhausted against the busy claim": v2 hits six BUSY refusals while v1 holds the claim. When v1 completes it enqueues a follow-up, the follow-up updates the item, and nothing else is enqueued.
+- "backfills existing orders in resumable bounded batches…":
+  - Backfill is refused while the sync is disabled and when the administrator has no step-up.
+  - It fails closed with `ORDERS_LISTING_UNAVAILABLE` when the listing port is absent, then resumes.
+  - It pages by keyset cursor, and the progress count reaches 5.
+  - A replayed batch is cancelled, and a restarted run creates no duplicate items.
+  - The started, resumed and finished events are audited.
+
+The tests use a fake of the orders module's `listOrderPublicIdsForSync` (commit 039ce05). They don't run against the real implementation.

@@ -11,7 +11,7 @@ import { FakeGraph } from "../storage/adapters/graphDriveFake.js";
 import { LIST_COLUMNS, ORDER_ID_COLUMN, buildOrderFields, fieldsHash, isCompatible, packetsSummary, safeText, toMajor, validListName } from "./fields.js";
 import { createSharepointModule, type SharepointModule } from "./index.js";
 import { sharepointOrderSync, sharepointSyncConfig } from "./schema.js";
-import { SYNC_JOB } from "./service.js";
+import { BACKFILL_JOB, SYNC_JOB } from "./service.js";
 
 const CONN = "01JCONN0000000000000000001";
 const ORDER = "01JORDER000000000000000001";
@@ -70,8 +70,9 @@ beforeEach(async () => {
   h.services.orders = {
     registerChangeListener: (l: (typeof listeners)[number]) => void listeners.push(l),
     getOrderSyncView: async (id: string) => {
+      const rendered = id === ORDER ? orderView() : null; // rendered before concurrent changes land
       await duringView?.();
-      return id === ORDER ? orderView() : null;
+      return rendered;
     },
   } as never;
   h.services.storageConnections = {
@@ -116,6 +117,74 @@ describe("field mapping", () => {
 });
 
 describe("sharepoint order sync (local fakes only)", () => {
+  it("dispatches a newer version whose own job exhausted against the busy claim", async () => {
+    await enable();
+    await changeOrder(); // v1
+    const handler = h.jobs.handlers.get(SYNC_JOB)!;
+    let blocked = 0;
+    duringView = async () => {
+      duringView = null;
+      orderStatus = "Delivered";
+      await changeOrder(); // v2 staged while v1 is rendering/writing
+      const v2 = h.jobs.enqueued.find((j) => j.options?.idempotencyKey === `sharepoint:order:${ORDER}:v2`)!;
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        const r = await handler({ jobId: v2.jobId, type: SYNC_JOB, payload: v2.payload as never, attempt, fencingToken: 1, correlationId: "c", signal: new AbortController().signal, assertStillOwned: async () => {} });
+        if (r.outcome === "failed" && r.reasonCode === "SHAREPOINT_SYNC_BUSY") blocked += 1;
+      }
+      h.jobs.enqueued = h.jobs.enqueued.filter((j) => j !== v2); // exhausted: the queue will never run it again
+    };
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { created: 1 } }]);
+    expect(blocked).toBe(6);
+    expect((await db.db.select().from(sharepointOrderSync))[0]).toMatchObject({ syncedVersion: 1, desiredVersion: 2, state: "pending", claimToken: null });
+    expect(h.jobs.enqueued.map((j) => j.options?.idempotencyKey)).toEqual([expect.stringMatching(new RegExp(`^sharepoint:order:${ORDER}:v2:after:`, "u"))]);
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { updated: 1 } }]);
+    expect(items().size).toBe(1);
+    expect((await db.db.select().from(sharepointOrderSync))[0]).toMatchObject({ syncedVersion: 2, state: "synced" });
+    expect(h.jobs.enqueued).toHaveLength(0); // caught up: no further follow-up
+  });
+
+  it("backfills existing orders in resumable bounded batches without duplicating list items", async () => {
+    const all = [ORDER, "01JORDER000000000000000002", "01JORDER000000000000000003", "01JORDER000000000000000004", "01JORDER000000000000000005"];
+    await expect(mod.orderSync.backfill(admin)).rejects.toMatchObject({ reasonCode: "SHAREPOINT_SYNC_DISABLED" });
+    await enable();
+    await expect(mod.orderSync.backfill(fakePrincipal({ role: "admin", stepUpAt: null }))).rejects.toBeInstanceOf(DomainError);
+
+    // Orders listing port absent → fails closed, progress kept.
+    let view = await mod.orderSync.backfill(admin);
+    expect(view.backfill).toMatchObject({ state: "running", enqueued: 0 });
+    expect(await h.jobs.runAll(BACKFILL_JOB)).toEqual([{ outcome: "failed", reasonCode: "ORDERS_LISTING_UNAVAILABLE", retryable: false }]);
+    expect((await mod.orderSync.get(admin)).backfill).toMatchObject({ state: "failed", reasonCode: "ORDERS_LISTING_UNAVAILABLE" });
+
+    const pages: (string | null)[] = [];
+    (h.services.orders as unknown as Record<string, unknown>).listOrderPublicIdsForSync = async (input: { afterPublicId: string | null; limit: number }) => {
+      pages.push(input.afterPublicId);
+      const rest = all.filter((id) => input.afterPublicId === null || id > input.afterPublicId).slice(0, Math.min(2, input.limit));
+      const last = rest[rest.length - 1];
+      return { publicIds: rest, nextAfter: last && last !== all[all.length - 1] ? last : null };
+    };
+    await mod.orderSync.backfill(admin); // resume
+    for (let i = 0; i < 5 && h.jobs.enqueued.some((j) => j.type === BACKFILL_JOB); i += 1) await h.jobs.runAll(BACKFILL_JOB);
+    expect(pages).toEqual([null, all[1], all[3]]);
+    view = await mod.orderSync.get(admin);
+    expect(view.backfill).toMatchObject({ state: "completed", enqueued: 5 });
+    expect(h.jobs.enqueued.filter((j) => j.type === SYNC_JOB)).toHaveLength(5);
+    await h.jobs.runAll(SYNC_JOB);
+    expect(items().size).toBe(1); // only ORDER exists in the fake orders module
+
+    // A replayed batch job for an advanced cursor writes nothing.
+    await mod.orderSync.backfill(admin, { restart: true });
+    const first = h.jobs.enqueued.find((j) => j.type === BACKFILL_JOB)!;
+    await h.jobs.runAll(BACKFILL_JOB);
+    const replay = await h.jobs.handlers.get(BACKFILL_JOB)!({ jobId: first.jobId, type: BACKFILL_JOB, payload: first.payload as never, attempt: 2, fencingToken: 1, correlationId: "c", signal: new AbortController().signal, assertStillOwned: async () => {} });
+    expect(replay).toEqual({ outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" });
+    for (let i = 0; i < 5 && h.jobs.enqueued.some((j) => j.type === BACKFILL_JOB); i += 1) await h.jobs.runAll(BACKFILL_JOB);
+    await h.jobs.runAll(SYNC_JOB);
+    expect(items().size).toBe(1);
+    expect((await mod.orderSync.get(admin)).backfill).toMatchObject({ state: "completed", enqueued: 5 });
+    const events = h.audit.events.map((e) => e.eventName);
+    expect(events).toEqual(expect.arrayContaining(["sharepoint.sync.backfill_started", "sharepoint.sync.backfill_resumed", "sharepoint.sync.backfill_finished"]));
+  });
+
   it("ships disabled: order changes stage nothing", async () => {
     await changeOrder();
     expect(h.jobs.enqueued).toHaveLength(0);

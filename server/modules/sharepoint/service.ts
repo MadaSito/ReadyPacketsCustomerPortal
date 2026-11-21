@@ -27,6 +27,17 @@ import { createListClient } from "./listClient.js";
 import { sharepointOrderSync, sharepointSyncConfig, type SharepointSyncState } from "./schema.js";
 
 export const SYNC_JOB = "sharepoint.sync_order";
+export const BACKFILL_JOB = "sharepoint.backfill_orders";
+const BACKFILL_BATCH = 200;
+
+export interface BackfillJobPayload {
+  runId: string;
+  /** Cursor this batch was planned for; a replay after the cursor advanced is a no-op. */
+  after: string | null;
+}
+
+/** Orders-owned keyset listing port (system use only; ids only). */
+type OrderIdLister = (input: { afterPublicId: string | null; limit: number }, tx?: DbOrTx) => Promise<{ publicIds: string[]; nextAfter: string | null }>;
 const CONFIG_ID = 1;
 const MAX_STATUS_PAGE = 100;
 const RESYNC_BATCH = 500;
@@ -48,6 +59,7 @@ export interface OrderSyncSettingsView {
   state: "disabled" | "not_configured" | "ready" | "error";
   lastError: { reasonCode: string; at: Date } | null;
   counts: { pending: number; synced: number; failed: number };
+  backfill: { state: "running" | "completed" | "failed"; enqueued: number; reasonCode: string | null; startedAt: Date | null; finishedAt: Date | null } | null;
 }
 
 export type OrderSyncTestCode = "OK" | "NOT_CONFIGURED" | "LIST_NOT_FOUND" | "LIST_INCOMPATIBLE" | "AUTH_FAILED" | "DESTINATION_DENIED" | "EGRESS_DENIED" | "RATE_LIMITED" | "PROVIDER_UNAVAILABLE";
@@ -132,9 +144,28 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     await stage(event.orderPublicId, tx);
   }
 
-  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string): Promise<void> {
+  /**
+   * Liveness: when a claim is released while a newer version was staged, the newer version's own job may
+   * have exhausted its attempts against the BUSY claim. Enqueue a fresh follow-up (distinct key) so the
+   * latest version is always dispatched. A redundant follow-up ends as caught_up.
+   */
+  async function followUp(tx: Tx, orderPublicId: string, latestVersion: number, targetVersion: number, job: ClaimedJob<SyncJobPayload>): Promise<void> {
+    if (latestVersion <= targetVersion) return;
+    await jobs.enqueue<SyncJobPayload>(
+      SYNC_JOB,
+      { orderPublicId },
+      { idempotencyKey: `sharepoint:order:${orderPublicId}:v${latestVersion}:after:${job.jobId}`, correlationId: job.correlationId, maxAttempts: 6 },
+      tx,
+    );
+  }
+
+  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string, targetVersion?: number): Promise<void> {
     await db.transaction(async (tx) => {
       await job.assertStillOwned(tx);
+      if (targetVersion !== undefined && state !== "pending") {
+        const [latest] = await tx.select({ v: sharepointOrderSync.desiredVersion, token: sharepointOrderSync.claimToken }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
+        if (latest?.token === claimToken) await followUp(tx, orderPublicId, latest.v, targetVersion, job);
+      }
       await tx
         .update(sharepointOrderSync)
         .set({ state, reasonCode, attempts: sql`${sharepointOrderSync.attempts} + 1`, claimJobId: null, claimToken: null, claimedUntil: null })
@@ -278,6 +309,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
             claimedUntil: null,
           })
           .where(ownsClaim);
+        await followUp(tx, orderPublicId, latest?.v ?? targetVersion, targetVersion, job);
         await audit.record(
           {
             category: "integration",
@@ -298,7 +330,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     } catch (error) {
       if (!(error instanceof StorageAdapterError) && !(error instanceof DomainError)) throw error; // lost fence etc.
       const { reasonCode, retryable } = reasonFor(error);
-      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken);
+      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken, targetVersion);
       return { outcome: "failed", reasonCode, retryable };
     }
   }
@@ -391,6 +423,9 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       state,
       lastError: config?.lastErrorCode && config.lastErrorAt ? { reasonCode: config.lastErrorCode, at: config.lastErrorAt } : null,
       counts,
+      backfill: config?.backfillState
+        ? { state: config.backfillState, enqueued: config.backfillEnqueued, reasonCode: config.backfillReasonCode, startedAt: config.backfillStartedAt, finishedAt: config.backfillFinishedAt }
+        : null,
     };
   }
 
@@ -409,9 +444,68 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     return { ok: code === "OK", code };
   }
 
+  const orderLister = (): OrderIdLister | null => {
+    const fn = (deps.services.orders as unknown as { listOrderPublicIdsForSync?: OrderIdLister }).listOrderPublicIdsForSync;
+    return typeof fn === "function" ? fn.bind(deps.services.orders) : null;
+  };
+
+  /** One bounded batch per job; the next batch is a new job keyed by (run, cursor). DB work only. */
+  async function runBackfill(job: ClaimedJob<BackfillJobPayload>): Promise<JobResult> {
+    const config = await readConfig(db);
+    if (!config || config.backfillRunId !== job.payload.runId || config.backfillState !== "running") return { outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" };
+    const finish = async (state: "completed" | "failed", reasonCode: string | null, tx: Tx) => {
+      await tx.update(sharepointSyncConfig).set({ backfillState: state, backfillReasonCode: reasonCode, backfillFinishedAt: clock.now() }).where(eq(sharepointSyncConfig.id, CONFIG_ID));
+      await audit.record(
+        { category: "integration", eventName: "sharepoint.sync.backfill_finished", action: "sync", outcome: state, ...(reasonCode ? { reasonCode } : {}), actor: { role: "system" }, resource: { type: "sharepoint_sync", id: CONFIG_ID }, jobId: job.jobId, correlationId: job.correlationId, provider: "sharepoint", safeCounts: { enqueued: config.backfillEnqueued } },
+        tx,
+      );
+    };
+    if (!config.enabled || !config.listId) {
+      await db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
+        await finish("failed", "SHAREPOINT_SYNC_DISABLED", tx);
+      });
+      return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_DISABLED" };
+    }
+    const lister = orderLister();
+    if (!lister) {
+      await db.transaction(async (tx) => {
+        await job.assertStillOwned(tx);
+        await finish("failed", "ORDERS_LISTING_UNAVAILABLE", tx);
+      });
+      return { outcome: "failed", reasonCode: "ORDERS_LISTING_UNAVAILABLE", retryable: false };
+    }
+    const cursor = job.payload.after ?? null;
+    if (config.backfillCursor !== cursor) return { outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" };
+    const page = await lister({ afterPublicId: cursor, limit: BACKFILL_BATCH });
+    const ids = page.publicIds.filter((id) => /^[0-9A-Z]{26}$/u.test(id)).slice(0, BACKFILL_BATCH);
+    return db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      const locked = await readConfig(tx, true);
+      // Resumable and exactly-once per batch: only the run/cursor this job was planned for may advance.
+      if (!locked || locked.backfillRunId !== job.payload.runId || locked.backfillState !== "running" || locked.backfillCursor !== cursor) {
+        return { outcome: "canceled" as const, reasonCode: "SHAREPOINT_BACKFILL_SUPERSEDED" };
+      }
+      for (const id of ids) await stage(id, tx, { correlationId: job.correlationId });
+      const last = ids[ids.length - 1] ?? cursor;
+      const done = page.nextAfter === null || ids.length === 0;
+      await tx
+        .update(sharepointSyncConfig)
+        .set({ backfillCursor: last, backfillEnqueued: sql`${sharepointSyncConfig.backfillEnqueued} + ${ids.length}` })
+        .where(eq(sharepointSyncConfig.id, CONFIG_ID));
+      if (done) {
+        await finish("completed", null, tx);
+      } else {
+        await jobs.enqueue<BackfillJobPayload>(BACKFILL_JOB, { runId: job.payload.runId, after: last }, { idempotencyKey: `sharepoint:backfill:${job.payload.runId}:${last}`, correlationId: job.correlationId }, tx);
+      }
+      return { outcome: "completed" as const, safeCounts: { enqueued: ids.length } };
+    });
+  }
+
   return {
     onOrderChange,
     runSync,
+    runBackfill,
 
     /** Automation action / manual resync for one order. Returns false when the sync is not enabled. */
     async enqueueOrder(orderPublicId: string, options: { correlationId: string; idempotencyKey: string }): Promise<"queued" | "disabled" | "order_not_found"> {
@@ -488,6 +582,34 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
         const result = await testList(principal, config?.listId ?? null);
         await guard(principal, (tx) => adminAudit(principal, "sharepoint.sync.tested", "test", tx, { outcome: result.ok ? "completed" : "failed", reasonCode: result.code }));
         return result;
+      },
+
+      /**
+       * "Sync all existing orders now": starts (or resumes after a failure) a bounded, fenced backfill over the
+       * orders module's keyset listing. Every order is staged through the same outbox; the list item is found
+       * by RpOrderId, so repeated runs never duplicate items. `restart` begins again from the first order.
+       */
+      async backfill(principal: SessionPrincipal, input: { restart?: boolean } = {}) {
+        await guard(principal, async (tx) => {
+          const config = await readConfig(tx, true);
+          if (!config?.enabled || !config.listId) throw new DomainError("NOT_CONFIGURED", "SHAREPOINT_SYNC_DISABLED", "Enable the sync first.");
+          if (config.backfillState === "running" && !input.restart) return;
+          const resume = !input.restart && config.backfillState === "failed" && config.backfillRunId !== null;
+          const runId = resume ? config.backfillRunId! : ulid(clock.now().getTime());
+          await tx
+            .update(sharepointSyncConfig)
+            .set({
+              backfillRunId: runId,
+              backfillState: "running",
+              backfillReasonCode: null,
+              backfillFinishedAt: null,
+              ...(resume ? {} : { backfillCursor: null, backfillEnqueued: 0, backfillStartedAt: clock.now() }),
+            })
+            .where(eq(sharepointSyncConfig.id, CONFIG_ID));
+          await jobs.enqueue<BackfillJobPayload>(BACKFILL_JOB, { runId, after: resume ? config.backfillCursor : null }, { idempotencyKey: `sharepoint:backfill:${runId}:${resume ? (config.backfillCursor ?? "start") : "start"}:${clock.now().getTime()}` }, tx);
+          await adminAudit(principal, resume ? "sharepoint.sync.backfill_resumed" : "sharepoint.sync.backfill_started", "sync", tx);
+        });
+        return view(principal);
       },
 
       /** Re-stages every order already known to the sync (bounded batch); new orders stage on their next change. */

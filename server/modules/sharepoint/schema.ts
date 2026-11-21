@@ -16,6 +16,14 @@ export const sharepointSyncConfig = mysqlTable("sharepoint_sync_config", {
   updatedByUserId: refColumn("updated_by_user_id"),
   lastErrorCode: varchar("last_error_code", { length: 64 }),
   lastErrorAt: utcDateTime("last_error_at"),
+  /** Backfill of existing orders ("Sync all existing orders now"): resumable keyset cursor + progress. */
+  backfillRunId: char("backfill_run_id", { length: 26 }),
+  backfillState: mysqlEnum("backfill_state", ["running", "completed", "failed"]),
+  backfillCursor: char("backfill_cursor", { length: 26 }),
+  backfillEnqueued: int("backfill_enqueued", { unsigned: true }).notNull().default(0),
+  backfillReasonCode: varchar("backfill_reason_code", { length: 64 }),
+  backfillStartedAt: utcDateTime("backfill_started_at"),
+  backfillFinishedAt: utcDateTime("backfill_finished_at"),
   updatedAt: updatedAtColumn(),
 });
 

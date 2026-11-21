@@ -37,6 +37,7 @@ export const sharepointRouter = router({
         .mutation(({ ctx, input }) => ctx.services.sharepoint.orderSync.update(ctx.session, input)),
       test: expensive.mutation(({ ctx }) => ctx.services.sharepoint.orderSync.test(ctx.session)),
       resyncAll: expensive.mutation(({ ctx }) => ctx.services.sharepoint.orderSync.resyncAll(ctx.session)),
+      backfill: expensive.input(z.object({ restart: z.boolean().optional() }).strict().default({})).mutation(({ ctx, input }) => ctx.services.sharepoint.orderSync.backfill(ctx.session, input)),
       status: admin
         .input(z.strictObject({ cursor: z.string().max(16).nullish(), limit: z.number().int().min(1).max(100).optional(), state: z.enum(SHAREPOINT_SYNC_STATES).optional() }))
         .query(({ ctx, input }) => ctx.services.sharepoint.orderSync.status(ctx.session, { ...input, state: input.state })),

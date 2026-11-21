@@ -9,7 +9,7 @@ import { graphDriveDefinitions } from "../storage/adapters/graphDrive.js";
 import { createGraphDrivePort, type PublishedGraphClient } from "../storage/adapters/graphDriveGraph.js";
 import { GraphTransportError, type GraphCredentials, type GraphHttpPort } from "../storage/adapters/graphDrivePort.js";
 import "./automation.js";
-import { SYNC_JOB, createSharepointService, type SharepointService, type SyncJobPayload } from "./service.js";
+import { BACKFILL_JOB, SYNC_JOB, createSharepointService, type BackfillJobPayload, type SharepointService, type SyncJobPayload } from "./service.js";
 
 export type { OrderSyncSettingsView, OrderSyncTestCode } from "./service.js";
 
@@ -44,6 +44,7 @@ export function createSharepointModule(deps: ModuleDeps, options: { port?: Graph
   // Mostly network I/O guarded by fences and remote-id lookup: an interrupted attempt re-runs the lookup by
   // RpOrderId before creating, so it cannot create a second item for the same order.
   deps.jobs.register<SyncJobPayload>(SYNC_JOB, (job) => service.runSync(job), { retrySafe: true });
+  deps.jobs.register<BackfillJobPayload>(BACKFILL_JOB, (job) => service.runBackfill(job), { retrySafe: true });
 
   const { runSync: _runSync, ...api } = service;
   return {

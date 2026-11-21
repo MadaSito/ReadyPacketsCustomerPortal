@@ -26,6 +26,7 @@ Every procedure requires admin, `storage.manage` and a fresh step-up. Each call 
 | `orderSync.update` (mutation) | `{ expectedVersion, enabled, listId, listLabel, includePortalLink }` | same as `get`. Enabling requires a passing test. |
 | `orderSync.test` (mutation) | none | `{ ok, code }`. Codes: `OK`, `NOT_CONFIGURED`, `LIST_NOT_FOUND`, `LIST_INCOMPATIBLE`, `AUTH_FAILED`, `DESTINATION_DENIED`, `EGRESS_DENIED`, `RATE_LIMITED`, `PROVIDER_UNAVAILABLE` |
 | `orderSync.resyncAll` (mutation) | none | `{ enqueued }`. Re-stages orders already known to the sync, at most 500. |
+| `orderSync.backfill` (mutation, step-up) | `{ restart?: boolean }` | "Sync all existing orders now". Returns the settings view; progress is in `backfill: { state: running/completed/failed, enqueued, reasonCode, startedAt, finishedAt }` (poll `orderSync.get`). Runs job `sharepoint.backfill_orders` in batches of 200 over `services.orders.listOrderPublicIdsForSync` (keyset order), staging each order through the fenced outbox. A failed run resumes from its cursor; `restart` starts again from the first order. Each batch job carries its cursor, so a replayed batch does nothing. Items are matched by RpOrderId, so a rerun never duplicates them. Audited: `sharepoint.sync.backfill_started`, `_resumed` and `_finished`. |
 | `orderSync.status` (query) | `{ cursor?, limit?, state? }` | `{ items: { orderPublicId, reference, state, attempts, lastSyncedAt, reasonCode }[], nextCursor }` |
 
 ## Order-data sync
@@ -41,6 +42,10 @@ Every procedure requires admin, `storage.manage` and a fresh step-up. Each call 
 - List columns, which use the minimal field set: Title (the order reference), `RpOrderId` (indexed and unique), `RpCustomerRef`, `RpStatus`, `RpPackets`, `RpCurrency`, `RpSubtotal`, `RpDiscount`, `RpTotal`, `RpCreatedAt`, `RpSubmittedAt`, `RpClosedAt`, `RpUpdatedAt`, `RpPortalLink` (optional). Customer names and email addresses are never sent.
 - Audit events: `sharepoint.order.sync`, `sharepoint.list.created`, `sharepoint.sync.enabled`, `sharepoint.sync.disabled`, `sharepoint.sync.updated`, `sharepoint.sync.tested`, `sharepoint.sync.resync_requested`, `sharepoint.admin.denied`. They carry IDs, counts and codes only.
 - Automation action `sharepoint.sync_order` ("Sync order to SharePoint"): `forbidOnStaffOnlyTrigger` is set, and the action is also refused at runtime when the trigger is staff-only. It only enqueues the job.
+
+### Liveness
+
+A job that is refused because another job holds the order's claim (BUSY) retries with backoff and can run out of attempts. To cover that, the job holding the claim enqueues a fresh follow-up (`sharepoint:order:<id>:v<latest>:after:<jobId>`) when it releases the claim, whether it completed or failed permanently, if a newer version was staged in the meantime. A follow-up that turns out to be redundant ends as caught up.
 
 ## Least privilege (administrator guidance)
 - For SharePoint, use an Entra app with `Sites.Selected`, granted `write` on the single chosen site only.
