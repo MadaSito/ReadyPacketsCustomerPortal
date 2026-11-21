@@ -167,8 +167,14 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
       navigate(`/admin/workflows/${result.workflowPublicId}/versions`);
     } catch (err) {
       if (err instanceof StepUpCancelledError) return;
-      const details = safeError(err)?.details as { issues?: unknown } | undefined;
-      if (Array.isArray(details?.issues)) setIssues(details.issues as WorkflowIssue[]);
+      // WORKFLOW_DRAFT_INVALID carries parallel arrays: messages, field paths and codes (all errors).
+      const details = safeError(err)?.details as { issues?: unknown; issuePaths?: unknown; issueCodes?: unknown } | undefined;
+      if (Array.isArray(details?.issues)) {
+        const paths = Array.isArray(details.issuePaths) ? details.issuePaths : [];
+        const codes = Array.isArray(details.issueCodes) ? details.issueCodes : [];
+        setIssues(details.issues.map((message, i) => ({ severity: "error" as const, message: String(message), path: String(paths[i] ?? ""), code: String(codes[i] ?? "") })));
+        setPublishable(false);
+      }
       setProblem(errorMessage(err, "The workflow could not be published. Please try again."));
     }
   };
@@ -329,9 +335,9 @@ function StepBody(props: StepBodyProps) {
                   <div className="mt-3 flex flex-wrap gap-2">
                     <IconButton label={`Move ${state.label || `status ${index + 1}`} up`} icon={<ArrowUp aria-hidden="true" />} size="sm" variant="ghost" disabled={index === 0} onClick={() => setDefinition(moveState(definition, index, -1))} />
                     <IconButton label={`Move ${state.label || `status ${index + 1}`} down`} icon={<ArrowDown aria-hidden="true" />} size="sm" variant="ghost" disabled={index === definition.states.length - 1} onClick={() => setDefinition(moveState(definition, index, 1))} />
-                    <Button size="sm" variant="ghost" onClick={() => edit((current) => ({ ...current, ...removeState(current.definition, current.layout, index) }))}>
+                    <Button size="sm" variant="ghost" aria-label={`Remove ${state.label || `status ${index + 1}`}`} onClick={() => edit((current) => ({ ...current, ...removeState(current.definition, current.layout, index) }))}>
                       <Trash2 aria-hidden="true" className="size-4" />
-                      Remove<span className="sr-only">{` ${state.label || `status ${index + 1}`}`}</span>
+                      Remove
                     </Button>
                   </div>
                 </fieldset>
@@ -357,9 +363,9 @@ function StepBody(props: StepBodyProps) {
                   <legend className="px-1 text-sm font-semibold text-ink">{`Transition ${index + 1}: ${stateLabel(definition, transition.from)} to ${stateLabel(definition, transition.to)}`}</legend>
                   <TransitionRouteFields definition={definition} transition={transition} index={index} issues={issues} onChange={(patch) => setDefinition(updateTransition(definition, index, patch))} />
                   <div className="mt-3">
-                    <Button size="sm" variant="ghost" onClick={() => setDefinition(removeTransition(definition, index))}>
+                    <Button size="sm" variant="ghost" aria-label={`Remove transition ${index + 1}`} onClick={() => setDefinition(removeTransition(definition, index))}>
                       <Trash2 aria-hidden="true" className="size-4" />
-                      Remove<span className="sr-only">{` transition ${index + 1}`}</span>
+                      Remove
                     </Button>
                   </div>
                 </fieldset>
@@ -522,7 +528,7 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
       </div>
       <aside aria-label="Properties" className="flex min-w-0 flex-col gap-4">
         {selectedState && selected ? (
-          <Card title={`Status: ${selectedState.label || "(no label)"}`} headingLevel={3}>
+          <Card title={`Status: ${selectedState.label || "(no label)"}`} headingLevel={2}>
             <div className="flex flex-col gap-4">
               <StatusFields state={selectedState} index={indexOfId(selected.id)} issues={issues} onChange={(patch) => edit((current) => ({ ...current, ...updateState(current.definition, current.layout, indexOfId(selected.id), patch) }))} />
               <Button variant="danger" size="sm" onClick={() => remove(selected)}>
@@ -532,7 +538,7 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
           </Card>
         ) : null}
         {selectedTransition && selected ? (
-          <Card title={`Transition: ${stateLabel(definition, selectedTransition.from)} to ${stateLabel(definition, selectedTransition.to)}`} headingLevel={3}>
+          <Card title={`Transition: ${stateLabel(definition, selectedTransition.from)} to ${stateLabel(definition, selectedTransition.to)}`} headingLevel={2}>
             <div className="flex flex-col gap-4">
               {(() => {
                 const index = indexOfId(selected.id);
@@ -553,11 +559,11 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
           </Card>
         ) : null}
         {!selectedState && !selectedTransition ? (
-          <Card title="Properties" headingLevel={3}>
+          <Card title="Properties" headingLevel={2}>
             <p className="text-body">Select a status or a transition on the canvas to edit it here. You can also use the forms below instead of dragging.</p>
           </Card>
         ) : null}
-        <Card title="Add" headingLevel={3}>
+        <Card title="Add" headingLevel={2}>
           <div className="flex flex-col gap-4">
             <Button
               variant="secondary"

@@ -6,7 +6,6 @@ import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminCatalogPage, { parseAmountToMinor, parseDeliverables, parsePacketNumbers } from "./pages/AdminCatalogPage";
 import AdminOrdersPage from "./pages/AdminOrdersPage";
-import AdminWorkflowsPage from "./pages/AdminWorkflowsPage";
 import NewOrderPage from "./pages/NewOrderPage";
 import OrderDetailPage from "./pages/OrderDetailPage";
 import AdminOrderDetailPage from "./pages/AdminOrderDetailPage";
@@ -542,29 +541,7 @@ describe("console", () => {
     expect(calls.some((c) => c.path === "orders.admin.catalog.createProduct")).toBe(false);
   });
 
-  it("workflows page renders states and transitions without axe violations", async () => {
-    session.role = "admin";
-    handlers.set("orders.admin.workflows.list", () => [
-      {
-        publicId: "01JTESTWF0000000000000000A",
-        workflowKey: "standard",
-        name: "Standard",
-        isDefault: true,
-        rowVersion: 1,
-        versionNumber: 1,
-        definition: {
-          states: [
-            { key: "submitted", label: "Submitted", customerLabel: "Submitted", kind: "initial", tone: "info" },
-            { key: "completed", label: "Completed", customerLabel: "Completed", kind: "terminal", tone: "success" },
-          ],
-          transitions: [{ from: "submitted", to: "completed", allowedBy: ["staff"], notifyCustomer: true, requiresNote: false }],
-        },
-      },
-    ]);
-    const { container } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
-    expect((await screen.findAllByText("submitted → completed")).length).toBeGreaterThan(0);
-    await expectNoAxeViolations(container);
-  });
+  // The workflows pages (list, designer, versions) are covered in pages/workflows/workflows.test.tsx.
 });
 
 describe("console orders pipeline widget", () => {
