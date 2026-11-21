@@ -63,3 +63,4 @@ export const ALL_NAV = FEATURES.flatMap((feature) => feature.nav ?? []).sort((a,
 export const ORDER_TABS = FEATURES.flatMap((feature) => feature.orderTabs ?? []).sort((a, b) => a.order - b.order);
 export const CUSTOMER_TABS = FEATURES.flatMap((feature) => feature.customerTabs ?? []).sort((a, b) => a.order - b.order);
 export const WIDGETS = FEATURES.flatMap((feature) => feature.widgets ?? []).sort((a, b) => a.order - b.order);
+export const SECURITY_CARDS = FEATURES.flatMap((feature) => feature.securityCards ?? []).sort((a, b) => a.order - b.order);

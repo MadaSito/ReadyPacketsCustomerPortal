@@ -105,6 +105,15 @@ export interface RouteWrapper {
   order: number;
 }
 
+/** A card a feature contributes to the customer Security page (`/account/security`, host: assurance feature). */
+export interface SecurityCard {
+  key: string;
+  /** Lower first. Two-factor (host) sits at 20. */
+  order: number;
+  access: "customer" | "staff" | "admin";
+  component: LazyExoticComponent<ComponentType> | ComponentType;
+}
+
 export interface FeatureRoutes {
   routes: RouteDef[];
   nav?: NavItem[];
@@ -116,4 +125,6 @@ export interface FeatureRoutes {
   widgets?: DashboardWidget[];
   /** Wrappers applied around routes owned by other features (see `RouteWrapper`). */
   routeWrappers?: RouteWrapper[];
+  /** Cards contributed to the customer Security page (host: assurance feature). */
+  securityCards?: SecurityCard[];
 }
