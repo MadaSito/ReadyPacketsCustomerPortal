@@ -1,7 +1,6 @@
 import type { Readable } from "node:stream";
 import type { z } from "zod";
-import type { ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
-import type { DbOrTx } from "../../db/client.js";
+import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 
 export const STORAGE_PROVIDER_KINDS = ["s3", "azure_blob", "dropbox", "google_drive", "sharepoint", "onedrive"] as const;
 export type StorageProviderKind = (typeof STORAGE_PROVIDER_KINDS)[number];
@@ -93,7 +92,7 @@ export interface StorageCopyInput extends StoragePutInput {
   connectionPublicId: string;
   correlationId?: string;
   /** Worker lease fence, rechecked before outbound writes; called with tx during durable checks. */
-  assertStillOwned: (tx?: DbOrTx) => Promise<void>;
+  assertStillOwned: (tx?: Tx) => Promise<void>;
 }
 
 export interface StorageModule extends ModuleLifecycle {
@@ -106,7 +105,7 @@ export interface StorageModule extends ModuleLifecycle {
     }>;
     get(principal: SessionPrincipal, input: { publicId: string }): Promise<StorageConnectionView>;
     create(principal: SessionPrincipal, input: StorageConnectionCreate): Promise<StorageConnectionView>;
-    update(principal: SessionPrincipal, input: StorageConnectionUpdate): Promise<StorageConnectionView>;
+    update(principal: SessionPrincipal, input: StorageConnectionUpdate, tx?: Tx): Promise<StorageConnectionView>;
     test(principal: SessionPrincipal, input: { publicId: string; expectedVersion: number }): Promise<StorageConnectionView>;
   };
   assignments: {
@@ -115,6 +114,14 @@ export interface StorageModule extends ModuleLifecycle {
   };
   /** Worker-side: only enabled, currently assigned connections. Includes no config or credentials. */
   listAssigned(purpose: StoragePurpose, tx?: DbOrTx): Promise<StorageAssignmentView[]>;
+  /** Server-only OAuth support; lock and check the live administrator, kind and version in caller's tx. */
+  readProviderSetup(principal: SessionPrincipal, input: {
+    publicId: string; kind: StorageProviderKind; expectedVersion: number;
+  }, tx: Tx): Promise<{ config: StorageConfig; credentials: StorageCredentials | null }>;
+  /** Server-only SharePoint sync support; checks active assignment, provider kind and the worker fence. */
+  readAssignedProvider(input: {
+    purpose: "order_data"; connectionPublicId: string; kind: "sharepoint"; assertStillOwned: (tx?: Tx) => Promise<void>;
+  }): Promise<{ config: StorageConfig; credentials: StorageCredentials }>;
   /** Worker-side: fail closed if disabled/unassigned; verify provider-reported size and digest. */
   copy(input: StorageCopyInput): Promise<StoragePutResult>;
 }
