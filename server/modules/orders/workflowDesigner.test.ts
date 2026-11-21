@@ -311,6 +311,25 @@ describe("order change hook and sync view (package H port)", () => {
     expect(await mod.getOrderRefByPublicId("not-an-id")).toBeNull();
     await expectError(mod.getOrderRefByPublicId(order.publicId, undefined, { forUpdate: true }), "VALIDATION:TX_REQUIRED");
   });
+
+  it("listOrderPublicIdsForSync pages every order by ascending publicId (ids only)", async () => {
+    await newOrder();
+    await newOrder();
+    const all = (await t.db.select({ publicId: orders.publicId }).from(orders)).map((row) => row.publicId).sort();
+    const seen: string[] = [];
+    let after: string | null = null;
+    for (let guard = 0; guard < 50; guard += 1) {
+      const page: { publicIds: string[]; nextAfter: string | null } = await mod.listOrderPublicIdsForSync({ afterPublicId: after, limit: 2 });
+      expect(page.publicIds.length).toBeLessThanOrEqual(2);
+      seen.push(...page.publicIds);
+      if (!page.nextAfter) break;
+      after = page.nextAfter;
+    }
+    expect(seen).toEqual(all);
+    expect((await mod.listOrderPublicIdsForSync({ limit: 5000 })).publicIds.length).toBe(Math.min(all.length, 500));
+    expect(await mod.listOrderPublicIdsForSync({ afterPublicId: all.at(-1)!, limit: 10 })).toEqual({ publicIds: [], nextAfter: null });
+    await expectError(mod.listOrderPublicIdsForSync({ afterPublicId: "nope", limit: 10 }), "VALIDATION:INVALID_CURSOR");
+  });
 });
 
 describe("automation trigger context (order triggers)", () => {

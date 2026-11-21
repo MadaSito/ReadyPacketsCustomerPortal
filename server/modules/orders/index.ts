@@ -62,6 +62,8 @@ export interface OrdersModule extends ModuleLifecycle {
   registerChangeListener(listener: OrderChangeListener): void;
   /** Increment 03: trusted read for the order-data sync worker; null when the order does not exist. */
   getOrderSyncView(orderPublicId: string, tx?: DbOrTx): Promise<OrderSyncView | null>;
+  /** Increment 03: trusted keyset listing (ascending publicId, limit ≤ 500) for the sync backfill; ids only. */
+  listOrderPublicIdsForSync(input: { afterPublicId?: string | null; limit: number }, tx?: DbOrTx): Promise<{ publicIds: string[]; nextAfter: string | null }>;
 
   /* ---- services used by the router ---- */
   catalog: CatalogService;
@@ -92,6 +94,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     getProductionScope: orders.getProductionScope,
     registerChangeListener: orders.registerChangeListener,
     getOrderSyncView: orders.getOrderSyncView,
+    listOrderPublicIdsForSync: orders.listOrderPublicIdsForSync,
     searchOrders: orders.searchOrders,
     portableOrders: portable.portableOrders,
     importOrder: portable.importOrder,

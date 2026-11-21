@@ -1026,6 +1026,25 @@ export function createOrderService(deps: OrderServiceDeps) {
     },
 
     /**
+     * Trusted (system sync worker, no principal): every order's publicId in ascending ULID order, keyset paged.
+     * Ids only (no PII). There are no placeholder orders: imported orders are real orders and are included.
+     */
+    async listOrderPublicIdsForSync(input: { afterPublicId?: string | null; limit: number }, tx?: DbOrTx): Promise<{ publicIds: string[]; nextAfter: string | null }> {
+      const limit = Math.max(1, Math.min(500, Math.trunc(input.limit) || 1));
+      const after = input.afterPublicId ?? null;
+      if (after !== null && !ULID_LIKE.test(after)) throw validation("INVALID_CURSOR", "The cursor is not valid.");
+      const db = tx ?? deps.db;
+      const rows = await db
+        .select({ publicId: orders.publicId })
+        .from(orders)
+        .where(after === null ? undefined : sql`${orders.publicId} > ${after}`)
+        .orderBy(asc(orders.publicId))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit).map((row) => row.publicId);
+      return { publicIds: page, nextAfter: rows.length > limit ? (page.at(-1) ?? null) : null };
+    },
+
+    /**
      * Trusted (caller already authorised — system sync worker): data for one external list item per order.
      * No locks; uses the caller's tx when given. Customer name / reference belong to identity (ownerUserId).
      */
