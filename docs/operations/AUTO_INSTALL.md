@@ -1,0 +1,110 @@
+# Automatically install ReadyPackets on Ubuntu 26.04 LTS
+
+Use the native installer on a fresh, dedicated Ubuntu 26.04 LTS server. It sets up Nginx, MySQL, the portal and its background worker, then creates the first administrator and prints the sign-in details. You choose the portal address before installation.
+
+## Before you start
+
+- **Server:** Ubuntu 26.04 LTS on amd64 (`x86_64`) or arm64 (`aarch64`), with systemd running and root or `sudo` access. Plan for about 2 GB of memory including swap and at least 4 GB free on each filesystem that holds `/opt` or `/var`. Allocate additional space for uploads, releases and backups.
+- **DNS:** Choose a DNS name such as `my.readypackets.com`, not an IP address. Publish an A record pointing to the server's public IPv4 address. Publish an AAAA record only if the server is reachable on that IPv6 address. Do the same for an optional redirecting alias.
+- **Network:** Allow inbound TCP 80 for Let's Encrypt HTTP validation and 443 for HTTPS, and keep SSH reachable from your management network. The installer does not configure your firewall or cloud security groups. Do not expose MySQL or the portal's internal port. The server needs outbound access to Ubuntu's package sources, `nodejs.org`, the public npm registry and, for a public certificate, Let's Encrypt.
+- **Repository:** Use a trusted, reviewed commit in a root-owned Git clone with no changes to tracked files. If you make the repository public for installation, it only needs to be reachable for the clone. Once cloned, the build uses local Git objects and the public npm registry; the running services do not require GitHub access. A repository-scoped, read-only SSH deploy key is the safer alternative to making the repository public. Configure the key and verify GitHub's host key for the root account that will clone, then use `git@github.com:MadaSito/ReadyPacketsCustomerPortal.git` in place of the HTTPS URL.
+
+## Quick start
+
+Run these commands on the server. Git is installed first only to fetch the installer; everything else the installer needs is set up by the kit. Replace the example domain and email, and check that the clone is at the reviewed revision before running it.
+
+```bash
+sudo apt-get update && sudo apt-get install -y git
+sudo git clone https://github.com/MadaSito/ReadyPacketsCustomerPortal.git /opt/readypackets-src
+cd /opt/readypackets-src
+sudo bash deploy/auto-install.sh --domain my.readypackets.com --acme-email you@example.com
+```
+
+For a redirect from `portal.readypackets.com`, add `--alias portal.readypackets.com` and set up its DNS first. For unattended execution, supply all required choices explicitly and add `--yes`. Run only where the final password can be seen privately; a terminal recorder or an external log capture would also capture it.
+
+| Option | What it does |
+| --- | --- |
+| `--domain <host>` | Sets the canonical HTTPS host. If omitted in a terminal, the installer prompts and offers `my.readypackets.com`; without a terminal, this option is required. |
+| `--alias <host>` | Sets a different DNS name that redirects to the canonical address. It does not serve a second portal. Omit for no alias. |
+| `--acme-email <email>` | Uses Let's Encrypt and sets its contact address. Supplying it accepts the Let's Encrypt Subscriber Agreement. Cannot be combined with `--tls-self-signed`. |
+| `--tls-self-signed` | Issues a self-signed certificate for testing. Browsers warn and may refuse passkeys. If neither certificate option is given in a terminal, the installer asks for an ACME email; a blank answer selects self-signed TLS. Without a terminal, one certificate option is required. |
+| `--admin-email <email>` | Sets the first administrator's `Sign-in name`. Defaults to the ACME email or `admin@<domain>`; in a terminal it prompts on first setup when omitted. Provide `--admin-email` explicitly to suppress that prompt even with `--yes`. |
+| `--admin-name "<name>"` | Sets the first administrator's display name. Defaults to `Portal Administrator`. |
+| `--skip-catalog` | Does not load the bundled offerings (packets, tiers and prices). To load them later, rerun without this option or use the [manual catalog procedure](INSTALL.md#load-the-offerings-catalog-optional). |
+| `--skip-dns-check` | Skips the installer's own HTTP reachability probe before requesting a certificate. It does not skip the certificate authority's validation. |
+| `--yes` or `-y` | Skips the final `Install now?` confirmation. It does not supply missing options. |
+| `--help` or `-h` | Shows help without installing anything. |
+
+`RP_ACME_SERVER=<directory URL>` is a test-only environment override for the ACME directory, such as a staging service. Do not use it for production. Keep test certificate lineages separate from production: the installer reuses the `readypackets-portal` lineage when present and covering the names, rather than requesting a replacement from a different authority.
+
+## What the installer changes
+
+1. Checks the OS, processor, memory, disk and operation state, then asks for confirmation unless `--yes` was given. Native deployment operations are serialized using `/run/readypackets-deploy.lock`.
+2. Installs Nginx, MySQL server and client tools (it requires MySQL 8.4), Certbot, Git, curl, OpenSSL, CA certificates and xz tools from Ubuntu. APT manages the normal package files, metadata, service units and logs. It installs checksum-verified Node.js `22.23.5` and pnpm `12.21.0` on a fresh host. A compatible pre-existing Node 22 runtime at `/usr/local/bin/node` is kept; an incompatible unmanaged runtime is refused.
+3. Configures MySQL on loopback with verified TLS and creates the `readypackets` database and three separate accounts: `rp_app`, `rp_migrator` and `rp_backup`. Each account is bound to `127.0.0.1` and requires TLS. Once migrations create the ledger tables, the installer grants the backup account its scoped ledger writes.
+4. Saves the host, optional alias and certificate mode in `site.conf`. It refuses other enabled Nginx sites, removes the enabled link for the untouched Ubuntu default page if present and keeps the default template itself. It obtains a Let's Encrypt certificate using a temporary HTTP site where needed, or generates a self-signed certificate. The final HTTPS site retains the HTTP-01 path for renewal; it redirects other known HTTP traffic to HTTPS.
+5. Builds the pinned Git commit under a separate `readypackets-build` user with a frozen lockfile, publishes a root-owned release, migrates MySQL and installs systemd units. It creates the first administrator if none exists, then starts web and worker under the unprivileged `readypackets` account. It checks local and Nginx TLS health and readiness plus worker state before opening the site.
+6. Runs a dry run of the catalog import, then loads the offerings unless skipped. Prints the portal address and initial sign-in information when the installation finishes.
+
+| Path | What is stored or changed |
+| --- | --- |
+| `/opt/readypackets-src` | The root-owned source clone from the quick start, not created by the installer itself. |
+| `/usr/local/lib/readypackets-node/v22.23.5/node`, `/usr/local/lib/readypackets-pnpm/12.21.0/pnpm` | Verified executable files; `/usr/local/bin/node` and `/usr/local/bin/pnpm` link to them on a fresh installation. The Node install does not add npm, npx or Corepack. |
+| `/etc/mysql/mysql.conf.d/zz-readypackets.cnf`, `/etc/mysql/readypackets-tls/` | Loopback, name-resolution, local-file and TLS settings. Database TLS files are `ca.pem`, `server-cert.pem` and `server-key.pem`; the temporary database CA signing key is discarded. MySQL uses its package data directory under `/var/lib/mysql`. |
+| `/etc/readypackets/site.conf`, `/etc/readypackets/portal.env` | Root-only site record and non-secret app settings: origin, alias if set, installation ID, loopback binding and storage/static paths. Read these files as data, not shell scripts. |
+| `/etc/readypackets/secrets/` | Root-only `database_url`, `migrator_database_url`, `backup_database_url`, `rp_data_keyring`, `rp_index_key`, `rp_pseudonym_key`, `rp_token_hash_key`, `rp_audit_chain_key` and `rp_backup_key`. |
+| `/etc/readypackets/initial-admin-password`, `/etc/readypackets/initial-admin-email` | Temporary root-only bootstrap inputs, kept across interrupted setup and removed after bootstrap is finalized. `/etc/readypackets/admin-bootstrap-done`, `/etc/readypackets/initial-admin-outcome` and `/etc/readypackets/catalog-import-done` record completed steps as applicable. |
+| `/etc/readypackets/install-migration-pending`, `/etc/nginx/readypackets-maintenance` | Temporary migration and traffic-fence markers. A failed run can leave them in place; see the recovery instructions below. |
+| `/opt/readypackets/releases/<commit>`, `/opt/readypackets/current` | Built release (including `release.env`, compiled tools and migrations) and its active symlink. Build and promotion use temporary directories under `/opt/readypackets/`. |
+| `/var/cache/readypackets-build`, `/var/lib/readypackets/storage` | Build user's dependency cache and private application storage, including the storage used by backup tooling. |
+| `/var/www/readypackets-acme/` | Certificate challenge webroot (`.well-known/acme-challenge/`). The installer's reachability test uses a temporary token removed after the probe. |
+| `/etc/nginx/sites-available/readypackets-acme.conf`, `/etc/nginx/sites-available/readypackets-portal.conf`, `/etc/nginx/snippets/readypackets-tls.conf` | Rendered Nginx files. `/etc/nginx/sites-enabled/readypackets-acme.conf` is only enabled while needed; the finished install enables `/etc/nginx/sites-enabled/readypackets-portal.conf` and removes the ACME link. |
+| `/etc/letsencrypt/`, `/etc/readypackets/tls/` | Public mode stores Certbot account, archive and renewal data in `/etc/letsencrypt/` and serves `live/readypackets-portal/{fullchain.pem,privkey.pem}` from that tree. It enables `certbot.timer` and installs `/etc/letsencrypt/renewal-hooks/deploy/readypackets-nginx`. Self-signed mode uses `/etc/readypackets/tls/{fullchain.pem,privkey.pem}`. |
+| `/etc/systemd/system/` | `readypackets-portal.service`, `readypackets-worker.service`, `readypackets-backup@.service` and `readypackets-backup.timer`. The three service units get a `.d/10-runtime.conf` drop-in. The installer starts and enables web and worker, but does not enable the backup timer on a fresh install. |
+| `/var/log/readypackets-install.log`, `/var/log/nginx/readypackets-access.log`, `/var/log/nginx/readypackets-error.log` | Root-only install step log and separate Nginx access and critical-error logs. Application services log to the systemd journal. |
+| `/root/readypackets-initial-admin.txt` | Root-owned `0600` copy of initial sign-in information when a password was generated for the first administrator. |
+
+## First sign-in and follow-up
+
+On success the installer prints `ReadyPackets is installed and running at https://<host>`. For a new installation, the summary includes `Portal address`, `Sign-in name` and `Password` marked `(temporary)`. It also saves those details in `/root/readypackets-initial-admin.txt`. The step log excludes the final password; do not put it in tickets, session logs or shared terminal output.
+
+- **Administrator:** Sign in at the canonical portal address. The first sign-in requires a new password and authenticator app enrollment. Keep recovery codes offline. Once sign-in and recovery are set up, delete the temporary credential file with `sudo rm /root/readypackets-initial-admin.txt`. Add a second named administrator for recovery.
+- **SMTP:** In the administration console, configure the approved mail destination under **Outbound connections**, then set up authenticated TLS under **E-mail (SMTP)**. Invitations and password resets are held until outgoing mail is configured. Test delivery to an approved inbox.
+- **Firewall:** Configure and verify host and provider rules yourself. Keep SSH restricted to approved management sources and allow HTTPS and HTTP as needed; confirm ports 3306, 33060 and 5000 are not externally reachable. Verify the site and certificate from another machine before opening access.
+- **Backups:** Run and verify a manual backup before enabling the daily timer. Keep the in-app backup schedule off for this deployment profile. Copy encrypted archives off-host and escrow recovery keys separately; plan an isolated restore drill using the [backup and restore guide](BACKUP_AND_RESTORE.md).
+
+```bash
+sudo systemctl start readypackets-backup@cli.service
+sudo journalctl -u readypackets-backup@cli.service
+# After confirming successful verification:
+sudo systemctl enable --now readypackets-backup.timer
+```
+
+## Retry, switch certificates or update
+
+After an ordinary failure, fix the reported cause and rerun the same command from the same commit. Completed steps preserve the active release, keys, database, uploads and the existing administrator; the catalog is not imported twice. If the original temporary credential file still exists it is printed again, not reset. If it was deleted or the database already had an administrator, the installer does not create or disclose a new password. If the script reports `install-migration-pending` or `upgrade-state`, stop and follow [manual recovery](INSTALL.md#upgrade-and-rollback); do not delete the marker or rerun migrations without reconciling the database.
+
+To replace a self-signed certificate with a trusted one, point public DNS at the server, confirm port 80 is reachable for all configured names, and rerun from the installed commit with the same `--domain` and `--alias` (omit `--alias` if none was set). Replace `--tls-self-signed` with `--acme-email you@example.com` and do not set the test ACME override. The existing Nginx site can answer the challenge; after issuance, the installer renders and reloads the site with the public certificate. Verify the presented chain and check `certbot.timer`. If a staging certificate already uses the reserved Certbot lineage, reconcile that lineage with Certbot before rerunning, rather than expecting the script to replace it.
+
+For application upgrades, restore authorized GitHub access to the source clone, then fetch the reviewed release. For example, `sudo git -C /opt/readypackets-src pull --ff-only` works if the clone tracks the intended branch; a pinned or detached clone needs a fetch and explicit checkout instead. Verify the full 40-character commit SHA and check out the reviewed kit before using `sudo bash deploy/upgrade.sh <REVIEWED_FULL_COMMIT_SHA>` from the clone. Follow the [upgrade and rollback procedure](INSTALL.md#upgrade-and-rollback) for dependency pins, migration review, draining and verified backups. `auto-install.sh` is not an updater and refuses to switch the active commit.
+
+## Troubleshooting
+
+- **Install log:** Read `sudo less /var/log/readypackets-install.log` for the last completed step. Early preflight errors appear on the terminal before the log is opened.
+- **DNS or HTTP probe fails:** Check A and AAAA records for both configured names and check TCP 80 from outside the server. Remove a stale AAAA record if the server cannot serve it. If the host cannot loop back to its own public IP but external access is proven, use `--skip-dns-check`; the CA still needs to reach the server.
+- **Low memory or disk:** Check `free -h`, `swapon --show` and `df -h /opt /var`. Add RAM or configure swap using your host's instructions, or move to a larger server. Check space for data and backups as well as the build.
+- **Port already in use:** Run `sudo ss -ltnp` and `sudo nginx -t` to identify conflicts. Do not remove another application's site or stop its service just to reuse the host; use a dedicated server.
+- **Certificate issuance fails:** Check `/var/log/letsencrypt/letsencrypt.log`, DNS, firewall rules and public HTTP access before retrying. If the CA reports a rate limit, follow the retry time it gives you rather than repeatedly requesting a new certificate. Use a separate test environment for staging.
+- **Service fails or is not ready:** Run `sudo systemctl status readypackets-portal.service readypackets-worker.service nginx.service mysql.service` and `sudo journalctl -b -u readypackets-portal.service -u readypackets-worker.service -u nginx.service -u mysql.service`. For backups, use `sudo journalctl -u readypackets-backup@cli.service`.
+
+## Maintaining tool pins
+
+Update a version and both architecture checksums in [`deploy/auto-install.sh`](../../deploy/auto-install.sh) together. Take the Node SHA-256 values for the Linux `x64` and `arm64` `.tar.xz` files from that Node release's `SHASUMS256.txt` on `nodejs.org`. For pnpm, verify the npm registry tarball from `@pnpm/exe.linux-x64` and `@pnpm/exe.linux-arm64` for the exact release and calculate the SHA-512 hex digest of each tarball, not of the extracted executable. Keep the pnpm pin in step with `package.json`'s `packageManager` and the lockfile; update the expected CI versions when the pins change.
+
+## Limits
+
+This is a single-server installation, not a high-availability setup or a firewall manager. Once installed, the canonical host and redirecting alias are fixed by the kit; you can change certificate mode without changing those names. Use the [manual runbook](INSTALL.md) for Ubuntu 24.04 LTS or to provision the services yourself on Ubuntu 26.04 LTS.
+
+## Verification status
+
+<!-- VERIFICATION: filled in by the lead after CI -->

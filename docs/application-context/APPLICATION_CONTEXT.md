@@ -12,11 +12,11 @@ change. It describes intent and state; it is not a certification or a guarantee.
 | Public marketing site | https://www.readypackets.com (separate system) |
 | Customer portal (this repository) | https://my.readypackets.com (canonical); `portal.readypackets.com` redirects to it |
 | Audiences | customers, staff, administrators |
-| Hosting | self-hosted VPS (Nginx + systemd); Docker Compose stack for evaluation and testing (Caddy + MySQL, `deploy/docker/`) |
+| Hosting | self-hosted single server (Nginx + systemd): automatic native setup on Ubuntu 26.04 LTS, manual native setup on Ubuntu 24.04/26.04 LTS; Docker Compose for evaluation and testing (Caddy + MySQL, `deploy/docker/`) |
 
 ## Owner instructions that govern every change
 
-1. Self-hosted. No dependency on Perplexity (or any hosted AI/builder) at runtime; no such OAuth.
+1. Self-hosted. No dependency on hosted AI or builder services at runtime; no authentication through such services.
 2. Local authentication with mandatory MFA until other methods are deliberately configured.
 3. Advanced, correlated logging; an audit log center with advanced filtering; secure forwarding to SIEM/syslog.
 4. Modern SDLC and security practice; minimise OWASP Top 10 classes of defect; zero-trust authorization.
@@ -55,10 +55,16 @@ server/trpc        procedure guards and root router
 server/modules     identity, assurance, orders, files, engagement, compliance, audit, siem, platform,
                    jobs, portable, backup, integrations
 portable/          vendor-neutral portable data contract, verifier CLI, reference importer, adapters
-deploy/            nginx, systemd, installer; docker/ = evaluation stack
+deploy/            native auto-install and manual kit, Nginx templates, systemd, MySQL; docker/ = evaluation
 migrations/        versioned forward-only SQL migrations
 docs/              specs, engineering contract, ADRs, runbooks, verification, context, session logs
 ```
+
+Native deployment entry points are `deploy/auto-install.sh`, `deploy/install.sh`, `deploy/upgrade.sh` and
+`deploy/uninstall.sh`. The installer stores site identity and TLS mode in `/etc/readypackets/site.conf`,
+renders `deploy/nginx/*.conf.template`, and publishes under `/opt/readypackets/releases/<commit>` with
+private data under `/var/lib/readypackets/storage`. See the [automatic installation guide](../operations/AUTO_INSTALL.md)
+for first-admin credential custody and `.github/workflows/native-install.yml` for the native CI workflow.
 
 Key rules: see `docs/engineering/BUILD_CONTRACT.md` (ownership, data conventions, authorization, audit,
 errors, client conventions).

@@ -15,7 +15,7 @@ WCAG/ADA conformance claim.
 
 - Node.js `>=22.12 <23` and pnpm `12.21.0` (`packageManager` in `package.json`).
 - MySQL 8.4 and the matching `mysql` and `mysqldump` client tools (needed by backups and the backup tests).
-- Linux or macOS. Production targets Ubuntu 24.04 LTS.
+- Linux or macOS for development. Native deployment targets Ubuntu 24.04 or 26.04 LTS.
 
 ### Local development
 
@@ -57,10 +57,16 @@ In the shared engineering sandbox, use `scripts/dev/{tc,test,lint,commit,add-dep
 
 ### Production install
 
-Use the reviewed release kit, not the dev commands:
+On a fresh Ubuntu 26.04 LTS server, use the [automatic native installer](docs/operations/AUTO_INSTALL.md). From a reviewed, root-owned Git clone, run:
 
 ```bash
-sudo bash deploy/install.sh <REVIEWED_FULL_COMMIT_SHA>    # native Ubuntu 24.04 profile (Nginx + systemd)
+sudo bash deploy/auto-install.sh --domain my.readypackets.com --acme-email you@example.com
+```
+
+The installer sets up prerequisites, TLS and the first administrator. For Ubuntu 24.04 or when provisioning prerequisites yourself on Ubuntu 26.04, follow the [manual runbook](docs/operations/INSTALL.md). Use the reviewed release kit, not the dev commands:
+
+```bash
+sudo bash deploy/install.sh <REVIEWED_FULL_COMMIT_SHA>    # manually provisioned native host
 sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>   # drained, backed-up, forward-only upgrade
 sudo bash deploy/uninstall.sh                             # deactivates; never deletes data or keys
 ```
@@ -71,7 +77,7 @@ server setup: see [`deploy/docker/README.md`](deploy/docker/README.md)
 Operator tools are in `scripts/ops/`:
 `keys/` (generate, rotate, doctor), `backup/` (run and verify encrypted backups), `restore/` (isolated restore drill),
 `install/` (VPS install, upgrade and rollback helpers), `migrate.ts`, `create-admin.ts` and `seed-demo.ts`.
-Read [Install on Ubuntu 24.04](docs/operations/INSTALL.md) and [release gates](deploy/VERIFICATION.md) first.
+Read the [release gates](deploy/VERIFICATION.md) before admitting customer data.
 
 ## Documentation map
 
@@ -85,7 +91,8 @@ Read [Install on Ubuntu 24.04](docs/operations/INSTALL.md) and [release gates](d
 
 ### Operations and deployment
 
-- [Install on Ubuntu 24.04 LTS](docs/operations/INSTALL.md)
+- [Automatic native install on Ubuntu 26.04 LTS](docs/operations/AUTO_INSTALL.md)
+- [Manual native install on Ubuntu 24.04 or 26.04 LTS](docs/operations/INSTALL.md)
 - [Logging and audit](docs/operations/LOGGING_AND_AUDIT.md)
 - [Deployment profiles](deploy/README.md) and [deployment verification and release gates](deploy/VERIFICATION.md)
 - [Key management runbook](scripts/ops/keys/RUNBOOK.md)

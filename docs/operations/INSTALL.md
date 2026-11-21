@@ -1,6 +1,8 @@
-# Install ReadyPackets on Ubuntu 24.04 LTS
+# Manually install ReadyPackets on Ubuntu 24.04 or 26.04 LTS
 
-This runbook covers a dedicated single node for `my.readypackets.com`, with `portal.readypackets.com` as a permanent redirect. Nginx is the public edge; the separate Node web and worker services use local MySQL and private object storage. Review [verification and release gates](../../deploy/VERIFICATION.md) before admitting customer data. Do not use a preview build or a Perplexity authentication service.
+For a fresh Ubuntu 26.04 LTS server, see the [automatic installation guide](AUTO_INSTALL.md). Use this runbook for Ubuntu 24.04 LTS or when you want to provision the prerequisites yourself on Ubuntu 26.04 LTS.
+
+This runbook covers a dedicated single node and uses `my.readypackets.com` as the example canonical host, with `portal.readypackets.com` as an optional permanent redirect. Nginx is the public edge; the separate Node web and worker services use local MySQL and private object storage. Review [verification and release gates](../../deploy/VERIFICATION.md) before admitting customer data. Use a production build and local authentication.
 
 For a quick evaluation or test installation under another host name, use the Docker Compose stack instead: [`deploy/docker/README.md`](../../deploy/docker/README.md). It is not a replacement for this runbook (no backups, drain or rollback).
 
@@ -8,7 +10,7 @@ For a quick evaluation or test installation under another host name, use the Doc
 
 - **Release**: Obtain a trusted clone in a root-controlled directory and identify the reviewed full Git commit SHA. Verify provenance, the lockfile, and that `migrations/meta/_journal.json` and its SQL files are included. The kit intentionally refuses a release without this journal. Run the kit shipped with that reviewed checkout, not scripts from an untrusted working directory or an arbitrary branch.
 - **Packages**: Patch Ubuntu and use trusted, signed package or release channels. Install Nginx, Certbot, Git, curl, OpenSSL, the Oracle MySQL 8.4 server and its matching `mysql`/`mysqldump` tools. Ubuntu's default database package is not a substitute if it selects another version. Install the latest maintained Node 22 patch (at least 22.12) at `/usr/local/bin/node` and the exact release-pinned pnpm at `/usr/local/bin/pnpm`; verify the vendor signatures or checksums. Do not pipe bootstrap downloads to a shell. The installer checks MySQL's server version via the local root socket. Configure authorized DBA socket access before continuing.
-- **Network**: Allow SSH from the management network before enabling a default-deny inbound firewall. Allow TCP 80/443 for ACME and HTTPS, and do not open 3306 or 5000. Publish A records for both hosts; publish AAAA only if the node can serve both names over IPv6. Do not place a CDN or other proxy in front without revisiting client-IP, authority, and rate-limit policy. Permit outbound access only to required package sources on the build path and approved service destinations in production.
+- **Network**: Allow SSH from the management network before enabling a default-deny inbound firewall. Allow TCP 80/443 for ACME and HTTPS, and do not open 3306, 33060 or 5000. Publish DNS for the portal and optional alias; publish AAAA only if the node can serve those names over IPv6. Do not place a CDN or other proxy in front without revisiting client-IP, authority, and rate-limit policy. Permit outbound access only to required package sources on the build path and approved service destinations in production.
 - **MySQL**: Bind TCP to `127.0.0.1` only; use `skip_name_resolve=ON` and verified MySQL TLS for the runtime and migrator accounts. If those DSNs use `127.0.0.1`, issue the MySQL certificate with a matching IP SAN. The CA must be readable by `readypackets` outside `/home` (it is not a private key). Use a dedicated schema and DBA account. Apply only Phase A in [accounts.sql](../../deploy/mysql/accounts.sql) at this point, substituting placeholders and protecting any generated passwords. The bootstrap migrator can change this schema, not other databases.
 - **Custody**: Provide sufficient disk for retained releases, private data, encrypted backups, and a restore drill. Use encrypted disks if required. Securely escrow the installation ID and all secrets; losing the field keyring or backup key can make an otherwise healthy archive unrecoverable. Keep Ubuntu, Node, MySQL, and Nginx in the patching program.
 
@@ -25,20 +27,36 @@ sudo ufw status verbose
 
 ## Issue the web certificate
 
-From the reviewed checkout, provision the temporary HTTP-01 site and certificate. This flow assumes a dedicated Nginx configuration with no other default virtual hosts. Disable the Ubuntu packaged default symlink only after checking that it is not serving another application.
+From the reviewed checkout, provision the temporary HTTP-01 site and certificate. The Nginx source files are templates, not usable configurations. This example uses the `write_site` and `render_site` helpers from the reviewed `deploy/lib.sh` in a root shell to create root-owned `0600` `/etc/readypackets/site.conf` and render a usable challenge site. Subsequent kit commands read the same site record and render the full TLS site. Replace the two host names; for no alias, pass `''` instead of `portal.readypackets.com`.
+
+This flow assumes a dedicated Nginx configuration with no other enabled sites. Before running it, inspect `/etc/nginx/sites-enabled/default` and confirm it is the Ubuntu packaged default symlink and is not serving another application, or that it is already absent. Do not run these first-install commands on a site that already serves the portal.
 
 ```bash
-sudo install -d -m 0755 /var/www/readypackets-acme
-sudo install -m 0644 deploy/nginx/readypackets-acme.conf /etc/nginx/sites-available/readypackets-acme.conf
-sudo ln -sfn /etc/nginx/sites-available/readypackets-acme.conf /etc/nginx/sites-enabled/readypackets-acme.conf
-sudo unlink /etc/nginx/sites-enabled/default  # only if the packaged symlink still exists
-sudo nginx -t
-sudo systemctl reload nginx
+sudo bash -s -- "$PWD/deploy" my.readypackets.com portal.readypackets.com <<'BASH'
+deploy_src=$1
+source "$deploy_src/lib.sh"
+lock_deploy
+write_site "$2" "$3" letsencrypt
+install -d -o root -g root -m 0755 /var/www/readypackets-acme
+render_site "$deploy_src/nginx/readypackets-acme.conf.template" /etc/nginx/sites-available/readypackets-acme.conf
+ln -sfn /etc/nginx/sites-available/readypackets-acme.conf /etc/nginx/sites-enabled/readypackets-acme.conf
+if [[ -L /etc/nginx/sites-enabled/default ]]; then
+  unlink /etc/nginx/sites-enabled/default
+fi
+nginx -t
+systemctl start nginx
+systemctl reload nginx
+BASH
+```
+
+Run Certbot interactively, using the same host names as `site.conf`. If you did not configure an alias, omit the second `-d` argument.
+
+```bash
 sudo certbot certonly --webroot -w /var/www/readypackets-acme \
   --cert-name readypackets-portal -d my.readypackets.com -d portal.readypackets.com
 ```
 
-The full TLS site retains the ACME exception on port 80. Install a root-owned Certbot deploy hook (`/etc/letsencrypt/renewal-hooks/deploy/`, mode `0755`) that runs `nginx -t && systemctl reload nginx`; check `sudo certbot renew --dry-run` and monitor expiry. The canonical app supplies HSTS on upstream HTTPS responses; Nginx supplies HSTS on the HTTPS alias redirect because it does not reach the app. Nginx-generated errors may not carry the application's headers. [Let's Encrypt ended its OCSP service](https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life.html), so stapling is disabled for the example issuer. For an issuer with an active OCSP responder, configure the [TLS snippet](../../deploy/nginx/readypackets-tls.conf) with the issuer trust chain and a trusted resolver, then verify a staple with `openssl s_client -status`.
+The full TLS site retains the ACME exception on port 80. Install a root-owned Certbot deploy hook (`/etc/letsencrypt/renewal-hooks/deploy/`, mode `0755`) that runs `nginx -t && systemctl reload nginx`; enable `certbot.timer`, check `sudo certbot renew --dry-run` and monitor expiry. The canonical app supplies HSTS on upstream HTTPS responses; Nginx supplies HSTS on the HTTPS alias redirect because it does not reach the app. Nginx-generated errors may not carry the application's headers. [Let's Encrypt ended its OCSP service](https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life.html), so stapling is disabled for the example issuer. For an issuer with an active OCSP responder, configure the [TLS snippet template](../../deploy/nginx/readypackets-tls.conf.template) with the issuer trust chain and a trusted resolver, then verify a staple with `openssl s_client -status`.
 
 ## Install and enroll the first administrator
 
@@ -50,9 +68,9 @@ The installer prompts for three MySQL connection URLs and for the initial admini
 
 - **Paths and services**: Before building, root generates any initial encryption and signing keys with the host OpenSSL, directly under the root-owned `0700` secrets directory. `readypackets-build` builds without credentials in transient systemd units, with the secrets directory inaccessible. Promotion copies validated regular files and directories (not links) into a separate root-owned staging tree, takes the final package manifest and migration files directly from the reviewed Git commit, and publishes by atomic rename under `/opt/readypackets/releases/`. The Nginx edge serves via the application, not this tree. Each base unit requires the unprivileged `readypackets` identity; the installed drop-in supplies additional sandboxing. `/etc/readypackets/portal.env` and source credential files are root-owned `0600`; systemd supplies `*_FILE` values via `LoadCredential`. Never source the environment file or put URL/key values in it. `MemoryDenyWriteExecute` is not enabled because it would prevent the Node/V8 JIT from running.
 - **Production commands**: The release prunes dev dependencies. Migration, administrator bootstrap, offerings catalog import, backup, restore and key tools use plain Node with the compiled `dist/ops/*.js` entry points; do not depend on `tsx` or the repository source tree in production. The demo seed is not included in the installed release.
-- **Repeated install**: Rerunning with the same SHA preserves keys, installation ID, prior admin marker, database, and uploads. It will not switch to another release. If bootstrap was skipped, rerun this installer to create the first admin. If bootstrap was interrupted after submission, first check whether the account exists; a successful creation must not be retried blindly. If a cleanly recreated site used a different certificate setup, reconcile the root-owned TLS snippet before reloading Nginx.
+- **Repeated install**: Rerunning with the same SHA preserves keys, installation ID, prior admin marker, database, and uploads. It will not switch to another release. If bootstrap was skipped, rerun this installer to create the first admin. If bootstrap was interrupted after submission, first check whether the account exists; a successful creation must not be retried blindly. `install.sh` renders the Nginx site and TLS snippet from `/etc/readypackets/site.conf`; keep the canonical host and alias unchanged after installation.
 - **Existing installations**: If an earlier installer generated production keys under the build account, review the historical custody before reuse and plan any rotation using the key runbook and retained decrypt keys. The new installer does not overwrite existing key material.
-- **Enable MFA**: Use `https://my.readypackets.com` to sign in with the temporary password. Change it and enroll an authenticator, then store recovery codes offline. Verify a fresh MFA step-up for sensitive operations. Provision a second named, secured admin using the portal before relying on production self-service. Leave external authentication disabled until its trust and recovery procedures have been tested.
+- **Enable MFA**: Use your canonical HTTPS address to sign in with the temporary password. Change it and enroll an authenticator, then store recovery codes offline. Verify a fresh MFA step-up for sensitive operations. Provision a second named, secured admin using the portal before relying on production self-service. Leave external authentication disabled until its trust and recovery procedures have been tested.
 - **SMTP**: Configure the approved SMTP host in integration egress policy and the admin console with authenticated TLS (implicit TLS or required STARTTLS as supported). Enter credentials through the console rather than in unit files or Git. Test delivery to an approved inbox and confirm sender authentication, expiry, and redacted delivery status. Never enable local mail capture in production.
 
 ### Load the offerings catalog (optional)
@@ -63,7 +81,7 @@ Run `--dry-run` first to validate the offerings file and execute the import insi
 
 ```bash
 run_catalog_import() {
-  sudo systemd-run --wait --collect --pipe --service-type=exec \
+  sudo systemd-run --wait --collect --pipe --service-type=exec --expand-environment=no \
     --property=User=readypackets --property=Group=readypackets --property=UMask=0077 \
     --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
     --property=PrivateTmp=yes --property=PrivateDevices=yes --property=CapabilityBoundingSet= \
@@ -120,7 +138,7 @@ sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>
 
 ## Go-live checklist
 
-- [ ] Confirm DNS for both names, certificate chain and renewal, HTTP→HTTPS, TLS alias 308, unknown-host rejection, and no externally reachable MySQL/Node listeners. Verify public ingress is down while the maintenance sentinel exists.
+- [ ] Confirm DNS for the canonical name and any alias, certificate chain and renewal, HTTP→HTTPS, TLS alias 308 if configured, unknown-host rejection, and no externally reachable MySQL/Node listeners. Verify public ingress is down while the maintenance sentinel exists.
 - [ ] Confirm TLS 1.2/1.3 only, app HSTS and security headers, and `index.html`/`sw.js` not served from an edge cache. Verify expected limits for JSON, presentation image, transfer and file upload independently.
 - [ ] Check loopback and public `/healthz` and `/readyz`; verify worker progress and a correlated app/edge log without payloads or credentials.
 - [ ] Exercise browser sign-in, MFA/recovery and mail, and verify application audit, off-host audit evidence and collector receipt. Review alerting, log rotation, deployment account grants, and the backup TLS exception.

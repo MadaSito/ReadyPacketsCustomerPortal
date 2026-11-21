@@ -9,6 +9,10 @@ procedure.
 
 ### Added
 
+- Native auto-installer for fresh Ubuntu 26.04 LTS servers (amd64 and arm64). Installs prerequisites and
+  checksum-pinned Node.js and pnpm, accepts a portal host and optional redirect alias, configures public or
+  self-signed TLS, loads the bundled offerings and generates the first administrator's temporary password.
+  See the [operator guide](docs/operations/AUTO_INSTALL.md).
 - Docker Compose stack for evaluation and testing on any host name (`deploy/docker/`): digest-pinned image
   build, generated secrets in volumes, MySQL 8.4 with required TLS and least-privilege accounts, Caddy with
   automatic certificates, a one-command server setup (`install-vps.sh`) and an operator wrapper

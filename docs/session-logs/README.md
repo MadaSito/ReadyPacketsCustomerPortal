@@ -6,3 +6,4 @@ values redacted. Newest last.
 | Date | File | Summary |
 | --- | --- | --- |
 | 2026-11-20 | `2026-11-20-session-01.md` | Initial secure rebuild of the customer portal platform |
+| 2026-11-21 | [2026-11-21-session-01.md](2026-11-21-session-01.md) | Native automatic Ubuntu 26.04 installation |
