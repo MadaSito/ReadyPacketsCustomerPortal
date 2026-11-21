@@ -6,8 +6,9 @@ contracts in `server/modules/*/API.md` and the operator tooling in `scripts/ops/
 only on the server or command line are marked as such. **Disabled in this release** means the feature is deliberately
 switched off.
 
-Server installation, TLS, upgrades and go-live checks are in [Install on Ubuntu 24.04](../operations/INSTALL.md) and
-[Deployment profiles](../../deploy/README.md). This guide covers using the console.
+For new Ubuntu 26.04 LTS servers, start with the [automatic installation guide](../operations/AUTO_INSTALL.md). For
+Ubuntu 24.04 LTS or self-provisioned dependencies, see the [manual installation guide](../operations/INSTALL.md).
+TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/README.md).
 
 ## Contents
 
@@ -43,6 +44,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Jobs and schedules](../../server/modules/jobs/ADMIN_GUIDE.md): inspect job attempts and manage schedules.
 - [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
 - [Application Protection](../../server/modules/protection/ADMIN_GUIDE.md): manage protection policy, offline country lookups and recovery.
 
