@@ -18,6 +18,7 @@ import { backupFeature } from "@/features/backup/routes";
 import { integrationsFeature } from "@/features/integrations/routes";
 import { automationsFeature } from "@/features/automations/routes";
 import { mailFeature } from "@/features/mail/routes";
+import { mailTemplatesFeature } from "@/features/mailTemplates/routes";
 import { storageFeature } from "@/features/storage/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
@@ -38,6 +39,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   integrationsFeature,
   automationsFeature,
   mailFeature,
+  mailTemplatesFeature,
   storageFeature,
 ];
 
