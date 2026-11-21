@@ -24,3 +24,7 @@ e400060876c5b796877a07495c10d7c6a59fe3d7:server/modules/compliance/compliance.te
 7c319dbcc5a24debf696a0d8e4e13cce0fdfaeb6:tests/integration/isolation.test.ts:generic-api-key:120
 7c319dbcc5a24debf696a0d8e4e13cce0fdfaeb6:tests/integration/isolation.test.ts:generic-api-key:198
 4754829aeb6b32db6a1c60f8eeeab7f54290823d:tests/integration/journey-integrations.test.ts:generic-api-key:14
+# 2026-11-21, increment 03: synthetic webhook signing secret in an automations test and a synthetic product key
+# in the workflow designer test. Reviewed; neither is a credential.
+cc919aeaf03dc4b6ed92ec94c66e7568dd63c162:server/modules/automations/automations.test.ts:generic-api-key:714
+cbabd32679c7e3002bc282c062db8b6f2c955588:server/modules/orders/workflowDesigner.test.ts:generic-api-key:62

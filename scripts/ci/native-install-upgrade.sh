@@ -195,7 +195,8 @@ customer = trpc_mutate(
     "identity.admin.customers.create",
     {"email": f"customer@{origin.removeprefix('https://')}", "name": "Pre-Upgrade Customer"},
 )
-assert customer["customerRef"].startswith("RPCUS-"), f"unexpected customer: {customer}"
+# The baseline release issues the earlier reference format; it must survive the upgrade unchanged (checked below).
+assert customer["customerRef"].startswith("RP-"), f"unexpected baseline customer: {customer}"
 
 groups = trpc_query("orders.catalog.list")
 products = [prod for group in groups for prod in group.get("products", [])]
@@ -387,6 +388,18 @@ assert loaded_customer["customerRef"] == state["customerRef"], f"customer mismat
 loaded_order = trpc_query("orders.admin.get", {"orderId": state["orderPublicId"]})
 assert loaded_order["reference"] == state["orderReference"], f"order mismatch: {loaded_order}"
 assert loaded_order["projectName"] == "Pre-Upgrade Order", f"order projectName mismatch: {loaded_order}"
+
+# Customers created after the upgrade get the new reference format: RPCUS- plus nine characters 0-9 A-Z.
+new_customer = trpc_mutate(
+    "identity.admin.customers.create",
+    {"email": f"customer.after@{origin.removeprefix('https://')}", "name": "Post-Upgrade Customer"},
+)
+new_ref = new_customer["customerRef"]
+assert (
+    new_ref.startswith("RPCUS-")
+    and len(new_ref) == 15
+    and all(ch in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" for ch in new_ref[6:])
+), f"unexpected post-upgrade customer reference: {new_customer}"
 
 # Verify Increment 03 migrated surfaces respond cleanly (and ship disabled by default).
 backups = trpc_query("backup.listArchives", {"limit": 10})

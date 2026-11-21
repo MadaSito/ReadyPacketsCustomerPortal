@@ -40,7 +40,8 @@ export function parseSiteUrl(raw: string): ParsedSiteUrl | null {
   if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443")) return null;
   const hostname = url.hostname.toLowerCase();
   const tenant = sharePointTenantOf(hostname);
-  if (!tenant || hostname.endsWith("-my.sharepoint.com")) return null;
+  // A personal (OneDrive) host is `<tenant>-my`; the host itself was validated by sharePointTenantOf above.
+  if (!tenant || hostname.slice(0, -SP_SUFFIX.length).endsWith("-my")) return null;
   let decoded: string;
   try {
     decoded = decodeURIComponent(url.pathname);

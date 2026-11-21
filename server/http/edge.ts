@@ -45,7 +45,7 @@ const MODULES = new Set([
 ]);
 
 /** Only fixed labels are emitted; callback paths may carry credentials in their query. */
-export function oauthCallbackRoute(path: string): string | undefined {
+export function providerCallbackRoute(path: string): string | undefined {
   if (/^\/api\/storage\/oauth\/callback(?:\/|$)/i.test(path)) return "/api/storage/oauth/callback/:provider";
   if (/^\/api\/identity\/sso\/callback\/?$/i.test(path)) return "/api/identity/sso/callback";
   return undefined;
@@ -53,7 +53,7 @@ export function oauthCallbackRoute(path: string): string | undefined {
 
 export function routeTemplate(req: Request): string {
   const path = req.path;
-  const oauth = oauthCallbackRoute(path);
+  const oauth = providerCallbackRoute(path);
   if (oauth) return oauth;
   if (PROBE_PATHS.has(path) || path === "/robots.txt" || path === "/api/csrf") return path;
   if (path === SIGNED_WEBHOOK_PATH || path.startsWith(`${SIGNED_WEBHOOK_PATH}/`)) return `${SIGNED_WEBHOOK_PATH}/:provider`;
