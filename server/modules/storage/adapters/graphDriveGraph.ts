@@ -28,6 +28,8 @@ export interface PublishedGraphClient {
     maxResponseBytes?: number;
     timeoutMs?: number;
     signal?: AbortSignal;
+    /** Proposed to integrations (not yet in API.md): called after token acquisition, before each write send/replay. */
+    beforeSend?: () => Promise<void>;
   }): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }>;
   uploadChunk(input: {
     uploadUrl: string;
@@ -36,7 +38,24 @@ export interface PublishedGraphClient {
     allowedHostSuffixes?: readonly string[];
     timeoutMs?: number;
     signal?: AbortSignal;
+    beforeSend?: () => Promise<void>;
   }): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }>;
+}
+
+/** Wraps a fence so its error can be told apart from transport errors and rethrown unchanged. */
+function trackFence(fence: (() => Promise<void>) | undefined) {
+  const state: { lost: { error: unknown } | null } = { lost: null };
+  const wrapped = fence
+    ? async () => {
+        try {
+          await fence();
+        } catch (error) {
+          state.lost = { error };
+          throw error;
+        }
+      }
+    : undefined;
+  return { state, wrapped };
 }
 
 export type ScopedGraphClientFactory = (credentials: GraphCredentials) => PublishedGraphClient;
@@ -102,7 +121,10 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
     async request(credentials: GraphCredentials, req: GraphRequest): Promise<GraphResponse> {
       if (req.rawBody) throw new GraphTransportError("NETWORK", false); // not supported by the published client
       if (!req.path.startsWith("/") || req.path.startsWith("//")) throw new GraphTransportError("EGRESS_DENIED", false);
+      const fence = trackFence(req.beforeSend);
       try {
+        // Until the client honours beforeSend itself, fence here too (before token acquisition).
+        await fence.wrapped?.();
         const client = factory(credentials);
         const res = await client.request({
           method: req.method,
@@ -113,9 +135,11 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
           maxResponseBytes: MAX_RESPONSE_BYTES,
           timeoutMs: REQUEST_TIMEOUT_MS,
           ...(req.signal ? { signal: req.signal } : {}),
+          ...(fence.wrapped ? { beforeSend: fence.wrapped } : {}),
         });
         return { status: res.status, headers: lowerHeaders(res.headers), body: parseBody(res.rawBody) };
       } catch (error) {
+        if (fence.state.lost) throw fence.state.lost.error;
         return mapGraphError(error);
       }
     },
@@ -125,7 +149,9 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
       if (input.url.protocol !== "https:" || input.url.port !== "" || input.url.username || input.url.password) {
         throw new GraphTransportError("EGRESS_DENIED", false);
       }
+      const fence = trackFence(input.beforeSend);
       try {
+        await fence.wrapped?.();
         const client = uploader();
         const res = await client.uploadChunk({
           uploadUrl: input.url.href,
@@ -134,9 +160,11 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
           allowedHostSuffixes: [input.url.hostname],
           timeoutMs: CHUNK_TIMEOUT_MS,
           ...(input.signal ? { signal: input.signal } : {}),
+          ...(fence.wrapped ? { beforeSend: fence.wrapped } : {}),
         });
         return { status: res.status, headers: lowerHeaders(res.headers), body: parseBody(res.rawBody) };
       } catch (error) {
+        if (fence.state.lost) throw fence.state.lost.error;
         return mapGraphError(error);
       }
     },

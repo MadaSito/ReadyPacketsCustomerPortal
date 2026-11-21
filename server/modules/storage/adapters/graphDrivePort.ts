@@ -31,6 +31,12 @@ export interface GraphRequest {
   rawBody?: Buffer;
   headers?: Record<string, string>;
   signal?: AbortSignal;
+  /**
+   * Write fence. The transport calls it after any async token acquisition and immediately before each
+   * outbound send of a provider write, including any internal replay; a throw aborts the send and must reach
+   * the caller unchanged.
+   */
+  beforeSend?: () => Promise<void>;
 }
 
 export interface GraphResponse {
@@ -58,7 +64,7 @@ export interface GraphHttpPort {
   readonly supportsRawBody?: boolean;
   request(credentials: GraphCredentials, request: GraphRequest): Promise<GraphResponse>;
   /** PUT a byte range to a checked upload-session URL. No Authorization header. */
-  uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string; signal?: AbortSignal }): Promise<GraphResponse>;
+  uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string; signal?: AbortSignal; beforeSend?: () => Promise<void> }): Promise<GraphResponse>;
   /** GET the status of (or DELETE / cancel) a checked upload session. No Authorization header. */
   uploadSessionControl(input: { url: URL; method: "GET" | "DELETE"; signal?: AbortSignal }): Promise<GraphResponse>;
 }

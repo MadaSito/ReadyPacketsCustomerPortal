@@ -90,7 +90,9 @@ describe("graph drive adapter (against the local Graph fake)", () => {
     const stored = graph.findByPath(graph.libraryDrive, ["Portal", "Orders", "AvExample_CUST-1", "RP-1 Demo", "file.pdf"]);
     expect(stored?.content?.equals(bytes)).toBe(true);
     expect(stored?.id).toBe(result.remoteId);
-    expect(writes).toBe(2); // one new folder ("RP-1 Demo"; the customer folder already existed) plus the content PUT
+    // One new folder ("RP-1 Demo"; the customer folder already existed) plus the content PUT, each fenced
+    // twice: by the adapter before the call and by the transport after token acquisition, right before sending.
+    expect(writes).toBe(4);
   });
 
   it("re-running an identical put returns the existing item; a different object under the same name conflicts", async () => {
@@ -128,13 +130,17 @@ describe("graph drive adapter (against the local Graph fake)", () => {
   it("propagates a fence loss during chunk upload unchanged and cancels the session", async () => {
     const { adapter, graph } = setup();
     await adapter.ensureFolder(["AvExample_CUST-1", "RP-1 Demo"]);
-    let n = 0;
-    const loseOnSecondChunk = async () => {
-      if (++n === 3) throw new Error("lease lost");
-    };
-    await expect(adapter.put({ ...putInput(randomBytes(UPLOAD_CHUNK * 2 + 1), "fenced.bin"), beforeWrite: loseOnSecondChunk })).rejects.toThrow("lease lost");
-    expect(graph.calls.filter((c) => c.kind === "upload" && c.method === "PUT")).toHaveLength(1);
-    expect(graph.sessions.size).toBe(0);
+    // Fence calls: session pre-check 1, session in-transport 2, chunk 1: 3/4, chunk 2: 5 (adapter) / 6 (transport).
+    for (const [i, failAt] of [5, 6].entries()) {
+      let n = 0;
+      const loseOnSecondChunk = async () => {
+        if (++n === failAt) throw new Error("lease lost");
+      };
+      const before = graph.calls.filter((c) => c.kind === "upload" && c.method === "PUT").length;
+      await expect(adapter.put({ ...putInput(randomBytes(UPLOAD_CHUNK * 2 + 1), `fenced${i}.bin`), beforeWrite: loseOnSecondChunk })).rejects.toThrow("lease lost");
+      expect(graph.calls.filter((c) => c.kind === "upload" && c.method === "PUT").length - before).toBe(1);
+      expect(graph.sessions.size).toBe(0);
+    }
   });
 
   it("refuses an upload-session URL outside the tenant lineage before sending bytes", async () => {

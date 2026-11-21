@@ -123,9 +123,22 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
 
   const call = async (req: Parameters<GraphHttpPort["request"]>[1]): Promise<GraphResponse> => {
     if (!creds || !config.driveId) throw new StorageAdapterError("NOT_CONFIGURED", false);
+    let fenceLost: { error: unknown } | null = null;
+    const fenced = req.beforeSend;
+    const beforeSend = fenced
+      ? async () => {
+          try {
+            await fenced();
+          } catch (error) {
+            fenceLost = { error };
+            throw error;
+          }
+        }
+      : undefined;
     try {
-      return await graph.request(creds, req);
+      return await graph.request(creds, beforeSend ? { ...req, beforeSend } : req);
     } catch (error) {
+      if (fenceLost) throw (fenceLost as { error: unknown }).error;
       throw toAdapterError(error);
     }
   };
@@ -155,6 +168,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           path: `${drive}/items/${encodeURIComponent(parentId)}/children`,
           body: { name: full[i], folder: {}, "@microsoft.graph.conflictBehavior": "fail" },
           signal,
+          ...(beforeWrite ? { beforeSend: beforeWrite } : {}),
         });
         if (res.status === 409) {
           const raced = await itemByPath(full.slice(0, i + 1), signal);
@@ -212,6 +226,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       path: `${drive}/items/${encodeURIComponent(parentId)}:/${encodeURIComponent(input.name)}:/createUploadSession`,
       body: { item: { "@microsoft.graph.conflictBehavior": "fail" } },
       signal: input.signal,
+      ...(input.beforeWrite ? { beforeSend: input.beforeWrite } : {}),
     });
     const url = checkUploadUrl(expectOk(res, 200).uploadUrl, tenant);
     if (!url) throw new StorageAdapterError("DESTINATION_DENIED", false);
@@ -239,9 +254,9 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
             let r: GraphResponse | null = null;
             await fence();
             try {
-              r = await graph.uploadSessionPut({ url, body: chunk, contentRange: `bytes ${offset}-${end}/${input.size}`, signal: input.signal });
+              r = await graph.uploadSessionPut({ url, body: chunk, contentRange: `bytes ${offset}-${end}/${input.size}`, signal: input.signal, beforeSend: fence });
             } catch (error) {
-              if (attempt >= CHUNK_ATTEMPTS) throw toAdapterError(error);
+              if (fenceError || attempt >= CHUNK_ATTEMPTS) throw error instanceof StorageAdapterError || fenceError ? error : toAdapterError(error);
             }
             if (r && (r.status === 200 || r.status === 201)) {
               finalItem = asRecord(r.body);
@@ -328,6 +343,7 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           rawBody: bytes,
           headers: { "content-type": "application/octet-stream" },
           signal: input.signal,
+          ...(input.beforeWrite ? { beforeSend: input.beforeWrite } : {}),
         });
         return verify(expectOk(res, 200, 201), input.size, quickXor, input.signal);
       }

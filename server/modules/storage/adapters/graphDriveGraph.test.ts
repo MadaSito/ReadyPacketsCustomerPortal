@@ -69,4 +69,18 @@ describe("graph drive port binding (structural stub)", () => {
     await expect(port.uploadSessionPut({ url: new URL("https://contoso.sharepoint.com:8443/x"), body: Buffer.from("a"), contentRange: "bytes 0-0/1" })).rejects.toMatchObject({ code: "EGRESS_DENIED" });
     await expect(port.uploadSessionControl({ url, method: "GET" })).rejects.toBeInstanceOf(GraphTransportError);
   });
+
+  it("passes the write fence to the client and rethrows a lost fence unchanged", async () => {
+    const lost = new Error("lease lost");
+    let calls = 0;
+    const { port, seen } = stub(async (i) => {
+      await (i as { beforeSend?: () => Promise<void> }).beforeSend?.();
+      return { status: 201, headers: {}, rawBody: Buffer.alloc(0) };
+    });
+    await port.request(creds, { method: "POST", path: "/x", body: {}, beforeSend: async () => void calls++ });
+    expect(calls).toBe(2); // binding pre-check + client after token acquisition
+    await expect(port.request(creds, { method: "POST", path: "/x", body: {}, beforeSend: async () => { if (++calls === 4) throw lost; } })).rejects.toBe(lost);
+    await expect(port.uploadSessionPut({ url: new URL("https://contoso.sharepoint.com/u"), body: Buffer.from("a"), contentRange: "bytes 0-0/1", beforeSend: async () => { throw lost; } })).rejects.toBe(lost);
+    expect(seen.chunks).toHaveLength(0);
+  });
 });

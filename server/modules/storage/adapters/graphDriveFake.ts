@@ -162,12 +162,14 @@ export class FakeGraph implements GraphHttpPort {
     if (req.rawBody && !this.supportsRawBody) throw new Error("fake: raw body not supported by this transport");
     this.calls.push({ method: req.method, path: req.path, kind: "graph", authorized: true });
     if (credentials.clientSecret !== this.validSecret) throw new GraphTransportError("AUTH_FAILED", false);
+    await req.beforeSend?.(); // after "token acquisition", before the send
     const hit = this.intercepted(req.method, req.path, "graph");
     if (hit) return hit;
     return this.route(req);
   }
 
-  async uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string }): Promise<GraphResponse> {
+  async uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string; beforeSend?: () => Promise<void> }): Promise<GraphResponse> {
+    await input.beforeSend?.();
     this.calls.push({ method: "PUT", path: input.url.pathname, kind: "upload", authorized: false });
     const hit = this.intercepted("PUT", input.url.pathname, "upload");
     if (hit) return hit;
