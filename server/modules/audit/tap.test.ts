@@ -242,6 +242,13 @@ describe("trigger catalogue", () => {
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_ENABLED" })).map((e) => e.key)).toEqual(["maintenance.enabled"]);
   });
 
+  it("only customer-visible uploads reach file.uploaded (staff-only and legacy events never match)", () => {
+    const file = { type: "file", publicId: "01JD0000000000000000000005" };
+    expect(entriesForEvent(tapEvent({ eventName: "file.uploaded", resource: file, attributes: { file_visibility: "customer_visible" } })).map((e) => e.key)).toEqual(["file.uploaded"]);
+    expect(entriesForEvent(tapEvent({ eventName: "file.uploaded", resource: file, attributes: { file_visibility: "staff_only" } }))).toEqual([]);
+    expect(entriesForEvent(tapEvent({ eventName: "file.uploaded", resource: file, attributes: {} }))).toEqual([]);
+  });
+
   it("keeps internal order notes away from customer-facing triggers (review J-A01)", () => {
     const message = { type: "order_message", publicId: "01JD0000000000000000000004" };
     expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: { visibility: "internal", attachment_count: 1 } })).map((e) => e.key)).toEqual(["message.internal_note"]);

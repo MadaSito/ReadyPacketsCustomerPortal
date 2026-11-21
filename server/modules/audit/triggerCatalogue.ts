@@ -125,8 +125,8 @@ const ENTRIES: TriggerCatalogueEntry[] = [
   },
   {
     key: "file.uploaded", label: "File uploaded", group: "Files and messages", owner: "files",
-    description: "A file was added to an order.",
-    eventName: "file.uploaded", outcomes: ["completed"], resourceType: "file",
+    description: "A customer-visible file was added to an order. Staff-only uploads never match.",
+    eventName: "file.uploaded", outcomes: ["completed"], match: { file_visibility: "customer_visible" }, resourceType: "file",
     fields: [actorRole, f("file_category", "File category", "enum", "context", { enumValues: FILE_CATEGORIES }), ...orderContext, recipientName],
     recipients: [ORDER_OWNER, ORDER_ASSIGNEE, ACTOR, ADMINS],
   },
