@@ -790,7 +790,7 @@ export function StorageConnectionsPage() {
                       <p className="mt-0.5 text-xs text-muted">{meta.description}</p>
                       {preset.hosts.length > 0 ? (
                         <p className="mt-1 font-mono text-xs text-body break-all">
-                          Active: {preset.hosts.join(", ")}
+                          {preset.enabled ? "Allowed" : "Hosts"}: {preset.hosts.join(", ")}
                         </p>
                       ) : null}
                     </div>

@@ -520,6 +520,15 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
             const key = keyOf(id);
             if (key) edit((current) => ({ ...current, layout: setPosition(current.layout, key, x, y) }));
           }}
+          onArrange={(positions) =>
+            edit((current) => ({
+              ...current,
+              layout: Object.entries(positions).reduce((next, [id, at]) => {
+                const key = current.definition.states[indexOfId(id)]?.key ?? "";
+                return key ? setPosition(next, key, at.x, at.y) : next;
+              }, current.layout),
+            }))
+          }
           onConnect={(from, to) => addTransition(keyOf(from), keyOf(to))}
           onDelete={remove}
         />

@@ -188,6 +188,7 @@ export function CanvasBuilder({ draft, onChange, catalogue, errors }: { draft: D
       <div className="flex min-w-0 flex-col gap-2">
         <FlowCanvas label="Automation canvas" nodes={graph.nodes} edges={graph.edges} height="md" selected={selected} onSelect={setSelected}
           onMove={(id, x, y) => onChange(setPosition(draft, id, x, y))}
+          onArrange={(positions) => onChange({ ...draft, positions: { ...draft.positions, ...positions } })}
           onConnect={(from, to) => { const next = connect(draft, from, to); if (next) onChange(next); }}
           onDelete={(sel) => { if (sel.type === "node") remove(sel.id); }} />
         <p className="text-sm text-muted">Select a box to edit it. Connecting a box to an action moves that action right after it. Every change can also be made with the buttons beside the canvas.</p>

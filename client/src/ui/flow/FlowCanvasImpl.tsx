@@ -23,9 +23,9 @@ import {
 } from "@xyflow/react";
 import { Maximize, Minus, Plus } from "lucide-react";
 import { createContext, useEffect, useCallback, useContext, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { IconButton } from "../Button";
+import { Button, IconButton } from "../Button";
 import { cn } from "../cn";
-import { FLOW_GRID, FLOW_HEIGHTS, snap, type FlowCanvasProps, type FlowEdge, type FlowNode, type FlowSelection, type FlowTone } from "./types";
+import { arrangeFlow, FLOW_GRID, FLOW_HEIGHTS, snap, type FlowCanvasProps, type FlowEdge, type FlowNode, type FlowSelection, type FlowTone } from "./types";
 
 type RpNode = Node<{ node: FlowNode }, "rp">;
 type RpEdge = Edge<{ edge: FlowEdge; fromLabel: string; toLabel: string }, "rp">;
@@ -133,7 +133,7 @@ const INSTANT = { duration: 0 } as const;
 // @xyflow/react 13 reads a bare number as pixels (0.2 → 0 px), so the margin is given as a percentage.
 const FIT = { padding: "8%", maxZoom: 1 } as const;
 
-function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConnect, onDelete, readOnly = false, height = "md" }: FlowCanvasProps) {
+function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConnect, onArrange, onDelete, readOnly = false, height = "md" }: FlowCanvasProps) {
   const flow = useReactFlow<RpNode, RpEdge>();
   const helpId = useId();
   const frameRef = useRef<HTMLDivElement>(null);
@@ -313,6 +313,20 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
           <IconButton label="Zoom in" icon={<Plus />} variant="secondary" size="sm" onClick={() => void flow.zoomIn(INSTANT)} />
           <IconButton label="Zoom out" icon={<Minus />} variant="secondary" size="sm" onClick={() => void flow.zoomOut(INSTANT)} />
           <IconButton label="Fit to view" icon={<Maximize />} variant="secondary" size="sm" onClick={() => void flow.fitView({ ...INSTANT, ...FIT })} />
+          {!readOnly && onArrange ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => {
+                onArrange(arrangeFlow(nodes, edges));
+                setMessage("Steps arranged from left to right.");
+                // Fit once the new positions have rendered.
+                window.setTimeout(() => void flow.fitView({ ...INSTANT, ...FIT }), 60);
+              }}
+            >
+              Tidy layout
+            </Button>
+          ) : null}
           {readOnly ? <span className="ml-2 text-sm text-muted">Read only</span> : null}
         </div>
         <p id={helpId} className="text-sm text-muted">
