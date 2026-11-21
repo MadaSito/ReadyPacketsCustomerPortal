@@ -6,7 +6,7 @@
 export const USER_ROLES = ["admin", "staff", "customer"] as const;
 export type UserRole = (typeof USER_ROLES)[number];
 
-export const AUTH_METHODS = ["local", "saml"] as const;
+export const AUTH_METHODS = ["local", "saml", "entra"] as const;
 export type AuthMethod = (typeof AUTH_METHODS)[number];
 
 /**
