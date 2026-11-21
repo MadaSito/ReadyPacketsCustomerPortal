@@ -277,3 +277,104 @@ sidebar marks `href` and everything under `href/` as current):
 | SharePoint order sync | `/admin/sharepoint-sync` | Integrations | 64 | siem |
 
 The existing `/admin/mail` (jobs, "Mail") stays as the message log; suggested new label "Mail log".
+
+## Increment 04 (package N): shared components, customer navigation, theme control, responsive rules
+
+Status: the **interfaces below are final**. Build against them now. Components land in `@/ui` as they are
+committed; each row says what it does so you can stub until then. Everything is keyboard operable,
+24 px minimum targets (44 px on coarse pointers), and tested with axe in light and dark.
+
+### New and changed components (`import { … } from "@/ui"`)
+
+| Component | Props | Notes |
+| --- | --- | --- |
+| `SegmentedControl<T extends string>` | `label` (group name, required), `options: {value: T, label: string, icon?: LucideIcon}[]`, `value: T`, `onValueChange(v: T)`, `size?: "sm"\|"md"`, `iconOnly?: boolean`, `className?` | `role="radiogroup"`, roving tabindex, arrows/Home/End select. `iconOnly` keeps the label as the accessible name and as a tooltip. Use for 2–5 mutually exclusive views or modes. |
+| `ThemeControl` | `variant?: "full"\|"compact"`, `className?` | System \| Light \| Dark segmented control bound to `useTheme()`. `compact` is icon-only (phones). Used by the shells, the sign-in page and Account settings; owners of settings pages just render `<ThemeControl />`. |
+| `Stepper` | `label`, `steps: {key, label, description?, state: "done"\|"current"\|"upcoming"\|"locked"\|"blocked"}[]`, `orientation?: "auto"\|"horizontal"\|"vertical"`, `onStepSelect?(key)` | Ordered list, `aria-current="step"`, state as icon **and** text (sr-only suffix "completed", "locked", …). `auto` = vertical in narrow containers (container query), horizontal otherwise. With `onStepSelect`, done steps become buttons. |
+| `PhaseRail` | same as `Stepper` plus `phases[].meta?: ReactNode` (for example a lock badge or date) | Order-page variant of `Stepper` with a lock icon for `locked`. Use `Stepper` for wizards that are not `Wizard`. |
+| `Checklist` | `title`, `headingLevel?: 2\|3`, `items: {key, label, description?, state: "done"\|"todo"\|"blocked"\|"optional", action?: ReactNode}[]`, `summary?: string` | Shows "2 of 5 done" (computed when `summary` is omitted, optional items excluded). Item state as icon and text. The progress summary is a polite live region. |
+| `StatCard` | `label`, `value: ReactNode`, `hint?`, `icon?: LucideIcon`, `tone?: "neutral"\|"info"\|"success"\|"warning"\|"danger"`, `href?` (whole card becomes one link), `loading?` | `<dl>` semantics; tone is decoration only, never the message. Put them in `<StatGrid>` (1 → 2 → 4 columns by container width). |
+| `StatGrid` | `children`, `label?` | Responsive grid for `StatCard`s (container query). |
+| `CopyField` | `label`, `value`, `hint?`, `monospace?`, `copyLabel?`, `secret?: boolean` | Read-only input + Copy button; "Copied" announced politely. `secret` masks the value with a Show toggle (for one-time API keys / webhook secrets). Never put a secret in the URL or in a toast. |
+| `EmptyState` (changed) | adds `variant?: "default"\|"first-use"\|"no-results"\|"filtered"\|"disabled"\|"error"`, `size?: "sm"\|"md"`, `onClearFilters?()` | Variant chooses the default icon and, for `filtered`, a "Clear filters" button. `disabled` = feature off ("This feature isn't turned on"). Existing calls unchanged. |
+| `TagInput` | `label`, `value: string[]`, `onValueChange(v)`, `max?`, `maxLength?` (per tag, default 40), `suggestions?: string[]`, `validate?(tag) => string \| null`, `normalize?(tag) => string` (default trim + lower-case), `hint?`, `error?`, `placeholder?`, `disabled?` | Enter or comma adds, Backspace on empty removes the last tag, each tag has a "Remove tag X" button, duplicates refused with a text error, changes announced. Wraps itself in a `Field`. |
+| `CodeBlock` (changed) | adds `language?: string` (shown as a caption, no highlighting, no inline styles) | Existing props unchanged. |
+| `CodeSamples` | `label`, `samples: {key, label, code, language?}[]`, `defaultKey?` | Tabs of `CodeBlock`s (curl / JavaScript / Python for API docs), each copyable. |
+| `Timeline` | `label`, `items: {key, title: ReactNode, time: Date\|string, description?: ReactNode, actor?: string, icon?: LucideIcon, tone?: Tone}[]`, `order?: "newest-first"\|"oldest-first"` | `<ol>` with `<time>`; tone never the only signal. Use for audit trails, order history, referral history. |
+| `Pagination` | cursor mode: `hasPrevious`, `hasNext`, `onPrevious()`, `onNext()`; page mode: `page`, `pageCount`, `onPageChange(n)`; both: `label`, `summary?` ("Showing 26–50 of 112"), `loading?` | `<nav aria-label>`; summary polite. Page mode collapses to "Page x of y" + previous/next below sm. `LoadMore` stays for infinite lists. |
+| `DataTable` (unchanged API) | — | Already renders stacked labelled cards below md. Rule: never give a table a fixed min-width; mark one column `primary`. |
+| `Breadcrumbs` (unchanged) | — | **Required** on every page nested two or more levels below a navigation entry (pass `breadcrumbs` to `PageHeader`). |
+
+### NavItem changes (`@/lib/routes`)
+
+```ts
+interface NavItem {
+  // … existing fields …
+  /** Customer area: undefined = main section, "Support", or "Account". Console: the existing heading. */
+  group?: string;
+  /** Feature switch key; the entry is shown only when `features.enabled(key)` is true (platform port). */
+  enabledBy?: "cart" | "community" | "referrals" | "knowledge" | (string & {});
+}
+```
+
+- `placement` keeps working. In the customer area an entry without `group` whose placement is `account`
+  (paths `/account…`, `/policies`) is treated as `group: "Account"`.
+- Current page: the **longest** matching `href` wins, so `/orders` and `/orders/new`, or `/account` and
+  `/account/security`, can both be entries.
+- Entries with `enabledBy` are hidden until the platform port says the feature is on (and when the port is
+  missing). Hiding is never authorisation; the server refuses disabled routes too.
+
+### Customer navigation (each owner sets these values in their own `routes.tsx`)
+
+| Section | Label | href | order | owner | enabledBy |
+| --- | --- | --- | --- | --- | --- |
+| main | Dashboard | `/` | 0 | dashboard (ui_foundation) | |
+| main | My orders | `/orders` | 10 | orders | |
+| main | Create an order | `/orders/new` | 12 | orders | |
+| main | Cart | `/cart` | 14 | cart (recovery_ops) | `cart` |
+| main | Messages | `/messages` | 20 | engagement | |
+| main | Invoices | `/invoices` | 40 | compliance | |
+| Support | Support | `/support` | 100 | engagement | |
+| Support | Community | `/community` | 110 | community (audit) | `community` |
+| Support | Knowledge base | `/help` | 120 | knowledge (engagement) | `knowledge` |
+| Account | Settings | `/account` | 200 | identity | |
+| Account | Referrals | `/account/referrals` | 210 | referrals (siem) | `referrals` |
+| Account | Security | `/account/security` | 220 | identity / assurance (one entry only) | |
+| Account | Policies | `/policies` | 230 | compliance | |
+| Account | Privacy and cookies | `/account/privacy` | 240 | consent (platform) | |
+
+`/notifications` stays `placement: "hidden"` (the bell). `/account/sessions` becomes `placement: "hidden"` once the
+Security page lists sessions (package D). Use `group: "Support"` / `group: "Account"` exactly.
+
+Shell behaviour: left sidebar with section headings at ≥ lg, collapsible to icons (the collapsed state is
+in-memory only); drawer from the top-bar menu button below lg; phone bottom bar with Dashboard, My orders,
+Create an order, Messages + "More" (everything else). Theme control: segmented in the top bar ≥ sm,
+compact below; also on the sign-in page.
+
+### Shell slots for other features (app composes; features never import each other)
+
+| Slot | Module the app looks for (optional, glob) | Export | Where it renders |
+| --- | --- | --- | --- |
+| Feature switches | `@/lib/features` (platform owns the file) | `useFeatureFlags(): (key: string) => boolean` (false while loading/unknown) | customer + console nav (`enabledBy`) |
+| Theme persistence | `@/lib/consent` (platform) + identity preference procedure | — | in-memory by default; saved server-side for a signed-in user; on anonymous screens it follows the system setting (decision 14) |
+| Cookie banner | `features/platform/consent/CookieConsent.tsx` | `CookieConsent()` | first element of every layout (public, auth, customer, console) via `CookieConsentSlot` |
+| "Manage cookie preferences" | `@/lib/consent` → `consent.openPreferences()` | — | every footer (shell renders the button) |
+| Customer maintenance | `features/jobs/CustomerMaintenanceBanner.tsx` | `CustomerMaintenanceBanner()` | sign-in page and console shell, separate from the drain banner |
+| Cart badge | `features/cart/CartBadge.tsx` | `CartBadge()` (count, `aria-label` with the number) | next to the Cart entry |
+
+Missing module or a thrown error renders nothing.
+
+### Responsive rules (every page)
+
+- No horizontal page scroll from 240 px to 3840 px. Use `min-w-0` on flex/grid children, `break-words` on
+  user text, no fixed widths above 240 px.
+- Type is fluid (`--text-*` tokens use `clamp()`); do not set pixel font sizes.
+- Components that live both in a sidebar and in a page body use container queries (`@container` on the
+  wrapper, `@md:` variants), not viewport breakpoints.
+- Fixed bars respect `env(safe-area-inset-*)`; landscape phones (short height) keep content visible:
+  avoid `h-screen`, use `min-h-dvh`.
+- Hover-only affordances must also exist for `hover: none`; coarse pointers get 44 px targets.
+- Printable pages (articles, invoices, receipts) use the `rp-print-*` helpers: shells, navigation and
+  buttons are hidden in print; `rp-print-avoid-break` keeps a block together.
+- `scripts/qa/responsive-check.mjs` checks every route at 240, 320, 390, 768, 1024, 1440, 1920 and 2560 px in
+  both themes for horizontal overflow, clipped text and targets under 24 px.

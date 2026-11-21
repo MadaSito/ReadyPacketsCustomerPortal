@@ -36,8 +36,17 @@ export interface NavItem {
   /** lucide-react icon component. */
   icon: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   area: "customer" | "console";
-  /** Console grouping heading, e.g. "Operations", "Security", "Platform". */
+  /**
+   * Console: grouping heading, e.g. "Operations", "Security", "Platform".
+   * Customer area: undefined = main section, "Support" or "Account" (entries placed in the account menu
+   * without a group count as "Account").
+   */
   group?: string;
+  /**
+   * Feature switch key (`features.enabled(key)`, platform port). The entry is shown only while the switch is
+   * on, and is hidden while loading or when the port is unavailable. Hiding is never authorisation.
+   */
+  enabledBy?: "cart" | "community" | "referrals" | "knowledge" | (string & {});
   access: RouteAccess;
   capability?: Capability;
   /** Sort order within the area/group (lower first). */
