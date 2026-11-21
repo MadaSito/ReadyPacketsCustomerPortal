@@ -41,6 +41,10 @@ x-app-environment: &app-environment
   RP_CANONICAL_ORIGIN: https://${RP_DOMAIN:?Run rp-docker.sh up --domain <host> first}
   RP_TRUSTED_PROXIES: ${RP_PROXY_IP:-172.30.250.10}
   RP_STORAGE_DIR: /var/lib/readypackets/storage
+  RP_FFMPEG_PATH: ${RP_FFMPEG_PATH:-/usr/bin/ffmpeg}
+  PROTECTION_MMDB_PATH: ${PROTECTION_MMDB_PATH:-}
+  PROTECTION_DISABLED: ${PROTECTION_DISABLED:-0}
+  PROTECTION_COUNTRY_HEADER: ${PROTECTION_COUNTRY_HEADER:-}
   TMPDIR: /var/lib/readypackets/tmp
   RP_INSTALLATION_ID: ${RP_INSTALLATION_ID:?Run rp-docker.sh up --domain <host> first}
   RP_RELEASE_REF: ${RP_RELEASE_REF:-container}

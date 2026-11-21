@@ -32,6 +32,7 @@ for name in fullchain.pem privkey.pem; do
     [[ -r "$tls_dir/$name" ]] || die "the web certificate is missing ($tls_dir/$name); see INSTALL.md"
 done
 prepare_dirs
+install_media_tools
 write_env
 
 write_url() {

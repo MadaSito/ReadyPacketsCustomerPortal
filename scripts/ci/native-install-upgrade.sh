@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end native upgrade verification on a fresh Ubuntu 26.04 runner:
-#   1. Switch /opt/readypackets-src (prepared by native-install-prepare.sh) to the baseline release (d964a3b)
+#   1. Switch /opt/readypackets-src (prepared by native-install-prepare.sh) to the baseline release (89c5cb8)
 #      and install it with deploy/auto-install.sh via native-install-run.sh.
 #   2. Over verified TLS, complete first-admin MFA enrollment + forced password change, create a customer
 #      and a real order, switch on Maintenance mode, and confirm queue_drained.
 #   3. Advance /opt/readypackets-src (root-owned, umask 022) to the commit under test, verify upgrade.sh
 #      refusal gates, and run deploy/upgrade.sh --yes <candidate-sha>.
-#   4. Verify release symlinks (previous -> d964a3b, current -> HEAD), verified pre-upgrade backup archive,
+#   4. Verify release symlinks (previous -> 89c5cb8, current -> HEAD), verified pre-upgrade backup archive,
 #      post-upgrade admin sign-in + MFA, Maintenance mode clear, pre-upgrade order + customer preservation,
-#      and newly migrated Increment 03 endpoints.
+#      migration 0003 and existing integration endpoints.
 #   5. Run the full scripts/ci/native-install-smoke.sh suite against the upgraded installation.
 set -euo pipefail
 set +x
@@ -21,7 +21,7 @@ set +x
 readonly host=$1
 readonly alias_host=$2
 readonly requested_admin_email=$3
-readonly baseline_ref=d964a3b
+readonly baseline_ref=89c5cb8
 readonly origin="https://$host"
 readonly repo_dir=/opt/readypackets-src
 readonly ca_cert=/etc/readypackets/tls/fullchain.pem
@@ -62,6 +62,7 @@ bash "$ci_scripts_dir/native-install-run.sh" first \
     --print-credentials \
     --yes
 expect 'baseline current symlink' "$(readlink -f /opt/readypackets/current)" "/opt/readypackets/releases/$baseline_sha"
+[[ ! -x /usr/bin/ffmpeg && ! -e /var/lib/readypackets/geo ]] || fail 'baseline unexpectedly installed Increment 04 dependencies'
 
 admin_email=$(sed -n 's/^  Sign-in name   : //p' "$credentials")
 sed -n 's/^  Password       : \([^ ]*\) .*$/\1/p' "$credentials" > "$work/initial.password"
@@ -195,8 +196,8 @@ customer = trpc_mutate(
     "identity.admin.customers.create",
     {"email": f"customer@{origin.removeprefix('https://')}", "name": "Pre-Upgrade Customer"},
 )
-# The baseline release issues the earlier reference format; it must survive the upgrade unchanged (checked below).
-assert customer["customerRef"].startswith("RP-"), f"unexpected baseline customer: {customer}"
+# Capture the actual reference for the round-trip check, not an earlier release's ID format.
+assert isinstance(customer["customerRef"], str) and customer["customerRef"], f"missing customer reference: {customer}"
 
 groups = trpc_query("orders.catalog.list")
 products = [prod for group in groups for prod in group.get("products", [])]
@@ -282,7 +283,18 @@ pre_upgrade_backups=$(mysql --no-defaults --protocol=socket --batch --skip-colum
     --execute="SELECT COUNT(*) FROM readypackets.backup_archives WHERE trigger_kind = 'pre_upgrade' AND state = 'completed' AND verification_status = 'verified'")
 expect 'verified pre_upgrade backup count' "$pre_upgrade_backups" 1
 
-step 'verifying post-upgrade sign-in, MFA, Maintenance clear, pre-upgrade order survival and Increment 03 routes'
+step 'verifying migration 0003 was applied exactly once'
+shopt -s nullglob
+migration_files=("$repo_dir"/migrations/0003_*.sql)
+[[ ${#migration_files[@]} == 1 ]] || fail 'expected exactly one migration 0003 file'
+migration_hash=$(sha256sum -- "${migration_files[0]}")
+migration_hash=${migration_hash%% *}
+[[ $migration_hash =~ ^[0-9a-f]{64}$ ]] || fail 'unexpected migration hash'
+expect 'migration 0003 journal entries' \
+    "$(mysql --no-defaults --protocol=socket --batch --skip-column-names readypackets \
+        --execute="SELECT COUNT(*) FROM __drizzle_migrations WHERE hash='$migration_hash'")" 1
+
+step 'verifying post-upgrade sign-in, MFA, Maintenance clear, pre-upgrade order survival and existing integration routes'
 python3 - "$origin" "$ca_cert" "$admin_email" "$work/permanent.password" "$work/state.json" <<'PY'
 import http.cookiejar
 import json
@@ -381,7 +393,7 @@ trpc_mutate(
 cleared = trpc_mutate("jobs.admin.setMaintenance", {"active": False, "expectedActive": True})
 assert cleared["active"] is False
 
-# Verify pre-upgrade customer and order survived migration 0002 intact.
+# Verify the pre-upgrade customer and order survived migration 0003 intact.
 loaded_customer = trpc_query("identity.admin.customers.get", {"customerId": state["customerPublicId"]})
 assert loaded_customer["customer"]["customerRef"] == state["customerRef"], f"customer mismatch: {loaded_customer}"
 
@@ -389,7 +401,7 @@ loaded_order = trpc_query("orders.admin.get", {"orderId": state["orderPublicId"]
 assert loaded_order["reference"] == state["orderReference"], f"order mismatch: {loaded_order}"
 assert loaded_order["projectName"] == "Pre-Upgrade Order", f"order projectName mismatch: {loaded_order}"
 
-# Customers created after the upgrade get the new reference format: RPCUS- plus nine characters 0-9 A-Z.
+# Newly created customers continue to use RPCUS- plus nine characters 0-9 A-Z.
 new_customer = trpc_mutate(
     "identity.admin.customers.create",
     {"email": f"customer.after@{origin.removeprefix('https://')}", "name": "Post-Upgrade Customer"},
@@ -401,7 +413,7 @@ assert (
     and all(ch in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" for ch in new_ref[6:])
 ), f"unexpected post-upgrade customer reference: {new_customer}"
 
-# Verify Increment 03 migrated surfaces respond cleanly (and ship disabled by default).
+# Existing Increment 03 surfaces still respond after migrating.
 backups = trpc_query("backup.admin.list", {"limit": 10})
 assert any(item["trigger"] == "pre_upgrade" and item["verificationStatus"] == "verified" for item in backups["items"]), (
     f"pre_upgrade archive missing from backup.admin.list: {backups}"

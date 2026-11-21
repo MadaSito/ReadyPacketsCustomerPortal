@@ -61,6 +61,10 @@ for tool in npm npx corepack; do
 done
 mysqld --version | grep -Eq 'Ver[[:space:]]+8\.4\.' || fail 'MySQL is not 8.4'
 
+expect 'packaged ffmpeg' "$(dpkg-query -W -f='${db:Status-Status}' ffmpeg)" installed
+runuser -u readypackets -- /usr/bin/prlimit -- /usr/bin/ffmpeg -version > "$work/ffmpeg.version"
+grep -q '^ffmpeg version ' "$work/ffmpeg.version" || fail 'FFmpeg version is unavailable to the service user'
+
 step 'readiness and the application shell over verified TLS'
 expect 'readyz' "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 expect 'healthz' "$(web -o /dev/null -w '%{http_code}' "$origin/healthz")" 200
@@ -90,6 +94,12 @@ refuse_callback 'OIDC callback on plain HTTP' "http://$host/api/identity/sso/cal
 refuse_callback 'OIDC callback mixed-case trailing slash on plain HTTP' "http://$host/API/identity/sso/callback/?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback 'storage OAuth callback on plain HTTP' "http://$host/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback 'bare storage OAuth callback on plain HTTP' "http://$host/API/storage/oauth/callback?code=callback-canary-81a4&state=state-canary-92b5"
+for callback in 'api/webhooks/inbound/demo' 'api/payments/webhooks' 'API/payments/return/'; do
+    refuse_callback "$callback on plain HTTP" "http://$host/$callback?token=callback-canary-81a4"
+    if [[ -n $alias ]]; then
+        refuse_callback "$callback on HTTPS alias" "https://$alias/$callback?token=callback-canary-81a4"
+    fi
+done
 expect 'explicit default port' \
     "$(web -o /dev/null -w '%{http_code}' -H "Host: $host:443" "$origin/readyz")" 200
 closed() {  # closed <label> <curl args...>: the server must drop the connection without an answer
@@ -176,6 +186,12 @@ done
 expect 'environment file' "$(mode_of "$conf/portal.env")" 600:root:root
 ! grep -Eq 'mysql://|PASSWORD|KEYRING=' "$conf/portal.env" || fail 'portal.env holds a secret'
 expect 'storage' "$(mode_of /var/lib/readypackets/storage)" 700:readypackets:readypackets
+expect 'GeoIP directory' "$(mode_of /var/lib/readypackets/geo)" 750:root:readypackets
+runuser -u readypackets -- test -x /var/lib/readypackets/geo || fail 'the service user cannot traverse the GeoIP directory'
+if runuser -u readypackets -- test -w /var/lib/readypackets/geo; then
+    fail 'the service user can modify the GeoIP directory'
+fi
+[[ -z $(find /var/lib/readypackets/geo -mindepth 1 -print -quit) ]] || fail 'the installer populated the optional GeoIP directory'
 release=$(readlink -f /opt/readypackets/current)
 [[ $release =~ ^/opt/readypackets/releases/[0-9a-f]{40}$ ]] || fail 'unexpected release layout'
 loose=$(find "$release" -xdev \( -perm /022 -o ! -user root \) ! -type l | head -5)

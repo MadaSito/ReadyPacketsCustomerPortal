@@ -59,6 +59,7 @@ What `deploy/upgrade.sh` does and asks at each gate:
 
 1. **Preflight and isolated build (portal still online)**:
    - Verifies root custody of `/opt/readypackets-src`, `HEAD == $TARGET_SHA`, clean tracked files, Nginx config (`nginx -t`), TLS files, database/key secret files, swap, and free disk space.
+   - Installs Ubuntu's `ffmpeg` and `util-linux` packages if needed, before stopping services or starting database work. On minimal hosts the kit enables the `universe` package component if FFmpeg has no candidate. Allow access to your approved Ubuntu mirrors.
    - Builds and promotes `/opt/readypackets/releases/$TARGET_SHA` under the unprivileged `readypackets-build` sandbox (`InaccessiblePaths=/etc/readypackets`).
    - Prints live MySQL queue counts (`Current release`, `Target release`, `Portal maintenance`, `Running jobs`, `Unresolved unknown`) and prompts:
      - Type **`DRAINED`** to fence public traffic (`/etc/nginx/readypackets-maintenance` → HTTP `503` externally) and stop `readypackets-portal.service` and `readypackets-worker.service`.
@@ -93,6 +94,14 @@ What `deploy/upgrade.sh` does and asks at each gate:
    ```
 3. All new Increment 03 capabilities (external OIDC sign-in, e-mail template overrides, cloud storage connections, off-site backup copies, SharePoint order sync, and event/scheduled automations) **ship disabled by default** and change nothing until an administrator configures and enables them in the console.
 4. If an administrator loses access to their password or second factors on the host, see [Offline Administrator Recovery](ADMIN-RECOVERY.md).
+
+## Increment 04 and migration `0003`
+
+The upgrade job is configured to install Increment 03 at `89c5cb8`, create an administrator session with MFA and live customer/order data, then upgrade to the candidate and check that migration `0003` is recorded once. For production, rehearse this exact release and migration on a restored copy, keep the verified pre-upgrade archive and keys off-host, and preserve the traffic fence until database, application, and edge readiness checks pass. The migration is additive, but a partially applied set of MySQL DDL statements is still possible; additive does not imply safe binary rollback.
+
+If migration starts and anything fails, keep writers stopped and ingress fenced. Reconcile the Drizzle journal and actual schema with the reviewed migration; either complete the forward fix under DBA review or restore the verified pre-upgrade backup into clean isolated targets and validate the prior release there. Do not delete the journal entry, drop new columns to undo the upgrade, or just swap the `current` symlink back. If traffic has already reopened, account for writes made after the backup before using any restored database as production.
+
+Leave optional integrations disabled until tested. FFmpeg being present does not enable audio conversion; the default executable is `/usr/bin/ffmpeg`, and missing conversion tooling must not prevent original uploads. Application Protection starts in detect mode without country restrictions. See [Media and country database setup](MEDIA_AND_GEOIP.md) for configuration, local database custody, and the emergency bypass.
 
 ---
 

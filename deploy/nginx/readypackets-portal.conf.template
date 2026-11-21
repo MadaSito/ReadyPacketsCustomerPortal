@@ -67,8 +67,8 @@ server {
         default_type text/plain;
         try_files $uri =404;
     }
-    # Never copy OAuth/OIDC callback queries (code, state) into a redirect Location header; mirrors server/http/edge.ts.
-    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)) {
+    # Sensitive callbacks are canonical HTTPS only; never put their queries in a redirect.
+    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
         return 404;
     }
     location / {
@@ -85,8 +85,8 @@ server {
     include /etc/nginx/snippets/readypackets-tls.conf;
     # No app response here. Canonical vhost passes the application's own HSTS unchanged.
     add_header Strict-Transport-Security "max-age=31536000" always;
-    # Never copy OAuth/OIDC callback queries (code, state) into a redirect Location header; mirrors server/http/edge.ts.
-    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)) {
+    # Sensitive callbacks are canonical HTTPS only; never put their queries in a redirect.
+    location ~* ^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$)) {
         return 404;
     }
     location / {

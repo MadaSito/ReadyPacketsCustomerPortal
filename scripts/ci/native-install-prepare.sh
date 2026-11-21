@@ -16,7 +16,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 systemctl stop mysql.service nginx.service apache2.service 2>/dev/null || true
 mapfile -t packages < <(dpkg-query --show --showformat='${Package}\n' |
-    grep -E '^(mysql-|libmysqlclient|nginx|libnginx|apache2|certbot|python3-certbot|python3-acme)' || true)
+    grep -E '^(mysql-|libmysqlclient|nginx|libnginx|apache2|certbot|python3-certbot|python3-acme|ffmpeg$)' || true)
 if ((${#packages[@]})); then apt-get purge --yes --quiet "${packages[@]}"; fi
 apt-get autoremove --purge --yes --quiet
 rm -rf /etc/mysql /var/lib/mysql /var/lib/mysql-files /var/lib/mysql-keyring /var/log/mysql \
@@ -27,6 +27,7 @@ hash -r
 for tool in mysql mysqld nginx apache2 certbot; do
     if command -v "$tool" >/dev/null; then echo "still present after the clean-up: $tool" >&2; exit 1; fi
 done
+[[ ! -x /usr/bin/ffmpeg ]] || { echo 'packaged ffmpeg is still present after the clean-up' >&2; exit 1; }
 if ss -Hltn | awk '{print $4}' | grep -Eq ':(80|443|3306|5000)$'; then
     echo 'a port the portal needs is still in use:' >&2
     ss -Hltnp >&2

@@ -53,6 +53,35 @@ describe("config: strict validation", () => {
     expect(Object.isFrozen(config.dataKeyring.keys)).toBe(true);
   });
 
+  it("keeps media path and Protection defaults optional and validates configured values", () => {
+    const defaults = loadConfig(prodEnv());
+    expect(defaults.ffmpegPath).toBe("/usr/bin/ffmpeg");
+    expect(defaults.protectionMmdbPath).toBeUndefined();
+    expect(defaults.protectionCountryHeader).toBeUndefined();
+    expect(defaults.protectionDisabled).toBe(false);
+    expect(loadConfig(prodEnv({
+      RP_FFMPEG_PATH: "/opt/readypackets/bin/ffmpeg",
+      PROTECTION_MMDB_PATH: "/var/lib/readypackets/geo/country.mmdb",
+      PROTECTION_COUNTRY_HEADER: "x-edge-country",
+      PROTECTION_DISABLED: "1",
+    }))).toMatchObject({
+      ffmpegPath: "/opt/readypackets/bin/ffmpeg",
+      protectionMmdbPath: "/var/lib/readypackets/geo/country.mmdb",
+      protectionCountryHeader: "x-edge-country",
+      protectionDisabled: true,
+    });
+    const issues = problemsOf(prodEnv({
+      RP_FFMPEG_PATH: "ffmpeg",
+      PROTECTION_MMDB_PATH: "/tmp/country.mmdb\nunexpected",
+      PROTECTION_COUNTRY_HEADER: "X-Edge-Country",
+      PROTECTION_DISABLED: "true",
+    }));
+    expect(issues.map((issue) => issue.split(":")[0])).toEqual([
+      "RP_FFMPEG_PATH", "PROTECTION_MMDB_PATH", "PROTECTION_DISABLED", "PROTECTION_COUNTRY_HEADER",
+    ]);
+    expect(issues.join("\n")).not.toContain("unexpected");
+  });
+
   it("reports every missing required variable by name", () => {
     const issues = problemsOf({ NODE_ENV: "production" });
     for (const name of ["RP_CANONICAL_ORIGIN", "DATABASE_URL", "RP_STORAGE_DIR", "RP_INSTALLATION_ID", "RP_DATA_KEYRING", "RP_INDEX_KEY", "RP_PSEUDONYM_KEY", "RP_TOKEN_HASH_KEY", "RP_AUDIT_CHAIN_KEY"]) {

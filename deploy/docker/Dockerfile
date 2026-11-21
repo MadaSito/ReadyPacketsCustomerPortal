@@ -32,7 +32,8 @@ RUN pnpm build \
 FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS runtime
 # openssl is used once by init-secrets.sh. The package managers are removed: nothing is installed at run time.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssl ca-certificates \
+    && apt-get install -y --no-install-recommends openssl ca-certificates ffmpeg util-linux \
+    && test -x /usr/bin/ffmpeg -a -x /usr/bin/prlimit \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
               /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-* \
@@ -41,6 +42,7 @@ RUN apt-get update \
                --shell /usr/sbin/nologin readypackets \
     && install -d -o 10001 -g 10001 -m 0700 /var/lib/readypackets /var/lib/readypackets/storage \
                /var/lib/readypackets/tmp \
+    && install -d -o root -g 10001 -m 0750 /var/lib/readypackets/geo \
     && install -d -o root -g root -m 0755 /run/readypackets /run/readypackets/secrets /run/readypackets/migrator \
                /secrets /secrets/app /secrets/migrator /secrets/db
 WORKDIR /opt/readypackets
