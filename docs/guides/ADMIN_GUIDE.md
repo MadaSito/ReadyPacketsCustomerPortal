@@ -48,6 +48,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
 - [Webhooks console](./WEBHOOKS_CONSOLE.md): configure subscriptions and inbound endpoints, inspect deliveries, and rerun eligible failures.
 - [Application Protection](../../server/modules/protection/ADMIN_GUIDE.md): manage protection policy, offline country lookups and recovery.
+- [Cookies and consent](../../server/modules/platform/ADMIN_GUIDE_CONSENT.md): configure the cookie banner, manage consent categories, and review the consent ledger.
 
 ## Storage copy log
 
