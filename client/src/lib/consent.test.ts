@@ -6,6 +6,8 @@ import {
   __setConsentForTests,
   applyConsentDecision,
   attachConsentReceipt,
+  commitConsentDecision,
+  consentRevision,
   configureConsent,
   consent,
   consentReceipt,
@@ -146,5 +148,28 @@ describe("consent store", () => {
     __storageForTests().setItem(CONSENT_STORAGE_KEY, JSON.stringify({ v: 2, choices: ALL }));
     configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
     expect(consent.has("analytics")).toBe(false);
+  });
+
+  it("never applies a stale grant after a newer decision in this tab, another tab, or a policy change", () => {
+    configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
+    // Same tab, another hook instance withdrew meanwhile.
+    let rev = consentRevision();
+    applyConsentDecision(NONE, { policyVersion: 1 });
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(false);
+    expect(consent.has("analytics")).toBe(false);
+    // Another tab wrote before its storage event arrived.
+    rev = consentRevision();
+    __storageForTests().setItem(CONSENT_STORAGE_KEY, JSON.stringify({ v: 1, receipt: RECEIPT, policyVersion: 1, choices: NONE, decidedAt: new Date(Date.now() + 1000).toISOString(), bySignal: false }));
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
+    // Policy changed while the request was in flight.
+    rev = consentRevision();
+    configureConsent({ enabled: true, policyVersion: 2, renewMonths: 12 });
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(false);
+    expect(consent.has("analytics")).toBe(false);
+    // Unchanged: applied.
+    rev = consentRevision();
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 2, receipt: RECEIPT })).toBe(true);
+    expect(consent.has("analytics")).toBe(true);
   });
 });

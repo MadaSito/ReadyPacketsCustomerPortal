@@ -5,7 +5,7 @@
  */
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
-import { applyConsentDecision, attachConsentReceipt, consent, consentReceipt, removalsOnly, type ConsentChoices } from "@/lib/consent";
+import { applyConsentDecision, commitConsentDecision, consent, consentReceipt, consentRevision, removalsOnly, type ConsentChoices } from "@/lib/consent";
 import { safeError, useTRPC } from "@/lib/trpc";
 
 export type ConsentAction = "accept_all" | "reject_all" | "save" | "withdraw";
@@ -14,7 +14,7 @@ export type ConsentSource = "banner" | "preferences" | "account" | "gpc";
 export const NO_CHOICES: ConsentChoices = { preferences: false, analytics: false, session_replay: false };
 export const ALL_CHOICES: ConsentChoices = { preferences: true, analytics: true, session_replay: true };
 
-export type DecisionResult = { ok: true } | { ok: false; policyChanged: boolean; message: string };
+export type DecisionResult = { ok: true } | { ok: false; policyChanged: boolean; superseded?: boolean; message: string };
 
 export function useConsentDecision() {
   const trpc = useTRPC();
@@ -31,12 +31,15 @@ export function useConsentDecision() {
       const allOff = !choices.preferences && !choices.analytics && !choices.session_replay;
       const early = removalsOnly(choices) ?? (allOff ? NO_CHOICES : null);
       if (early) applyConsentDecision(early, { policyVersion, bySignal });
+      // Taken after the early removals: any later decision (any tab, any hook instance), policy change or
+      // privacy-signal change makes this response stale, and a stale grant is never applied.
+      const revision = consentRevision();
       setPending(true);
       try {
         const result = await record.mutateAsync({ receipt: consentReceipt(), policyVersion, choices, action, source, gpc: state.gpc });
-        applyConsentDecision(choices, { policyVersion: result.policyVersion, receipt: result.receipt, bySignal });
-        attachConsentReceipt(result.receipt);
+        const committed = commitConsentDecision(revision, choices, { policyVersion: result.policyVersion, receipt: result.receipt, bySignal });
         await client.invalidateQueries({ queryKey: trpc.platform.consent.mine.queryKey() });
+        if (!committed) return { ok: false, policyChanged: false, superseded: true, message: "A newer cookie choice was made meanwhile, so that one applies." };
         return { ok: true };
       } catch (error) {
         const safe = safeError(error);

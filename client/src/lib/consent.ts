@@ -114,7 +114,10 @@ function readChoice(): StoredChoice | null {
   return memoryChoice;
 }
 
+let writeSeq = 0;
+
 function writeChoice(choice: StoredChoice | null): void {
+  writeSeq += 1;
   memoryChoice = choice;
   loaded = true;
   const store = storageAvailable();
@@ -345,6 +348,37 @@ export function applyConsentDecision(choices: ConsentChoices, meta: { policyVers
   emit(previous);
 }
 
+/**
+ * Store-wide revision of the persisted decision: this tab's write counter plus the raw value currently in
+ * storage (read fresh, so another tab's write counts even before its storage event arrives).
+ */
+export function consentRevision(): string {
+  const store = storageAvailable();
+  let raw = "";
+  if (store) {
+    try {
+      raw = store.getItem(CONSENT_STORAGE_KEY) ?? "";
+    } catch {
+      raw = "";
+    }
+  }
+  return `${writeSeq}|${raw}|${config.policyVersion ?? ""}|${browserSignalsOptOut() ? 1 : 0}`;
+}
+
+/**
+ * Applies a server-confirmed decision only if nothing changed since `revision` was taken (another decision in
+ * this or another tab, a policy change or a privacy-signal change). Returns false when the response is stale;
+ * the newer state then stands. Synchronous, so the check and the write cannot interleave in this tab.
+ */
+export function commitConsentDecision(revision: string, choices: ConsentChoices, meta: { policyVersion: number; receipt?: string | null; bySignal?: boolean }): boolean {
+  if (consentRevision() !== revision || config.policyVersion !== meta.policyVersion) {
+    refresh();
+    return false;
+  }
+  applyConsentDecision(choices, meta);
+  return true;
+}
+
 /** Stores the receipt the server returned without changing the decision. */
 export function attachConsentReceipt(receipt: string): void {
   const stored = readChoice();
@@ -422,6 +456,7 @@ export function __resetConsentForTests(): void {
   config = { enabled: false, policyVersion: null, renewMonths: 12 };
   memoryChoice = null;
   loaded = false;
+  writeSeq = 0;
   now = () => Date.now();
   snapshotCache = null;
   unwatch();

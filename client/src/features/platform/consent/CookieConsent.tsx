@@ -82,7 +82,7 @@ export function CookieConsent() {
       setAnnouncement("Cookie preferences saved");
       return true;
     }
-    toast.show({ tone: result.policyChanged ? "warning" : "danger", title: "Cookie preferences", description: result.message });
+    toast.show({ tone: result.superseded ? "info" : result.policyChanged ? "warning" : "danger", title: "Cookie preferences", description: result.message });
     return false;
   }
 

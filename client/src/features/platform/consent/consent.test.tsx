@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppRouter } from "@server/trpc/root";
 import { AppRoutes } from "@/app/AppRouter";
 import type { MeResult } from "@/lib/authApi";
-import { __resetConsentForTests, __setConsentForTests, consent } from "@/lib/consent";
+import { CONSENT_STORAGE_KEY, __resetConsentForTests, __setConsentForTests, __storageForTests, consent } from "@/lib/consent";
 import { TRPCProvider } from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { createTestQueryClient, fakeAuthApi, renderUi } from "@/ui/testing";
@@ -69,15 +69,15 @@ function renderWith(ui: ReactElement, records: Record<string, Handler>, options:
           const url = new URL(String(request));
           const data = JSON.parse((typeof init?.body === "string" ? init.body : url.searchParams.get("input")) || "{}") as Record<string, Parameters<typeof superjson.deserialize>[0]>;
           const paths = url.pathname.slice("/rpc/".length).split(",");
-          const result = paths.map((path, index) => {
+          const result = await Promise.all(paths.map(async (path, index) => {
             const respond = handlers[path];
             if (!respond) throw new Error(`Unexpected test request: ${path}`);
             const input = data[index] === undefined ? undefined : superjson.deserialize(data[index]!);
             calls.push({ path, input });
-            const value = respond(input);
+            const value = await respond(input);
             if (value instanceof Refuse) return { error: superjson.serialize({ message: "Refused", code: -32603, data: { code: value.code, httpStatus: value.httpStatus, ...(value.safe ? { safe: value.safe } : {}) } }) };
             return { result: { data: superjson.serialize(value) } };
-          });
+          }));
           return Response.json(result, { status: result.some((r) => "error" in r) ? 207 : 200 });
         },
       }),
@@ -236,5 +236,33 @@ describe("cookie banner", () => {
     await waitFor(() => expect(calls.find((c) => c.path === "platform.consent.record")?.input).toMatchObject({ action: "reject_all", source: "gpc", gpc: true }));
     expect(screen.queryByRole("heading", { name: "Your cookie choices" })).not.toBeInTheDocument();
     expect(consent.snapshot().bySignal).toBe(true);
+  });
+
+  it("a delayed acceptance never restores a choice withdrawn meanwhile in another tab", async () => {
+    let release: (v: unknown) => void = () => {};
+    const calls: { path: string; input: unknown }[] = [];
+    renderWith(<CookieConsent />, { "platform.consent.record": () => new Promise((r) => (release = r)) }, { calls });
+    await userEvent.click(await screen.findByRole("button", { name: "Accept all" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "platform.consent.record")).toBe(true));
+    // Another tab withdraws; its storage event has not arrived yet.
+    __storageForTests().setItem(CONSENT_STORAGE_KEY, JSON.stringify({ v: 1, receipt: RECEIPT, policyVersion: 1, choices: NONE, decidedAt: new Date().toISOString(), bySignal: false }));
+    release(recorded());
+    await screen.findByText(/newer cookie choice/);
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
+  });
+
+  it("a mixed save that fails removes the withdrawn category and grants nothing new", async () => {
+    __setConsentForTests({ enabled: true, policyVersion: 1, choices: { analytics: true } });
+    renderWith(<CookieConsent />, { "platform.consent.record": () => new Refuse("INTERNAL_SERVER_ERROR", 500) });
+    await waitFor(() => expect(consent.enabled()).toBe(true));
+    consent.openPreferences();
+    const dialog = await screen.findByRole("dialog", { name: "Cookie preferences" });
+    await userEvent.click(within(dialog).getByRole("switch", { name: /analytics/i }));
+    await userEvent.click(within(dialog).getByRole("switch", { name: /session replay/i }));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save choices" }));
+    await screen.findByText(/applies on this device/);
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
   });
 });

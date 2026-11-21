@@ -291,3 +291,4 @@ time. No user agent and no IP in clear.
 - Setting `privacy.consent.retention_months` (12–72, default 36): a record is deleted that many months after it was superseded by a newer decision of the same browser, or after it expired (renewal period).
 - Job `platform.consent.purge` every 6 h, batches of 1000, audits `privacy.consent.purged` with counts only.
 - `ctx.services.platform` internals: `consent.forgetUser(userPublicId, tx?)` — account erasure unlinks the person (sets `userPublicId` null); the anonymous record stays until retention ends. Identity's erasure flow should call it.
+- `consentRevision()` / `commitConsentDecision(revision, choices, meta): boolean` — a server-confirmed decision is applied only if the persisted choice (read fresh from storage, plus this tab's write counter), policy version and privacy signal are unchanged since the request started; otherwise the newer state stands.
