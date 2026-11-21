@@ -97,6 +97,7 @@ if [[ ! -e "$base/current" ]]; then
 fi
 
 install_unit_files
+render_site "$deploy_src/nginx/readypackets-edge.conf.template" "$nginx_dir/snippets/readypackets-edge.conf"
 render_site "$deploy_src/nginx/readypackets-tls.conf.template" "$nginx_dir/snippets/readypackets-tls.conf"
 render_site "$deploy_src/nginx/readypackets-portal.conf.template" "$nginx_dir/sites-available/readypackets-portal.conf"
 ln -sfn -- "$nginx_dir/sites-available/readypackets-portal.conf" "$site"

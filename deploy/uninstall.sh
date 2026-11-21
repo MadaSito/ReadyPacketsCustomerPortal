@@ -17,7 +17,8 @@ for unit in "$web" "$worker" 'readypackets-backup@.service' "$timer"; do
     rm -f -- "$unit_dir/$unit" "$unit_dir/$unit.d/10-runtime.conf"
 done
 systemctl daemon-reload
-rm -f -- "$site" "$acme_site" "$nginx_dir/sites-available/readypackets-portal.conf" "$nginx_dir/snippets/readypackets-tls.conf"
+rm -f -- "$site" "$acme_site" "$nginx_dir/sites-available/readypackets-portal.conf" "$nginx_dir/snippets/readypackets-tls.conf" \
+    "$nginx_dir/snippets/readypackets-edge.conf"
 nginx -t
 systemctl reload nginx
 printf 'ReadyPackets deactivated. Database, storage, keys, certificates, backups and releases were not deleted.\n'
