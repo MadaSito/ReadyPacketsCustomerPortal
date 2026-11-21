@@ -60,6 +60,35 @@ import {
   BACKUP_RETENTION_MAX_AGE_DAYS,
   BACKUP_SCHEDULE_ENABLED,
 } from "./settings.js";
+import {
+  BACKUP_JOB_REMOTE_COPY,
+  BACKUP_JOB_REMOTE_SWEEP,
+  compute321Status,
+  copyBackupOffsiteNow,
+  executeRemoteCopyJob,
+  executeRemoteCopySweepJob,
+  getOffsiteBackupConfig,
+  loadRemoteCopiesByBackupIds,
+  maybeStageAutomaticOffsiteCopies,
+  registerBackupAutomationTriggers,
+  updateOffsiteBackupConfig,
+  type Backup321Status,
+  type BackupRemoteCopySummary,
+  type OffsiteBackupConfigView,
+  type OffsiteDestinationOption,
+  type RemoteCopyJobPayload,
+  type UpdateOffsiteBackupConfigInput,
+} from "./offsite.js";
+
+export {
+  BACKUP_JOB_REMOTE_COPY,
+  BACKUP_JOB_REMOTE_SWEEP,
+  type Backup321Status,
+  type BackupRemoteCopySummary,
+  type OffsiteBackupConfigView,
+  type OffsiteDestinationOption,
+  type UpdateOffsiteBackupConfigInput,
+};
 
 export const BACKUP_JOB_CREATE = "backup.create";
 export const BACKUP_JOB_VERIFY = "backup.verify";
@@ -87,6 +116,7 @@ export interface BackupArchiveSummary {
   verificationStatus: BackupVerificationStatus;
   lastVerifiedAt: Date | null;
   offHostCopyStatus: OffHostCopyStatus;
+  remoteCopies: readonly BackupRemoteCopySummary[];
   activeHoldCount: number;
   isLastKnownGood: boolean;
   purgedAt: Date | null;
@@ -174,6 +204,7 @@ export interface BackupModule extends ModuleLifecycle {
     verifications: BackupVerificationSummary[];
     restores: RestoreDrillSummary[];
     holds: BackupLegalHoldView[];
+    remoteCopies: readonly BackupRemoteCopySummary[];
   }>;
   enqueueBackup(
     principal: SessionPrincipal,
@@ -246,6 +277,15 @@ export interface BackupModule extends ModuleLifecycle {
     principal: SessionPrincipal,
     backupPublicId: string,
   ): Promise<{ filename: string; size: number; stream: Readable }>;
+  getOffsiteConfig(principal: SessionPrincipal): Promise<OffsiteBackupConfigView>;
+  updateOffsiteConfig(
+    principal: SessionPrincipal,
+    input: UpdateOffsiteBackupConfigInput,
+  ): Promise<OffsiteBackupConfigView>;
+  copyOffsiteNow(
+    principal: SessionPrincipal,
+    input: { backupPublicId: string; connectionPublicId?: string },
+  ): Promise<{ queued: BackupRemoteCopySummary[] }>;
 }
 
 interface FilesBackupCollectorLike {
@@ -332,6 +372,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     row: BackupArchiveRow,
     activeHoldCount: number,
     lastKnownGoodPublicId: string | null,
+    remoteCopies: readonly BackupRemoteCopySummary[] = [],
   ): BackupArchiveSummary {
     return {
       publicId: row.publicId,
@@ -350,6 +391,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
       verificationStatus: row.verificationStatus,
       lastVerifiedAt: row.lastVerifiedAt,
       offHostCopyStatus: row.offHostCopyStatus,
+      remoteCopies,
       activeHoldCount,
       isLastKnownGood: row.purgedAt === null && row.publicId === lastKnownGoodPublicId,
       purgedAt: row.purgedAt,
@@ -801,6 +843,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         verificationStatus: "unverified",
         lastVerifiedAt: null,
         offHostCopyStatus: "local_only",
+        remoteCopies: [],
         activeHoldCount: 0,
         isLastKnownGood: false,
         purgedAt: null,
@@ -849,6 +892,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
               actor: runOpts.actorUserId ? { userId: runOpts.actorUserId, role: "admin" } : { role: "system" },
               resource: { type: "backup_archive", publicId: archivePublicId },
               correlationId,
+              attributes: { trigger },
             },
             tx,
           );
@@ -1052,6 +1096,13 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           },
           tx,
         );
+      });
+
+      await maybeStageAutomaticOffsiteCopies(deps, archive.publicId, correlationId).catch((err) => {
+        deps.logger.warn("failed to stage automatic off-site backup copies; worker sweep will retry", {
+          backupPublicId: archive.publicId,
+          errorName: err instanceof Error ? err.name : "unknown",
+        });
       });
 
       const [vRow] = await deps.db
@@ -1628,17 +1679,70 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     everyMs: 24 * 60 * 60 * 1000,
     payload: {},
   });
+  deps.jobs.register<RemoteCopyJobPayload>(
+    BACKUP_JOB_REMOTE_COPY,
+    (job) => executeRemoteCopyJob(deps, isMaintenanceDraining, isJobLeaseLostError, job),
+  );
+  deps.jobs.register(
+    BACKUP_JOB_REMOTE_SWEEP,
+    (job) => executeRemoteCopySweepJob(deps, isMaintenanceDraining, isJobLeaseLostError, job),
+  );
+  deps.jobs.registerSchedule({
+    name: "backup.scheduled.remote_sweep",
+    type: BACKUP_JOB_REMOTE_SWEEP,
+    everyMs: 15 * 60 * 1000,
+    payload: {},
+  });
 
   return {
+    init() {
+      registerBackupAutomationTriggers(deps);
+    },
+
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
       const offHostFlag = await isFlagEnabled(deps.settings, BACKUP_OFFHOST_ENABLED).catch(() => false);
-      const offHostHealth: ModuleHealth = {
-        component: "backup.offhost",
-        state: offHostFlag ? "degraded" : "not_configured",
-        summary: "Local storage only: independent off-host copy target is not configured.",
-        checkedAt,
-      };
+      const status321 = await compute321Status(deps).catch(() => null);
+      const policyActive =
+        offHostFlag ||
+        Boolean(status321 && (status321.autoCopyAfterVerify || status321.enabledOffsiteDestinations > 0));
+      const offHostHealth: ModuleHealth = !policyActive
+        ? {
+            component: "backup.offhost",
+            state: "not_configured",
+            summary: "Local storage only: off-site backup replication is not enabled.",
+            checkedAt,
+          }
+        : status321?.overallMet
+          ? {
+              component: "backup.offhost",
+              state: "ok",
+              summary: `3-2-1 backup policy met (${String(status321.verifiedCopies)} verified copies across ${String(status321.storageSystems)} storage systems).`,
+              metrics: {
+                verifiedCopies: status321.verifiedCopies,
+                offsiteCopies: status321.offsiteVerifiedCopies,
+                storageSystems: status321.storageSystems,
+              },
+              checkedAt,
+            }
+          : status321?.oneOffsiteMet
+            ? {
+                component: "backup.offhost",
+                state: "degraded",
+                summary: "Off-site verified backup copy exists, but fewer than three total verified copies exist in the evaluation window.",
+                metrics: {
+                  verifiedCopies: status321.verifiedCopies,
+                  offsiteCopies: status321.offsiteVerifiedCopies,
+                  storageSystems: status321.storageSystems,
+                },
+                checkedAt,
+              }
+            : {
+                component: "backup.offhost",
+                state: "failing",
+                summary: "Off-site backup policy is enabled, but no verified off-site copy exists in the evaluation window.",
+                checkedAt,
+              };
 
       let keyring;
       try {
@@ -1797,8 +1901,15 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
 
       const hasMore = rows.length > limit;
       const pageRows = hasMore ? rows.slice(0, limit) : rows;
-      const holdCounts = await countActiveHoldsByBackupIds(pageRows.map((r) => r.id));
-      const lastKnownGoodId = await computeLastKnownGoodId();
+      const [holdCounts, remoteCopiesMap, lastKnownGoodId, status321] = await Promise.all([
+        countActiveHoldsByBackupIds(pageRows.map((r) => r.id)),
+        loadRemoteCopiesByBackupIds(
+          deps.db,
+          pageRows.map((r) => ({ id: r.id, publicId: r.publicId })),
+        ),
+        computeLastKnownGoodId(),
+        compute321Status(deps).catch(() => null),
+      ]);
 
       let keyConfigured: boolean;
       let keyCustodyWarning: string | null = null;
@@ -1813,13 +1924,21 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         keyCustodyWarning = "Backup encryption key configuration or file permissions are invalid.";
       }
 
+      const offHostNote = status321?.overallMet
+        ? `3-2-1 backup policy met: ${String(status321.verifiedCopies)} verified copies across ${String(status321.storageSystems)} storage systems (${String(status321.offsiteVerifiedCopies)} off-site). Store rp_backup_key separately off-host.`
+        : status321 && status321.offsiteVerifiedCopies > 0
+          ? `${String(status321.offsiteVerifiedCopies)} verified off-site copy(ies) in the last ${String(status321.windowDays)} days; configure a second off-site destination to reach 3 total copies.`
+          : LOCAL_ONLY_NOTICE;
+
       const lastItem = pageRows[pageRows.length - 1];
       return {
-        items: pageRows.map((r) => toArchiveSummary(r, holdCounts.get(r.id) ?? 0, lastKnownGoodId)),
+        items: pageRows.map((r) =>
+          toArchiveSummary(r, holdCounts.get(r.id) ?? 0, lastKnownGoodId, remoteCopiesMap.get(r.id) ?? []),
+        ),
         nextCursor: hasMore && lastItem ? encodeCursor(lastItem.createdAt, lastItem.id) : null,
         keyConfigured,
         keyCustodyWarning,
-        offHostStatusNote: LOCAL_ONLY_NOTICE,
+        offHostStatusNote: offHostNote,
       };
     },
 
@@ -1832,8 +1951,12 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         .limit(1);
       if (!row) throw notFound("BACKUP_NOT_FOUND");
 
-      const holdCounts = await countActiveHoldsByBackupIds([row.id]);
-      const lastKnownGoodId = await computeLastKnownGoodId();
+      const [holdCounts, remoteCopiesMap, lastKnownGoodId] = await Promise.all([
+        countActiveHoldsByBackupIds([row.id]),
+        loadRemoteCopiesByBackupIds(deps.db, [{ id: row.id, publicId: row.publicId }]),
+        computeLastKnownGoodId(),
+      ]);
+      const remoteCopies = remoteCopiesMap.get(row.id) ?? [];
 
       const vRows = await deps.db
         .select()
@@ -1861,7 +1984,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         .limit(50);
 
       return {
-        archive: toArchiveSummary(row, holdCounts.get(row.id) ?? 0, lastKnownGoodId),
+        archive: toArchiveSummary(row, holdCounts.get(row.id) ?? 0, lastKnownGoodId, remoteCopies),
         verifications: vRows.map((v) => toVerificationSummary(v, row.publicId)),
         restores: rRows.map((r) => ({
           publicId: r.publicId,
@@ -1886,6 +2009,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
           createdAt: hold.createdAt,
           releasedAt: hold.releasedAt,
         })),
+        remoteCopies,
       };
     },
 
@@ -2184,5 +2308,11 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
         stream,
       };
     },
+
+    getOffsiteConfig: (principal) => getOffsiteBackupConfig(deps, principal),
+
+    updateOffsiteConfig: (principal, input) => updateOffsiteBackupConfig(deps, principal, input),
+
+    copyOffsiteNow: (principal, input) => copyBackupOffsiteNow(deps, isMaintenanceDraining, principal, input),
   };
 }

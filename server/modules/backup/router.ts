@@ -102,5 +102,41 @@ export const backupRouter = router({
         await ctx.services.backup.releaseLegalHold(ctx.session, input);
         return { ok: true as const };
       }),
+
+    offsiteConfig: adminProcedure
+      .use(requireCapability("backup.read"))
+      .query(({ ctx }) => ctx.services.backup.getOffsiteConfig(ctx.session)),
+
+    updateOffsiteConfig: adminProcedure
+      .use(requireCapability("backup.retention.manage"))
+      .use(requireCapability("storage.manage"))
+      .input(
+        z.strictObject({
+          autoCopyAfterVerify: z.boolean(),
+          windowDays: z.number().int().min(1).max(90),
+          destinations: z
+            .array(
+              z.strictObject({
+                connectionPublicId: publicIdSchema,
+                assigned: z.boolean(),
+                enabled: z.boolean(),
+                retentionNote: z.string().max(240).optional(),
+              }),
+            )
+            .max(50),
+        }),
+      )
+      .mutation(({ ctx, input }) => ctx.services.backup.updateOffsiteConfig(ctx.session, input)),
+
+    copyOffsiteNow: adminProcedure
+      .meta({ rateLimit: "expensive" })
+      .use(requireCapability("backup.run"))
+      .input(
+        z.strictObject({
+          backupPublicId: publicIdSchema,
+          connectionPublicId: publicIdSchema.optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) => ctx.services.backup.copyOffsiteNow(ctx.session, input)),
   }),
 });

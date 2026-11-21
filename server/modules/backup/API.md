@@ -199,7 +199,10 @@ Router mounted at `trpc.backup` (`server/modules/backup/router.ts`). **There is 
 | Procedure | Type | Capability | Step-up | Exact Input | Exact Output |
 | --- | --- | --- | --- | --- | --- |
 | `backup.admin.list` | `query` | `backup.read` | No | `{ cursor?: string; limit?: number /* 1..100 */; state?: OperationState } \| undefined` | `{ items: BackupArchiveSummary[]; nextCursor: string \| null; keyConfigured: boolean; keyCustodyWarning: string \| null; offHostStatusNote: string }` |
-| `backup.admin.detail` | `query` | `backup.read` | No | `{ backupPublicId: string }` | `{ archive: BackupArchiveSummary; verifications: BackupVerificationSummary[]; restores: RestoreDrillSummary[]; holds: BackupLegalHoldView[] }` |
+| `backup.admin.detail` | `query` | `backup.read` | No | `{ backupPublicId: string }` | `{ archive: BackupArchiveSummary; verifications: BackupVerificationSummary[]; restores: RestoreDrillSummary[]; holds: BackupLegalHoldView[]; remoteCopies: BackupRemoteCopySummary[] }` |
+| `backup.admin.offsiteConfig` | `query` | `backup.read` | No | `void` | `OffsiteBackupConfigView` (`autoCopyAfterVerify`, `windowDays`, `destinations`, `status321`) |
+| `backup.admin.updateOffsiteConfig` | `mutation` | `backup.retention.manage` + `storage.manage` | **Yes** | `{ autoCopyAfterVerify: boolean; windowDays: number /* 1..90 */; destinations: { connectionPublicId: string; assigned: boolean; enabled: boolean; retentionNote?: string }[] /* max 8 assigned */ }` | `OffsiteBackupConfigView` |
+| `backup.admin.copyOffsiteNow` | `mutation` | `backup.run` | **Yes** | `{ backupPublicId: string; connectionPublicId?: string }` | `{ queued: BackupRemoteCopySummary[] }` |
 | `backup.admin.runNow` | `mutation` | `backup.run` | **Yes** (`STEP_UP_REQUIRED` if missing/stale) | `{ trigger?: "manual" \| "pre_upgrade" } \| undefined` | `{ backupPublicId: string; jobId: string }` |
 | `backup.admin.verify` | `mutation` | `backup.verify` | **Yes** | `{ backupPublicId: string }` | `BackupVerificationSummary` |
 | `backup.admin.retentionPolicy` | `query` | `backup.read` | No | `void` | `{ keepLastCount: number; maxAgeDays: number; scheduleEnabled: boolean; autoPruneEnabled: boolean; recoverySandboxRoot: string }` |
@@ -218,13 +221,16 @@ Router mounted at `trpc.backup` (`server/modules/backup/router.ts`). **There is 
 
 ## 6. Jobs, Schedules & Crash-Safe Fenced State Transitions
 
-- `backup.create`, `backup.verify`, and `backup.retention.prune` pass `(tx) => job.assertStillOwned(tx)` into **every** state-transition transaction (`running`, `completed`, `failed`, `verify`, `retention`), propagate `job.signal` to abort `mysqldump` immediately on lease loss/shutdown, allocate unique per-attempt storage keys, and separate post-commit summary reads from archive publication so a post-commit error can never unlink a committed archive.
+- `backup.create`, `backup.verify`, `backup.retention.prune`, `backup.remote_copy`, and `backup.remote_copy.sweep` pass `(tx) => job.assertStillOwned(tx)` into **every** state-transition transaction (`running`, `completed`, `failed`, `verify`, `retention`, `remote_copy`), propagate `job.signal`, allocate unique per-attempt storage keys, and separate post-commit summary reads from archive publication so a post-commit error can never unlink a committed archive.
+- **3-2-1 Off-Site Copies (`server/modules/backup/offsite.ts`)**: Ships disabled by default (`autoCopyAfterVerify = false`, zero assigned `backups` destinations). Only verified (`verificationStatus === "verified"`) encrypted `.rpbk` archives whose wire header starts with `RPBK0001` are copied to up to 8 enabled `storageConnections` destinations (`purpose: "backups"`). Remote copy records verify SHA-256 or provider transport digest (`sha256` / `md5` / `crc32c`), never persist or expose provider `remoteId` URIs, and are **never** deleted by local retention pruning (`runRetention`). `status321` is computed strictly from real verified local + completed off-site copies within `windowDays`, never from configuration alone.
 - Startup reconciliation (`start()`) marks orphaned `running` archives older than 15 minutes as `state = "unknown"` (`INTERRUPTED_DURING_RESTART`) with durable `backup.archive.unknown` audit events.
 
-## 7. Audit Events (`category: "backup"`)
+## 7. Audit Events (`category: "backup"`) & Automation Triggers
 
 - `backup.archive.requested`, `backup.archive.completed`, `backup.archive.failed`, `backup.archive.refused`, `backup.archive.unknown`, `backup.archive.downloaded`
 - `backup.verify.completed` (`attributes.verification_scope`: `"byte_and_manifest"` | `"scratch_restore_verified"`), `backup.verify.failed`
+- `backup.remote_copy.requested`, `backup.remote_copy.completed`, `backup.remote_copy.failed`, `backup.offsite.policy_changed`, `backup.policy.unmet`
 - `backup.restore.requested`, `backup.restore.completed`, `backup.restore.failed`, `backup.restore.refused`, `backup.restore.continuity_marker`
 - `backup.retention.policy_changed`, `backup.retention.intent`, `backup.retention.executed`
 - `backup.legal_hold.created`, `backup.legal_hold.released`
+- **Registered Automation Triggers (`init()`)**: `backup.completed`, `backup.failed`, `backup.verify_failed`, `backup.remote_copy_completed`, `backup.remote_copy_failed`, `backup.policy_unmet`.

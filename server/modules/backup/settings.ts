@@ -76,5 +76,38 @@ export const BACKUP_OFFHOST_ENABLED = defineFeatureFlag({
   owner: "backup",
   group: "backup",
   label: "Off-host backup replication",
-  description: "Replicate encrypted archives to an independent off-host copy target (not configured in this release).",
+  description: "Replicate verified encrypted archives to assigned off-site storage connections.",
 });
+
+export const OffsiteDestinationPolicySchema = z.strictObject({
+  enabled: z.boolean(),
+  retentionNote: z.string().max(240),
+});
+
+export const BackupOffsitePolicySchema = z.strictObject({
+  autoCopyAfterVerify: z.boolean(),
+  windowDays: z.number().int().min(1).max(90),
+  destinations: z.record(z.string().regex(/^[A-Za-z0-9_-]{10,64}$/), OffsiteDestinationPolicySchema),
+  lastPolicyUnmetSignaled: z.boolean().optional(),
+});
+
+export type StoredBackupOffsitePolicy = z.infer<typeof BackupOffsitePolicySchema>;
+
+export const BACKUP_OFFSITE_POLICY = defineSetting({
+  key: "backup.offsite.policy",
+  owner: "backup",
+  group: "backup",
+  label: "Off-site backup replication and 3-2-1 evaluation policy",
+  description:
+    "Per-destination enablement, optional remote retention notes, automatic copy after verification, and 3-2-1 evaluation window.",
+  schema: BackupOffsitePolicySchema,
+  default: {
+    autoCopyAfterVerify: false,
+    windowDays: 7,
+    destinations: {},
+    lastPolicyUnmetSignaled: false,
+  },
+  sensitivity: "internal",
+  exportable: true,
+});
+

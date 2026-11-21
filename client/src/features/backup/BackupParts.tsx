@@ -51,8 +51,25 @@ export function VerificationBadge({ status }: { status: Archive["verificationSta
   return <Badge tone="warning">Not verified</Badge>;
 }
 
-export function OffHostBadge({ status }: { status: Archive["offHostCopyStatus"] }) {
-  // The server reports only local_only/disabled in this release; never imply an off-host copy exists.
+export function OffHostBadge({
+  status,
+  remoteCopies = [],
+}: {
+  status: Archive["offHostCopyStatus"];
+  remoteCopies?: Archive["remoteCopies"];
+}) {
+  const completed = remoteCopies.filter((c) => c.state === "completed").length;
+  const inFlight = remoteCopies.filter((c) => c.state === "queued" || c.state === "running").length;
+  const failed = remoteCopies.filter((c) => c.state === "failed").length;
+  if (completed > 0 || inFlight > 0 || failed > 0) {
+    return (
+      <span className="flex flex-wrap items-center gap-1">
+        {completed > 0 ? <Badge tone="success">{`${completed} off-site verified`}</Badge> : null}
+        {inFlight > 0 ? <Badge tone="info">{`${inFlight} copying`}</Badge> : null}
+        {failed > 0 ? <Badge tone="danger">{`${failed} failed`}</Badge> : null}
+      </span>
+    );
+  }
   return <Badge tone="warning">{status === "disabled" ? "Off-host copy not configured" : "Local copy only"}</Badge>;
 }
 
@@ -76,7 +93,23 @@ export function KeyCustodyNotice({ keyConfigured, warning }: { keyConfigured: bo
   );
 }
 
-export function ArchivesTable({ rows, loading, error, onRetry }: { rows: readonly Archive[] | undefined; loading: boolean; error: unknown; onRetry: () => void }) {
+export function ArchivesTable({
+  rows,
+  loading,
+  error,
+  onRetry,
+  canCopyArchive,
+  onCopyNow,
+  copyingBackupId,
+}: {
+  rows: readonly Archive[] | undefined;
+  loading: boolean;
+  error: unknown;
+  onRetry: () => void;
+  canCopyArchive?: (row: Archive) => boolean;
+  onCopyNow?: (row: Archive) => void;
+  copyingBackupId?: string | null;
+}) {
   return (
     <DataTable
       caption="Backups"
@@ -101,6 +134,11 @@ export function ArchivesTable({ rows, loading, error, onRetry }: { rows: readonl
           ),
         },
         {
+          key: "offsite",
+          header: "Off-site",
+          cell: (r) => <OffHostBadge status={r.offHostCopyStatus} remoteCopies={r.remoteCopies ?? []} />,
+        },
+        {
           key: "retention", header: "Retention", hideOnMobile: true, cell: (r) => (
             r.purgedAt ? <Badge>Removed by retention</Badge>
               : r.activeHoldCount > 0 ? <Badge tone="brand">{r.activeHoldCount === 1 ? "On legal hold" : `${r.activeHoldCount} legal holds`}</Badge>
@@ -109,9 +147,23 @@ export function ArchivesTable({ rows, loading, error, onRetry }: { rows: readonl
         },
       ]}
       rowActions={(r) => (
-        <Button asChild size="sm" variant="secondary">
-          <Link href={`${BASE}/${encodeURIComponent(r.publicId)}`} aria-label={`Open backup started ${new Date(r.createdAt).toISOString()}`}>Open</Link>
-        </Button>
+        <span className="inline-flex flex-wrap items-center gap-2">
+          {onCopyNow && canCopyArchive?.(r) ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={copyingBackupId === r.publicId}
+              disabled={Boolean(copyingBackupId)}
+              onClick={() => onCopyNow(r)}
+              aria-label={`Copy verified backup ${r.publicId} off-site now`}
+            >
+              Copy now
+            </Button>
+          ) : null}
+          <Button asChild size="sm" variant="secondary">
+            <Link href={`${BASE}/${encodeURIComponent(r.publicId)}`} aria-label={`Open backup started ${new Date(r.createdAt).toISOString()}`}>Open</Link>
+          </Button>
+        </span>
       )}
     />
   );
@@ -131,7 +183,7 @@ export function ArchiveFacts({ archive }: { archive: Archive }) {
       { label: "Files included", value: archive.objectCount === null ? null : `${archive.objectCount.toLocaleString()} (${formatBytes(archive.objectTotalBytes) ?? "size unknown"})` },
       { label: "Schema migrations", value: archive.schemaMigrationCount?.toLocaleString() ?? null },
       { label: "Release", value: <code className="text-xs break-all">{archive.releaseRef}</code> },
-      { label: "Off-host copy", value: <OffHostBadge status={archive.offHostCopyStatus} /> },
+      { label: "Off-host copy", value: <OffHostBadge status={archive.offHostCopyStatus} remoteCopies={archive.remoteCopies ?? []} /> },
       { label: "Archive SHA-256", value: archive.archiveSha256 ? <code className="text-xs break-all">{archive.archiveSha256}</code> : null, wide: true },
     ]} />
   );

@@ -141,3 +141,26 @@ Before re-pointing `DATABASE_URL` and `STORAGE_LOCAL_DIR` in `/etc/readypackets/
    - Provision/grant the live application MySQL user least-privilege DML access to `rp_restore_<YYYYMMDD>` (and revoke write access to the retired schema).
    - Update `DATABASE_URL` and `STORAGE_LOCAL_DIR`, then start `readypackets.service` and `readypackets-worker.service`.
    - Immediately trigger a fresh baseline backup (`run-backup.ts --label "post-restore-baseline"`).
+
+---
+
+## 7. Configuring a 3-2-1 Off-Site Backup Strategy
+
+A complete **3-2-1 backup strategy** keeps **at least three verified copies** of data across **at least two different storage systems** (for example, local host disk plus S3 or Azure Blob) with **at least one verified copy off-site**:
+
+1. **Create and Test Cloud Storage Connections**:
+   - Sign in as an administrator, open **Admin -> Storage**, create up to eight backup-capable connections (for example, S3-compatible object storage with Object Lock and Azure Blob Storage with an immutable policy), run **Test connection**, and enable each connection.
+2. **Assign Off-Site Backup Destinations**:
+   - Open **Admin -> Backups** and configure the **Off-site copies** form:
+     - Select the storage connections assigned to backup replication (up to 8).
+     - Toggle individual destinations **Active** or **Paused**, add an optional operator retention note (for example, bucket Object Lock / lifecycle policy details), and optionally enable **Copy after verification automatically**.
+     - Save with fresh MFA step-up.
+   - You can also trigger **Copy now** on any verified backup or **Retry** an individual destination from the backup detail page.
+   - The **3-2-1 backup strategy status** card evaluates real verified local + digest-verified off-site copies within the configured freshness window — configuration alone never marks a condition as met.
+3. **Key Separation & Non-Deletion Rules (Critical)**:
+   - **Only verified encrypted `.rpbk` archives leave the host.** Every upload verifies both `verificationStatus = verified` and the `RPBK0001` wire header before streaming bytes to the remote adapter.
+   - **The backup encryption key (`RP_BACKUP_KEY_FILE`, `/etc/readypackets/secrets/rp_backup_key`) NEVER leaves the host.** Store an independent offline copy of `rp_backup_key` and `rp_audit_chain_key` in a separate password vault, HSM, or sealed offline recovery kit on a different failure domain from both the portal host and the cloud bucket — without `rp_backup_key`, off-site `.rpbk` archives cannot be decrypted after full host loss.
+   - **ReadyPackets never deletes remote copies automatically.** Local retention pruning only removes local disk copies; enforce remote lifecycle expiration and ransomware immutability (S3 Object Lock / Azure Immutable Storage) directly in your cloud storage provider.
+4. **Restoring from an Off-Site `.rpbk` Copy**:
+   - Download the `<BACKUP_PUBLIC_ID>.rpbk` object from your cloud bucket (`backups/<YYYY>/<MM>/<BACKUP_PUBLIC_ID>.rpbk`) onto your recovery host and pass `--archive-file` to `restore-isolated.js` (or `restore-isolated.ts` in source checkouts) together with your separately stored `rp_backup_key` and `rp_audit_chain_key`.
+
