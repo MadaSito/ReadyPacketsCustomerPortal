@@ -13,3 +13,9 @@ export const storageOAuthAttempts = mysqlTable("storage_oauth_attempts", {
   binderHash: char("binder_hash", { length: 64 }),
   payloadEnc: text("payload_enc"),
 }, (t) => [index("idx_storage_oauth_expiry").on(t.expiresAt)]);
+
+/** One durable provider-issued ID per connection/account/parent/folder path. */
+export const storageGoogleDriveFolders = mysqlTable("storage_google_drive_folders", {
+  locator: char("locator", { length: 64 }).primaryKey(),
+  providerIdEnc: text("provider_id_enc").notNull(),
+});
