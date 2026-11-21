@@ -24,7 +24,11 @@ run_installer() {  # run_installer <output-file> <options...>
     set -e
     return "$status"
 }
-saved_password() { sed -n 's/^  Password       : \([^ ]*\) .*$/\1/p' "$credentials"; }
+# The saved password goes into a root-only file and is only ever matched from there (never a command line).
+save_password() {
+    sed -n 's/^  Password       : \([^ ]*\) .*$/\1/p' "$credentials" > /root/auto-install-password
+    [[ -s /root/auto-install-password ]] || fail 'no password was saved'
+}
 
 case $mode in
     first)
@@ -33,12 +37,12 @@ case $mode in
         printf '\nInstallation took %s seconds.\n' "$(($(date +%s) - started))"
         out=/root/auto-install-first.out
         grep -q 'ReadyPackets is installed and running at https://' "$out" || fail 'no final summary was printed'
-        password=$(saved_password)
-        [[ -n $password ]] || fail 'no password was saved'
-        # The summary shows the sign-in name and the temporary password exactly once, at the very end.
-        expect_count=$(grep -cF -- "$password" "$out")
+        save_password
+        # With --print-credentials the summary shows the sign-in name and the temporary password exactly
+        # once, at the very end.
+        expect_count=$(grep -cFf /root/auto-install-password "$out" || true)
         [[ $expect_count == 1 ]] || fail "the password appears $expect_count times in the output, expected once"
-        tail -n 25 "$out" | grep -qF -- "$password" || fail 'the password is not in the final summary'
+        tail -n 25 "$out" | grep -qFf /root/auto-install-password || fail 'the password is not in the final summary'
         tail -n 25 "$out" | grep -q 'Sign-in name   : ' || fail 'the sign-in name is not in the final summary'
         sha256sum "$credentials" > /root/auto-install-credentials.sha256
         ;;
@@ -48,7 +52,10 @@ case $mode in
         run_installer /root/auto-install-again.out "$@" || fail 'the second run did not finish'
         out=/root/auto-install-again.out
         sha256sum --check --status /root/auto-install-credentials.sha256 || fail 'the saved sign-in details changed'
-        grep -cF -- "$(saved_password)" "$out" | grep -qx 1 || fail 'the second run did not show the same sign-in details once'
+        save_password
+        # The password is shown once only; later runs name the account and point at the root-only file.
+        ! grep -qFf /root/auto-install-password "$out" || fail 'a later run printed the password again'
+        grep -q 'The temporary password was shown when the installation finished' "$out" || fail 'the later run does not point at the saved details'
         [[ $(systemctl show readypackets-portal.service -p MainPID --value) == "$pid_before" ]] || fail 'the portal was restarted'
         [[ $(readlink -f /opt/readypackets/current) == "$release_before" ]] || fail 'the release changed'
         [[ $(mysql --protocol=socket --batch --skip-column-names --execute="SELECT COUNT(*) FROM readypackets.users WHERE role = 'admin'") == 1 ]] ||

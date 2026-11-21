@@ -73,7 +73,7 @@ jobs:
           WITH_ALIAS: ${{ matrix.alias }}
         run: |
           set -euo pipefail
-          options=(--domain "https://${PORTAL_HOST^^}/" --tls-self-signed --admin-email "$ADMIN_EMAIL" --yes)
+          options=(--domain "https://${PORTAL_HOST^^}/" --tls-self-signed --admin-email "$ADMIN_EMAIL" --print-credentials --yes)
           if [[ $WITH_ALIAS == true ]]; then options+=(--alias "$ALIAS_HOST"); fi
           sudo bash scripts/ci/native-install-run.sh first "${options[@]}"
       - name: End-to-end checks
@@ -86,7 +86,7 @@ jobs:
           else
             sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST"
           fi
-      - name: A second run changes nothing and shows the same sign-in details
+      - name: A second run changes nothing and does not print the password again
         env:
           WITH_ALIAS: ${{ matrix.alias }}
         run: |
@@ -157,7 +157,7 @@ jobs:
           set -euo pipefail
           sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \
             bash scripts/ci/native-install-run.sh first --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" \
-            --acme-email "$ADMIN_EMAIL" --yes
+            --acme-email "$ADMIN_EMAIL" --print-credentials --yes
       - name: End-to-end checks
         run: sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Renewal replaces the certificate and Nginx serves the new one
@@ -173,7 +173,7 @@ jobs:
           after=$(serial)
           [[ -n $before && -n $after && $before != "$after" ]] || { echo "the served certificate did not change"; exit 1; }
           curl --silent --fail --max-time 20 --resolve "$PORTAL_HOST:443:127.0.0.1" -o /dev/null "https://$PORTAL_HOST/readyz"
-      - name: A second run changes nothing and shows the same sign-in details
+      - name: A second run changes nothing and does not print the password again
         run: |
           set -euo pipefail
           sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \

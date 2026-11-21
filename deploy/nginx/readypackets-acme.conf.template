@@ -1,5 +1,13 @@
 #@ TEMPLATE (see readypackets-portal.conf.template).
 # Temporary HTTP-only vhost, used before issuance. Remove once the full site is enabled.
+server_tokens off;
+# Any other name, and requests by IP address, are dropped without an answer.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
 server {
     listen 80;
     listen [::]:80;

@@ -13,6 +13,7 @@ set -euo pipefail
 readonly host=$1 alias=${2:-}
 readonly origin=https://$host conf=/etc/readypackets credentials=/root/readypackets-initial-admin.txt
 readonly install_log=/var/log/readypackets-install.log
+umask 077
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -183,6 +184,7 @@ expect 'verified TLS login' "$(login VERIFY_IDENTITY)" 1
 if login DISABLED >/dev/null; then fail 'the runtime account can sign in without TLS'; fi
 unset app_password
 [[ ! -e /etc/mysql/readypackets-tls/ca-key.pem ]] || fail 'the database CA key was kept'
+[[ -z $(find /etc/mysql /etc/readypackets -maxdepth 1 -name '.*tls*' -print -quit) ]] || fail 'a certificate work directory was left behind'
 expect 'database server key' "$(mode_of /etc/mysql/readypackets-tls/server-key.pem)" 600:mysql:mysql
 
 step 'first administrator: saved root-only, never logged'
@@ -203,17 +205,19 @@ expect 'administrators in the database' "$(sql "SELECT COUNT(*) FROM readypacket
 grep -q 'Catalog imported: 6 packets, 18 products' "$install_log" || fail 'the offerings were not loaded'
 
 sign_in() {
-    local name value token body
+    local name value token
     web -D "$work/csrf.headers" -o /dev/null -H "Origin: $origin" -H 'Sec-Fetch-Site: same-origin' "$origin/api/csrf"
     name=$(grep -i '^set-cookie: __Host-rp_csrf=' "$work/csrf.headers" | head -1 | sed -E 's/^[^:]+: ([^=]+)=.*/\1/')
     value=$(grep -i '^set-cookie: __Host-rp_csrf=' "$work/csrf.headers" | head -1 | sed -E 's/^[^:]+: [^=]+=([^;]*);.*/\1/')
     [[ -n $name && -n $value ]] || fail 'no anti-forgery cookie was issued'
     token=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$value")
-    body=$(python3 -c 'import json, sys; print(json.dumps({"json": {"email": sys.argv[1], "password": open(sys.argv[2]).read().rstrip("\n")}}))' \
-        "$admin_email" "$work/password")
+    # The request body and the anti-forgery values travel in root-only files, not in command lines.
+    python3 -c 'import json, sys; print(json.dumps({"json": {"email": sys.argv[1], "password": open(sys.argv[2]).read().rstrip("\n")}}))' \
+        "$admin_email" "$work/password" > "$work/signin.body"
+    printf 'Cookie: %s=%s\nx-rp-csrf: %s\n' "$name" "$value" "$token" > "$work/signin.request-headers"
     web -D "$work/signin.headers" -o "$work/signin.json" -H "Origin: $origin" -H 'Sec-Fetch-Site: same-origin' \
-        -H "Cookie: $name=$value" -H "x-rp-csrf: $token" -H 'Content-Type: application/json' \
-        --data "$body" "$origin/api/trpc/identity.signIn"
+        -H "@$work/signin.request-headers" -H 'Content-Type: application/json' \
+        --data "@$work/signin.body" "$origin/api/trpc/identity.signIn"
     grep -q '"nextStep":"enroll_mfa"' "$work/signin.json" || fail 'sign-in did not reach authenticator enrolment'
     grep -i '^set-cookie: __Host-rp_session=' "$work/signin.headers" | grep -qi 'HttpOnly; Secure; SameSite=Strict' ||
         fail 'the session cookie is missing its protective attributes'
@@ -227,11 +231,14 @@ web -o /dev/null -H 'X-Probe: header-canary-7f3a' "$origin/path-canary-91c2?toke
 sleep 1
 ! grep -rqs 'canary' /var/log/nginx || fail 'the Nginx logs contain request data'
 
-step 'maintenance fence'
+step 'maintenance fence: everyone but the local health probe is turned away'
+# Requests from 127.0.0.2 stand in for outside clients; 127.0.0.1 is the installer's own probe address.
+expect 'outside client before fencing' "$(web --interface 127.0.0.2 -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 touch /etc/nginx/readypackets-maintenance
-expect 'fenced' "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 503
+expect 'fenced' "$(web --interface 127.0.0.2 -o /dev/null -w '%{http_code}' "$origin/readyz")" 503
+expect 'local probe while fenced' "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 rm -f /etc/nginx/readypackets-maintenance
-expect 'reopened' "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
+expect 'reopened' "$(web --interface 127.0.0.2 -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 
 step 'a manual encrypted backup completes and is verified'
 systemctl start readypackets-backup@cli.service || { journalctl --unit=readypackets-backup@cli.service --no-pager --lines=60; fail 'the backup failed'; }

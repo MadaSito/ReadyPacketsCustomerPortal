@@ -19,13 +19,42 @@
 #   --admin-name "<name>"  display name of the first administrator (default: Portal Administrator)
 #   --skip-catalog         do not load the ReadyPackets offerings (packets, tiers, prices)
 #   --skip-dns-check       do not check that the host names reach this server before asking for a certificate
+#   --print-credentials    print the sign-in details to standard output when there is no terminal (they are
+#                          otherwise shown on the terminal only, once, and kept in a root-only file)
 #   --yes                  do not ask for confirmation
 #   -h, --help             show this text
 #
 # Environment (testing only): RP_ACME_SERVER=<directory URL> selects another ACME service, for example the
 # Let's Encrypt staging environment.
 set -euo pipefail
+# Never trace: this script handles passwords and keys.
+set +x
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+
+# Everything below runs as root, so the files it is about to read must be under root's control alone: the
+# clone, everything in it and every directory above it. This is checked before any of those files is used.
+# (It cannot make an untrusted copy of this very script safe; clone it yourself, as root, from the repository.)
+if [[ $EUID == 0 ]]; then
+    custody_top=$(realpath -- "$deploy_src/..")
+    custody_dir=$custody_top
+    while :; do
+        [[ $(stat -c '%u' -- "$custody_dir") == 0 && ! $(stat -c '%A' -- "$custody_dir") =~ ^d....w..w. ]] || {
+            if [[ $custody_dir == "$custody_top" || $(stat -c '%u' -- "$custody_dir") != 0 ||
+                  ! $(stat -c '%A' -- "$custody_dir") =~ [tT]$ ]]; then
+                printf 'ReadyPackets: %s must belong to root and must not be writable by anyone else.\nClone the repository as root into a root-owned directory, for example /opt/readypackets-src.\n' "$custody_dir" >&2
+                exit 1
+            fi
+        }
+        [[ $custody_dir != / ]] || break
+        custody_dir=$(dirname -- "$custody_dir")
+    done
+    custody_bad=$(find "$custody_top" -xdev \( ! -user root -o \( ! -type l -perm /022 \) \) -print -quit)
+    if [[ -n $custody_bad ]]; then
+        printf 'ReadyPackets: the clone holds files that do not belong to root or that others can change (for example %s).\nClone the repository again as root: sudo git clone <url> /opt/readypackets-src\n' "$custody_bad" >&2
+        exit 1
+    fi
+    unset custody_top custody_dir custody_bad
+fi
 # shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
 
@@ -49,14 +78,15 @@ readonly install_log=/var/log/readypackets-install.log
 readonly credentials=/root/readypackets-initial-admin.txt
 readonly pending_password="$conf/initial-admin-password" pending_email="$conf/initial-admin-email"
 readonly admin_marker="$conf/admin-bootstrap-done" catalog_marker="$conf/catalog-import-done"
+readonly db_marker="$conf/database-accounts-created" shown_marker="$conf/initial-admin-shown"
 
 say() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # --- options -------------------------------------------------------------------------------------------
 domain='' alias='' acme_email='' self_signed=0 admin_email='' admin_name='Portal Administrator'
-catalog=1 dns_check=1 assume_yes=0
+catalog=1 dns_check=1 assume_yes=0 print_credentials=0
 need_value() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"; }
 while (($#)); do
     case $1 in
@@ -68,6 +98,7 @@ while (($#)); do
         --admin-name) need_value "$@"; admin_name=$2; shift 2 ;;
         --skip-catalog) catalog=0; shift ;;
         --skip-dns-check) dns_check=0; shift ;;
+        --print-credentials) print_credentials=1; shift ;;
         --yes|-y) assume_yes=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
@@ -75,8 +106,8 @@ while (($#)); do
 done
 
 [[ $EUID == 0 ]] || die 'run as root (sudo bash deploy/auto-install.sh ...)'
-exec 8>/run/lock/readypackets-auto-install.lock
-flock -n 8 || die 'another auto-install is already running'
+# Held until this script ends; install.sh, started below, continues under the same lock.
+lock_deploy
 
 interactive=0
 if [[ -t 0 && -t 1 ]]; then interactive=1; fi
@@ -198,8 +229,8 @@ resolve_commit() {
     local top
     top=$(realpath -- "$deploy_src/..")
     [[ -d $top/.git ]] || die "run this script from a Git clone of the repository (no .git in $top)"
-    [[ $(stat -c '%u' "$top") == 0 && $(stat -c '%u' "$top/.git") == 0 ]] ||
-        die "the clone must belong to root. Fix it with: sudo chown -R root:root $top"
+    [[ ! -L $top/.git && $(stat -c '%u' "$top") == 0 && $(stat -c '%u' "$top/.git") == 0 ]] ||
+        die "the clone must belong to root; clone the repository again as root"
     [[ -z $(git -C "$top" status --porcelain --untracked-files=no) ]] ||
         die 'the clone has local changes to tracked files; install from an unmodified commit'
     commit=$(git -C "$top" rev-parse --verify 'HEAD^{commit}')
@@ -271,28 +302,34 @@ configure_mysql() {
     local changed=0 work desired attempt
     if [[ ! -s $db_tls/ca.pem || ! -s $db_tls/server-cert.pem || ! -s $db_tls/server-key.pem ]]; then
         [[ ! -e $db_tls ]] || die "$db_tls exists but is incomplete; inspect it before retrying"
-        work=$(mktemp -d /etc/mysql/.readypackets-tls.XXXXXXXX)
-        # A private authority that signs exactly one certificate; its key is discarded afterwards.
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-            -keyout "$work/ca-key.pem" -out "$work/ca.pem" -days 3650 -sha256 \
-            -subj '/O=ReadyPackets/CN=ReadyPackets database CA' \
-            -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
-            -addext 'keyUsage=critical,keyCertSign,cRLSign' 2>/dev/null
-        openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-            -keyout "$work/server-key.pem" -out "$work/server.csr" \
-            -subj '/O=ReadyPackets/CN=127.0.0.1' 2>/dev/null
-        printf '%s\n' 'subjectAltName=IP:127.0.0.1,DNS:localhost' 'basicConstraints=critical,CA:FALSE' \
-            'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth' > "$work/server.ext"
-        openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" -CAkey "$work/ca-key.pem" -CAcreateserial \
-            -out "$work/server-cert.pem" -days 3650 -sha256 -extfile "$work/server.ext" 2>/dev/null
-        openssl verify -CAfile "$work/ca.pem" "$work/server-cert.pem" >/dev/null
-        rm -f -- "$work/ca-key.pem" "$work/server.csr" "$work/server.ext" "$work/ca.srl"
-        chown root:root "$work" "$work/ca.pem" "$work/server-cert.pem"
-        chown mysql:mysql "$work/server-key.pem"
-        chmod 0644 "$work/ca.pem" "$work/server-cert.pem"
-        chmod 0600 "$work/server-key.pem"
-        chmod 0755 "$work"
-        mv -T -- "$work" "$db_tls"
+        # Work directories of an interrupted earlier attempt may hold the authority's key; remove them.
+        rm -rf -- /etc/mysql/.readypackets-tls.????????
+        (
+            work=$(mktemp -d /etc/mysql/.readypackets-tls.XXXXXXXX)
+            trap 'rm -rf -- "$work"' EXIT
+            # A private authority that signs exactly one certificate; its key is discarded afterwards.
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+                -keyout "$work/ca-key.pem" -out "$work/ca.pem" -days 3650 -sha256 \
+                -subj '/O=ReadyPackets/CN=ReadyPackets database CA' \
+                -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+                -addext 'keyUsage=critical,keyCertSign,cRLSign' 2>/dev/null
+            openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+                -keyout "$work/server-key.pem" -out "$work/server.csr" \
+                -subj '/O=ReadyPackets/CN=127.0.0.1' 2>/dev/null
+            printf '%s\n' 'subjectAltName=IP:127.0.0.1,DNS:localhost' 'basicConstraints=critical,CA:FALSE' \
+                'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth' > "$work/server.ext"
+            openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" -CAkey "$work/ca-key.pem" -CAcreateserial \
+                -out "$work/server-cert.pem" -days 3650 -sha256 -extfile "$work/server.ext" 2>/dev/null
+            openssl verify -CAfile "$work/ca.pem" "$work/server-cert.pem" >/dev/null
+            rm -f -- "$work/ca-key.pem" "$work/server.csr" "$work/server.ext" "$work/ca.srl"
+            chown root:root "$work" "$work/ca.pem" "$work/server-cert.pem"
+            chown mysql:mysql "$work/server-key.pem"
+            chmod 0644 "$work/ca.pem" "$work/server-cert.pem"
+            chmod 0600 "$work/server-key.pem"
+            chmod 0755 "$work"
+            mv -T -- "$work" "$db_tls"
+            trap - EXIT
+        )
         changed=1
     fi
     desired=$(printf '%s\n' \
@@ -334,7 +371,7 @@ db_login_ok() {  # db_login_ok <account> <password>: connects over TCP with a ve
 
 provision_database() {
     say 'Creating the database and its three accounts'
-    local name present=0 tables app_pw migrator_pw backup_pw
+    local name present=0 tables existing app_pw migrator_pw backup_pw
     for name in database_url migrator_database_url backup_database_url; do
         if [[ -e $conf/secrets/$name || -L $conf/secrets/$name ]]; then ((present += 1)); fi
     done
@@ -350,6 +387,12 @@ provision_database() {
         note 'discarding incomplete credential files left by an interrupted run (the database is still empty)'
         rm -f -- "$conf/secrets/database_url" "$conf/secrets/migrator_database_url" "$conf/secrets/backup_database_url"
     fi
+    # Accounts with these names are only ever replaced when this installer created them itself.
+    existing=$(mysql_root --execute="SELECT COUNT(*) FROM mysql.user WHERE user IN ('$db_app', '$db_migrator', '$db_backup')")
+    if [[ $existing != 0 && ! -e $db_marker ]]; then
+        die "MySQL already has an account named $db_app, $db_migrator or $db_backup that this installer did not create; remove or rename it first"
+    fi
+    : > "$db_marker"
     app_pw=$(openssl rand -hex 24) migrator_pw=$(openssl rand -hex 24) backup_pw=$(openssl rand -hex 24)
     [[ $app_pw =~ ^[0-9a-f]{48}$ && $migrator_pw =~ ^[0-9a-f]{48}$ && $backup_pw =~ ^[0-9a-f]{48}$ &&
        $app_pw != "$migrator_pw" && $app_pw != "$backup_pw" && $migrator_pw != "$backup_pw" ]] || die 'random source failed'
@@ -428,15 +471,20 @@ self_signed_certificate() {
         note 'already present'
         return
     fi
-    local work san="DNS:$origin"
+    local san="DNS:$origin"
     [[ -z $alias_host ]] || san+=",DNS:$alias_host"
     [[ ! -e $tls_dir ]] || die "$tls_dir exists but is incomplete; inspect it before retrying"
-    work=$(mktemp -d "$conf/.tls.XXXXXXXX")
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-        -keyout "$work/privkey.pem" -out "$work/fullchain.pem" -days 825 -sha256 -subj "/CN=$origin" \
-        -addext "subjectAltName=$san" -addext 'basicConstraints=critical,CA:FALSE' \
-        -addext 'keyUsage=critical,digitalSignature' -addext 'extendedKeyUsage=serverAuth' 2>/dev/null
-    mv -T -- "$work" "$tls_dir"
+    rm -rf -- "$conf"/.tls.????????
+    (
+        work=$(mktemp -d "$conf/.tls.XXXXXXXX")
+        trap 'rm -rf -- "$work"' EXIT
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$work/privkey.pem" -out "$work/fullchain.pem" -days 825 -sha256 -subj "/CN=$origin" \
+            -addext "subjectAltName=$san" -addext 'basicConstraints=critical,CA:FALSE' \
+            -addext 'keyUsage=critical,digitalSignature' -addext 'extendedKeyUsage=serverAuth' 2>/dev/null
+        mv -T -- "$work" "$tls_dir"
+        trap - EXIT
+    )
 }
 
 public_certificate() {
@@ -624,11 +672,24 @@ printf ' ReadyPackets is installed and running at https://%s\n' "$origin"
 printf '==================================================================\n\n'
 outcome=''
 if [[ -s $conf/initial-admin-outcome ]]; then outcome=$(<"$conf/initial-admin-outcome"); fi
-if [[ -s $credentials ]]; then
-    sed 's/^/  /' "$credentials"
+# The temporary password is shown once, on the terminal of the person installing. Without a terminal it is
+# only printed when --print-credentials asks for it; it always stays in the root-only file until deleted.
+if [[ -s $credentials && ! -e $shown_marker ]]; then
+    if { : > /dev/tty; } 2>/dev/null; then
+        sed 's/^/  /' "$credentials" > /dev/tty
+        : > "$shown_marker"
+    elif ((print_credentials)); then
+        sed 's/^/  /' "$credentials"
+        : > "$shown_marker"
+    else
+        printf '  The first administrator was created. No terminal is attached, so the sign-in details are not\n  printed. Read them as root:  sudo cat %s\n' "$credentials"
+    fi
     if [[ $outcome == existing ]]; then
         printf '\n  Note: an earlier, interrupted run had already created this administrator.\n'
     fi
+elif [[ -s $credentials ]]; then
+    printf '  First administrator: %s\n  The temporary password was shown when the installation finished. Until you delete the file it\n  can be read as root:  sudo cat %s\n' \
+        "$(sed -n 's/^  Sign-in name   : //p' "$credentials")" "$credentials"
 elif [[ $outcome == unused ]]; then
     printf '  An administrator already existed in this database, so no new account was created.\n'
 else

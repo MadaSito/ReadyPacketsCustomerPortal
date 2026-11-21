@@ -4,6 +4,8 @@
 # SC2016: the single-quoted snippets passed to "bash -c" are expanded by that inner shell, on purpose.
 # shellcheck disable=SC2016,SC2034,SC2154
 set -euo pipefail
+# Never trace: these scripts handle passwords and keys, and a trace would copy them to the terminal or a log.
+set +x
 umask 077
 export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
 
@@ -15,7 +17,7 @@ readonly maintenance="$nginx_dir/readypackets-maintenance"
 readonly web=readypackets-portal.service worker=readypackets-worker.service
 readonly timer=readypackets-backup.timer
 readonly node=/usr/local/bin/node pnpm=/usr/local/bin/pnpm
-readonly site_conf="$conf/site.conf"
+readonly site_conf="$conf/site.conf" deploy_lock=/run/readypackets-deploy.lock
 # Site identity: the portal's host name, an optional alias that only redirects to it, and where the web
 # certificate lives. Defaults apply when site.conf is absent; load_site (end of this file) reads it as data.
 origin=my.readypackets.com alias_host=portal.readypackets.com tls_mode=letsencrypt
@@ -30,8 +32,10 @@ confirm() {
     [[ "$reply" == "$2" ]] || die 'confirmation did not match'
 }
 lock_deploy() {
+    # One lock for every entry point. auto-install.sh takes it first and install.sh, started by it, inherits
+    # the open descriptor; taking the lock again on that same descriptor succeeds.
     [[ $EUID == 0 ]] || die 'run as root'
-    exec 9>/run/lock/readypackets-deploy.lock
+    if [[ ! /proc/self/fd/9 -ef "$deploy_lock" ]]; then exec 9>"$deploy_lock"; fi
     flock -n 9 || die 'an installation, upgrade, or uninstall is already running'
 }
 valid_host() {
@@ -159,7 +163,7 @@ root_directory() {
         die "unexpected owner, permissions or resolved path: $dir"
 }
 build_as_user() {
-    systemd-run --wait --collect --pipe --service-type=exec \
+    systemd-run --wait --collect --pipe --service-type=exec --expand-environment=no \
         --property=User=readypackets-build --property=Group=readypackets-build \
         --property=UMask=0022 --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
         --property=ProtectHome=yes --property=PrivateTmp=yes --property=PrivateDevices=yes \
@@ -284,7 +288,7 @@ write_env() {
 migrate_release() {
     local target=$1
     secret_ok migrator_database_url
-    systemd-run --wait --collect --pipe --service-type=exec \
+    systemd-run --wait --collect --pipe --service-type=exec --expand-environment=no \
         --property=User=readypackets --property=Group=readypackets --property=UMask=0077 \
         --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
         --property=PrivateTmp=yes --property=PrivateDevices=yes --property=CapabilityBoundingSet= \
@@ -301,7 +305,7 @@ ops_run() {
     shift
     local -a creds=("--property=LoadCredential=database_url:$conf/secrets/database_url")
     for key in "${app_keys[@]}"; do creds+=("--property=LoadCredential=$key:$conf/secrets/$key"); done
-    systemd-run --wait --collect --quiet "$io" --service-type=exec \
+    systemd-run --wait --collect --quiet "$io" --service-type=exec --expand-environment=no \
         --property=User=readypackets --property=Group=readypackets --property=UMask=0077 \
         --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
         --property=PrivateTmp=yes --property=PrivateDevices=yes --property=CapabilityBoundingSet= \

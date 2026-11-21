@@ -33,6 +33,9 @@ fi
 # The test names resolve to this machine, as a DNS record would on a real server.
 printf '127.0.0.1 %s %s\n' "$1" "$2" >> /etc/hosts
 
+# The runner image leaves /opt writable by everyone; a server has it root-owned, and the installer insists.
+chown root:root /opt
+chmod 0755 /opt
 rm -rf -- "$target"
 git -c safe.directory="$source_dir" clone --quiet --no-hardlinks "$source_dir" "$target"
 git -C "$target" -c advice.detachedHead=false checkout --quiet --detach "$(git -c safe.directory="$source_dir" -C "$source_dir" rev-parse HEAD)"
