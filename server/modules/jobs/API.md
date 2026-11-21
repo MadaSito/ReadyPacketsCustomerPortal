@@ -56,6 +56,7 @@ interface MailTemplateStore {
 - `JobsModule.registerMailTemplateStore(store: MailTemplateStore): void`: one provider. `resolve` returns the current published renderer or `null`, never a draft. Use the supplied transaction for reads if present. The published renderer is synchronous and must escape substitutions, handle redacted variable strings, and sanitize HTML again after substitution. The Jobs engine owns fallback to built-in renderers and preserves their `sensitiveVars`.
 - `JobsModule.getBuiltinMailTemplates(): readonly MailTemplate[]`: in-process snapshots of current built-in registrations, for discovering system defaults. Never expose functions or raw actual mail variables over a router.
 - `JobsModule.getMailSenderIdentity(): Promise<MailSenderIdentity | null>`: shared sender; use for provider test sends as well. `JobsModule.getMailReadiness(): Promise<{ ready: boolean }>` checks sender and configured routes without contacting a provider to send; readiness is not acceptance.
+- Automation mail inherits the worker's `automation:<runPublicId>` correlation ID, persists it in the outbox and copies it to every delivery generation (even manual resend). Mail audit keeps that ID, so the audit tap suppresses automation-origin events from future triggers without suppressing the durable audit record itself.
 
 ## Console procedures
 

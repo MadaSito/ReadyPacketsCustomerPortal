@@ -39,18 +39,20 @@ function latch(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function fixture(profile: Parameters<typeof createTestDeps>[0] = {}) {
+function fixture(profile: Parameters<typeof createTestDeps>[0] = {}, useDurableAudit = false) {
   const h = createTestDeps({ db: t.db, ...profile });
-  const jobs = createJobQueue(h.deps);
-  const mailer = createMailer({ ...h.deps, jobs });
-  const deps = { ...h.deps, jobs, mailer };
+  const durableAudit = useDurableAudit ? createAuditEmitter(h.deps) : undefined;
+  const core = { ...h.deps, audit: durableAudit ?? h.audit };
+  const jobs = createJobQueue(core);
+  const mailer = createMailer({ ...core, jobs });
+  const deps = { ...core, jobs, mailer };
   const admin = createJobsAdmin(deps);
   const engine = engineFor(jobs)!;
   const mail = mailEngineFor(mailer)!;
   const operator = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
   const assertCurrent = vi.fn(async () => ({ pendingSteps: [], role: operator.role, stepUpAt: h.clock.now(), mfaVerifiedAt: h.clock.now() }));
   h.services.identity = { sessions: { assertCurrent } } as unknown as typeof h.services.identity;
-  return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent };
+  return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent, durableAudit };
 }
 
 describe("MySQL durable job leases", () => {
@@ -535,6 +537,34 @@ describe("MySQL transactional mail outbox", () => {
     expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
     expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
     await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+  });
+
+  it("preserves automation origin through a failed submission and operator resend, suppressing only those tap events", async () => {
+    const f = fixture({}, true);
+    setDelivery(f, "rejected", true);
+    const onRecorded = vi.fn(async () => undefined);
+    const audit = f.durableAudit!;
+    audit.setTap({ listens: (name) => name === "job.mail.failed", onRecorded });
+    const marker = "automation:01JD0000000000000000000001";
+    const run = async () => { await f.engine.execute((await f.engine.claim())!); };
+
+    await runWithRequestContext(newRequestContext("worker", { correlationId: marker }), () => f.mailer.enqueue(input));
+    const [mail] = await t.db.select().from(mailOutbox);
+    expect(mail?.correlationId).toBe(marker);
+    await run(); // Separate async execution from the originating automation context.
+    const resend = await runWithRequestContext(newRequestContext("http", { correlationId: "operator-request" }),
+      () => f.admin.resend(f.operator, mail!.publicId));
+    const [resendJob] = await t.db.select().from(jobRuns).where(eq(jobRuns.publicId, resend.jobId));
+    expect(resendJob?.correlationId).toBe(marker);
+    await run();
+    const failures = await t.db.select().from(auditEvents).where(eq(auditEvents.eventName, "job.mail.failed"));
+    expect(failures.map((event) => event.correlationId)).toEqual([marker, marker]);
+    expect(onRecorded).not.toHaveBeenCalled();
+    expect(audit.tapStats().suppressedAutomationOrigin).toBe(2);
+
+    await f.mailer.enqueue({ ...input, idempotencyKey: "non-automation-control" });
+    await run();
+    expect(onRecorded).toHaveBeenCalledTimes(1);
   });
 
   it("fences a late SMTP success after reaping an interrupted provider call", async () => {
