@@ -7,6 +7,7 @@ import type { AuditEventInput, DbOrTx, SessionPrincipal, Tx } from "../../core/t
 import { azureBlobAdapter } from "./adapters/azureBlob.js";
 import { s3Adapter } from "./adapters/s3.js";
 import { assertCurrentStorageAdmin, assertStorageAdmin } from "./authz.js";
+import "./automation.js";
 import type {
   StorageAdapter, StorageAdapterDefinition, StorageConfig, StorageConnectionView, StorageCredentials,
   StorageModule, StorageProviderKind, StoragePurpose, StorageTestResult,
@@ -14,7 +15,7 @@ import type {
 import { StorageAdapterError } from "./contracts.js";
 import { registerFileCopies } from "./fileCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
-import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storageTest, storageUpdate } from "./validation.js";
+import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storagePublicId, storageTest, storageUpdate } from "./validation.js";
 
 export type { StorageModule } from "./contracts.js";
 
@@ -341,6 +342,28 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
     },
     async stageOrderFile(filePublicId, tx) {
       await copies.stage(filePublicId, await activeRows("order_files", tx), tx);
+    },
+    async stageOrderFilesForAutomation(input) {
+      const orderPublicId = checked(storagePublicId, input.orderPublicId);
+      const connectionPublicId = input.connectionPublicId === undefined ? undefined : checked(storagePublicId, input.connectionPublicId);
+      if (!/^automation:[A-Za-z0-9_-]{10,40}$/u.test(input.correlationId)) {
+        throw validation("STORAGE_AUTOMATION_ORIGIN_INVALID", "This copy must be staged by an automation run.");
+      }
+      return db.transaction(async (tx) => {
+        input.signal.throwIfAborted();
+        await input.assertStillOwned(tx);
+        const files = await deps.services.files.listOrderFileCopyCandidates(orderPublicId, tx);
+        if (files === null) return { queued: 0, cause: "STORAGE_COPY_SOURCE_INACTIVE" };
+        if (files.length > 50) return { queued: 0, cause: "STORAGE_COPY_BATCH_LIMIT" };
+        const destinations = (await activeRows("order_files", tx)).filter((row) => !connectionPublicId || row.publicId === connectionPublicId);
+        if (!destinations.length) return { queued: 0, cause: "STORAGE_ASSIGNMENT_INACTIVE" };
+        let queued = 0;
+        for (const fileId of files) {
+          input.signal.throwIfAborted();
+          queued += await copies.stage(fileId, destinations, tx, input.correlationId);
+        }
+        return { queued };
+      }, { isolationLevel: "read committed" });
     },
   };
   const copies = registerFileCopies(deps, service);

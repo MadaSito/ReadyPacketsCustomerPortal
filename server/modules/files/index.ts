@@ -7,6 +7,7 @@ import { getRequestContext } from "../../core/requestContext.js";
 import type { AuditEventInput, DbOrTx, ModuleLifecycle, SessionPrincipal, StoredObjectInfo, Tx } from "../../core/types.js";
 import { roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { registerAutomationTrigger } from "../automations/contracts.js";
 import { readSetting, writeSetting } from "../platform/settingsRegistry.js";
 import { acceptsDeclaredType, allowedExtensions, classifyFile, displayExtension, sanitizeDisplayName, type FileClassification, type FileExtension } from "./classification.js";
 import { fileAccessLog, fileDownloadTickets, orderFiles, type FileCategory, type FileVisibility } from "./schema.js";
@@ -119,7 +120,32 @@ export interface FilesModule extends ModuleLifecycle {
     ownerUserId: number; customerName: string; customerReference: string; customerPublicId: string;
     orderReference: string; orderPublicId: string; filePublicId: string;
   }>;
+  /** Automation-only bounded traversal: null for unknown/held orders, ≥51 means do not copy the batch. */
+  listOrderFileCopyCandidates(orderPublicId: string, tx: Tx): Promise<string[] | null>;
+  /** Trusted audit-trigger resolver; returns IDs/category only, never file bytes or names. */
+  getUploadAutomationContext(filePublicId: string, handle: DbOrTx): Promise<{
+    orderPublicId: string; orderOwnerUserId: number; category: FileCategory;
+  } | null>;
 }
+
+registerAutomationTrigger({
+  key: "file.uploaded",
+  async resolveContext({ event, db, services, signal }) {
+    signal.throwIfAborted();
+    const filePublicId = event.resource?.type === "file" ? event.resource.publicId : null;
+    if (!filePublicId || !publicIdShape(filePublicId)) return {};
+    const context = await services.files.getUploadAutomationContext(filePublicId, db);
+    if (!context) return {};
+    const order = await services.orders.getOrderSyncView(context.orderPublicId, db);
+    if (!order || order.ownerUserId !== context.orderOwnerUserId) return {};
+    return {
+      orderPublicId: order.publicId,
+      fields: { file_category: context.category, order_reference: order.reference, order_status_label: order.status.label,
+        order_link: new URL(`/orders/${order.publicId}`, services.config.canonicalOrigin).href },
+      recipients: { order_owner: [order.ownerUserId] },
+    };
+  },
+});
 
 function boundedLimit(value = 30) {
   if (!Number.isInteger(value) || value < 1 || value > 100) throw validation("INVALID_FILE_LIMIT", "Choose a file page size between 1 and 100.");
@@ -361,8 +387,9 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     if (input.previous) {
       await tx.update(orderFiles).set({ supersededAt: now }).where(eq(orderFiles.id, input.previous.id));
     }
-    await audit.record(event(principal, input.imported ? "file.imported" : "file.uploaded",
-      input.imported ? "import" : "upload", "completed", publicId), tx);
+    await audit.record({ ...event(principal, input.imported ? "file.imported" : "file.uploaded",
+      input.imported ? "import" : "upload", "completed", publicId),
+      ...(!input.imported ? { attributes: { order_public_id: input.orderPublicId } } : {}) }, tx);
     return output(await findFile(publicId, tx, true));
   }
 
@@ -760,7 +787,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       });
       const initial = await findSource(false);
       const order = await deps.services.orders.getOrderRefById(initial.orderId, tx, { forUpdate: true });
-      if (!order || order.lockState === "legal_hold") throw unavailable();
+      if (!order || order.lockState !== "none") throw unavailable();
       const owner = await deps.services.identity.getUser(order.ownerUserId, { tx, forUpdate: true });
       const row = await findSource(true);
       if (!owner || owner.status !== "active" || row.orderId !== order.id || row.orderPublicId !== order.publicId ||
@@ -771,6 +798,25 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         customerName: owner.name, customerReference: owner.customerRef ?? owner.publicId,
         customerPublicId: owner.publicId, orderReference: order.reference, orderPublicId: order.publicId, filePublicId: row.publicId,
       };
+    },
+    async listOrderFileCopyCandidates(orderPublicId, tx) {
+      const order = await deps.services.orders.getOrderRefByPublicId(orderPublicId, tx, { forUpdate: true });
+      if (!order || order.lockState !== "none") return null;
+      const owner = await deps.services.identity.getUser(order.ownerUserId, { tx, forUpdate: true });
+      if (!owner || owner.status !== "active") return null;
+      const rows = await tx.select({ publicId: orderFiles.publicId }).from(orderFiles)
+        .where(and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
+          eq(orderFiles.ownerUserId, order.ownerUserId), isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt),
+          isNull(orderFiles.supersededAt))).orderBy(orderFiles.publicId).limit(51);
+      return rows.map(({ publicId }) => publicId);
+    },
+    async getUploadAutomationContext(filePublicId, handle) {
+      if (!publicIdShape(filePublicId)) return null;
+      const [row] = await handle.select({
+        orderPublicId: orderFiles.orderPublicId, orderOwnerUserId: orderFiles.ownerUserId, category: orderFiles.category,
+      }).from(orderFiles).where(and(eq(orderFiles.publicId, filePublicId), isNull(orderFiles.deletedAt),
+        isNull(orderFiles.purgedAt))).limit(1);
+      return row ?? null;
     },
   };
   return service;

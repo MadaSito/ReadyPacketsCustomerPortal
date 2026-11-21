@@ -1,5 +1,5 @@
 import type { Readable } from "node:stream";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
@@ -138,16 +138,25 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
   });
 
   return {
-    async stage(filePublicId: string, destinations: readonly Destination[], tx: Tx) {
+    async stage(filePublicId: string, destinations: readonly Destination[], tx: Tx, correlationId?: string) {
       const now = clock.now();
+      let queued = 0;
       for (const destination of destinations) {
         const copyPublicId = ulid(now.getTime());
         await tx.insert(storageFileCopies).values({ publicId: copyPublicId, filePublicId,
-          connectionPublicId: destination.publicId, destinationVersion: destination.destinationVersion, createdAt: now, updatedAt: now });
+          connectionPublicId: destination.publicId, destinationVersion: destination.destinationVersion, createdAt: now, updatedAt: now })
+          .onDuplicateKeyUpdate({ set: { id: sql`${storageFileCopies.id}` } });
+        const [stored] = await tx.select({ publicId: storageFileCopies.publicId }).from(storageFileCopies)
+          .where(and(eq(storageFileCopies.filePublicId, filePublicId), eq(storageFileCopies.connectionPublicId, destination.publicId)))
+          .limit(1).for("update");
+        if (!stored) throw new Error("STORAGE_COPY_ROW_UNAVAILABLE");
+        if (stored.publicId !== copyPublicId) continue; // Preserve any existing result and its bound generation.
         await jobs.enqueue(jobType, { copyPublicId }, {
-          idempotencyKey: `${filePublicId}:${destination.publicId}`, maxAttempts,
+          idempotencyKey: `${filePublicId}:${destination.publicId}`, maxAttempts, correlationId,
         }, tx);
+        queued += 1;
       }
+      return queued;
     },
   };
 }

@@ -11,6 +11,7 @@ All cloud tests use local protocol fakes. No live tenant, bucket or provider acc
 | Atomic upload enqueue and no automatic remote delete or local mutation | `../files/files.test.ts`, `storage.test.ts`: rollback on outbox failure, disabled path, fan-out, encrypted labels and originals preserved | automated-test |
 | Live source and destination fences; rotated credentials do not redirect queued bytes | `storage.test.ts`: scope changes after folder stage, credential change and re-enable skips old job | automated-test |
 | Provider verification and safe retry | `storage.test.ts`: mismatched digest fails; duplicate-safe failure retries with queue backoff, unknown isn't replayed | automated-test |
+| Automation loop marker, deduplication and scope | `storage.test.ts`: origin survives child queue and audit transitions, repeat staging creates no copy, unassigned target refused | automated-test |
 | SigV4 and Azure authentication, path confinement, observed integrity | `objectAdapters.test.ts`: published [AWS signing example](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html), synthetic Azure signatures/SAS and streaming protocol responses; check the [Azure Shared Key reference](https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key) | automated-test |
 | Real authorization, provider behavior/limits and latency | Test with a synthetic object in a dedicated staging destination on each configured provider. This is not a live provider certification. | not-verified |
 

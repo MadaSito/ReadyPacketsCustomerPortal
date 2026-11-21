@@ -26,8 +26,8 @@ let providerFault: StorageAdapterError | undefined;
 let overrideDigest: string | undefined;
 let visitEnsure: (() => Promise<void>) | undefined;
 let sourceUnavailable: boolean;
-let adapterPuts: ReturnType<typeof vi.fn>;
-let adapterRemovals: ReturnType<typeof vi.fn>;
+let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string, data: Buffer) => void>>;
+let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
 beforeAll(async () => {
   db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies } });
@@ -82,19 +82,25 @@ async function testEnable(row: StorageConnectionView) {
 
 async function stage() {
   const filePublicId = ulid();
+  const orderPublicId = ulid();
   const storageKey = h.storage.newKey("files");
   const local = await h.storage.put(storageKey, sourceBytes);
-  h.services.files = { async getOrderFileCopySource() {
-    if (sourceUnavailable) throw new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "Source unavailable.");
-    return {
-      storageKey, size: sourceBytes.length, sha256: local.sha256, contentType: "application/octet-stream",
-      displayName: "Synthetic ../Doc.pdf", extension: "pdf", ownerUserId: 42,
-      customerName: "E\u0301lodie Beispiel", customerReference: "RPCUS-TEST00001", customerPublicId: ulid(),
-      orderReference: "Order / synthetic", orderPublicId: ulid(), filePublicId,
-    };
-  } } as unknown as TestHarness["services"]["files"];
+  h.services.files = {
+    async getOrderFileCopySource() {
+      if (sourceUnavailable) throw new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "Source unavailable.");
+      return {
+        storageKey, size: sourceBytes.length, sha256: local.sha256, contentType: "application/octet-stream",
+        displayName: "Synthetic ../Doc.pdf", extension: "pdf", ownerUserId: 42,
+        customerName: "E\u0301lodie Beispiel", customerReference: "RPCUS-TEST00001", customerPublicId: ulid(),
+        orderReference: "Order / synthetic", orderPublicId, filePublicId,
+      };
+    },
+    async listOrderFileCopyCandidates(requestedOrder: string) {
+      return !sourceUnavailable && requestedOrder === orderPublicId ? [filePublicId] : null;
+    },
+  } as unknown as TestHarness["services"]["files"];
   await db.db.transaction((tx) => module.stageOrderFile(filePublicId, tx));
-  return { filePublicId, storageKey };
+  return { filePublicId, storageKey, orderPublicId };
 }
 
 describe("storage registry", () => {
@@ -228,5 +234,26 @@ describe("fenced order-file copy jobs", () => {
     providerFault = new StorageAdapterError("OUTCOME_UNKNOWN");
     expect(await h.jobs.runAll(jobType)).toEqual([{ outcome: "unknown", reasonCode: "STORAGE_COPY_UNCERTAIN" }]);
     expect(h.audit.named("storage.order_file.copy").at(-1)?.outcome).toBe("unknown");
+  });
+
+  it("deduplicates automation replays, preserves their origin, and cannot target an unassigned destination", async () => {
+    const { orderPublicId } = await stage();
+    const active = await create("Active");
+    const unassigned = await create("Unassigned");
+    await module.assignments.set(admin, { purpose: "order_files", connectionPublicIds: [active.publicId] });
+    const fence = vi.fn(async () => {});
+    const input = { orderPublicId, signal: new AbortController().signal, assertStillOwned: fence, correlationId: `automation:${ulid()}` };
+    await expect(module.stageOrderFilesForAutomation({ ...input, correlationId: "request-not-an-automation" }))
+      .rejects.toMatchObject({ reasonCode: "STORAGE_AUTOMATION_ORIGIN_INVALID" });
+    await expect(module.stageOrderFilesForAutomation({ ...input, connectionPublicId: unassigned.publicId }))
+      .resolves.toEqual({ queued: 0, cause: "STORAGE_ASSIGNMENT_INACTIVE" });
+    await expect(module.stageOrderFilesForAutomation(input)).resolves.toEqual({ queued: 1 });
+    await expect(module.stageOrderFilesForAutomation(input)).resolves.toEqual({ queued: 0 });
+    expect(fence).toHaveBeenCalledTimes(3);
+    expect(h.jobs.enqueued).toHaveLength(1);
+    expect(h.jobs.enqueued[0]?.options?.correlationId).toBe(input.correlationId);
+    await h.jobs.runAll(jobType);
+    expect(h.audit.named("storage.order_file.copy").map((row) => row.correlationId))
+      .toEqual([input.correlationId, input.correlationId]);
   });
 });
