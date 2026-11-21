@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { MeResult, MeUser } from "@/lib/authApi";
 import type { RouteDef } from "@/lib/routes";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
+import { pageA11y } from "@/test/a11y";
 import { AppRoutes } from "./AppRouter";
 import { ConsoleShell } from "./shell/ConsoleShell";
 import { CustomerShell } from "./shell/CustomerShell";
@@ -194,5 +195,18 @@ describe("console header search (D5)", () => {
     expect(links[0]).toHaveAttribute("href", "/admin/search");
     expect(links[0]?.className).toContain("size-11");
     expect(links[0]?.className).toContain("md:hidden");
+  });
+});
+
+describe("customer shell page a11y (package N)", () => {
+  pageA11y("customer shell", async () => {
+    document.title = "Dashboard · ReadyPackets";
+    renderUi(
+      <CustomerShell user={user("customer")}>
+        <h1>Dashboard</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    await screen.findByRole("navigation", { name: "Customer" });
   });
 });
