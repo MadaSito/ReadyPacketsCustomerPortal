@@ -59,26 +59,30 @@ Post bodies use a constrained plain-text format. They are not HTML.
 |---|---|---|
 | `status` (query) | signed-in | `{ enabled, profile: { displayName, publicId } \| null, suspendedUntil, canModerate }` |
 | `profile.save` (mutation) | signed-in | `{ displayName }`: 3–32 chars, letters/digits/space/`._-`, not e-mail-like, not reserved, unique case-insensitive |
-| `categories.list` | M | non-archived, ordered |
-| `topics.list` | M | `{ categoryId?, cursor?, limit? }`, pinned first |
+| `categories.list` | M | ordered; archived categories are included with `archived: true` (read-only) |
+| `topics.list` | M | `{ categoryPublicId?, cursor?, limit? }`, pinned first |
 | `topics.get` | M | topic + paged posts; hidden/removed posts show a placeholder (moderators see the body) |
-| `topics.create` | M | `{ categoryId, title (5–140), body, idempotencyKey }` |
-| `posts.reply` | M | `{ topicId, body, quotePostId?, idempotencyKey }`; refused when locked |
-| `posts.edit` | M (author) | within the edit window; `expectedVersion` |
+| `topics.create` | M | `{ categoryPublicId, title (5–140), body, idempotencyKey }` |
+| `posts.reply` | M | `{ topicPublicId, body, quotePostPublicId?, idempotencyKey }`; refused when locked or archived |
+| `posts.edit` | M (author) | `{ postPublicId, body, title?, expectedVersion }`; within the edit window; re-moderated (held words, new-member link threshold) |
 | `posts.delete` | M (author) | soft delete |
 | `posts.react` | M | `{ postId, helpful: boolean }`; not your own post |
 | `posts.report` | M | `{ postId, reason: spam\|abuse\|off_topic\|personal_info\|other, note? (≤500) }`; one open report per member per post |
 | `subscriptions.set` | M | `{ topicId, subscribed }` |
 | `search` | M | `{ q (2–100), cursor? }`; LIKE with escaped wildcards, published posts only |
 | `mod.queue` | S | pending posts + open reports |
-| `mod.reports.resolve` | S | `{ reportId, outcome: dismissed\|actioned, note? }` |
+| `mod.reports.resolve` | S | `{ reportPublicId, outcome: dismissed\|actioned, note? }` |
 | `mod.post` | S | `{ postId, action: approve\|hide\|unhide\|remove, reason? }` |
 | `mod.topic` | S | `{ topicId, action: lock\|unlock\|pin\|unpin\|move, categoryId? }` |
 | `mod.suspend` / `mod.unsuspend` | S | `{ memberPublicId, days 1–365 \| null (indefinite), reason }`; staff cannot suspend staff/admin |
 | `mod.log` | S | moderation log, paginated |
-| `admin.settings.get` / `admin.settings.update` | A | `COMMUNITY_CONFIG`, `expectedVersion` |
+| `admin.settings.get` / `admin.settings.update` | A | `COMMUNITY_CONFIG` (whole object; last writer wins, audited with changed field names) |
 | `admin.setEnabled` | A + step-up | audited |
-| `admin.categories.create` / `update` / `reorder` / `archive` | A | `reorder` takes an ordered id list (non-drag alternative) |
+| `admin.categories.create` / `update` / `reorder` | A | archive through `update { archived }`; `reorder` takes the full ordered public-id list (non-drag alternative) |
+
+## Archived categories
+
+Archived means read-only. Archived categories still appear in `categories.list` (flagged), in topic lists, in search and through direct links. `topics.create`, `posts.reply` and `posts.edit` are refused with `CONFLICT COMMUNITY_CATEGORY_ARCHIVED`, and no topic can be moved into an archived category. Moderators can still hide or remove content.
 
 ## Abuse controls
 

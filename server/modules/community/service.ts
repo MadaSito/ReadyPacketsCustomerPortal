@@ -537,7 +537,8 @@ export function createCommunityService(deps: ModuleDeps) {
 
     async listCategories(principal: SessionPrincipal): Promise<CategoryView[]> {
       return memberTx(principal, async (tx) => {
-        const rows = await tx.select().from(communityCategories).where(eq(communityCategories.archived, false)).orderBy(asc(communityCategories.sortOrder), asc(communityCategories.id)).limit(200);
+        // Archived categories are listed (flagged) because archive means read-only, not hidden.
+        const rows = await tx.select().from(communityCategories).orderBy(asc(communityCategories.sortOrder), asc(communityCategories.id)).limit(200);
         return rows.map(categoryView);
       });
     },
@@ -672,6 +673,8 @@ export function createCommunityService(deps: ModuleDeps) {
         const { post, topic } = await loadPost(input.postPublicId, tx, actor, true);
         if (post.authorUserId !== actor.userId) throw forbidden("COMMUNITY_NOT_AUTHOR");
         const profile = await postingProfile(actor, tx);
+        const [cat] = await tx.select({ archived: communityCategories.archived }).from(communityCategories).where(eq(communityCategories.id, topic.categoryId)).limit(1);
+        if (!cat || cat.archived) throw conflict("COMMUNITY_CATEGORY_ARCHIVED", "This category is archived and its posts can no longer be edited.");
         if (post.state !== "published" && post.state !== "pending") throw conflict("COMMUNITY_POST_NOT_EDITABLE", "This post can no longer be edited.");
         if (post.version !== input.expectedVersion) throw conflict("STALE_VERSION", "This post changed since you opened it. Reload and try again.");
         const cfg = await config(tx);
