@@ -21,4 +21,5 @@ export * from "../../modules/sharepoint/schema.js";
 export * from "../../modules/mailTemplates/schema.js";
 export * from "../../modules/automations/schema.js";
 export * from "../../modules/protection/schema.js";
+export * from "../../modules/publicApi/schema.js";
 export * from "../../security/rateLimiterSchema.js";

@@ -21,6 +21,7 @@ import { mailFeature } from "@/features/mail/routes";
 import { mailTemplatesFeature } from "@/features/mailTemplates/routes";
 import { storageFeature } from "@/features/storage/routes";
 import { accessibilityFeature } from "@/features/accessibility/routes";
+import { protectionFeature } from "@/features/protection/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
   authFeature,
@@ -43,6 +44,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   mailTemplatesFeature,
   storageFeature,
   accessibilityFeature,
+  protectionFeature,
 ];
 
 export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);

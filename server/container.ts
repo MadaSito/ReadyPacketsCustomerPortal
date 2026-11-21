@@ -44,6 +44,7 @@ import { createSharepointModule, type SharepointModule } from "./modules/sharepo
 import { createMailTemplatesModule, type MailTemplatesModule } from "./modules/mailTemplates/index.js";
 import { createAutomationsModule, type AutomationsModule } from "./modules/automations/index.js";
 import { createProtectionModule, type ProtectionModule } from "./modules/protection/index.js";
+import { createPublicApiModule, type PublicApiModule } from "./modules/publicApi/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -66,6 +67,7 @@ export interface ModuleRegistry {
   mailTemplates: MailTemplatesModule;
   automations: AutomationsModule;
   protection: ProtectionModule;
+  publicApi: PublicApiModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -136,6 +138,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.mailTemplates = createMailTemplatesModule(deps);
   services.automations = createAutomationsModule(deps);
   services.protection = createProtectionModule(deps);
+  services.publicApi = createPublicApiModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -161,6 +164,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.mailTemplates,
     services.automations,
     services.protection,
+    services.publicApi,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();

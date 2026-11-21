@@ -18,6 +18,7 @@ import { sharepointRouter } from "../modules/sharepoint/router.js";
 import { mailTemplatesRouter } from "../modules/mailTemplates/router.js";
 import { automationsRouter } from "../modules/automations/router.js";
 import { protectionRouter } from "../modules/protection/router.js";
+import { publicApiRouter } from "../modules/publicApi/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -38,6 +39,7 @@ export const appRouter = router({
   mailTemplates: mailTemplatesRouter,
   automations: automationsRouter,
   protection: protectionRouter,
+  publicApi: publicApiRouter,
 });
 
 export type AppRouter = typeof appRouter;
