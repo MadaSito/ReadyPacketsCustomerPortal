@@ -19,6 +19,7 @@ import type { AuditEmitter, AuditEventInput, Clock, Db, FieldCrypto, Logger, Tx 
 import { AuditValidationError, buildEnvelope, type AuditEnvelope } from "./envelope.js";
 import { envelopeToRow } from "./rows.js";
 import { auditEvents } from "./schema.js";
+import { abortsTransaction, isAutomationOrigin, toTapEvent, type AuditTap, type AuditTapStats } from "./tap.js";
 
 export interface AuditEmitterDeps {
   config: AppConfig;
@@ -47,6 +48,9 @@ export interface DurableAuditEmitter extends AuditEmitter {
   /** Waits until the best-effort queue is empty (tests, graceful shutdown). */
   flushNotes(): Promise<void>;
   stats(): AuditEmitterStats;
+  /** Installs the single in-transaction tap (automations). Returns a detach function. See tap.ts. */
+  setTap(tap: AuditTap): () => void;
+  tapStats(): AuditTapStats;
 }
 
 export function isDurableAuditEmitter(value: AuditEmitter): value is DurableAuditEmitter {
@@ -67,6 +71,36 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
   const queue: ReturnType<DurableAuditEmitter["build"]>[] = [];
   let flushing: Promise<void> | null = null;
   let dropsSinceReport = 0;
+  let tap: AuditTap | null = null;
+  const tapStats: AuditTapStats = { offered: 0, suppressedAutomationOrigin: 0, failures: 0, lastFailureAt: null };
+
+  function wants(name: string): boolean {
+    if (!tap) return false;
+    try {
+      return tap.listens(name) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function offer(envelope: AuditEnvelope, tx: Tx | undefined): Promise<void> {
+    const current = tap;
+    if (!current || !wants(envelope.event_name)) return;
+    if (isAutomationOrigin(envelope.correlation_id) || isAutomationOrigin(envelope.parent_correlation_id)) {
+      tapStats.suppressedAutomationOrigin += 1;
+      return;
+    }
+    tapStats.offered += 1;
+    try {
+      await current.onRecorded(toTapEvent(envelope), tx);
+    } catch (error) {
+      tapStats.failures += 1;
+      tapStats.lastFailureAt = deps.clock.now().toISOString();
+      log.error("audit tap failed; automation trigger not enqueued", { event_name: envelope.event_name, in_transaction: tx !== undefined, error });
+      // The database already rolled the transaction back: carrying on would commit the rest outside it.
+      if (tx !== undefined && abortsTransaction(error)) throw new AuditUnavailableError();
+    }
+  }
 
   function build(event: AuditEventInput, durability: AuditEnvelope["durability"] = "durable") {
     const observedAt = deps.clock.now();
@@ -158,6 +192,7 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
         log.error("durable audit write failed", { event_name: item.envelope.event_name, in_transaction: tx !== undefined, error });
         throw new AuditUnavailableError();
       }
+      if (tap) await offer(item.envelope, tx);
     },
     note(event: AuditEventInput): void {
       try {
@@ -181,5 +216,13 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
       }
     },
     stats: () => ({ ...stats, notesQueued: queue.length }),
+    setTap(next: AuditTap): () => void {
+      if (tap && tap !== next) throw new Error("an audit tap is already installed");
+      tap = next;
+      return () => {
+        if (tap === next) tap = null;
+      };
+    },
+    tapStats: () => ({ ...tapStats }),
   };
 }

@@ -13,9 +13,15 @@ import * as exportsSvc from "./exports.js";
 import * as integrity from "./integrity.js";
 import * as retention from "./retention.js";
 import * as searchSvc from "./search.js";
+import { TRIGGER_CATALOGUE, type TriggerCatalogueEntry } from "./triggerCatalogue.js";
+import type { AuditTap, AuditTapStats } from "./tap.js";
 
 export type { AuditEnvelope, ExternalAuditEvent } from "./envelope.js";
 export type { ChainVerification } from "./chain.js";
+export type { AuditTap, AuditTapEvent, AuditTapStats } from "./tap.js";
+export { AUTOMATION_ORIGIN_PREFIX, automationCorrelationId, isAutomationOrigin } from "./tap.js";
+export type { TriggerCatalogueEntry, TriggerField, TriggerRecipient } from "./triggerCatalogue.js";
+export { TRIGGER_CATALOGUE } from "./triggerCatalogue.js";
 export type { AuditQuery, Group as AuditQueryGroup, Term as AuditQueryTerm, PivotKind, StatBucket, StatDimension } from "./query.js";
 
 export const SEAL_JOB = "audit.chain.seal";
@@ -31,6 +37,14 @@ export interface AuditModule extends ModuleLifecycle {
   projectForExternal(event: AuditEnvelope): ExternalAuditEvent;
   sealPending(options?: { fullScan?: boolean }): Promise<{ sealed: number; headSeq: number }>;
   verifyChain(options?: { fromSeq?: number; maxEvents?: number }): Promise<ChainVerification>;
+  /**
+   * Package J: installs the in-transaction tap (automations module, from its `init()`). Throws when the
+   * emitter is not the durable emitter (fail closed: a fake emitter would silently never trigger).
+   */
+  registerTap(tap: AuditTap): () => void;
+  tapStats(): AuditTapStats | null;
+  /** The curated trigger catalogue (event names, labels, condition/template fields, addressable people). */
+  triggerCatalogue(): readonly TriggerCatalogueEntry[];
 
   /* ---- audit center (principal-scoped, capability re-checked, self-audited) ---- */
   search: Tail<typeof searchSvc.search>;
@@ -97,6 +111,12 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
   return {
     readEventsAfter: (cursor, limit) => searchSvc.readEventsAfter(ctx, cursor, limit),
     projectForExternal,
+    registerTap: (tap) => {
+      if (!isDurableAuditEmitter(deps.audit)) throw new Error("the audit tap needs the durable audit emitter");
+      return deps.audit.setTap(tap);
+    },
+    tapStats: () => (isDurableAuditEmitter(deps.audit) ? deps.audit.tapStats() : null),
+    triggerCatalogue: () => TRIGGER_CATALOGUE,
     sealPending: (options) => chain.sealPending(options),
     verifyChain: (options) => chain.verify(options),
 
