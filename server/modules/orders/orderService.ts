@@ -1069,6 +1069,19 @@ export function createOrderService(deps: OrderServiceDeps) {
       };
     },
 
+    /** Trusted (caller already authorised): like getOrderRefById, by public id; null for unknown or malformed ids. */
+    async getOrderRefByPublicId(orderPublicId: string, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
+      if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
+      if (!ULID_LIKE.test(orderPublicId)) return null;
+      const query = (tx ?? deps.db)
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .from(orders)
+        .where(eq(orders.publicId, orderPublicId))
+        .limit(1);
+      const [row] = options.forUpdate ? await query.for("update") : await query;
+      return row ?? null;
+    },
+
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       const query = (tx ?? deps.db)

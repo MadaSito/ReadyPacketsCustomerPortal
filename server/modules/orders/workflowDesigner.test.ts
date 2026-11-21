@@ -279,5 +279,8 @@ describe("order change hook and sync view (package H port)", () => {
     expect(view!.items).toEqual([{ packetNumber: null, tier: null, name: "Synthetic item" }]);
     expect(await mod.getOrderSyncView("01ARZ3NDEKTSV4RRFFQ69G5FAV")).toBeNull();
     expect(await mod.getOrderSyncView("not-an-id")).toBeNull();
+    expect(await mod.getOrderRefByPublicId(order.publicId)).toMatchObject({ publicId: order.publicId, reference: order.reference, ownerUserId: alice.id });
+    expect(await mod.getOrderRefByPublicId("not-an-id")).toBeNull();
+    await expectError(mod.getOrderRefByPublicId(order.publicId, undefined, { forUpdate: true }), "VALIDATION:TX_REQUIRED");
   });
 });

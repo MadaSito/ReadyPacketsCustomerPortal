@@ -41,6 +41,8 @@ export interface OrdersModule extends ModuleLifecycle {
   /** Trusted lookup for jobs/collectors that already authorised. */
   /** `forUpdate` (requires tx) locks the order row — use it before acting on lockState (e.g. retention purge). */
   getOrderRefById(orderId: number, tx?: DbOrTx, options?: { forUpdate?: boolean }): Promise<OrderRef | null>;
+  /** Increment 03 (storage copy automation): same as getOrderRefById, by public id; null when unknown. */
+  getOrderRefByPublicId(orderPublicId: string, tx?: DbOrTx, options?: { forUpdate?: boolean }): Promise<OrderRef | null>;
   /** Trusted packet scope for P101/P201 (caller authorises first). Runs in the caller's tx when given; no locks. */
   getProductionScope(orderId: number, opts?: { tx?: DbOrTx }): Promise<OrderProductionScope | null>;
   searchOrders(principal: SessionPrincipal, query: string, limit?: number): Promise<OrderSearchHit[]>;
@@ -85,6 +87,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     listAccessibleOrderIds: policy.listAccessibleOrderIds,
     getOrderSummary: orders.getOrderSummary,
     getOrderRefById: orders.getOrderRefById,
+    getOrderRefByPublicId: orders.getOrderRefByPublicId,
     getProductionScope: orders.getProductionScope,
     registerChangeListener: orders.registerChangeListener,
     getOrderSyncView: orders.getOrderSyncView,
