@@ -9,6 +9,7 @@ import { startWorker, type WorkerHandle } from "./worker.js";
 
 export type { WorkerHandle } from "./worker.js";
 export type { OutboxJobDisposition } from "./admin.js";
+export type { CustomerAccessStatus } from "./customerMaintenance.js";
 export type {
   MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportMessage,
   MailTransportResult, PublishedMailTemplate,

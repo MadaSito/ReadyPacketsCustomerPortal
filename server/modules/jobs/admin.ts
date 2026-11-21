@@ -5,6 +5,7 @@ import { ULID_PATTERN } from "../../core/ids.js";
 import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
+import { createCustomerMaintenance } from "./customerMaintenance.js";
 import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
 import { engineFor, ensureMaintenanceGate, gateDraining, jobAudit, MAINTENANCE_ID } from "./queue.js";
 import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailOutbox, mailTransportAttempts } from "./schema.js";
@@ -52,6 +53,7 @@ function pageOf<T extends { publicId: string }>(rows: T[], limit: number) {
 
 export function createJobsAdmin(deps: ModuleDeps) {
   const { db, clock } = deps;
+  const customerMaintenance = createCustomerMaintenance(deps);
   const unresolved = sql`(
     (${jobRuns.state} = 'unknown' and ${jobRuns.reconciledAt} is null)
      or (${jobRuns.state} = 'queued' and ${jobRuns.interruptionPending} = true)
@@ -94,7 +96,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
     }
   }
 
-  async function assertCurrentMailActor(principal: SessionPrincipal | null, capability: "mail.manage" | "mail.content.read", tx: Tx) {
+  async function assertCurrentAdminActor(principal: SessionPrincipal | null,
+    capability: "mail.manage" | "mail.content.read" | "maintenance.manage", tx: Tx) {
     const sessions = deps.services.identity?.sessions;
     if (!principal || !sessions?.assertCurrent) throw forbidden("ACTOR_UNVERIFIABLE");
     const current = await sessions.assertCurrent(principal, tx);
@@ -108,13 +111,13 @@ export function createJobsAdmin(deps: ModuleDeps) {
     }
   }
 
-  async function withCurrentMailActor<T>(principal: SessionPrincipal | null, capability: "mail.manage" | "mail.content.read",
+  async function withCurrentAdminActor<T>(principal: SessionPrincipal | null, capability: "mail.manage" | "mail.content.read" | "maintenance.manage",
     run: (tx: Tx) => Promise<T>,
   ): Promise<T> {
     let denied = false;
     try {
       return await db.transaction(async (tx) => {
-        try { await assertCurrentMailActor(principal, capability, tx); }
+        try { await assertCurrentAdminActor(principal, capability, tx); }
         catch (error) {
           denied = error instanceof DomainError;
           throw error;
@@ -125,7 +128,8 @@ export function createJobsAdmin(deps: ModuleDeps) {
       if (denied) {
         await deps.audit.record({
           category: "security", eventName: "job.admin.denied", action: "authorize", outcome: "denied",
-          reasonCode: "MAIL_ACTOR_NOT_CURRENT", resource: { type: "job_admin" },
+          reasonCode: capability === "maintenance.manage" ? "MAINTENANCE_ACTOR_NOT_CURRENT" : "MAIL_ACTOR_NOT_CURRENT",
+          resource: { type: "job_admin" },
           actor: principal ? { userId: principal.userId, role: principal.role } : { role: "anonymous" },
         });
       }
@@ -189,7 +193,18 @@ export function createJobsAdmin(deps: ModuleDeps) {
       const active = await isDraining();
       return { active, message: active ? activeMessage : null };
     },
-    async maintenance(principal: SessionPrincipal | null) {
+    maintenance: {
+      customerAccess: customerMaintenance.customerAccess,
+    },
+    async customerMaintenance(principal: SessionPrincipal | null) {
+      await authorize(principal, "jobs.read");
+      return customerMaintenance.read();
+    },
+    async setCustomerMaintenance(principal: SessionPrincipal | null, input: Parameters<typeof customerMaintenance.write>[1]) {
+      await authorize(principal, "maintenance.manage");
+      return withCurrentAdminActor(principal, "maintenance.manage", (tx) => customerMaintenance.write(principal!, input, tx));
+    },
+    async workerMaintenance(principal: SessionPrincipal | null) {
       await authorize(principal, "jobs.read");
       const active = await isDraining();
       const counts = await drainCounts(db);
@@ -348,7 +363,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
     },
     async mailContent(principal: SessionPrincipal | null, publicId: string) {
       await authorize(principal, "mail.content.read");
-      return withCurrentMailActor(principal, "mail.content.read", (tx) => mailer().viewContent(tx, publicId));
+      return withCurrentAdminActor(principal, "mail.content.read", (tx) => mailer().viewContent(tx, publicId));
     },
     async auditCopyStatus(principal: SessionPrincipal | null) {
       await authorize(principal, "mail.manage");
@@ -358,7 +373,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
       await authorize(principal, "mail.manage");
       await limitVerification("request");
       await ensureMaintenanceGate(deps);
-      return withCurrentMailActor(principal, "mail.manage", async (tx) => {
+      return withCurrentAdminActor(principal, "mail.manage", async (tx) => {
         if (await gateDraining(tx)) throw new DomainError("MAINTENANCE", "PORTAL_DRAINING", activeMessage);
         return mailer().requestAuditCopyVerification(tx);
       });
@@ -366,7 +381,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
     async confirmAuditCopyVerification(principal: SessionPrincipal | null, code: string): Promise<{ verified: true }> {
       await authorize(principal, "mail.manage");
       await limitVerification("confirm");
-      const result = await withCurrentMailActor(principal, "mail.manage", (tx) => mailer().confirmAuditCopyVerification(tx, code));
+      const result = await withCurrentAdminActor(principal, "mail.manage", (tx) => mailer().confirmAuditCopyVerification(tx, code));
       if (!result.verified) throw validation("MAIL_AUDIT_CODE_INVALID", "The code is invalid or expired. Request a new code and try again.");
       return { verified: true };
     },

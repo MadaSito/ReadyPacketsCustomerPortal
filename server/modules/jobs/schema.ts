@@ -59,6 +59,16 @@ export const jobMaintenance = mysqlTable("job_maintenance", {
   updatedAt: updatedAtColumn(),
 });
 
+export const customerMaintenance = mysqlTable("customer_maintenance", {
+  id: int("id", { unsigned: true }).primaryKey(),
+  enabled: boolean("enabled").notNull().default(false),
+  message: varchar("message", { length: 500 }).notNull().default(""),
+  startsAt: utcDateTime("starts_at"),
+  endsAt: utcDateTime("ends_at"),
+  version: int("version", { unsigned: true }).notNull().default(0),
+  updatedAt: updatedAtColumn(),
+});
+
 export const mailOutbox = mysqlTable("mail_outbox", {
   id: idColumn(),
   publicId: publicIdColumn(),

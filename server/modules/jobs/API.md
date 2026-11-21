@@ -82,6 +82,15 @@ interface CustomerAccessStatus {
 
 Inactive responses always have `message: null` and `expectedEnd: null`; scheduled future windows do not disclose their contents before activation. An active window starts at the inclusive start and ends at the exclusive expected end, if one is set. Scheduled boundaries do not depend on a worker running. The public banner component is `@/features/jobs/CustomerMaintenanceBanner`.
 
+The maintenance singleton is locked for shared reads through the Identity transaction and for exclusive updates; use the same order as Identity (`users`/`user_sessions` before this lock). Do not perform unrelated external work while holding this lock. Query times are interpreted in UTC using the injected server clock. A missing policy means disabled; a transactional check initializes the singleton as needed.
+
+| Admin procedure | Authorization | Contract |
+| --- | --- | --- |
+| `jobs.admin.customerMaintenance` | Admin with `jobs.read` | `{ enabled, message, startsAt, endsAt, active, phase, version }`. `phase` is `off`, `scheduled`, `active`, or `ended`; times are UTC ISO strings or null. |
+| `jobs.admin.setCustomerMaintenance` | Admin with `maintenance.manage` and fresh step-up, revalidated inside the transaction | `{ enabled, message, startsAt, endsAt, expectedVersion }` → same admin view. Up to 500 plain-text characters; nullable UTC instants; concurrent edits fail with `CUSTOMER_MAINTENANCE_CHANGED`. |
+
+An effective settings change records `job.customer_maintenance.changed` in the same transaction with `enabled`, `starts_at`, and `ends_at`; the notice body is never included. The `customer_maintenance.configured` automation trigger fires on successful enabling or editing of the configured window, not when its scheduled boundary passes or when turned off. Saving a window never ends sessions. The confirmed console bulk action uses Identity's own `identity.admin.sessions.endAllCustomers`, requiring fresh step-up for `sessions.revoke_any`; it does not run inside the maintenance configuration transaction.
+
 ## Configuration and evidence
 
 - `jobs.mail.capture`: boolean setting, defaults off; only development and test allow use. Preview and production refuse capture.

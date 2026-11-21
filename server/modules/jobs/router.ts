@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, publicProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { customerMaintenanceInput } from "./customerMaintenance.js";
 import { JOB_TYPE } from "./queue.js";
 import { JOB_STATES, MAIL_STATES } from "./schema.js";
 
@@ -14,6 +15,9 @@ const mailManage = adminProcedure.use(requireCapability("mail.manage"));
 
 export const jobsRouter = router({
   maintenanceBanner: publicProcedure.query(({ ctx }) => ctx.services.jobAdmin.maintenanceBanner()),
+  maintenance: router({
+    customerAccess: publicProcedure.query(({ ctx }) => ctx.services.jobAdmin.maintenance.customerAccess()),
+  }),
   mail: router({
     content: adminProcedure.use(requireCapability("mail.content.read")).input(idInput)
       .mutation(({ ctx, input }) => ctx.services.jobAdmin.mailContent(ctx.session, input.publicId)),
@@ -40,8 +44,11 @@ export const jobsRouter = router({
     capture: adminProcedure.use(requireCapability("jobs.mail.capture")).input(idInput)
       // A mutation (POST) keeps captured content out of GET and shared caches.
       .mutation(({ ctx, input }) => ctx.services.jobAdmin.capture(ctx.session, input.publicId)),
-    maintenance: read.query(({ ctx }) => ctx.services.jobAdmin.maintenance(ctx.session)),
+    maintenance: read.query(({ ctx }) => ctx.services.jobAdmin.workerMaintenance(ctx.session)),
     setMaintenance: maintenanceManage.input(z.strictObject({ active: z.boolean(), expectedActive: z.boolean() }))
       .mutation(({ ctx, input }) => ctx.services.jobAdmin.setMaintenance(ctx.session, input)),
+    customerMaintenance: read.query(({ ctx }) => ctx.services.jobAdmin.customerMaintenance(ctx.session)),
+    setCustomerMaintenance: maintenanceManage.input(customerMaintenanceInput)
+      .mutation(({ ctx, input }) => ctx.services.jobAdmin.setCustomerMaintenance(ctx.session, input)),
   }),
 });
