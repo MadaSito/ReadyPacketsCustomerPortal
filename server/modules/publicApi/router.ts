@@ -5,7 +5,6 @@
 import { z } from "zod";
 import type { Services } from "../../container.js";
 import { adminProcedure, requireCapability, router } from "../../trpc/trpc.js";
-import type { PublicApiModule } from "./index.js";
 import { API_SCOPES } from "./ports.js";
 
 const keys = adminProcedure.use(requireCapability("api.keys.manage"));
@@ -14,7 +13,7 @@ const replay = adminProcedure.use(requireCapability("api.replay")).meta({ rateLi
 const publicId = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
 const cursor = z.string().regex(/^\d{1,15}$/u).nullish();
 const version = z.number().int().min(0);
-const api = (services: Services) => (services as Services & { publicApi: PublicApiModule }).publicApi;
+const api = (services: Services) => services.publicApi;
 
 const keyInput = z.strictObject({
   name: z.string().min(1).max(120),

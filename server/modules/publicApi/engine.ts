@@ -9,7 +9,7 @@ import { and, eq, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
-import { ulid } from "../../core/ids.js";
+import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx } from "../../core/types.js";
 import { redact } from "../../observability/redact.js";
 import { hasControlChar, ipAllowed, parseBearer, sha256Hex, verifySignature } from "./credentials.js";
@@ -31,6 +31,8 @@ export interface ApiHttpRequest {
   headers: Record<string, string | undefined>;
   body: Buffer;
   ipAddress?: string;
+  /** Server-generated HTTP request id (requestContext) so API log, audit and HTTP events join; minted if absent. */
+  requestId?: string;
 }
 
 export interface ApiHttpResponse {
@@ -227,19 +229,28 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
       const [row] = await db.select().from(apiIdempotency).where(and(eq(apiIdempotency.keyId, key.id), eq(apiIdempotency.idempotencyKey, idempotencyKey)));
       if (!row) throw fail(409, "IDEMPOTENCY_IN_PROGRESS");
       if (row.requestHash !== requestHash) throw fail(422, "IDEMPOTENCY_KEY_REUSED");
+      // in_progress + status set = an earlier attempt ended with an unknown outcome; never re-run it.
+      if (row.state !== "completed" && row.status !== null) throw fail(409, "IDEMPOTENCY_OUTCOME_UNKNOWN");
       if (row.state !== "completed" || row.status === null || !row.responseEnc) throw fail(409, "IDEMPOTENCY_IN_PROGRESS");
       return { stored: { status: row.status, body: crypto.decrypt(row.responseEnc, aad) } } as const;
     }
     return {
-      async finish(status: number, body: string) {
+      /** `effectFree`: the provider provably did not run (missing provider). Only then may the key be reused. */
+      async finish(status: number, body: string, effectFree: boolean) {
+        const where = and(eq(apiIdempotency.keyId, key.id), eq(apiIdempotency.idempotencyKey, idempotencyKey));
+        if (status >= 500 && effectFree) {
+          await db.delete(apiIdempotency).where(where);
+          return;
+        }
         if (status >= 500) {
-          await db.delete(apiIdempotency).where(and(eq(apiIdempotency.keyId, key.id), eq(apiIdempotency.idempotencyKey, idempotencyKey)));
+          // Outcome unknown (provider may have committed): keep the reservation until TTL so it is not re-run.
+          await db.update(apiIdempotency).set({ status }).where(where);
           return;
         }
         await db
           .update(apiIdempotency)
           .set({ state: "completed", status, responseEnc: crypto.encrypt(body, aad) })
-          .where(and(eq(apiIdempotency.keyId, key.id), eq(apiIdempotency.idempotencyKey, idempotencyKey)));
+          .where(where);
       },
     } as const;
   }
@@ -273,7 +284,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
 
   async function handle(req: ApiHttpRequest, replay?: ReplayContext): Promise<ApiHttpResponse> {
     const started = clock.now();
-    const requestId = ulid(started.getTime());
+    const requestId = !replay && req.requestId && ULID_PATTERN.test(req.requestId) ? req.requestId : ulid(started.getTime());
     const method = req.method.toUpperCase();
     const headerCorrelation = req.headers["x-correlation-id"];
     const correlationId = headerCorrelation && CORRELATION_RE.test(headerCorrelation) ? headerCorrelation : requestId;
@@ -304,6 +315,9 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     let extraHeaders: Record<string, string> = {};
     let idempotencyKey: string | undefined;
     let logRow = true;
+    /** Passed auth, IP, signature, rate, route, scope and validation: only such calls are replayable. */
+    let admitted = false;
+    let effectFree = true;
     let route: ApiRoute | null;
     const search = new URLSearchParams(rawQuery);
     try {
@@ -330,6 +344,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
       if (!key.scopes.includes(route.scope)) throw fail(403, "INSUFFICIENT_SCOPE");
       const query = parseQuery(route, search);
       const body = parseBody(route, req);
+      admitted = true;
       const caller: ApiCaller = { kind: "api_key", keyPublicId: key.publicId, scopes: key.scopes as ApiScope[], requestId, replay: Boolean(replay) };
 
       let reservation: Awaited<ReturnType<typeof reserveIdempotency>> | null = null;
@@ -362,6 +377,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
       }
       if (route) {
         try {
+          effectFree = false;
           const result = await route.invoke(providers(), { params: matched.params, query, body, caller });
           if (result === null || result === undefined) throw fail(404, "NOT_FOUND");
           const plain = serialiseDates(result);
@@ -371,6 +387,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
           responseBody = JSON.stringify(route.kind === "list" ? dto.data : { data: dto.data });
         } catch (error) {
           const failure = toFailure(error);
+          if (error instanceof ResourceUnavailable) effectFree = true;
           status = failure.status;
           errorCode = failure.code;
           responseBody = problem(failure, requestId);
@@ -390,7 +407,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
             })
             .catch(() => deps.logger.warn("api.request.write result audit failed", { requestId }));
         }
-        await reservation?.finish(status, responseBody);
+        await reservation?.finish(status, responseBody, effectFree);
       }
       await touchKey(key);
     } catch (error) {
@@ -408,7 +425,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
       body: method === "HEAD" ? "" : responseBody,
     };
     if (logRow) {
-      await writeLog({ req, requestId, key, method, path, routeTemplate, status, errorCode, correlationId, responseBody, search, idempotencyKey, replay, started }).catch(() =>
+      await writeLog({ req, requestId, key, admitted, method, path, routeTemplate, status, errorCode, correlationId, responseBody, search, idempotencyKey, replay, started }).catch(() =>
         deps.logger.warn("api request log write failed", { requestId }),
       );
     }
@@ -427,6 +444,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     req: ApiHttpRequest;
     requestId: string;
     key: KeyRow | null;
+    admitted: boolean;
     method: string;
     path: string;
     routeTemplate: string;
@@ -449,31 +467,36 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     }
     const responseView = boundedJson(redact(responseJson, { maxString: 4096 }));
     const replayable = input.req.body.length <= LOG_BODY_LIMIT && input.req.target.length <= 4096;
+    // Clear columns hold only server-derived or validated values: the concrete path only when it matched a
+    // route template (segments are pattern-checked ids); client correlation only after authentication and
+    // when it does not look like a credential; the idempotency key only as a hash. Raw input stays encrypted.
+    const matchedPath = input.routeTemplate !== "unmatched" ? input.path : "unmatched";
+    const clientCorrelation = input.key && input.correlationId !== requestId && !looksLikeSecret(input.correlationId) ? input.correlationId : requestId;
     await db.insert(apiRequestLog).values({
       publicId: requestId,
       keyId: input.key?.id ?? null,
       keyPublicId: input.key?.publicId ?? null,
       method: input.method.slice(0, 8),
       route: input.routeTemplate,
-      path: input.path,
+      path: matchedPath,
       status: input.status,
       durationMs: Math.max(0, clock.now().getTime() - input.started.getTime()),
-      correlationId: input.correlationId,
+      correlationId: clientCorrelation,
       errorCode: input.errorCode,
       requestBytes: input.req.body.length,
       responseBytes: Buffer.byteLength(input.responseBody),
       requestViewEnc: crypto.encrypt(view.text, `api_request_log.request:${requestId}`),
       responseViewEnc: crypto.encrypt(responseView.text, `api_request_log.response:${requestId}`),
       replayEnc:
-        input.key && replayable
+        input.key && input.admitted && replayable
           ? crypto.encrypt(
               JSON.stringify({ method: input.method, target: input.req.target, contentType: input.req.headers["content-type"] ?? null, body: input.req.body.toString("base64") }),
               `api_request_log.replay:${requestId}`,
             )
           : null,
-      bodyTruncated: !replayable || view.truncated,
+      bodyTruncated: input.req.body.length > LOG_BODY_LIMIT || view.truncated,
       ipEnc: input.req.ipAddress ? crypto.encrypt(input.req.ipAddress, `api_request_log.ip:${requestId}`) : null,
-      idempotencyKey: input.idempotencyKey ?? null,
+      idempotencyKey: input.idempotencyKey ? `sha256:${sha256Hex(input.idempotencyKey).slice(0, 56)}` : null,
       replayOf: input.replay?.ofRequestId ?? null,
       replayedByUserId: input.replay?.byUserId ?? null,
     });
@@ -500,6 +523,11 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
 }
 
 export type ApiEngine = ReturnType<typeof createApiEngine>;
+
+/** Token-shaped values (our key prefix, or one long unbroken high-entropy run) are never stored in clear. */
+export function looksLikeSecret(value: string): boolean {
+  return /rpk_/iu.test(value) || /[A-Za-z0-9+/=_-]{32,}/u.test(value);
+}
 
 export function isDuplicate(error: unknown): boolean {
   for (let e: unknown = error, i = 0; e && i < 4; e = (e as { cause?: unknown }).cause, i += 1) {
