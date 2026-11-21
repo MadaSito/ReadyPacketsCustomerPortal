@@ -303,13 +303,13 @@ export function createPublicApiService(deps: ModuleDeps, engine: ApiEngine) {
             c.push(gte(apiRequestLog.status, base), lt(apiRequestLog.status, base + 100));
           }
           if (filter.pathPrefix) c.push(like(apiRequestLog.path, `${escapeLike(filter.pathPrefix)}%`));
-          if (filter.correlationId) c.push(eq(apiRequestLog.correlationId, filter.correlationId));
+          if (filter.correlationId) c.push(or(eq(apiRequestLog.correlationId, filter.correlationId), eq(apiRequestLog.correlationId, engine.correlationDigest(filter.correlationId)))!);
           if (filter.from) c.push(gte(apiRequestLog.createdAt, filter.from));
           if (filter.to) c.push(lte(apiRequestLog.createdAt, filter.to));
           if (filter.replay !== undefined) c.push(filter.replay ? isNotNull(apiRequestLog.replayOf) : isNull(apiRequestLog.replayOf));
           if (filter.search) {
             const term = `%${escapeLike(filter.search)}%`;
-            c.push(or(like(apiRequestLog.path, term), like(apiRequestLog.route, term), like(apiRequestLog.errorCode, term), like(apiRequestLog.correlationId, term), eq(apiRequestLog.publicId, filter.search))!);
+            c.push(or(like(apiRequestLog.path, term), like(apiRequestLog.route, term), like(apiRequestLog.errorCode, term), eq(apiRequestLog.publicId, filter.search))!);
           }
           const rows = await tx
             .select({
