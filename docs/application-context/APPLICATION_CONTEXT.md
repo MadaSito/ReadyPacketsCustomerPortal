@@ -61,10 +61,13 @@ docs/              specs, engineering contract, ADRs, runbooks, verification, co
 ```
 
 Native deployment entry points are `deploy/auto-install.sh`, `deploy/install.sh`, `deploy/upgrade.sh` and
-`deploy/uninstall.sh`. The installer stores site identity and TLS mode in `/etc/readypackets/site.conf`,
-renders `deploy/nginx/*.conf.template`, and publishes under `/opt/readypackets/releases/<commit>` with
-private data under `/var/lib/readypackets/storage`. See the [automatic installation guide](../operations/AUTO_INSTALL.md)
-for first-admin credential custody and `.github/workflows/native-install.yml` for the native CI workflow.
+`deploy/uninstall.sh`, serialized by `/run/readypackets-deploy.lock`. The installer records the fixed
+portal host and optional alias, plus the switchable TLS mode, in `/etc/readypackets/site.conf`. It
+renders the Nginx site and edge/TLS snippets, publishes under `/opt/readypackets/releases/<commit>`,
+and keeps private data under `/var/lib/readypackets/storage`. Automatic setup can add
+`/swapfile.readypackets` and its `/etc/fstab` entry. It saves first-admin credentials in
+`/root/readypackets-initial-admin.txt`, with one-time display. See the [automatic installation guide](../operations/AUTO_INSTALL.md)
+for setup and `.github/workflows/native-install.yml` for the defined runner checks.
 
 Key rules: see `docs/engineering/BUILD_CONTRACT.md` (ownership, data conventions, authorization, audit,
 errors, client conventions).

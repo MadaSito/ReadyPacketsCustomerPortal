@@ -8,7 +8,7 @@ For a quick evaluation or test installation under another host name, use the Doc
 
 ## Prepare the host
 
-- **Release**: Obtain a trusted clone in a root-controlled directory and identify the reviewed full Git commit SHA. Verify provenance, the lockfile, and that `migrations/meta/_journal.json` and its SQL files are included. The kit intentionally refuses a release without this journal. Run the kit shipped with that reviewed checkout, not scripts from an untrusted working directory or an arbitrary branch.
+- **Release**: Clone as root with `umask 022` into a root-controlled location such as `/opt/readypackets-src`, using the [automatic guide's clone command](AUTO_INSTALL.md#quick-start). Keep the clone, its contents and its parent directories root-owned and not group- or other-writable. Identify the reviewed full Git commit SHA, and verify provenance, the lockfile and `migrations/meta/_journal.json` with its SQL files. Run the kit shipped with that reviewed checkout, not scripts from an untrusted working directory or an arbitrary branch.
 - **Packages**: Patch Ubuntu and use trusted, signed package or release channels. Install Nginx, Certbot, Git, curl, OpenSSL, the Oracle MySQL 8.4 server and its matching `mysql`/`mysqldump` tools. Ubuntu's default database package is not a substitute if it selects another version. Install the latest maintained Node 22 patch (at least 22.12) at `/usr/local/bin/node` and the exact release-pinned pnpm at `/usr/local/bin/pnpm`; verify the vendor signatures or checksums. Do not pipe bootstrap downloads to a shell. The installer checks MySQL's server version via the local root socket. Configure authorized DBA socket access before continuing.
 - **Network**: Allow SSH from the management network before enabling a default-deny inbound firewall. Allow TCP 80/443 for ACME and HTTPS, and do not open 3306, 33060 or 5000. Publish DNS for the portal and optional alias; publish AAAA only if the node can serve those names over IPv6. Do not place a CDN or other proxy in front without revisiting client-IP, authority, and rate-limit policy. Permit outbound access only to required package sources on the build path and approved service destinations in production.
 - **MySQL**: Bind TCP to `127.0.0.1` only; use `skip_name_resolve=ON` and verified MySQL TLS for the runtime and migrator accounts. If those DSNs use `127.0.0.1`, issue the MySQL certificate with a matching IP SAN. The CA must be readable by `readypackets` outside `/home` (it is not a private key). Use a dedicated schema and DBA account. Apply only Phase A in [accounts.sql](../../deploy/mysql/accounts.sql) at this point, substituting placeholders and protecting any generated passwords. The bootstrap migrator can change this schema, not other databases.
@@ -27,7 +27,7 @@ sudo ufw status verbose
 
 ## Issue the web certificate
 
-From the reviewed checkout, provision the temporary HTTP-01 site and certificate. The Nginx source files are templates, not usable configurations. This example uses the `write_site` and `render_site` helpers from the reviewed `deploy/lib.sh` in a root shell to create root-owned `0600` `/etc/readypackets/site.conf` and render a usable challenge site. Subsequent kit commands read the same site record and render the full TLS site. Replace the two host names; for no alias, pass `''` instead of `portal.readypackets.com`.
+From the reviewed checkout, provision the temporary HTTP-01 site and certificate. The Nginx source files are templates, not usable configurations. This example uses the `write_site` and `render_site` helpers from the reviewed `deploy/lib.sh` to create root-owned `0600` `/etc/readypackets/site.conf`, prepare the portal edge snippet and render the challenge site. It uses the same `/run/readypackets-deploy.lock` as the deployment scripts. Replace the two host names; for no alias, pass `''` instead of `portal.readypackets.com`.
 
 This flow assumes a dedicated Nginx configuration with no other enabled sites. Before running it, inspect `/etc/nginx/sites-enabled/default` and confirm it is the Ubuntu packaged default symlink and is not serving another application, or that it is already absent. Do not run these first-install commands on a site that already serves the portal.
 
@@ -37,7 +37,9 @@ deploy_src=$1
 source "$deploy_src/lib.sh"
 lock_deploy
 write_site "$2" "$3" letsencrypt
-install -d -o root -g root -m 0755 /var/www/readypackets-acme
+install -d -o root -g root -m 0755 /var/www/readypackets-acme \
+  /var/www/readypackets-acme/.well-known /var/www/readypackets-acme/.well-known/acme-challenge
+render_site "$deploy_src/nginx/readypackets-edge.conf.template" /etc/nginx/snippets/readypackets-edge.conf
 render_site "$deploy_src/nginx/readypackets-acme.conf.template" /etc/nginx/sites-available/readypackets-acme.conf
 ln -sfn /etc/nginx/sites-available/readypackets-acme.conf /etc/nginx/sites-enabled/readypackets-acme.conf
 if [[ -L /etc/nginx/sites-enabled/default ]]; then
@@ -52,9 +54,11 @@ BASH
 Run Certbot interactively, using the same host names as `site.conf`. If you did not configure an alias, omit the second `-d` argument.
 
 ```bash
-sudo certbot certonly --webroot -w /var/www/readypackets-acme \
+sudo sh -c 'umask 022; exec certbot "$@"' sh certonly --webroot -w /var/www/readypackets-acme \
   --cert-name readypackets-portal -d my.readypackets.com -d portal.readypackets.com
 ```
+
+`install.sh` uses the site record to render all three final Nginx files: `readypackets-edge.conf`, `readypackets-tls.conf` and `readypackets-portal.conf`. Every server block in the final site includes the edge snippet so server tokens, gzip, access and error logging and TLS policy are set at server level without repeating directives in Ubuntu's `nginx.conf`. The temporary challenge site does not include this snippet. The TLS snippet enables HTTP/2 for the named HTTPS servers on Nginx 1.25.1 or newer (Ubuntu 26.04's 1.28); Ubuntu 24.04's Nginx 1.24 remains HTTP/1.1.
 
 The full TLS site retains the ACME exception on port 80. Install a root-owned Certbot deploy hook (`/etc/letsencrypt/renewal-hooks/deploy/`, mode `0755`) that runs `nginx -t && systemctl reload nginx`; enable `certbot.timer`, check `sudo certbot renew --dry-run` and monitor expiry. The canonical app supplies HSTS on upstream HTTPS responses; Nginx supplies HSTS on the HTTPS alias redirect because it does not reach the app. Nginx-generated errors may not carry the application's headers. [Let's Encrypt ended its OCSP service](https://letsencrypt.org/2025/08/06/ocsp-service-has-reached-end-of-life.html), so stapling is disabled for the example issuer. For an issuer with an active OCSP responder, configure the [TLS snippet template](../../deploy/nginx/readypackets-tls.conf.template) with the issuer trust chain and a trusted resolver, then verify a staple with `openssl s_client -status`.
 
@@ -124,7 +128,7 @@ run_catalog_import
 
 ## Upgrade and rollback
 
-Fetch and review the candidate in a trusted checkout. Ensure new migrations were reviewed and exercised on a restored copy. The script builds before quiescing, so defer enabling Jobs maintenance until it prompts. The candidate's managed systemd units and drop-in are installed after switching releases with traffic still fenced; review them before invoking upgrade. Apply unrelated ingress or grant changes separately, and ensure the old pre-upgrade backup unit still works before migration.
+Fetch and review the candidate in a trusted checkout. Ensure new migrations were reviewed and exercised on a restored copy. The script builds before quiescing, so defer enabling Jobs maintenance until it prompts. After switching releases, with traffic still fenced, it installs the candidate's managed units and drop-ins, renders the edge and TLS snippets and portal site from the kit, then runs `nginx -t` and reloads Nginx. Review these files before upgrading. The `native-install` workflow does not run this upgrade path; exercise it on a staging copy before production. Apply unrelated ingress or grant changes separately, and ensure the old pre-upgrade backup unit still works before migration.
 
 ```bash
 sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>
@@ -134,7 +138,7 @@ sudo bash deploy/upgrade.sh <CANDIDATE_FULL_COMMIT_SHA>
 - **Back up and restart**: Record the verified pre-upgrade archive ID and secure an off-host copy before confirming `BACKUP-VERIFIED`. The script runs schema migration with the migrator credential, switches the `current` link atomically, and verifies local and TLS-edge `/healthz` and `/readyz` plus an active worker. Inspect both service journals before confirming `REOPEN`; then verify fresh sign-in, the Jobs maintenance state, and clear the app gate with fresh MFA. The loopback edge checks bypass the public fence; do not put an untrusted local proxy on the node.
 - **Failure before migration**: Read `/etc/readypackets/upgrade-state` as data, never source it. In `draining` or `backup`, establish whether web/worker or a backup were interrupted, reconcile unresolved work, and confirm no migrator was started. The prior release remains pointed to by `current`. With the edge fence still installed, restart and check the old services, restore their enablement and the previous timer state if applicable, then remove the fence/state and clear Jobs maintenance. If initial install left `/etc/readypackets/install-migration-pending`, inspect the journal and real schema; remove it only after a DBA has proved the condition safe for reattempt or verified and adopted the correct release. A missing state file is not proof after a host crash.
 - **Failure once migration may have started**: Keep traffic fenced, stop and disable the web/worker and timer, preserve logs, and inspect the live schema and `__drizzle_migrations`. MySQL DDL can be partially applied. Do not automatically swap back to `previous`, rerun migrations blindly, edit the migration journal, or start the old release against the changed schema. Either repair and finish the forward release with DBA approval, or restore the verified pre-upgrade archive to isolated clean targets using the old release and escrowed keys. Verify schema compatibility, storage completeness and security continuity; plan promotion with human approval and document writes lost since the backup. Keep original schema/storage intact as incident evidence. Only a verified compatible database/storage pair should serve traffic.
-- **Deactivation**: `sudo bash deploy/uninstall.sh` asks for typed confirmation, removes the managed site/units and stops services. It has no data or key deletion mode. Database, accounts, release directories, certificates, keys, private objects and archives are retained. Cleanup or reinstallation after incident recovery is a separate reviewed operation.
+- **Deactivation**: `sudo bash deploy/uninstall.sh` asks for typed confirmation, stops the ReadyPackets services and removes their units, the enabled Nginx site, the portal site's rendered files (including the edge snippet) and `/etc/letsencrypt/renewal-hooks/deploy/readypackets-nginx`. It does not delete the database, accounts, releases, certificates, keys, private objects, archives or the [optional swap file and its registration](AUTO_INSTALL.md#retry-switch-certificates-or-update). Public certificates stay on disk; Certbot will report failed renewals for this site until reinstallation or until you deliberately run `sudo certbot delete --cert-name readypackets-portal`. Only delete that certificate if you will not reuse it and no other service needs it.
 
 ## Go-live checklist
 

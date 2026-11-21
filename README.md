@@ -57,13 +57,13 @@ In the shared engineering sandbox, use `scripts/dev/{tc,test,lint,commit,add-dep
 
 ### Production install
 
-On a fresh Ubuntu 26.04 LTS server, use the [automatic native installer](docs/operations/AUTO_INSTALL.md). From a reviewed, root-owned Git clone, run:
+On a fresh Ubuntu 26.04 LTS server, use the [automatic native installer](docs/operations/AUTO_INSTALL.md). Clone as root with `umask 022` using the guide, then run from the reviewed checkout:
 
 ```bash
 sudo bash deploy/auto-install.sh --domain my.readypackets.com --acme-email you@example.com
 ```
 
-The installer sets up prerequisites, TLS and the first administrator. For Ubuntu 24.04 or when provisioning prerequisites yourself on Ubuntu 26.04, follow the [manual runbook](docs/operations/INSTALL.md). Use the reviewed release kit, not the dev commands:
+The installer sets up prerequisites, adds swap if needed, and creates the first administrator. The temporary password is shown once on the controlling terminal and saved in `/root/readypackets-initial-admin.txt`; without a terminal, use the file unless you explicitly opt in to standard output with `--print-credentials`. For Ubuntu 24.04 or when provisioning prerequisites yourself on Ubuntu 26.04, follow the [manual runbook](docs/operations/INSTALL.md). Use the reviewed release kit, not the dev commands:
 
 ```bash
 sudo bash deploy/install.sh <REVIEWED_FULL_COMMIT_SHA>    # manually provisioned native host
