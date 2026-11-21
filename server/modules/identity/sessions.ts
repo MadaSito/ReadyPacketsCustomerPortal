@@ -8,10 +8,11 @@
  *    e-mail verification
  *  - every resolve re-checks revocation, expiry, account status and re-derives pendingSteps
  */
-import { and, eq, gt, isNull, ne } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, ne, notInArray, or, type SQL } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, notFound } from "../../core/errors.js";
 import { randomToken, ulid } from "../../core/ids.js";
+import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionCredentials, SessionPrincipal, SessionResolver, Tx } from "../../core/types.js";
 import { deriveSessionCsrfToken } from "../../security/csrf.js";
 import type { AuthMethod, TransitionStep, UserRole } from "../../../shared/domain.js";
@@ -20,6 +21,8 @@ import { deviceSummary } from "./normalize.js";
 import { userSessions, users, type UserRow, type UserSessionRow, type UserStatus } from "./schema.js";
 import { SESSION_ABSOLUTE_HOURS, SESSION_IDLE_MINUTES } from "./settings.js";
 import type { TransitionService } from "./transitions.js";
+import { admission, type RequestFacts, type Restrictions, type SessionPolicy, type SignInLog } from "./sessionPolicy.js";
+import type { SignInEventKind } from "./schema.js";
 
 export interface IssuedSession {
   token: string;
@@ -48,10 +51,28 @@ export interface SessionListItem {
   lastSeenAt: Date;
   expiresAt: Date;
   deviceSummary: string | null;
+  authMethod: AuthMethod;
+  country: string | null;
+  /** The address the session signed in from (own sessions only; decrypted server-side). */
+  ipAddress: string | null;
 }
+
+/** Revocation reason → sign-in log kind. */
+export function signInKindForReason(reason: string): SignInEventKind {
+  if (reason === "logout" || reason === "user_revoked" || reason === "user_revoked_others") return "sign_out";
+  if (reason === "idle_timeout" || reason === "absolute_timeout") return "expiry";
+  return "forced_end";
+}
+
+/** Refusal of a new session by the restrictions (raised inside the login transaction; logged after rollback). */
+export const sessionRestricted = (reasonCode: "RESTRICTION_IP" | "RESTRICTION_COUNTRY") =>
+  new DomainError("FORBIDDEN", "SESSION_RESTRICTED", "Sign-in is not allowed from your current network or location. Contact your administrator.", {
+    restriction: reasonCode,
+  });
 
 const TOKEN_SHAPE = /^[A-Za-z0-9_-]{43}$/;
 const LAST_SEEN_WRITE_INTERVAL_MS = 60 * 1000;
+const END_BATCH = 1000;
 /**
  * device_summary marker of a service-internal ops session (openOpsSession). deviceSummary() only ever yields
  * "<Browser> on <OS>", so no user agent can produce it; the resolver also refuses such rows outright.
@@ -61,11 +82,12 @@ const OPS_SESSION_TTL_MS = 10 * 60 * 1000;
 /** Steps an ops session for a not-yet-enrolled demo_seed account may skip (the human enrols at first sign-in). */
 const OPS_WAIVABLE_STEPS: ReadonlySet<TransitionStep> = new Set(["enroll_mfa", "acknowledge_recovery_codes", "change_password"]);
 const csrfAad = (publicId: string) => `user_sessions.csrf:${publicId}`;
+const ipAad = (publicId: string) => `user_sessions.ip:${publicId}`;
 
 export const sessionNotCurrent = () =>
   new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Your session has ended. Please sign in again.");
 
-export function createSessionService(deps: ModuleDeps, transitions: TransitionService) {
+export function createSessionService(deps: ModuleDeps, transitions: TransitionService, centre: { policy: SessionPolicy; log: SignInLog }) {
   const db = (tx?: DbOrTx) => tx ?? deps.db;
 
   /*
@@ -73,13 +95,87 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
    * transaction the read goes through THAT transaction's connection (readSetting(..., tx)) — never through the
    * settings pool while a connection is held (one-connection pools would deadlock — review ID-06).
    */
-  async function policy(tx?: DbOrTx) {
+  async function policy(tx?: DbOrTx, role?: UserRole, loaded?: Restrictions) {
     const t = tx as Tx | undefined;
-    const [idleMinutes, absoluteHours] = await Promise.all([
+    const [idleMinutes, absoluteHours, restrictions] = await Promise.all([
       readSetting(deps.settings, SESSION_IDLE_MINUTES, t),
       readSetting(deps.settings, SESSION_ABSOLUTE_HOURS, t),
+      loaded ?? (role ? centre.policy.load(tx) : null),
     ]);
-    return { idleMs: idleMinutes * 60_000, absoluteMs: absoluteHours * 3_600_000 };
+    // Increment 04: per-role lifetimes replace the global settings for that role while restrictions are on.
+    const perRole = role && restrictions?.enabled && !centre.policy.breakGlass() ? restrictions : null;
+    const idle = (perRole && role ? perRole.idleMinutes[role] : null) ?? idleMinutes;
+    const absolute = (perRole && role ? perRole.absoluteHours[role] : null) ?? absoluteHours;
+    return { idleMs: idle * 60_000, absoluteMs: absolute * 3_600_000 };
+  }
+
+  /** Sign-in log row for every session ended by revoke()/revokeAllForUser()/resolver expiry. */
+  function endEvents(rows: { publicId: string; userId: number; role: UserRole; authMethod: AuthMethod; deviceSummary: string | null }[], reason: string) {
+    const actor = getRequestContext()?.actor;
+    const kind = signInKindForReason(reason);
+    // Rows describe OTHER sessions: never stamp them with the caller's address/country.
+    const facts: RequestFacts | undefined = kind === "forced_end" || kind === "expiry" ? { ip: null, country: null } : undefined;
+    return rows.map((row) => ({
+      kind,
+      reasonCode: reason.toUpperCase().slice(0, 40),
+      userId: row.userId,
+      role: row.role,
+      authMethod: row.authMethod,
+      sessionPublicId: row.publicId,
+      deviceSummary: row.deviceSummary === OPS_SESSION_MARKER ? null : row.deviceSummary,
+      actorUserId: kind === "forced_end" && actor && actor.userId !== row.userId ? actor.userId : null,
+      ...(facts ? { facts } : {}),
+    }));
+  }
+
+  type EndRow = { id: number; publicId: string; userId: number; role: UserRole; authMethod: AuthMethod; deviceSummary: string | null };
+
+  /**
+   * Ends every unrevoked session matching `condition`, in id-ordered batches until none remain (no silent
+   * cap). Inside a transaction the batch is locked FOR UPDATE first, so every selected row is really ended by
+   * this call and logged exactly once; outside a transaction each row is ended by its own compare-and-set
+   * update and logged only when that update changed it (idempotent under concurrency).
+   */
+  async function endWhere(tx: DbOrTx, condition: SQL | undefined, reason: string, inTx: boolean, onRow?: (row: EndRow) => void): Promise<number> {
+    let lastId = 0;
+    let ended = 0;
+    for (;;) {
+      // Only user_sessions rows are locked (a role condition is a non-locking subquery on users), so this never
+      // takes users locks out of the canonical ascending order.
+      const query = tx
+        .select({ id: userSessions.id, publicId: userSessions.publicId, userId: userSessions.userId, authMethod: userSessions.authMethod, deviceSummary: userSessions.deviceSummary })
+        .from(userSessions)
+        .where(and(condition, isNull(userSessions.revokedAt), gt(userSessions.id, lastId)))
+        .orderBy(asc(userSessions.id))
+        .limit(END_BATCH);
+      const locked = inTx ? await query.for("update") : await query;
+      if (locked.length === 0) break;
+      const owners = await tx.select({ id: users.id, role: users.role }).from(users).where(inArray(users.id, [...new Set(locked.map((r) => r.userId))]));
+      const roleOf = new Map(owners.map((o) => [o.id, o.role]));
+      const rows: EndRow[] = locked.map((r) => ({ ...r, role: roleOf.get(r.userId) ?? "customer" }));
+      lastId = rows[rows.length - 1]!.id;
+      const now = deps.clock.now();
+      const done: EndRow[] = [];
+      if (inTx) {
+        await tx.update(userSessions).set({ revokedAt: now, revokeReason: reason.slice(0, 40) }).where(inArray(userSessions.id, rows.map((r) => r.id)));
+        done.push(...rows);
+      } else {
+        for (const row of rows) {
+          const [result] = (await tx
+            .update(userSessions)
+            .set({ revokedAt: now, revokeReason: reason.slice(0, 40) })
+            .where(and(eq(userSessions.id, row.id), isNull(userSessions.revokedAt)))) as unknown as [{ affectedRows?: number }];
+          if ((result?.affectedRows ?? 0) === 1) done.push(row);
+        }
+      }
+      ended += done.length;
+      done.forEach((row) => onRow?.(row));
+      const events = endEvents(done, reason);
+      if (inTx) await centre.log.recordMany(events, tx as Tx);
+      else for (const event of events) await centre.log.note(event);
+      if (rows.length < END_BATCH) break;
+    }
+    return ended;
   }
 
   /** Live = not revoked, not idle-expired, not absolute-expired (stored OR current policy), user active. */
@@ -142,9 +238,15 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
      * whichever is sooner) — what identity.me reports so the client can warn before expiry.
      */
     async timing(sessionId: string, opts: { tx?: DbOrTx } = {}): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null> {
-      const [row] = await db(opts.tx).select().from(userSessions).where(eq(userSessions.publicId, sessionId)).limit(1);
-      if (!row) return null;
-      const p = await policy(opts.tx);
+      const [joined] = await db(opts.tx)
+        .select({ row: userSessions, role: users.role })
+        .from(userSessions)
+        .innerJoin(users, eq(users.id, userSessions.userId))
+        .where(eq(userSessions.publicId, sessionId))
+        .limit(1);
+      if (!joined) return null;
+      const row = joined.row;
+      const p = await policy(opts.tx, joined.role);
       return {
         idleTimeoutSeconds: Math.floor(p.idleMs / 1000),
         absoluteExpiresAt: new Date(Math.min(row.absoluteExpiresAt.getTime(), row.authenticatedAt.getTime() + p.absoluteMs)),
@@ -221,11 +323,15 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
     /** Creates a new session row for a freshly authenticated user. Call inside the login transaction. */
     async create(
       tx: Tx,
-      user: Pick<UserRow, "id">,
+      user: Pick<UserRow, "id" | "role">,
       options: { authMethod: AuthMethod; userAgent?: string; mfaVerifiedAt?: Date | null },
     ): Promise<{ sessionId: string; issued: IssuedSession }> {
       const now = deps.clock.now();
-      const p = await policy(tx);
+      const restrictions = await centre.policy.load(tx);
+      const facts = centre.policy.requestFacts();
+      const refusal = admission(restrictions, user.role, facts.ip, facts.country, centre.policy.breakGlass());
+      if (refusal) throw sessionRestricted(refusal);
+      const p = await policy(tx, user.role, restrictions);
       const token = randomToken(32);
       const csrfSecret = randomToken(32);
       const absoluteExpiresAt = new Date(now.getTime() + p.absoluteMs);
@@ -241,7 +347,36 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         absoluteExpiresAt,
         mfaVerifiedAt: options.mfaVerifiedAt ?? null,
         deviceSummary: deviceSummary(options.userAgent),
+        ipAddressEnc: facts.ip ? deps.crypto.encrypt(facts.ip, ipAad(publicId)) : null,
+        country: facts.country,
       });
+      await centre.log.record(
+        { kind: "success", userId: user.id, role: user.role, authMethod: options.authMethod, sessionPublicId: publicId, deviceSummary: deviceSummary(options.userAgent), facts },
+        tx,
+      );
+      // Concurrent-session limit: the newest sessions win; the oldest live ones beyond the limit are ended.
+      const max = restrictions.enabled && !centre.policy.breakGlass() ? restrictions.maxConcurrentPerUser : null;
+      if (max !== null && max > 0) {
+        // Effective liveness in SQL (current per-role policy), newest `max` kept (the new session included),
+        // every other live session ended through endWhere — batched, no total cap. The users row lock taken
+        // by the login transaction serialises concurrent sign-ins of this user.
+        const live = and(
+          eq(userSessions.userId, user.id),
+          isNull(userSessions.revokedAt),
+          gt(userSessions.absoluteExpiresAt, now),
+          gt(userSessions.lastSeenAt, new Date(now.getTime() - p.idleMs)),
+          gt(userSessions.authenticatedAt, new Date(now.getTime() - p.absoluteMs)),
+          or(isNull(userSessions.deviceSummary), ne(userSessions.deviceSummary, OPS_SESSION_MARKER)),
+        );
+        const keep = await tx
+          .select({ id: userSessions.id })
+          .from(userSessions)
+          .where(live)
+          .orderBy(desc(userSessions.lastSeenAt), desc(userSessions.id))
+          .limit(max);
+        const keepIds = keep.map((row) => row.id);
+        await endWhere(tx, and(live, keepIds.length > 0 ? notInArray(userSessions.id, keepIds) : undefined), "concurrency_limit", true);
+      }
       return { sessionId: publicId, issued: issued(publicId, token, csrfSecret, absoluteExpiresAt) };
     },
 
@@ -253,20 +388,36 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
     },
 
     async revoke(sessionId: string, reason: string, opts: { tx?: Tx } = {}): Promise<void> {
-      await db(opts.tx)
-        .update(userSessions)
-        .set({ revokedAt: deps.clock.now(), revokeReason: reason.slice(0, 40) })
-        .where(and(eq(userSessions.publicId, sessionId), isNull(userSessions.revokedAt)));
+      await endWhere(db(opts.tx), eq(userSessions.publicId, sessionId), reason, opts.tx !== undefined);
     },
 
     async revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx }): Promise<number> {
       const conditions = [eq(userSessions.userId, userId), isNull(userSessions.revokedAt)];
       if (opts.exceptSessionId) conditions.push(ne(userSessions.publicId, opts.exceptSessionId));
-      const [result] = (await db(opts.tx)
-        .update(userSessions)
-        .set({ revokedAt: deps.clock.now(), revokeReason: opts.reason.slice(0, 40) })
-        .where(and(...conditions))) as unknown as [{ affectedRows?: number }];
-      return result?.affectedRows ?? 0;
+      return endWhere(db(opts.tx), and(...conditions), opts.reason, opts.tx !== undefined);
+    },
+
+    /** Package D: ends every live CUSTOMER session (bounded batches). Caller authorises + audits in `tx`. */
+    async revokeAllCustomers(reason: string, tx: Tx): Promise<number> {
+      const customers = tx.select({ id: users.id }).from(users).where(eq(users.role, "customer"));
+      return endWhere(tx, and(inArray(userSessions.userId, customers), gt(userSessions.absoluteExpiresAt, deps.clock.now())), reason, true);
+    },
+
+    /** Package D: ends one session of any user (admin). Returns the row it ended, or null when none was live. */
+    async revokeAny(sessionId: string, reason: string, tx: Tx): Promise<{ userId: number } | null> {
+      let owner: number | null = null;
+      const ended = await endWhere(tx, eq(userSessions.publicId, sessionId), reason, true, (row) => (owner = row.userId));
+      return ended === 1 && owner !== null ? { userId: owner } : null;
+    },
+
+    isLive,
+    ipOf(row: Pick<UserSessionRow, "publicId" | "ipAddressEnc">): string | null {
+      if (!row.ipAddressEnc) return null;
+      try {
+        return deps.crypto.decrypt(row.ipAddressEnc, ipAad(row.publicId));
+      } catch {
+        return null;
+      }
     },
 
     async getState(sessionId: string, opts: { tx?: DbOrTx } = {}): Promise<SessionState | null> {
@@ -277,7 +428,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         .where(eq(userSessions.publicId, sessionId))
         .limit(1);
       if (!joined) return null;
-      const p = await policy(opts.tx);
+      const p = await policy(opts.tx, joined.user.role);
       return {
         sessionId,
         userId: joined.user.id,
@@ -304,7 +455,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       const [user] = await tx.select().from(users).where(eq(users.id, principal.userId)).limit(1).for("update");
       const row = await sessionRow(tx, principal.sessionId, true);
       if (!user || !row || row.userId !== user.id) throw sessionNotCurrent();
-      if (!isLive(row, user, deps.clock.now(), await policy(tx))) throw sessionNotCurrent();
+      if (!isLive(row, user, deps.clock.now(), await policy(tx, user.role))) throw sessionNotCurrent();
       if (user.role !== principal.role) throw sessionNotCurrent();
       if (row.authMethod !== principal.authMethod) throw sessionNotCurrent();
       let secret: string;
@@ -322,9 +473,9 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       return { pendingSteps, role: user.role, stepUpAt: row.stepUpAt, mfaVerifiedAt: row.mfaVerifiedAt };
     },
 
-    async listForUser(userId: number, currentSessionId: string): Promise<SessionListItem[]> {
+    async listForUser(userId: number, currentSessionId: string, role?: UserRole): Promise<SessionListItem[]> {
       const now = deps.clock.now();
-      const p = await policy();
+      const p = await policy(undefined, role);
       const rows = await deps.db
         .select()
         .from(userSessions)
@@ -340,6 +491,9 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
           lastSeenAt: row.lastSeenAt,
           expiresAt: new Date(Math.min(row.absoluteExpiresAt.getTime(), row.lastSeenAt.getTime() + p.idleMs, row.authenticatedAt.getTime() + p.absoluteMs)),
           deviceSummary: row.deviceSummary,
+          authMethod: row.authMethod,
+          country: row.country,
+          ipAddress: service.ipOf(row),
         }));
     },
 
@@ -375,12 +529,20 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
         const { session, user } = joined;
         if (session.deviceSummary === OPS_SESSION_MARKER) return null; // ops sessions never ride HTTP
         const now = deps.clock.now();
-        const p = await policy();
+        const restrictions = await centre.policy.load();
+        const p = await policy(undefined, user.role, restrictions);
         if (!isLive(session, user, now, p)) {
           if (session.revokedAt === null) {
             const reason = user.status !== "active" ? "account_inactive" : now.getTime() - session.lastSeenAt.getTime() > p.idleMs ? "idle_timeout" : "absolute_timeout";
             await service.revoke(session.publicId, reason);
           }
+          return null;
+        }
+        // Increment 04: restrictions are re-checked on every request (address / country may change mid-session).
+        const facts = centre.policy.requestFacts();
+        const refusal = admission(restrictions, user.role, facts.ip, facts.country, centre.policy.breakGlass());
+        if (refusal) {
+          await service.revoke(session.publicId, refusal === "RESTRICTION_IP" ? "restriction_ip" : "restriction_country");
           return null;
         }
         const pendingSteps = await transitions.derive(user, session);

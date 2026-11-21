@@ -16,7 +16,8 @@ import {
   staffProcedure,
 } from "../../trpc/trpc.js";
 import { customerRefSchema, emailSchema, nameSchema } from "./normalize.js";
-import { SSO_JIT_MODES, USER_STATUSES } from "./schema.js";
+import { AUTH_METHODS } from "../../../shared/domain.js";
+import { COUNTRY_RULE_MODES, RESTRICTION_SCOPES, SIGN_IN_EVENT_KINDS, SSO_JIT_MODES, USER_STATUSES } from "./schema.js";
 import type { SignInMethods } from "./sso/service.js";
 import type { Services } from "../../container.js";
 
@@ -55,6 +56,36 @@ async function withSignInMethods<T extends { publicId: string }>(services: Servi
   return { ...page, items: page.items.map((item) => ({ ...item, signInMethods: methods.get(item.publicId) ?? none })) };
 }
 
+const country = z.string().regex(/^[A-Z]{2}$/, "Use a two-letter country code.");
+const cursor = z.string().max(64).optional();
+const limit = z.number().int().min(1).max(100).optional();
+const signInLogFilter = z.strictObject({
+  kind: z.enum(SIGN_IN_EVENT_KINDS).optional(),
+  userId: publicId.optional(),
+  role: z.enum(USER_ROLES).optional(),
+  authMethod: z.enum(AUTH_METHODS).optional(),
+  country: country.optional(),
+  ip: z.string().trim().min(2).max(64).optional(),
+  from: z.date().optional(),
+  to: z.date().optional(),
+  cursor,
+  limit,
+});
+const perRole = (min: number, max: number) =>
+  z.strictObject({ customer: z.number().int().min(min).max(max).nullable(), staff: z.number().int().min(min).max(max).nullable(), admin: z.number().int().min(min).max(max).nullable() });
+const restrictionsInput = z.strictObject({
+  expectedVersion: z.number().int().min(1),
+  enabled: z.boolean(),
+  maxConcurrentPerUser: z.number().int().min(1).max(50).nullable(),
+  idleMinutes: perRole(5, 240),
+  absoluteHours: perRole(1, 72),
+  consoleIpAllowList: z.array(z.string().trim().min(1).max(64)).max(100),
+  countryMode: z.enum(COUNTRY_RULE_MODES),
+  countryScope: z.enum(RESTRICTION_SCOPES),
+  countries: z.array(z.string().trim().min(2).max(2)).max(250),
+  allowUnknownCountry: z.boolean(),
+});
+
 const statusInput = z.strictObject({ customerId: publicId, status: z.enum(["active", "suspended", "deactivated"]), reasonCode });
 
 export const identityRouter = router({
@@ -62,7 +93,7 @@ export const identityRouter = router({
 
   register: publicProcedure
     .meta({ rateLimit: "auth_high_risk" })
-    .input(z.strictObject({ email: emailSchema, name: nameSchema, password }))
+    .input(z.strictObject({ email: emailSchema, name: nameSchema, password, referralCode: z.string().trim().max(16).optional() }))
     .mutation(({ ctx, input }) =>
       ctx.services.identity.auth.register(input, { ipAddress: ctx.request.ipAddress, userAgent: ctx.request.userAgent }),
     ),
@@ -163,6 +194,11 @@ export const identityRouter = router({
     })),
   }),
 
+  /** Increment 04: the caller's own security overview (sessions + recent sign-in activity). */
+  security: router({
+    overview: protectedProcedure.query(({ ctx }) => ctx.services.identity.centre.securityOverview(ctx.session)),
+  }),
+
   /** Microsoft Entra ID single sign-on (raw start/callback/complete routes live in http.ts). */
   sso: router({
     publicConfig: publicProcedure.query(({ ctx }) => ctx.services.identity.sso.publicConfig()),
@@ -178,6 +214,41 @@ export const identityRouter = router({
   }),
 
   admin: router({
+    sessions: router({
+      list: staffProcedure
+        .use(requireCapability("sessions.read_all"))
+        .input(z.strictObject({ role: z.enum(USER_ROLES).optional(), authMethod: z.enum(AUTH_METHODS).optional(), country: country.optional(), userId: publicId.optional(), cursor, limit }).optional())
+        .query(({ ctx, input }) => ctx.services.identity.centre.listSessions(ctx.session, input ?? {})),
+      end: adminProcedure
+        .use(requireCapability("sessions.revoke_any"))
+        .input(z.strictObject({ sessionId: publicId, reasonCode }))
+        .mutation(({ ctx, input }) => ctx.services.identity.centre.endSession(ctx.session, input.sessionId, input.reasonCode)),
+      endForUser: adminProcedure
+        .use(requireCapability("sessions.revoke_any"))
+        .input(z.strictObject({ userId: publicId, reasonCode }))
+        .mutation(({ ctx, input }) => ctx.services.identity.centre.endForUser(ctx.session, input.userId, input.reasonCode)),
+      endAllCustomers: adminProcedure
+        .use(requireCapability("sessions.revoke_any"))
+        .input(z.strictObject({ reasonCode }))
+        .mutation(({ ctx, input }) => ctx.services.identity.centre.endAllCustomers(ctx.session, input)),
+    }),
+    signInLog: router({
+      list: staffProcedure
+        .use(requireCapability("sessions.read_all"))
+        .input(signInLogFilter.optional())
+        .query(({ ctx, input }) => ctx.services.identity.centre.listSignInLog(ctx.session, input ?? {})),
+      export: adminProcedure
+        .use(requireCapability("sessions.read_all"))
+        .input(signInLogFilter.omit({ cursor: true, limit: true }).optional())
+        .mutation(({ ctx, input }) => ctx.services.identity.centre.exportSignInLog(ctx.session, input ?? {})),
+    }),
+    restrictions: router({
+      get: adminProcedure.use(requireCapability("sessions.policy.manage")).query(({ ctx }) => ctx.services.identity.centre.getRestrictions(ctx.session)),
+      update: adminProcedure
+        .use(requireCapability("sessions.policy.manage"))
+        .input(restrictionsInput)
+        .mutation(({ ctx, input }) => ctx.services.identity.centre.updateRestrictions(ctx.session, input)),
+    }),
     sso: router({
       get: adminProcedure.use(requireCapability("identity.sso.manage")).query(({ ctx }) => ctx.services.identity.sso.adminView()),
       update: adminProcedure

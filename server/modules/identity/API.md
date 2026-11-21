@@ -252,3 +252,50 @@ By (tid, oid) only — never by e-mail. Self link (fresh step-up + Entra re-auth
 
 ### Break-glass
 Admin view includes `breakGlass {localMfaAdministrators, soleLocalMfaAdministratorHasPasskey}` from assurance; enabling requires `assertLocalAdministratorRemains`. Host recovery: `recoverLocalAdministratorPassword` returns `{sessionsRevoked}`.
+
+## Increment 04 — session centre, sign-in log, restrictions (package D)
+
+Everything here ships **disabled** (restrictions `enabled=false`); the sign-in log and session centre are read
+views and are always on for holders of the capability.
+
+### Ports provided
+```ts
+// deps.services.identity.sessions
+endAllCustomers(actor: SessionPrincipal, input: { reasonCode: string /* ^[A-Z][A-Z0-9_]{2,39}$ */ }): Promise<{ ended: number }>;
+```
+Opens its own transaction: `authorizeInTx(actor, "sessions.revoke_any")` (fresh step-up) → actor `users` row →
+customer `user_sessions` rows (bounded batches). Never touches staff/admin sessions. Audited
+`auth.session.ended_all_customers`; one sign-in-log `forced_end` row per session. Callers must NOT hold other
+module locks (call after your own transaction commits).
+
+### Ports consumed
+- `jobAdmin.maintenance.customerAccess(tx?)` (package E) — local sign-in, registration and SSO refuse customers
+  with `FORBIDDEN / CUSTOMER_MAINTENANCE`; SSO refusal code `SSO_MAINTENANCE`. Authoritative call inside the
+  session-creating transaction after the users row lock.
+- `protection.clientCountry()` (package C) — stored on the session and the sign-in log; `null` = unknown.
+- `referrals.attributeRegistration(code, newUserId, tx)` (package G) — optional; called only when a NEW customer
+  row is created with `referralCode`. Missing module ⇒ ignored.
+
+### tRPC
+| Procedure | Guard | Notes |
+|---|---|---|
+| `identity.security.overview` | protected | Own live sessions (device, method, country, IP, current) + last 20 own sign-in-log rows. |
+| `identity.admin.sessions.list` | staff/admin + `sessions.read_all` | Live sessions of all users; filters `role, authMethod, country, userId, query` (name prefix); cursor, limit ≤ 100. |
+| `identity.admin.sessions.end` | admin + `sessions.revoke_any` (step-up) | `{ sessionId, reasonCode }`. Own current session refused (`OWN_SESSION`). |
+| `identity.admin.sessions.endForUser` | admin + `sessions.revoke_any` (step-up) | `{ userId, reasonCode }`; keeps the actor's current session. |
+| `identity.admin.sessions.endAllCustomers` | admin + `sessions.revoke_any` (step-up) | `{ reasonCode }` → `{ ended }`. |
+| `identity.admin.signInLog.list` | staff/admin + `sessions.read_all` | Filters `kind, userId, role, authMethod, country, ip, from, to`; cursor, limit ≤ 100; newest first. |
+| `identity.admin.signInLog.export` | admin + `sessions.read_all` | Same filters, ≤ 5 000 rows CSV text; durably audited. |
+| `identity.admin.restrictions.get` / `update` | admin + `sessions.policy.manage` (+ fresh step-up for update) | Versioned (`expectedVersion`). Update refused with `WOULD_LOCK_OUT` when the candidate would refuse the acting admin's current IP/country. |
+
+Sign-in log kinds: `success | failure | lock | sign_out | forced_end | expiry | refused`. Rows hold user (when
+known; never the typed e-mail), role, method, session id, IP (encrypted; blind index for exact-IP filter),
+country, device summary, reason code, actor (forced ends). Retention 180 days (`identity.signin_log.prune`).
+
+### Restrictions (enforced at session creation and on every request)
+Concurrent sessions per user (oldest ended, `concurrency_limit`), idle / absolute lifetime per role (replace
+the global settings for that role, same bounds), console IP allow-list (CIDR, staff + admin; unknown IP is
+refused), country rule (`off | allow | deny`, scope `all | customers | console`, unknown-country policy).
+Per-request violations end the session (`restriction_ip` / `restriction_country`). Cached ≤ 5 s per process.
+Break-glass: host recovery (`recoverLocalAdministratorPassword`) also clears restrictions; `PROTECTION_DISABLED=1`
+disables enforcement.

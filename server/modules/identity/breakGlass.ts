@@ -7,7 +7,7 @@ import { DomainError, notFound } from "../../core/errors.js";
 import type { Tx } from "../../core/types.js";
 import type { AuthInternals } from "./auth.js";
 import { assertPasswordAcceptable } from "./auth.js";
-import { users } from "./schema.js";
+import { sessionRestrictions, users } from "./schema.js";
 import { toView } from "./users.js";
 
 export function createBreakGlassService(i: AuthInternals) {
@@ -54,12 +54,15 @@ export function createBreakGlassService(i: AuthInternals) {
         .set({ passwordHash, passwordChangedAt: now, mustChangePassword: true, authSource: "local", version: user.version + 1 })
         .where(eq(users.id, user.id));
       const revoked = await sessions.revokeAllForUser(user.id, { reason: "host_recovery", tx });
+      // Increment 04: host recovery also switches session restrictions off (users → restrictions lock order),
+      // so a recovered administrator can always sign in from wherever the host operator is.
+      const [restricted] = (await tx.update(sessionRestrictions).set({ enabled: false, updatedAt: now }).where(and(eq(sessionRestrictions.id, 1), eq(sessionRestrictions.enabled, true)))) as unknown as [{ affectedRows?: number }];
       await tokens.retireAll(tx, user.id, ["password_reset", "admin_set_password", "invitation"], "host_recovery");
       await deps.audit.record(
         {
           category: "security", eventName: "identity.admin.local_password_recovered", action: "update", outcome: "completed",
           actor: { role: "system" }, resource: { type: "user", publicId: user.publicId },
-          safeCounts: { sessions_revoked: revoked }, attributes: { auth_source_reset: user.authSource !== "local" },
+          safeCounts: { sessions_revoked: revoked }, attributes: { auth_source_reset: user.authSource !== "local", session_restrictions_disabled: (restricted?.affectedRows ?? 0) > 0 },
         },
         tx,
       );

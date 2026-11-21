@@ -17,6 +17,8 @@ import type { IssuedSession, SessionService } from "./sessions.js";
 import { REGISTRATION_ENABLED, RESEND_MIN_INTERVAL_MS } from "./settings.js";
 import type { TokenService } from "./tokens.js";
 import type { TransitionService } from "./transitions.js";
+import type { Gates } from "./gates.js";
+import type { SignInLog } from "./sessionPolicy.js";
 import { emailColumns, emailIndexOf, generateCustomerRef, isDuplicate, nameColumns, toView, type UserRepo } from "./users.js";
 
 export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
@@ -44,6 +46,8 @@ export interface AuthInternals {
   tokens: TokenService;
   sessions: SessionService;
   transitions: TransitionService;
+  gates: Gates;
+  signInLog: SignInLog;
 }
 
 export function assertPasswordAcceptable(password: string, context: { email?: string | null; name?: string | null }): void {
@@ -52,7 +56,7 @@ export function assertPasswordAcceptable(password: string, context: { email?: st
 }
 
 export function createAuthService(i: AuthInternals) {
-  const { deps, hasher, repo, tokens, sessions, transitions } = i;
+  const { deps, hasher, repo, tokens, sessions, transitions, gates, signInLog } = i;
   const preview = (path: string) => (deps.config.deploymentProfile === "preview" ? { previewLink: path } : {});
 
   // Throttle refusals leave a sampled best-effort note: at most one per (category, subject) per minute, so an
@@ -73,6 +77,32 @@ export function createAuthService(i: AuthInternals) {
       });
     }
     throw rateLimited(verdict.retryAfterSeconds);
+  }
+
+  /** Sampled (≤ 1 per minute per process) sign-in-log row for login throttling; no subject is stored. */
+  let lastLockNote = -Infinity;
+  function noteLock(): void {
+    const now = deps.clock.now().getTime();
+    if (now - lastLockNote < 60_000 && now >= lastLockNote) return;
+    lastLockNote = now;
+    void signInLog.note({ kind: "lock", reasonCode: "RATE_LIMITED", authMethod: "local" });
+  }
+
+  /** Sign-in log + audit for a refusal raised by a gate or restriction (after the transaction rolled back). */
+  async function noteRefusal(error: unknown, user: Pick<UserRow, "id" | "role" | "publicId">, authMethod: "local" | "entra"): Promise<void> {
+    if (!(error instanceof DomainError)) return;
+    const code = error.reasonCode === "SESSION_RESTRICTED" ? String((error.details as { restriction?: string } | undefined)?.restriction ?? "SESSION_RESTRICTED") : error.reasonCode;
+    if (error.reasonCode !== "SESSION_RESTRICTED" && error.reasonCode !== "CUSTOMER_MAINTENANCE") return;
+    await signInLog.note({ kind: "refused", reasonCode: code, userId: user.id, role: user.role, authMethod });
+    const event: AuditEventInput = {
+      category: "security", eventName: "auth.login.refused", action: "login", outcome: "denied", severity: "WARN",
+      reasonCode: code, actor: { role: "anonymous" }, resource: { type: "user", publicId: user.publicId }, attributes: { auth_method: authMethod },
+    };
+    try {
+      await deps.audit.record(event);
+    } catch {
+      deps.audit.note(event);
+    }
   }
 
   /**
@@ -249,10 +279,12 @@ export function createAuthService(i: AuthInternals) {
     claimNewRef,
     provisionLocalAccount,
 
-    async register(input: { email: string; name: string; password: string }, meta: CallMeta): Promise<{ accepted: true; previewLink?: string }> {
+    async register(input: { email: string; name: string; password: string; referralCode?: string }, meta: CallMeta): Promise<{ accepted: true; previewLink?: string }> {
       if (!(await readSetting(deps.settings, REGISTRATION_ENABLED))) {
         throw new DomainError("FORBIDDEN", "REGISTRATION_DISABLED", "New account registration is currently closed.");
       }
+      // Customer maintenance (package E) refuses registration before any account lookup (reveals nothing).
+      await gates.assertCustomerAccess();
       const email = normalizeEmail(input.email);
       await throttle("auth_high_risk", `register:${emailIndexOf(deps.crypto, email)}`);
       // Policy is checked before any existence lookup, so its outcome reveals nothing about accounts.
@@ -290,7 +322,9 @@ export function createAuthService(i: AuthInternals) {
       }
       try {
         return await deps.db.transaction(async (tx) => {
+          await gates.assertCustomerAccess(tx);
           const created = await insertUser(tx, { email, name: input.name, role: "customer", status: "active", origin: "register", passwordHash });
+          const referral = await gates.attributeReferral(input.referralCode, created.id, tx);
           const link = await tokens.issue(tx, created.id, "verify_email");
           await deps.mailer.enqueue(
             { template: "auth.verify_email", to: { userId: created.id }, vars: { name: input.name, link: link.url }, idempotencyKey: link.mailKey, expiresAt: link.expiresAt },
@@ -304,6 +338,7 @@ export function createAuthService(i: AuthInternals) {
               outcome: "completed",
               actor: { userId: created.id, role: "customer" },
               resource: { type: "user", publicId: created.publicId },
+              attributes: { referral: input.referralCode ? (referral.attributed ? "attributed" : "not_attributed") : "none" },
             },
             tx,
           );
@@ -319,7 +354,12 @@ export function createAuthService(i: AuthInternals) {
 
     async signIn(input: { email: string; password: string }, meta: CallMeta): Promise<{ issued: IssuedSession; nextStep: TransitionStep | null; sessionId: string; userId: number }> {
       const email = normalizeEmail(input.email);
-      await throttle("user_login", `acct:${emailIndexOf(deps.crypto, email)}`);
+      try {
+        await throttle("user_login", `acct:${emailIndexOf(deps.crypto, email)}`);
+      } catch (error) {
+        if (error instanceof DomainError && error.reasonCode === "RATE_LIMITED") noteLock();
+        throw error;
+      }
       const user = await repo.byEmail(email);
       const ok = await hasher.verify(user?.passwordHash ?? null, input.password);
       const reason = !user ? "UNKNOWN_ACCOUNT" : !ok ? "BAD_PASSWORD" : user.status !== "active" ? "ACCOUNT_INACTIVE" : user.authSource !== "local" ? "WRONG_AUTH_SOURCE" : null;
@@ -334,7 +374,16 @@ export function createAuthService(i: AuthInternals) {
           actor: { role: "anonymous" },
           resource: user ? { type: "user", publicId: user.publicId } : { type: "user" },
         });
+        await signInLog.note({ kind: "failure", reasonCode: reason ?? "UNKNOWN_ACCOUNT", userId: user?.id ?? null, role: user?.role ?? null, authMethod: "local" });
         throw badCredentials();
+      }
+      if (user.role === "customer") {
+        try {
+          await gates.assertCustomerAccess();
+        } catch (error) {
+          await noteRefusal(error, user, "local");
+          throw error;
+        }
       }
       const result = await recordDenial(() => deps.db.transaction(async (tx) => {
         const locked = await repo.byId(user.id, { tx, forUpdate: true });
@@ -350,6 +399,8 @@ export function createAuthService(i: AuthInternals) {
             .set({ passwordHash: await hasher.hash(input.password) })
             .where(and(eq(users.id, user.id), eq(users.passwordHash, locked.passwordHash), eq(users.status, "active")));
         }
+        // Authoritative maintenance check after the users row lock (package E lock order).
+        if (locked.role === "customer") await gates.assertCustomerAccess(tx);
         const created = await sessions.create(tx, locked, { authMethod: "local", userAgent: meta.userAgent });
         const steps = await transitions.derive(locked, { mfaVerifiedAt: null }, tx);
         await deps.audit.record(
@@ -370,7 +421,10 @@ export function createAuthService(i: AuthInternals) {
             category: "security", eventName: "auth.login.failed", action: "login", outcome: "denied", severity: "WARN",
             reasonCode: "CREDENTIAL_CHANGED_CONCURRENTLY", actor: { role: "anonymous" }, resource: { type: "user", publicId: user.publicId },
           }
-        : null);
+        : null).catch(async (error: unknown) => {
+          await noteRefusal(error, user, "local");
+          throw error;
+        });
       return { issued: result.issued, nextStep: result.nextStep, sessionId: result.sessionId, userId: user.id };
     },
 
@@ -646,6 +700,7 @@ export function createAuthService(i: AuthInternals) {
     },
 
     nextStepFor,
+    noteRefusal,
   };
 }
 export type AuthService = ReturnType<typeof createAuthService>;

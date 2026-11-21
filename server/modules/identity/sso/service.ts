@@ -12,6 +12,8 @@
  *                                                              the SAME live session; effect in one tx
  * Nothing in the callback URL is logged; nothing sensitive is ever placed in a redirect.
  */
+import type { Gates } from "../gates.js";
+import type { SignInLog } from "../sessionPolicy.js";
 import { and, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../../core/errors.js";
@@ -80,6 +82,8 @@ export const SSO_REFUSALS = [
   "SSO_MFA_REQUIRED",
   "SSO_PROVISIONING_LIMIT",
   "SSO_ROLE_NOT_ASSIGNED",
+  "SSO_MAINTENANCE",
+  "SSO_RESTRICTED",
 ] as const;
 export type SsoRefusal = (typeof SSO_REFUSALS)[number];
 
@@ -99,6 +103,8 @@ const REFUSAL_MESSAGES: Record<SsoRefusal, string> = {
   SSO_MFA_REQUIRED: "Microsoft did not confirm multi-factor authentication. Use your portal authenticator instead.",
   SSO_PROVISIONING_LIMIT: "New accounts cannot be created through single sign-on right now. Contact your administrator.",
   SSO_ROLE_NOT_ASSIGNED: "Your Microsoft account is not assigned to this application.",
+  SSO_MAINTENANCE: "Customer sign-in is paused for scheduled maintenance. Please try again later.",
+  SSO_RESTRICTED: "Sign-in is not allowed from your current network or location. Contact your administrator.",
 };
 
 export const refusal = (code: SsoRefusal, detail?: string) =>
@@ -202,6 +208,8 @@ export interface SsoInternals {
   sessions: SessionService;
   transitions: TransitionService;
   auth: AuthService;
+  gates: Gates;
+  signInLog: SignInLog;
   /** Admin-service in-tx actor guard (locks actor + target in id order, re-validates the session). */
   authorizeInTx: (tx: Tx, principal: SessionPrincipal, capability: "identity.sso.manage", targetPublicId?: string) => Promise<UserRow | null>;
 }
@@ -671,6 +679,8 @@ export function createSsoService(i: SsoInternals) {
           await deps.db.update(ssoAuthRequests).set({ status: "refused", refusalCode: error.reasonCode.slice(0, 40), resultEnc: null, codeEnc: null, completedAt: t }).where(eq(ssoAuthRequests.id, req.id));
           const detail = typeof error.details?.detail === "string" ? error.details.detail : error.reasonCode;
           if (req.purpose === "sign_in") {
+            const refusedKinds = ["SSO_MAINTENANCE", "SSO_RESTRICTED", "SSO_DOMAIN_NOT_ALLOWED", "SSO_ACCOUNT_INACTIVE", "SSO_PROVISIONING_LIMIT", "SSO_ROLE_NOT_ASSIGNED"];
+            await i.signInLog.note({ kind: refusedKinds.includes(error.reasonCode) ? "refused" : "failure", reasonCode: detail, authMethod: "entra" });
             try {
               await deps.audit.record({
                 category: "security", eventName: "auth.login.refused", action: "login", outcome: "denied", severity: "WARN", reasonCode: detail,
@@ -867,6 +877,16 @@ export function createSsoService(i: SsoInternals) {
     if (user.status !== "active") throw refusal("SSO_ACCOUNT_INACTIVE", `ACCOUNT_${user.status.toUpperCase()}`.slice(0, 40));
     // Host recovery / forced change: Entra cannot skip the local remediation.
     if (user.mustChangePassword) throw refusal("SSO_LOCAL_SIGN_IN_REQUIRED", "LOCAL_REMEDIATION_PENDING");
+    // Increment 04: customer maintenance (package E) — authoritative, after the users row lock. Also rolls
+    // back a just-provisioned customer.
+    if (user.role === "customer") {
+      try {
+        await i.gates.assertCustomerAccess(tx);
+      } catch (error) {
+        if (error instanceof DomainError && error.reasonCode === "CUSTOMER_MAINTENANCE") throw refusal("SSO_MAINTENANCE", "CUSTOMER_MAINTENANCE");
+        throw error;
+      }
+    }
     const t = now();
     if (!link.verifiedAt) {
       await tx.update(ssoIdentities).set({ verifiedAt: t }).where(eq(ssoIdentities.id, link.id));
@@ -877,7 +897,12 @@ export function createSsoService(i: SsoInternals) {
     }
     await tx.update(ssoIdentities).set({ lastSignInAt: t }).where(eq(ssoIdentities.id, link.id));
     const { mfaVerified } = deps.services.assurance.assessEntraSignIn(result.amr ?? undefined, config.trustEntraMfa);
-    const created = await sessions.create(tx, user, { authMethod: "entra", userAgent, mfaVerifiedAt: mfaVerified ? t : null });
+    const created = await sessions.create(tx, user, { authMethod: "entra", userAgent, mfaVerifiedAt: mfaVerified ? t : null }).catch((error: unknown) => {
+      if (error instanceof DomainError && error.reasonCode === "SESSION_RESTRICTED") {
+        throw refusal("SSO_RESTRICTED", String(error.details?.restriction ?? "SESSION_RESTRICTED"));
+      }
+      throw error;
+    });
     const steps = await transitions.derive(user, { mfaVerifiedAt: mfaVerified ? t : null, authMethod: "entra" }, tx);
     await deps.audit.record(
       {
