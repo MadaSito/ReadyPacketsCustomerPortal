@@ -25,8 +25,7 @@ export async function recoverAdministrator(services: RecoveryServices, email: st
     if (!user || user.email !== parsed.data || user.role !== "admin" || user.status !== "active") throw deny();
 
     const password = identity.generateTemporaryPassword();
-    await identity.recoverLocalAdministratorPassword(user.id, password, { tx });
-    const sessionsRevoked = await identity.sessions.revokeAllForUser(user.id, { reason: "HOST_ADMIN_RECOVERY", tx });
+    const { sessionsRevoked } = await identity.recoverLocalAdministratorPassword(user.id, password, { tx });
     await clearFactors(tx, user.id, clock.now());
     await audit.record({
       category: "security",

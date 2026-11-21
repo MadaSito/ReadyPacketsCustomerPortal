@@ -13,7 +13,7 @@ import { createIdentityModule } from "../../server/modules/identity/index.js";
 import { identityRouter } from "../../server/modules/identity/router.js";
 import { identityTokens, ssoIdentities, userSessions, users } from "../../server/modules/identity/schema.js";
 import { createCallerFactory, router } from "../../server/trpc/trpc.js";
-import { createTestDeps } from "../../tests/helpers/fakes.js";
+import { createTestDeps, FakeAudit } from "../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../tests/helpers/testDb.js";
 import { recoverAdministrator } from "./lib/recoverAdmin.js";
 
@@ -98,7 +98,7 @@ describe("host administrator recovery", () => {
     const [audit] = await testDb.db.select().from(auditEvents).where(eq(auditEvents.requestId, request.requestId));
     expect(audit).toMatchObject({
       eventName: "auth.admin.host_recovery", severityText: "FATAL", actorRole: "system", attributes: { actor_type: "host-operator" },
-      resourcePublicId: user.publicId, requestId: request.requestId, origin: "cli",
+      resourcePublicId: user.publicId, requestId: request.requestId, origin: "cli", safeCounts: { sessions_revoked: 1 },
     });
     expect(JSON.stringify(audit)).not.toContain(password);
     expect(JSON.stringify(audit)).not.toContain(user.email);
@@ -132,8 +132,10 @@ describe("host administrator recovery", () => {
     await h.api(null).identity.signIn({ email: user.email, password: user.password });
     const before = await user.read();
     await testDb.db.insert(assuranceAccounts).values({ userId: user.id, totpSecretEnc: "locked-test-factor", totpFailures: 50 });
-    h.audit.failRecords = true;
-    await expect(recoverAdministrator({ ...h.services, audit: h.audit }, user.email, user.email)).rejects.toBeDefined();
+    const failingHostAudit = new FakeAudit();
+    failingHostAudit.failRecords = true;
+    await expect(recoverAdministrator({ ...h.services, audit: failingHostAudit }, user.email, user.email)).rejects.toBeDefined();
+    expect(h.audit.named("identity.admin.local_password_recovered")).toHaveLength(1);
     expect(await user.read()).toEqual(before);
     expect(await h.resolve()).not.toBeNull();
     expect(await testDb.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, user.id))).toMatchObject([
