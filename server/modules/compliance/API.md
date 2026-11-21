@@ -123,8 +123,137 @@ export interface ComplianceModule extends ModuleLifecycle {
    * and explicit `(importId, sourceInstallationId, sourcePublicId)` provenance. Never fabricates local active consent.
    */
   importPortableEvidence(input: ImportComplianceEvidenceInput, tx: Tx): Promise<ImportComplianceEvidenceResult>;
+
+  /* ---- Increment 04 ports (Cart, Payments, Referrals, Public API v1) ---- */
+
+  /**
+   * Server-side tax quote helper for `cart` (`recovery_ops_engineer`).
+   * Reads `compliance.invoices.default_tax_rate_bps` (integer 0..5000 bps, default 0) inside `tx` and computes
+   * half-up integer minor units on `Math.max(0, subtotalAfterDiscountMinor)`.
+   */
+  quoteTaxMinor(
+    input: {
+      subtotalAfterDiscountMinor: number;
+      currency: string;
+      billingCountry?: string | null;
+      billingRegion?: string | null;
+    },
+    tx?: DbOrTx,
+  ): Promise<{ taxRateBps: number; taxMinor: number }>;
+
+  /**
+   * Atomic customer-checkout invoice port for `cart` (`recovery_ops_engineer`).
+   * Runs inside `cart`'s transaction (`tx`): verifies `principal` owns `orderPublicId`, computes integer line/tax/total
+   * math, allocates the sequential invoice number, inserts an `issued` invoice + lines, records durable `invoice.created`
+   * and `invoice.issued` events in `tx`, and returns the issued invoice summary ready for `payments.startCheckout`.
+   */
+  issueCheckoutInvoiceInTx(
+    input: {
+      principal: SessionPrincipal;
+      orderId?: number;
+      orderPublicId: string;
+      currency: string;
+      lines: readonly {
+        description: string;
+        quantity: number;
+        unitAmountMinor: number;
+        productKey?: string;
+        tierKey?: string;
+      }[];
+      discountMinor: number;
+      taxMinor?: number;
+      dueAt?: Date;
+      memo?: string;
+    },
+    tx: Tx,
+  ): Promise<{
+    invoiceId: number;
+    invoicePublicId: string;
+    invoiceNumber: string;
+    orderId: number;
+    orderPublicId: string;
+    currency: string;
+    subtotalMinor: number;
+    discountMinor: number;
+    taxMinor: number;
+    totalMinor: number;
+    issuedAt: Date;
+  }>;
+
+  /**
+   * Checkout policy-acceptance hook for `cart` (`recovery_ops_engineer`).
+   * Records `portal_checkbox` or `typed_signature` acceptances bound to `orderId`/`orderPublicId` inside `tx`.
+   */
+  recordCheckoutAcceptances(
+    input: {
+      principal: SessionPrincipal;
+      orderId?: number;
+      orderPublicId?: string;
+      items: readonly { versionPublicId: string; contentHash: string; signerName?: string }[];
+    },
+    tx: Tx,
+  ): Promise<{ recorded: number }>;
+
+  /**
+   * Verified online payment booking hook for `payments` (Package K, Decision 12).
+   * Called ONLY after BOTH a verified signed webhook AND a matching provider `fetchPayment` check succeed.
+   * Idempotent on `idempotencyKey`; records `compliance_invoice_payments` (`method: "provider_online"`), transitions
+   * `compliance_invoices.status` to `"paid"` when netPaid >= totalMinor, emits `invoice.payment.recorded` (firing
+   * `invoice.paid` in `TRIGGER_CATALOGUE` for automations & outbound webhooks), and invokes `onInvoicePaid` listeners in `tx`.
+   */
+  bookVerifiedProviderPayment(
+    input: {
+      invoicePublicId: string;
+      provider: "stripe" | "square";
+      environment: "test" | "live";
+      attemptPublicId: string;
+      providerPaymentRef: string;
+      amountMinor: number;
+      currency: string;
+      paidAt: Date;
+      idempotencyKey: string;
+    },
+    tx: Tx,
+  ): Promise<{
+    paymentPublicId: string;
+    invoiceId: number;
+    invoicePublicId: string;
+    invoiceNumber: string | null;
+    invoiceStatus: InvoiceStatus;
+    balanceDueMinor: number;
+    duplicate: boolean;
+  }>;
+
+  /**
+   * In-transaction listener registration for `referrals` (`siem_engineer`, Package G).
+   * Invoked inside `tx` whenever an invoice transitions from unpaid (`status !== "paid"`) to `"paid"` (both manual
+   * staff payment and verified Stripe/Square online payment).
+   */
+  onInvoicePaid(
+    listener: (
+      event: {
+        invoiceId: number;
+        invoicePublicId: string;
+        invoiceNumber: string | null;
+        orderId: number;
+        orderPublicId: string;
+        orderReference: string;
+        ownerUserId: number;
+        totalMinor: number;
+        netPaidMinor: number;
+        currency: string;
+        paymentPublicId: string;
+        method: PaymentMethod;
+        provider: "stripe" | "square" | null;
+        paidAt: Date;
+      },
+      tx: Tx,
+    ) => Promise<void>,
+  ): void;
 }
 ```
+
+In `compliance.init()`, the module also registers the `invoices` resource provider on `deps.services.publicApi?.registerProvider("invoices", ...)` (`server/modules/publicApi/ports.ts`).
 
 ## 2. Dependencies on other modules (`deps.services.*`, accessed at call time only)
 
