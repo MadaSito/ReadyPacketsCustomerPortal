@@ -196,3 +196,45 @@ All procedures are under `orders.admin.workflows.*`, need an admin session with 
 - Error codes: `WORKFLOW_DRAFT_EXISTS` (details.draftId), `WORKFLOW_KEY_TAKEN`, `WORKFLOW_NAME_REQUIRED`, `COPY_VERSION_REQUIRED`, `STALE_VERSION`, `WORKFLOW_CHANGED_SINCE_DRAFT`, `WORKFLOW_DRAFT_INVALID` (details `issues`, `issuePaths`, `issueCodes`), `INVALID_WORKFLOW_DRAFT`, `INVALID_WORKFLOW_LAYOUT`, `WORKFLOW_DRAFT_NOT_FOUND`, `WORKFLOW_VERSION_NOT_FOUND`, `WORKFLOW_NOT_FOUND`, `STEP_UP_REQUIRED`, `ACTOR_NOT_AUTHORIZED`.
 - The former direct `admin.workflows.create` / `admin.workflows.publish` procedures are no longer mounted (bc092eb). The internal service methods remain with the same gates as `drafts.publish` (admin, fresh step-up, designer validation).
 - Internal ports (no principal, system callers only): `registerChangeListener(listener)` (runs in-tx after audit on create/update/setLock/changeReference/transition/reassign; a throw aborts the write), `getOrderSyncView(orderPublicId, tx?)`, `getOrderRefByPublicId(id, tx?, { forUpdate? })`, `listOrderPublicIdsForSync({ afterPublicId?, limit ≤500 }, tx?)` (ascending publicId keyset, ids only). Automation triggers `order.created`, `order.status_changed`, `order.assigned` (context `order_reference`, `order_status_label`, `order_link`).
+
+## Increment 04 — workflow rules, phase locks, console order actions (package A, published day one; may gain fields, never lose them)
+
+### Definition extension (published versions and drafts; all optional, so every existing version parses unchanged)
+
+```ts
+phases?: { key: Key; label: string /* ≤60 */ }[]                 // ≤12, ordered
+states[n].phase?: Key                                             // must name a phase; statuses of one phase should be contiguous
+states[n].requirements?: {
+  uploads: { key: Key; label: string; hint?: string /* ≤200 */; kind: "document" | "audio";
+             minCount: number /* 0–20 */; maxCount: number /* 1–20, ≥ minCount */;
+             allowedTypes: string[] /* canonical extensions without dot, lowercase, ≤20; [] = any Files-approved format of the kind */;
+             uploadedBy: ("customer" | "staff" | "admin")[] /* ≥1 */ }[];            // ≤10 per status
+  acknowledgements: { key: Key; title: string /* ≤120 */; body: string /* plain text, ≤8000, no markup */;
+                      acceptedBy: "customer" | "staff"; requireTypedName: boolean }[]; // ≤5 per status
+}
+// Key = /^[a-z][a-z0-9_]{1,47}$/ (a subset of the Files slot-key format)
+```
+Setting `orders.workflow_rules.enabled` (default **false**, audited by the settings registry): while off, publishing a definition that contains phases or requirements is refused (`WORKFLOW_RULES_DISABLED`); already published rules are always enforced.
+
+### Semantics
+- **Requirements** of the order's current status must be met before ANY transition out of it (`VALIDATION:REQUIREMENTS_UNMET`, details `{ uploads: string[], acknowledgements: string[] }`). Upload count = `files.countFilesInSlot(orderId, slotKey, tx, { statusKey })` ≥ `minCount`. An acknowledgement is met when a record exists for (order, version, status, key) by the required side (customer = owner or contributor; staff = staff/admin).
+- **Phase lock:** a transition whose target status is in a different phase locks the phase being left (row in `order_phase_locks`). A locked phase's uploads, acknowledgements and customer-editable data are read-only. Re-entering a phase through a permitted transition reopens it (audited). Order-level `lockState` always wins.
+- **Acknowledgement record** (`order_acknowledgements`, insert-only, no update/withdraw): SHA-256 of the exact `title + "\n\n" + body` shown, workflow version, status, key, user, role, session id, time, optional typed name (encrypted). IP is captured in the audit event `order.acknowledgement.recorded` under the existing audit rules (not in the table).
+
+### tRPC
+| Procedure | Who | Input | Output / notes |
+| --- | --- | --- | --- |
+| `orders.requirements.forOrder` (query) | anyone with read access to the order | `{ orderId }` | `{ phases: { key, label, position: "done"\|"current"\|"upcoming", locked, lockedAt }[], status: { key, label, phaseKey }, uploads: { key, label, hint, kind, minCount, maxCount, allowedTypes, count, met, canUpload }[], acknowledgements: { key, title, body, textSha256, acceptedBy, requireTypedName, met, acceptedAt, canAccept }[], unmet: number, readOnly, readOnlyReason: "order_locked"\|"phase_locked"\|null, canUnlock }` |
+| `orders.requirements.acknowledge` (mutation) | required side with write access | `{ orderId, statusKey, ackKey, textSha256, typedName? (≤120) }` | `{ acknowledgementId, acceptedAt }`; `ACK_TEXT_CHANGED` if the hash differs, `ACK_ALREADY_RECORDED`, `PHASE_LOCKED`, `ORDER_LOCKED` |
+| `orders.phases.unlock` (mutation) | staff/admin + `orders.phase.unlock` | `{ orderId, phaseKey, reason (10–500), notifyCustomer }` | `{ unlocked: true }`; reason stored as a staff-only encrypted note; audit `order.phase.unlocked` |
+| `orders.admin.customerLookup` (query) | staff + `customers.read_all` | `{ query (2–120) }` | `{ publicId, name, customerRef }[]` (≤20, active customers only; e-mail never returned) |
+| `orders.admin.createForCustomer` (mutation) | admin + `orders.manage` | `{ customerPublicId, projectName, items, idempotencyKey }` | same as `orders.create`; owner = the customer; audit `order.created` with `created_for_customer: true` |
+| `orders.admin.access.list` (query) | staff + `orders.read_all` | `{ orderId } \| { customerPublicId }` | grants with role, scope `order`\|`customer`, grantee name, granted by/at |
+| `orders.admin.access.grant` (mutation, step-up) | admin + `orders.access.grant` | `{ scope: { orderId } \| { customerPublicId }, email, role: "viewer"\|"contributor" }` | grantee must be an existing active customer account other than the owner (`GRANTEE_NOT_FOUND` is the same answer for unknown and ineligible); a customer-scope grant covers all current and future orders of that customer; both parties notified; audit `order.access.granted` |
+| `orders.admin.access.revoke` (mutation, step-up) | admin + `orders.access.grant` | `{ grantId }` | revokes the grant (customer scope: and every order grant derived from it); audit `order.access.revoked` |
+Setting `orders.console_access.enabled` (default **false**) gates `access.grant`; `createForCustomer` and reassign follow their capabilities.
+
+### Ports for other modules
+- `getFileUploadSlots(principal, orderPublicId, tx?) → { statusKey, slots: { key, label, kind, maxCount, allowedTypes }[] }` — current status of the order's pinned version; only slots whose `uploadedBy` includes the actor's side; empty when the order is locked, the phase is locked or the actor lacks write access.
+- `assertFileStatusWritable(principal, orderPublicId, statusKey, tx?) → void` — throws `FORBIDDEN:PHASE_LOCKED` when `statusKey` belongs to a locked phase, `FORBIDDEN:ORDER_LOCKED` for an order lock; otherwise resolves (Files still applies its own rules).
+- Both re-read the order under the caller's tx; call them after locking the order row for final mutations.
