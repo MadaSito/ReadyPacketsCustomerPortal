@@ -16,6 +16,7 @@ import { jobsFeature } from "@/features/jobs/routes";
 import { portableFeature } from "@/features/portable/routes";
 import { backupFeature } from "@/features/backup/routes";
 import { integrationsFeature } from "@/features/integrations/routes";
+import { automationsFeature } from "@/features/automations/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
   authFeature,
@@ -33,6 +34,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   portableFeature,
   backupFeature,
   integrationsFeature,
+  automationsFeature,
 ];
 
 export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);
