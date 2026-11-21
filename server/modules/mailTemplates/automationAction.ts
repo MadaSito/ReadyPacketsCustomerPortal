@@ -16,11 +16,8 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
+import type { Mailer } from "../../core/types.js";
 import { users } from "../identity/schema.js";
-import {
-  ensureAutomationMailTemplateRegistered,
-  GENERIC_AUTOMATION_MAIL_TEMPLATE,
-} from "../automations/builtinActions.js";
 import {
   registerAutomationAction,
   type AutomationActionRegistration,
@@ -28,12 +25,49 @@ import {
   type AutomationActionRunResult,
   type AutomationScalarValue,
 } from "../automations/contracts.js";
-import { renderPlainTemplate } from "../automations/templates.js";
+import { substitutePlainText } from "./sanitizer.js";
 import {
   mailTemplates,
   mailTemplateVersions,
   type MailTemplateVariableSpec,
 } from "./schema.js";
+
+const GENERIC_AUTOMATION_MAIL_TEMPLATE = "automations.generic_notice";
+const registeredGenericMailers = new WeakSet<Mailer>();
+
+function ensureGenericAutomationTemplateRegistered(mailer: Mailer): void {
+  if (registeredGenericMailers.has(mailer)) return;
+  try {
+    mailer.registerTemplate({
+      key: GENERIC_AUTOMATION_MAIL_TEMPLATE,
+      vars: ["subject", "body", "recipient_name"],
+      subject: (vars) => String(vars.subject ?? "Portal notification"),
+      text: (vars) => {
+        const greeting =
+          typeof vars.recipient_name === "string" && vars.recipient_name.trim().length > 0
+            ? `Hello ${vars.recipient_name.trim()},\n\n`
+            : "";
+        return `${greeting}${String(vars.body ?? "")}`;
+      },
+    });
+  } catch {
+    // Already registered on this mailer instance.
+  }
+  registeredGenericMailers.add(mailer);
+}
+
+function renderGenericNoticeField(
+  template: string,
+  fields: Readonly<Record<string, AutomationScalarValue>>,
+  singleLine = false,
+): string {
+  const stringVars: Record<string, string> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    stringVars[k] = v === null || v === undefined ? "" : String(v);
+  }
+  const rendered = substitutePlainText(template, stringVars);
+  return singleLine ? rendered.replace(/[\r\n]+/g, " ").trim() : rendered;
+}
 
 const RESERVED_INTERNAL_TEMPLATE_KEYS = new Set(["jobs.mail.verify_audit_copy"]);
 const TEMPLATE_KEY_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
@@ -214,7 +248,7 @@ async function runSendTemplateAction(
 
   // Support starter-recipe `automations.generic_notice` seamlessly alongside Template Centre templates.
   if (config.templateKey === GENERIC_AUTOMATION_MAIL_TEMPLATE) {
-    ensureAutomationMailTemplateRegistered(deps.mailer);
+    ensureGenericAutomationTemplateRegistered(deps.mailer);
     if (ctx.dryRun) {
       return {
         outcome: "completed",
@@ -233,8 +267,8 @@ async function runSendTemplateAction(
           safeSummary: "Fixed destination e-mail address is invalid.",
         };
       }
-      const subject = renderPlainTemplate(config.subject ?? "Portal notification", ctx.fields, { singleLine: true });
-      const body = renderPlainTemplate(config.body ?? "", ctx.fields);
+      const subject = renderGenericNoticeField(config.subject ?? "Portal notification", ctx.fields, true);
+      const body = renderGenericNoticeField(config.body ?? "", ctx.fields, false);
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
@@ -282,10 +316,8 @@ async function runSendTemplateAction(
         }
       }
       const perRecipientFields = { ...ctx.fields, recipient_name: displayName };
-      const subject = renderPlainTemplate(config.subject ?? "Portal notification", perRecipientFields, {
-        singleLine: true,
-      });
-      const body = renderPlainTemplate(config.body ?? "", perRecipientFields);
+      const subject = renderGenericNoticeField(config.subject ?? "Portal notification", perRecipientFields, true);
+      const body = renderGenericNoticeField(config.body ?? "", perRecipientFields, false);
       await execWithAutomationCorrelation(() =>
         deps.mailer.enqueue({
           template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
