@@ -430,11 +430,13 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
       status: 200, headers: { "content-type": "application/json" }, body: '{"openapi":"3.1.0"}',
     }));
     h.services.publicApi = { handle } as unknown as typeof h.services.publicApi;
-    await h.http.get("/api/v1/openapi.json").set("Host", HOST)
-      .set("Cookie", requestCookies(h.config, TOKEN_A)).expect(200, { openapi: "3.1.0" });
+    const response = await h.http.get("/api/v1/openapi.json").set("Host", HOST)
+      .set("X-Request-Id", "untrusted-api-id").set("Cookie", requestCookies(h.config, TOKEN_A))
+      .expect(200, { openapi: "3.1.0" });
     expect(handle).toHaveBeenCalledWith(expect.objectContaining({
-      method: "GET", target: "/openapi.json", body: Buffer.alloc(0),
+      method: "GET", target: "/openapi.json", body: Buffer.alloc(0), requestId: response.headers["x-request-id"],
     }));
+    expect(response.headers["x-request-id"]).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
     expect(h.sessionResolver).not.toHaveBeenCalled();
   });
 
