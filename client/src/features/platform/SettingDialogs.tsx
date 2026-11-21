@@ -75,7 +75,6 @@ function SettingForm({ view, onSubmit }: { view: SettingView; onSubmit: (value: 
   }
 
   const errorCount = Object.keys(errors).length;
-  const rootError = errors._;
   const formBody = formOk ? (
     <div className="grid gap-4 pt-4">
       {hasUnsupportedPart(field) ? <Callout tone="info" title="Some parts are JSON only">Those parts show a JSON box; the JSON tab edits the whole value.</Callout> : null}
@@ -92,7 +91,7 @@ function SettingForm({ view, onSubmit }: { view: SettingView; onSubmit: (value: 
     <form id={SETTING_FORM} onSubmit={(e) => void submit(e)} noValidate className="grid gap-4">
       {errorCount > 0 ? (
         <Callout tone="danger" title={errorCount === 1 ? "1 field needs attention" : `${errorCount} fields need attention`}>
-          {rootError ?? "Check the highlighted fields and save again."}
+          Check the highlighted fields and save again.
         </Callout>
       ) : null}
       {formOk ? (

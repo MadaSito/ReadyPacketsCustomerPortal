@@ -99,7 +99,7 @@ function SettingsTable({ group, rows, onEdit, onSetSecret, onClearSecret }: { gr
         const page = managedPage(v);
         if (page) {
           return (
-            <Link href={page.href} className={buttonClasses({ variant: "ghost", size: "sm" })} aria-label={`Open ${page.label} to change ${v.label}`}>
+            <Link href={page.href} className={buttonClasses("ghost", "sm")} aria-label={`Open ${page.label} to change ${v.label}`}>
               Open {page.label}
               <ArrowRight aria-hidden="true" className="size-4" />
             </Link>

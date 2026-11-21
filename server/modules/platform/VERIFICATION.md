@@ -44,3 +44,14 @@ Server tests use isolated MySQL databases created with `tests/helpers/testDb.ts`
 - Readiness depends only on platform's own critical components. Peer modules affect health, not readiness.
 - `setupStatus` fails closed (`administratorExists: true` when unknown), so the first-run flow cannot be reopened by an outage.
 - Uploaded images have their metadata stripped and are served from a separate path with `default-src 'none'` and nosniff. Object GC happens only after a definitive transaction outcome.
+
+## Increment 03, package A: settings forms
+
+| Check | Evidence |
+|---|---|
+| Field descriptions derived from Zod (scalars, enums/literal unions, bounds, required/optional/nullable, defaults, nested objects, arrays of scalars; everything else "unsupported" so JSON only) | `settingFields.test.ts` |
+| Secrets never get a description; `fields` paths, `writeCapability` and `managedBy` href are validated at declaration (console paths only) | `settingFields.test.ts` |
+| Generic update / setSecret / import also re-validate each declared `writeCapability` inside the transaction (fresh step-up where required) | `router.ts` `settingWriteGuard` (code review; DB example tests unchanged) |
+| Edit dialog: Form tab by default, JSON tab on the same value, client pre-checks, server `details.fields` mapped onto fields (`aria-invalid`), axe clean | `client/src/features/platform/platform.test.tsx`, `fieldForm.test.ts` |
+| Settings page: search (live count for screen readers), collapsible groups (disclosure buttons with `aria-expanded`), link-out rows for E-mail delivery / Storage / SharePoint sync / Single sign-on, axe clean | `platform.test.tsx` |
+| Not run here: browser checks at 320 px and keyboard walkthrough (no browser in this sandbox); the layout is single-column below `sm` and uses kit controls |  |
