@@ -39,6 +39,7 @@ import { createPortableModule, type PortableModule } from "./modules/portable/in
 import { createBackupModule, type BackupModule } from "./modules/backup/index.js";
 import { createIntegrationsModule, type IntegrationsModule } from "./modules/integrations/index.js";
 import { createStorageModule, type StorageModule } from "./modules/storage/index.js";
+import { registerStorageOAuthAdapters } from "./modules/storage/oauth/register.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -122,6 +123,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.backup = createBackupModule(deps);
   services.integrations = createIntegrationsModule(deps);
   services.storageConnections = createStorageModule(deps);
+  registerStorageOAuthAdapters(services);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
