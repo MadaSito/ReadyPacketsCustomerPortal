@@ -313,7 +313,6 @@ export const INTEGRATIONS_SMTP_FLAG = defineFeatureFlag({
   group: "mail",
   label: "Outbound SMTP mail",
   description: "Enable TLS-verified SMTP delivery for queued outbound portal messages.",
-  managedBy: MAIL_MANAGED_BY,
 });
 
 export const INTEGRATIONS_CLARITY_FLAG = defineFeatureFlag({
@@ -368,7 +367,6 @@ export const INTEGRATIONS_GRAPH_FLAG = defineFeatureFlag({
   group: "mail",
   label: "Microsoft Graph mail & cloud integration",
   description: "Enable single-tenant Microsoft Graph client-credentials integration and outbound Graph mail.",
-  managedBy: MAIL_MANAGED_BY,
 });
 
 export const INTEGRATIONS_GRAPH_CONFIG = defineSetting({

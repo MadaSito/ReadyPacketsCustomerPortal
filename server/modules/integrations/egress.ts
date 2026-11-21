@@ -520,7 +520,38 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
-    req.on("error", () => {
+    let tlsConnected = false;
+    req.on("socket", (socket) => {
+      socket.once("secureConnect", () => {
+        tlsConnected = true;
+      });
+    });
+
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      const errCode = typeof err?.code === "string" ? err.code.toUpperCase() : "";
+      if (!tlsConnected && (errCode.includes("CERT") || errCode.includes("TLS") || errCode.includes("SSL"))) {
+        finishError(
+          new DomainError(
+            "FORBIDDEN",
+            "EGRESS_TLS_VALIDATION_FAILED",
+            "Outbound TLS certificate validation failed.",
+          ),
+        );
+        return;
+      }
+      if (
+        !tlsConnected &&
+        (errCode === "ECONNREFUSED" || errCode === "EHOSTUNREACH" || errCode === "ENETUNREACH")
+      ) {
+        finishError(
+          new DomainError(
+            "UNAVAILABLE",
+            "EGRESS_CONNECT_REFUSED",
+            "The outbound provider refused the TCP connection before TLS negotiation.",
+          ),
+        );
+        return;
+      }
       finishError(
         new DomainError(
           "UNAVAILABLE",

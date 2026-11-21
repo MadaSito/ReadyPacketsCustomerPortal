@@ -143,10 +143,13 @@ export interface GraphRequestInput {
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
+  rawBody?: Uint8Array;
   headers?: Record<string, string>;
   timeoutMs?: number;
   maxResponseBytes?: number;
   signal?: AbortSignal;
+  /** Runs after token acquisition + DNS/allowlist resolution and directly before opening the HTTPS socket (G-02). */
+  beforeSend?: () => Promise<void>;
 }
 
 export interface GraphResponse<T = unknown> {
@@ -162,10 +165,20 @@ export interface GraphUploadChunkInput {
   bytes: Uint8Array;
   /** e.g. `"bytes 0-327679/1048576"` */
   contentRange: string;
-  /** Optional additional host/suffix lineage restriction (e.g. `[siteHostname, "files.1drv.com"]`). */
+  /** Optional additional host/suffix lineage restriction (e.g. `[siteHostname, "*.files.1drv.com"]`). */
   allowedHostSuffixes?: readonly string[];
   timeoutMs?: number;
   signal?: AbortSignal;
+  beforeSend?: () => Promise<void>;
+}
+
+export interface GraphUploadSessionControlInput {
+  uploadUrl: string;
+  method: "GET" | "DELETE";
+  allowedHostSuffixes?: readonly string[];
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  beforeSend?: () => Promise<void>;
 }
 
 export interface GraphUploadChunkResult {
@@ -181,12 +194,14 @@ export class GraphApiError extends DomainError {
   readonly retryable: boolean;
   /** True only when the target Graph request may already have been transmitted over the wire. */
   readonly requestSent: boolean;
+  readonly reason: string;
 }
 
 export interface GraphClient {
   isConfigured(): Promise<boolean>;
   request<T = unknown>(input: GraphRequestInput): Promise<GraphResponse<T>>;
   uploadChunk(input: GraphUploadChunkInput): Promise<GraphUploadChunkResult>;
+  uploadSessionControl(input: GraphUploadSessionControlInput): Promise<GraphUploadChunkResult>;
 }
 ```
 

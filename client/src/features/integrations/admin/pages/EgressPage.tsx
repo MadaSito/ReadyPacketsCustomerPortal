@@ -19,7 +19,21 @@ type Purpose = Rule["purpose"];
 type Protocol = Rule["protocol"];
 type MatchType = Rule["matchType"];
 
-export const PURPOSE_LABELS: Record<Purpose, string> = { siem: "SIEM / syslog", smtp: "E-mail relay", webhook: "Webhook", sharepoint: "SharePoint", stripe: "Stripe", antivirus: "Malware scanner" };
+export const PURPOSE_LABELS: Record<Purpose, string> = {
+  siem: "SIEM / syslog",
+  smtp: "E-mail relay",
+  webhook: "Webhook",
+  sharepoint: "SharePoint",
+  stripe: "Stripe",
+  antivirus: "Malware scanner",
+  graph: "Microsoft Graph API",
+  graph_upload: "Microsoft Graph upload session",
+  entra_oidc: "Microsoft Entra OIDC",
+  storage_s3: "S3-compatible storage",
+  storage_azure: "Azure Blob Storage",
+  storage_dropbox: "Dropbox storage",
+  storage_gdrive: "Google Drive storage",
+};
 const PROTOCOL_LABELS: Record<Protocol, string> = { "https:": "HTTPS", "tls:": "TLS (syslog over TLS)", "smtp:": "SMTP with STARTTLS", "smtps:": "SMTP over implicit TLS" };
 const MATCH_LABELS: Record<MatchType, string> = { host: "Host name", ip: "IP address", cidr: "Address range (CIDR)" };
 const opts = <K extends string>(labels: Record<K, string>) => (Object.keys(labels) as K[]).map((value) => ({ value, label: labels[value] }));

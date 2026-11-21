@@ -18,14 +18,33 @@ const updateSmtpInputSchema = z.strictObject({
   tlsMode: z.enum(["starttls", "implicit"]),
   username: z.string().trim().max(254),
   password: z.string().max(1024).nullable().optional(),
-  fromAddress: z.string().trim().max(254),
-  fromName: z.string().trim().max(120),
+  fromAddress: z.string().trim().max(254).optional(),
+  fromName: z.string().trim().max(120).optional(),
   replyToAddress: z.string().trim().max(254).optional(),
 });
 
-const sendTestSmtpSchema = z.strictObject({
-  toAddress: z.string().trim().min(3).max(254),
+const sendTestSmtpSchema = z
+  .strictObject({
+    toAddress: z.string().trim().min(3).max(254).optional(),
+  })
+  .default({});
+
+const updateGraphInputSchema = z.strictObject({
+  enabled: z.boolean(),
+  tenantId: z.string().trim().max(64),
+  clientId: z.string().trim().max(64),
+  clientSecret: z.string().max(1024).nullable().optional(),
+  senderMailbox: z.string().trim().max(254).optional(),
+  enableEgressPreset: z.boolean().optional(),
 });
+
+const emptyOrOptionalObjectSchema = z.strictObject({}).default({});
+
+const sendTestGraphSchema = z
+  .strictObject({
+    toAddress: z.string().trim().min(3).max(254).optional(),
+  })
+  .default({});
 
 const updateAnalyticsInputSchema = z.strictObject({
   clarityEnabled: z.boolean(),
@@ -161,13 +180,30 @@ export const integrationsRouter = router({
 
     smtp: router({
       get: adminProcedure.query(({ ctx }) => ctx.services.integrations.smtp.getConfig()),
-      update: manageProcedure
+      update: adminProcedure
         .input(updateSmtpInputSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.smtp.updateConfig(ctx.session, input)),
-      sendTest: manageProcedure
+      sendTest: adminProcedure
         .meta({ rateLimit: "expensive" })
         .input(sendTestSmtpSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.smtp.sendTestMessage(ctx.session, input)),
+    }),
+
+    graphReadiness: adminProcedure.query(({ ctx }) => ctx.services.integrations.graphAdmin.getReadiness()),
+
+    graph: router({
+      get: adminProcedure.query(({ ctx }) => ctx.services.integrations.graphAdmin.getConfig()),
+      update: adminProcedure
+        .input(updateGraphInputSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.updateConfig(ctx.session, input)),
+      testConnection: adminProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(emptyOrOptionalObjectSchema)
+        .mutation(({ ctx }) => ctx.services.integrations.graphAdmin.testConnection(ctx.session)),
+      sendTest: adminProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(sendTestGraphSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.graphAdmin.sendTestMessage(ctx.session, input)),
     }),
 
     analytics: router({
