@@ -18,6 +18,13 @@ procedure.
   automatic certificates, a one-command server setup (`install-vps.sh`) and an operator wrapper
   (`rp-docker.sh`). The `container` workflow builds and exercises the stack end to end.
 
+### Fixed
+
+- Forced password change after the first sign-in: the page now asks for the "Temporary password" (with a
+  hint), no longer shows the misleading advice about passwords "used here before", reports a wrong
+  temporary password on that field, and gives password managers the account's sign-in name so that a
+  password saved for another account on the same address is not filled in.
+
 ## [0.1.0] - Unreleased
 
 ### Added

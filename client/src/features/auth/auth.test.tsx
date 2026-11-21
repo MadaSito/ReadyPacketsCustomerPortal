@@ -108,6 +108,34 @@ describe("sign-in behaviour", () => {
     await waitFor(() => expect(location.history?.at(-1)).toBe("/"));
   });
 
+  it("forced change: names the temporary password, and a wrong one is reported on that field, not on the new password", async () => {
+    const changePassword = vi.fn(async () => {
+      throw Object.assign(new Error("denied"), {
+        data: { safe: { domainCode: "VALIDATION", reasonCode: "CURRENT_PASSWORD_INCORRECT", safeMessage: "Your current password is incorrect." } },
+      });
+    });
+    const { container } = renderUi(<ChangePasswordPage />, {
+      path: "/change-password",
+      api: fakeAuthApi({ me: async () => remediationMe("change_password"), changePassword }),
+    });
+    await screen.findByRole("heading", { level: 1 });
+    expect(screen.queryByText(/haven't used here before/i)).not.toBeInTheDocument();
+    const temporary = screen.getByLabelText(/^Temporary password/);
+    expect(temporary).toHaveAttribute("autocomplete", "current-password");
+    expect(temporary).toHaveAccessibleDescription(/just signed in with/i);
+    // The sign-in name is present for password managers, and invisible to everyone else.
+    await waitFor(() => expect(container.querySelector('input[autocomplete="username"]')).toHaveValue("avery@example.test"));
+    expect(container.querySelector('input[autocomplete="username"]')).toHaveAttribute("aria-hidden", "true");
+    type(/^Temporary password/, "a password saved for the old site");
+    type(/^New password/, LONG_PASSWORD);
+    fireEvent.click(screen.getByRole("button", { name: "Save and continue" }));
+    await waitFor(() => expect(changePassword).toHaveBeenCalledWith({ currentPassword: "a password saved for the old site", newPassword: LONG_PASSWORD }));
+    await waitFor(() => expect(temporary).toHaveAttribute("aria-invalid", "true"));
+    expect(temporary).toHaveAccessibleDescription(/not the temporary password you signed in with/i);
+    expect(screen.getByLabelText(/^New password/)).not.toHaveAttribute("aria-invalid", "true");
+    await expectNoAxeViolations(container);
+  });
+
   it("password show/hide toggle is a labelled button that flips the input type and allows paste", () => {
     renderUi(<SignInPage />, { path: "/sign-in" });
     const input = screen.getByLabelText(/^password/i);

@@ -4,10 +4,24 @@ import { errorMessage, safeError } from "@/lib/trpc";
 import { Button, Field } from "@/ui";
 import { FormError, PasswordInput, PasswordMeter, useFocusOnError } from "./bits";
 
-/** New-password form shared by reset, activation and forced change. `withCurrent` adds the current password. */
-export function NewPasswordForm({ submitLabel, withCurrent, onSubmit }: { submitLabel: string; withCurrent?: boolean; onSubmit: (input: { currentPassword: string; password: string }) => Promise<void> }) {
+type NewPasswordFormProps = {
+  submitLabel: string;
+  /** Adds the field for the password in use now. */
+  withCurrent?: boolean;
+  /** Label, hint and wrong-password message of that field (defaults suit a voluntary change). */
+  currentLabel?: string;
+  currentHint?: string;
+  currentIncorrectMessage?: string;
+  /** The account's sign-in name, so that a password manager offers and saves the right entry. */
+  username?: string;
+  onSubmit: (input: { currentPassword: string; password: string }) => Promise<void>;
+};
+
+/** New-password form shared by reset, activation and forced change. */
+export function NewPasswordForm({ submitLabel, withCurrent, currentLabel = "Current password", currentHint, currentIncorrectMessage, username, onSubmit }: NewPasswordFormProps) {
   const [current, setCurrent] = useState("");
   const [password, setPassword] = useState("");
+  const [currentError, setCurrentError] = useState<string | undefined>();
   const [fieldError, setFieldError] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -17,9 +31,11 @@ export function NewPasswordForm({ submitLabel, withCurrent, onSubmit }: { submit
     event.preventDefault();
     const length = countCodePoints(password);
     if (withCurrent && !current) {
-      setError("Enter your current password.");
+      setCurrentError("This field is required.");
+      setError(`Enter the ${currentLabel.toLowerCase()}.`);
       return;
     }
+    setCurrentError(undefined);
     if (length < PASSWORD_POLICY.minLength || length > PASSWORD_POLICY.maxLength) {
       setFieldError(`Use between ${PASSWORD_POLICY.minLength} and ${PASSWORD_POLICY.maxLength} characters.`);
       setError("Please choose a longer password.");
@@ -34,6 +50,14 @@ export function NewPasswordForm({ submitLabel, withCurrent, onSubmit }: { submit
       setPassword("");
     } catch (err) {
       const safe = safeError(err);
+      if (safe?.reasonCode === "CURRENT_PASSWORD_INCORRECT") {
+        // Shown on the field it concerns, so it is not mistaken for a verdict on the new password.
+        const message = currentIncorrectMessage ?? safe.safeMessage;
+        setCurrentError(message);
+        setFieldError(undefined);
+        setError(message);
+        return;
+      }
       setFieldError(safe?.fieldErrors?.password?.[0] ?? safe?.fieldErrors?.newPassword?.[0]);
       setError(errorMessage(err));
     } finally {
@@ -45,9 +69,13 @@ export function NewPasswordForm({ submitLabel, withCurrent, onSubmit }: { submit
     <>
       <FormError message={error} focusRef={errorRef} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
-        {/* Hidden username helps password managers associate the new password with the account. */}
+        {/* The sign-in name, out of sight: a password manager then matches its saved entries to this account
+            instead of filling in a password saved for another one, and files the new password correctly. */}
+        {username ? (
+          <input type="text" name="username" autoComplete="username" value={username} readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
+        ) : null}
         {withCurrent ? (
-          <Field label="Current password" required>
+          <Field label={currentLabel} hint={currentHint} error={currentError} required>
             <PasswordInput autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} maxLength={1024} />
           </Field>
         ) : null}
