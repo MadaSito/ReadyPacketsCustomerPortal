@@ -115,6 +115,7 @@ export interface RequestSignals {
   address: Address | undefined;
   country: string | null;
   oversize: boolean;
+  recovery?: boolean;
 }
 
 export function inspectedHeaderNames() { return inspectedHeaders; }
@@ -158,7 +159,7 @@ export function compilePolicy(policy: ProtectionPolicy) {
     for (const group of managedGroups) {
       const mode = policy.managed[group];
       if (mode !== "off" && managedMatch(group, signals)) {
-        const blocked = match(`managed.${group}`, mode === "block");
+        const blocked = match(`managed.${group}`, mode === "block" && !signals.recovery);
         if (blocked) return blocked;
       }
     }
@@ -175,7 +176,8 @@ export function compilePolicy(policy: ProtectionPolicy) {
           rule.operator === "prefix" ? haystack.startsWith(rule.needle) : haystack.includes(rule.needle);
       }
       if (matches) {
-        const blocked = match(`custom.${rule.id}`, rule.action === "block");
+        const addressRule = rule.field === "ip" || rule.field === "country";
+        const blocked = match(`custom.${rule.id}`, rule.action === "block" && (addressRule || !signals.recovery));
         if (blocked) return blocked;
       }
     }

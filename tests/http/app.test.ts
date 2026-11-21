@@ -377,6 +377,50 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
+  it("isolates increment 04 routers, preserves signed bytes and refuses alias, preview and alternate methods", async () => {
+    const inbound = vi.fn();
+    const returns = vi.fn();
+    const publicApi = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/orders", (req, res) => {
+        expect(Buffer.isBuffer(req.body)).toBe(true);
+        expect(getRequestContext()?.actor).toBeUndefined();
+        res.json({ raw: req.body.toString("utf8"), path: req.path, requestId: getRequestContext()?.requestId });
+      });
+      return r;
+    };
+    const inboundWebhooks = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/hook", (req, res) => { inbound(req.body); res.status(204).end(); });
+      return r;
+    };
+    const paymentReturn = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.get("/example", (_req, res) => { returns(); res.status(204).end(); });
+      return r;
+    };
+    const raw = "{\n  \"status\" : \"synthetic\"\n}";
+    const h = harness({ isolatedRouters: { publicApi, inboundWebhooks, paymentReturn } }, { aliasHosts: ["portal.readypackets.test"] });
+    const api = await h.http.post("/api/v1/orders").set("Host", HOST).set("X-RP-CSRF", "synthetic")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("json").send(raw).expect(200);
+    expect(api.body).toEqual({ raw, path: "/orders", requestId: api.headers["x-request-id"] });
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("json").send(raw).expect(204);
+    expect(inbound).toHaveBeenCalledWith(Buffer.from(raw));
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("text").send(raw).expect(400);
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("json").send({ huge: "a".repeat(270_000) }).expect(413);
+    await h.http.get("/api/webhooks/inbound/hook").set("Host", HOST).expect(404);
+    await h.http.post("/api/v1/missing").set("Host", HOST).type("json").send(raw).expect(404);
+    await h.http.post("/API/V1/orders").set("Host", HOST).type("json").send(raw).expect(404);
+    await h.http.get("/api/payments/return/example").set("Host", HOST).expect(204);
+    const alias = await h.http.get("/Api/Payments/Return/example?state=synthetic-query").set("Host", "portal.readypackets.test").expect(404);
+    expect(alias.headers.location).toBeUndefined();
+    expect(JSON.stringify(h.access.mock.calls)).not.toContain("synthetic-query");
+    expect(returns).toHaveBeenCalledTimes(1);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    const preview = harness({ isolatedRouters: { publicApi } }, { deploymentProfile: "preview" });
+    await preview.http.post("/api/v1/orders").set("Host", HOST).type("json").send(raw).expect(404);
+  });
+
   it("passes only narrow webhook bytes ahead of JSON parsing and enforces request body limits", async () => {
     const signedWebhookRouter = Router();
     signedWebhookRouter.post("/synthetic", (req, res) => {
