@@ -108,7 +108,7 @@ export function PaymentSettings({ settings, saving, onSave }: {
         {provider !== "none" ? <Callout title={mode === "live" ? "Live charges" : "Test payments only"}
           tone={mode === "live" ? "warning" : "info"}>
           {mode === "live" ? "Customers can make real payments after this change is saved. Use credentials and webhook settings for the live account." :
-            "Use sandbox credentials to test the checkout and webhook flow without taking a real payment."}
+            "Use sandbox credentials on a staging instance with test invoices. Sandbox payments do not move real money."}
         </Callout> : <Callout title="Invoice-only payments" tone="info">No hosted payment link is offered. Customers can still receive invoices.</Callout>}
         <div className="grid min-w-0 gap-4 sm:grid-cols-2">
           <Field label="Success return path" hint="Use an internal /checkout, /invoices or /orders path." required>

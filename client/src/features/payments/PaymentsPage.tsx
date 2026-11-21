@@ -191,7 +191,7 @@ export default function PaymentsPage() {
       attempts={<Attempts />} webhooks={<Webhooks />} />
     <ConfirmDialog title="Reconcile pending payments?" open={reconcileOpen} onOpenChange={setReconcileOpen} confirmLabel="Reconcile now" onConfirm={runReconcile}>
       <Callout tone="info" title="What reconciliation does">
-        Checks provider records for previously verified events. It does not start any new charges.
+        Checks provider records for pending attempts. It can book payments backed by a verified webhook, but does not start any new charges.
       </Callout>
     </ConfirmDialog>
   </>;
