@@ -15,6 +15,10 @@ const FOLDER = "application/vnd.google-apps.folder";
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 const listing = z.object({ files: z.array(z.object({ id, mimeType: z.string().max(200) })).max(2),
   nextPageToken: z.string().optional(), incompleteSearch: z.boolean().optional() });
+const folder = z.object({
+  id, name: z.string().max(255), mimeType: z.literal(FOLDER), trashed: z.literal(false), parents: z.array(id).length(1),
+  appProperties: z.object({ rpObject: z.string(), rpConnection: z.string() }),
+});
 const metadata = z.object({
   id, size: z.string().regex(/^(0|[1-9][0-9]{0,15})$/).transform(Number).pipe(z.number().int().safe()),
   sha256Checksum: z.string().regex(/^[a-f0-9A-F]{64}$/).transform((value) => value.toLowerCase()).optional(),
@@ -35,15 +39,18 @@ function uploadSession(location: string | undefined, path: string): URL {
     if (!location || location.length > 4096 || /[\s\\]/.test(location)) throw dataError();
     const url = new URL(location);
     const sessions = url.searchParams.getAll("upload_id");
+    const modes = url.searchParams.getAll("uploadType");
     if (url.origin !== ORIGIN || url.username || url.password || url.hash || url.pathname !== path ||
         sessions.length !== 1 || !/^[A-Za-z0-9_-]{1,2048}$/.test(sessions[0]!) ||
         Array.from(url.searchParams.keys()).some((key) => key !== "upload_id" && key !== "uploadType") ||
-        url.searchParams.getAll("uploadType").some((mode) => mode !== "resumable")) throw dataError();
+        modes.length > 1 || modes.some((mode) => mode !== "resumable")) throw dataError();
     return url;
   } catch { throw dataError(); }
 }
 
-export function googleDriveAdapter(request: StorageRequest): StorageAdapterDefinition<OAuthStorageConfig, OAuthStorageCredentials> {
+export type ReserveDriveFolder = (locator: string, generate: () => Promise<string>) => Promise<string>;
+
+export function googleDriveAdapter(request: StorageRequest, reserveFolder: ReserveDriveFolder): StorageAdapterDefinition<OAuthStorageConfig, OAuthStorageCredentials> {
   return {
     configSchema: oauthConfigSchema, credentialsSchema: oauthCredentialsSchema, purposes: ["order_files", "backups"],
     create({ publicId, config, credentials }) {
@@ -75,6 +82,15 @@ export function googleDriveAdapter(request: StorageRequest): StorageAdapterDefin
         [appPropertyKey]: objectKey(parent, name), rpConnection: publicId,
       });
       const folderCache = new Map<string, string>();
+      let account: string | undefined;
+      async function accountKey(signal?: AbortSignal): Promise<string> {
+        if (!account) {
+          const about = parseResponse(await api(apiUrl("/drive/v3/about", { fields: "user(permissionId)" }), { signal }),
+            z.object({ user: z.object({ permissionId: id }) }));
+          account = about.user.permissionId;
+        }
+        return account;
+      }
       async function resolveFolder(path: readonly string[], signal?: AbortSignal, fence?: () => Promise<void>) {
         let parent = "root";
         for (const name of pathParts({ ...config, rootPath: config.rootPath || "ReadyPackets" }, path)) {
@@ -82,17 +98,27 @@ export function googleDriveAdapter(request: StorageRequest): StorageAdapterDefin
           const cached = folderCache.get(cacheKey);
           if (cached) { parent = cached; continue; }
           const existing = await lookup(parent, name, signal);
-          if (existing && existing.mimeType !== FOLDER) throw dataError();
-          if (existing) parent = existing.id;
-          else {
-            const created = parseResponse(await api(apiUrl("/drive/v3/files", { fields: "id,mimeType" }), {
-              method: "POST", signal, ...json({ name, mimeType: FOLDER, parents: [parent], appProperties: properties(parent, name) }),
-            }, fence, true), z.object({ id, mimeType: z.literal(FOLDER) }), [200, 201]);
-            // Drive does not have a unique name constraint. Verify the newly created path is unambiguous.
-            const check = await lookup(parent, name, signal);
-            if (!check || check.id !== created.id || check.mimeType !== FOLDER) throw dataError();
-            parent = created.id;
+          if (existing && existing.mimeType !== FOLDER) throw new StorageAdapterError("DESTINATION_CONFLICT");
+          const expectedProperties = properties(parent, name);
+          const locator = JSON.stringify([publicId, config.clientId, await accountKey(signal), parent, name]);
+          const reservedId = await reserveFolder(locator, async () => {
+            if (existing) return existing.id;
+            return parseResponse(await api(apiUrl("/drive/v3/files/generateIds", { count: "1", space: "drive", type: "files" }), { signal }, fence),
+              z.object({ ids: z.array(id).length(1) })).ids[0]!;
+          });
+          if (!id.safeParse(reservedId).success || (existing && existing.id !== reservedId)) throw new StorageAdapterError("DESTINATION_CONFLICT");
+          if (!existing) {
+            // Folders support pre-generated IDs. A repeated create gets 409, never another folder.
+            const created = await api(apiUrl("/drive/v3/files", { fields: "id" }), {
+              method: "POST", signal, ...json({ id: reservedId, name, mimeType: FOLDER, parents: [parent], appProperties: expectedProperties }),
+            }, fence);
+            if (created.status !== 409 && parseResponse(created, z.object({ id }), [200, 201]).id !== reservedId) throw integrityError();
           }
+          const verified = parseResponse(await api(apiUrl(`/drive/v3/files/${reservedId}`,
+            { fields: "id,name,parents,mimeType,trashed,appProperties" }), { signal }), folder);
+          if (verified.id !== reservedId || verified.name !== name || (parent !== "root" && verified.parents[0] !== parent) ||
+              verified.appProperties.rpObject !== expectedProperties[appPropertyKey] || verified.appProperties.rpConnection !== publicId) throw integrityError();
+          parent = verified.id;
           folderCache.set(cacheKey, parent);
         }
         return parent;

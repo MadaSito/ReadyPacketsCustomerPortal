@@ -1,0 +1,8 @@
+# Dropbox and Google Drive verification
+
+The provider tests use local, synthetic protocol fakes only. No Dropbox or Google API was contacted, no real credential or cloud account was used, and no real browser/provider consent, native deployment, or TLS edge behavior is claimed.
+
+- `scripts/dev/test.sh server/modules/storage/oauth/oauth.test.ts`: isolated MySQL coverage for encrypted grant storage, one-time state under concurrent callbacks, browser/provider and live-session binding, expiry, stale versions, revocation, post-exchange reauthorization, malformed grants, local-first disconnect and uncertain remote revocation. Also tests the application HTTP pipeline, including CSRF, the separate Lax binder, HEAD rejection, canonical host refusal without `Location`, no referrer, and query-free callback logging. Two Drive workers share one encrypted folder ID reservation; the real egress policy runs with synthetic DNS and HTTPS handlers.
+- `scripts/dev/test.sh server/modules/storage/oauth/adapters.test.ts`: local protocol fakes exercise refresh, Dropbox stable paths, bounded upload sessions, checksums, source verification and write fences; Drive resumable ranges, write fences, provider URL origin/path locking, metadata verification and explicit deletion.
+
+Before enabling production use, follow the [administrator API and registration guide](API.md) on the canonical deployment. Use a designated test account and non-sensitive test data for a manual provider acceptance test, including consent, transfer, disconnect and provider-side confirmation. No live-provider acceptance test was run for this increment.

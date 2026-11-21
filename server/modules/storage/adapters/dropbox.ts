@@ -55,7 +55,7 @@ export function dropboxAdapter(request: StorageRequest): StorageAdapterDefinitio
           try {
             // App Folder access and metadata scope; no mutation or user/account-read scope.
             parseResponse(await rpc("files/list_folder", { path: "", limit: 1 }, signal),
-              z.object({ entries: z.array(z.unknown()).max(1) }));
+              z.object({ entries: z.array(z.unknown()) }));
             return { ok: true, code: "OK" };
           } catch (error) { return testResult(error); }
         },

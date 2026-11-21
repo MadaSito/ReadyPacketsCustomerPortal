@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { and, eq, lte } from "drizzle-orm";
 import type { Services } from "../../../container.js";
-import { DomainError, conflict, validation } from "../../../core/errors.js";
+import { conflict, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
 import { setRequestActor } from "../../../core/requestContext.js";
 import type { AuditOutcome, SessionPrincipal, Tx } from "../../../core/types.js";
@@ -120,7 +120,7 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
       const row = await claim(provider, input.state, input.binder);
       const target = { provider, publicId: row.connectionPublicId, expectedVersion: row.expectedVersion };
       let principal: SessionPrincipal | undefined;
-      let acquired: { app: OAuthApp; refreshToken: string } | undefined;
+      let grantAcquired = false;
       try {
         const material = open(row.payloadEnc!, row.attemptId);
         principal = material.principal;
@@ -136,7 +136,7 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
         setRequestActor({ userId: actor.userId, role: actor.role, sessionId: actor.sessionId });
         if (!input.code) throw callbackDenied();
         const grant = await exchangeCode(requestFor(provider), provider, app, { code: input.code, verifier: material.verifier, redirectUri: row.redirectUri });
-        acquired = { app, refreshToken: grant.refreshToken };
+        grantAcquired = true;
         await services.db.transaction(async (tx) => {
           await readSetup(actor, target, tx);
           await assertMarker(tx, row);
@@ -150,8 +150,8 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
       } catch {
         // Deliberately do not revoke here: an ambiguous COMMIT or an expired revision could otherwise
         // revoke a valid grant. Incomplete connections can be removed in the provider's console.
-        if (principal) await audit(services, target, "connect", "failed", principal, row.attemptId, undefined,
-          acquired ? "STORAGE_OAUTH_GRANT_NOT_CONFIRMED" : "STORAGE_OAUTH_CALLBACK_REJECTED");
+        if (principal) await audit(services, target, "connect", grantAcquired ? "unknown" : "failed", principal, row.attemptId, undefined,
+          grantAcquired ? "STORAGE_OAUTH_GRANT_NOT_CONFIRMED" : "STORAGE_OAUTH_CALLBACK_REJECTED");
         throw callbackDenied();
       } finally {
         await services.db.delete(attempts).where(owned(row.connectionPublicId, row.attemptId));

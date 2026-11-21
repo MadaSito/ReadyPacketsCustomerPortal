@@ -88,11 +88,17 @@ describe("Dropbox protocol fake", () => {
 describe("Google Drive protocol fake", () => {
   function drive(data: Buffer, location = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=local", mismatch = false) {
     let properties: unknown;
+    const desiredKey = createHash("sha256").update(JSON.stringify([publicId, "root", "ReadyPackets"])).digest("hex");
     const request = vi.fn<StorageRequest>().mockImplementation(async (target, opts) => {
       const url = new URL(target);
       if (url.hostname === "oauth2.googleapis.com") return answer(200, validGrant);
       expect(url.hostname).toBe("www.googleapis.com");
       expect(opts?.headers?.Authorization).toBe("Bearer local-fake-access");
+      if (url.pathname === "/drive/v3/about") return answer(200, { user: { permissionId: "account-fake" } });
+      if (url.pathname === "/drive/v3/files/fake_folder") return answer(200, {
+        id: "fake_folder", name: "ReadyPackets", mimeType: "application/vnd.google-apps.folder", parents: ["fake_root"],
+        appProperties: { rpObject: desiredKey, rpConnection: publicId }, trashed: false,
+      });
       if (url.pathname === "/drive/v3/files" && opts?.method !== "POST") {
         const q = url.searchParams.get("q")!;
         const files = q.includes("'ReadyPackets'") ? [{ id: "fake_folder", mimeType: "application/vnd.google-apps.folder" }] : [];
@@ -117,7 +123,7 @@ describe("Google Drive protocol fake", () => {
       });
       throw new Error("Unexpected fake Google Drive request");
     });
-    return { request, adapter: googleDriveAdapter(request).create({ publicId, config, credentials }) };
+    return { request, adapter: googleDriveAdapter(request, async (_, generate) => generate()).create({ publicId, config, credentials }) };
   }
 
   it("uses the app-created root, checks range acknowledgements and fetches independent integrity metadata", async () => {

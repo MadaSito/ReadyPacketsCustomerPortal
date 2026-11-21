@@ -2,6 +2,7 @@ import { lte } from "drizzle-orm";
 import type { Services } from "../../../container.js";
 import { dropboxAdapter } from "../adapters/dropbox.js";
 import { googleDriveAdapter } from "../adapters/googleDrive.js";
+import { reserveGoogleDriveFolder } from "./googleDriveFolders.js";
 import { providerRequest, type StorageOAuthProvider } from "./provider.js";
 import { storageOAuthAttempts } from "./schema.js";
 
@@ -11,7 +12,8 @@ export function requestForOAuthProvider(services: Services, provider: StorageOAu
 
 export function registerStorageOAuthAdapters(services: Services): void {
   services.storageConnections.registerAdapter("dropbox", dropboxAdapter(requestForOAuthProvider(services, "dropbox")));
-  services.storageConnections.registerAdapter("google_drive", googleDriveAdapter(requestForOAuthProvider(services, "google_drive")));
+  services.storageConnections.registerAdapter("google_drive", googleDriveAdapter(requestForOAuthProvider(services, "google_drive"),
+    reserveGoogleDriveFolder(services)));
   const prune = "storage.oauth.prune";
   services.jobs.register(prune, async (job) => {
     await services.db.transaction(async (tx) => {

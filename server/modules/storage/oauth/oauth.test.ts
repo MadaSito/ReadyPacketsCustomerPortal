@@ -11,13 +11,16 @@ import type { SessionPrincipal } from "../../../core/types.js";
 import { createApp } from "../../../http/app.js";
 import { deriveSessionCsrfToken } from "../../../security/csrf.js";
 import { router } from "../../../trpc/trpc.js";
-import type { EgressFetchResponse } from "../../integrations/egress.js";
+import { createEgressPolicy, type EgressFetchResponse } from "../../integrations/egress.js";
+import { integrationEgressAllowlist } from "../../integrations/schema.js";
+import { googleDriveAdapter } from "../adapters/googleDrive.js";
 import { createStorageModule } from "../index.js";
 import { storageConnections } from "../schema.js";
 import { registerStorageOAuthRoutes } from "./http.js";
+import { reserveGoogleDriveFolder } from "./googleDriveFolders.js";
 import type { StorageRequest } from "./provider.js";
-import { registerStorageOAuthAdapters } from "./register.js";
-import { storageOAuthAttempts } from "./schema.js";
+import { registerStorageOAuthAdapters, requestForOAuthProvider } from "./register.js";
+import { storageGoogleDriveFolders, storageOAuthAttempts } from "./schema.js";
 import { OAUTH_TTL_MS, storageOAuthService } from "./service.js";
 
 vi.mock("../../../trpc/root.js", () => ({ appRouter: undefined }));
@@ -34,7 +37,9 @@ const origin = `https://${host}`;
 const cb = "/api/storage/oauth/callback/dropbox";
 
 let t: TestDb;
-beforeAll(async () => { t = await createTestDb({ schema: { storageConnections, storageOAuthAttempts } }); }, 20_000);
+beforeAll(async () => {
+  t = await createTestDb({ schema: { storageConnections, storageOAuthAttempts, storageGoogleDriveFolders, integrationEgressAllowlist } });
+}, 20_000);
 afterAll(async () => { await t?.cleanup(); });
 
 async function fixture(kind: "dropbox" | "google_drive" = "dropbox") {
@@ -135,6 +140,18 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     expect(f.h.audit.named("storage.oauth.connect").map(({ outcome }) => outcome)).not.toContain("completed");
   });
 
+  it("fails closed and consumes state if the high-impact audit cannot be persisted", async () => {
+    const f = await fixture();
+    const start = callbackData(await f.oauth.start(f.principal, f.target));
+    f.network.mockImplementationOnce(async () => { f.h.audit.failRecords = true; return response(200, grant); });
+    await expect(f.oauth.callback("dropbox", start)).rejects.toThrow();
+    f.h.audit.failRecords = false;
+    await expect(f.oauth.callback("dropbox", start)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
+    expect(f.network).toHaveBeenCalledOnce();
+    const [row] = await t.db.select().from(storageConnections).where(eq(storageConnections.publicId, f.target.publicId));
+    expect(row?.oauthConnected).toBe(false);
+  });
+
   it.each(["google_drive", "dropbox"] as const)("detaches %s before provider revocation and reports the actual outcome", async (kind) => {
     const f = await fixture(kind);
     const started = await f.oauth.start(f.principal, f.target);
@@ -196,5 +213,71 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     expect(logs).toHaveBeenCalledWith("http request", expect.objectContaining({ route: "/api/storage/oauth/callback/:provider", status: 303 }));
     expect(JSON.stringify(logs.mock.calls)).not.toContain(code);
     expect(JSON.stringify(logs.mock.calls)).not.toContain(state);
+  });
+
+  it("uses one encrypted generated Drive ID when workers create the same folder concurrently", async () => {
+    const f = await fixture("google_drive");
+    const created = new Map<string, Record<string, unknown>>();
+    let generated = 0;
+    const outbound: StorageRequest = async (target, options) => {
+      const path = new URL(target).pathname;
+      if (path === "/token") return response(200, grant);
+      if (path === "/drive/v3/about") return response(200, { user: { permissionId: "fake_account" } });
+      if (path === "/drive/v3/files/generateIds") return response(200, { ids: [`fake_folder_${++generated}`] });
+      if (path === "/drive/v3/files" && options?.method !== "POST") return response(200, { files: [] });
+      if (path === "/drive/v3/files") {
+        const payload = JSON.parse(options?.body as string) as Record<string, unknown> & { id: string };
+        if (created.has(payload.id)) return response(409);
+        created.set(payload.id, { ...payload, trashed: false, parents: ["drive_fake_root"] });
+        return response(200, { id: payload.id });
+      }
+      if (path.startsWith("/drive/v3/files/")) return response(200, created.get(path.split("/").at(-1)!));
+      throw new Error("unexpected local Drive request");
+    };
+    const definition = googleDriveAdapter(outbound, reserveGoogleDriveFolder(f.h.services));
+    const input = { publicId: f.target.publicId, config: { clientId: "synthetic-app" }, credentials: { clientSecret: secret, refreshToken: refresh } };
+    await Promise.all([definition.create(input).ensureFolder([]), definition.create(input).ensureFolder([])]);
+    expect(created.size).toBe(1);
+    expect(generated).toBeGreaterThanOrEqual(1);
+    const rows = await t.db.select().from(storageGoogleDriveFolders);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.providerIdEnc).toMatch(/^rpenc:/);
+    expect(JSON.stringify(rows)).not.toMatch(/fake_folder|fake_account|ReadyPackets/);
+  });
+
+  it("requires the real public-only egress policy before contacting either fake provider", async () => {
+    const f = await fixture();
+    let providerResponse = response(200, grant);
+    const httpsRequester = vi.fn(async () => providerResponse);
+    let address = "93.184.216.34";
+    const egress = createEgressPolicy(f.h.deps, {
+      dnsLookup: async () => [{ address, family: 4 }], httpsRequester,
+    });
+    f.h.services.integrations = { egress } as typeof f.h.services.integrations;
+    const dropbox = requestForOAuthProvider(f.h.services, "dropbox");
+    const gdrive = requestForOAuthProvider(f.h.services, "google_drive");
+    const dropboxUrl = "https://api.dropboxapi.com/oauth2/token";
+    const gdriveUrl = "https://oauth2.googleapis.com/token";
+    await expect(dropbox(dropboxUrl)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(gdrive(gdriveUrl)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(httpsRequester).not.toHaveBeenCalled();
+    await egress.setPresetEnabled(f.principal, { presetKey: "dropbox", enabled: true });
+    await egress.setPresetEnabled(f.principal, { presetKey: "google_drive", enabled: true });
+    await expect(dropbox(dropboxUrl)).resolves.toMatchObject({ status: 200 });
+    await expect(gdrive(gdriveUrl)).resolves.toMatchObject({ status: 200 });
+    address = "127.0.0.1";
+    await expect(dropbox(dropboxUrl)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(gdrive(gdriveUrl)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(httpsRequester).toHaveBeenCalledTimes(2);
+    address = "93.184.216.34";
+    providerResponse = { ...response(308), headers: { range: "bytes=0-1023", location: "https://outside.example.test/" } };
+    const driveUploadUrl = "https://www.googleapis.com/upload/drive/v3/files?upload_id=synthetic";
+    await expect(gdrive(driveUploadUrl, { method: "PUT", acceptUploadIncomplete: true })).resolves.toMatchObject({
+      status: 308, headers: { range: "bytes=0-1023" },
+    });
+    const progress = await gdrive(driveUploadUrl, { method: "PUT", acceptUploadIncomplete: true });
+    expect(progress.headers.location).toBeUndefined();
+    await expect(gdrive(driveUploadUrl, { method: "POST", acceptUploadIncomplete: true })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(dropbox(dropboxUrl, { method: "PUT", acceptUploadIncomplete: true })).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });

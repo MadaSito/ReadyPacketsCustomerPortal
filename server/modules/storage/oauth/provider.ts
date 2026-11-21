@@ -26,6 +26,7 @@ const grantSchema = z.object({
 });
 
 export function storageProviderError(status?: number): DomainError {
+  if (status === 429) return new DomainError("RATE_LIMITED", "STORAGE_PROVIDER_RATE_LIMITED", "The storage provider is throttling requests.");
   if (status === 400 || status === 401 || status === 403) {
     return new DomainError("VALIDATION", "STORAGE_OAUTH_AUTHORIZATION_REJECTED", "The storage provider refused the authorization. Check the app registration or reconnect the account.");
   }
@@ -71,7 +72,7 @@ async function requestGrant(
   const parsed = grantSchema.safeParse(payload);
   if (!parsed.success) throw storageProviderError();
   const data = parsed.data;
-  if (data.scope && !grantedScopes(provider, data.scope)) throw storageProviderError(403);
+  if (data.scope !== undefined && !grantedScopes(provider, data.scope)) throw storageProviderError(403);
   return { accessToken: data.access_token, refreshToken: data.refresh_token, expiresIn: data.expires_in };
 }
 
