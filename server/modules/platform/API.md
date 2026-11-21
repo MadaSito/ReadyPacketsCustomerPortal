@@ -217,3 +217,68 @@ Secrets: never any value; `configured: boolean` only.
 ## 8. Feature flags / settings declared by platform
 
 See `server/modules/platform/settings.ts` (presentation slides, support text, announcement banner).
+
+## 9. Increment 04, package J: cookie consent, privacy centre, public bootstrap
+
+Status: ports published first; implementation follows in the same files.
+
+### 9.1 Client ports (`client/src/lib`, platform-owned new files)
+
+```ts
+// @/lib/consent
+export type ConsentCategory = "necessary" | "preferences" | "analytics" | "session_replay";
+export interface ConsentChoices { preferences: boolean; analytics: boolean; session_replay: boolean }
+export interface ConsentState {
+  enabled: boolean;            // feature.privacy.consent is on (bootstrap); when false has() is false for all optional categories
+  decided: boolean;            // a choice exists for the CURRENT policy version and is younger than renewMonths
+  choices: ConsentChoices;     // all false until decided
+  policyVersion: number | null;
+  decidedAt: string | null;    // ISO
+  gpc: boolean;                // navigator.globalPrivacyControl === true or doNotTrack === "1"
+}
+export const consent: {
+  has(category: ConsentCategory): boolean;   // "necessary" is always true
+  snapshot(): ConsentState;
+  subscribe(listener: (state: ConsentState) => void): () => void; // fires on every change, incl. withdrawal
+  openPreferences(): void;                    // opens the preference centre (footer link / account page)
+};
+export function useConsent(): ConsentState & { has: (c: ConsentCategory) => boolean; openPreferences: () => void };
+
+// @/lib/features
+export function useFeatureEnabled(flag: string): boolean; // false while loading, unknown or not clientVisible
+export function useFeatureFlags(): (flag: string) => boolean; // one hook call for filtering many nav items
+export function useBootstrap(): { features: Record<string, boolean>; consent: { enabled: boolean; policyVersion: number; renewMonths: number } } | undefined;
+```
+
+The choice itself lives in first-party `localStorage["rp.consent.v1"]` (strictly necessary: it stores the
+choice; listed in the inventory). The preview build keeps it in memory only. Withdrawal removes the
+`_clck`, `_clsk`, `CLID`, `ANONCHK`, `MR`, `MUID`, `SM` and `ph_*` cookies and `ph_*` / `_cl*` storage
+entries that are readable from this origin. Third-party cookies on vendor domains cannot be removed by the
+site; the preference centre says so.
+
+### 9.2 Feature flags in the bootstrap
+
+`defineFeatureFlag({ ..., clientVisible: true })` publishes the flag's on/off state (and nothing else) in
+the public `platform.bootstrap` query, so `useFeatureEnabled("community")` can hide navigation. Flags
+without `clientVisible` never appear. Hiding navigation is UX only; every procedure still checks the flag.
+
+### 9.3 tRPC
+
+| Procedure | Guard | Notes |
+|---|---|---|
+| `platform.bootstrap` (query) | public | `{ features, consent: { enabled, policyVersion, renewMonths } }`, cached 60 s client-side |
+| `platform.consent.inventory` (query) | public | `{ policyVersion, renewMonths, categories[], items: CookieItem[] }`; items are plain text |
+| `platform.consent.record` (mutation) | public, `rateLimit: "form_submission"` | input `{ consentId?, policyVersion, choices, action: "accept_all" \| "reject_all" \| "save" \| "withdraw", source: "banner" \| "preferences" \| "account" \| "gpc", gpc }`; returns `{ consentId, recordedAt }`. Refused when the feature is off (`NOT_FOUND`/`CONSENT_DISABLED`), on a stale policy version (`CONFLICT`/`CONSENT_POLICY_CHANGED`) or inconsistent action/choices (`VALIDATION`). A full session attaches the user's public id. |
+| `platform.consent.mine` (query) | authenticated (full session) | my last 200 decisions (download is client-side JSON of the same data) |
+| `platform.admin.consent.stats` | admin + `privacy.consent.read` | counts by action, acceptance per category, by policy version, over `days` (1–400) |
+| `platform.admin.consent.search` | admin + `privacy.consent.read` | filters `from,to,action,source,policyVersion,consentId,userPublicId,gpc`; cursor, limit ≤ 100 |
+| `platform.admin.consent.export` | admin + `privacy.consent.read` | CSV of the same filters, ≤ 10 000 rows, audited `privacy.consent.exported` |
+
+Inventory, policy version and renewal period are settings (group `privacy`, `writeCapability:
+"privacy.consent.manage"`, `managedBy: /admin/privacy`) written through `platform.admin.settings.update`:
+`privacy.cookie_inventory`, `privacy.consent.policy_version` (1–100000), `privacy.consent.renew_months` (6–13,
+default 12). Flag `feature.privacy.consent` (clientVisible, off by default).
+
+Ledger table `platform_consent_records` (schema.ts): consent id (random, 22 chars), user public id when
+signed in, policy version, the three choices, action, source, GPC flag, keyed HMAC of the IP (never the IP),
+time. No user agent and no IP in clear.

@@ -1,0 +1,338 @@
+/**
+ * Cookie-consent store (increment 04, package J). Owner: platform_engineer (new file in @/lib by agreement
+ * with ui_foundation_engineer).
+ *
+ * The single client authority for "may this optional tool run?". Nothing optional runs until a choice is
+ * made: `has()` is false for every optional category until the feature is on AND a choice exists for the
+ * current policy version that is younger than the renewal period. Global Privacy Control / Do Not Track
+ * count as "reject" until the person chooses otherwise.
+ *
+ * The choice itself is stored in first-party localStorage (`rp.consent.v1`) because storing the choice is
+ * strictly necessary; it holds no personal data (random id, flags, version, time). The preview build keeps
+ * it in memory. The server ledger (platform.consent.record) is the proof; this copy is only the cache.
+ */
+import { useSyncExternalStore } from "react";
+import { RUNTIME } from "./runtime";
+
+export type ConsentCategory = "necessary" | "preferences" | "analytics" | "session_replay";
+export type OptionalCategory = Exclude<ConsentCategory, "necessary">;
+export const OPTIONAL_CATEGORIES: readonly OptionalCategory[] = ["preferences", "analytics", "session_replay"];
+
+export interface ConsentChoices {
+  preferences: boolean;
+  analytics: boolean;
+  session_replay: boolean;
+}
+
+export interface ConsentConfig {
+  enabled: boolean;
+  policyVersion: number | null;
+  renewMonths: number;
+}
+
+export interface ConsentState {
+  enabled: boolean;
+  /** A valid choice exists for the current policy version and renewal period. */
+  decided: boolean;
+  choices: ConsentChoices;
+  policyVersion: number | null;
+  decidedAt: string | null;
+  /** Browser signals Global Privacy Control or Do Not Track. */
+  gpc: boolean;
+  /** Random anonymous id that links this browser's decisions in the ledger (null before the first one). */
+  consentId: string | null;
+  /** The stored choice was made by the GPC / DNT signal, not by the person. */
+  bySignal: boolean;
+}
+
+interface StoredChoice {
+  v: 1;
+  id: string;
+  policyVersion: number;
+  choices: ConsentChoices;
+  decidedAt: string;
+  bySignal: boolean;
+}
+
+export const CONSENT_STORAGE_KEY = "rp.consent.v1";
+const NONE: ConsentChoices = Object.freeze({ preferences: false, analytics: false, session_replay: false });
+const CONSENT_ID = /^[A-Za-z0-9_-]{22}$/;
+
+let config: ConsentConfig = { enabled: false, policyVersion: null, renewMonths: 12 };
+let memoryChoice: StoredChoice | null = null;
+let loaded = false;
+let snapshotCache: ConsentState | null = null;
+let now: () => number = () => Date.now();
+const listeners = new Set<(state: ConsentState) => void>();
+const openListeners = new Set<() => void>();
+
+function storageAvailable(): Storage | null {
+  if (RUNTIME.preview || typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function parseStored(raw: string | null): StoredChoice | null {
+  if (!raw || raw.length > 1024) return null;
+  try {
+    const value = JSON.parse(raw) as Partial<StoredChoice> & { choices?: Partial<ConsentChoices> };
+    if (value.v !== 1 || typeof value.id !== "string" || !CONSENT_ID.test(value.id)) return null;
+    if (typeof value.policyVersion !== "number" || !Number.isInteger(value.policyVersion) || value.policyVersion < 1) return null;
+    if (typeof value.decidedAt !== "string" || Number.isNaN(Date.parse(value.decidedAt))) return null;
+    const c: Partial<ConsentChoices> = value.choices ?? {};
+    return {
+      v: 1,
+      id: value.id,
+      policyVersion: value.policyVersion,
+      decidedAt: value.decidedAt,
+      bySignal: value.bySignal === true,
+      choices: { preferences: c.preferences === true, analytics: c.analytics === true, session_replay: c.session_replay === true },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readChoice(): StoredChoice | null {
+  if (!loaded) {
+    loaded = true;
+    const store = storageAvailable();
+    if (store) {
+      try {
+        memoryChoice = parseStored(store.getItem(CONSENT_STORAGE_KEY));
+      } catch {
+        memoryChoice = null;
+      }
+    }
+  }
+  return memoryChoice;
+}
+
+function writeChoice(choice: StoredChoice | null): void {
+  memoryChoice = choice;
+  loaded = true;
+  const store = storageAvailable();
+  if (!store) return;
+  try {
+    if (choice) store.setItem(CONSENT_STORAGE_KEY, JSON.stringify(choice));
+    else store.removeItem(CONSENT_STORAGE_KEY);
+  } catch {
+    // Storage full or blocked: the in-memory copy still applies for this page.
+  }
+}
+
+/** Global Privacy Control or Do Not Track. */
+export function browserSignalsOptOut(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const nav = navigator as Navigator & { globalPrivacyControl?: boolean; msDoNotTrack?: string };
+  return nav.globalPrivacyControl === true || nav.doNotTrack === "1" || nav.msDoNotTrack === "1";
+}
+
+const MONTH_MS = 30.4375 * 24 * 60 * 60 * 1000;
+
+function compute(): ConsentState {
+  const stored = readChoice();
+  const gpc = browserSignalsOptOut();
+  const fresh =
+    stored !== null &&
+    config.policyVersion !== null &&
+    stored.policyVersion === config.policyVersion &&
+    now() - Date.parse(stored.decidedAt) < config.renewMonths * MONTH_MS &&
+    Date.parse(stored.decidedAt) <= now() + 5 * 60_000;
+  const decided = config.enabled && fresh;
+  return {
+    enabled: config.enabled,
+    decided,
+    choices: decided && stored ? { ...stored.choices } : { ...NONE },
+    policyVersion: config.policyVersion,
+    decidedAt: decided && stored ? stored.decidedAt : null,
+    gpc,
+    consentId: stored?.id ?? null,
+    bySignal: decided && stored ? stored.bySignal : false,
+  };
+}
+
+/* --------------------------------------------------------------- vendor clean-up on withdrawal */
+
+const VENDOR_COOKIES: Record<"analytics" | "session_replay", RegExp> = {
+  analytics: /^(ph_|__ph_|posthog)/i,
+  session_replay: /^(_clck|_clsk|CLID|ANONCHK|MR|MUID|SM|_cl)/,
+};
+
+function expireCookie(name: string): void {
+  const host = window.location.hostname;
+  const parts = host.split(".");
+  const domains = [""];
+  for (let i = 0; i < parts.length - 1; i += 1) domains.push(`; domain=.${parts.slice(i).join(".")}`);
+  for (const domain of domains) document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/${domain}`;
+}
+
+/** Removes the cookies and storage entries of a withdrawn category that this origin can reach. */
+export function removeVendorData(category: "analytics" | "session_replay"): void {
+  if (typeof document === "undefined") return;
+  const pattern = VENDOR_COOKIES[category];
+  for (const pair of document.cookie ? document.cookie.split(";") : []) {
+    const name = pair.split("=")[0]?.trim();
+    if (name && pattern.test(name)) expireCookie(name);
+  }
+  for (const store of [storageAvailable(), RUNTIME.preview ? null : safeSession()]) {
+    if (!store) continue;
+    try {
+      for (const key of Object.keys(store)) if (pattern.test(key)) store.removeItem(key);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function safeSession(): Storage | null {
+  try {
+    return typeof window === "undefined" ? null : window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function emit(previous: ConsentState): void {
+  snapshotCache = null;
+  const next = snapshot();
+  for (const category of ["analytics", "session_replay"] as const) {
+    if (previous.choices[category] && !next.choices[category]) removeVendorData(category);
+  }
+  if (JSON.stringify(previous) === JSON.stringify(next)) return;
+  for (const listener of listeners) {
+    try {
+      listener(next);
+    } catch {
+      // A failing subscriber never blocks the others.
+    }
+  }
+}
+
+function snapshot(): ConsentState {
+  snapshotCache ??= compute();
+  return snapshotCache;
+}
+
+function randomConsentId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/* --------------------------------------------------------------- public port */
+
+export const consent = {
+  /** "necessary" is always true; optional categories only after an explicit, current choice. */
+  has(category: ConsentCategory): boolean {
+    if (category === "necessary") return true;
+    const state = snapshot();
+    return state.decided && state.choices[category];
+  },
+  /** The consent feature is switched on by the administrator. */
+  enabled(): boolean {
+    return config.enabled;
+  },
+  snapshot,
+  subscribe(listener: (state: ConsentState) => void): () => void {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  },
+  /** Opens the preference centre (footer link, account page). */
+  openPreferences(): void {
+    for (const listener of openListeners) listener();
+  },
+};
+
+/* --------------------------------------------------------------- platform-internal (CookieConsent) */
+
+/** Fed by the platform consent component from the public bootstrap. */
+export function configureConsent(next: ConsentConfig): void {
+  const previous = snapshot();
+  config = { enabled: next.enabled, policyVersion: next.policyVersion, renewMonths: Math.min(13, Math.max(6, next.renewMonths)) };
+  emit(previous);
+}
+
+/** Stores a decision locally (after the server recorded it, or immediately for a GPC default). */
+export function applyConsentDecision(choices: ConsentChoices, meta: { consentId: string; policyVersion: number; decidedAt?: string; bySignal?: boolean }): void {
+  if (!CONSENT_ID.test(meta.consentId)) throw new Error("invalid consent id");
+  const previous = snapshot();
+  writeChoice({
+    v: 1,
+    id: meta.consentId,
+    policyVersion: meta.policyVersion,
+    choices: { preferences: choices.preferences, analytics: choices.analytics, session_replay: choices.session_replay },
+    decidedAt: meta.decidedAt ?? new Date(now()).toISOString(),
+    bySignal: meta.bySignal === true,
+  });
+  emit(previous);
+}
+
+/** The existing anonymous id, or a new random one (not stored until a decision is applied). */
+export function consentIdForNextDecision(): string {
+  return readChoice()?.id ?? randomConsentId();
+}
+
+export function onOpenPreferences(listener: () => void): () => void {
+  openListeners.add(listener);
+  return () => openListeners.delete(listener);
+}
+
+/* --------------------------------------------------------------- React */
+
+const subscribeReact = (cb: () => void) => consent.subscribe(() => cb());
+
+export function useConsent(): ConsentState & { has: (category: ConsentCategory) => boolean; openPreferences: () => void } {
+  const state = useSyncExternalStore(subscribeReact, snapshot, snapshot);
+  return { ...state, has: consent.has, openPreferences: consent.openPreferences };
+}
+
+/* --------------------------------------------------------------- tests */
+
+/** Test helper: sets config + choice directly (no storage). Pass `null` choices to clear. */
+export function __setConsentForTests(state: { enabled?: boolean; policyVersion?: number; renewMonths?: number; choices?: Partial<ConsentChoices> | null; decidedAt?: string; bySignal?: boolean; clock?: () => number }): void {
+  const previous = snapshot();
+  if (state.clock) now = state.clock;
+  config = {
+    enabled: state.enabled ?? config.enabled,
+    policyVersion: state.policyVersion ?? config.policyVersion ?? 1,
+    renewMonths: state.renewMonths ?? config.renewMonths,
+  };
+  loaded = true;
+  memoryChoice =
+    state.choices === null
+      ? null
+      : state.choices
+        ? {
+            v: 1,
+            id: memoryChoice?.id ?? "AAAAAAAAAAAAAAAAAAAAAA",
+            policyVersion: config.policyVersion ?? 1,
+            choices: { ...NONE, ...state.choices },
+            decidedAt: state.decidedAt ?? new Date(now()).toISOString(),
+            bySignal: state.bySignal === true,
+          }
+        : memoryChoice;
+  emit(previous);
+}
+
+/** Test helper: back to the initial state (feature off, no choice, real clock). */
+export function __resetConsentForTests(): void {
+  config = { enabled: false, policyVersion: null, renewMonths: 12 };
+  memoryChoice = null;
+  loaded = false;
+  now = () => Date.now();
+  snapshotCache = null;
+  listeners.clear();
+  openListeners.clear();
+  const store = storageAvailable();
+  try {
+    store?.removeItem(CONSENT_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
