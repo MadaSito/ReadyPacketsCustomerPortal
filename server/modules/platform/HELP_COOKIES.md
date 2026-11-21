@@ -9,7 +9,7 @@ are optional, and they only run if you allow them.
   These are always on.
 - **Preferences** — remembers settings such as layout choices.
 - **Analytics** — PostHog helps us understand which pages are used, so we can improve them.
-- **Session replay** — Microsoft Clarity records anonymised sessions (no typed passwords or form values) to
+- **Session replay** — Microsoft Clarity records how pages are used, with what you type hidden, to
   help us find problems.
 
 The full list, with each cookie's name, provider, purpose and duration, is in **Manage cookie preferences**.
