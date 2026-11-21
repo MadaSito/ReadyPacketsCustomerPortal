@@ -69,7 +69,12 @@ import { z } from "zod";
 import { entriesForEvent } from "../audit/triggerCatalogue.js";
 import { getStaticAutomationRegistrations } from "../automations/contracts.js";
 import { createStorageModule } from "../storage/index.js";
-import { storageAssignments, storageConnections, storageFileCopies } from "../storage/schema.js";
+import {
+  storageAssignments,
+  storageConnections,
+  storageCopyAttempts,
+  storageFileCopies,
+} from "../storage/schema.js";
 import { BACKUP_JOB_REMOTE_COPY, BACKUP_JOB_REMOTE_SWEEP } from "./offsite.js";
 // Side-effect import ensures backup setting definitions are registered in the platform settings registry.
 import "./settings.js";
@@ -96,6 +101,7 @@ const TEST_SCHEMA = {
   auditTombstones,
   storageConnections,
   storageAssignments,
+  storageCopyAttempts,
   storageFileCopies,
   backupArchives,
   backupVerifications,

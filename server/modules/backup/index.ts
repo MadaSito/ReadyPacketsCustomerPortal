@@ -70,6 +70,7 @@ import {
   getOffsiteBackupConfig,
   loadRemoteCopiesByBackupIds,
   maybeStageAutomaticOffsiteCopies,
+  mayRetryBackupOffsiteCopy,
   registerBackupAutomationTriggers,
   updateOffsiteBackupConfig,
   type Backup321Status,
@@ -284,8 +285,12 @@ export interface BackupModule extends ModuleLifecycle {
   ): Promise<OffsiteBackupConfigView>;
   copyOffsiteNow(
     principal: SessionPrincipal,
-    input: { backupPublicId: string; connectionPublicId?: string },
+    input: { backupPublicId: string; connectionPublicId?: string; expectedFailedJobId?: string },
   ): Promise<{ queued: BackupRemoteCopySummary[] }>;
+  mayRetryOffsiteCopy(
+    input: { backupPublicId: string; connectionPublicId: string; jobPublicId: string },
+    tx: Tx,
+  ): Promise<boolean>;
 }
 
 interface FilesBackupCollectorLike {
@@ -2314,5 +2319,7 @@ export function createBackupModule(deps: ModuleDeps, options: BackupModuleOption
     updateOffsiteConfig: (principal, input) => updateOffsiteBackupConfig(deps, principal, input),
 
     copyOffsiteNow: (principal, input) => copyBackupOffsiteNow(deps, isMaintenanceDraining, principal, input),
+
+    mayRetryOffsiteCopy: (input, tx) => mayRetryBackupOffsiteCopy(deps, input, tx),
   };
 }

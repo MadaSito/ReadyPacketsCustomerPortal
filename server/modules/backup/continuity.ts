@@ -491,6 +491,15 @@ export async function reconcileAndVerifyIsolatedRestore(options: {
           "UPDATE `mail_outbox` SET state = 'canceled', reason_code = 'RESTORE_QUARANTINED' WHERE state IN ('queued', 'sending', 'held')",
         );
         queuedMailQuarantined = (res as mysql.ResultSetHeader).affectedRows;
+        const [colRows] = await targetConn.query(
+          "SELECT COLUMN_NAME AS colName FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'mail_outbox' AND COLUMN_NAME = 'payload_enc'",
+          [targetMeta.database],
+        );
+        if ((colRows as { colName: string }[]).length > 0) {
+          await targetConn.execute(
+            "UPDATE `mail_outbox` SET payload_enc = NULL WHERE state IN ('canceled', 'unknown') AND payload_enc IS NOT NULL",
+          );
+        }
       }
       if (tableSet.has("platform_settings")) {
         const [res] = await targetConn.execute(
