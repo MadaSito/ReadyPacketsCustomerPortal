@@ -99,7 +99,7 @@ export async function qaRouteScenarios() {
   return resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
 }
 
-export async function openQaRoute(page, baseUrl, scenario, theme) {
+export async function openQaRoute(page, baseUrl, scenario, theme, beforeSteps) {
   const probe = await page.request.get(new URL("/api/trpc/identity.me", baseUrl).href, { timeout: 8_000, maxRedirects: 0 });
   try {
     const { result } = await probe.json();
@@ -127,6 +127,7 @@ export async function openQaRoute(page, baseUrl, scenario, theme) {
     if (scenario.heading) {
       await main.getByRole("heading", { level: 1, name: scenario.heading, exact: true }).waitFor({ state: "visible", timeout: 5_000 });
     }
+    await beforeSteps?.();
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
     for (const step of scenario.steps) {
       await page.getByRole(step.role, { name: step.name, exact: true }).press("Enter", { timeout: 5_000 });

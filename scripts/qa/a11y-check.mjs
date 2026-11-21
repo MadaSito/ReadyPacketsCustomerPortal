@@ -3,13 +3,14 @@
 import axe from "axe-core";
 import { launchQaBrowser } from "./lib/browser.mjs";
 import { openQaRoute, qaRouteScenarios } from "./lib/routes.mjs";
+import { createQaZoomDriver, setLiteralZoom } from "./lib/zoom.mjs";
 
 const tags = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"];
 // Desktop zoom-equivalent CSS viewports, NOT literal browser zoom. See ACCESSIBILITY.md.
 const sizes = [
-  { label: "desktop baseline", width: 1280, height: 960 },
-  { label: "200% reflow equivalent", width: 640, height: 480 },
-  { label: "400% reflow equivalent", width: 320, height: 240 },
+  { factor: 1, label: "desktop baseline", width: 1280, height: 960 },
+  { factor: 2, label: "200% reflow equivalent", width: 640, height: 480 },
+  { factor: 4, label: "400% reflow equivalent", width: 320, height: 240 },
 ];
 
 async function scan(page) {
@@ -31,7 +32,9 @@ async function scan(page) {
 }
 
 async function main() {
-  const { browser, baseUrl } = await launchQaBrowser();
+  const driver = process.env.QA_LITERAL_ZOOM === "1" ? await createQaZoomDriver() : await launchQaBrowser();
+  const { baseUrl } = driver;
+  const literalZoom = "openZoomProfile" in driver;
   let runs = 0;
   let failures = 0;
   try {
@@ -40,19 +43,30 @@ async function main() {
     for (const message of missing) console.error(`NOT CHECKED ${message}`);
     for (const scenario of cases) {
       for (const theme of ["light", "dark"]) {
-        for (const { label, width, height } of sizes) {
-          const scope = `${scenario.name} · ${theme} · ${label} (${width} CSS px viewport)`;
+        for (const { factor, label, width, height } of sizes) {
+          const mode = literalZoom ? `${factor * 100}% browser zoom` : label;
+          const scope = `${scenario.name} · ${theme} · ${mode} (≤${width} CSS px viewport)`;
           runs++;
-          let context;
+          let close;
           try {
-            context = await browser.newContext({
-              colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
-              acceptDownloads: false, serviceWorkers: "block",
-            });
+            let context;
+            let page;
+            let zoom;
+            if (literalZoom) {
+              const profile = await driver.openZoomProfile(theme, scenario.storageState);
+              ({ context, page, close } = profile);
+              zoom = () => setLiteralZoom(page, profile.worker, factor, width);
+            } else {
+              context = await driver.browser.newContext({
+                colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
+                acceptDownloads: false, serviceWorkers: "block",
+              });
+              close = () => context.close();
+              page = await context.newPage();
+            }
             // A disposable instance should not contact external analytics, fonts, or services during QA.
             await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
-            const page = await context.newPage();
-            await openQaRoute(page, baseUrl, scenario, theme);
+            await openQaRoute(page, baseUrl, scenario, theme, zoom);
             const result = await scan(page);
             const problems = [...result.violations];
             if (!result.lang) problems.push("missing document language");
@@ -68,15 +82,15 @@ async function main() {
             // Playwright diagnostics may include a route's synthetic ID or a reset token. Do not print raw errors.
             console.error(`FAIL ${scope}: browser could not reach or scan the expected state (check QA origin, features and fixture).`);
           } finally {
-            await context?.close();
+            await close?.();
           }
         }
       }
     }
-    console.log(`Automated a11y: ${runs} executed, ${failures} failed, ${missing.length} missing fixture entries. Literal 200%/400% browser zoom and manual checks are still required.`);
+    console.log(`Automated a11y: ${runs} executed, ${failures} failed, ${missing.length} missing fixture entries. ${literalZoom ? "Literal zoom verified for passing cases; manual checks still required." : "Literal 200%/400% browser zoom and manual checks are still required."}`);
     if (!runs || failures || missing.length) process.exitCode = 1;
   } finally {
-    await browser.close();
+    if (!literalZoom) await driver.browser.close();
   }
 }
 

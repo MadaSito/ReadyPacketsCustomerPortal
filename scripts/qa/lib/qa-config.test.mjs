@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { parseQaBaseUrl, qaChromiumPath } from "./browser.mjs";
 import { matchesQaRoute, resolveQaScenarios } from "./routes.mjs";
+import { setLiteralZoom } from "./zoom.mjs";
 
 test("QA setup accepts only plain HTTP origins", () => {
   assert.equal(parseQaBaseUrl("http://127.0.0.1:9090"), "http://127.0.0.1:9090");
@@ -58,4 +59,15 @@ test("explicit route fixtures add roles and concrete paths without redirecting t
   for (const rejected of ["//elsewhere.test/orders/id", "/orders/id#different", "/orders/../sign-in", "/\\elsewhere.test/orders/id"]) {
     assert.equal(matchesQaRoute("/orders/:id", rejected), false);
   }
+});
+
+test("literal zoom requires browser-reported zoom and waits for the matching DPR and viewport", async () => {
+  const worker = { evaluate: async (_fn, zoom) => zoom };
+  const page = {
+    evaluate: async () => ({ dpr: 1.25, width: 1280 }),
+    waitForFunction: async (_fn, args) => { assert.deepEqual(args, { dpr: 5, maxWidth: 320 }); },
+  };
+  await setLiteralZoom(page, worker, 4, 320);
+  await assert.rejects(setLiteralZoom(page, { evaluate: async () => 1 }, 4, 320), /did not report/);
+  await assert.rejects(setLiteralZoom({ evaluate: async () => ({ dpr: 1, width: 800 }) }, worker, 4, 320), /desktop zoom baseline/);
 });
