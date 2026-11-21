@@ -386,13 +386,13 @@ function adminSession(): MeResult {
 
 async function completeStepUpDialog() {
   const dialog = await screen.findByRole("dialog", { name: "Confirm it's you" });
-  fireEvent.change(within(dialog).getByLabelText(/Current password/), {
+  fireEvent.change(within(dialog).getByLabelText(/^Password/), {
     target: { value: "correct-horse-battery-staple" },
   });
-  fireEvent.change(within(dialog).getByLabelText(/Authenticator code/), {
+  fireEvent.change(within(dialog).getByLabelText(/6-digit code/), {
     target: { value: "123456" },
   });
-  fireEvent.click(within(dialog).getByRole("button", { name: "Verify and continue" }));
+  fireEvent.click(within(dialog).getByRole("button", { name: "Verify" }));
 }
 
 describe("E-mail delivery administration UI", () => {
@@ -457,19 +457,19 @@ describe("E-mail delivery administration UI", () => {
     });
 
     expect(await screen.findByRole("heading", { level: 1, name: "E-mail delivery" })).toBeTruthy();
-    expect(await screen.findByLabelText("SMTP host")).toHaveProperty("value", "smtp.example.test");
+    expect(await screen.findByLabelText(/SMTP host/)).toHaveProperty("value", "smtp.example.test");
     // Secrets are never echoed
-    expect(screen.getByLabelText("SMTP password")).toHaveProperty("value", "");
+    expect(screen.getByLabelText(/^SMTP password/)).toHaveProperty("value", "");
     await expectNoAxeViolations(container);
 
     // Block port 25 on SMTP before calling server
-    fireEvent.change(screen.getByLabelText("SMTP port"), { target: { value: "25" } });
+    fireEvent.change(screen.getByLabelText(/SMTP port/), { target: { value: "25" } });
     fireEvent.click(screen.getByRole("button", { name: "Save SMTP settings" }));
     expect(await screen.findByText(/Port 25 is forbidden/)).toBeTruthy();
     expect(updateSmtp).not.toHaveBeenCalled();
 
     // Fix port to 465, save with step-up
-    fireEvent.change(screen.getByLabelText("SMTP port"), { target: { value: "465" } });
+    fireEvent.change(screen.getByLabelText(/SMTP port/), { target: { value: "465" } });
     fireEvent.click(screen.getByRole("button", { name: "Save SMTP settings" }));
     await completeStepUpDialog();
 
@@ -499,14 +499,14 @@ describe("E-mail delivery administration UI", () => {
       api: fakeAuthApi({ me: async () => adminSession(), stepUp }),
     });
 
-    await screen.findByLabelText("SMTP host");
+    await screen.findByLabelText(/SMTP host/);
     const graphTab = screen.getByRole("tab", { name: /Microsoft Graph/ });
     fireEvent.mouseDown(graphTab, { button: 0 });
     fireEvent.click(graphTab);
 
     const tenantInput = await screen.findByLabelText(/Directory \(tenant\) ID/);
     expect(tenantInput).toHaveProperty("value", "11111111-2222-3333-4444-555555555555");
-    expect(screen.getByLabelText("Client secret")).toHaveProperty("value", "");
+    expect(screen.getByLabelText(/Client secret/)).toHaveProperty("value", "");
     expect(screen.getByText(/ends in …7q9z/)).toBeTruthy();
     await expectNoAxeViolations(container);
 
@@ -518,7 +518,7 @@ describe("E-mail delivery administration UI", () => {
 
     // Restore valid tenant GUID and rotate secret
     fireEvent.change(tenantInput, { target: { value: "11111111-2222-3333-4444-555555555555" } });
-    fireEvent.change(screen.getByLabelText("Client secret"), {
+    fireEvent.change(screen.getByLabelText(/Client secret/), {
       target: { value: "rotated-graph-secret-value" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save Microsoft Graph settings" }));
