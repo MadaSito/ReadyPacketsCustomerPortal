@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { conflict } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, publicProcedure, requireCapability, router } from "../../trpc/trpc.js";
 import { customerMaintenanceInput } from "./customerMaintenance.js";
@@ -52,5 +53,12 @@ export const jobsRouter = router({
     customerMaintenance: read.query(({ ctx }) => ctx.services.jobAdmin.customerMaintenance(ctx.session)),
     setCustomerMaintenance: maintenanceManage.input(customerMaintenanceInput)
       .mutation(({ ctx, input }) => ctx.services.jobAdmin.setCustomerMaintenance(ctx.session, input)),
+    endCustomerSessions: adminProcedure.use(requireCapability("sessions.revoke_any")).mutation(async ({ ctx }) => {
+      // Identity opens and audits its own transaction; no customer maintenance lock is held during revocation.
+      if (!(await ctx.services.jobAdmin.maintenance.customerAccess()).active) {
+        throw conflict("CUSTOMER_MAINTENANCE_INACTIVE", "Start customer maintenance before ending sessions from this page.");
+      }
+      return ctx.services.identity.sessions.endAllCustomers(ctx.session, { reasonCode: "CUSTOMER_MAINTENANCE" });
+    }),
   }),
 });

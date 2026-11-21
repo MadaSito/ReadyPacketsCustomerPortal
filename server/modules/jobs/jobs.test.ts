@@ -450,11 +450,22 @@ describe("MySQL durable job leases", () => {
       active: true, message: "Maintenance is in progress. Some operations are temporarily unavailable.",
     });
     const anonymous = caller({ ...publicContext, session: null });
+    const operator = caller({ ...publicContext, session: f.operator });
+    const endAll = vi.fn(async () => ({ ended: 3 }));
+    f.h.services.identity.sessions.endAllCustomers = endAll;
     expect(await anonymous.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
     await expect(anonymous.admin.customerMaintenance()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(operator.admin.endCustomerSessions()).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(endAll).not.toHaveBeenCalled();
     await f.admin.setCustomerMaintenance(f.operator, { enabled: true, startsAt: null, endsAt: null,
       message: "Planned work", expectedVersion: 0 });
     expect(await anonymous.maintenance.customerAccess()).toEqual({ active: true, message: "Planned work", expectedEnd: null });
+    await expect(anonymous.admin.endCustomerSessions()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller({ ...publicContext, session: fakePrincipal({ role: "admin" }) }).admin.endCustomerSessions())
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(endAll).not.toHaveBeenCalled();
+    expect(await operator.admin.endCustomerSessions()).toEqual({ ended: 3 });
+    expect(endAll).toHaveBeenCalledExactlyOnceWith(f.operator, { reasonCode: "CUSTOMER_MAINTENANCE" });
   });
 
   it("permits one manual attempt after exhausted retryable failure, without resetting the fence", async () => {

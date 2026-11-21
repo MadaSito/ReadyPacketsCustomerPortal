@@ -222,7 +222,7 @@ describe("Jobs administration pages", () => {
       "jobs.admin.maintenance": () => workerOpen,
       "jobs.admin.customerMaintenance": () => settings,
       "jobs.admin.setCustomerMaintenance": save,
-      "identity.admin.sessions.endAllCustomers": end,
+      "jobs.admin.endCustomerSessions": end,
     });
     await user.click(await screen.findByRole("checkbox", { name: "Enable customer maintenance" }));
     await user.type(screen.getByRole("textbox", { name: "Public message" }), "Planned maintenance");
@@ -243,7 +243,7 @@ describe("Jobs administration pages", () => {
     await user.type(within(dialog).getByRole("textbox", { name: /type end customer sessions/i }), "END CUSTOMER SESSIONS");
     await user.click(confirm);
     expect(await screen.findByText("3 customer sessions ended.")).toBeVisible();
-    expect(end).toHaveBeenCalledExactlyOnceWith({ reasonCode: "CUSTOMER_MAINTENANCE" });
+    expect(end).toHaveBeenCalledExactlyOnceWith(undefined);
   });
 
   it("renders customer maintenance status as inert text and includes the UTC expected end", async () => {

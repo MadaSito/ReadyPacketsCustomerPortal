@@ -6,7 +6,7 @@ import { Button, Callout, ConfirmDialog, StepUpCancelledError, useStepUp } from 
 export function EndCustomerSessions() {
   const trpc = useTRPC();
   const stepUp = useStepUp();
-  const endAll = useMutation(trpc.identity.admin.sessions.endAllCustomers.mutationOptions());
+  const endAll = useMutation(trpc.jobs.admin.endCustomerSessions.mutationOptions());
   const [open, setOpen] = useState(false);
   const [ended, setEnded] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -14,7 +14,7 @@ export function EndCustomerSessions() {
   async function confirm() {
     setError(null);
     try {
-      const result = await stepUp.run(() => endAll.mutateAsync({ reasonCode: "CUSTOMER_MAINTENANCE" }),
+      const result = await stepUp.run(() => endAll.mutateAsync(),
         { reason: "Ending customer sessions requires fresh verification." });
       setEnded(result.ended);
     } catch (failure) {
