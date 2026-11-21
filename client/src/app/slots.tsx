@@ -54,3 +54,29 @@ export function SsoSignInSlot({ next }: { next?: string }) {
 export function AnalyticsConsentSlot() {
   return AnalyticsConsentSlotImpl ? slot(<AnalyticsConsentSlotImpl />) : null;
 }
+
+/**
+ * Optional increment-04 slots, resolved by glob so the shell builds before (or without) the owning feature.
+ * Missing module or a thrown error renders nothing.
+ */
+function optionalSlot<P extends object>(loaders: Record<string, () => Promise<Record<string, unknown>>>, exportName: string) {
+  const loader = Object.values(loaders)[0];
+  if (!loader) return null;
+  return lazy(() => loader().then((m) => ({ default: m[exportName] as (props: P) => ReactNode })));
+}
+const CookieConsentImpl = optionalSlot<object>(import.meta.glob<Record<string, unknown>>("../features/platform/consent/CookieConsent.tsx"), "CookieConsent");
+const CustomerMaintenanceImpl = optionalSlot<object>(import.meta.glob<Record<string, unknown>>("../features/jobs/CustomerMaintenanceBanner.tsx"), "CustomerMaintenanceBanner");
+const CartBadgeImpl = optionalSlot<object>(import.meta.glob<Record<string, unknown>>("../features/cart/CartBadge.tsx"), "CartBadge");
+
+/** Cookie banner + preference centre (platform). Rendered first in every layout so it is first in tab order. */
+export function CookieConsentSlot() {
+  return CookieConsentImpl ? slot(<CookieConsentImpl />) : null;
+}
+/** Customer maintenance notice (jobs, decision 6): sign-in/register pages and the console shell. */
+export function CustomerMaintenanceSlot() {
+  return CustomerMaintenanceImpl ? slot(<CustomerMaintenanceImpl />) : null;
+}
+/** Cart item count next to the Cart navigation entry (cart feature). */
+export function CartBadgeSlot() {
+  return CartBadgeImpl ? slot(<CartBadgeImpl />) : null;
+}

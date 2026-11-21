@@ -4,7 +4,7 @@
  */
 import type { ReactNode } from "react";
 import { Link } from "wouter";
-import { BrandLogo } from "@/ui";
+import { BrandLogo, ThemeControl } from "@/ui";
 import { cn } from "@/ui/cn";
 import { ThemeToggle } from "@/app/shell/common";
 import { BrandSlideshow } from "./BrandSlideshow";
@@ -34,7 +34,8 @@ export function AuthLayout({ title, description, children, below, showcase = fal
           <Link href="/sign-in" aria-label="ReadyPackets sign in" className={cn("inline-flex rounded", showcase && "lg:invisible")}>
             <BrandLogo label="" className="w-44 sm:w-52" />
           </Link>
-          <ThemeToggle />
+          <ThemeControl className="hidden sm:inline-flex" />
+          <ThemeToggle className="sm:hidden" />
         </div>
         <div className="flex flex-1 items-start justify-center px-4 py-8 sm:items-center sm:px-8 sm:py-12">
           <div className={cn("w-full", wide ? "max-w-2xl" : "max-w-md")}>

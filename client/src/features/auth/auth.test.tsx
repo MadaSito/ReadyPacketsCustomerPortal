@@ -189,7 +189,7 @@ describe("MFA", () => {
   it("challenge offers passkey only when the user has one", async () => {
     const api = fakeAuthApi({ me: async () => remediationMe("mfa_challenge"), assuranceState: async () => assurance });
     renderUi(<MfaChallengePage />, { path: "/mfa", api });
-    await screen.findByRole("radiogroup");
+    await screen.findByRole("radio", { name: /authenticator app/i });
     expect(screen.queryByRole("radio", { name: /passkey/i })).not.toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /authenticator app/i })).toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /recovery code/i })).toBeInTheDocument();

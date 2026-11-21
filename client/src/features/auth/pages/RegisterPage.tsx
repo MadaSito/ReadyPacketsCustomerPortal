@@ -1,15 +1,23 @@
 import { useState, type FormEvent } from "react";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { PASSWORD_POLICY, countCodePoints } from "@shared/domain";
 import { useAuthApi, type Accepted } from "@/lib/authApi";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button, Callout, Checkbox, Field, Input } from "@/ui";
 import { usePreviewProfile } from "@/app/shell/common";
+import { CustomerMaintenanceSlot } from "@/app/slots";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, PasswordMeter, useFocusOnError } from "../components/bits";
 
+/** Referral code from `/register?ref=CODE` (decision 8); anything that isn't a well-formed code is dropped. */
+export function referralCodeFrom(search: string): string | undefined {
+  const raw = new URLSearchParams(search).get("ref")?.trim().toUpperCase();
+  return raw && /^[0-9A-Z]{10}$/.test(raw) ? raw : undefined;
+}
+
 export default function RegisterPage() {
   const api = useAuthApi();
+  const referralCode = referralCodeFrom(useSearch());
   const preview = usePreviewProfile();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -38,7 +46,7 @@ export default function RegisterPage() {
     setError(null);
     setBusy(true);
     try {
-      const result = await api.register({ name: name.trim(), email: email.trim(), password });
+      const result = await api.register({ name: name.trim(), email: email.trim(), password, ...(referralCode ? { referralCode } : {}) });
       setPassword("");
       setDone(result);
     } catch (err) {
@@ -84,6 +92,7 @@ export default function RegisterPage() {
         </>
       }
     >
+      <CustomerMaintenanceSlot />
       <FormError message={error} focusRef={errorRef} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
         <Field label="Full name" error={errors.name} required>

@@ -10,8 +10,8 @@ import type { MeUser } from "@/lib/authApi";
 import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
-import { GlobalSearchSlot, NotificationSlot } from "../slots";
-import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, NotificationSlot } from "../slots";
+import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
   const groups = new Map<string, NavItem[]>();
@@ -23,7 +23,7 @@ function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> 
 }
 
 function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof groupNav>; collapsed?: boolean; onNavigate?: () => void }) {
-  const active = useActive();
+  const active = useCurrentNav(groups.flatMap((g) => g.items));
   return (
     <nav aria-label="Console" className="flex flex-col gap-5">
       {groups.map(({ group, items }) => (
@@ -58,12 +58,13 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
 }
 
 export function ConsoleShell({ user, children }: { user: MeUser; children: ReactNode }) {
-  const groups = groupNav(visibleNav(ALL_NAV, "console", user.role).filter((item) => navPlacement(item) !== "hidden"));
+  const groups = groupNav(useEnabledNav(visibleNav(ALL_NAV, "console", user.role)).filter((item) => navPlacement(item) !== "hidden"));
   const [collapsed, setCollapsed] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   return (
     <div className="flex min-h-dvh bg-surface-soft">
+      <CookieConsentSlot />
       <SkipLink />
       {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
       <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
@@ -92,6 +93,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       <div className="flex min-w-0 flex-1 flex-col">
         <PreviewBanner />
         <MaintenanceBanner />
+        <CustomerMaintenanceSlot />
         <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
           <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
             <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
