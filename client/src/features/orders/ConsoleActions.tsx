@@ -5,6 +5,7 @@ import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, DateTime, Dialog, Field, Input, Select, StepUpCancelledError, useStepUp, useToast } from "@/ui";
+import { AccessDialog, CustomerPicker, NewOrderForCustomerDialog, type PickedCustomer } from "./ConsoleOrderTools";
 import { LOCK_LABELS, newIdempotencyKey, type LockState } from "./shared";
 
 type Props = { orderId: string; version: number; lockState: LockState; reference: string };
@@ -66,7 +67,8 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
   const [lockTarget, setLockTarget] = useState<LockState>(lockState === "none" ? "review" : "none");
   const [reasonCode, setReasonCode] = useState("");
   const [newReference, setNewReference] = useState("");
-  const [targetCustomer, setTargetCustomer] = useState("");
+  const [targetCustomer, setTargetCustomer] = useState<PickedCustomer | null>(null);
+  const [panel, setPanel] = useState<"access" | "new" | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [error, setError] = useState<string | null>(null);
   // Stable per dialog opening so a retried reassignment is idempotent on the server.
@@ -77,6 +79,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
     setReasonCode("");
     setError(null);
     setConfirmText("");
+    setTargetCustomer(null);
     setOperationId(newIdempotencyKey());
   };
   const done = (title: string) => {
@@ -127,6 +130,14 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
           {isAdmin ? (
             <Button variant="danger" onClick={() => open("reassign")}>
               Reassign to another customer
+            </Button>
+          ) : null}
+          <Button variant="secondary" onClick={() => setPanel("access")}>
+            Access for other users
+          </Button>
+          {canManage ? (
+            <Button variant="secondary" onClick={() => setPanel("new")}>
+              New order for a customer
             </Button>
           ) : null}
         </div>
@@ -214,12 +225,12 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
             {cancelButton}
           <Button
             variant="danger"
-            disabled={confirmText.trim() !== reference}
+            disabled={confirmText.trim() !== reference || !targetCustomer}
             loading={reassign.isPending}
             onClick={() =>
               void run(
                 () =>
-                  stepUp.run(() => reassign.mutateAsync({ orderId, targetCustomerPublicId: targetCustomer.trim(), expectedVersion: version, operationId, reasonCode }), {
+                  stepUp.run(() => reassign.mutateAsync({ orderId, targetCustomerPublicId: targetCustomer?.publicId ?? "", expectedVersion: version, operationId, reasonCode }), {
                     reason: "Reassigning an order needs verification.",
                   }),
                 "Order reassigned",
@@ -233,9 +244,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
       >
         <div className="flex flex-col gap-4">
           {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
-          <Field label="Target customer ID" hint="The customer's account ID from the customer record (26 characters).">
-            <Input value={targetCustomer} onChange={(event) => setTargetCustomer(event.target.value)} maxLength={26} autoComplete="off" spellCheck={false} />
-          </Field>
+          <CustomerPicker label="New owner" value={targetCustomer} onChange={setTargetCustomer} />
           <Field label="Reason" required>
             <Select options={REASSIGN_REASONS} placeholder="Choose a reason" value={reasonCode} onChange={(event) => setReasonCode(event.target.value)} />
           </Field>
@@ -244,6 +253,8 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
           </Field>
         </div>
       </Dialog>
+      <AccessDialog open={panel === "access"} onClose={() => setPanel(null)} scope={{ orderId }} subject={reference} />
+      {canManage ? <NewOrderForCustomerDialog open={panel === "new"} onClose={() => setPanel(null)} /> : null}
     </Card>
   );
 }

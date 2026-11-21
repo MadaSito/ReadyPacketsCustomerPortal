@@ -31,6 +31,7 @@ export const ordersFeature: FeatureRoutes = {
     { label: "Catalog", href: "/admin/catalog", icon: ClipboardList, area: "console", group: "Operations", access: "admin", capability: "catalog.manage", order: 12 },
     { label: "Workflows", href: "/admin/workflows", icon: Workflow, area: "console", group: "Operations", access: "admin", capability: "workflows.manage", order: 14 },
   ],
+  customerTabs: [{ key: "orders", label: "Orders", access: "staff", order: 20, component: lazy(() => import("./ConsoleOrderTools")) }],
   widgets: [
     { key: "orders.recent", area: "customer", access: "customer", order: 10, span: 8, component: lazy(() => import("./RecentOrdersWidget")) },
     { key: "orders.pipeline", area: "console", access: "staff", capability: "orders.read_all", order: 10, span: 8, component: lazy(() => import("./OrdersPipelineWidget")) },
