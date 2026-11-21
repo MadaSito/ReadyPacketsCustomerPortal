@@ -46,8 +46,24 @@ export default function PrivacyPage() {
             stored encrypted on our servers and cleared once delivery finishes.
           </li>
           <li>
-            <strong>Transactional email (if enabled):</strong> Account invitations, password reset links, and order or billing notifications are sent
-            through the outbound mail server configured by our administrators.
+            <strong>Transactional email (if enabled):</strong> Account invitations, password reset links, and order, support or billing notifications
+            are sent through the outbound SMTP mail server and/or <strong>Microsoft Graph</strong> mail service configured by our administrators. If
+            an audit-copy mailbox or bounded message-preview retention is enabled, single-use verification, invitation and password reset links are
+            redacted in those copies.
+          </li>
+          <li>
+            <strong>Cloud storage copies and Microsoft SharePoint sync (if enabled):</strong> Accepted order files and verified encrypted backups may
+            be copied to cloud storage destinations configured by our administrators — including <strong>Amazon S3</strong>, <strong>Wasabi</strong>,{" "}
+            <strong>Backblaze B2</strong>, <strong>Azure Blob Storage</strong>, <strong>Dropbox</strong>, <strong>Google Drive</strong>,{" "}
+            <strong>Microsoft OneDrive for Business</strong>, and <strong>Microsoft SharePoint</strong> document libraries (via{" "}
+            <strong>Microsoft Graph</strong>) — using folder labels that include abbreviated customer name, customer reference and order reference. If
+            SharePoint order sync is enabled, order summary records (order reference, customer reference, status, packets and tiers, totals, dates, and
+            an optional portal link) are synchronised to a SharePoint list through Microsoft Graph.
+          </li>
+          <li>
+            <strong>Enterprise single sign-on and automation webhooks (if enabled):</strong> Where <strong>Microsoft Entra ID</strong> single sign-on
+            is enabled for an account, authentication tokens are exchanged with Microsoft&apos;s identity endpoints. Where administrators configure
+            outbound HTTPS automation webhooks, allow-listed event metadata may be delivered to those endpoints.
           </li>
           <li>
             <strong>Security monitoring (if enabled):</strong> Pseudonymised security and audit events may be forwarded over TLS to a security
@@ -82,8 +98,10 @@ export default function PrivacyPage() {
         <p>
           We keep account and order information for as long as your account is active and afterwards for as long as legal, tax or contractual
           obligations require. Security and audit records are kept under retention periods set by our administrators, and may be held longer when a
-          legal hold applies. Retention periods for specific categories are described in the company's{" "}
-          <ExternalPolicyLink href={MARKETING_POLICY_URLS.privacy}>Privacy & cookie notice</ExternalPolicyLink>.
+          legal hold applies. Removing or superseding a file in the portal does not automatically delete copies already written to configured cloud
+          storage destinations; retention and deletion of those remote copies are managed by our administrators in the destination storage accounts.
+          Retention periods for specific categories are described in the company&apos;s{" "}
+          <ExternalPolicyLink href={MARKETING_POLICY_URLS.privacy}>Privacy &amp; cookie notice</ExternalPolicyLink>.
         </p>
       </LegalSection>
 

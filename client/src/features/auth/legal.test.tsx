@@ -76,6 +76,28 @@ describe("public legal pages", () => {
     expect(screen.getByText(/order owner's name and email address/i)).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
+
+  it("/privacy discloses Microsoft Graph, cloud storage copy providers, SharePoint sync, Entra ID SSO, and remote copy retention", async () => {
+    const { container } = renderUi(<AppRoutes routes={authFeature.routes} />, {
+      path: "/privacy",
+      api: fakeAuthApi({ me: unauth }),
+    });
+    expect(await screen.findByRole("heading", { level: 2, name: "Who receives your information" })).toBeInTheDocument();
+    expect(screen.getAllByText(/Microsoft Graph/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Amazon S3/)).toBeInTheDocument();
+    expect(screen.getByText(/Wasabi/)).toBeInTheDocument();
+    expect(screen.getByText(/Backblaze B2/)).toBeInTheDocument();
+    expect(screen.getByText(/Azure Blob Storage/)).toBeInTheDocument();
+    expect(screen.getByText(/Dropbox/)).toBeInTheDocument();
+    expect(screen.getByText(/Google Drive/)).toBeInTheDocument();
+    expect(screen.getByText(/Microsoft OneDrive for Business/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Microsoft SharePoint/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/Microsoft Entra ID/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/does not automatically delete copies already written to configured cloud storage destinations/i),
+    ).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
 });
 
 describe("consent-gated analytics on the legal pages", () => {
