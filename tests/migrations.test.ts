@@ -83,7 +83,7 @@ describe("migrations", () => {
     }
   });
 
-  it("0001 upgrades a baseline database that already holds orders and catalog rows", async () => {
+  it("0001 and 0002 upgrade a baseline database that already holds orders and catalog rows", async () => {
     const upgraded = await createTestDb({ schema: {} });
     try {
       const connection = await upgraded.pool.getConnection();
@@ -107,6 +107,12 @@ describe("migrations", () => {
         expect(versions).toEqual([{ n: 0, o: "", tl: "" }]);
         const [items] = await connection.query("SELECT JSON_LENGTH(`deliverables`) AS n, `packet_number` AS p, `tier` AS t FROM `order_line_items`");
         expect(items).toEqual([{ n: 0, p: null, t: null }]);
+        // 0002 (increment 03) is additive: it must apply on top of a database that already holds rows and leave them as they were.
+        for (const statement of statementsOf("0002_integrations_mail_sso_automations")) await connection.query(statement);
+        const [after] = await connection.query("SELECT `reference` AS r, `total_minor` AS t, `workflow_version_id` AS w FROM `orders`");
+        expect((after as { r: string; t: number | string; w: number | string }[]).map((r) => [r.r.startsWith("RP-TEST"), Number(r.t)])).toEqual([[true, 2500]]);
+        const [lineItems] = await connection.query("SELECT COUNT(*) AS n FROM `order_line_items`");
+        expect(Number((lineItems as { n: number | string }[])[0]?.n)).toBe(1);
       } finally {
         connection.release();
       }
