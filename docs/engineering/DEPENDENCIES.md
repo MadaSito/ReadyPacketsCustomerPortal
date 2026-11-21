@@ -22,6 +22,7 @@ third-party service at runtime unless an administrator explicitly configured tha
 | nodemailer | runtime | optional SMTP delivery | disabled until configured |
 | yazl, yauzl | runtime | archive write/read for portable packages | |
 | compression | runtime | static response compression | not applied to secret-bearing dynamic responses |
+| mmdb-lib 3.0.5 (MIT) | runtime | read an operator-provided local MaxMind-format country database | no built-in MMDB parser; no cloud lookup, SDK transport or network dependency |
 | react, react-dom 19 | client | UI | |
 | wouter | client | routing (path; hash in preview) | |
 | radix-ui | client | accessible primitives | |
