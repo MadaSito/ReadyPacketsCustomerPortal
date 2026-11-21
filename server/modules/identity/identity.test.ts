@@ -527,7 +527,7 @@ describe("identity module (MySQL)", () => {
       const admin = await makeUser({ role: "admin" });
       const { principal } = await session(admin.email, { stepUp: true });
       const created = await identity.admin.createCustomer(principal, { email: `cust${Date.now()}@example.test`, name: "Cara Customer" });
-      expect(created.customerRef).toMatch(/^RP-[0-9A-HJKMNP-TV-Z]{7}$/);
+      expect(created.customerRef).toMatch(/^RPCUS-[0-9A-Z]{9}$/);
       expect(created.previewLink).toMatch(/^\/activate\?token=/);
       await identity.auth.activateAccount({ token: tokenOf(created.previewLink), password: PW2 });
       await rejects(identity.auth.activateAccount({ token: tokenOf(created.previewLink), password: PW2 }), "LINK_INVALID");
