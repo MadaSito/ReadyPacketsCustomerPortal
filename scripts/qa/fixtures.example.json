@@ -1,0 +1,8 @@
+{
+  "sessions": {
+    "customer": "customer.state.json",
+    "staff": "staff.state.json",
+    "admin": "admin.state.json"
+  },
+  "cases": {}
+}
