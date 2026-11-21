@@ -17,4 +17,5 @@ export * from "../../modules/backup/schema.js";
 export * from "../../modules/integrations/schema.js";
 export * from "../../modules/storage/oauth/schema.js";
 export * from "../../modules/storage/schema.js";
+export * from "../../modules/mailTemplates/schema.js";
 export * from "../../security/rateLimiterSchema.js";
