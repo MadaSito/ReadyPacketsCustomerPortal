@@ -174,13 +174,24 @@ export const CATEGORY_TEXT: Record<ConsentCategoryKey, { label: string; descript
   session_replay: { label: "Session replay (Microsoft Clarity)", description: "Records clicks and scrolling on public pages, with text masked, to find usability problems.", required: false },
 };
 
+/** Length-independent comparison of two ASCII strings. */
+export function constantTimeEqual(a: string, b: string): boolean {
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
 /* ------------------------------------------------------------------ inputs */
 
 export const choicesSchema = z.strictObject({ preferences: z.boolean(), analytics: z.boolean(), session_replay: z.boolean() });
 export type Choices = z.infer<typeof choicesSchema>;
 
+/** `<consentId>.<signature>` issued by the server; anything else is ignored and a new id is issued. */
+export const RECEIPT_PATTERN = /^[A-Za-z0-9_-]{22}\.[0-9a-f]{32}$/;
+
 export const recordInputSchema = z.strictObject({
-  consentId: z.string().regex(CONSENT_ID_PATTERN).optional(),
+  /** Opaque receipt from an earlier decision of this browser. Optional, untrusted, only a grouping hint. */
+  receipt: z.string().max(64).optional(),
   policyVersion: z.number().int().min(1).max(100_000),
   choices: choicesSchema,
   action: z.enum(CONSENT_ACTIONS),
@@ -297,6 +308,16 @@ export function createConsentService(deps: ConsentServiceDeps) {
   const { db, clock, crypto, audit, settings, logger } = deps;
   const log = logger.child({ component: "platform.consent" });
 
+  function signReceipt(consentId: string): string {
+    return `${consentId}.${crypto.blindIndex(consentId, "platform.consent.receipt").slice(0, 32)}`;
+  }
+
+  function verifyReceipt(receipt: string | undefined): string | null {
+    if (receipt === undefined || !RECEIPT_PATTERN.test(receipt)) return null;
+    const consentId = receipt.slice(0, 22);
+    return constantTimeEqual(signReceipt(consentId), receipt) ? consentId : null;
+  }
+
   async function config() {
     const [enabled, policyVersion, renewMonths] = await Promise.all([
       isFlagEnabled(settings, CONSENT_FLAG),
@@ -346,12 +367,16 @@ export function createConsentService(deps: ConsentServiceDeps) {
       };
     },
 
-    async record(input: RecordInput, context: { userPublicId: string | null; ipAddress: string | null }): Promise<{ consentId: string; recordedAt: Date; policyVersion: number }> {
+    async record(input: RecordInput, context: { userPublicId: string | null; ipAddress: string | null }): Promise<{ consentId: string; receipt: string; recordedAt: Date; policyVersion: number }> {
       const cfg = await config();
       if (!cfg.enabled) throw new DomainError("NOT_FOUND", "CONSENT_DISABLED", "Cookie consent is not enabled.");
       if (input.policyVersion !== cfg.policyVersion) throw conflict("CONSENT_POLICY_CHANGED", "The cookie policy has changed. Please review it and choose again.");
       assertConsistent(input);
-      const consentId = input.consentId ?? randomConsentId();
+      // The consent id only groups one browser's decisions. It is accepted back only inside a receipt the
+      // server signed, so a client cannot attach its decisions to another browser's history. It is never
+      // used as authority: account history is selected by the session's user, not by consent id.
+      const reused = verifyReceipt(input.receipt);
+      const consentId = reused ?? randomConsentId();
       const recordedAt = clock.now();
       await db.insert(platformConsentRecords).values({
         consentId,
@@ -367,7 +392,8 @@ export function createConsentService(deps: ConsentServiceDeps) {
         createdAt: recordedAt,
       });
       log.info("consent decision recorded", { action: input.action, source: input.source, policy_version: cfg.policyVersion, signed_in: context.userPublicId !== null });
-      return { consentId, recordedAt, policyVersion: cfg.policyVersion };
+      if (input.receipt !== undefined && reused === null) log.warn("consent receipt rejected", { reason: "invalid_signature_or_format" });
+      return { consentId, receipt: signReceipt(consentId), recordedAt, policyVersion: cfg.policyVersion };
     },
 
     async mine(userPublicId: string): Promise<ConsentRecordView[]> {

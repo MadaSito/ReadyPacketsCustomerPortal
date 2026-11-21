@@ -39,7 +39,7 @@ export interface ConsentState {
   decidedAt: string | null;
   /** Browser signals Global Privacy Control or Do Not Track. */
   gpc: boolean;
-  /** Random anonymous id that links this browser's decisions in the ledger (null before the first one). */
+  /** Random anonymous id that links this browser's decisions in the ledger (null until the server issued one). */
   consentId: string | null;
   /** The stored choice was made by the GPC / DNT signal, not by the person. */
   bySignal: boolean;
@@ -47,7 +47,8 @@ export interface ConsentState {
 
 interface StoredChoice {
   v: 1;
-  id: string;
+  /** Server-signed `<consentId>.<signature>`; null until the server recorded a decision. */
+  receipt: string | null;
   policyVersion: number;
   choices: ConsentChoices;
   decidedAt: string;
@@ -56,7 +57,7 @@ interface StoredChoice {
 
 export const CONSENT_STORAGE_KEY = "rp.consent.v1";
 const NONE: ConsentChoices = Object.freeze({ preferences: false, analytics: false, session_replay: false });
-const CONSENT_ID = /^[A-Za-z0-9_-]{22}$/;
+const RECEIPT = /^[A-Za-z0-9_-]{22}\.[0-9a-f]{32}$/;
 
 let config: ConsentConfig = { enabled: false, policyVersion: null, renewMonths: 12 };
 let memoryChoice: StoredChoice | null = null;
@@ -79,13 +80,14 @@ function parseStored(raw: string | null): StoredChoice | null {
   if (!raw || raw.length > 1024) return null;
   try {
     const value = JSON.parse(raw) as Partial<StoredChoice> & { choices?: Partial<ConsentChoices> };
-    if (value.v !== 1 || typeof value.id !== "string" || !CONSENT_ID.test(value.id)) return null;
+    if (value.v !== 1) return null;
+    const receipt = typeof value.receipt === "string" && RECEIPT.test(value.receipt) ? value.receipt : null;
     if (typeof value.policyVersion !== "number" || !Number.isInteger(value.policyVersion) || value.policyVersion < 1) return null;
     if (typeof value.decidedAt !== "string" || Number.isNaN(Date.parse(value.decidedAt))) return null;
     const c: Partial<ConsentChoices> = value.choices ?? {};
     return {
       v: 1,
-      id: value.id,
+      receipt,
       policyVersion: value.policyVersion,
       decidedAt: value.decidedAt,
       bySignal: value.bySignal === true,
@@ -150,7 +152,7 @@ function compute(): ConsentState {
     policyVersion: config.policyVersion,
     decidedAt: decided && stored ? stored.decidedAt : null,
     gpc,
-    consentId: stored?.id ?? null,
+    consentId: stored?.receipt ? stored.receipt.slice(0, 22) : null,
     bySignal: decided && stored ? stored.bySignal : false,
   };
 }
@@ -202,6 +204,7 @@ function emit(previous: ConsentState): void {
   for (const category of ["analytics", "session_replay"] as const) {
     if (previous.choices[category] && !next.choices[category]) removeVendorData(category);
   }
+  scheduleExpiry();
   if (JSON.stringify(previous) === JSON.stringify(next)) return;
   for (const listener of listeners) {
     try {
@@ -212,17 +215,76 @@ function emit(previous: ConsentState): void {
   }
 }
 
+/** Moment the current choice stops being valid (renewal period), or null. */
+function expiresAt(): number | null {
+  const stored = readChoice();
+  if (!stored || !config.enabled) return null;
+  return Date.parse(stored.decidedAt) + config.renewMonths * MONTH_MS;
+}
+
 function snapshot(): ConsentState {
+  // Long-lived tabs: a cached "decided" state must not outlive the renewal period.
+  if (snapshotCache?.decided) {
+    const end = expiresAt();
+    if (end !== null && now() >= end) {
+      const stale = snapshotCache;
+      snapshotCache = compute();
+      // Tell subscribers (and clean vendor data) about the true -> false transition, once.
+      queueMicrotask(() => emit(stale));
+      return snapshotCache;
+    }
+  }
   snapshotCache ??= compute();
   return snapshotCache;
 }
 
-function randomConsentId(): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+/** Re-reads the stored choice (another tab may have changed it) and notifies subscribers of any change. */
+function refresh(): void {
+  // The raw published state (possibly expired), so a grant -> denial transition is never missed.
+  const previous = snapshotCache ?? snapshot();
+  loaded = false;
+  emit(previous);
+}
+
+let expiryTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleExpiry(): void {
+  if (typeof window === "undefined") return;
+  if (expiryTimer) clearTimeout(expiryTimer);
+  expiryTimer = null;
+  const end = expiresAt();
+  if (end === null || end <= now()) return;
+  // Browsers cap timers at about 24.8 days; re-arm in steps.
+  expiryTimer = setTimeout(() => {
+    expiryTimer = null;
+    refresh();
+  }, Math.min(Math.max(end - now(), 0) + 50, 2 ** 31 - 1));
+}
+
+let watching = false;
+function onStorage(event: StorageEvent): void {
+  if (event.key === CONSENT_STORAGE_KEY || event.key === null) refresh();
+}
+function onWake(): void {
+  if (typeof document === "undefined" || document.visibilityState !== "hidden") refresh();
+}
+/** Cross-tab and wake-up handling: withdrawal in one tab stops tools in every tab. */
+function watch(): void {
+  if (watching || typeof window === "undefined") return;
+  watching = true;
+  window.addEventListener("storage", onStorage);
+  window.addEventListener("focus", onWake);
+  window.addEventListener("pageshow", onWake);
+  document.addEventListener("visibilitychange", onWake);
+}
+function unwatch(): void {
+  if (!watching || typeof window === "undefined") return;
+  watching = false;
+  window.removeEventListener("storage", onStorage);
+  window.removeEventListener("focus", onWake);
+  window.removeEventListener("pageshow", onWake);
+  document.removeEventListener("visibilitychange", onWake);
+  if (expiryTimer) clearTimeout(expiryTimer);
+  expiryTimer = null;
 }
 
 /* --------------------------------------------------------------- public port */
@@ -241,7 +303,12 @@ export const consent = {
   snapshot,
   subscribe(listener: (state: ConsentState) => void): () => void {
     listeners.add(listener);
-    return () => listeners.delete(listener);
+    watch();
+    scheduleExpiry();
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) unwatch();
+    };
   },
   /** Opens the preference centre (footer link, account page). */
   openPreferences(): void {
@@ -258,13 +325,16 @@ export function configureConsent(next: ConsentConfig): void {
   emit(previous);
 }
 
-/** Stores a decision locally (after the server recorded it, or immediately for a GPC default). */
-export function applyConsentDecision(choices: ConsentChoices, meta: { consentId: string; policyVersion: number; decidedAt?: string; bySignal?: boolean }): void {
-  if (!CONSENT_ID.test(meta.consentId)) throw new Error("invalid consent id");
+/**
+ * Stores a decision locally. Denials (reject, withdraw, GPC default) are applied BEFORE the ledger call so
+ * a failed request can never leave a tool running; grants are applied after the server recorded them.
+ */
+export function applyConsentDecision(choices: ConsentChoices, meta: { policyVersion: number; receipt?: string | null; decidedAt?: string; bySignal?: boolean }): void {
   const previous = snapshot();
+  const receipt = meta.receipt && RECEIPT.test(meta.receipt) ? meta.receipt : (readChoice()?.receipt ?? null);
   writeChoice({
     v: 1,
-    id: meta.consentId,
+    receipt,
     policyVersion: meta.policyVersion,
     choices: { preferences: choices.preferences, analytics: choices.analytics, session_replay: choices.session_replay },
     decidedAt: meta.decidedAt ?? new Date(now()).toISOString(),
@@ -273,9 +343,34 @@ export function applyConsentDecision(choices: ConsentChoices, meta: { consentId:
   emit(previous);
 }
 
-/** The existing anonymous id, or a new random one (not stored until a decision is applied). */
-export function consentIdForNextDecision(): string {
-  return readChoice()?.id ?? randomConsentId();
+/** Stores the receipt the server returned without changing the decision. */
+export function attachConsentReceipt(receipt: string): void {
+  const stored = readChoice();
+  if (!stored || !RECEIPT.test(receipt)) return;
+  const previous = snapshot();
+  writeChoice({ ...stored, receipt });
+  emit(previous);
+}
+
+/** The receipt of this browser's previous decision, sent back so the ledger can group them. */
+export function consentReceipt(): string | undefined {
+  return readChoice()?.receipt ?? undefined;
+}
+
+/**
+ * The part of a requested choice that may be applied before the ledger call: current AND requested, so
+ * only removals take effect early and nothing new is granted until the server recorded the decision.
+ * Returns null when the request removes nothing.
+ */
+export function removalsOnly(requested: ConsentChoices): ConsentChoices | null {
+  const current = snapshot().choices;
+  const removes = OPTIONAL_CATEGORIES.some((c) => current[c] && !requested[c]);
+  if (!removes) return null;
+  return {
+    preferences: current.preferences && requested.preferences,
+    analytics: current.analytics && requested.analytics,
+    session_replay: current.session_replay && requested.session_replay,
+  };
 }
 
 export function onOpenPreferences(listener: () => void): () => void {
@@ -310,7 +405,7 @@ export function __setConsentForTests(state: { enabled?: boolean; policyVersion?:
       : state.choices
         ? {
             v: 1,
-            id: memoryChoice?.id ?? "AAAAAAAAAAAAAAAAAAAAAA",
+            receipt: memoryChoice?.receipt ?? null,
             policyVersion: config.policyVersion ?? 1,
             choices: { ...NONE, ...state.choices },
             decidedAt: state.decidedAt ?? new Date(now()).toISOString(),
@@ -327,6 +422,7 @@ export function __resetConsentForTests(): void {
   loaded = false;
   now = () => Date.now();
   snapshotCache = null;
+  unwatch();
   listeners.clear();
   openListeners.clear();
   const store = storageAvailable();

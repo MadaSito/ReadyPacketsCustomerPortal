@@ -268,7 +268,7 @@ without `clientVisible` never appear. Hiding navigation is UX only; every proced
 |---|---|---|
 | `platform.bootstrap` (query) | public | `{ features, consent: { enabled, policyVersion, renewMonths } }`, cached 60 s client-side |
 | `platform.consent.inventory` (query) | public | `{ policyVersion, renewMonths, categories[], items: CookieItem[] }`; items are plain text |
-| `platform.consent.record` (mutation) | public, `rateLimit: "form_submission"` | input `{ consentId?, policyVersion, choices, action: "accept_all" \| "reject_all" \| "save" \| "withdraw", source: "banner" \| "preferences" \| "account" \| "gpc", gpc }`; returns `{ consentId, recordedAt }`. Refused when the feature is off (`NOT_FOUND`/`CONSENT_DISABLED`), on a stale policy version (`CONFLICT`/`CONSENT_POLICY_CHANGED`) or inconsistent action/choices (`VALIDATION`). A full session attaches the user's public id. |
+| `platform.consent.record` (mutation) | public, `rateLimit: "form_submission"` | input `{ receipt?, policyVersion, choices, action: "accept_all" \| "reject_all" \| "save" \| "withdraw", source: "banner" \| "preferences" \| "account" \| "gpc", gpc }`; returns `{ consentId, receipt, recordedAt, policyVersion }`. `receipt` is `<consentId>.<HMAC>` signed by the server; an unsigned or forged receipt is ignored (warn log) and a new id is issued, so a client cannot join another browser's history. The consent id is a grouping key only — never authority; `consent.mine` selects by the session user. Refused when the feature is off (`NOT_FOUND`/`CONSENT_DISABLED`), on a stale policy version (`CONFLICT`/`CONSENT_POLICY_CHANGED`) or inconsistent action/choices (`VALIDATION`). A full session attaches the user's public id. |
 | `platform.consent.mine` (query) | authenticated (full session) | my last 200 decisions (download is client-side JSON of the same data) |
 | `platform.admin.consent.stats` | admin + `privacy.consent.read` | counts by action, acceptance per category, by policy version, over `days` (1–400) |
 | `platform.admin.consent.search` | admin + `privacy.consent.read` | filters `from,to,action,source,policyVersion,consentId,userPublicId,gpc`; cursor, limit ≤ 100 |
@@ -282,3 +282,7 @@ default 12). Flag `feature.privacy.consent` (clientVisible, off by default).
 Ledger table `platform_consent_records` (schema.ts): consent id (random, 22 chars), user public id when
 signed in, policy version, the three choices, action, source, GPC flag, keyed HMAC of the IP (never the IP),
 time. No user agent and no IP in clear.
+
+#### Client store additions (assurance review)
+- `applyConsentDecision(choices, { policyVersion, receipt?, decidedAt?, bySignal? })`, `attachConsentReceipt(receipt)`, `consentReceipt()`, `removalsOnly(choices)`. Before the ledger call only `current ∩ requested` is applied (removals); the full choice, including any new grant, is applied after the server recorded it. With no previous decision, an all-off choice is applied first.
+- The store re-checks on `storage` events (other tabs), `focus`/`visibilitychange`/`pageshow`, and a timer at the renewal deadline; `has()` never returns a cached grant past expiry. Withdrawal in any tab removes reachable vendor cookies/storage and notifies subscribers.
