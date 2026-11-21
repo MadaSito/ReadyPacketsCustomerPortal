@@ -68,6 +68,20 @@ interface MailTemplateStore {
 - `jobs.mail.auditCopy.status` (query) -> `{ verified: boolean }`; `jobs.mail.auditCopy.requestVerification` (POST; no input) -> `{ queued: true }`; `jobs.mail.auditCopy.confirmVerification({ code })` (POST) -> `{ verified: true }`. Full administrator, `mail.manage` and fresh step-up. Mutations are rate-limited and revalidate the live session in their transaction. A one-time, 22-character base64url code expires in 30 minutes; requesting another replaces it. The challenge is a reserved mail template; its code cannot appear in development capture, retained content, or an audit copy.
 - No raw HTTP routes.
 
+## Customer access maintenance (Increment 04)
+
+This policy is independent of `JobsModule.isDraining()` and the queue maintenance procedures. The Identity and shell port is `deps.services.jobAdmin.maintenance.customerAccess(tx?: Tx): Promise<CustomerAccessStatus>`. Pass the same transaction that issues a customer session or creates a customer registration for the final check; a preliminary check may omit `tx`. Staff and administrator access is not blocked. The public tRPC query `jobs.maintenance.customerAccess` has no input and returns exactly the same shape:
+
+```ts
+interface CustomerAccessStatus {
+  active: boolean;
+  message: string | null;
+  expectedEnd: string | null; // ISO UTC, or null for no set end
+}
+```
+
+Inactive responses always have `message: null` and `expectedEnd: null`; scheduled future windows do not disclose their contents before activation. An active window starts at the inclusive start and ends at the exclusive expected end, if one is set. Scheduled boundaries do not depend on a worker running. The public banner component is `@/features/jobs/CustomerMaintenanceBanner`.
+
 ## Configuration and evidence
 
 - `jobs.mail.capture`: boolean setting, defaults off; only development and test allow use. Preview and production refuse capture.
