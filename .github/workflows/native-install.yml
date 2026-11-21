@@ -45,7 +45,7 @@ jobs:
       - name: Shell scripts (ShellCheck)
         run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh
       - name: Make the runner look like a new server
-        run: sudo bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Refusals that change nothing
         run: |
           set -uo pipefail
@@ -118,7 +118,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Make the runner look like a new server
-        run: sudo bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Start a local ACME certificate authority (Pebble) and trust its root
         run: |
           set -euo pipefail
