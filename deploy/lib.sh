@@ -88,8 +88,16 @@ write_site() {
     mv -fT -- "$temp" "$site_conf"
     load_site
 }
+nginx_has_http2_directive() {
+    # "http2 on;" exists from nginx 1.25.1 (Ubuntu 26.04 ships 1.28; Ubuntu 24.04 ships 1.24).
+    local version
+    version=$(nginx -v 2>&1 | sed -n 's|^nginx version: nginx/\([0-9][0-9.]*\).*|\1|p')
+    [[ -n $version && $(printf '%s\n' 1.25.1 "$version" | sort -V | head -n1) == 1.25.1 ]]
+}
 render_site() {
     # render_site <template> <destination>: substitutes the site identity into an nginx template.
+    # Regions "#@alias{ ... #@alias}" are kept only with an alias, "#@http2{ ... #@http2}" only where the
+    # installed nginx knows the "http2" directive. Regions do not nest.
     local template=$1 dest=$2 line temp skip=0 names=$origin
     [[ -z "$alias_host" ]] || names="$origin $alias_host"
     temp=$(mktemp "$dest.XXXXXXXX")
@@ -97,6 +105,8 @@ render_site() {
         case $line in
             '#@alias{') if [[ -z "$alias_host" ]]; then skip=1; fi; continue ;;
             '#@alias}') skip=0; continue ;;
+            '#@http2{') if ! nginx_has_http2_directive; then skip=1; fi; continue ;;
+            '#@http2}') skip=0; continue ;;
             '#@ '*) continue ;;
         esac
         if ((skip)); then continue; fi
@@ -121,7 +131,7 @@ check_host() {
         die 'install the Oracle MySQL 8.4 client'
     mysqldump --version | grep -Eiq '\b(Ver[[:space:]]+8\.4\.|Distrib[[:space:]]+8\.4\.)' ||
         die 'install the Oracle MySQL 8.4 mysqldump client'
-    [[ $(mysql --protocol=socket --batch --skip-column-names --execute='SELECT VERSION()') =~ ^8\.4\. ]] ||
+    [[ $(mysql --no-defaults --protocol=socket --batch --skip-column-names --execute='SELECT VERSION()') =~ ^8\.4\. ]] ||
         die 'cannot verify the local MySQL 8.4 server via the root socket account'
     local command
     for command in nginx systemctl systemd-run git tar curl openssl; do

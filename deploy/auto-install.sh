@@ -19,13 +19,16 @@
 #   --admin-name "<name>"  display name of the first administrator (default: Portal Administrator)
 #   --skip-catalog         do not load the ReadyPackets offerings (packets, tiers, prices)
 #   --skip-dns-check       do not check that the host names reach this server before asking for a certificate
+#   --swap <auto|yes|no>   add a 2 GB swap file for the build: auto (default) adds it when memory plus swap
+#                          is below 3 GB, yes always adds it, no never does
 #   --print-credentials    print the sign-in details to standard output when there is no terminal (they are
 #                          otherwise shown on the terminal only, once, and kept in a root-only file)
 #   --yes                  do not ask for confirmation
 #   -h, --help             show this text
 #
 # Environment (testing only): RP_ACME_SERVER=<directory URL> selects another ACME service, for example the
-# Let's Encrypt staging environment.
+# Let's Encrypt staging environment. This server must already trust that service's root certificate
+# (/usr/local/share/ca-certificates + update-ca-certificates), or the final health check fails.
 set -euo pipefail
 # Never trace: this script handles passwords and keys.
 set +x
@@ -80,14 +83,17 @@ readonly credentials=/root/readypackets-initial-admin.txt
 readonly pending_password="$conf/initial-admin-password" pending_email="$conf/initial-admin-email"
 readonly admin_marker="$conf/admin-bootstrap-done" catalog_marker="$conf/catalog-import-done"
 readonly db_marker="$conf/database-accounts-created" shown_marker="$conf/initial-admin-shown"
+# Written by install.sh just before it first tries to create the administrator (see prepare_admin).
+readonly attempt_marker="$conf/admin-bootstrap-attempted"
+readonly swap_file=/swapfile.readypackets
 
 say() { printf '\n==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
-usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # --- options -------------------------------------------------------------------------------------------
 domain='' alias='' acme_email='' self_signed=0 admin_email='' admin_name='Portal Administrator'
-catalog=1 dns_check=1 assume_yes=0 print_credentials=0
+catalog=1 dns_check=1 assume_yes=0 print_credentials=0 swap_mode=auto
 need_value() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"; }
 while (($#)); do
     case $1 in
@@ -99,6 +105,7 @@ while (($#)); do
         --admin-name) need_value "$@"; admin_name=$2; shift 2 ;;
         --skip-catalog) catalog=0; shift ;;
         --skip-dns-check) dns_check=0; shift ;;
+        --swap) need_value "$@"; swap_mode=$2; shift 2 ;;
         --print-credentials) print_credentials=1; shift ;;
         --yes|-y) assume_yes=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -153,6 +160,7 @@ valid_email "$admin_email" || die "not a valid e-mail address: $admin_email"
 admin_email=${admin_email,,}
 [[ -n $admin_name && ${#admin_name} -le 100 && $admin_name != -* && $admin_name != *[[:cntrl:]]* ]] ||
     die 'the administrator name must be 1 to 100 printable characters and must not start with a dash'
+[[ $swap_mode == auto || $swap_mode == yes || $swap_mode == no ]] || die '--swap takes auto, yes or no'
 tls_choice=letsencrypt
 if ((self_signed)); then tls_choice=self-signed; fi
 
@@ -165,14 +173,28 @@ case $(uname -m) in
     *) die "unsupported processor architecture: $(uname -m)" ;;
 esac
 [[ -d /run/systemd/system ]] || die 'systemd must be running (containers without an init system are not supported)'
-memory_kb=$(awk '/^(MemTotal|SwapTotal):/ { total += $2 } END { print total + 0 }' /proc/meminfo)
-((memory_kb >= 1800000)) || die "building the portal needs about 2 GB of memory including swap; this server has $((memory_kb / 1024)) MB.
-Add swap first, for example:
-  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-  echo '/swapfile none swap sw 0 0' >> /etc/fstab"
-for mount in /opt /var; do
+ram_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+swap_kb=$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)
+# Building the portal next to a running MySQL needs more than a 2 GB server has without swap.
+add_swap=0
+case $swap_mode in
+    yes) add_swap=1 ;;
+    auto) if ((ram_kb + swap_kb < 3000000)); then add_swap=1; fi ;;
+esac
+if [[ -e $swap_file ]]; then add_swap=0; fi  # added by an earlier run
+if ((add_swap)); then
+    ((ram_kb >= 900000)) || die "this server has $((ram_kb / 1024)) MB of memory; at least 1 GB (2 GB recommended) is needed"
+elif [[ ! -e $swap_file ]]; then
+    ((ram_kb + swap_kb >= 1800000)) || die "building the portal needs about 2 GB of memory including swap; this server has $(((ram_kb + swap_kb) / 1024)) MB.
+Run again without \"--swap no\" to let this script add a swap file, or add swap yourself first."
+fi
+for mount in /opt /var /; do
+    # A directory that does not exist yet will be created on the file system of its nearest parent.
+    while [[ ! -d $mount ]]; do mount=$(dirname -- "$mount"); done
     free_kb=$(df --output=avail -k "$mount" | tail -1 | tr -d ' ')
-    ((free_kb >= 4000000)) || die "at least 4 GB of free disk space is needed on $mount"
+    needed_kb=4000000
+    if ((add_swap)) && [[ $mount == / ]]; then needed_kb=6200000; fi
+    ((free_kb >= needed_kb)) || die "at least $((needed_kb / 1000000)) GB of free disk space is needed on $mount"
 done
 if [[ -e $conf/upgrade-state || -e $conf/install-migration-pending ]]; then
     die 'an earlier operation on this server needs manual reconciliation; see docs/operations/INSTALL.md'
@@ -187,7 +209,16 @@ else
     printf "  Certificate          Let's Encrypt, contact %s\n" "$acme_email"
 fi
 printf '  First administrator  %s (%s)\n' "$admin_email" "$admin_name"
-printf '  Installs             Nginx, MySQL 8.4, Certbot, Node.js %s, pnpm %s\n\n' "$node_version" "$pnpm_version"
+if ((self_signed)); then
+    printf '  Installs             Nginx, MySQL 8.4, Node.js %s, pnpm %s\n' "$node_version" "$pnpm_version"
+else
+    printf '  Installs             Nginx, MySQL 8.4, Certbot, Node.js %s, pnpm %s\n' "$node_version" "$pnpm_version"
+fi
+if ((add_swap)); then
+    printf '  Swap                 adds a 2 GB swap file (%s); this server has %s MB of memory and %s MB of swap\n' \
+        "$swap_file" "$((ram_kb / 1024))" "$((swap_kb / 1024))"
+fi
+printf '\n'
 if ((!assume_yes)); then
     ((interactive)) || die 'no terminal to confirm on; add --yes'
     [[ $(ask 'Install now? [y/N] ') =~ ^[Yy]$ ]] || die 'cancelled; nothing was changed'
@@ -198,28 +229,74 @@ fetch() {  # fetch <https-url> <file>
     curl --disable --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
         --retry 3 --retry-delay 2 --max-time 600 --output "$2" "$1"
 }
-mysql_root() { mysql --protocol=socket --batch --skip-column-names "$@"; }
+# --no-defaults: an option file left in root's home directory by a hosting image must not redirect this.
+mysql_root() { mysql --no-defaults --protocol=socket --batch --skip-column-names "$@"; }
 
+ensure_swap() {
+    if [[ -e $swap_file ]]; then
+        # Added by an earlier run; switched back on if a restart without the fstab entry dropped it.
+        if ! swapon --show=NAME --noheadings | grep -qxF -- "$swap_file"; then swapon -- "$swap_file" || true; fi
+        return
+    fi
+    if ((!add_swap)); then return; fi
+    say 'Adding a 2 GB swap file (the build needs more memory than this server has free)'
+    local ok=0
+    # Written out in full rather than preallocated: that works as swap on every file system that allows it.
+    if (umask 077; dd if=/dev/zero of="$swap_file" bs=1M count=2048 status=none) &&
+       chmod 0600 -- "$swap_file" && mkswap --quiet -- "$swap_file" >/dev/null && swapon -- "$swap_file"; then
+        ok=1
+    fi
+    if ((!ok)); then
+        rm -f -- "$swap_file"
+        ((ram_kb + swap_kb >= 1800000)) ||
+            die 'the swap file could not be switched on (some virtual servers do not allow swap); this server needs about 2 GB of memory including swap'
+        note 'the swap file could not be switched on here; continuing without it'
+        return
+    fi
+    if ! awk -v file="$swap_file" '$1 == file { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then
+        # Kept across restarts. To remove it later: swapoff, delete this line, delete the file.
+        [[ ! -s /etc/fstab || -z $(tail -c1 /etc/fstab) ]] || printf '\n' >> /etc/fstab
+        printf '%s none swap sw 0 0\n' "$swap_file" >> /etc/fstab
+    fi
+    note "$swap_file is active and listed in /etc/fstab"
+}
+
+certbot_available() { [[ -n $(apt-cache policy certbot 2>/dev/null | awk '$1 == "Candidate:" && $2 != "(none)" { print $2 }') ]]; }
 install_packages() {
-    say 'Installing system packages (Nginx, MySQL, Certbot, Git, curl, OpenSSL)'
-    if ! command -v nginx >/dev/null; then
-        local port
-        for port in 80 443; do
-            if (exec 7<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-                die "another program is already listening on port $port; this installer needs a dedicated server"
-            fi
-        done
+    local -a packages=(ca-certificates curl git openssl xz-utils nginx mysql-server mysql-client)
+    local -a tools=(nginx mysql mysqldump mysqld git curl openssl xz)
+    if ((self_signed)); then
+        say 'Installing system packages (Nginx, MySQL, Git, curl, OpenSSL)'
+    else
+        say 'Installing system packages (Nginx, MySQL, Certbot, Git, curl, OpenSSL)'
+        packages+=(certbot)
+        tools+=(certbot)
+    fi
+    if ! systemctl is-active --quiet nginx 2>/dev/null && command -v ss >/dev/null &&
+       ss -Hltn 'sport = :80 or sport = :443' | grep -q .; then
+        ss -Hltnp 'sport = :80 or sport = :443' >&2 || true
+        die 'another program is already listening on port 80 or 443; this installer needs a dedicated server'
     fi
     (
         # Package scripts expect the usual umask; ours is stricter.
         umask 022
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
         apt-get -o DPkg::Lock::Timeout=600 update --quiet
-        apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends \
-            ca-certificates curl git openssl xz-utils nginx mysql-server mysql-client certbot
+        if ((!self_signed)) && ! certbot_available; then
+            # Certbot is published in Ubuntu's "universe" component, which minimal images leave switched off.
+            printf '    switching on the Ubuntu "universe" package component (Certbot is published there)\n'
+            apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends software-properties-common
+            add-apt-repository --yes --no-update universe
+            apt-get -o DPkg::Lock::Timeout=600 update --quiet
+            certbot_available || {
+                printf 'ReadyPackets: the certbot package is not available from this server'"'"'s package sources.\n' >&2
+                exit 1
+            }
+        fi
+        apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends "${packages[@]}"
     )
     local tool
-    for tool in nginx mysql mysqldump mysqld certbot git curl openssl xz; do
+    for tool in "${tools[@]}"; do
         command -v "$tool" >/dev/null || die "$tool is missing after the package installation"
     done
     mysqld --version | grep -Eq 'Ver[[:space:]]+8\.4\.' ||
@@ -507,25 +584,42 @@ public_certificate() {
         fi
         nginx -t
         systemctl reload nginx
+        # A check file, fetched the way the certificate authority will fetch its own. Certbot runs with the
+        # usual umask below, and the directories exist beforehand, so that Nginx can read what Certbot writes.
+        install -d -o root -g root -m 0755 "$webroot/.well-known" "$webroot/.well-known/acme-challenge"
+        rm -f -- "$webroot/.well-known/acme-challenge"/rp-check-*
+        token="rp-check-$(openssl rand -hex 16)"
+        printf '%s\n' "$token" > "$webroot/.well-known/acme-challenge/$token"
+        chmod 0644 "$webroot/.well-known/acme-challenge/$token"
+        # Nginx applies a reload in the background; wait until it serves the challenge directory.
+        local attempt
+        for ((attempt = 1; attempt <= 20; attempt++)); do
+            body=$(curl --disable --silent --noproxy '*' --max-time 5 --resolve "$origin:80:127.0.0.1" \
+                "http://$origin/.well-known/acme-challenge/$token" || true)
+            if [[ $body == "$token" ]]; then break; fi
+            sleep 1
+        done
+        [[ $body == "$token" ]] || { rm -f -- "$webroot/.well-known/acme-challenge/$token"
+            die "Nginx on this server does not serve $webroot over HTTP; check 'systemctl status nginx'"; }
         if ((dns_check)); then
             # Spares the certificate authority's rate limits: a request is only sent once each name is seen
             # to reach this server over plain HTTP.
-            token="rp-check-$(openssl rand -hex 16)"
-            install -d -o root -g root -m 0755 "$webroot/.well-known" "$webroot/.well-known/acme-challenge"
-            printf '%s\n' "$token" > "$webroot/.well-known/acme-challenge/$token"
-            chmod 0644 "$webroot/.well-known/acme-challenge/$token"
             for name in "$origin" ${alias_host:+"$alias_host"}; do
                 getent ahosts "$name" >/dev/null || { rm -f -- "$webroot/.well-known/acme-challenge/$token"
                     die "$name does not resolve yet. Point its DNS record at this server, wait for it to take effect and run this script again."; }
-                body=$(curl --disable --silent --noproxy '*' --max-time 20 "http://$name/.well-known/acme-challenge/$token" || true)
+                body=$(curl --disable --silent --noproxy '*' --max-time 20 --retry 2 --retry-delay 2 \
+                    "http://$name/.well-known/acme-challenge/$token" || true)
                 [[ $body == "$token" ]] || { rm -f -- "$webroot/.well-known/acme-challenge/$token"
                     die "http://$name does not reach this server (DNS record, firewall or port 80). Fix it and run this script again, or add --skip-dns-check if this server cannot reach its own public address."; }
             done
-            rm -f -- "$webroot/.well-known/acme-challenge/$token"
         fi
-        certbot certonly --webroot --webroot-path "$webroot" --cert-name readypackets-portal "${names[@]}" \
-            --non-interactive --agree-tos --email "$acme_email" --no-eff-email --key-type ecdsa \
-            ${RP_ACME_SERVER:+--server "$RP_ACME_SERVER"}
+        rm -f -- "$webroot/.well-known/acme-challenge/$token"
+        (
+            umask 022
+            certbot certonly --webroot --webroot-path "$webroot" --cert-name readypackets-portal "${names[@]}" \
+                --non-interactive --agree-tos --email "$acme_email" --no-eff-email --key-type ecdsa \
+                ${RP_ACME_SERVER:+--server "$RP_ACME_SERVER"}
+        )
         [[ -r $tls_dir/fullchain.pem && -r $tls_dir/privkey.pem ]] || die 'certbot did not leave a certificate behind'
     fi
     # Renewal: the packaged timer runs certbot; this hook makes Nginx pick the new certificate up.
@@ -548,16 +642,16 @@ generate_password() {
 }
 
 prepare_admin() {
-    reused_pending=0
     if [[ -e $admin_marker ]]; then return; fi
     if [[ -s $pending_password && -s $pending_email && -s $credentials ]]; then
         # An earlier run stopped after preparing the account. Its details are kept so that the saved
         # sign-in stays correct whether or not the account had already been created.
-        reused_pending=1
         admin_email=$(<"$pending_email")
         note "continuing with the administrator prepared by an earlier run ($admin_email)"
         return
     fi
+    # A new password: no earlier attempt can have created an account with it.
+    rm -f -- "$attempt_marker"
     rm -f -- "$pending_password" "$pending_email"
     local password
     password=$(generate_password)
@@ -580,17 +674,20 @@ prepare_admin() {
 }
 
 finish_admin() {
+    # install.sh recorded what happened: "created"; "existing" when the account was found on a repeated
+    # attempt with the same prepared password (an interrupted run had most likely created it); "preexisting"
+    # when the database already had an administrator before the first attempt.
     local outcome
     outcome=$(<"$admin_marker")
     if [[ -e $pending_password ]]; then
-        if [[ $outcome == existing && $reused_pending == 0 ]]; then
-            # The database already had an administrator, so the password generated in this run was never used.
+        if [[ $outcome == preexisting ]]; then
+            # The password generated here was never used.
             rm -f -- "$credentials"
             printf 'unused\n' > "$conf/initial-admin-outcome"
         else
             printf '%s\n' "$outcome" > "$conf/initial-admin-outcome"
         fi
-        rm -f -- "$pending_password" "$pending_email"
+        rm -f -- "$pending_password" "$pending_email" "$attempt_marker"
     fi
 }
 
@@ -617,6 +714,7 @@ load_catalog() {
 }
 
 run_steps() {
+    ensure_swap
     install_packages
     resolve_commit
     install_node
@@ -686,7 +784,7 @@ if [[ -s $credentials && ! -e $shown_marker ]]; then
         printf '  The first administrator was created. No terminal is attached, so the sign-in details are not\n  printed. Read them as root:  sudo cat %s\n' "$credentials"
     fi
     if [[ $outcome == existing ]]; then
-        printf '\n  Note: an earlier, interrupted run had already created this administrator.\n'
+        printf '\n  Note: this administrator already existed when this run reached that step, most likely created by an\n  earlier, interrupted run with the same password.\n'
     fi
 elif [[ -s $credentials ]]; then
     printf '  First administrator: %s\n  The temporary password was shown when the installation finished. Until you delete the file it\n  can be read as root:  sudo cat %s\n' \
@@ -701,6 +799,7 @@ printf '    - Sign in, choose a new password and enrol an authenticator app.\n'
 printf '    - Configure outgoing mail (SMTP) in the administration console; until then invitations and\n      password resets are held.\n'
 printf '    - Firewall: this script does not change it. Allow only SSH, 80 and 443 from outside.\n'
 printf '    - Backups: run "sudo systemctl start readypackets-backup@cli.service", check the result with\n      "sudo journalctl -u readypackets-backup@cli.service", then enable the daily timer with\n      "sudo systemctl enable --now readypackets-backup.timer".\n'
+printf '      Archives (/var/lib/readypackets/storage/backups) and the keys in /etc/readypackets/secrets are both on\n      this server. Keep a copy of each somewhere else; an archive cannot be restored without the keys.\n'
 if [[ $tls_mode == self-signed ]]; then
     printf '    - The certificate is self-signed: browsers warn and passkeys may be refused.\n'
 fi

@@ -107,14 +107,19 @@ systemctl reload nginx
 
 if [[ ! -e "$conf/admin-bootstrap-done" ]]; then
     if ((unattended)); then
+        # A second attempt with the same prepared password (auto-install.sh removes this marker whenever it
+        # prepares a new one) may find the account that an interrupted first attempt created.
+        admin_retry=0
+        if [[ -e "$conf/admin-bootstrap-attempted" ]]; then admin_retry=1; fi
+        : > "$conf/admin-bootstrap-attempted"
         admin_status=0
         bootstrap_admin_unattended "$RP_BOOTSTRAP_ADMIN_EMAIL" "$RP_BOOTSTRAP_ADMIN_NAME" \
             "$RP_BOOTSTRAP_ADMIN_PASSWORD_FILE" || admin_status=$?
-        # The marker records the outcome for auto-install.sh: 73 means an administrator was already there,
-        # for example because an earlier run was interrupted after creating it.
+        # The marker records the outcome for auto-install.sh. Exit status 73 means an administrator was
+        # already there: "existing" on a repeated attempt, "preexisting" on the first one.
         case $admin_status in
             0) printf 'created\n' > "$conf/admin-bootstrap-done" ;;
-            73) printf 'existing\n' > "$conf/admin-bootstrap-done" ;;
+            73) if ((admin_retry)); then printf 'existing\n'; else printf 'preexisting\n'; fi > "$conf/admin-bootstrap-done" ;;
             *) die "the first administrator could not be created (exit $admin_status); the portal stays fenced" ;;
         esac
     else

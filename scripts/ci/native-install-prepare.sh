@@ -4,9 +4,12 @@
 # image ships are removed, and the checked-out commit is cloned into a root-owned directory, which is what
 # the installation guide tells an operator to do.
 #
-#   native-install-prepare.sh <portal-host> <alias-host>
+#   native-install-prepare.sh <portal-host> <alias-host> [without-universe]
+#
+# "without-universe" also switches off Ubuntu's "universe" package component, as minimal server images do.
 set -euo pipefail
-[[ $EUID == 0 && $# == 2 ]] || { echo 'usage: sudo native-install-prepare.sh <portal-host> <alias-host>' >&2; exit 64; }
+[[ $EUID == 0 && ($# == 2 || ($# == 3 && $3 == without-universe)) ]] ||
+    { echo 'usage: sudo native-install-prepare.sh <portal-host> <alias-host> [without-universe]' >&2; exit 64; }
 [[ ${GITHUB_ACTIONS:-} == true ]] || { echo 'this script removes software; it only runs on a CI runner' >&2; exit 1; }
 readonly source_dir=${GITHUB_WORKSPACE:?} target=/opt/readypackets-src
 export DEBIAN_FRONTEND=noninteractive
@@ -28,6 +31,17 @@ if ss -Hltn | awk '{print $4}' | grep -Eq ':(80|443|3306|5000)$'; then
     echo 'a port the portal needs is still in use:' >&2
     ss -Hltnp >&2
     exit 1
+fi
+
+if [[ ${3:-} == without-universe ]]; then
+    sources=/etc/apt/sources.list.d/ubuntu.sources
+    grep -Eq '^Components:.* universe' "$sources" || { echo "unexpected package sources layout in $sources" >&2; cat "$sources" >&2; exit 1; }
+    sed -i -E '/^Components:/ s/ (universe|multiverse)//g' "$sources"
+    apt-get update --quiet
+    if [[ -n $(apt-cache policy certbot | awk '$1 == "Candidate:" && $2 != "(none)" { print $2 }') ]]; then
+        echo 'certbot is still installable although universe was switched off' >&2; exit 1
+    fi
+    echo 'Prepared without the universe component.'
 fi
 
 # The test names resolve to this machine, as a DNS record would on a real server.

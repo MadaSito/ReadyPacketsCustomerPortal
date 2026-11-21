@@ -1,6 +1,11 @@
 #@ TEMPLATE (see readypackets-portal.conf.template). @RP_TLS_DIR@ holds fullchain.pem and privkey.pem.
 ssl_certificate @RP_TLS_DIR@/fullchain.pem;
 ssl_certificate_key @RP_TLS_DIR@/privkey.pem;
+#@http2{
+# HTTP/2 for the two named TLS servers that include this file. (Left out on nginx older than 1.25.1, which
+# does not know this directive; those servers stay on HTTP/1.1.)
+http2 on;
+#@http2}
 
 # Let's Encrypt does not issue OCSP URLs. For an alternate CA with an OCSP responder:
 # ssl_stapling on;

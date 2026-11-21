@@ -19,6 +19,10 @@ done
 systemctl daemon-reload
 rm -f -- "$site" "$acme_site" "$nginx_dir/sites-available/readypackets-portal.conf" "$nginx_dir/snippets/readypackets-tls.conf" \
     "$nginx_dir/snippets/readypackets-edge.conf"
+# Certificates are kept, but nothing answers the renewal challenge any more: the hook goes, and Certbot will
+# report failed renewals for "readypackets-portal" until the portal is installed again or the certificate is
+# deleted (certbot delete --cert-name readypackets-portal).
+rm -f -- /etc/letsencrypt/renewal-hooks/deploy/readypackets-nginx
 nginx -t
 systemctl reload nginx
 printf 'ReadyPackets deactivated. Database, storage, keys, certificates, backups and releases were not deleted.\n'

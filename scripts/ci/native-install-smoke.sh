@@ -57,7 +57,7 @@ expect 'node' "$(/usr/local/bin/node --version)" v22.23.5
 expect 'pnpm' "$(/usr/local/bin/pnpm --version)" 12.21.0
 [[ $(readlink -f /usr/local/bin/node) == /usr/local/lib/readypackets-node/* ]] || fail 'node is not the pinned runtime'
 for tool in npm npx corepack; do
-    [[ ! -e /usr/local/bin/$tool ]] || fail "unexpected tool next to the runtime: $tool"
+    [[ ! -e /usr/local/bin/$tool && ! -L /usr/local/bin/$tool ]] || fail "unexpected tool next to the runtime: $tool"
 done
 mysqld --version | grep -Eq 'Ver[[:space:]]+8\.4\.' || fail 'MySQL is not 8.4'
 
@@ -65,7 +65,7 @@ step 'readiness and the application shell over verified TLS'
 expect 'readyz' "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 expect 'healthz' "$(web -o /dev/null -w '%{http_code}' "$origin/healthz")" 200
 web -D "$work/shell.headers" -o "$work/shell.html" -H 'Accept: text/html' "$origin/"
-grep -qi '^HTTP/2 200' "$work/shell.headers" || fail 'the shell was not served over HTTP/2 with status 200'
+grep -qi '^HTTP/2 200' "$work/shell.headers" || fail "the shell was not served over HTTP/2 with status 200: $(head -n1 "$work/shell.headers" | tr -d '\r')"
 for header in strict-transport-security content-security-policy x-content-type-options x-request-id; do
     grep -qi "^$header:" "$work/shell.headers" || fail "missing response header: $header"
 done
@@ -104,7 +104,7 @@ expect 'IP address is refused during the TLS handshake' "$status" 35
 if [[ -n $alias ]]; then
     step 'the alias only redirects'
     web -D "$work/alias.headers" -o /dev/null "https://$alias/orders?x=1"
-    grep -qi '^HTTP/2 308' "$work/alias.headers" || fail 'the alias did not answer 308'
+    grep -qi '^HTTP/2 308' "$work/alias.headers" || fail "the alias did not answer 308 over HTTP/2: $(head -n1 "$work/alias.headers" | tr -d '\r')"
     grep -qi "^location: $origin/orders?x=1" "$work/alias.headers" || fail 'the alias did not redirect to the portal'
     grep -qi '^strict-transport-security:' "$work/alias.headers" || fail 'the alias redirect carries no HSTS'
     expect 'alias on port 80' "$(web -o /dev/null -w '%{http_code} %{redirect_url}' "http://$alias/a")" "308 $origin/a"
@@ -127,7 +127,8 @@ upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: app
 step 'only Nginx is reachable from outside'
 listeners=$(ss -Hltn | awk '{print $4}' | sort -u)
 grep -qx '127.0.0.1:5000' <<<"$listeners" || fail 'the application does not listen on 127.0.0.1:5000'
-! grep -Eq '^(0\.0\.0\.0|\*|\[::\]):(5000|3306|33060)$' <<<"$listeners" || fail 'the application or the database listens on every address'
+# Every listener on the application and database ports is on IPv4 loopback, whatever else is configured.
+! grep -E ':(5000|3306|33060)$' <<<"$listeners" | grep -qv '^127\.0\.0\.1:' || fail 'the application or the database listens beyond 127.0.0.1'
 grep -qx '127.0.0.1:3306' <<<"$listeners" || fail 'MySQL does not listen on 127.0.0.1:3306'
 expect 'MySQL settings' "$(sql "SELECT CONCAT_WS(' ', @@bind_address, @@skip_name_resolve, @@local_infile)")" '127.0.0.1 1 0'
 
@@ -198,6 +199,7 @@ grep -q "Portal address : $origin\$" "$credentials" || fail 'the saved details n
 expect 'install log' "$(mode_of "$install_log")" 600:root:root
 ! grep -qFf "$work/password" "$install_log" || fail 'the administrator password is in the installation log'
 journalctl --boot --no-pager --output=cat > "$work/journal" 2>/dev/null || true
+[[ -s $work/journal ]] || fail 'the system journal could not be read'
 ! grep -qFf "$work/password" "$work/journal" || fail 'the administrator password is in the system journal'
 [[ ! -e $conf/initial-admin-password && ! -e $conf/initial-admin-email ]] || fail 'the pending password file was kept'
 expect 'administrator marker' "$(cat "$conf/admin-bootstrap-done")" created
@@ -229,7 +231,10 @@ sign_in
 step 'Nginx logs hold no request target, query string or header value'
 web -o /dev/null -H 'X-Probe: header-canary-7f3a' "$origin/path-canary-91c2?token=query-canary-55d1" || true
 sleep 1
+grep -q '"edge_request_id"' /var/log/nginx/readypackets-access.log || fail 'the Nginx access log recorded nothing'
 ! grep -rqs 'canary' /var/log/nginx || fail 'the Nginx logs contain request data'
+# The stock log files of the package must not receive the portal's requests either.
+[[ ! -s /var/log/nginx/access.log ]] || fail 'the stock Nginx access log is in use'
 
 step 'maintenance fence: everyone but the local health probe is turned away'
 # Requests from 127.0.0.2 stand in for outside clients; 127.0.0.1 is the installer's own probe address.
@@ -241,9 +246,13 @@ rm -f /etc/nginx/readypackets-maintenance
 expect 'reopened' "$(web --interface 127.0.0.2 -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 
 step 'a manual encrypted backup completes and is verified'
+verified_archives="SELECT COUNT(*) FROM readypackets.backup_archives WHERE state = 'completed' AND verification_status = 'verified'"
+archives_before=$(sql "$verified_archives")
+verifications_before=$(sql "SELECT COUNT(*) FROM readypackets.backup_verifications WHERE state = 'completed'")
 systemctl start readypackets-backup@cli.service || { journalctl --unit=readypackets-backup@cli.service --no-pager --lines=60; fail 'the backup failed'; }
 expect 'backup result' "$(systemctl show readypackets-backup@cli.service -p Result --value)" success
-expect 'verified archives recorded' "$(sql "SELECT COUNT(*) > 0 FROM readypackets.backup_archives")" 1
+expect 'verified archives recorded by this run' "$(sql "$verified_archives")" "$((archives_before + 1))"
+expect 'verifications recorded by this run' "$(sql "SELECT COUNT(*) FROM readypackets.backup_verifications WHERE state = 'completed'")" "$((verifications_before + 1))"
 
 step 'restart of every service (as after a reboot) keeps the portal working'
 systemctl restart mysql.service

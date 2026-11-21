@@ -37,13 +37,14 @@ jobs:
             alias: false
           - runner: ubuntu-26.04-arm
             alias: true
+            swap: true
     steps:
       - uses: actions/checkout@v7 # TODO(pin)
         with:
           persist-credentials: false
           fetch-depth: 0
       - name: Shell scripts (ShellCheck)
-        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh
+        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh
       - name: Make the runner look like a new server
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Refusals that change nothing
@@ -64,6 +65,7 @@ jobs:
           expect_refusal 'give --acme-email' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --yes
           expect_refusal 'not both' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --acme-email a@example.com --tls-self-signed --yes
           expect_refusal 'must differ' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --alias "$PORTAL_HOST" --tls-self-signed --yes
+          expect_refusal '--swap takes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --swap maybe --yes
           expect_refusal 'add --yes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed
           for path in /etc/readypackets /opt/readypackets /etc/nginx /etc/mysql /usr/local/bin/node; do
             if sudo test -e "$path"; then echo "a refused run left $path behind"; exit 1; fi
@@ -71,11 +73,16 @@ jobs:
       - name: Install (one command, no questions)
         env:
           WITH_ALIAS: ${{ matrix.alias }}
+          WITH_SWAP: ${{ matrix.swap }}
         run: |
           set -euo pipefail
           options=(--domain "https://${PORTAL_HOST^^}/" --tls-self-signed --admin-email "$ADMIN_EMAIL" --print-credentials --yes)
           if [[ $WITH_ALIAS == true ]]; then options+=(--alias "$ALIAS_HOST"); fi
+          # The runners have plenty of memory, so the swap file is asked for explicitly on one of them.
+          if [[ $WITH_SWAP == true ]]; then options+=(--swap yes); fi
           sudo bash scripts/ci/native-install-run.sh first "${options[@]}"
+          # Certbot is only installed when a public certificate is asked for.
+          if command -v certbot >/dev/null; then echo 'certbot was installed for a self-signed setup'; exit 1; fi
       - name: End-to-end checks
         env:
           WITH_ALIAS: ${{ matrix.alias }}
@@ -89,11 +96,19 @@ jobs:
       - name: A second run changes nothing and does not print the password again
         env:
           WITH_ALIAS: ${{ matrix.alias }}
+          WITH_SWAP: ${{ matrix.swap }}
         run: |
           set -euo pipefail
           options=(--domain "$PORTAL_HOST" --tls-self-signed --admin-email other.admin@example.com --yes)
           if [[ $WITH_ALIAS == true ]]; then options+=(--alias "$ALIAS_HOST"); fi
           sudo bash scripts/ci/native-install-run.sh again "${options[@]}"
+          if [[ $WITH_SWAP == true ]]; then
+            sudo swapon --show=NAME --noheadings | grep -qxF /swapfile.readypackets || { echo 'the swap file is not active'; exit 1; }
+            [[ $(sudo stat -c '%a:%U' /swapfile.readypackets) == 600:root ]] || { echo 'the swap file is not private to root'; exit 1; }
+            [[ $(grep -c '^/swapfile.readypackets ' /etc/fstab) == 1 ]] || { echo 'expected exactly one fstab entry for the swap file'; exit 1; }
+          else
+            if sudo test -e /swapfile.readypackets; then echo 'a swap file was added although memory is plentiful'; exit 1; fi
+          fi
       - name: Another host name is refused once installed
         run: |
           set -uo pipefail
@@ -118,7 +133,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Make the runner look like a new server
-        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
+        run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST" without-universe
       - name: Start a local ACME certificate authority (Pebble) and trust its root
         run: |
           set -euo pipefail
@@ -158,6 +173,10 @@ jobs:
           sudo env REQUESTS_CA_BUNDLE="$RUNNER_TEMP/pebble/minica.pem" RP_ACME_SERVER=https://localhost:14000/dir \
             bash scripts/ci/native-install-run.sh first --domain "$PORTAL_HOST" --alias "$ALIAS_HOST" \
             --acme-email "$ADMIN_EMAIL" --print-credentials --yes
+          # The runner was prepared like a minimal image without the "universe" component, where Certbot lives.
+          grep -q 'switching on the Ubuntu "universe" package component' <(sudo cat /root/auto-install-first.out) ||
+            { echo 'the installer did not have to switch the universe component on'; exit 1; }
+          command -v certbot >/dev/null
       - name: End-to-end checks
         run: sudo bash scripts/ci/native-install-smoke.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Renewal replaces the certificate and Nginx serves the new one

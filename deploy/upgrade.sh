@@ -75,6 +75,12 @@ point_release "$release" current
 phase=verifying
 record_phase
 install_unit_files
+# The Nginx files come from the release's templates too; the site stays fenced while they are replaced.
+render_site "$deploy_src/nginx/readypackets-edge.conf.template" "$nginx_dir/snippets/readypackets-edge.conf"
+render_site "$deploy_src/nginx/readypackets-tls.conf.template" "$nginx_dir/snippets/readypackets-tls.conf"
+render_site "$deploy_src/nginx/readypackets-portal.conf.template" "$nginx_dir/sites-available/readypackets-portal.conf"
+nginx -t
+systemctl reload nginx
 systemctl start "$worker" "$web"
 check_http local
 check_http edge
