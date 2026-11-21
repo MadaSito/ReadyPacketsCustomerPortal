@@ -6,7 +6,9 @@ export const managedMode = z.enum(["off", "detect", "block"]);
 export const fieldSchema = z.enum(["path", "method", "header", "query", "ip", "country"]);
 const inspectedHeaders = ["user-agent", "content-type", "accept", "accept-language", "sec-fetch-site"] as const;
 const country = z.string().regex(/^[A-Z]{2}$/);
-const literal = z.string().trim().min(1).max(160).refine((s) => !/[\u0000-\u001f\u007f]/.test(s));
+const literal = z.string().trim().min(1).max(160).refine((s) =>
+  Array.from(s).every((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127),
+);
 
 export interface Address { family: 4 | 6; text: string; number: bigint }
 export interface Network { address: Address; length: number }

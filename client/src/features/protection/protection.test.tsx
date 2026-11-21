@@ -65,7 +65,7 @@ for (const [index, page] of protectionPages.entries()) {
   pageA11y(page.path, async () => {
     renderPage(Component, page.path, page.title);
     await screen.findByRole("heading", { level: 1, name: page.title });
-    if (index >= 3) await screen.findByLabelText(content);
+    if (index >= 3) await screen.findByLabelText(content, { exact: false, selector: "input" });
     else await screen.findByText(content);
     expect(screen.getByRole("link", { name: page.navigation })).toHaveAttribute("aria-current", "page");
   });

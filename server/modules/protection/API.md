@@ -26,4 +26,6 @@ Managed groups: `injection`, `traversal`, `protocol`, `scanner`, `oversize` (`of
 
 Events record bounded route templates, normalized method/country, correlation and action; sensitive detail is limited to the administrator event view and redacted in audit/SIEM. Requests do not record raw queries, credential-bearing headers or bodies. Bounded sampling and retention apply to request events. Release of an automatic block does not remove a manual list entry.
 
-Exports for integration: `createProtectionModule`, `protectionRouter`, `protectionFeature`, and protection schema tables (will notify the integrator when final).
+Exports for integration: `createProtectionModule`, `ProtectionModule`, `protectionRouter`, and `protectionFeature`. Schema exports: `protectionPolicies`, `protectionBlocks`, and `protectionEvents`; existing `rateLimitCounters` adds nullable indexed `blockPublicId`.
+
+See the [administrator guide](ADMIN_GUIDE.md), [customer help](CUSTOMER_HELP.md), and [verification notes](VERIFICATION.md).
