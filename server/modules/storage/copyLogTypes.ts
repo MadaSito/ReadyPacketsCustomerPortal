@@ -17,7 +17,8 @@ type AttemptIdentity = {
 };
 
 export type CopyAttemptEvent = AttemptIdentity & (
-  { phase: "queued" | "started" } |
+  { phase: "queued" } |
+  { phase: "started" } |
   { phase: "finished"; alreadyAudited?: true } & (
     { result: "verified"; verification: CopyVerification; errorCode?: never } |
     { result: "written"; verification?: never; errorCode?: never } |

@@ -7,6 +7,7 @@ import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, JobResult, Tx } from "../../core/types.js";
 import { isAutomationOrigin } from "../audit/tap.js";
 import type { StorageModule } from "./contracts.js";
+import { recordCopyAttempt } from "./copyLogWriter.js";
 import { storageFileCopies } from "./schema.js";
 import { copySegment, storagePublicId } from "./validation.js";
 
@@ -69,6 +70,10 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
     const [row] = await db.select().from(storageFileCopies)
       .where(eq(storageFileCopies.publicId, parsed.data.copyPublicId)).limit(1);
     if (!row || row.state === "copied" || row.state === "skipped") return { outcome: "completed" };
+    const attempt = {
+      kind: "order_file" as const, sourcePublicId: row.filePublicId, connectionPublicId: row.connectionPublicId,
+      jobPublicId: job.jobId, attempt: job.attempt, correlationId: job.correlationId,
+    };
     const automationOrigin = isAutomationOrigin(job.correlationId);
     const automationSourceInactive = (source: { visibility: string; currentVersion: boolean }) =>
       automationOrigin && (source.visibility !== "customer_visible" || !source.currentVersion);
@@ -88,6 +93,7 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
           targetEnc: row.targetEnc ?? crypto.encrypt(JSON.stringify(target), targetAad(row.publicId)),
           updatedAt: clock.now() }).where(eq(storageFileCopies.id, row.id));
         await auditCopy(job, row, "attempted", undefined, tx);
+        await recordCopyAttempt(deps, { ...attempt, phase: "started", bytes: source.size }, tx);
         return { source, target };
       });
       const { source, target } = prepared;
@@ -120,6 +126,10 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
         await tx.update(storageFileCopies).set({ state: "copied", remoteIdEnc: crypto.encrypt(result.remoteId, remoteAad(row.publicId)),
           digestVerified, updatedAt: now, finishedAt: now }).where(eq(storageFileCopies.id, row.id));
         await auditCopy(job, row, "completed", undefined, tx);
+        await recordCopyAttempt(deps, {
+          ...attempt, phase: "finished", bytes: source.size, alreadyAudited: true,
+          ...(digestVerified ? { result: "verified", verification: "checksum" } as const : { result: "written" } as const),
+        }, tx);
       });
       return { outcome: "completed", safeCounts: { files: 1, digestVerified: digestVerified ? 1 : 0 } };
     } catch (error) {
@@ -135,6 +145,9 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
           attempts: job.attempt, reasonCode: code, updatedAt: now, finishedAt: willRetry ? null : now })
           .where(eq(storageFileCopies.id, row.id));
         await auditCopy(job, row, skipped ? "refused" : code === "STORAGE_COPY_UNCERTAIN" ? "unknown" : "failed", code, tx);
+        await recordCopyAttempt(deps, {
+          ...attempt, phase: "finished", result: skipped ? "not_written" : "failed", errorCode: code, alreadyAudited: true,
+        }, tx);
       });
       if (skipped) return { outcome: "completed", safeCounts: { skipped: 1 } };
       if (code === "STORAGE_COPY_UNCERTAIN") return { outcome: "unknown", reasonCode: code };
@@ -158,8 +171,12 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
           .limit(1).for("update");
         if (!stored) throw new Error("STORAGE_COPY_ROW_UNAVAILABLE");
         if (stored.publicId !== copyPublicId) continue; // Preserve any existing result and its bound generation.
-        await jobs.enqueue(jobType, { copyPublicId }, {
+        const { jobId } = await jobs.enqueue(jobType, { copyPublicId }, {
           idempotencyKey: `${filePublicId}:${destination.publicId}`, maxAttempts, correlationId,
+        }, tx);
+        await recordCopyAttempt(deps, {
+          phase: "queued", kind: "order_file", sourcePublicId: filePublicId, connectionPublicId: destination.publicId,
+          jobPublicId: jobId, attempt: 1, correlationId,
         }, tx);
         queued += 1;
       }

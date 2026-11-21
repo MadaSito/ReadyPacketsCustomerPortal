@@ -9,7 +9,7 @@ import type { SessionPrincipal } from "../../core/types.js";
 import { orderFilesCopyAction } from "./automation.js";
 import { StorageAdapterError, type StorageConnectionView } from "./contracts.js";
 import { createStorageModule, type StorageModule } from "./index.js";
-import { storageAssignments, storageConnections, storageFileCopies } from "./schema.js";
+import { storageAssignments, storageConnections, storageCopyAttempts, storageFileCopies } from "./schema.js";
 
 const jobType = "storage.copy_order_file";
 const sourceBytes = Buffer.from("synthetic local order file");
@@ -33,11 +33,11 @@ let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string,
 let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies } });
+  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies, storageCopyAttempts } });
 });
 afterAll(() => db?.cleanup());
 beforeEach(async () => {
-  for (const table of [storageFileCopies, storageAssignments, storageConnections]) await db.db.delete(table);
+  for (const table of [storageCopyAttempts, storageFileCopies, storageAssignments, storageConnections]) await db.db.delete(table);
   h = createTestDeps({ db: db.db });
   admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
   stepUp = admin.stepUpAt;
