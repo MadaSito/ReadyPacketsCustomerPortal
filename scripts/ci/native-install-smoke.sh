@@ -93,7 +93,18 @@ closed 'unknown name on port 80' -H 'Host: unknown.example' "http://$host/"
 closed 'IP address on port 80' http://127.0.0.1/
 closed 'another port in Host on port 80' -H "Host: $host:8080" "http://$host/"
 closed 'another port in Host on port 443' -H "Host: $host:8443" "$origin/readyz"
-closed 'look-alike name' -H "Host: $host.evil.example" "$origin/readyz"
+# A name that does not belong to the certificate's server: dropped over HTTP/1.1, answered with
+# "421 Misdirected Request" by Nginx itself over HTTP/2. Either way the application never sees it.
+misdirected() {  # misdirected <label> <curl args...>
+    local label=$1 status=0 code
+    shift
+    code=$(web -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || status=$?
+    [[ ($status == 0 && $code == 421) || $status == 52 || $status == 56 || $status == 92 ]] ||
+        fail "$label: expected 421 or a dropped connection, got status $code (curl exit $status)"
+}
+misdirected 'look-alike name' -H "Host: $host.evil.example" "$origin/readyz"
+misdirected 'look-alike name over HTTP/1.1' --http1.1 -H "Host: $host.evil.example" "$origin/readyz"
+misdirected 'unknown name inside a connection for the portal' -H 'Host: unknown.example' "$origin/readyz"
 status=0
 curl --disable --silent --max-time 15 --insecure -o /dev/null --resolve unknown.example:443:127.0.0.1 https://unknown.example/ 2>/dev/null || status=$?
 expect 'unknown name is refused during the TLS handshake' "$status" 35
