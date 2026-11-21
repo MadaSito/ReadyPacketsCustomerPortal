@@ -101,6 +101,11 @@ export default function MailPage() {
     <Callout title="Acceptance is not delivery" tone="info">
       Provider acceptance confirms submission, not arrival in the recipient’s inbox.
     </Callout>
+    <Callout title="Viewing what was sent" tone="info">
+      A View message action appears on messages sent while stored message content is turned on. It is off by
+      default; turn it on under <Link href="/admin/email-delivery" className="underline underline-offset-2">E-mail delivery</Link>.
+      Messages sent while it was off cannot be shown later.
+    </Callout>
     {message ? <Callout tone="success" live="polite">{message}</Callout> : null}
     {captureError ? <Callout tone="danger" live="assertive">{captureError}</Callout> : null}
     <DataTable caption="Outgoing mail" rows={rows} rowKey={(row) => row.publicId} loading={result.isPending}

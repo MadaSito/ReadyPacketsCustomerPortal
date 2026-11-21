@@ -387,7 +387,7 @@ export function conditionSummary(draft: Pick<Draft, "groups" | "match">): string
 }
 
 export function toGraph(draft: Draft, catalogue: Catalogue | undefined, errors?: Record<Exclude<StepId, "review">, Errors>): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const pos = (id: string, index: number) => draft.positions[id] ?? { x: GRID * 2 + index * 260, y: GRID * 4 };
+  const pos = (id: string, index: number) => draft.positions[id] ?? { x: GRID * 2 + index * 320, y: GRID * 4 };
   const nodes: GraphNode[] = [];
   const order: string[] = [TRIGGER_NODE];
   nodes.push({ id: TRIGGER_NODE, kind: "Trigger", label: triggerLabel(draft.trigger, catalogue), sublabel: draft.trigger?.kind === "event" ? "Event" : draft.trigger ? (draft.trigger.kind === "manual" ? "Manual" : "Schedule") : "Choose a trigger",

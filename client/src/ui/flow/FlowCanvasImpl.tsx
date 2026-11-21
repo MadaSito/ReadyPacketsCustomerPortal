@@ -22,7 +22,7 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import { Maximize, Minus, Plus } from "lucide-react";
-import { createContext, useCallback, useContext, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { createContext, useEffect, useCallback, useContext, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { IconButton } from "../Button";
 import { cn } from "../cn";
 import { FLOW_GRID, FLOW_HEIGHTS, snap, type FlowCanvasProps, type FlowEdge, type FlowNode, type FlowSelection, type FlowTone } from "./types";
@@ -130,6 +130,8 @@ function EdgeLine(props: EdgeProps<RpEdge>) {
 const nodeTypes = { rp: NodeCard };
 const edgeTypes = { rp: EdgeLine };
 const INSTANT = { duration: 0 } as const;
+// @xyflow/react 13 reads a bare number as pixels (0.2 → 0 px), so the margin is given as a percentage.
+const FIT = { padding: "8%", maxZoom: 1 } as const;
 
 function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConnect, onDelete, readOnly = false, height = "md" }: FlowCanvasProps) {
   const flow = useReactFlow<RpNode, RpEdge>();
@@ -142,6 +144,21 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
   const canDelete = !readOnly && !!onDelete;
 
   const labels = useMemo(() => new Map(nodes.map((node) => [node.id, node.label])), [nodes]);
+
+  // Keyboard moves can change the reading order (nodes are sorted top-to-bottom, left-to-right). The browser
+  // drops focus when the focused element is re-inserted, so put it back on the step that was just moved.
+  const refocusNode = useRef<string | null>(null);
+  useEffect(() => {
+    const id = refocusNode.current;
+    if (!id) return;
+    const frame = window.requestAnimationFrame(() => {
+      refocusNode.current = null;
+      const target = [...(frameRef.current?.querySelectorAll<HTMLElement>("[data-flow-node]") ?? [])]
+        .find((element) => element.dataset.flowNode === id);
+      if (target && document.activeElement !== target) target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [nodes]);
 
   const rfNodes = useMemo<RpNode[]>(
     () =>
@@ -235,6 +252,7 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
         const dy = key === "ArrowUp" ? -step : key === "ArrowDown" ? step : 0;
         const x = snap(node.x + dx);
         const y = snap(node.y + dy);
+        refocusNode.current = node.id;
         onMove?.(node.id, x, y);
         select({ type: "node", id: node.id });
         setMessage(`Moved ${node.label} to ${x}, ${y}.`);
@@ -294,7 +312,7 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
         <div className="flex flex-wrap items-center gap-1">
           <IconButton label="Zoom in" icon={<Plus />} variant="secondary" size="sm" onClick={() => void flow.zoomIn(INSTANT)} />
           <IconButton label="Zoom out" icon={<Minus />} variant="secondary" size="sm" onClick={() => void flow.zoomOut(INSTANT)} />
-          <IconButton label="Fit to view" icon={<Maximize />} variant="secondary" size="sm" onClick={() => void flow.fitView({ ...INSTANT, padding: 0.2, maxZoom: 1 })} />
+          <IconButton label="Fit to view" icon={<Maximize />} variant="secondary" size="sm" onClick={() => void flow.fitView({ ...INSTANT, ...FIT })} />
           {readOnly ? <span className="ml-2 text-sm text-muted">Read only</span> : null}
         </div>
         <p id={helpId} className="text-sm text-muted">
@@ -346,7 +364,7 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
             minZoom={0.25}
             maxZoom={2}
             fitView
-            fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+            fitViewOptions={FIT}
             proOptions={{ hideAttribution: true }}
           />
         </div>

@@ -54,11 +54,18 @@ export default defineConfig(({ mode }) => {
           ]),
     ],
     resolve: {
-      alias: {
-        "@shared": path.resolve(import.meta.dirname, "shared"),
-        "@server": path.resolve(import.meta.dirname, "server"),
-        "@": path.resolve(import.meta.dirname, "client/src"),
-      },
+      alias: [
+        { find: "@shared", replacement: path.resolve(import.meta.dirname, "shared") },
+        { find: "@server", replacement: path.resolve(import.meta.dirname, "server") },
+        { find: "@", replacement: path.resolve(import.meta.dirname, "client/src") },
+        // Radix dialogs pull in react-remove-scroll-bar, which injects a <style> element that our CSP
+        // (style-src 'self') refuses. Exact-match alias to a CSSOM-only replacement; the sub-path
+        // `react-remove-scroll-bar/constants` is left alone.
+        {
+          find: /^react-remove-scroll-bar$/,
+          replacement: path.resolve(import.meta.dirname, "client/src/ui/vendor/removeScrollBar.ts"),
+        },
+      ],
     },
     build: {
       outDir: path.resolve(import.meta.dirname, "dist/public"),

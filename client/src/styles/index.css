@@ -240,3 +240,19 @@ html:not(.dark) {
   :focus-visible { outline: 3px solid CanvasText; }
   .rp-forced-border { border: 1px solid CanvasText; }
 }
+
+/*
+ * Page scroll lock behind dialogs, sheets and menus. The attribute and the custom property are set by
+ * client/src/ui/vendor/removeScrollBar.ts (a CSP-safe stand-in for react-remove-scroll-bar, which would otherwise
+ * inject a <style> element that style-src 'self' refuses). The margin keeps the layout from shifting when the
+ * scrollbar disappears.
+ */
+body[data-scroll-locked] {
+  overflow: hidden !important;
+  overscroll-behavior: contain;
+  margin-right: var(--removed-body-scroll-bar-size, 0px) !important;
+}
+.right-scroll-bar-position { right: var(--removed-body-scroll-bar-size, 0px) !important; }
+.width-before-scroll-bar { margin-right: var(--removed-body-scroll-bar-size, 0px) !important; }
+.right-scroll-bar-position .right-scroll-bar-position { right: 0 !important; }
+.width-before-scroll-bar .width-before-scroll-bar { margin-right: 0 !important; }

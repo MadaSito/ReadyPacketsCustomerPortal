@@ -3,9 +3,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Workflow } from "lucide-react";
 import { Link } from "wouter";
 import { errorMessage } from "@/lib/trpc";
-import { Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, EmptyState, PageHeader, Section, StepUpCancelledError, useStepUp, useToast } from "@/ui";
+import { Badge, Breadcrumbs, Button, Card, DataTable, DateTime, EmptyState, PageHeader, Section, StepUpCancelledError, useStepUp, useToast } from "@/ui";
 import { useAutomationsApi } from "./api";
 import { BASE, TRIGGER_MODE_LABEL, triggerLabel, type AutomationSummaryView } from "./model";
+import { EnginePanel } from "./EnginePanel";
 import { EnabledBadge, RunStateBadge } from "./parts";
 
 export default function AutomationsPage() {
@@ -50,11 +51,7 @@ export default function AutomationsPage() {
         actions={<Button asChild leadingIcon={<Plus className="size-4" aria-hidden />}><Link href={`${BASE}/new`}>New automation</Link></Button>}
       />
       <div className="space-y-8">
-        {catalogue.data && !catalogue.data.globallyEnabled ? (
-          <Callout tone="warning" title="Automations are switched off for the whole portal">
-            You can build and test automations, but none will run until an administrator turns on automations in platform settings.
-          </Callout>
-        ) : null}
+        <EnginePanel />
         <Section title="Your automations">
           <DataTable
             caption="Automations"

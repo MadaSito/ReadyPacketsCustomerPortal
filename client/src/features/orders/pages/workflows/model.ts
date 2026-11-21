@@ -169,9 +169,10 @@ export function toggleActor(list: readonly string[], actor: Actor, on: boolean):
 
 /* ------------------------------------------------------------------ canvas */
 
-const COLUMNS = 4;
+// Steps are 208 px wide; the spacing leaves room for a transition label between neighbours.
+const COLUMNS = 3;
 export function defaultPosition(index: number): { x: number; y: number } {
-  return { x: (index % COLUMNS) * 260, y: Math.floor(index / COLUMNS) * 160 };
+  return { x: (index % COLUMNS) * 320, y: Math.floor(index / COLUMNS) * 180 };
 }
 
 export function positionOf(layout: Layout, key: string, index: number): { x: number; y: number } {

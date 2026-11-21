@@ -80,7 +80,7 @@ export default function AutomationDetailPage() {
         }
       />
       <div className="space-y-8">
-        {!cat.globallyEnabled ? <Callout tone="warning" title="Automations are switched off for the whole portal">This automation will not run until automations are turned on in platform settings.</Callout> : null}
+        {!cat.globallyEnabled ? <Callout tone="warning" title="Automations are switched off for the whole portal">This automation will not run until the automations engine is turned on. <Link href={BASE} className="underline underline-offset-2">Open Automations</Link> to turn it on.</Callout> : null}
         {a.trigger.kind === "manual" && a.trigger.requireOrderPublicId ? <Callout tone="info" title="Started from an order">This automation needs an order. Start it from the order's page.</Callout> : null}
         <Section title="How it works">
           <DraftSummary draft={draftFromDetail(a, cat)} catalogue={cat} />

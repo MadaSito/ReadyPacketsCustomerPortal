@@ -41,7 +41,7 @@ export interface PlatformSettingRow {
   label: string;
   description: string;
   group: string;
-  kind: "value" | "secret";
+  kind: "flag" | "value" | "secret";
   value?: unknown;
   configured?: boolean;
   invalidStored?: boolean;

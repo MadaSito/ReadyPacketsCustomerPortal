@@ -358,7 +358,11 @@ export default function MailTemplatesPage() {
             options={FORMAT_OPTIONS}
           />
 
-          <Field label="Subject line" hint="Use {{variable}} placeholders for dynamic fields." required>
+          <Field
+            label="Subject line"
+            hint="Starter placeholders: {{recipient_name}}, {{order_reference}} and {{order_link}}. Declare more in the editor after creating the draft."
+            required
+          >
             <Input value={subjectInput} onChange={(e) => setSubjectInput(e.target.value)} />
           </Field>
 

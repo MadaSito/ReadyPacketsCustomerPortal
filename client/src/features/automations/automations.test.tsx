@@ -135,6 +135,7 @@ beforeEach(() => {
   session.role = "admin";
   for (const k of Object.keys(handlers)) delete handlers[k];
   handlers["automations.catalogue"] = () => catalogue;
+  handlers["automations.settings.get"] = () => ({ enabled: false, globalRunsPerMinute: 120, defaultPerAutomationRunsPerHour: 60, maxPerAutomationRunsPerHour: 600, runRetentionDays: 90 });
   handlers["automations.list"] = () => ({ items: [summary()], nextCursor: null });
   handlers["automations.get"] = () => detail();
   handlers["automations.runs.list"] = () => ({ items: [run()], nextCursor: null });
@@ -201,7 +202,7 @@ describe("AutomationsPage", () => {
   it("lists automations with state, last run and recipes, and warns when globally off", async () => {
     const { container } = renderUi(<AutomationsPage />);
     expect((await screen.findAllByRole("link", { name: "Order confirmation" }))[0]).toHaveAttribute("href", `/admin/automations/${AID}`);
-    expect(screen.getByText(/switched off for the whole portal/)).toBeInTheDocument();
+    expect(await screen.findByText(/switched off for the whole portal/)).toBeInTheDocument();
     expect(screen.getAllByText("Off").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "Use recipe: Backup failed alert" })).toHaveAttribute("href", "/admin/automations/new?recipe=backup_failed_alert");
     await expectNoAxeViolations(container);
@@ -211,6 +212,24 @@ describe("AutomationsPage", () => {
     handlers["automations.list"] = () => { throw new Error("boom"); };
     renderUi(<AutomationsPage />);
     expect(await screen.findByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+
+  it("turns the portal-wide engine on and saves limits from the page itself", async () => {
+    const update = vi.fn((input: unknown) => ({ enabled: true, globalRunsPerMinute: 120, defaultPerAutomationRunsPerHour: 60, maxPerAutomationRunsPerHour: 600, runRetentionDays: 90, ...(input as object) }));
+    handlers["automations.settings.update"] = update;
+    renderUi(<AutomationsPage />);
+    await userEvent.click(await screen.findByRole("button", { name: "Turn automations on" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith({ enabled: true }));
+    const retention = screen.getByLabelText(/Keep run history/);
+    await userEvent.clear(retention);
+    await userEvent.type(retention, "3");
+    await userEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    expect(await screen.findByText(/enter a whole number from 7 to 365/)).toBeInTheDocument();
+    expect(update).toHaveBeenCalledTimes(1);
+    await userEvent.clear(retention);
+    await userEvent.type(retention, "30");
+    await userEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    await waitFor(() => expect(update).toHaveBeenLastCalledWith({ globalRunsPerMinute: 120, defaultPerAutomationRunsPerHour: 60, maxPerAutomationRunsPerHour: 600, runRetentionDays: 30 }));
   });
 
   it("turns an automation on with the current version", async () => {
