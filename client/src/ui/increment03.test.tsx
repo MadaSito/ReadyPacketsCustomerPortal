@@ -1,7 +1,7 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { FlowCanvas, INERT_PREVIEW_CSP, InertMailPreview, Input, Field, SsoButton, Wizard, type FlowNode, type FlowSelection } from "@/ui";
 import { expectNoAxeViolations, renderUi } from "./testing";
 
@@ -75,7 +75,7 @@ describe("SsoButton", () => {
 
 describe("InertMailPreview", () => {
   it("renders a fully sandboxed srcDoc frame with the policy first, plus a plain-text tab", async () => {
-    renderUi(<InertMailPreview title="Preview of Password reset" html="<h1>Hello</h1><p>Body</p>" text="Hello\nBody" />);
+    renderUi(<InertMailPreview title="Preview of Password reset" html="<h1>Hello</h1><p>Body</p>" text={"Hello\nBody"} />);
     const frame = screen.getByTitle("Preview of Password reset");
     expect(frame.tagName).toBe("IFRAME");
     expect(frame.getAttribute("sandbox")).toBe("");
@@ -100,6 +100,32 @@ describe("InertMailPreview", () => {
 });
 
 describe("FlowCanvas", () => {
+  // jsdom has no layout: give elements a size and let ResizeObserver report it, so the library shows the nodes.
+  const original = { ro: window.ResizeObserver, w: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetWidth"), h: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight") };
+  beforeAll(() => {
+    Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, get: () => 200 });
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, get: () => 80 });
+    (window as unknown as { DOMMatrixReadOnly: unknown }).DOMMatrixReadOnly = class {
+      m22: number;
+      constructor(transform?: string) {
+        const scale = transform?.match(/scale\(([0-9.]+)\)/)?.[1];
+        this.m22 = scale !== undefined ? Number(scale) : 1;
+      }
+    };
+    window.ResizeObserver = class {
+      constructor(private readonly cb: ResizeObserverCallback) {}
+      observe(target: Element) {
+        this.cb([{ target } as ResizeObserverEntry], this as unknown as ResizeObserver);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+  });
+  afterAll(() => {
+    window.ResizeObserver = original.ro;
+    if (original.w) Object.defineProperty(HTMLElement.prototype, "offsetWidth", original.w);
+    if (original.h) Object.defineProperty(HTMLElement.prototype, "offsetHeight", original.h);
+  });
   const NODES: FlowNode[] = [
     { id: "n1", label: "Received", kind: "Status", x: 0, y: 0 },
     { id: "n2", label: "In production", tone: "info", x: 300, y: 0 },
@@ -131,24 +157,25 @@ describe("FlowCanvas", () => {
     const onConnect = vi.fn();
     const onDelete = vi.fn();
     renderUi(<Demo onConnect={onConnect} onDelete={onDelete} />);
-    const received = await screen.findByRole("button", { name: /Received/ });
+    const received = await screen.findByRole("button", { name: /^Status: Received/ });
     expect(screen.getByRole("group", { name: "Workflow canvas" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start: from Received to In production" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Zoom in" })).toBeInTheDocument();
 
-    await userEvent.click(received);
+    // fireEvent: user-event mousedown has no `view` in jsdom, which the drag library needs.
+    fireEvent.click(received);
     expect(state().selected).toEqual({ type: "node", id: "n1" });
-    expect(screen.getByRole("button", { name: /Received/ })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /^Status: Received/ })).toHaveAttribute("aria-pressed", "true");
 
     received.focus();
     fireEvent.keyDown(received, { key: "ArrowRight" });
-    fireEvent.keyDown(screen.getByRole("button", { name: /Received/ }), { key: "ArrowDown", shiftKey: true });
+    fireEvent.keyDown(screen.getByRole("button", { name: /^Status: Received/ }), { key: "ArrowDown", shiftKey: true });
     expect(state().n1).toMatchObject({ x: 20, y: 100 });
     expect(screen.getByText("Moved Received to 20, 100.")).toBeInTheDocument();
 
-    fireEvent.keyDown(screen.getByRole("button", { name: /Received/ }), { key: "c" });
+    fireEvent.keyDown(screen.getByRole("button", { name: /^Status: Received/ }), { key: "c" });
     expect(screen.getByText(/Connecting from Received/)).toBeInTheDocument();
-    fireEvent.keyDown(screen.getByRole("button", { name: /Delivered/ }), { key: "Enter" });
+    fireEvent.keyDown(screen.getByRole("button", { name: /^Delivered/ }), { key: "Enter" });
     expect(onConnect).toHaveBeenCalledWith("n1", "n3");
 
     fireEvent.keyDown(screen.getByRole("button", { name: /Start: from/ }), { key: "Delete" });
@@ -160,21 +187,21 @@ describe("FlowCanvas", () => {
   it("read-only: arrows and C do nothing, selection still works", async () => {
     const onConnect = vi.fn();
     renderUi(<Demo readOnly onConnect={onConnect} />);
-    const received = await screen.findByRole("button", { name: /Received/ });
+    const received = await screen.findByRole("button", { name: /^Status: Received/ });
     fireEvent.keyDown(received, { key: "ArrowRight" });
     fireEvent.keyDown(received, { key: "c" });
-    fireEvent.keyDown(screen.getByRole("button", { name: /Delivered/ }), { key: "Enter" });
+    fireEvent.keyDown(screen.getByRole("button", { name: /^Delivered/ }), { key: "Enter" });
     expect(state().n1).toMatchObject({ x: 0, y: 0 });
     expect(onConnect).not.toHaveBeenCalled();
     expect(screen.getByText("Read only")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: /Delivered/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Delivered/ }));
     await waitFor(() => expect(state().selected).toEqual({ type: "node", id: "n3" }));
   });
 
   it("creates no <style> elements and sets no style attribute markup (CSP)", async () => {
     const before = document.querySelectorAll("style").length;
     renderUi(<Demo />);
-    await screen.findByRole("button", { name: /Received/ });
+    await screen.findByRole("button", { name: /^Status: Received/ });
     expect(document.querySelectorAll("style").length).toBe(before);
   });
 });

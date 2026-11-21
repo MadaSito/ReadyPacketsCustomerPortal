@@ -66,6 +66,7 @@ function NodeCard({ id, data, selected }: NodeProps<RpNode>) {
       <button
         type="button"
         data-flow-node={id}
+        aria-label={`${node.kind ? `${node.kind}: ` : ""}${node.label}${node.sublabel ? `, ${node.sublabel}` : ""}${connecting ? ", connecting from this step" : ""}`}
         aria-pressed={selected ? "true" : "false"}
         aria-describedby={api.helpId}
         onClick={() => api.select({ type: "node", id })}
@@ -81,7 +82,6 @@ function NodeCard({ id, data, selected }: NodeProps<RpNode>) {
         {node.kind ? <span className="text-xs font-semibold tracking-wide text-muted uppercase">{node.kind}</span> : null}
         <span className="w-full font-semibold break-words text-ink">{node.label}</span>
         {node.sublabel ? <span className="w-full text-sm break-words text-muted">{node.sublabel}</span> : null}
-        {connecting ? <span className="sr-only">, connecting from this step</span> : null}
       </button>
       <Handle type="source" position={Position.Right} isConnectable={api.canConnect} className="rp-flow-handle" />
     </>
@@ -179,6 +179,7 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
         source: edge.from,
         target: edge.to,
         data: { edge, fromLabel: labels.get(edge.from) ?? edge.from, toLabel: labels.get(edge.to) ?? edge.to },
+        ariaLabel: `${edge.label ? `${edge.label}: ` : ""}from ${labels.get(edge.from) ?? edge.from} to ${labels.get(edge.to) ?? edge.to}`,
         selected: selected?.type === "edge" && selected.id === edge.id,
         selectable: false,
         focusable: false,
@@ -327,6 +328,8 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
             onConnect={(connection: Connection) => {
               if (connection.source && connection.target && connection.source !== connection.target) onConnect?.(connection.source, connection.target);
             }}
+            // Also keeps pointer events on read-only nodes (the library disables them for inert nodes).
+            onNodeClick={(_event, node) => select({ type: "node", id: node.id })}
             onPaneClick={() => select(null)}
             nodesDraggable={canMove}
             nodesConnectable={canConnect}

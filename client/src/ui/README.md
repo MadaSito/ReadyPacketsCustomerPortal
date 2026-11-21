@@ -195,11 +195,14 @@ interface FlowCanvasProps {
   height?: "sm" | "md" | "lg";                     // 20 / 30 / 40 rem (capped to 70 vh on phones)
 }
 ```
-Keyboard: Tab reaches the toolbar (Zoom in, Zoom out, Fit) and then each node in reading order; Enter / Space
-selects; arrow keys move the selected node by 20 px (Shift: 100 px); `C` on a selected node starts "connect"
-mode, Tab / Enter on the target finishes it, Escape cancels; Delete removes the selection (only with `onDelete`).
-Every action is announced in a polite live region. Drag-only is never required, but you must still offer a form
-alternative for connecting and for editing properties (side panel). Reduced motion: no animated edges or
+Keyboard: Tab reaches the toolbar (Zoom in, Zoom out, Fit to view), then each connection (a labelled button at
+the middle of the arrow, "Label: from A to B"), then each node (top-to-bottom, left-to-right); Enter / Space
+selects; arrow keys move the focused node by 20 px (Shift: 100 px) and select it; `C` starts "connect" mode from
+the focused node, Enter on the target finishes it, Escape cancels; Delete / Backspace removes the focused item
+(only with `onDelete`); Escape clears the selection. A focused item scrolled out of view is panned into view.
+Every action is announced in a polite live region; the shortcut help is visible under the toolbar. Drag-only is
+never required, but you must still offer a form alternative for connecting and for editing properties (side
+panel). Reduced motion: no animated edges or
 transitions; fit / zoom are instant.
 
 ### RichTextEditor — `import { RichTextEditor } from "@/ui"`

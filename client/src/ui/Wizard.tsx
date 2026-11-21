@@ -57,7 +57,7 @@ export function Wizard({ steps, current, onNext, onBack, onStepSelect, completed
     <div className={cn("flex min-w-0 flex-col gap-6", className)}>
       <nav aria-label="Progress">
         <p className="text-sm font-medium text-muted sm:hidden">
-          Step {index + 1} of {steps.length}
+          {`Step ${index + 1} of ${steps.length}`}
         </p>
         <ol className="hidden flex-wrap gap-2 sm:flex">
           {steps.map((item, i) => {
@@ -75,9 +75,7 @@ export function Wizard({ steps, current, onNext, onBack, onStepSelect, completed
                   {done && !isCurrent ? <Check className="size-3.5" /> : i + 1}
                 </span>
                 <span className={cn("min-w-0 break-words", isCurrent ? "font-semibold text-ink" : "text-body")}>
-                  <span className="sr-only">
-                    Step {i + 1} of {steps.length}:{" "}
-                  </span>
+                  <span className="sr-only">{`Step ${i + 1} of ${steps.length}: `}</span>
                   {item.label}
                   {item.optional ? <span className="text-muted"> (optional)</span> : null}
                   {done && !isCurrent ? <span className="sr-only"> (completed)</span> : null}
@@ -90,6 +88,7 @@ export function Wizard({ steps, current, onNext, onBack, onStepSelect, completed
                 {selectable ? (
                   <button
                     type="button"
+                    aria-label={`Step ${i + 1} of ${steps.length}: ${item.label}${item.optional ? " (optional)" : ""} (completed)`}
                     onClick={() => onStepSelect(item.id)}
                     className="flex min-h-11 min-w-0 items-center gap-2 rounded-[var(--radius-control)] px-2 text-sm hover:bg-surface-sunken"
                   >
