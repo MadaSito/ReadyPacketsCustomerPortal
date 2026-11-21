@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, opendir, rename, rm, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
@@ -22,6 +22,7 @@ export interface LocalObjectStorage extends ObjectStorage {
   checkRoot(): Promise<void>;
   sweepStaging(before: Date, signal?: AbortSignal): Promise<number>;
   inspect<T>(key: string, inspect: (read: (offset: number, length: number) => Promise<Buffer>, size: number) => Promise<T>): Promise<T>;
+  withConversionDirectory<T>(work: (path: string) => Promise<T>): Promise<T>;
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -144,6 +145,21 @@ export function createObjectStorage({ config, logger }: { config: Pick<AppConfig
   }
 
   return {
+    async withConversionDirectory(work) {
+      const parent = await namespace("quarantine");
+      let path: string | undefined;
+      try {
+        path = await mkdtemp(fdPath(parent, "audio-"));
+        const directory = await open(path, directoryFlags);
+        try {
+          await privateDirectory(directory);
+          return await work(`/proc/${process.pid}/fd/${directory.fd}`);
+        } finally { await directory.close(); }
+      } finally {
+        if (path) await rm(path, { recursive: true, force: true }).catch(() => logger.warn("Audio quarantine cleanup failed"));
+        await parent.close();
+      }
+    },
     newKey(name) {
       if (!namespaces.includes(name)) throw validation("INVALID_OBJECT_NAMESPACE", "The object namespace is invalid.");
       let leaf: string;

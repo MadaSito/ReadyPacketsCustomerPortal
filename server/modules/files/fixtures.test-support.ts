@@ -52,8 +52,8 @@ export function exampleOgg(kind: "video" | "audio", addLast = true): Buffer {
   return addLast ? Buffer.concat([opener, page(4, 1, Buffer.from([1, 2]))]) : opener;
 }
 
-export function exampleWav(): Buffer {
-  const riff = Buffer.alloc(46);
+export function exampleWav(samples = 1): Buffer {
+  const riff = Buffer.alloc(44 + samples * 2);
   riff.write("RIFF");
   riff.writeUInt32LE(riff.length - 8, 4);
   riff.write("WAVEfmt ", 8);
@@ -65,7 +65,7 @@ export function exampleWav(): Buffer {
   riff.writeUInt16LE(2, 32);
   riff.writeUInt16LE(16, 34);
   riff.write("data", 36);
-  riff.writeUInt32LE(2, 40);
+  riff.writeUInt32LE(samples * 2, 40);
   return riff;
 }
 
