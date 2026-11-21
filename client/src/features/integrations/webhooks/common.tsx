@@ -64,8 +64,8 @@ export function WebhookConfirmation({ action, close }: { action: Confirmation; c
   </ConfirmDialog>;
 }
 
-export function WebhookEditor({ title, description, submit, close, children, submitLabel = "Save" }: {
-  title: string; description: string; submit: () => Promise<void>; close: () => void; children: ReactNode; submitLabel?: string;
+export function WebhookEditor({ title, description, submit, close, children, submitLabel = "Save", submitDisabled = false }: {
+  title: string; description: string; submit: () => Promise<void>; close: () => void; children: ReactNode; submitLabel?: string; submitDisabled?: boolean;
 }) {
   const form = useId();
   const [busy, setBusy] = useState(false);
@@ -74,11 +74,11 @@ export function WebhookEditor({ title, description, submit, close, children, sub
     onOpenChange={(open) => { if (!open && !busy) close(); }}
     footer={<>
       <Button variant="secondary" onClick={close} disabled={busy}>Cancel</Button>
-      <Button form={form} type="submit" loading={busy}>{submitLabel}</Button>
+      <Button form={form} type="submit" loading={busy} disabled={submitDisabled}>{submitLabel}</Button>
     </>}>
     <form id={form} className="grid min-w-0 gap-4" onSubmit={(event) => {
       event.preventDefault();
-      if (busy) return;
+      if (busy || submitDisabled) return;
       setError(null);
       setBusy(true);
       void submit().catch((failure) => setError(errorMessage(failure))).finally(() => setBusy(false));

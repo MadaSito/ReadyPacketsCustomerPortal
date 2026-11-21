@@ -123,6 +123,37 @@ describe("Webhooks administration", () => {
     expect(screen.queryByText(secret)).not.toBeInTheDocument();
   });
 
+  it("offers setup while the service is off and saves only changed settings", async () => {
+    const user = userEvent.setup();
+    const update = vi.fn(() => ({ ...settings, enabled: true }));
+    renderWebhooks(<SubscriptionsPage />, "Webhook subscriptions", WEBHOOK_PATHS.subscriptions, { "settings.update": update });
+    expect(await screen.findByText(/webhooks are off/iu)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Webhook settings" });
+    await user.click(within(dialog).getByRole("checkbox", { name: "Enable webhooks" }));
+    expect(update).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("Inbound and outbound webhooks are enabled.")).toBeVisible();
+    expect(update).toHaveBeenCalledExactlyOnceWith({ enabled: true });
+  });
+
+  it("requires an acknowledgement to set zero-day body retention", async () => {
+    const user = userEvent.setup();
+    const update = vi.fn(() => ({ ...settings, retentionDays: 0 }));
+    renderWebhooks(<SubscriptionsPage />, "Webhook subscriptions", WEBHOOK_PATHS.subscriptions, { "settings.update": update });
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Webhook settings" });
+    const retention = within(dialog).getByRole("spinbutton", { name: "Body retention (days)" });
+    await user.clear(retention);
+    await user.type(retention, "0");
+    const save = within(dialog).getByRole("button", { name: "Save" });
+    expect(save).toBeDisabled();
+    expect(update).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("checkbox", { name: /immediately delete retained/iu }));
+    await user.click(save);
+    expect(update).toHaveBeenCalledExactlyOnceWith({ retentionDays: 0 });
+  });
+
   it("rotates an inbound endpoint secret only after confirmation and keeps the receive path unchanged", async () => {
     const user = userEvent.setup();
     const rotate = vi.fn(() => ({ endpoint: inbound, signingSecretOnce: "synthetic_rotated_secret" }));
@@ -193,5 +224,25 @@ describe("Webhooks administration", () => {
     const dialog = screen.getByRole("dialog", { name: "Webhook delivery detail" });
     expect(await within(dialog).findByText(/stored body was removed/iu)).toBeVisible();
     expect(within(dialog).queryByRole("button", { name: "Reprocess inbound event" })).not.toBeInTheDocument();
+  });
+
+  it("uses the inbound-specific action rather than outbound redelivery when reprocessing", async () => {
+    const user = userEvent.setup();
+    const eventDetail = { ...detail, direction: "inbound" };
+    const reprocess = vi.fn(() => ({ ...eventDetail, publicId: rerunId, isReplay: true }));
+    const redeliver = vi.fn();
+    renderWebhooks(<DeliveriesPage />, "Webhook deliveries", WEBHOOK_PATHS.deliveries, {
+      "deliveries.get": () => eventDetail, "deliveries.reprocessInbound": reprocess, "deliveries.redeliver": redeliver,
+    });
+    const table = await screen.findByRole("table", { name: "Webhook delivery records" });
+    await user.click(within(table).getByRole("button", { name: `Details for delivery ${deliveryId}` }));
+    const dialog = screen.getByRole("dialog", { name: "Webhook delivery detail" });
+    const run = await within(dialog).findByRole("button", { name: "Reprocess inbound event" });
+    expect(run).toBeDisabled();
+    await user.click(within(dialog).getByRole("checkbox", { name: /may start automations again/iu }));
+    await user.click(run);
+    expect(await screen.findByRole("button", { name: "View rerun" })).toBeVisible();
+    expect(reprocess).toHaveBeenCalledExactlyOnceWith({ publicId: deliveryId });
+    expect(redeliver).not.toHaveBeenCalled();
   });
 });

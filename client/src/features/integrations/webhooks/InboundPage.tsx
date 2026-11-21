@@ -19,13 +19,13 @@ function EndpointEditor({ current, close, save }: {
     submit={() => save({ name: name.trim(), endpointKey: endpointKey.trim(), description: description.trim() || null, toleranceSeconds })}>
     <Field label="Name" required><Input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} /></Field>
     <Field label="Endpoint key" required={!current}
-      hint={current ? "This identifier was set when the endpoint was created." : "Use a short, unique identifier with lower-case letters and numbers. Do not include a secret."}>
-      <Input required={!current} readOnly={!!current} maxLength={64} autoComplete="off" value={endpointKey}
+      hint={current ? "This identifier was set when the endpoint was created." : "Use 3–64 characters: lowercase letters, digits, hyphens, or underscores. Start and end with a letter or digit. Do not include a secret."}>
+      <Input required={!current} readOnly={!!current} minLength={3} maxLength={64} pattern={"[a-z0-9][a-z0-9_\\-]{1,62}[a-z0-9]"} autoComplete="off" value={endpointKey}
         onChange={(event) => setEndpointKey(event.target.value)} />
     </Field>
-    <Field label="Description"><Textarea rows={2} maxLength={500} value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
-    <Field label="Timestamp tolerance (seconds)" required hint="Requests outside this window are refused. The maximum is 300 seconds.">
-      <Input type="number" min={1} max={300} step={1} required value={toleranceSeconds || ""} onChange={(event) => setTolerance(Number(event.target.value))} />
+    <Field label="Description"><Textarea rows={2} maxLength={280} value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
+    <Field label="Timestamp tolerance (seconds)" required hint="Choose 30–300 seconds. Requests outside this window are refused.">
+      <Input type="number" min={30} max={300} step={1} required value={toleranceSeconds || ""} onChange={(event) => setTolerance(Number(event.target.value))} />
     </Field>
   </WebhookEditor>;
 }
@@ -86,7 +86,9 @@ export default function InboundPage() {
         error={list.error} onRetry={() => void list.refetch()}
         empty={<EmptyState title="No inbound endpoints" description="Create an endpoint to configure a receive path and signing secret." />}
         columns={[
-          { key: "name", header: "Endpoint", primary: true, cell: (row) => <span className="break-words">{row.name}</span> },
+          { key: "name", header: "Endpoint", primary: true, cell: (row) => <div className="break-words">
+            {row.name}<code className="block break-all text-xs text-muted">{row.publicId}</code>
+          </div> },
           { key: "status", header: "Status", cell: (row) => <Badge tone={row.enabled ? "success" : "neutral"}>{row.enabled ? "Enabled" : "Disabled"}</Badge> },
           { key: "path", header: "Receive path", cell: (row) => <code className="break-all">{row.receivePath}</code> },
           { key: "secret", header: "Secret ending", cell: (row) => <span>{row.signingSecretLast4}{row.hasOverlapSecret ? <> · Overlap until <DateTime value={row.overlapExpiresAt} /></> : null}</span> },
