@@ -88,15 +88,12 @@ beforeEach(async () => {
     assertCanReadOrder: read, assertCanWriteOrder: write, assertCanReadOrderById: read, assertCanWriteOrderById: write,
     async getOrderRefByPublicId(id: string) {
       if (id !== orderPublicId) return null;
-      return { id: orderId, publicId: id, ownerUserId: orderOwner.userId, lockState: locked };
+      return { id: orderId, publicId: id, reference: "RP-TEST", ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
     },
     async getOrderRefById(id: number, tx?: Tx, options?: { forUpdate?: boolean }) {
       if (id !== orderId) return null;
       if (tx && options?.forUpdate && holdAtPurgeLock) locked = "legal_hold";
       return { id, publicId: orderPublicId, ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
-    },
-    async getOrderRefByPublicId(id: string) {
-      return id === orderPublicId ? { id: orderId, publicId: id, ownerUserId: orderOwner.userId, lockState: locked } : null;
     },
     async getFileUploadSlots(principal: SessionPrincipal, id: string) {
       await write(principal, id);
