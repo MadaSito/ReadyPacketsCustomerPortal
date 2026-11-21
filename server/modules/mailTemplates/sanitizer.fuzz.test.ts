@@ -49,6 +49,9 @@ function assertStandardsDomSafeDelivery(htmlFragmentOrDoc: string, options?: { a
     if (tag === "a") {
       expect(el.closest("a"), "nested <a> in standards DOM").toBe(el);
     }
+    if (tag === "table") {
+      expect(el.closest("table"), "nested <table> in standards DOM").toBe(el);
+    }
     if (tag === "li") {
       expect(parentTag === "ul" || parentTag === "ol", `<li> parent was <${parentTag}>`).toBe(true);
     }
@@ -175,12 +178,12 @@ describe("mailTemplates sanitizer security gates (D-S01..D-S04) & independent st
       '<meta charset="utf-8"><p>meta outside head</p>',
       '<head><meta http-equiv="refresh" content="0;url=https://evil.example"></head><body><p>ok</p></body>',
       '<table>foster parented bare text<img src=x onerror=alert(1)><tr><td>cell</td></tr></table>',
+      '<table><tbody><tr><td><div><table><tbody><tr><td>nested table</td></tr></tbody></table></div></td></tr></tbody></table>',
       '<a href="https://example.com/1">outer <a href="https://example.com/2">nested</a></a>',
     ];
 
     for (const vector of dangerousCorpus) {
       expect(() => sanitizeTemplateHtmlOnSave(vector), `strict should reject: ${vector}`).toThrow();
-      // Lenient preview must fail closed to "" on opaque/foreign/head-smuggled payloads (except foster-text / nested-a which repair cleanly)
     }
 
     for (const mustFailClosed of dangerousCorpus.slice(0, 13)) {
@@ -189,6 +192,7 @@ describe("mailTemplates sanitizer security gates (D-S01..D-S04) & independent st
         `preview should fail closed to empty string: ${mustFailClosed}`,
       ).toBe("");
     }
+    expect(projectInertMailPreviewHtml(dangerousCorpus[14]!)).toBe("");
 
     // Truncated EOF tag/comment must never leak raw markup tail into preview
     const truncatedTag = '<p>Safe intro</p><a href="https://example.com" onclick="alert(1)"';
@@ -232,6 +236,36 @@ describe("mailTemplates sanitizer security gates (D-S01..D-S04) & independent st
     const decomposed = `<p>Cafe<span>\u0301</span> — {{customer_name}}</p>`;
     const savedUnicode = sanitizeTemplateHtmlOnSave(decomposed, declared);
     expect(sanitizeTemplateHtmlOnSave(savedUnicode.html, declared).html).toBe(savedUnicode.html);
+
+    // Numeric CR/CRLF entities (`&#13;`, `&#x0d;`, `&#13;&#10;`) must normalize to LF on pass 1 so save & preview are exact on pass 2
+    const numericCrHtml = "<p>LineA&#13;LineB&#x0d;&#x0a;LineC&#13;&#10;End</p>";
+    const savedCr = sanitizeTemplateHtmlOnSave(numericCrHtml);
+    expect(savedCr.html).not.toContain("\r");
+    expect(savedCr.html).toBe("<p>LineA\nLineB\nLineC\nEnd</p>");
+    expect(sanitizeTemplateHtmlOnSave(savedCr.html).html).toBe(savedCr.html);
+    const previewCr = projectInertMailPreviewHtml(numericCrHtml);
+    expect(previewCr).not.toContain("\r");
+    expect(projectInertMailPreviewHtml(previewCr)).toBe(previewCr);
+
+    // Near-cap & at-cap depth (`MAX_AST_DEPTH = 16`) with `<img>` and `<a data-rp-button="primary">` must remain exact idempotent on pass 2
+    for (const depth of [14, 15, 16]) {
+      const openQuotes = "<blockquote>".repeat(depth);
+      const closeQuotes = "</blockquote>".repeat(depth);
+      const atCapImg = `${openQuotes}<img src="https://portal.example.com/a.png" alt="Cap">${closeQuotes}`;
+      const p1 = projectInertMailPreviewHtml(atCapImg);
+      expect(projectInertMailPreviewHtml(p1)).toBe(p1);
+
+      const atCapBtn = `${openQuotes}<a href="https://portal.example.com" data-rp-button="primary">Go</a>${closeQuotes}`;
+      const b1 = projectInertMailPreviewHtml(atCapBtn);
+      expect(projectInertMailPreviewHtml(b1)).toBe(b1);
+    }
+
+    // Near-cap & at-cap node count (`MAX_AST_NODES = 2500`) with `<img>` expansion (`img` -> `<em>text</em>`) must remain exact idempotent on pass 2
+    for (const imgCount of [1_248, 1_249, 1_250, 2_499, 2_500]) {
+      const manyImgs = `<p>${'<img src="https://portal.example.com/a.png" alt="x">'.repeat(imgCount)}</p>`;
+      const proj1 = projectInertMailPreviewHtml(manyImgs);
+      expect(projectInertMailPreviewHtml(proj1)).toBe(proj1);
+    }
 
     // Percent-encoded control chars / multi-recipient injection in mailto: are rejected
     expect(parseAllowedTemplateUrl("mailto:help@example.com", { allowMailto: true })).toBe("mailto:help@example.com");

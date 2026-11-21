@@ -271,7 +271,7 @@ function decodeHtmlEntities(raw: string): string {
     const replacement = NAMED_ENTITIES.get(body.toLowerCase());
     return replacement ?? full;
   });
-  return decoded.normalize("NFC");
+  return decoded.replace(/\r\n?/g, "\n").normalize("NFC");
 }
 
 function hasAnyCurlyBraces(value: string): boolean {
@@ -770,6 +770,10 @@ function parseHtmlToAst(rawHtml: string, options: ParseOptions): ParsedHtmlResul
       throw validation("INVALID_HTML_STRUCTURE", `Only <li> elements are permitted directly inside <${parentTag}>.`);
     }
 
+    if (mappedTag === "table" && hasOpenElement("table")) {
+      throw validation("INVALID_HTML_STRUCTURE", "Nested tables are not permitted in mail templates.");
+    }
+
     if (TABLE_PART_TAGS.has(mappedTag)) {
       const validTableParent =
         ((mappedTag === "thead" || mappedTag === "tbody") && parentTag === "table") ||
@@ -1098,13 +1102,13 @@ function serializeInertPreviewNodes(nodes: readonly AstNode[]): string {
     }
     if (tag === "img") {
       const label = attrs.alt ? `[Image: ${attrs.alt}]` : "[Image]";
-      parts.push(`<span><em>${escapeHtmlText(label)}</em></span>`);
+      parts.push(`<em>${escapeHtmlText(label)}</em>`);
       continue;
     }
     if (tag === "a") {
       const inner = serializeInertPreviewNodes(children);
       if (attrs.buttonPrimary) {
-        parts.push(`<span><strong>${inner}</strong></span>`);
+        parts.push(`<strong>${inner}</strong>`);
       } else {
         parts.push(`<span>${inner}</span>`);
       }
@@ -1222,10 +1226,19 @@ export function projectInertMailPreviewHtml(rawOrRenderedHtml: string): string {
       allowPlaceholders: false,
     });
     const projected = serializeInertPreviewNodes(parsed.roots);
-    if (Buffer.byteLength(projected, "utf8") > MAX_HTML_INPUT_BYTES) {
+    if (!projected || Buffer.byteLength(projected, "utf8") > MAX_HTML_INPUT_BYTES) {
       return "";
     }
-    return projected;
+    // Enforce identical AST depth, node-count, and canonicalization bounds on emitted preview HTML
+    const verified = parseHtmlToAst(projected, {
+      mode: "lenient_preview",
+      allowPlaceholders: false,
+    });
+    const canonicalProjected = serializeInertPreviewNodes(verified.roots);
+    if (Buffer.byteLength(canonicalProjected, "utf8") > MAX_HTML_INPUT_BYTES) {
+      return "";
+    }
+    return canonicalProjected;
   } catch {
     return "";
   }
@@ -1342,7 +1355,7 @@ export function renderMailTemplateVersion(input: {
     throw validation("INVALID_MAIL_RENDER", "Rendered HTML exceeds maximum message size.");
   }
 
-  const previewHtml = serializeInertPreviewNodes(resanitizedAst.roots);
+  const previewHtml = projectInertMailPreviewHtml(html);
   return { subject, text, html, previewHtml };
 }
 
