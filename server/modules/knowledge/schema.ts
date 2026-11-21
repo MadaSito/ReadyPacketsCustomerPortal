@@ -2,12 +2,15 @@
  * Knowledge Base module — additive Drizzle MySQL schema (Increment 04, Package F).
  * Owner: engagement_engineer (`server/modules/knowledge/**`).
  *
+ * Every foreign key and index name is explicitly named (`<= 36` chars, well within
+ * MySQL's 64-character identifier limit).
  * Migrations are generated centrally by `/root` (`migrations/0003_*.sql`).
  */
 import {
   bigint,
   boolean,
   char,
+  foreignKey,
   index,
   int,
   mediumtext,
@@ -51,8 +54,8 @@ export const knowledgeCategories = mysqlTable(
     updatedAt: updatedAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_categories_slug").on(t.slug),
-    index("idx_knowledge_categories_parent_sort").on(t.parentCategoryId, t.sortOrder, t.id),
+    uniqueIndex("uq_kb_cat_slug").on(t.slug),
+    index("idx_kb_cat_parent_sort").on(t.parentCategoryId, t.sortOrder, t.id),
   ],
 );
 
@@ -61,7 +64,7 @@ export const knowledgeArticles = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
-    categoryId: refColumn("category_id").references(() => knowledgeCategories.id),
+    categoryId: refColumn("category_id"),
     slug: varchar("slug", { length: 120 }).notNull(),
     title: varchar("title", { length: 200 }).notNull(),
     summary: varchar("summary", { length: 500 }).notNull(),
@@ -76,12 +79,8 @@ export const knowledgeArticles = mysqlTable(
     publishedAt: utcDateTime("published_at"),
     /** Optional ISO calendar date (`YYYY-MM-DD`) when the article was last reviewed for accuracy. */
     reviewedOn: varchar("reviewed_on", { length: 10 }),
-    authorUserId: refColumn("author_user_id")
-      .notNull()
-      .references(() => users.id),
-    updatedByUserId: refColumn("updated_by_user_id")
-      .notNull()
-      .references(() => users.id),
+    authorUserId: refColumn("author_user_id").notNull(),
+    updatedByUserId: refColumn("updated_by_user_id").notNull(),
     sortOrder: int("sort_order", { unsigned: true }).notNull().default(0),
     viewCount: bigint("view_count", { mode: "number", unsigned: true }).notNull().default(0),
     helpfulYesCount: int("helpful_yes_count", { unsigned: true }).notNull().default(0),
@@ -92,10 +91,25 @@ export const knowledgeArticles = mysqlTable(
     updatedAt: updatedAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_articles_slug").on(t.slug),
-    index("idx_knowledge_articles_pub_list").on(t.state, t.audience, t.sortOrder, t.id),
-    index("idx_knowledge_articles_cat_sort").on(t.categoryId, t.state, t.sortOrder, t.id),
-    index("idx_knowledge_articles_updated").on(t.updatedAt, t.id),
+    uniqueIndex("uq_kb_art_slug").on(t.slug),
+    index("idx_kb_art_pub_list").on(t.state, t.audience, t.sortOrder, t.id),
+    index("idx_kb_art_cat_sort").on(t.categoryId, t.state, t.sortOrder, t.id),
+    index("idx_kb_art_updated").on(t.updatedAt, t.id),
+    foreignKey({
+      name: "kb_art_cat_fk",
+      columns: [t.categoryId],
+      foreignColumns: [knowledgeCategories.id],
+    }),
+    foreignKey({
+      name: "kb_art_author_fk",
+      columns: [t.authorUserId],
+      foreignColumns: [users.id],
+    }),
+    foreignKey({
+      name: "kb_art_updater_fk",
+      columns: [t.updatedByUserId],
+      foreignColumns: [users.id],
+    }),
   ],
 );
 
@@ -104,9 +118,7 @@ export const knowledgeArticleVersions = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
+    articleId: refColumn("article_id").notNull(),
     versionNumber: int("version_number", { unsigned: true }).notNull(),
     categoryId: refColumn("category_id"),
     slug: varchar("slug", { length: 120 }).notNull(),
@@ -118,14 +130,22 @@ export const knowledgeArticleVersions = mysqlTable(
     audience: mysqlEnum("audience", KNOWLEDGE_AUDIENCES).notNull(),
     reviewedOn: varchar("reviewed_on", { length: 10 }),
     changeNote: varchar("change_note", { length: 255 }),
-    authorUserId: refColumn("author_user_id")
-      .notNull()
-      .references(() => users.id),
+    authorUserId: refColumn("author_user_id").notNull(),
     createdAt: createdAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_article_versions_num").on(t.articleId, t.versionNumber),
-    index("idx_knowledge_article_versions_created").on(t.articleId, t.createdAt),
+    uniqueIndex("uq_kb_ver_num").on(t.articleId, t.versionNumber),
+    index("idx_kb_ver_created").on(t.articleId, t.createdAt),
+    foreignKey({
+      name: "kb_ver_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_ver_author_fk",
+      columns: [t.authorUserId],
+      foreignColumns: [users.id],
+    }),
   ],
 );
 
@@ -133,15 +153,18 @@ export const knowledgeArticleTags = mysqlTable(
   "knowledge_article_tags",
   {
     id: idColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
+    articleId: refColumn("article_id").notNull(),
     tag: varchar("tag", { length: 64 }).notNull(),
     createdAt: createdAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_article_tags_pair").on(t.articleId, t.tag),
-    index("idx_knowledge_article_tags_lookup").on(t.tag, t.articleId),
+    uniqueIndex("uq_kb_tags_pair").on(t.articleId, t.tag),
+    index("idx_kb_tags_lookup").on(t.tag, t.articleId),
+    foreignKey({
+      name: "kb_tags_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -149,18 +172,24 @@ export const knowledgeArticleRelations = mysqlTable(
   "knowledge_article_relations",
   {
     id: idColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
-    relatedArticleId: refColumn("related_article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
+    articleId: refColumn("article_id").notNull(),
+    relatedArticleId: refColumn("related_article_id").notNull(),
     sortOrder: int("sort_order", { unsigned: true }).notNull().default(0),
     createdAt: createdAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_article_relations_pair").on(t.articleId, t.relatedArticleId),
-    index("idx_knowledge_article_relations_related").on(t.relatedArticleId),
+    uniqueIndex("uq_kb_rel_pair").on(t.articleId, t.relatedArticleId),
+    index("idx_kb_rel_target").on(t.relatedArticleId),
+    foreignKey({
+      name: "kb_rel_src_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_rel_dst_art_fk",
+      columns: [t.relatedArticleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -169,12 +198,8 @@ export const knowledgeArticleAttachments = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
-    uploadedByUserId: refColumn("uploaded_by_user_id")
-      .notNull()
-      .references(() => users.id),
+    articleId: refColumn("article_id").notNull(),
+    uploadedByUserId: refColumn("uploaded_by_user_id").notNull(),
     /** Immutable object storage key allocated via `deps.storage.newKey("files")` (`files/<32hex>`). */
     storageKey: varchar("storage_key", { length: 48 }).notNull(),
     /** AES-256-GCM encrypted filename (`knowledge_article_attachments.display_name:${publicId}`). */
@@ -187,8 +212,18 @@ export const knowledgeArticleAttachments = mysqlTable(
     createdAt: createdAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_attachments_storage_key").on(t.storageKey),
-    index("idx_knowledge_attachments_article").on(t.articleId, t.deletedAt, t.id),
+    uniqueIndex("uq_kb_att_storage_key").on(t.storageKey),
+    index("idx_kb_att_article").on(t.articleId, t.deletedAt, t.id),
+    foreignKey({
+      name: "kb_att_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_att_uploader_fk",
+      columns: [t.uploadedByUserId],
+      foreignColumns: [users.id],
+    }),
   ],
 );
 
@@ -197,19 +232,25 @@ export const knowledgeAttachmentTickets = mysqlTable(
   {
     id: idColumn(),
     tokenHash: char("token_hash", { length: 64 }).notNull(),
-    attachmentId: refColumn("attachment_id")
-      .notNull()
-      .references(() => knowledgeArticleAttachments.id, { onDelete: "cascade" }),
-    userId: refColumn("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
+    attachmentId: refColumn("attachment_id").notNull(),
+    userId: refColumn("user_id").notNull(),
     sessionId: varchar("session_id", { length: 80 }).notNull(),
     issuedAt: utcDateTime("issued_at").notNull(),
     expiresAt: utcDateTime("expires_at").notNull(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_attachment_tickets_hash").on(t.tokenHash),
-    index("idx_knowledge_attachment_tickets_exp").on(t.expiresAt),
+    uniqueIndex("uq_kb_tkt_hash").on(t.tokenHash),
+    index("idx_kb_tkt_exp").on(t.expiresAt),
+    foreignKey({
+      name: "kb_tkt_att_fk",
+      columns: [t.attachmentId],
+      foreignColumns: [knowledgeArticleAttachments.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_tkt_user_fk",
+      columns: [t.userId],
+      foreignColumns: [users.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -218,12 +259,8 @@ export const knowledgeArticleFeedback = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
-    userId: refColumn("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
+    articleId: refColumn("article_id").notNull(),
+    userId: refColumn("user_id").notNull(),
     helpful: boolean("helpful").notNull(),
     /** Optional user comment encrypted at rest (`knowledge_article_feedback.comment_enc:${publicId}`). */
     commentEnc: text("comment_enc"),
@@ -231,8 +268,18 @@ export const knowledgeArticleFeedback = mysqlTable(
     updatedAt: updatedAtColumn(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_feedback_article_user").on(t.articleId, t.userId),
-    index("idx_knowledge_feedback_article_created").on(t.articleId, t.createdAt),
+    uniqueIndex("uq_kb_fb_art_user").on(t.articleId, t.userId),
+    index("idx_kb_fb_art_created").on(t.articleId, t.createdAt),
+    foreignKey({
+      name: "kb_fb_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "kb_fb_user_fk",
+      columns: [t.userId],
+      foreignColumns: [users.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -240,16 +287,19 @@ export const knowledgeArticleViewDedup = mysqlTable(
   "knowledge_article_view_dedup",
   {
     id: idColumn(),
-    articleId: refColumn("article_id")
-      .notNull()
-      .references(() => knowledgeArticles.id, { onDelete: "cascade" }),
+    articleId: refColumn("article_id").notNull(),
     /** Keyed HMAC digest over `(articleId, hourBucket, sessionId)` — expires and is purged hourly/daily. */
     viewerSlotHash: char("viewer_slot_hash", { length: 64 }).notNull(),
     expiresAt: utcDateTime("expires_at").notNull(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_view_dedup_slot").on(t.articleId, t.viewerSlotHash),
-    index("idx_knowledge_view_dedup_exp").on(t.expiresAt),
+    uniqueIndex("uq_kb_view_dedup_slot").on(t.articleId, t.viewerSlotHash),
+    index("idx_kb_view_dedup_exp").on(t.expiresAt),
+    foreignKey({
+      name: "kb_vdedup_art_fk",
+      columns: [t.articleId],
+      foreignColumns: [knowledgeArticles.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -262,7 +312,8 @@ export const knowledgeSearchLogs = mysqlTable(
   {
     id: idColumn(),
     audienceScope: mysqlEnum("audience_scope", KNOWLEDGE_AUDIENCES).notNull().default("customers"),
-    normalizedTerm: varchar("normalized_term", { length: 80 }).notNull(),
+    /** Lowercased, whitespace-normalized, PII-scrubbed query string (`<= 120` chars). */
+    normalizedTerm: varchar("normalized_term", { length: 120 }).notNull(),
     searchCount: int("search_count", { unsigned: true }).notNull().default(1),
     zeroResultCount: int("zero_result_count", { unsigned: true }).notNull().default(0),
     lastResultCount: int("last_result_count", { unsigned: true }).notNull().default(0),
@@ -270,9 +321,9 @@ export const knowledgeSearchLogs = mysqlTable(
     lastSearchedAt: utcDateTime("last_searched_at").notNull(),
   },
   (t) => [
-    uniqueIndex("uq_knowledge_search_logs_term").on(t.audienceScope, t.normalizedTerm),
-    index("idx_knowledge_search_logs_top").on(t.audienceScope, t.searchCount),
-    index("idx_knowledge_search_logs_zero").on(t.audienceScope, t.zeroResultCount),
-    index("idx_knowledge_search_logs_last").on(t.lastSearchedAt),
+    uniqueIndex("uq_kb_search_term_scope").on(t.audienceScope, t.normalizedTerm),
+    index("idx_kb_search_top").on(t.audienceScope, t.searchCount, t.lastSearchedAt),
+    index("idx_kb_search_zero").on(t.audienceScope, t.zeroResultCount, t.lastSearchedAt),
+    index("idx_kb_search_ret").on(t.lastSearchedAt),
   ],
 );
