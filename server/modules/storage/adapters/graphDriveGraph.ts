@@ -2,18 +2,19 @@
  * Binds the drive adapter's GraphHttpPort to the shared Microsoft Graph client of package C
  * (services.integrations.createScopedGraphClient, server/modules/integrations/API.md §1.2).
  *
- * The integrations runtime (server/modules/integrations/graph/**) was not present when this was written, so the
- * client is typed structurally from the published API instead of imported. Behaviour against the real client
- * is NOT verified; graphDriveGraph.test.ts checks this mapping against a structural stub only.
+ * Bound to the integrations GraphClient runtime (server/modules/integrations/graph/**, commit 7668b53). The client
+ * is typed structurally (a subset of integrations/graph/types.ts GraphClient). graphDriveGraph.test.ts checks
+ * this mapping against a structural stub AND against the real client over a local fake transport; never a tenant.
  *
  * Gates (§4.1 G/H):
  *  - Graph API calls go through `request` (purpose "graph", egress-pinned, bearer token added by the client).
  *  - Upload-session URLs go through `uploadChunk` (purpose "graph_upload", which refuses Authorization/Cookie),
  *    narrowed to the exact host the adapter already checked against the tenant lineage. The URL is never
  *    logged or placed into an error here.
- *  - The published client has no raw-bytes `request` body and no upload-session GET/DELETE yet; the port
- *    reports `supportsRawBody: false` (the adapter then uses upload sessions for every file) and session
- *    control fails closed (resume is not attempted; cancel is best-effort, sessions expire on their own).
+ *  - Small files use `request` with a raw byte body (`supportsRawBody: true`). Upload-session status/cancel use
+ *    `uploadSessionControl` under the same graph_upload guardrails, narrowed to the checked host.
+ *  - Fencing (G-02): the caller's `beforeSend` is passed to the client, which runs it after token acquisition and
+ *    egress resolution, directly before each send; its error propagates unchanged.
  */
 import { type GraphCredentials, type GraphHttpPort, type GraphRequest, type GraphResponse, GraphTransportError } from "./graphDrivePort.js";
 
@@ -24,11 +25,12 @@ export interface PublishedGraphClient {
     path: string;
     query?: Record<string, string>;
     body?: unknown;
+    rawBody?: Uint8Array;
     headers?: Record<string, string>;
     maxResponseBytes?: number;
     timeoutMs?: number;
     signal?: AbortSignal;
-    /** Proposed to integrations (not yet in API.md): called after token acquisition, before each write send/replay. */
+    /** G-02: called by the client after token acquisition, directly before each send; throws propagate unchanged. */
     beforeSend?: () => Promise<void>;
   }): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }>;
   uploadChunk(input: {
@@ -40,6 +42,18 @@ export interface PublishedGraphClient {
     signal?: AbortSignal;
     beforeSend?: () => Promise<void>;
   }): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }>;
+  uploadSessionControl(input: {
+    uploadUrl: string;
+    method: "GET" | "DELETE";
+    allowedHostSuffixes?: readonly string[];
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    beforeSend?: () => Promise<void>;
+  }): Promise<{ status: number; headers: Record<string, string>; rawBody: Buffer }>;
+}
+
+function assertCheckedUploadUrl(url: URL): void {
+  if (url.protocol !== "https:" || url.port !== "" || url.username || url.password) throw new GraphTransportError("EGRESS_DENIED", false);
 }
 
 /** Wraps a fence so its error can be told apart from transport errors and rethrown unchanged. */
@@ -81,6 +95,7 @@ function parseBody(raw: Buffer | undefined): unknown {
 
 interface GraphApiErrorLike {
   name?: unknown;
+  reasonCode?: unknown;
   status?: unknown;
   retryable?: unknown;
   requestSent?: unknown;
@@ -98,7 +113,7 @@ export function mapGraphError(error: unknown): GraphResponse {
   if (error instanceof GraphTransportError) throw error;
   const e = (typeof error === "object" && error !== null ? error : {}) as GraphApiErrorLike;
   if (e.name === "AbortError") throw new GraphTransportError("ABORTED", false);
-  const tag = `${typeof e.reason === "string" ? e.reason : ""} ${typeof e.code === "string" ? e.code : ""}`.toUpperCase();
+  const tag = [e.reasonCode, e.reason, e.code].map((v) => (typeof v === "string" ? v : "")).join(" ").toUpperCase();
   if (tag.includes("EGRESS")) throw new GraphTransportError("EGRESS_DENIED", false);
   if (tag.includes("TOO_LARGE")) throw new GraphTransportError("RESPONSE_TOO_LARGE", false);
   if (tag.includes("TIMEOUT")) throw new GraphTransportError("TIMEOUT", true);
@@ -116,21 +131,18 @@ export function mapGraphError(error: unknown): GraphResponse {
  */
 export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader: () => PublishedGraphClient): GraphHttpPort {
   return {
-    supportsRawBody: false,
+    supportsRawBody: true,
 
     async request(credentials: GraphCredentials, req: GraphRequest): Promise<GraphResponse> {
-      if (req.rawBody) throw new GraphTransportError("NETWORK", false); // not supported by the published client
       if (!req.path.startsWith("/") || req.path.startsWith("//")) throw new GraphTransportError("EGRESS_DENIED", false);
       const fence = trackFence(req.beforeSend);
       try {
-        // Until the client honours beforeSend itself, fence here too (before token acquisition).
-        await fence.wrapped?.();
         const client = factory(credentials);
         const res = await client.request({
           method: req.method,
           path: req.path,
           ...(req.query ? { query: req.query } : {}),
-          ...(req.body !== undefined ? { body: req.body } : {}),
+          ...(req.rawBody ? { rawBody: new Uint8Array(req.rawBody.buffer, req.rawBody.byteOffset, req.rawBody.byteLength) } : req.body !== undefined ? { body: req.body } : {}),
           ...(req.headers ? { headers: req.headers } : {}),
           maxResponseBytes: MAX_RESPONSE_BYTES,
           timeoutMs: REQUEST_TIMEOUT_MS,
@@ -146,12 +158,9 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
 
     async uploadSessionPut(input): Promise<GraphResponse> {
       // Re-assert the invariants the adapter already checked; the exact host is the only allowed suffix.
-      if (input.url.protocol !== "https:" || input.url.port !== "" || input.url.username || input.url.password) {
-        throw new GraphTransportError("EGRESS_DENIED", false);
-      }
+      assertCheckedUploadUrl(input.url);
       const fence = trackFence(input.beforeSend);
       try {
-        await fence.wrapped?.();
         const client = uploader();
         const res = await client.uploadChunk({
           uploadUrl: input.url.href,
@@ -169,9 +178,23 @@ export function createGraphDrivePort(factory: ScopedGraphClientFactory, uploader
       }
     },
 
-    async uploadSessionControl(): Promise<GraphResponse> {
-      // Not in the published client yet: fail closed (no resume; cancel is best-effort and ignored).
-      throw new GraphTransportError("NETWORK", false);
+    async uploadSessionControl(input): Promise<GraphResponse> {
+      assertCheckedUploadUrl(input.url);
+      const fence = trackFence(input.beforeSend);
+      try {
+        const res = await uploader().uploadSessionControl({
+          uploadUrl: input.url.href,
+          method: input.method,
+          allowedHostSuffixes: [input.url.hostname],
+          timeoutMs: REQUEST_TIMEOUT_MS,
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(fence.wrapped ? { beforeSend: fence.wrapped } : {}),
+        });
+        return { status: res.status, headers: lowerHeaders(res.headers), body: parseBody(res.rawBody) };
+      } catch (error) {
+        if (fence.state.lost) throw fence.state.lost.error;
+        return mapGraphError(error);
+      }
     },
   };
 }

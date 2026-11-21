@@ -44,3 +44,16 @@ The tests use a fake of the orders module's `listOrderPublicIdsForSync` (commit 
 - "a retryable failure on the final attempt still dispatches a newer staged version".
 - "cancels a backfill when its settings or destination scope changes after a page was read": when the destination generation changes, or the sync is disabled, between the listing and staging, nothing is staged. The run fails with `SCOPE_CHANGED`, and it is not resumed silently.
 - "does not dispatch already-staged bulk jobs after the destination scope changes": a batch completes under scope A and the destination then changes before the jobs drain. The order job is cancelled, nothing is written, and a later ordinary order change syncs normally.
+
+## Binding to the real Graph client (local fake egress only)
+
+`graphDriveGraph.test.ts` tests the binding against the real `createGraphClientFromResolver` (integrations 7668b53), using a local fake `fetchPinned` and a fake token cache. No tenant or network is involved. It checks:
+
+- The order is token, then fence, then wire.
+- Raw bytes and the bearer token are sent on purpose `graph`.
+- An HTTP 409 is mapped to a status with no provider body.
+- Nothing is sent after a lost fence.
+- Upload-session GET/DELETE go on `graph_upload` with no Authorization header, narrowed to the checked host, and the DELETE is fenced.
+- Real `GraphApiError.reasonCode` values map to EGRESS_DENIED, TIMEOUT, RESPONSE_TOO_LARGE and AUTH_FAILED.
+
+`graphDrive.test.ts` checks that no cleanup DELETE is sent after a lost fence.

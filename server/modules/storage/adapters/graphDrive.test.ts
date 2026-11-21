@@ -127,7 +127,7 @@ describe("graph drive adapter (against the local Graph fake)", () => {
     await rejectsWith(adapter.put(putInput(Buffer.alloc(0), "empty.bin")), "INVALID_INPUT");
   });
 
-  it("propagates a fence loss during chunk upload unchanged and cancels the session", async () => {
+  it("propagates a fence loss during chunk upload unchanged and sends no cleanup after it", async () => {
     const { adapter, graph } = setup();
     await adapter.ensureFolder(["AvExample_CUST-1", "RP-1 Demo"]);
     // Fence calls: session pre-check 1, session in-transport 2, chunk 1: 3/4, chunk 2: 5 (adapter) / 6 (transport).
@@ -139,7 +139,9 @@ describe("graph drive adapter (against the local Graph fake)", () => {
       const before = graph.calls.filter((c) => c.kind === "upload" && c.method === "PUT").length;
       await expect(adapter.put({ ...putInput(randomBytes(UPLOAD_CHUNK * 2 + 1), `fenced${i}.bin`), beforeWrite: loseOnSecondChunk })).rejects.toThrow("lease lost");
       expect(graph.calls.filter((c) => c.kind === "upload" && c.method === "PUT").length - before).toBe(1);
-      expect(graph.sessions.size).toBe(0);
+      // No DELETE after a lost fence: the abandoned session expires provider-side.
+      expect(graph.calls.filter((c) => c.kind === "upload" && c.method === "DELETE")).toHaveLength(0);
+      expect(graph.sessions.size).toBe(i + 1);
     }
   });
 
@@ -172,7 +174,7 @@ describe("graph drive adapter (against the local Graph fake)", () => {
     expect(graph.sessions.size).toBe(0);
   });
 
-  it("stops before any write when the fence is lost, and cancels an open session", async () => {
+  it("stops before any write when the fence is lost, and sends nothing (not even a cancel) after a lost fence", async () => {
     const { adapter, graph } = setup();
     const lost = async () => {
       throw new Error("lease lost");
@@ -185,7 +187,8 @@ describe("graph drive adapter (against the local Graph fake)", () => {
       if (++n > 4) throw new Error("lease lost");
     };
     await expect(adapter.put({ ...putInput(randomBytes(UPLOAD_CHUNK * 2 + 1), "late.bin"), beforeWrite: lateLoss })).rejects.toThrow("lease lost");
-    expect(graph.sessions.size).toBe(0);
+    // The abandoned session expires provider-side; a cleanup DELETE would be a send after the fence was lost.
+    expect(graph.calls.filter((c) => c.kind === "upload" && c.method === "DELETE")).toHaveLength(0);
   });
 
   it("detects provider-side corruption, size mismatch and missing hashes", async () => {

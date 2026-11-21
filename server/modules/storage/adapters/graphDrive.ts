@@ -278,7 +278,8 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
         UPLOAD_CHUNK,
       );
     } catch (error) {
-      await graph.uploadSessionControl({ url, method: "DELETE" }).catch(() => undefined);
+      // Best-effort cancel, but never after a lost write fence; a valid cancel is itself fenced.
+      if (!fenceError) await graph.uploadSessionControl({ url, method: "DELETE", beforeSend: fence }).catch(() => undefined);
       if (fenceError) throw (fenceError as { error: unknown }).error;
       throw toAdapterError(error);
     }

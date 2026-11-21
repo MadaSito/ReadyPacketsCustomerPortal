@@ -66,5 +66,5 @@ export interface GraphHttpPort {
   /** PUT a byte range to a checked upload-session URL. No Authorization header. */
   uploadSessionPut(input: { url: URL; body: Buffer; contentRange: string; signal?: AbortSignal; beforeSend?: () => Promise<void> }): Promise<GraphResponse>;
   /** GET the status of (or DELETE / cancel) a checked upload session. No Authorization header. */
-  uploadSessionControl(input: { url: URL; method: "GET" | "DELETE"; signal?: AbortSignal }): Promise<GraphResponse>;
+  uploadSessionControl(input: { url: URL; method: "GET" | "DELETE"; signal?: AbortSignal; beforeSend?: () => Promise<void> }): Promise<GraphResponse>;
 }
