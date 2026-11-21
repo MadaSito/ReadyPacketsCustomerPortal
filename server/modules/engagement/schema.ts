@@ -174,6 +174,8 @@ export const engagementNotifications = mysqlTable(
     title: varchar("title", { length: 160 }).notNull(),
     body: varchar("body", { length: 500 }).notNull(),
     link: varchar("link", { length: 255 }),
+    /** Staff-internal audience flag (`J-A01`): hidden from customer accounts even after staff→customer demotion. */
+    staffOnly: boolean("staff_only").notNull().default(false),
     readAt: utcDateTime("read_at"),
     idempotencyKey: varchar("idempotency_key", { length: 128 }),
     createdAt: createdAtColumn(),

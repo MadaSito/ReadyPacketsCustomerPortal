@@ -64,6 +64,11 @@ export interface NotifyInput {
    * (use when the caller already enqueues a dedicated domain mail template).
    */
   skipEmail?: boolean;
+  /**
+   * Marks the notification as staff-internal (`J-A01`). Forces `skipEmail = true`, verifies recipient has
+   * live `staff` or `admin` role at write time, and hides the row from customer sessions on list/count/read.
+   */
+  staffOnly?: boolean;
 }
 
 export interface NotifyResult {

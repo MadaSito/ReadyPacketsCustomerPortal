@@ -1,10 +1,11 @@
-import { and, count, desc, eq, inArray, isNull, lt, lte } from "drizzle-orm";
+import { and, count, desc, eq, exists, inArray, isNull, lt, lte, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { readSetting } from "../platform/index.js";
+import { users } from "../identity/schema.js";
 import { buildCanonicalPortalUrl, MAIL_GENERIC_NOTIFICATION } from "./mail.js";
 import { assertCurrentActorInTx } from "./peers.js";
 import { engagementNotificationPreferences, engagementNotifications } from "./schema.js";
@@ -121,6 +122,21 @@ export function createNotificationsService(deps: ModuleDeps) {
 
     const handle: DbOrTx = tx ?? db;
     const category = classifyNotificationCategory(kind);
+    const staffOnly = Boolean(input.staffOnly);
+
+    if (staffOnly) {
+      const [liveRecipient] = await handle
+        .select({ role: users.role, status: users.status })
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .limit(1);
+      if (!liveRecipient || liveRecipient.status !== "active" || liveRecipient.role === "customer") {
+        throw validation(
+          "STAFF_ONLY_RECIPIENT_FORBIDDEN",
+          "Staff-only notifications may only be delivered to active staff or administrator accounts.",
+        );
+      }
+    }
 
     if (idempotencyKey !== null) {
       const [existing] = await handle
@@ -152,6 +168,7 @@ export function createNotificationsService(deps: ModuleDeps) {
         title,
         body,
         link,
+        staffOnly,
         readAt: null,
         idempotencyKey,
         createdAt: now,
@@ -160,7 +177,7 @@ export function createNotificationsService(deps: ModuleDeps) {
     }
 
     let enqueuedEmail = false;
-    if (!input.skipEmail && pref.email) {
+    if (!input.skipEmail && !staffOnly && pref.email) {
       const globalEmailEnabled = await readSetting(settings, ENGAGEMENT_NOTIFICATIONS_EMAIL_ENABLED, tx);
       if (globalEmailEnabled) {
         const portalUrl = buildCanonicalPortalUrl(config.canonicalOrigin, link ?? "/notifications");
@@ -185,6 +202,27 @@ export function createNotificationsService(deps: ModuleDeps) {
     return pref.email;
   }
 
+  function staffOnlyVisibilityPredicate(principal: SessionPrincipal) {
+    if (principal.role === "customer") {
+      return eq(engagementNotifications.staffOnly, false);
+    }
+    return or(
+      eq(engagementNotifications.staffOnly, false),
+      exists(
+        db
+          .select({ id: users.id })
+          .from(users)
+          .where(
+            and(
+              eq(users.id, engagementNotifications.userId),
+              eq(users.status, "active"),
+              inArray(users.role, ["admin", "staff"]),
+            ),
+          ),
+      ),
+    );
+  }
+
   async function list(
     principal: SessionPrincipal,
     options: { unreadOnly?: boolean; cursor?: string; limit?: number } = {},
@@ -199,6 +237,7 @@ export function createNotificationsService(deps: ModuleDeps) {
       .where(
         and(
           eq(engagementNotifications.userId, principal.userId),
+          staffOnlyVisibilityPredicate(principal),
           options.unreadOnly ? isNull(engagementNotifications.readAt) : undefined,
           beforeId !== undefined ? lt(engagementNotifications.id, beforeId) : undefined,
         ),
@@ -229,7 +268,13 @@ export function createNotificationsService(deps: ModuleDeps) {
     const [row] = await db
       .select({ total: count(engagementNotifications.id) })
       .from(engagementNotifications)
-      .where(and(eq(engagementNotifications.userId, principal.userId), isNull(engagementNotifications.readAt)));
+      .where(
+        and(
+          eq(engagementNotifications.userId, principal.userId),
+          staffOnlyVisibilityPredicate(principal),
+          isNull(engagementNotifications.readAt),
+        ),
+      );
     return { unreadCount: Number(row?.total ?? 0) };
   }
 
@@ -242,6 +287,7 @@ export function createNotificationsService(deps: ModuleDeps) {
       .select({
         id: engagementNotifications.id,
         userId: engagementNotifications.userId,
+        staffOnly: engagementNotifications.staffOnly,
         readAt: engagementNotifications.readAt,
       })
       .from(engagementNotifications)
@@ -265,30 +311,56 @@ export function createNotificationsService(deps: ModuleDeps) {
       throw notFound("NOTIFICATION_NOT_FOUND");
     }
 
+    const visibility = staffOnlyVisibilityPredicate(principal);
+    if (existing.staffOnly) {
+      const [visible] = await db
+        .select({ id: engagementNotifications.id })
+        .from(engagementNotifications)
+        .where(and(eq(engagementNotifications.id, existing.id), visibility))
+        .limit(1);
+      if (!visible) {
+        throw notFound("NOTIFICATION_NOT_FOUND");
+      }
+    }
+
     if (existing.readAt === null) {
       await db
         .update(engagementNotifications)
         .set({ readAt: clock.now() })
-        .where(and(eq(engagementNotifications.id, existing.id), eq(engagementNotifications.userId, principal.userId)));
+        .where(
+          and(
+            eq(engagementNotifications.id, existing.id),
+            eq(engagementNotifications.userId, principal.userId),
+            visibility,
+          ),
+        );
     }
     return { ok: true };
   }
 
   async function markAllRead(principal: SessionPrincipal): Promise<{ markedCount: number }> {
     assertFullSession(principal);
+    const visibility = staffOnlyVisibilityPredicate(principal);
     const unreadRows = await db
       .select({ id: engagementNotifications.id })
       .from(engagementNotifications)
-      .where(and(eq(engagementNotifications.userId, principal.userId), isNull(engagementNotifications.readAt)))
+      .where(
+        and(
+          eq(engagementNotifications.userId, principal.userId),
+          visibility,
+          isNull(engagementNotifications.readAt),
+        ),
+      )
       .limit(1000);
     if (unreadRows.length === 0) return { markedCount: 0 };
 
-    await db
+    const [upd] = await db
       .update(engagementNotifications)
       .set({ readAt: clock.now() })
       .where(
         and(
           eq(engagementNotifications.userId, principal.userId),
+          visibility,
           isNull(engagementNotifications.readAt),
           inArray(
             engagementNotifications.id,
@@ -296,7 +368,7 @@ export function createNotificationsService(deps: ModuleDeps) {
           ),
         ),
       );
-    return { markedCount: unreadRows.length };
+    return { markedCount: Number(upd.affectedRows ?? unreadRows.length) };
   }
 
   async function getPreferences(principal: SessionPrincipal): Promise<{ items: NotificationPreferenceView[] }> {

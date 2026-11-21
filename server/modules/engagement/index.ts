@@ -5,6 +5,7 @@
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, Tx } from "../../core/types.js";
 import "./settings.js";
+import "./automationTriggers.js";
 import { registerEngagementMailTemplates } from "./mail.js";
 import { createMessagesService, type MessagesService } from "./messagesService.js";
 import { createNotificationsService, type NotificationsService } from "./notificationsService.js";
@@ -18,6 +19,8 @@ import type {
   NotifyResult,
   PortableOrderMessageItem,
   PortableTicketItem,
+  TicketCategory,
+  TicketPriority,
 } from "./types.js";
 
 export * from "./types.js";
@@ -86,6 +89,17 @@ export interface EngagementModule extends ModuleLifecycle {
   /** Idempotent portable import for historical support tickets (no mail/notification replay; audited in tx). */
   importTicket(input: ImportTicketInput, tx: Tx): Promise<{ publicId: string; ticketNumber: string; created: boolean }>;
 
+  /** Server-internal idempotent ticket creation for `automations` (`support.create_ticket` action). */
+  createAutomationTicket(input: {
+    requesterUserId: number;
+    category: TicketCategory;
+    priority: TicketPriority;
+    subject: string;
+    body: string;
+    relatedOrderPublicId?: string | null;
+    idempotencyKey: string;
+  }): Promise<{ publicId: string; ticketNumber: string; created: boolean }>;
+
   /** Router-facing domain services (used by `engagementRouter` and integration tests). */
   readonly messages: MessagesService;
   readonly tickets: TicketsService;
@@ -152,6 +166,7 @@ export function createEngagementModule(deps: ModuleDeps): EngagementModule {
     portableTickets: portable.portableTickets,
     importOrderMessage: portable.importOrderMessage,
     importTicket: portable.importTicket,
+    createAutomationTicket: tickets.createFromAutomation,
     messages,
     tickets,
     notifications,
