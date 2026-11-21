@@ -21,6 +21,7 @@ import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionS
 import type { PacketTier } from "./schema.js";
 import { priceOrder } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
+import type { RequirementsService } from "./requirements.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
 export interface OrderServiceDeps {
@@ -35,6 +36,8 @@ export interface OrderServiceDeps {
   policy: OrderPolicy;
   catalog: CatalogService;
   workflows: WorkflowService;
+  /** Increment 04: requirement guard + phase bookkeeping, run inside the transition tx. */
+  requirements: Pick<RequirementsService, "onTransition">;
 }
 
 export const MAX_PAGE = 100;
@@ -641,6 +644,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           const transition = actor ? transitionsFrom(bound.definition, view.statusKey, actor).find((t) => t.to === input.toStatus) : undefined;
           if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
           if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+          await deps.requirements.onTransition(tx, principal, view, bound, transition.to);
           const now = deps.clock.now();
           const staffSide = actor !== "customer";
           const note = input.note

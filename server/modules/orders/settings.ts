@@ -64,3 +64,27 @@ export const ORDER_BUNDLE_RULE = defineSetting<BundleRule>({
   default: { enabled: false, requiredPacketNumbers: [], discountPercent: 0, label: "" },
   sensitivity: "internal",
 });
+
+/** Increment 04 — workflow phases and status requirements. Off by default; the settings registry audits changes. */
+export const ORDER_WORKFLOW_RULES_ENABLED = defineSetting({
+  key: "orders.workflow_rules.enabled",
+  owner: "orders",
+  group: "orders",
+  label: "Workflow phases and requirements",
+  description: "Allows publishing workflows with phases (which lock when an order leaves them), required uploads and acknowledgements. Rules already published are always enforced.",
+  schema: z.boolean(),
+  default: false,
+  sensitivity: "internal",
+});
+
+/** Increment 04 — console access grants to other platform users. Off by default. */
+export const ORDER_CONSOLE_ACCESS_ENABLED = defineSetting({
+  key: "orders.console_access.enabled",
+  owner: "orders",
+  group: "orders",
+  label: "Console access grants",
+  description: "Lets administrators with the access-grant capability give another customer account viewer or contributor access to one order or to all of a customer's orders.",
+  schema: z.boolean(),
+  default: false,
+  sensitivity: "internal",
+});

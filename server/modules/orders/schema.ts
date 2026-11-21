@@ -361,11 +361,14 @@ export const orderGrants = mysqlTable(
     endedByUserId: refColumn("ended_by_user_id").references(() => users.id),
     endReasonCode: varchar("end_reason_code", { length: 48 }),
     expiresAt: utcDateTime("expires_at"),
+    /** Increment 04: set when the grant was derived from a customer-wide console grant (`order_customer_grants.id`). */
+    customerGrantId: refColumn("customer_grant_id"),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
   },
   (t) => [
     uniqueIndex("order_grants_live_uq").on(t.liveKey),
+    index("order_grants_customer_grant_idx").on(t.customerGrantId),
     index("order_grants_order_idx").on(t.orderId, t.status),
     index("order_grants_grantee_idx").on(t.granteeUserId, t.status),
     index("order_grants_invitee_idx").on(t.inviteeEmailIndex, t.status),
@@ -405,4 +408,85 @@ export const orderImportProvenance = mysqlTable(
     uniqueIndex("order_import_provenance_source_uq").on(t.sourceInstallationId, t.sourceOrderPublicId),
     index("order_import_provenance_order_idx").on(t.orderId),
   ],
+);
+
+/* ---------------- Increment 04: phases, requirements, console access ---------------- */
+
+export const PHASE_LOCK_STATES = ["locked", "unlocked"] as const;
+export const ACK_ACCEPTOR_SIDES = ["customer", "staff"] as const;
+
+/**
+ * One row per (order, phase) once the order has left that phase at least once. `locked` makes the phase's uploads,
+ * acknowledgements and customer-editable data read-only; staff unlock (audited) sets `unlocked` until the order
+ * leaves the phase again. Re-entering the phase through a permitted transition also sets `unlocked`.
+ */
+export const orderPhaseLocks = mysqlTable(
+  "order_phase_locks",
+  {
+    id: idColumn(),
+    orderId: refColumn("order_id").notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    phaseKey: varchar("phase_key", { length: 48 }).notNull(),
+    state: mysqlEnum("state", PHASE_LOCK_STATES).notNull(),
+    lockedAt: utcDateTime("locked_at").notNull(),
+    lockedFromStatus: varchar("locked_from_status", { length: 48 }).notNull(),
+    unlockedAt: utcDateTime("unlocked_at"),
+    unlockedByUserId: refColumn("unlocked_by_user_id").references(() => users.id),
+    /** Staff-only encrypted note that holds the unlock reason (`order_notes.public_id`). */
+    unlockNotePublicId: varchar("unlock_note_public_id", { length: 26 }),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [uniqueIndex("order_phase_locks_order_phase_uq").on(t.orderId, t.phaseKey)],
+);
+
+/**
+ * Insert-only acceptance records. `textSha256` pins the exact text shown (`title + "\n\n" + body` of the pinned
+ * workflow version). IP and user agent are captured in the audit event under the audit module's rules.
+ */
+export const orderAcknowledgements = mysqlTable(
+  "order_acknowledgements",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    orderId: refColumn("order_id").notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    statusKey: varchar("status_key", { length: 48 }).notNull(),
+    ackKey: varchar("ack_key", { length: 48 }).notNull(),
+    acceptorSide: mysqlEnum("acceptor_side", ACK_ACCEPTOR_SIDES).notNull(),
+    textSha256: char("text_sha256", { length: 64 }).notNull(),
+    userId: refColumn("user_id").notNull().references(() => users.id),
+    userRole: varchar("user_role", { length: 16 }).notNull(),
+    /** Public, non-secret session identifier. */
+    sessionId: varchar("session_id", { length: 64 }).notNull(),
+    /** Encrypted typed name (aad `order_acknowledgements.typed_name:<publicId>`), when the requirement asks for it. */
+    typedNameEnc: text("typed_name_enc"),
+    acceptedAt: utcDateTime("accepted_at").notNull(),
+  },
+  (t) => [
+    uniqueIndex("order_acknowledgements_once_uq").on(t.orderId, t.workflowVersionId, t.statusKey, t.ackKey, t.acceptorSide),
+    index("order_acknowledgements_order_idx").on(t.orderId),
+  ],
+);
+
+/** Console grant covering every current and future order of one customer (derived rows live in `order_grants`). */
+export const orderCustomerGrants = mysqlTable(
+  "order_customer_grants",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    ownerUserId: refColumn("owner_user_id").notNull().references(() => users.id),
+    granteeUserId: refColumn("grantee_user_id").notNull().references(() => users.id),
+    role: mysqlEnum("role", GRANT_ROLES).notNull(),
+    status: mysqlEnum("status", ["active", "revoked"] as const).notNull().default("active"),
+    /** `owner:grantee` while active, NULL once revoked ⇒ one live customer-wide grant per pair. */
+    liveKey: varchar("live_key", { length: 48 }),
+    grantedByUserId: refColumn("granted_by_user_id").references(() => users.id),
+    endedAt: utcDateTime("ended_at"),
+    endedByUserId: refColumn("ended_by_user_id").references(() => users.id),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [uniqueIndex("order_customer_grants_live_uq").on(t.liveKey), index("order_customer_grants_owner_idx").on(t.ownerUserId, t.status)],
 );

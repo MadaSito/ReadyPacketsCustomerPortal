@@ -9,7 +9,7 @@ import { ulid } from "../../core/ids.js";
 import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersionLayouts, orderWorkflowVersions, type WorkflowDraftSource } from "./schema.js";
-import { DEFAULT_WORKFLOW, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
+import { DEFAULT_WORKFLOW, usesWorkflowRules, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
 import {
   BLANK_DRAFT,
   draftDefinitionSchema,
@@ -30,6 +30,8 @@ export interface WorkflowDeps {
   audit: AuditEmitter;
   /** In-tx actor re-validation (first statement of every admin write; these writes lock no order row). */
   actorCheck: ActorCheck;
+  /** Increment 04: reads `orders.workflow_rules.enabled`. Absent = disabled (fail closed). */
+  rulesEnabled?: (tx?: Tx) => Promise<boolean>;
 }
 
 export interface BoundWorkflow {
@@ -128,6 +130,13 @@ export function createWorkflowService(deps: WorkflowDeps) {
   }
 
   /** Semantic validation shared by every publish-class path (drafts and the legacy direct create/publish). */
+  /** Increment 04: phases and requirements may only be published while the feature setting is on. */
+  async function assertRulesAllowed(definition: WorkflowDefinition, tx?: Tx): Promise<void> {
+    if (!usesWorkflowRules(definition)) return;
+    if (deps.rulesEnabled && (await deps.rulesEnabled(tx))) return;
+    throw validation("WORKFLOW_RULES_DISABLED", "Phases and status requirements are switched off. Turn on “Workflow phases and requirements” in Settings first, or remove them from this workflow.");
+  }
+
   function assertPublishable(draft: WorkflowDraftDefinition): WorkflowIssue[] {
     const issues = validateDraft(draft);
     if (!hasErrors(issues)) return issues;
@@ -389,6 +398,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
         const draft = draftDefinitionSchema.parse(row.definition);
         const issues = assertPublishable(draft);
         const definition = toPublishable(draft);
+        await assertRulesAllowed(definition, tx);
         const layout = pruneLayout(row.layout ? layoutSchema.parse(row.layout) : null, draft);
         const [hasDefault] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).limit(1);
         let workflowRow: typeof orderWorkflows.$inferSelect;
@@ -542,6 +552,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
       // same gates as publishDraft: admin + workflows.manage, fresh persisted step-up, and designer validation.
       const definition = parseDefinition(input.definition);
       assertPublishable(toDraft(definition));
+      await assertRulesAllowed(definition);
       return deps.db.transaction(async (tx) => {
         await assertDesigner(principal, tx, true);
         const [taken] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.workflowKey, input.workflowKey)).limit(1);
@@ -576,6 +587,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
       // same gates as publishDraft: admin + workflows.manage, fresh persisted step-up, and designer validation.
       const definition = parseDefinition(input.definition);
       assertPublishable(toDraft(definition));
+      await assertRulesAllowed(definition);
       return deps.db.transaction(async (tx) => {
         await assertDesigner(principal, tx, true);
         const [workflow] = await tx.select().from(orderWorkflows).where(eq(orderWorkflows.publicId, input.workflowId)).limit(1).for("update");

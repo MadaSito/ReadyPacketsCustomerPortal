@@ -8,7 +8,20 @@
  * Data only: no code, scripts, expressions or URLs.
  */
 import { z } from "zod";
-import { STATE_KINDS, STATE_TONES, WORKFLOW_ACTORS, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
+import {
+  ACK_BODY_MAX,
+  ACK_SIDES,
+  MAX_ACKNOWLEDGEMENTS,
+  MAX_PHASES,
+  MAX_SLOT_COUNT,
+  MAX_UPLOAD_SLOTS,
+  STATE_KINDS,
+  STATE_TONES,
+  UPLOAD_KINDS,
+  WORKFLOW_ACTORS,
+  workflowDefinitionSchema,
+  type WorkflowDefinition,
+} from "./workflowTypes.js";
 
 export const MAX_STATES = 30;
 export const MAX_TRANSITIONS = 200;
@@ -16,12 +29,38 @@ const KEY_PATTERN = /^[a-z][a-z0-9_]*$/;
 
 const draftText = (max: number) => z.string().max(max).transform((value) => value.normalize("NFC"));
 
+export const draftUploadSchema = z.strictObject({
+  key: draftText(48),
+  label: draftText(60),
+  hint: draftText(200).optional(),
+  kind: z.enum(UPLOAD_KINDS),
+  minCount: z.number().int().min(0).max(MAX_SLOT_COUNT),
+  maxCount: z.number().int().min(0).max(MAX_SLOT_COUNT),
+  allowedTypes: z.array(z.string().max(10)).max(20),
+  uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(3),
+});
+
+export const draftAcknowledgementSchema = z.strictObject({
+  key: draftText(48),
+  title: draftText(120),
+  body: draftText(ACK_BODY_MAX),
+  acceptedBy: z.enum(ACK_SIDES),
+  requireTypedName: z.boolean(),
+});
+
 export const draftStateSchema = z.strictObject({
   key: draftText(48),
   label: draftText(60),
   customerLabel: draftText(60),
   kind: z.enum(STATE_KINDS),
   tone: z.enum(STATE_TONES),
+  phase: draftText(48).optional(),
+  requirements: z
+    .strictObject({
+      uploads: z.array(draftUploadSchema).max(MAX_UPLOAD_SLOTS),
+      acknowledgements: z.array(draftAcknowledgementSchema).max(MAX_ACKNOWLEDGEMENTS),
+    })
+    .optional(),
 });
 
 export const draftTransitionSchema = z.strictObject({
@@ -36,6 +75,7 @@ export const draftTransitionSchema = z.strictObject({
 export const draftDefinitionSchema = z.strictObject({
   states: z.array(draftStateSchema).max(MAX_STATES),
   transitions: z.array(draftTransitionSchema).max(MAX_TRANSITIONS),
+  phases: z.array(z.strictObject({ key: draftText(48), label: draftText(60) })).max(MAX_PHASES).optional(),
 });
 export type WorkflowDraftDefinition = z.output<typeof draftDefinitionSchema>;
 
@@ -160,7 +200,76 @@ export function validateDraft(definition: WorkflowDraftDefinition): WorkflowIssu
     if (transitions.length > 0 && !transitions.some((transition) => transition.notifyCustomer))
       warn("NO_CUSTOMER_NOTICE", "transitions", "No transition notifies the customer. Customers will only see changes when they open the order.");
   }
+  validateRules(definition, firstIndexByKey, error, warn);
   return issues;
+}
+
+type Report = (code: string, path: string, message: string) => void;
+
+/** Increment 04: phases and per-status requirements. */
+function validateRules(definition: WorkflowDraftDefinition, stateIndex: Map<string, number>, error: Report, warn: Report): void {
+  const phases = definition.phases ?? [];
+  const phaseIndex = new Map<string, number>();
+  phases.forEach((phase, index) => {
+    const key = phase.key.trim();
+    const name = `Phase ${index + 1}${phase.label.trim() ? ` (“${phase.label.trim()}”)` : ""}`;
+    if (!key) error("PHASE_KEY_REQUIRED", `phases.${index}.key`, `${name} needs a key.`);
+    else if (key.length < 2 || !KEY_PATTERN.test(key))
+      error("PHASE_KEY_FORMAT", `phases.${index}.key`, `${name}: the key must be at least 2 characters, start with a lowercase letter and use only lowercase letters, digits and underscores.`);
+    else if (phaseIndex.has(key)) error("PHASE_KEY_DUPLICATE", `phases.${index}.key`, `${name}: the key “${key}” is already used by phase ${phaseIndex.get(key)! + 1}.`);
+    else phaseIndex.set(key, index);
+    if (!phase.label.trim()) error("PHASE_LABEL_REQUIRED", `phases.${index}.label`, `${name} needs a label.`);
+  });
+  const used = new Set<string>();
+  definition.states.forEach((state, index) => {
+    const name = stateName(state, index);
+    const phase = state.phase?.trim();
+    if (phase) {
+      if (!phaseIndex.has(phase)) error("STATE_PHASE_UNKNOWN", `states.${index}.phase`, `${name}: the phase “${phase}” does not exist.`);
+      else used.add(phase);
+    } else if (phases.length > 0) warn("STATE_PHASE_MISSING", `states.${index}.phase`, `${name} is not in any phase, so leaving it never locks anything.`);
+    const req = state.requirements;
+    if (!req) return;
+    const slotKeys = new Map<string, number>();
+    req.uploads.forEach((slot, slotIndex) => {
+      const path = `states.${index}.requirements.uploads.${slotIndex}`;
+      const slotName = `${name}, upload ${slotIndex + 1}${slot.label.trim() ? ` (“${slot.label.trim()}”)` : ""}`;
+      const key = slot.key.trim();
+      if (!key || key.length < 2 || !KEY_PATTERN.test(key))
+        error("UPLOAD_KEY_FORMAT", `${path}.key`, `${slotName}: the key must be at least 2 characters, start with a lowercase letter and use only lowercase letters, digits and underscores.`);
+      else if (slotKeys.has(key)) error("UPLOAD_KEY_DUPLICATE", `${path}.key`, `${slotName}: the key “${key}” is already used by upload ${slotKeys.get(key)! + 1}.`);
+      else slotKeys.set(key, slotIndex);
+      if (!slot.label.trim()) error("UPLOAD_LABEL_REQUIRED", `${path}.label`, `${slotName} needs a label.`);
+      if (slot.maxCount < 1) error("UPLOAD_MAX_TOO_LOW", `${path}.maxCount`, `${slotName}: allow at least one file.`);
+      if (slot.minCount > slot.maxCount) error("UPLOAD_MIN_ABOVE_MAX", `${path}.minCount`, `${slotName}: the minimum (${slot.minCount}) is more than the maximum (${slot.maxCount}).`);
+      if (slot.uploadedBy.length === 0) error("UPLOAD_NOBODY", `${path}.uploadedBy`, `${slotName}: choose who may upload (customer, staff or administrator).`);
+      if (new Set(slot.uploadedBy).size !== slot.uploadedBy.length) error("UPLOAD_ACTOR_DUPLICATE", `${path}.uploadedBy`, `${slotName}: each role can be listed only once.`);
+      const bad = slot.allowedTypes.find((type) => !/^[a-z0-9]{1,10}$/.test(type));
+      if (bad !== undefined) error("UPLOAD_TYPE_FORMAT", `${path}.allowedTypes`, `${slotName}: “${bad}” is not a file extension. Use lowercase letters and digits without a dot, e.g. pdf.`);
+      if (new Set(slot.allowedTypes).size !== slot.allowedTypes.length) error("UPLOAD_TYPE_DUPLICATE", `${path}.allowedTypes`, `${slotName}: each file type can be listed only once.`);
+      if (slot.hint !== undefined && /<\s*[a-z!/?]/i.test(slot.hint)) error("UPLOAD_HINT_MARKUP", `${path}.hint`, `${slotName}: use plain text without markup.`);
+    });
+    const ackKeys = new Map<string, number>();
+    req.acknowledgements.forEach((ack, ackIndex) => {
+      const path = `states.${index}.requirements.acknowledgements.${ackIndex}`;
+      const ackName = `${name}, acknowledgement ${ackIndex + 1}${ack.title.trim() ? ` (“${ack.title.trim()}”)` : ""}`;
+      const key = ack.key.trim();
+      if (!key || key.length < 2 || !KEY_PATTERN.test(key))
+        error("ACK_KEY_FORMAT", `${path}.key`, `${ackName}: the key must be at least 2 characters, start with a lowercase letter and use only lowercase letters, digits and underscores.`);
+      else if (ackKeys.has(key)) error("ACK_KEY_DUPLICATE", `${path}.key`, `${ackName}: the key “${key}” is already used by acknowledgement ${ackKeys.get(key)! + 1}.`);
+      else ackKeys.set(key, ackIndex);
+      if (!ack.title.trim()) error("ACK_TITLE_REQUIRED", `${path}.title`, `${ackName} needs a title.`);
+      if (!ack.body.trim()) error("ACK_BODY_REQUIRED", `${path}.body`, `${ackName} needs the text people must read and accept.`);
+      if (/<\s*[a-z!/?]/i.test(ack.title) || /<\s*[a-z!/?]/i.test(ack.body)) error("ACK_MARKUP", `${path}.body`, `${ackName}: use plain text without markup.`);
+    });
+    if (state.kind === "terminal" && (req.uploads.some((slot) => slot.minCount > 0) || req.acknowledgements.length > 0))
+      warn("TERMINAL_REQUIREMENTS", `states.${index}.requirements`, `${name} is final, so its requirements never block anything.`);
+  });
+  phases.forEach((phase, index) => {
+    const key = phase.key.trim();
+    if (phaseIndex.get(key) === index && !used.has(key)) warn("PHASE_UNUSED", `phases.${index}`, `Phase “${phase.label.trim() || key}” has no statuses.`);
+  });
+  void stateIndex;
 }
 
 export function hasErrors(issues: WorkflowIssue[]): boolean {
@@ -169,8 +278,26 @@ export function hasErrors(issues: WorkflowIssue[]): boolean {
 
 /** Strict conversion for publishing; call only when `validateDraft` reported no errors. */
 export function toPublishable(definition: WorkflowDraftDefinition): WorkflowDefinition {
+  const phases = (definition.phases ?? []).map((phase) => ({ key: phase.key.trim(), label: phase.label.trim() }));
   return workflowDefinitionSchema.parse({
-    states: definition.states.map((state) => ({ ...state, key: state.key.trim(), label: state.label.trim(), customerLabel: state.customerLabel.trim() })),
+    states: definition.states.map(({ phase, requirements, ...state }) => {
+      const uploads = (requirements?.uploads ?? []).map(({ hint, ...slot }) => ({
+        ...slot,
+        key: slot.key.trim(),
+        label: slot.label.trim(),
+        ...(hint?.trim() ? { hint: hint.trim() } : {}),
+      }));
+      const acknowledgements = (requirements?.acknowledgements ?? []).map((ack) => ({ ...ack, key: ack.key.trim(), title: ack.title.trim(), body: ack.body.trim() }));
+      return {
+        ...state,
+        key: state.key.trim(),
+        label: state.label.trim(),
+        customerLabel: state.customerLabel.trim(),
+        ...(phase?.trim() ? { phase: phase.trim() } : {}),
+        ...(uploads.length || acknowledgements.length ? { requirements: { uploads, acknowledgements } } : {}),
+      };
+    }),
+    ...(phases.length ? { phases } : {}),
     transitions: definition.transitions.map(({ actionLabel, ...transition }) => ({
       ...transition,
       from: transition.from.trim(),

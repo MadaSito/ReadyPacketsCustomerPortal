@@ -28,6 +28,10 @@ import type {
   OrderProductionScope,
 } from "./types.js";
 import { createWorkflowService, type WorkflowService } from "./workflows.js";
+import { createRequirementsService, type FileUploadSlots, type RequirementsService } from "./requirements.js";
+export type { FileUploadSlots, RequirementsView } from "./requirements.js";
+import { readSetting } from "../platform/index.js";
+import { ORDER_WORKFLOW_RULES_ENABLED } from "./settings.js";
 
 export type * from "./types.js";
 
@@ -65,7 +69,15 @@ export interface OrdersModule extends ModuleLifecycle {
   /** Increment 03: trusted keyset listing (ascending publicId, limit ≤ 500) for the sync backfill; ids only. */
   listOrderPublicIdsForSync(input: { afterPublicId?: string | null; limit: number }, tx?: DbOrTx): Promise<{ publicIds: string[]; nextAfter: string | null }>;
 
+  /** Increment 04 (Files port): writable upload slots of the current status for this actor. */
+  getFileUploadSlots(principal: SessionPrincipal, orderPublicId: string, tx?: Tx): Promise<FileUploadSlots>;
+  /** Increment 04 (Files port): throws PHASE_LOCKED / ORDER_LOCKED for writes tied to a read-only status. */
+  assertFileStatusWritable(principal: SessionPrincipal, orderPublicId: string, statusKey: string, tx?: Tx): Promise<void>;
+  /** Increment 04: is data tied to `statusKey` read-only because its phase is locked (trusted, in-tx). */
+  isStatusPhaseLocked(orderId: number, workflowVersionId: number, statusKey: string, tx: Tx): Promise<boolean>;
+
   /* ---- services used by the router ---- */
+  requirements: RequirementsService;
   catalog: CatalogService;
   workflows: WorkflowService;
   orders: OrderService;
@@ -77,8 +89,15 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const policy = createOrderPolicy({ db: deps.db, clock: deps.clock, audit: deps.audit });
   const actorCheck = createActorCheck(deps.services, deps.clock);
   const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, settings: deps.settings, actorCheck });
-  const workflows = createWorkflowService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
-  const orders = createOrderService({ ...deps, policy, catalog, workflows });
+  const workflows = createWorkflowService({
+    db: deps.db,
+    clock: deps.clock,
+    audit: deps.audit,
+    actorCheck,
+    rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
+  });
+  const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck });
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
 
@@ -102,6 +121,10 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     isPortableStatusSupported: portable.isPortableStatusSupported,
     preflightImportOrder: portable.preflightImportOrder,
     checkCatalogViability: catalog.checkViability,
+    getFileUploadSlots: requirements.getFileUploadSlots,
+    assertFileStatusWritable: requirements.assertFileStatusWritable,
+    isStatusPhaseLocked: requirements.isStatusPhaseLocked,
+    requirements,
     catalog,
     workflows,
     orders,
