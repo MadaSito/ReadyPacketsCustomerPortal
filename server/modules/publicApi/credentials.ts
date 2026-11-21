@@ -146,3 +146,12 @@ export function ipAllowed(ip: string | undefined, allowList: readonly string[]):
     return address.value >> shift === network.value >> shift;
   });
 }
+
+/** True when the string contains a C0 control character (U+0000–U+001F) or DEL. */
+export function hasControlChar(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}

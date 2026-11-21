@@ -6,13 +6,13 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { and, eq, lt, sql } from "drizzle-orm";
-import { ulid } from "ulid";
 import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
+import { ulid } from "../../core/ids.js";
 import type { DbOrTx } from "../../core/types.js";
 import { redact } from "../../observability/redact.js";
-import { ipAllowed, parseBearer, sha256Hex, verifySignature } from "./credentials.js";
+import { hasControlChar, ipAllowed, parseBearer, sha256Hex, verifySignature } from "./credentials.js";
 import { type ApiCaller, type ApiScope, type PublicApiProviders } from "./ports.js";
 import { type ApiRoute, ResourceUnavailable, buildOpenApiDocument, matchRoute } from "./routes.js";
 import { apiIdempotency, apiKeys, apiRateWindows, apiRequestLog, apiSettings, apiSignatureNonces } from "./schema.js";
@@ -192,7 +192,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     for (const name of route.filters) {
       const value = search.get(name);
       if (value === null) continue;
-      if (value.length < 1 || value.length > 100 || /[\u0000-\u001f]/u.test(value)) throw fail(422, "INVALID_FILTER");
+      if (value.length < 1 || value.length > 100 || hasControlChar(value)) throw fail(422, "INVALID_FILTER");
       filter[name] = value.normalize("NFC");
     }
     return { cursor, limit, ...(updatedSince ? { updatedSince } : {}), filter };
@@ -304,7 +304,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
     let extraHeaders: Record<string, string> = {};
     let idempotencyKey: string | undefined;
     let logRow = true;
-    let route: ApiRoute | null = null;
+    let route: ApiRoute | null;
     const search = new URLSearchParams(rawQuery);
     try {
       if (replay) {
@@ -339,7 +339,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
         idempotencyKey = header;
         caller.idempotencyKey = header;
         reservation = await reserveIdempotency(key, header, sha256Hex(`${method}\n${req.target}\n${req.body.toString("base64")}`));
-        if ("stored" in reservation) {
+        if ("stored" in reservation && reservation.stored) {
           status = reservation.stored.status;
           responseBody = reservation.stored.body;
           extraHeaders["idempotent-replayed"] = "true";
@@ -441,7 +441,7 @@ export function createApiEngine(deps: ModuleDeps, providers: () => Partial<Publi
   }): Promise<void> {
     const { requestId } = input;
     const view = requestView(input.req, input.search);
-    let responseJson: unknown = null;
+    let responseJson: unknown;
     try {
       responseJson = input.responseBody ? JSON.parse(input.responseBody) : null;
     } catch {
