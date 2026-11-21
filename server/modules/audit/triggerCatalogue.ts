@@ -40,7 +40,7 @@ export interface TriggerCatalogueEntry {
   label: string;
   description: string;
   group: "Accounts" | "Orders" | "Files and messages" | "Support" | "Billing" | "Operations";
-  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup";
+  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup" | "integrations" | "community" | "payments" | "referrals" | "knowledge";
   eventName: string;
   outcomes: readonly AuditTapEvent["outcome"][];
   match?: Readonly<Record<string, string | boolean>>;

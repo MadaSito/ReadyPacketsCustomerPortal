@@ -175,9 +175,24 @@ describe("audit tap (real MySQL)", () => {
     expect(abortsTransaction(Object.assign(new Error("SAVEPOINT sp1 does not exist"), { errno: 1305 }))).toBe(true);
   });
 
-  it("allows one tap at a time", () => {
-    install({ listens: () => false, onRecorded: async () => undefined });
-    expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/already installed/u);
+  it("fans out to several taps, each isolated in its own savepoint, and stays bounded", async () => {
+    const detachers: (() => void)[] = [];
+    try {
+      detachers.push(emitter.setTap({ listens: () => true, onRecorded: async (_e, tx) => { await (tx as Tx).insert(things).values({ label: "partial" }); throw new Error("first tap failed"); } }));
+      detachers.push(emitter.setTap({ listens: () => true, onRecorded: async (_e, tx) => { await (tx as Tx).insert(things).values({ label: "second" }); } }));
+      const silent = vi.fn(async () => undefined);
+      detachers.push(emitter.setTap({ listens: () => false, onRecorded: silent }));
+      await t.db.transaction(async (tx) => {
+        await tx.insert(things).values({ label: "business" });
+        await emitter.record(event(), tx);
+      });
+      expect((await t.db.select().from(things)).map((r) => r.label).sort()).toEqual(["business", "second"]);
+      expect(silent).not.toHaveBeenCalled();
+      detachers.push(emitter.setTap({ listens: () => false, onRecorded: async () => undefined }));
+      expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/at most 4/u);
+    } finally {
+      for (const d of detachers) d();
+    }
   });
 });
 

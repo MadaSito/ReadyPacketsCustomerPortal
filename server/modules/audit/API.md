@@ -149,7 +149,7 @@ Consumers: the automations module (engagement engineer). Source: `tap.ts`, `trig
 ```ts
 import { type AuditTap, type AuditTapEvent, TRIGGER_CATALOGUE, automationCorrelationId, isAutomationOrigin } from "../audit/index.js";
 // in your module's init():
-const detach = deps.services.auditCenter.registerTap(tap);   // one tap per process; throws on a non-durable emitter
+const detach = deps.services.auditCenter.registerTap(tap);   // up to MAX_TAPS (4) taps, each in its own savepoint; idempotent per tap; throws on a non-durable emitter
 deps.services.auditCenter.triggerCatalogue();                // readonly TriggerCatalogueEntry[]
 deps.services.auditCenter.tapStats();                        // { offered, suppressedAutomationOrigin, failures, lastFailureAt }
 ```
