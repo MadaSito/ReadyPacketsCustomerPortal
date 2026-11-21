@@ -8,6 +8,7 @@ import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from
 import { createActorCheck } from "./actor.js";
 import { createCatalogService, type CatalogService } from "./catalog.js";
 import { registerOrderMailTemplates } from "./mail.js";
+import "./automationTriggers.js";
 import { createOrderService, type OrderChangeListener, type OrderService, type OrderSyncView } from "./orderService.js";
 export type { OrderChangeEvent, OrderChangeKind, OrderChangeListener, OrderSyncView } from "./orderService.js";
 import { createOrderPolicy } from "./policy.js";

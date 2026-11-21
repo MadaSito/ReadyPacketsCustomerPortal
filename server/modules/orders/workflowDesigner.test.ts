@@ -15,6 +15,7 @@ import { ordersRouter } from "./router.js";
 import { orders, orderWorkflowDrafts, orderWorkflows } from "./schema.js";
 import { BLANK_DRAFT, toDraft, validateDraft, type WorkflowDraftDefinition } from "./workflowDesign.js";
 import { DEFAULT_WORKFLOW } from "./workflowTypes.js";
+import { resolveOrderContext } from "./automationTriggers.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, idemKey, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
 
 let t: TestDb;
@@ -282,5 +283,32 @@ describe("order change hook and sync view (package H port)", () => {
     expect(await mod.getOrderRefByPublicId(order.publicId)).toMatchObject({ publicId: order.publicId, reference: order.reference, ownerUserId: alice.id });
     expect(await mod.getOrderRefByPublicId("not-an-id")).toBeNull();
     await expectError(mod.getOrderRefByPublicId(order.publicId, undefined, { forUpdate: true }), "VALIDATION:TX_REQUIRED");
+  });
+});
+
+describe("automation trigger context (order triggers)", () => {
+  const tapEvent = (eventName: string, publicId: string | null, attributes: Record<string, string> = {}) => ({
+    eventId: "e1", eventName, category: "business" as const, action: "transition", outcome: "completed" as const, reasonCode: null,
+    occurredAt: new Date().toISOString(), actor: { role: "admin" as const, userId: admin.id }, resource: publicId ? { type: "order", publicId } : null,
+    correlationId: null, jobId: null, attributes, safeCounts: {},
+  });
+  const resolve = (event: ReturnType<typeof tapEvent>) =>
+    resolveOrderContext({ triggerKey: "order.status_changed", event: event as never, db: t.db, services: h.services, signal: new AbortController().signal });
+
+  it("labels the status from the event's to_status in the order's bound version, and addresses the owner by id only", async () => {
+    const order = await newOrder();
+    const context = await resolve(tapEvent("order.status.changed", order.publicId, { to_status: "in_review" }));
+    expect(context).toEqual({
+      orderPublicId: order.publicId,
+      fields: { order_reference: order.reference, order_status_label: "Being reviewed", order_link: new URL(`/orders/${order.publicId}`, h.services.config.canonicalOrigin).href },
+      recipients: { order_owner: [alice.id], order_assignee: [] },
+    });
+    expect((await resolve(tapEvent("order.created", order.publicId))).fields).toMatchObject({ order_status_label: "Submitted" });
+  });
+
+  it("returns nothing for missing, malformed or unknown order ids", async () => {
+    expect(await resolve(tapEvent("order.created", null))).toEqual({});
+    expect(await resolve(tapEvent("order.created", "x"))).toEqual({});
+    expect(await resolve(tapEvent("order.created", "01ARZ3NDEKTSV4RRFFQ69G5FAV"))).toEqual({});
   });
 });
