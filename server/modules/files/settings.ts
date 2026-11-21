@@ -32,3 +32,24 @@ export const fileRulesSetting = defineSetting({
   },
   sensitivity: "internal",
 });
+
+export const audioRulesSchema = z.strictObject({
+  enabled: z.boolean(),
+  maxMinutes: z.number().int().min(1).max(20),
+  bitrateKbps: z.number().int().min(24).max(128),
+  keepOriginal: z.literal(true),
+});
+export type AudioRules = z.infer<typeof audioRulesSchema>;
+export const audioRulesSetting = defineSetting({
+  key: "files.audio_conversion",
+  owner: "files",
+  group: "files",
+  label: "Order audio recording and conversion",
+  description: "Enable microphone recording and local conversion to WebM/Opus. The original is always retained.",
+  schema: audioRulesSchema,
+  default: { enabled: false, maxMinutes: 5, bitrateKbps: 48, keepOriginal: true },
+  sensitivity: "internal",
+});
+
+export const slotKeySchema = z.string().min(1).max(64).regex(/^[a-z][a-z0-9_-]*$/u);
+export const transcriptSchema = z.string().trim().max(4000).refine((value) => !/\p{Cc}/u.test(value.replace(/[\r\n\t]/gu, "")));

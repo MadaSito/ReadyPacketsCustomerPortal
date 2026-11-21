@@ -1,8 +1,9 @@
-import { bigint, char, index, mysqlEnum, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { bigint, char, index, int, mysqlEnum, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 import { createdAtColumn, idColumn, publicIdColumn, refColumn, utcDateTime, versionColumn } from "../../db/columns.js";
 
 export const fileCategories = ["supporting", "intake_attachment", "deliverable"] as const;
 export const fileVisibilities = ["customer_visible", "staff_only"] as const;
+export const audioConversionStates = ["converting", "converted", "failed"] as const;
 export type FileCategory = (typeof fileCategories)[number];
 export type FileVisibility = (typeof fileVisibilities)[number];
 
@@ -16,6 +17,12 @@ export const orderFiles = mysqlTable("order_files", {
   ownerUserId: refColumn("owner_user_id").notNull(),
   phasePublicId: char("phase_public_id", { length: 26 }),
   statusKey: varchar("status_key", { length: 64 }),
+  slotKey: varchar("slot_key", { length: 64 }),
+  derivedFromPublicId: char("derived_from_public_id", { length: 26 }),
+  conversionState: mysqlEnum("conversion_state", audioConversionStates),
+  conversionReason: varchar("conversion_reason", { length: 64 }),
+  durationMs: int("duration_ms", { unsigned: true }),
+  transcriptEnc: text("transcript_enc"),
   uploadedByUserId: refColumn("uploaded_by_user_id").notNull(),
   storageKey: varchar("storage_key", { length: 48 }).notNull(),
   displayNameEnc: text("display_name_enc").notNull(),
@@ -34,7 +41,9 @@ export const orderFiles = mysqlTable("order_files", {
 }, (t) => [
   uniqueIndex("order_files_storage_key_uq").on(t.storageKey),
   uniqueIndex("order_files_logical_version_uq").on(t.logicalPublicId, t.version),
+  uniqueIndex("order_files_audio_source_uq").on(t.derivedFromPublicId),
   index("order_files_order_public_idx").on(t.orderId, t.publicId),
+  index("order_files_slot_idx").on(t.orderId, t.slotKey, t.statusKey),
   index("order_files_owner_idx").on(t.ownerUserId),
   index("order_files_retention_idx").on(t.purgeAfter, t.purgedAt),
 ]);
