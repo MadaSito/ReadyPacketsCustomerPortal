@@ -46,14 +46,17 @@ export interface CodeBlockProps {
   label?: string;
   copyable?: boolean;
   wrap?: boolean;
+  /** Shown as a small caption (no highlighting). */
+  language?: string;
   className?: string;
 }
 
-export function CodeBlock({ children, label = "Code", copyable, wrap, className }: CodeBlockProps) {
+export function CodeBlock({ children, label = "Code", copyable, wrap, language, className }: CodeBlockProps) {
   return (
     <div className={cn("relative min-w-0 rounded-[var(--radius-control)] border border-line bg-surface-sunken", className)}>
+      {language ? <p className="border-b border-line px-3 py-1 text-xs font-medium text-muted">{language}</p> : null}
       {copyable ? (
-        <div className="absolute top-1.5 right-1.5">
+        <div className={cn("absolute right-1.5", language ? "top-8" : "top-1.5")}>
           <CopyButton value={children} label={`Copy ${label.toLowerCase()}`} iconOnly />
         </div>
       ) : null}
