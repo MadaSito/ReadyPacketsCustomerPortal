@@ -45,7 +45,7 @@ export function createImportWorker(deps: ModuleDeps) {
       !session.stepUpAt || session.stepUpAt < expected.approvalStepUpAt || age < 0 || age > TRANSFER_STEP_UP_MS) {
       throw new DomainError("FORBIDDEN", "PORTABLE_APPROVAL_NO_LONGER_CURRENT", "The import approval is no longer current.");
     }
-    const pendingSteps = await deps.services.identity.transitions.derive(user.id, { mfaVerifiedAt: session.mfaVerifiedAt, tx });
+    const pendingSteps = await deps.services.identity.transitions.derive(user.id, { mfaVerifiedAt: session.mfaVerifiedAt, authMethod: session.authMethod, tx });
     if (pendingSteps.length) throw new DomainError("FORBIDDEN", "PORTABLE_APPROVAL_NO_LONGER_CURRENT", "The import approval is no longer current.");
     // Internal proof only: this principal is never issued to a browser and cannot authenticate any request.
     return {

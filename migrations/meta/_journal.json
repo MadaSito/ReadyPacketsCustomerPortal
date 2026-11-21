@@ -15,6 +15,13 @@
       "when": 1795189662388,
       "tag": "0001_offerings_and_production_dispatch",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1795289378826,
+      "tag": "0002_integrations_mail_sso_automations",
+      "breakpoints": true
     }
   ]
 }
