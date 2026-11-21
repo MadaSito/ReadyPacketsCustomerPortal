@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, HardDriveDownload } from "lucide-react";
+import { Link } from "wouter";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Button, Callout, DataTable, DateTime, Drawer, EmptyState, ErrorState, Field, Input, KeyValueList,
@@ -210,14 +211,21 @@ export function CopyLogPage() {
             { label: "Connection ID", value: <code className="break-all text-xs">{attempt.connectionPublicId}</code> },
             { label: "Size", value: bytesLabel(attempt.bytes) },
             { label: "Attempt", value: attempt.attempt.toLocaleString() },
+            { label: "Job ID", value: <code className="break-all text-xs">{attempt.jobPublicId}</code> },
             { label: "Recorded", value: <DateTime value={attempt.createdAt} /> },
             { label: "Started", value: attempt.startedAt ? <DateTime value={attempt.startedAt} /> : "Not recorded" },
             { label: "Finished", value: attempt.finishedAt ? <DateTime value={attempt.finishedAt} /> : "Not recorded" },
             { label: "Error class", value: attempt.errorCode ? <code className="break-all text-xs">{attempt.errorCode}</code> : "None recorded" },
             { label: "Correlation ID", value: attempt.correlationId ? <code className="break-all text-xs">{attempt.correlationId}</code> : "Not recorded", wide: true },
           ]} />
-          {attempt.canRetry ? <Button loading={retry.isPending} onClick={() => void retryCopy(attempt.publicId)}>Retry backup copy</Button> :
-            attempt.state === "failed" && <p className="text-sm text-muted">This attempt has no direct retry here. Check the source module and correlated audit events before taking action.</p>}
+          <div className="flex flex-wrap gap-2">
+            {attempt.correlationId && <Button asChild variant="secondary">
+              <Link href={`/admin/audit?correlationId=${encodeURIComponent(attempt.correlationId)}`}>View audit trail</Link>
+            </Button>}
+            {attempt.canRetry && <Button loading={retry.isPending} onClick={() => void retryCopy(attempt.publicId)}>Retry backup copy</Button>}
+          </div>
+          {!attempt.canRetry && attempt.state === "failed" &&
+            <p className="text-sm text-muted">This attempt has no direct retry here. Check the source module and correlated audit events before taking action.</p>}
         </div>}
       </Drawer>
     </>

@@ -4,7 +4,7 @@ import type { CopyAttemptEvent } from "./copyLogTypes.js";
 import { storageCopyAttempts as attempts } from "./schema.js";
 
 const identityToken = /^[A-Za-z0-9_-]{1,26}$/u;
-const traceToken = /^[A-Za-z0-9:_-]{1,64}$/u;
+const traceToken = /^[A-Za-z0-9_.:-]{1,64}$/u;
 const reasonToken = /^[A-Z][A-Z0-9_]{0,63}$/u;
 
 /** Call inside the owner's fenced transaction. No provider or request data belongs here. */

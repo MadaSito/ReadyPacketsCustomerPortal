@@ -74,6 +74,7 @@ it("applies named filters and opens unverified write details by keyboard", async
   await user.keyboard("{Enter}");
   const drawer = await screen.findByRole("dialog", { name: "Copy attempt details" });
   expect(await within(drawer).findByText("Not verified")).toBeVisible();
+  expect(within(drawer).getByRole("link", { name: "View audit trail" })).toHaveAttribute("href", "/admin/audit?correlationId=copy-test");
   expect(within(drawer).queryByRole("button", { name: "Retry backup copy" })).not.toBeInTheDocument();
   await user.keyboard("{Escape}");
   await waitFor(() => expect(details).toHaveFocus());
