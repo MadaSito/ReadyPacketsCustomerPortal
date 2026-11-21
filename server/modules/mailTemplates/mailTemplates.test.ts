@@ -344,22 +344,24 @@ describe("mailTemplates module (Package D)", () => {
     expect(denials.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("executes email.send_template automation action with correlation propagation and staffOnlyTrigger isolation (J-A01)", async () => {
+  it("executes email.send_template automation action with correlation propagation and default-denies staffOnlyTrigger (J-A01)", async () => {
+    expect(SEND_TEMPLATE_AUTOMATION_ACTION.forbidOnStaffOnlyTrigger).toBe(true);
+
     const custom = await mod.createCustom(adminPrincipal, {
-      templateKey: "custom.staff_alert",
-      name: "Staff note alert",
+      templateKey: "custom.order_notice",
+      name: "Order notice",
       category: "automation",
       declaredVars: [
-        { name: "recipient_name", label: "Recipient", required: true, sampleValue: "Sam" },
+        { name: "recipient_name", label: "Recipient", required: true, sampleValue: "Casey" },
         { name: "order_reference", label: "Order", required: true, sampleValue: "RP-1" },
       ],
       format: "html",
-      subject: "Note on {{order_reference}}",
-      bodyHtml: "<p>Hello {{recipient_name}}, internal activity on {{order_reference}}.</p>",
+      subject: "Notice on {{order_reference}}",
+      bodyHtml: "<p>Hello {{recipient_name}}, update on {{order_reference}}.</p>",
       deriveTextFromHtml: true,
     });
     await mod.publish(adminPrincipal, {
-      templateKey: "custom.staff_alert",
+      templateKey: "custom.order_notice",
       expectedVersion: custom.version,
     });
 
@@ -372,11 +374,11 @@ describe("mailTemplates module (Package D)", () => {
       idempotencyKey: "auto:run1:step:step_1",
       correlationId: "automation:01J9RUNPUBLICID00000000000",
       triggerMode: "event" as const,
-      triggerKey: "message.internal_note",
+      triggerKey: "order.created",
       triggerEventId: "evt_1",
       secrets: {},
       fields: { order_reference: "RP-2026-888" },
-      recipients: { mixed_group: [customerUserId, staffUserId] },
+      recipients: { order_owner: [customerUserId], staff_group: [staffUserId] },
       orderPublicId: null,
       filePublicId: null,
       dryRun: false,
@@ -395,38 +397,40 @@ describe("mailTemplates module (Package D)", () => {
       },
     };
 
-    // 1. `staffOnlyTrigger: true` MUST refuse fixed external recipient addresses
-    const fixedBlocked = await SEND_TEMPLATE_AUTOMATION_ACTION.run({
+    // 1. `J-A01`: `staffOnlyTrigger: true` is default-denied even on direct override invocation (both fixed and user recipients)
+    const staffOnlyUserBlocked = await SEND_TEMPLATE_AUTOMATION_ACTION.run({
       ...baseCtx,
+      triggerKey: "message.internal_note",
       staffOnlyTrigger: true,
       config: {
-        templateKey: "custom.staff_alert",
-        recipientMode: "fixed",
-        fixedAddress: "external@example.test",
+        templateKey: "custom.order_notice",
+        recipientMode: "trigger",
+        recipientKey: "staff_group",
       },
     });
-    expect(fixedBlocked).toMatchObject({
+    expect(staffOnlyUserBlocked).toMatchObject({
       outcome: "failed",
-      reasonCode: "STAFF_ONLY_FIXED_RECIPIENT_FORBIDDEN",
+      reasonCode: "AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN",
     });
+    expect(enqueuedMails).toHaveLength(0);
 
-    // 2. `staffOnlyTrigger: true` MUST filter out `customer` users and only enqueue to `staff`/`admin` with automation correlationId
-    const staffFiltered = await SEND_TEMPLATE_AUTOMATION_ACTION.run({
+    // 2. Non-staff-only trigger delivers published Template Centre template with `automation:<runPublicId>` correlationId
+    const delivered = await SEND_TEMPLATE_AUTOMATION_ACTION.run({
       ...baseCtx,
-      staffOnlyTrigger: true,
+      staffOnlyTrigger: false,
       config: {
-        templateKey: "custom.staff_alert",
-        recipientMode: "catalogue",
-        recipientKey: "mixed_group",
+        templateKey: "custom.order_notice",
+        recipientMode: "trigger",
+        recipientKey: "order_owner",
       },
     });
-    expect(staffFiltered).toMatchObject({
+    expect(delivered).toMatchObject({
       outcome: "completed",
       safeCounts: { queued_messages: 1 },
     });
     expect(enqueuedMails).toHaveLength(1);
-    expect(enqueuedMails[0]!.mail.to).toEqual({ userId: staffUserId });
-    expect(enqueuedMails[0]!.mail.vars.recipient_name).toBe("Sam Staff");
+    expect(enqueuedMails[0]!.mail.to).toEqual({ userId: customerUserId });
+    expect(enqueuedMails[0]!.mail.vars.recipient_name).toBe("Casey Customer");
     expect(enqueuedMails[0]!.correlationId).toBe("automation:01J9RUNPUBLICID00000000000");
 
     // 3. Templates with sensitive single-use secrets (`auth.password_reset`) cannot be dispatched by automations
@@ -435,8 +439,8 @@ describe("mailTemplates module (Package D)", () => {
       staffOnlyTrigger: false,
       config: {
         templateKey: "auth.password_reset",
-        recipientMode: "catalogue",
-        recipientKey: "mixed_group",
+        recipientMode: "trigger",
+        recipientKey: "order_owner",
       },
     });
     expect(sensitiveRefused).toMatchObject({

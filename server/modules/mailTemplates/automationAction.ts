@@ -1,167 +1,338 @@
-import { inArray } from "drizzle-orm";
+/**
+ * Package D (`mailTemplates`) implementation of the `"email.send_template"` automation action,
+ * registered via `registerAutomationAction(..., { replaceBuiltIn: true })`.
+ *
+ * Security & integration invariants:
+ *  - `J-A01`: `forbidOnStaffOnlyTrigger: true` AND runtime `ctx.staffOnlyTrigger` default-deny refusal
+ *    (`AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN`), matching `automations/builtinActions.ts`,
+ *    because queued mail outbox delivery re-resolves `userId` status without a `staff_only` role fence
+ *    if an account is later demoted to `customer`.
+ *  - Supports both Template Centre templates (`custom.*` and non-sensitive system templates) AND
+ *    starter-recipe `automations.generic_notice` (`subject` + `body`) with `recipientMode: "trigger" | "catalogue" | "fixed"`.
+ *  - Refuses unpublished custom templates (`TEMPLATE_NOT_PUBLISHED`) and any template carrying
+ *    single-use authentication secrets (`SENSITIVE_TEMPLATE_FORBIDDEN_IN_AUTOMATION`).
+ *  - Propagates `ctx.correlationId` (`automation:<runPublicId>`) into `deps.mailer.enqueue`.
+ */
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
+import { users } from "../identity/schema.js";
+import {
+  ensureAutomationMailTemplateRegistered,
+  GENERIC_AUTOMATION_MAIL_TEMPLATE,
+} from "../automations/builtinActions.js";
 import {
   registerAutomationAction,
   type AutomationActionRegistration,
   type AutomationActionRunContext,
   type AutomationActionRunResult,
+  type AutomationScalarValue,
 } from "../automations/contracts.js";
-import { users } from "../identity/schema.js";
-import { HEADER_CONTROL_RE } from "./sanitizer.js";
+import { renderPlainTemplate } from "../automations/templates.js";
+import {
+  mailTemplates,
+  mailTemplateVersions,
+  type MailTemplateVariableSpec,
+} from "./schema.js";
 
-const TEMPLATE_KEY_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
-const RECIPIENT_KEY_RE = /^[a-z][a-z0-9_]{1,47}$/;
-const SIMPLE_EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+const RESERVED_INTERNAL_TEMPLATE_KEYS = new Set(["jobs.mail.verify_audit_copy"]);
+const TEMPLATE_KEY_PATTERN = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
 
-export interface SendTemplateActionConfig {
-  templateKey: string;
-  recipientMode: "catalogue" | "fixed";
-  recipientKey?: string;
-  fixedAddress?: string;
-}
+const SIMPLE_EMAIL_RE = /^[^\s@<>"',;\\]+@[^\s@<>"',;\\]+\.[^\s@<>"',;\\]{2,}$/;
+const HEADER_CONTROL_RE = /[\r\n\u0000-\u001f\u007f]/;
 
-export const sendTemplateActionConfigSchema: z.ZodType<SendTemplateActionConfig> = z
+export const sendTemplateActionConfigSchema = z
   .strictObject({
     templateKey: z
       .string()
+      .trim()
       .min(3)
-      .max(100)
-      .regex(TEMPLATE_KEY_RE, "Select a valid template key.")
-      .refine((key) => !key.startsWith("mail_templates.test_") && key !== "jobs.mail.verify_audit_copy", {
-        message: "Internal verification and test keys cannot be used in automations.",
-      }),
-    recipientMode: z.enum(["catalogue", "fixed"]),
-    recipientKey: z.string().regex(RECIPIENT_KEY_RE).optional(),
+      .max(120)
+      .regex(TEMPLATE_KEY_PATTERN, "Invalid template key.")
+      .default(GENERIC_AUTOMATION_MAIL_TEMPLATE),
+    recipientMode: z.enum(["trigger", "catalogue", "fixed"]).default("trigger"),
+    recipientKey: z.string().trim().min(1).max(64).optional(),
     fixedAddress: z
       .string()
+      .trim()
       .max(254)
-      .refine((v) => !HEADER_CONTROL_RE.test(v) && SIMPLE_EMAIL_RE.test(v.trim()), {
-        message: "Enter a valid e-mail address without control characters.",
-      })
+      .refine((v) => !HEADER_CONTROL_RE.test(v) && SIMPLE_EMAIL_RE.test(v), "Invalid e-mail address.")
       .optional(),
+    subject: z.string().trim().min(1).max(160).optional(),
+    body: z.string().trim().min(1).max(4000).optional(),
   })
   .superRefine((val, ctx) => {
-    if (val.recipientMode === "catalogue" && !val.recipientKey) {
+    if (val.recipientMode === "fixed") {
+      if (!val.fixedAddress) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["fixedAddress"],
+          message: "Fixed e-mail address is required when recipientMode is fixed.",
+        });
+      }
+    } else if (!val.recipientKey) {
       ctx.addIssue({
-        code: "custom",
+        code: z.ZodIssueCode.custom,
         path: ["recipientKey"],
-        message: "Select a recipient from the trigger.",
+        message: "Recipient key is required when recipientMode addresses a trigger or role recipient.",
       });
     }
-    if (val.recipientMode === "fixed" && !val.fixedAddress) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["fixedAddress"],
-        message: "Enter a fixed destination e-mail address.",
-      });
+
+    if (val.templateKey === GENERIC_AUTOMATION_MAIL_TEMPLATE) {
+      if (!val.subject) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["subject"],
+          message: "Subject is required when using automations.generic_notice.",
+        });
+      }
+      if (!val.body) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["body"],
+          message: "Message body is required when using automations.generic_notice.",
+        });
+      }
     }
   });
 
+export type SendTemplateActionConfig = z.infer<typeof sendTemplateActionConfigSchema>;
+
+function scalarToString(val: AutomationScalarValue | undefined): string {
+  if (val === null || val === undefined) return "";
+  return String(val);
+}
+
 function resolveTemplateVarsForRecipient(
-  declaredVars: readonly string[],
-  fields: Readonly<Record<string, string | number | boolean | null>>,
+  declaredVars: readonly MailTemplateVariableSpec[],
+  contextFields: Readonly<Record<string, AutomationScalarValue>>,
   canonicalOrigin: string,
   recipientDisplayName: string | null,
-): Record<string, string | number | boolean> {
-  const out: Record<string, string | number | boolean> = {};
-  const strField = (k: string): string | null => {
-    const raw = fields[k];
-    if (raw === undefined || raw === null) return null;
-    const clean = String(raw).replace(/\0/g, "").trim();
-    return clean.length > 0 ? clean : null;
-  };
+): Record<string, string> {
+  const vars: Record<string, string> = {};
+  const portalUrl = new URL("/", canonicalOrigin).href;
 
-  for (const varName of declaredVars) {
-    const direct = fields[varName];
-    if (direct !== undefined && direct !== null) {
-      out[varName] = typeof direct === "string" ? direct.replace(/\0/g, "") : direct;
+  for (const v of declaredVars) {
+    if (v.name === "recipient_name") {
+      vars[v.name] = recipientDisplayName ?? scalarToString(contextFields.recipient_name) ?? "Customer";
       continue;
     }
-
-    switch (varName) {
-      case "recipient_name":
-      case "name":
-        out[varName] = recipientDisplayName || "Valued user";
-        break;
-      case "reference":
-      case "orderReference":
-        out[varName] = strField("order_reference") ?? strField("order_public_id") ?? "Order";
-        break;
-      case "statusLabel":
-        out[varName] = strField("order_status_label") ?? strField("to_status") ?? "Updated";
-        break;
-      case "invoiceNumber":
-        out[varName] = strField("invoice_number") ?? strField("invoice_public_id") ?? "Invoice";
-        break;
-      case "ticketNumber":
-        out[varName] = strField("ticket_number") ?? "Ticket";
-        break;
-      case "eventLabel":
-        out[varName] = strField("to_status") ?? "Updated";
-        break;
-      case "link":
-        out[varName] =
-          strField("order_link") ??
-          strField("invoice_link") ??
-          strField("ticket_link") ??
-          canonicalOrigin;
-        break;
-      case "portalPath":
-        out[varName] =
-          strField("invoice_link") ??
-          strField("order_link") ??
-          strField("ticket_link") ??
-          canonicalOrigin;
-        break;
-      case "title":
-      case "summary":
-        out[varName] = strField("reason_code") ?? strField("order_status_label") ?? "ReadyPackets update";
-        break;
-      case "windowLabel":
-        out[varName] = "Scheduled maintenance";
-        break;
-      default:
-        out[varName] = "";
-        break;
+    if (Object.prototype.hasOwnProperty.call(contextFields, v.name)) {
+      vars[v.name] = scalarToString(contextFields[v.name]);
+      continue;
     }
+    if (v.name === "portal_link" || v.name === "link") {
+      const candidateLink =
+        scalarToString(contextFields.order_link) ||
+        scalarToString(contextFields.invoice_link) ||
+        scalarToString(contextFields.ticket_link) ||
+        portalUrl;
+      vars[v.name] = candidateLink;
+      continue;
+    }
+    if (v.name === "reference" && contextFields.order_reference !== undefined) {
+      vars[v.name] = scalarToString(contextFields.order_reference);
+      continue;
+    }
+    if (v.name === "status" && contextFields.order_status_label !== undefined) {
+      vars[v.name] = scalarToString(contextFields.order_status_label);
+      continue;
+    }
+    if (v.name === "invoiceNumber" && contextFields.invoice_number !== undefined) {
+      vars[v.name] = scalarToString(contextFields.invoice_number);
+      continue;
+    }
+    if (v.name === "subject" && contextFields.ticket_subject !== undefined) {
+      vars[v.name] = scalarToString(contextFields.ticket_subject);
+      continue;
+    }
+    vars[v.name] = "";
   }
-  return out;
+  return vars;
+}
+
+async function resolveCatalogueUserIds(
+  ctx: AutomationActionRunContext<SendTemplateActionConfig>,
+  recipientKey: string,
+): Promise<number[]> {
+  if (Object.prototype.hasOwnProperty.call(ctx.recipients, recipientKey)) {
+    return [...(ctx.recipients[recipientKey] ?? [])];
+  }
+  if (recipientKey === "administrators") {
+    const rows = await ctx.deps.db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.status, "active"), eq(users.role, "admin")))
+      .orderBy(asc(users.id))
+      .limit(50);
+    return rows.map((r) => r.id);
+  }
+  if (recipientKey === "staff") {
+    const rows = await ctx.deps.db
+      .select({ id: users.id })
+      .from(users)
+      .where(and(eq(users.status, "active"), inArray(users.role, ["admin", "staff"])))
+      .orderBy(asc(users.id))
+      .limit(50);
+    return rows.map((r) => r.id);
+  }
+  return [];
 }
 
 async function runSendTemplateAction(
   ctx: AutomationActionRunContext<SendTemplateActionConfig>,
 ): Promise<AutomationActionRunResult> {
+  ctx.signal.throwIfAborted();
+
+  // J-A01: Outbound e-mail is default-denied on staff-only triggers (`staffOnly: true`), even on direct invocation,
+  // because queued user-ID mail delivery does not re-enforce staff/admin role if the recipient is demoted before send.
+  if (ctx.staffOnlyTrigger) {
+    return {
+      outcome: "failed",
+      reasonCode: "AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN",
+      retryable: false,
+      safeSummary: "Outbound e-mail actions are forbidden on staff-only triggers.",
+    };
+  }
+
   const { config, deps } = ctx;
 
-  // Defense-in-depth `staffOnly` enforcement (`J-A01`)
-  if (ctx.staffOnlyTrigger && config.recipientMode === "fixed") {
+  if (RESERVED_INTERNAL_TEMPLATE_KEYS.has(config.templateKey)) {
     return {
       outcome: "failed",
-      reasonCode: "STAFF_ONLY_FIXED_RECIPIENT_FORBIDDEN",
+      reasonCode: "TEMPLATE_FORBIDDEN",
       retryable: false,
-      safeSummary: "Staff-only triggers cannot send e-mail to fixed external addresses.",
+      safeSummary: "Internal verification templates cannot be used by automations.",
     };
   }
 
-  // Verify the template exists and is resolvable (either published custom/override or built-in system)
+  const execWithAutomationCorrelation = <T>(fn: () => Promise<T>): Promise<T> =>
+    runWithRequestContext(
+      newRequestContext("worker", { correlationId: ctx.correlationId }),
+      fn,
+    );
+
+  // Support starter-recipe `automations.generic_notice` seamlessly alongside Template Centre templates.
+  if (config.templateKey === GENERIC_AUTOMATION_MAIL_TEMPLATE) {
+    ensureAutomationMailTemplateRegistered(deps.mailer);
+    if (ctx.dryRun) {
+      return {
+        outcome: "completed",
+        safeSummary: "Dry-run verified generic automation notice configuration.",
+        safeCounts: { queued_messages: 0 },
+      };
+    }
+
+    if (config.recipientMode === "fixed") {
+      const addr = config.fixedAddress?.trim().toLowerCase() ?? "";
+      if (!addr || HEADER_CONTROL_RE.test(addr) || !SIMPLE_EMAIL_RE.test(addr)) {
+        return {
+          outcome: "failed",
+          reasonCode: "INVALID_FIXED_RECIPIENT",
+          retryable: false,
+          safeSummary: "Fixed destination e-mail address is invalid.",
+        };
+      }
+      const subject = renderPlainTemplate(config.subject ?? "Portal notification", ctx.fields, { singleLine: true });
+      const body = renderPlainTemplate(config.body ?? "", ctx.fields);
+      await execWithAutomationCorrelation(() =>
+        deps.mailer.enqueue({
+          template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
+          to: { address: addr },
+          vars: { subject, body, recipient_name: "" },
+          idempotencyKey: `${ctx.idempotencyKey}:mail:fixed`,
+        }),
+      );
+      return {
+        outcome: "completed",
+        safeSummary: "Queued 1 templated e-mail.",
+        safeCounts: { queued_messages: 1 },
+      };
+    }
+
+    const rawIds = await resolveCatalogueUserIds(ctx, config.recipientKey ?? "");
+    const uniqueUserIds = [...new Set(rawIds.filter((id) => Number.isInteger(id) && id > 0))].slice(0, 50);
+    if (uniqueUserIds.length === 0) {
+      return {
+        outcome: "skipped",
+        reasonCode: "NO_RECIPIENTS_RESOLVED",
+        safeSummary: "No eligible active recipients resolved for the configured recipient key.",
+      };
+    }
+    const recipientRows = await deps.db
+      .select({
+        id: users.id,
+        publicId: users.publicId,
+        status: users.status,
+        nameEnc: users.nameEnc,
+      })
+      .from(users)
+      .where(inArray(users.id, uniqueUserIds));
+
+    let queuedCount = 0;
+    for (const u of recipientRows) {
+      ctx.signal.throwIfAborted();
+      if (u.status !== "active" && u.status !== "pending_activation") continue;
+      let displayName = "Customer";
+      if (u.nameEnc) {
+        try {
+          displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`).toString("utf8");
+        } catch {
+          displayName = "Customer";
+        }
+      }
+      const perRecipientFields = { ...ctx.fields, recipient_name: displayName };
+      const subject = renderPlainTemplate(config.subject ?? "Portal notification", perRecipientFields, {
+        singleLine: true,
+      });
+      const body = renderPlainTemplate(config.body ?? "", perRecipientFields);
+      await execWithAutomationCorrelation(() =>
+        deps.mailer.enqueue({
+          template: GENERIC_AUTOMATION_MAIL_TEMPLATE,
+          to: { userId: u.id },
+          vars: { subject, body, recipient_name: displayName },
+          idempotencyKey: `${ctx.idempotencyKey}:mail:u:${u.id}`,
+        }),
+      );
+      queuedCount += 1;
+    }
+
+    if (queuedCount === 0) {
+      return {
+        outcome: "skipped",
+        reasonCode: "NO_ELIGIBLE_RECIPIENTS",
+        safeSummary: "No active recipients matched the step policy.",
+      };
+    }
+    return {
+      outcome: "completed",
+      safeSummary: `Queued ${queuedCount} templated e-mail(s).`,
+      safeCounts: { queued_messages: queuedCount },
+    };
+  }
+
+  // Template Centre template resolution (`custom.*` or built-in system templates)
   const published = await deps.services.mailTemplates.store.resolve(config.templateKey);
-  const builtin = deps.services.jobAdmin
-    .getBuiltinMailTemplates()
-    .find((t) => t.key === config.templateKey);
+  const builtins = deps.services.jobAdmin.getBuiltinMailTemplates();
+  const builtin = builtins.find((b) => b.key === config.templateKey);
 
-  // For custom templates (`custom.*`), an active published version is mandatory
   if (!published && !builtin) {
+    const [existingRow] = await deps.db
+      .select({ id: mailTemplates.id, activePublishedVersionId: mailTemplates.activePublishedVersionId })
+      .from(mailTemplates)
+      .where(eq(mailTemplates.templateKey, config.templateKey))
+      .limit(1);
+
     return {
       outcome: "failed",
-      reasonCode: "TEMPLATE_NOT_PUBLISHED",
+      reasonCode: existingRow ? "TEMPLATE_NOT_PUBLISHED" : "TEMPLATE_NOT_FOUND",
       retryable: false,
-      safeSummary: "Selected mail template does not exist or has no published version.",
+      safeSummary: existingRow
+        ? "Selected mail template has no published version."
+        : "Selected mail template does not exist.",
     };
   }
 
-  const declaredVars = published ? published.vars : (builtin?.vars ?? []);
-  // Disallow automated mass-dispatch of templates carrying single-use authentication secrets
   const sensitiveVars = published?.sensitiveVars ?? builtin?.sensitiveVars ?? [];
   if (sensitiveVars.length > 0) {
     return {
@@ -180,11 +351,36 @@ async function runSendTemplateAction(
     };
   }
 
-  const execWithAutomationCorrelation = <T>(fn: () => Promise<T>): Promise<T> =>
-    runWithRequestContext(
-      newRequestContext("worker", { correlationId: ctx.correlationId }),
-      fn,
-    );
+  const [tplMetaRow] = await deps.db
+    .select({
+      declaredVarsJson: mailTemplates.declaredVarsJson,
+      activePublishedVersionId: mailTemplates.activePublishedVersionId,
+    })
+    .from(mailTemplates)
+    .where(eq(mailTemplates.templateKey, config.templateKey))
+    .limit(1);
+
+  let declaredVars: readonly MailTemplateVariableSpec[] = tplMetaRow?.declaredVarsJson ?? [];
+  if (declaredVars.length === 0) {
+    const varNames = published?.vars ?? builtin?.vars ?? [];
+    declaredVars = varNames.map((name) => ({ name, label: name, required: true, sampleValue: name }));
+  }
+
+  if (tplMetaRow?.activePublishedVersionId) {
+    const [ver] = await deps.db
+      .select({ state: mailTemplateVersions.state })
+      .from(mailTemplateVersions)
+      .where(eq(mailTemplateVersions.id, tplMetaRow.activePublishedVersionId))
+      .limit(1);
+    if (!ver || ver.state !== "published") {
+      return {
+        outcome: "failed",
+        reasonCode: "TEMPLATE_NOT_PUBLISHED",
+        retryable: false,
+        safeSummary: "Selected mail template is not currently published.",
+      };
+    }
+  }
 
   if (config.recipientMode === "fixed") {
     const addr = config.fixedAddress?.trim().toLowerCase() ?? "";
@@ -207,64 +403,47 @@ async function runSendTemplateAction(
         template: config.templateKey,
         to: { address: addr },
         vars,
-        idempotencyKey: `${ctx.idempotencyKey}:fixed`,
+        idempotencyKey: `${ctx.idempotencyKey}:mail:fixed`,
       }),
     );
     return {
       outcome: "completed",
-      safeSummary: "E-mail queued for configured recipient.",
+      safeSummary: "Queued 1 templated e-mail.",
       safeCounts: { queued_messages: 1 },
     };
   }
 
-  const rawUserIds = [...new Set(ctx.recipients[config.recipientKey ?? ""] ?? [])].filter(
-    (id) => Number.isInteger(id) && id > 0,
-  );
-  if (rawUserIds.length === 0) {
+  const recipientKey = config.recipientKey ?? "";
+  const rawUserIds = await resolveCatalogueUserIds(ctx, recipientKey);
+  const uniqueUserIds = [...new Set(rawUserIds.filter((id) => Number.isInteger(id) && id > 0))].slice(0, 50);
+
+  if (uniqueUserIds.length === 0) {
     return {
       outcome: "skipped",
       reasonCode: "NO_RECIPIENTS_RESOLVED",
-      safeSummary: "No active recipients matched the selected recipient group.",
+      safeSummary: "No eligible active recipients resolved for the configured recipient key.",
     };
   }
 
-  const userRows = await deps.db
+  const recipientRows = await deps.db
     .select({
       id: users.id,
       publicId: users.publicId,
-      role: users.role,
       status: users.status,
       nameEnc: users.nameEnc,
     })
     .from(users)
-    .where(inArray(users.id, rawUserIds));
+    .where(inArray(users.id, uniqueUserIds));
 
-  const eligibleUsers = userRows.filter((u) => {
-    if (u.status !== "active") return false;
-    if (ctx.staffOnlyTrigger && u.role === "customer") return false;
-    return true;
-  });
-
-  if (eligibleUsers.length === 0) {
-    return {
-      outcome: "skipped",
-      reasonCode: ctx.staffOnlyTrigger ? "STAFF_ONLY_RECIPIENTS_FILTERED" : "NO_ACTIVE_RECIPIENTS",
-      safeSummary: "No eligible active recipients remained after policy checks.",
-    };
-  }
-
-  const needsName = declaredVars.includes("recipient_name") || declaredVars.includes("name");
   let queuedCount = 0;
-
-  for (const recipient of eligibleUsers) {
+  for (const u of recipientRows) {
     ctx.signal.throwIfAborted();
+    if (u.status !== "active" && u.status !== "pending_activation") continue;
+
     let displayName: string | null = null;
-    if (needsName) {
+    if (u.nameEnc) {
       try {
-        displayName = deps.crypto
-          .decrypt(recipient.nameEnc, `users.name:${recipient.publicId}`)
-          .replace(/[\p{Cc}\u2028\u2029]+/gu, " ")
-          .trim();
+        displayName = deps.crypto.decrypt(u.nameEnc, `users.name:${u.publicId}`).toString("utf8");
       } catch {
         displayName = null;
       }
@@ -280,58 +459,83 @@ async function runSendTemplateAction(
     await execWithAutomationCorrelation(() =>
       deps.mailer.enqueue({
         template: config.templateKey,
-        to: { userId: recipient.id },
+        to: { userId: u.id },
         vars,
-        idempotencyKey: `${ctx.idempotencyKey}:u:${recipient.id}`,
+        idempotencyKey: `${ctx.idempotencyKey}:mail:u:${u.id}`,
       }),
     );
-    queuedCount++;
+    queuedCount += 1;
+  }
+
+  if (queuedCount === 0) {
+    return {
+      outcome: "skipped",
+      reasonCode: "NO_ELIGIBLE_RECIPIENTS",
+      safeSummary: "No active recipients matched the step policy.",
+    };
   }
 
   return {
     outcome: "completed",
-    safeSummary: "E-mail queued.",
+    safeSummary: `Queued ${queuedCount} templated e-mail(s).`,
     safeCounts: { queued_messages: queuedCount },
   };
 }
 
 export const SEND_TEMPLATE_AUTOMATION_ACTION: AutomationActionRegistration<SendTemplateActionConfig> = {
   key: "email.send_template",
-  label: "Send an e-mail template",
-  description: "Renders a published system or custom template with escaped variables and queues delivery.",
+  label: "Send e-mail template",
+  description: "Queues a published e-mail template through the durable mail outbox using logic-less {{field}} variables.",
   category: "Messaging",
   owner: "mailTemplates",
+  forbidOnStaffOnlyTrigger: true,
   configSchema: sendTemplateActionConfigSchema,
   configFields: [
     {
       key: "templateKey",
-      label: "Template",
-      helpText: "Choose a published custom template or built-in system template.",
+      label: "E-mail template",
       type: "template_key",
       required: true,
+      helpText: "Published custom or system template from the E-mail template centre.",
     },
     {
       key: "recipientMode",
-      label: "Send to",
+      label: "Recipient source",
       type: "enum",
       required: true,
       enumOptions: [
-        { value: "catalogue", label: "A person from the event" },
-        { value: "fixed", label: "A fixed address" },
+        { value: "trigger", label: "A role or person from the trigger" },
+        { value: "fixed", label: "Fixed operational e-mail address" },
       ],
     },
     {
       key: "recipientKey",
-      label: "Recipient",
+      label: "Trigger or role recipient",
       type: "trigger_recipient",
       required: true,
+      helpText: "Used when Recipient source is set to a role or person from the trigger.",
     },
     {
       key: "fixedAddress",
-      label: "E-mail address",
+      label: "Fixed operational e-mail",
       type: "email",
       required: true,
       maxLength: 254,
+      helpText: "Used when Recipient source is set to Fixed operational e-mail address.",
+    },
+    {
+      key: "subject",
+      label: "Fallback subject (generic notice only)",
+      type: "string",
+      required: false,
+      maxLength: 160,
+    },
+    {
+      key: "body",
+      label: "Fallback body (generic notice only)",
+      type: "textarea",
+      required: false,
+      maxLength: 4000,
     },
   ],
   retrySafe: true,
@@ -341,3 +545,4 @@ export const SEND_TEMPLATE_AUTOMATION_ACTION: AutomationActionRegistration<SendT
 export function registerMailTemplateAutomationAction(): void {
   registerAutomationAction(SEND_TEMPLATE_AUTOMATION_ACTION, { replaceBuiltIn: true });
 }
+

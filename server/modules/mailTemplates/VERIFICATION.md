@@ -11,7 +11,7 @@
    - Required/sensitive variable enforcement on publish (`auth.password_reset` `{{link}}`), live + `[REDACTED]` renders via `MailTemplateStore.resolve`, and `resetToDefault`.
    - Custom template creation, draft save, publish, optimistic concurrency (`STALE_TEMPLATE_VERSION`), version history, `restoreVersion`, inert `preview`, and rate-limited `sendTestToMe` restricted to `{ userId: actor.userId }`.
    - Capability (`mail.manage`) and fresh step-up enforcement with `authz.mail_templates.denied` audit events.
-   - `email.send_template` automation action execution, `automation:<runPublicId>` correlation propagation, sensitive-template refusal, and `staffOnlyTrigger` recipient filtering (`J-A01`).
+   - `email.send_template` automation action execution, `automation:<runPublicId>` correlation propagation, sensitive-template refusal, and `forbidOnStaffOnlyTrigger: true` + runtime default-deny on `staffOnlyTrigger` (`AUTOMATION_STAFF_ONLY_TRIGGER_ACTION_FORBIDDEN`, `J-A01`).
 
 ## Fakes vs Live External Services
 
