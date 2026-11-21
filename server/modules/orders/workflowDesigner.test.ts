@@ -234,6 +234,32 @@ describe("designer service", () => {
     await expectError(mod.workflows.getDraft(draft.publicId), "NOT_FOUND:WORKFLOW_DRAFT_NOT_FOUND");
   });
 
+  it("legacy direct create/publish are not mounted; internal callers need step-up and pass designer validation", async () => {
+    const legacy = call(admin.principal).admin.workflows as unknown as Record<string, (input: unknown) => Promise<unknown>>;
+    const [workflow] = await t.db.select().from(orderWorkflows).where(eq(orderWorkflows.publicId, standardId));
+    const body = { workflowId: standardId, expectedVersion: workflow!.version, name: "Standard", definition: DEFAULT_WORKFLOW, makeDefault: false };
+    await expect(legacy.publish!(body)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(legacy.create!({ workflowKey: "legacy_wf", name: "Legacy", definition: DEFAULT_WORKFLOW })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(Object.keys(ordersRouter._def.procedures).filter((path) => /^admin\.workflows\.(create|publish)$/.test(path))).toEqual([]);
+    await expectError(mod.workflows.publish(adminNoStepUp.principal, body), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+    await expectError(mod.workflows.create(adminNoStepUp.principal, { workflowKey: "legacy_wf", name: "Legacy", definition: DEFAULT_WORKFLOW }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+    await expectError(mod.workflows.publish(staff.principal, body), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
+    const deadEnd = {
+      states: [
+        { key: "submitted", label: "Submitted", customerLabel: "Submitted", kind: "initial", tone: "info" },
+        { key: "in_review", label: "In review", customerLabel: "In review", kind: "active", tone: "info" },
+        { key: "completed", label: "Completed", customerLabel: "Completed", kind: "terminal", tone: "success" },
+      ],
+      transitions: [
+        { from: "submitted", to: "in_review", allowedBy: ["staff"], notifyCustomer: true, requiresNote: false },
+        { from: "submitted", to: "completed", allowedBy: ["staff"], notifyCustomer: true, requiresNote: false },
+      ],
+    };
+    await expectError(mod.workflows.publish(admin.principal, { ...body, definition: deadEnd }), "VALIDATION:WORKFLOW_DRAFT_INVALID");
+    const [after] = await t.db.select().from(orderWorkflows).where(eq(orderWorkflows.publicId, standardId));
+    expect(after!.version).toBe(workflow!.version);
+  });
+
   it("creates a new workflow from a blank draft; it is not the default unless asked", async () => {
     await expectError(mod.workflows.createDraft(admin.principal, { from: "blank", workflowKey: "standard", name: "Clash" }), "CONFLICT:WORKFLOW_KEY_TAKEN");
     const draft = await mod.workflows.createDraft(admin.principal, { from: "blank", workflowKey: "rush", name: "Rush" });

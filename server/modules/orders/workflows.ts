@@ -127,6 +127,18 @@ export function createWorkflowService(deps: WorkflowDeps) {
     }
   }
 
+  /** Semantic validation shared by every publish-class path (drafts and the legacy direct create/publish). */
+  function assertPublishable(draft: WorkflowDraftDefinition): WorkflowIssue[] {
+    const issues = validateDraft(draft);
+    if (!hasErrors(issues)) return issues;
+    const errors = issues.filter((issue) => issue.severity === "error").slice(0, 50);
+    throw validation("WORKFLOW_DRAFT_INVALID", "Fix the problems listed before publishing.", {
+      issues: errors.map((issue) => issue.message),
+      issuePaths: errors.map((issue) => issue.path),
+      issueCodes: errors.map((issue) => issue.code),
+    });
+  }
+
   async function layoutOf(db: DbOrTx, versionId: number): Promise<{ layout: WorkflowLayout | null; changeNote: string | null }> {
     const [row] = await db
       .select({ layout: orderWorkflowVersionLayouts.layout, changeNote: orderWorkflowVersionLayouts.changeNote })
@@ -375,15 +387,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
         const row = await loadDraftRow(tx, input.draftId, true);
         if (row.version !== input.expectedVersion) throw staleDraft();
         const draft = draftDefinitionSchema.parse(row.definition);
-        const issues = validateDraft(draft);
-        if (hasErrors(issues)) {
-          const errors = issues.filter((issue) => issue.severity === "error").slice(0, 50);
-          throw validation("WORKFLOW_DRAFT_INVALID", "Fix the problems listed before publishing.", {
-            issues: errors.map((issue) => issue.message),
-            issuePaths: errors.map((issue) => issue.path),
-            issueCodes: errors.map((issue) => issue.code),
-          });
-        }
+        const issues = assertPublishable(draft);
         const definition = toPublishable(draft);
         const layout = pruneLayout(row.layout ? layoutSchema.parse(row.layout) : null, draft);
         const [hasDefault] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).limit(1);
@@ -534,9 +538,12 @@ export function createWorkflowService(deps: WorkflowDeps) {
     },
 
     async create(principal: SessionPrincipal, input: { workflowKey: string; name: string; definition: unknown }) {
+      // Not mounted on the API since increment 03 (the designer replaced it); kept for internal callers with the
+      // same gates as publishDraft: admin + workflows.manage, fresh persisted step-up, and designer validation.
       const definition = parseDefinition(input.definition);
+      assertPublishable(toDraft(definition));
       return deps.db.transaction(async (tx) => {
-        await deps.actorCheck(principal, tx, "workflows.manage");
+        await assertDesigner(principal, tx, true);
         const [taken] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.workflowKey, input.workflowKey)).limit(1);
         if (taken) throw conflict("WORKFLOW_KEY_TAKEN", "A workflow with that key already exists.");
         const publicId = ulid(deps.clock.now().getTime());
@@ -565,9 +572,12 @@ export function createWorkflowService(deps: WorkflowDeps) {
       principal: SessionPrincipal,
       input: { workflowId: string; expectedVersion: number; name: string; definition: unknown; makeDefault: boolean },
     ) {
+      // Not mounted on the API since increment 03 (the designer replaced it); kept for internal callers with the
+      // same gates as publishDraft: admin + workflows.manage, fresh persisted step-up, and designer validation.
       const definition = parseDefinition(input.definition);
+      assertPublishable(toDraft(definition));
       return deps.db.transaction(async (tx) => {
-        await deps.actorCheck(principal, tx, "workflows.manage");
+        await assertDesigner(principal, tx, true);
         const [workflow] = await tx.select().from(orderWorkflows).where(eq(orderWorkflows.publicId, input.workflowId)).limit(1).for("update");
         if (!workflow) throw notFound("WORKFLOW_NOT_FOUND");
         if (workflow.version !== input.expectedVersion)

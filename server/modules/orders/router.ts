@@ -96,14 +96,8 @@ const catalogAdmin = router({
 
 const workflowsAdmin = router({
   list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.list()),
-  create: adminProcedure
-    .use(requireCapability("workflows.manage"))
-    .input(z.strictObject({ workflowKey: statusKey, name: nfc(1, 120), definition: z.unknown() }))
-    .mutation(({ ctx, input }) => ctx.services.orders.workflows.create(ctx.session, input)),
-  publish: adminProcedure
-    .use(requireCapability("workflows.manage"))
-    .input(z.strictObject({ workflowId: id, expectedVersion: version, name: nfc(1, 120), definition: z.unknown(), makeDefault: z.boolean() }))
-    .mutation(({ ctx, input }) => ctx.services.orders.workflows.publish(ctx.session, input)),
+  // Increment 03: the direct create/publish procedures are no longer mounted. Every new version goes through a draft
+  // (drafts.publish), which requires a fresh step-up and passes the designer's validation.
 
   /* ---- increment 03: designer (drafts edited by the wizard and the canvas) ---- */
   installStandard: adminProcedure
