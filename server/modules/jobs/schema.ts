@@ -106,3 +106,11 @@ export const mailTransportAttempts = mysqlTable("mail_transport_attempts", {
   startedAt: utcDateTime("started_at").notNull(),
   finishedAt: utcDateTime("finished_at"),
 }, (t) => [uniqueIndex("mail_transport_attempts_slot_uq").on(t.mailId, t.generation, t.purpose)]);
+
+export const mailAuditVerification = mysqlTable("mail_audit_verification", {
+  id: int("id", { unsigned: true }).primaryKey(),
+  addressHash: char("address_hash", { length: 64 }).notNull(),
+  codeHash: char("code_hash", { length: 64 }),
+  expiresAt: utcDateTime("expires_at"),
+  verifiedAt: utcDateTime("verified_at"),
+});
