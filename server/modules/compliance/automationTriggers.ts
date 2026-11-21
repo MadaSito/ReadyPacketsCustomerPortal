@@ -4,7 +4,11 @@
  */
 import { eq } from "drizzle-orm";
 import { ULID_PATTERN } from "../../core/ids.js";
-import { registerAutomationTrigger, type AutomationTriggerResolveInput } from "../automations/contracts.js";
+import {
+  registerAutomationTrigger,
+  type AutomationResolvedTriggerContext,
+  type AutomationTriggerResolveInput,
+} from "../automations/contracts.js";
 import { orders } from "../orders/schema.js";
 import { findState } from "../orders/workflowTypes.js";
 import { complianceInvoices } from "./schema.js";
@@ -15,7 +19,7 @@ async function resolveInvoiceTriggerContext({
   db,
   services,
   signal,
-}: AutomationTriggerResolveInput) {
+}: AutomationTriggerResolveInput): Promise<AutomationResolvedTriggerContext> {
   signal.throwIfAborted();
 
   let invoicePublicId: string | null = null;
