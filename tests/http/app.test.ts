@@ -139,6 +139,7 @@ describe("HTTP edge: authority, headers, proxy and probes", () => {
       "cache-control": "no-store",
     });
     expect(res.headers["permissions-policy"]).toContain("camera=()");
+    expect(String(res.headers["permissions-policy"]).split(/,\s*/u)).toContain("microphone=(self)");
     expect(res.headers["x-powered-by"]).toBeUndefined();
   });
 

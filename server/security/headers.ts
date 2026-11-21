@@ -51,7 +51,7 @@ export function applySecurityHeaders(
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", [
-    "camera=()", "microphone=()", "geolocation=()", "payment=()", "usb=()",
+    "camera=()", "microphone=(self)", "geolocation=()", "payment=()", "usb=()",
     "publickey-credentials-create=(self)", "publickey-credentials-get=(self)",
   ].join(", "));
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
