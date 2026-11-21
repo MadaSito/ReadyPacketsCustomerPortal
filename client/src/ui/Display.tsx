@@ -153,8 +153,8 @@ export function Pagination(props: PaginationProps) {
         {summary ?? (paged ? `Page ${props.page} of ${props.pageCount}` : "")}
       </p>
       <div className="flex flex-wrap items-center gap-1">
-        <Button variant="secondary" size="sm" disabled={!hasPrevious || loading} onClick={previous} leadingIcon={<ChevronLeft aria-hidden="true" />}>
-          Previous<span className="sr-only"> page</span>
+        <Button variant="secondary" size="sm" disabled={!hasPrevious || loading} onClick={previous} aria-label="Previous page" leadingIcon={<ChevronLeft aria-hidden="true" />}>
+          Previous
         </Button>
         {paged ? (
           <ul className="hidden items-center gap-1 sm:flex">
@@ -180,8 +180,8 @@ export function Pagination(props: PaginationProps) {
             )}
           </ul>
         ) : null}
-        <Button variant="secondary" size="sm" disabled={!hasNext || loading} onClick={next} trailingIcon={<ChevronRight aria-hidden="true" />}>
-          Next<span className="sr-only"> page</span>
+        <Button variant="secondary" size="sm" disabled={!hasNext || loading} onClick={next} aria-label="Next page" trailingIcon={<ChevronRight aria-hidden="true" />}>
+          Next
         </Button>
       </div>
     </nav>

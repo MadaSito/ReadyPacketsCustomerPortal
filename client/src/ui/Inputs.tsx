@@ -28,13 +28,12 @@ export function CopyField({ label, value, hint, monospace, copyLabel, secret, cl
         {secret ? (
           <button
             type="button"
-            aria-pressed={shown}
+            aria-label={`${shown ? "Hide" : "Show"} ${label}`}
             onClick={() => setShown((s) => !s)}
             className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-[var(--radius-control)] border border-control-border bg-surface px-3 text-sm font-medium text-ink hover:bg-surface-sunken"
           >
             {shown ? <EyeOff aria-hidden="true" className="size-4" /> : <Eye aria-hidden="true" className="size-4" />}
             {shown ? "Hide" : "Show"}
-            <span className="sr-only"> {label}</span>
           </button>
         ) : null}
         <CopyButton value={value} label={copyLabel ?? `Copy ${label.toLowerCase()}`} size="md" className="shrink-0" />
