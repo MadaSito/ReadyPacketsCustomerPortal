@@ -22,4 +22,8 @@ export * from "../../modules/mailTemplates/schema.js";
 export * from "../../modules/automations/schema.js";
 export * from "../../modules/protection/schema.js";
 export * from "../../modules/publicApi/schema.js";
+export * from "../../modules/community/schema.js";
+export * from "../../modules/referrals/schema.js";
+export * from "../../modules/cart/schema.js";
+export * from "../../modules/payments/schema.js";
 export * from "../../security/rateLimiterSchema.js";

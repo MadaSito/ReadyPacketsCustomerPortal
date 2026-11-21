@@ -83,7 +83,7 @@ describe("migrations", () => {
     }
   });
 
-  it("0001 and 0002 upgrade a baseline database that already holds orders and catalog rows", async () => {
+  it("0001 and every later migration upgrade a baseline database that already holds orders and catalog rows", async () => {
     const upgraded = await createTestDb({ schema: {} });
     try {
       const connection = await upgraded.pool.getConnection();
@@ -111,8 +111,15 @@ describe("migrations", () => {
         for (const statement of statementsOf("0002_integrations_mail_sso_automations")) await connection.query(statement);
         const [after] = await connection.query("SELECT `reference` AS r, `total_minor` AS t, `workflow_version_id` AS w FROM `orders`");
         expect((after as { r: string; t: number | string; w: number | string }[]).map((r) => [r.r.startsWith("RP-TEST"), Number(r.t)])).toEqual([[true, 2500]]);
+        // Every later migration (increment 04 onwards) is additive too: apply each in journal order on top of the same rows.
+        const journal = JSON.parse(readFileSync(path.join(migrationsFolder, "meta", "_journal.json"), "utf8")) as { entries: { idx: number; tag: string }[] };
+        for (const entry of journal.entries.filter((item) => item.idx >= 3).sort((a, b) => a.idx - b.idx)) {
+          for (const statement of statementsOf(entry.tag)) await connection.query(statement);
+        }
         const [lineItems] = await connection.query("SELECT COUNT(*) AS n FROM `order_line_items`");
         expect(Number((lineItems as { n: number | string }[])[0]?.n)).toBe(1);
+        const [later] = await connection.query("SELECT `reference` AS r, `total_minor` AS t FROM `orders`");
+        expect((later as { r: string; t: number | string }[]).map((r) => [r.r.startsWith("RP-TEST"), Number(r.t)])).toEqual([[true, 2500]]);
       } finally {
         connection.release();
       }
