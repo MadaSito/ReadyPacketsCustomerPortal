@@ -8,7 +8,9 @@ import type { AutomationScalarValue } from "./contracts.js";
 
 const VALID_PLACEHOLDER_TOKEN = /^\{\{\s*([a-z][a-z0-9_]{0,63})\s*\}\}$/;
 const ANY_MUSTACHE_LIKE = /\{\{[\s\S]*?\}\}|\{|\}/g;
+// eslint-disable-next-line no-control-regex
 const HEADER_CONTROL_CHARS = /[\r\n\0\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+// eslint-disable-next-line no-control-regex
 const BODY_FORBIDDEN_CONTROL = /[\0\x01-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 
 /**
@@ -69,11 +71,13 @@ export function extractAndValidateTemplateVars(
 
 export function sanitizeHeaderScalar(value: AutomationScalarValue | undefined): string {
   if (value === undefined || value === null) return "";
+  // eslint-disable-next-line no-control-regex
   return String(value).replace(/[\r\n\0\x01-\x1f\x7f]+/g, " ").trim();
 }
 
 export function sanitizeBodyScalar(value: AutomationScalarValue | undefined): string {
   if (value === undefined || value === null) return "";
+  // eslint-disable-next-line no-control-regex
   return String(value).replace(/[\0\x01-\x08\x0b\x0c\x0e-\x1f\x7f]+/g, "");
 }
 
