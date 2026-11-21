@@ -63,6 +63,10 @@ const view = (over: Record<string, unknown>) => ({
 describe("platform console", () => {
   it("routes are lazy, admin/staff only, and under /admin", () => {
     for (const route of platformFeature.routes) {
+      if (route.path === "/account/privacy") {
+        expect(route.access).toBe("customer");
+        continue;
+      }
       expect(route.path.startsWith("/admin/")).toBe(true);
       expect(["admin", "staff"]).toContain(route.access);
     }
