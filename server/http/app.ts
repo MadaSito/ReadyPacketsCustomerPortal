@@ -24,6 +24,7 @@ import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
+import type { ProtectionModule } from "../modules/protection/index.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
   issueAnonymousCsrfToken, matchesSessionCsrfToken, secureEqual,
@@ -35,6 +36,7 @@ import { appRouter } from "../trpc/root.js";
 import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, providerCallbackRoute, requestHost, routeTemplate } from "./edge.js";
 import { createEdgeAdmission } from "./edgeAdmission.js";
 import { sendSafeError, trpcRetryAfter } from "./errors.js";
+import { createIsolatedHttpRouter, isolatedRoutePrefix, type IsolatedRouterFactories } from "./isolatedRoutes.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
 import { getHttpState, setHttpState } from "./requestState.js";
@@ -50,6 +52,7 @@ export interface AppOptions {
   trpcRouter?: AnyTRPCRouter;
   moduleRouter?: Router;
   signedWebhookRouter?: Router;
+  isolatedRouters?: IsolatedRouterFactories;
 }
 
 const JSON_LIMIT_BYTES = 256 * 1024;
@@ -198,7 +201,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       throw validation("INVALID_REQUEST_TARGET", "The request target is invalid.");
     }
     // Path-pattern test only (no lookup): provider callbacks exist on the canonical host and nowhere else.
-    if (!canonicalHost && providerCallbackRoute(req.path)) throw notFound();
+    const isolated = isolatedRoutePrefix(req.path);
+    if ((!canonicalHost && (providerCallbackRoute(req.path) || isolated)) || (isolated && preview)) throw notFound();
     if (!accepted) {
       if (alias) {
         // Concatenate only an origin-form target to the known origin; never resolve a user-controlled URL.
@@ -219,6 +223,23 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     if (PROBE_PATHS.has(req.path) && (req.method === "GET" || req.method === "HEAD")) return next();
     const retry = admission.consume(currentAddress(), services.clock.now().getTime());
     if (retry > 0) throw rateLimited(retry);
+    next();
+  });
+
+  app.use(async (req, _res, next) => {
+    const protection = (services as Services & { protection?: ProtectionModule }).protection;
+    if (protection && (await protection.inspect(req)).action === "block") {
+      throw new DomainError("FORBIDDEN", "PROTECTION_BLOCKED", "This request was refused by the portal's protection policy.");
+    }
+    next();
+  });
+
+  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? {}, async (_req, _res, next) => {
+    await applyRateLimit(services, "api", `ip:${currentAddress()}`);
+    next();
+  }));
+
+  app.use((req, _res, next) => {
     const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");
     if (!pathIn(SIGNED_WEBHOOK_PATH, req.path) && !preview?.usesExplicitCredentials &&
         (bootstrap || !SAFE_METHODS.has(req.method)) && !hasCanonicalOrigin(req, canonical.origin, bootstrap)) {

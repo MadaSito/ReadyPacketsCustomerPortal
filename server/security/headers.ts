@@ -31,6 +31,7 @@ function contentSecurityPolicy(nonce: string, preview: PreviewProfile, analytics
     "img-src 'self' data: blob:",
     "font-src 'self'",
     ["connect-src 'self'", ...exactHttpsOrigins(analytics?.connectSrc)].join(" "),
+    "media-src 'self' blob:",
     "manifest-src 'self'",
     "worker-src 'self'",
     ...(preview ? [] : ["frame-ancestors 'none'"]),

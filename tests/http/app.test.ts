@@ -124,6 +124,7 @@ describe("HTTP edge: authority, headers, proxy and probes", () => {
     const csp = res.headers["content-security-policy"];
     expect(csp).toMatch(/default-src 'none'; script-src 'self' 'nonce-[A-Za-z0-9_-]{24}'/);
     expect(csp).toContain("style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'");
+    expect(csp).toContain("; media-src 'self' blob:;");
     expect(csp).toContain("frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'");
     expect(csp).not.toMatch(/unsafe-inline|unsafe-eval/);
     expect(second.headers["content-security-policy"]).not.toBe(csp);
