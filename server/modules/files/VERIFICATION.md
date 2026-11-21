@@ -4,6 +4,9 @@ Use `source scripts/dev/env.sh` to select the project Node toolchain and local t
 
 ## Evidence and scope
 
+- Increment 04 integration coverage includes slot admission, current owner, actor, phase changes at publication, counted versions, capacity and staff restore; the public API provider checks service scope, page bounds, current ownership, visibility, and its DTO. The worker tests use a synthetic waveform and real local FFmpeg to test conversion, lease loss, audit rollback, idempotent publication, and original retention, and a deliberately missing executable to test degraded health and original availability.
+- Local microphone permission, cancellation, keyboard pause/resume, review, object-URL disposal, and light/dark axe checks are exercised with mock browser APIs in jsdom. Device recording/playback, real browser layout and contrast, and assistive-technology acceptance remain staging checks.
+
 - Storage tests cover opaque-key parsing, rooted storage with private modes, symbolic/hard-link refusal, atomic moves and duplicate-key refusal, streaming limits, hashing, inclusive ranges, and scoped staging cleanup.
 - Format tests cover synthetic PDF, PNG, JPEG, WAV, WebM, MP4, M4A and Ogg fixtures, malformed or incompatible forms, and canonical media typing. A supplementary local check classified six short FFmpeg-generated tone/color samples as audio WebM, video WebM, video MP4, audio M4A, audio Ogg and video Ogg. This is not a recorded browser capture matrix.
 - Files service tests use MySQL transactions with injected order/session, storage, jobs and audit fakes. They cover staged upload reauthorization, visibility, versions, restore, portable adoption and export in a supplied transaction, earlier source timestamps, retention checks, and upload-rule and download-audit failure paths. The orders module separately tests a late grant revocation under a repeatable-read snapshot.

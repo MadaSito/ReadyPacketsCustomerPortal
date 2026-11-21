@@ -1,4 +1,4 @@
-import { and, count, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
+import { and, count, eq, gt, gte, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import type { Readable } from "node:stream";
 import type { ModuleDeps } from "../../container.js";
 import { z } from "zod";
@@ -10,6 +10,7 @@ import { roleHasCapability, type Capability } from "../../../shared/capabilities
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { registerAutomationTrigger } from "../automations/contracts.js";
 import { readSetting, writeSetting } from "../platform/settingsRegistry.js";
+import type { PublicApiProviders } from "../publicApi/ports.js";
 import { acceptsDeclaredType, allowedExtensions, classifyFile, displayExtension, sanitizeDisplayName, type FileClassification, type FileExtension } from "./classification.js";
 import { audioJob, AudioConversionError, convertAudio, maxAudioOutputBytes, probeAudioBinary } from "./audio.js";
 import { fileAccessLog, fileDownloadTickets, orderFiles, type FileCategory, type FileVisibility } from "./schema.js";
@@ -20,6 +21,7 @@ export type { FileCategory, FileVisibility } from "./schema.js";
 const ticketLifetimeMs = 60_000;
 const day = 86_400_000;
 const retentionJob = "files.retention";
+const maxAudioJobAttempts = 3;
 const stagingKey = /^staging\/[a-f0-9]{32}$/u;
 const filesKey = /^files\/[a-f0-9]{32}$/u;
 const tokenShape = /^[a-zA-Z0-9_-]{43}$/u;
@@ -490,8 +492,9 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (row.slotKey && row.statusKey && !row.supersededAt &&
           ((typeof change === "object" && change.visibility === "customer_visible" && row.visibility === "staff_only") ||
             (change === "restore" && row.visibility === "customer_visible"))) {
-        const slot = await resolveSlot(principal, order.publicId, row.statusKey, row.slotKey, tx);
-        if (slot && await countFilesInSlot(order.id, slot.key, tx, { statusKey: row.statusKey }) >= slot.maxCount) throw slotRoomError();
+        const slot = await deps.services.orders.getFileSlotForCustody(order.publicId, row.statusKey, row.slotKey, tx);
+        if (!slot) throw forbidden("UPLOAD_SLOT_UNAVAILABLE");
+        if (await countFilesInSlot(order.id, slot.key, tx, { statusKey: row.statusKey }) >= slot.maxCount) throw slotRoomError();
       }
       const now = clock.now();
       let outcome: AuditEventInput["outcome"] = "completed";
@@ -594,7 +597,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const row = await findFile(filePublicId, tx, true);
       const valid = order && order.publicId === row.orderPublicId && row.orderId === initial!.orderId &&
         order.ownerUserId === row.ownerUserId && row.ownerUserId === initial!.ownerUserId && order.lockState === "none" &&
-        (!row.slotKey || order.statusKey === row.statusKey) && !row.derivedFromPublicId && !row.deletedAt && !row.purgedAt &&
+        (!row.statusKey || !await deps.services.orders.isStatusPhaseLocked(order.id, order.workflowVersionId, row.statusKey, tx)) &&
+        !row.derivedFromPublicId && !row.deletedAt && !row.purgedAt &&
         !row.supersededAt && row.storageKey === initial!.storageKey && row.sha256 === initial!.sha256 && row.contentType.startsWith("audio/");
       return { row, valid };
     }
@@ -662,10 +666,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         else if (committed === undefined) logger.warn("Audio conversion publication requires reconciliation");
       }
       job.signal.throwIfAborted();
-      if (!(error instanceof AudioConversionError) &&
-          (!(error instanceof DomainError) || error.reasonCode !== "FILE_SCANNER_UNAVAILABLE")) throw error;
-      const reason = error instanceof AudioConversionError ? error.reasonCode :
-        error instanceof DomainError && error.reasonCode === "FILE_SCANNER_UNAVAILABLE" ? "FILE_SCANNER_UNAVAILABLE" : "AUDIO_CONVERSION_FAILED";
+      const safeReason = error instanceof AudioConversionError ? error.reasonCode :
+        error instanceof DomainError && ["FILE_SCANNER_UNAVAILABLE", "FILE_SCAN_REFUSED", "FILE_BYTES_UNAVAILABLE"].includes(error.reasonCode)
+          ? error.reasonCode : undefined;
+      if (!safeReason && job.attempt < maxAudioJobAttempts) throw error;
+      const reason = safeReason ?? "AUDIO_CONVERSION_FAILED";
       return currentTx(async (tx) => {
         const { row } = await lockSource(tx);
         return row.conversionState === "converting" ? stop(row, reason, tx) : { outcome: "completed" };
@@ -674,6 +679,38 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   }, { retrySafe: true });
 
   const service: FilesModule = {
+    init() {
+      const provider: PublicApiProviders["orderFiles"] = {
+        async list(orderPublicId, query, caller) {
+          if (caller.kind !== "api_key" || !caller.scopes.includes("files:read")) throw forbidden("FILE_API_SCOPE_REQUIRED");
+          const limit = boundedLimit(query.limit);
+          const after = cursorValue(query.cursor ?? undefined);
+          return currentTx(async (tx) => {
+            const order = await deps.services.orders.getOrderRefByPublicId(orderPublicId, tx, { forUpdate: true });
+            if (!order) return null;
+            const rows = await tx.select({
+              publicId: orderFiles.publicId, category: orderFiles.category, displayNameEnc: orderFiles.displayNameEnc,
+              contentType: orderFiles.contentType, size: orderFiles.byteSize, version: orderFiles.version, createdAt: orderFiles.createdAt,
+            }).from(orderFiles).where(and(
+              eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
+              eq(orderFiles.ownerUserId, order.ownerUserId), eq(orderFiles.visibility, "customer_visible"),
+              isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt), isNull(orderFiles.supersededAt),
+              after ? gt(orderFiles.publicId, after) : undefined,
+              query.updatedSince ? gte(orderFiles.createdAt, query.updatedSince) : undefined,
+            )).orderBy(orderFiles.publicId).limit(limit + 1).for("update");
+            return {
+              items: rows.slice(0, limit).map((row) => ({
+                id: row.publicId, orderId: order.publicId, category: row.category, contentType: row.contentType,
+                displayName: crypto.decrypt(row.displayNameEnc, `order_files.display_name:${row.publicId}`),
+                size: row.size, version: row.version, createdAt: row.createdAt.toISOString(),
+              })),
+              nextCursor: rows.length > limit ? encodeCursor(rows[limit - 1]!.publicId) : null,
+            };
+          });
+        },
+      };
+      deps.services.publicApi.registerProvider("orderFiles", provider);
+    },
     async health() {
       let healthy = true;
       try {
@@ -791,7 +828,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           await deps.services.storageConnections?.stageOrderFile(file.publicId, tx);
           if (convert) {
             await deps.jobs.enqueue(audioJob, { filePublicId: file.publicId }, {
-              maxAttempts: 3, idempotencyKey: `file-audio:${file.publicId}`, correlationId: getRequestContext()?.correlationId,
+              maxAttempts: maxAudioJobAttempts, idempotencyKey: `file-audio:${file.publicId}`, correlationId: getRequestContext()?.correlationId,
             }, tx);
           }
           return file;
