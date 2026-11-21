@@ -12,8 +12,10 @@ import { eq } from "drizzle-orm";
 import { CryptoError, DomainError, conflict, validation } from "../../core/errors.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { AuditEmitter, AuditEventInput, Clock, Db, FieldCrypto, Logger, SafeAttributeValue, SettingsStore, Tx } from "../../core/types.js";
+import type { Capability } from "../../../shared/capabilities.js";
 import { platformSettings } from "./schema.js";
-import { flagKey, getSettingDefinition, listSettingDefinitions, type AnySettingDefinition, type SettingGroup } from "./settingsRegistry.js";
+import { describeSettingFields, type SettingFieldDescription } from "./settingFields.js";
+import { flagKey, getSettingDefinition, listSettingDefinitions, type AnySettingDefinition, type SettingGroup, type SettingManagedBy } from "./settingsRegistry.js";
 
 export interface SettingsStoreDeps {
   db: Db;
@@ -44,6 +46,12 @@ export interface SettingView {
   configured: boolean;
   /** Non-secret only: the stored value failed validation and the default is in effect. */
   invalidStored?: boolean;
+  /** Non-secret only: form description derived from the declared Zod schema (see settingFields.ts). */
+  field?: SettingFieldDescription;
+  /** A dedicated admin page owns this setting; generic editors should link there. */
+  managedBy?: SettingManagedBy;
+  /** Extra capability required (in addition to platform.settings.manage) for generic writes. */
+  writeCapability?: Capability;
 }
 
 export interface WriteOptions {
@@ -213,6 +221,8 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       exportable: def.exportable,
       version: row?.version ?? 0,
       updatedAt: row?.updatedAt ?? null,
+      ...(def.kind !== "flag" && def.managedBy ? { managedBy: def.managedBy } : {}),
+      ...(def.kind !== "flag" && def.writeCapability ? { writeCapability: def.writeCapability } : {}),
     };
     if (def.kind === "secret") return { ...base, configured: Boolean(row?.secretEnc) };
     const stored = parseStored(def, row);
@@ -222,6 +232,7 @@ export function createSettingsStore(deps: SettingsStoreDeps): PlatformSettingsSt
       defaultValue: def.default,
       configured: stored !== undefined,
       invalidStored: stored !== undefined && !stored.valid,
+      ...(def.kind === "value" ? { field: describeSettingFields(def) } : {}),
     };
   }
 

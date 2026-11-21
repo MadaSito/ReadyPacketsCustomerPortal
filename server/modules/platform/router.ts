@@ -5,7 +5,10 @@
  */
 import { z } from "zod";
 import { DomainError } from "../../core/errors.js";
-import { SETTING_GROUPS } from "./settingsRegistry.js";
+import { SETTING_GROUPS, getSettingDefinition, listSettingDefinitions } from "./settingsRegistry.js";
+import type { Capability } from "../../../shared/capabilities.js";
+import type { ActorGuard } from "./actorGuard.js";
+import type { SessionPrincipal } from "../../core/types.js";
 import { MAX_CONFIG_DOCUMENT_BYTES } from "./configTransfer.js";
 import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import type { PlatformModuleImpl } from "./module.js";
@@ -22,6 +25,21 @@ function impl(services: Services): PlatformModuleImpl {
     throw new DomainError("NOT_CONFIGURED", "PLATFORM_UNAVAILABLE", "This feature is not available.");
   }
   return platform as PlatformModuleImpl;
+}
+
+/**
+ * Guard for generic writes: platform.settings.manage plus every `writeCapability` declared by the affected
+ * settings (e.g. mail.manage), each re-validated in-transaction with its own step-up rule.
+ * `keys === "all"` covers configuration import, which may touch any exportable setting.
+ */
+function settingWriteGuard(platform: PlatformModuleImpl, principal: SessionPrincipal, keys: readonly string[] | "all"): ActorGuard {
+  const defs = keys === "all" ? listSettingDefinitions() : keys.map((key) => getSettingDefinition(key));
+  const extra = new Set<Capability>();
+  for (const def of defs) if (def && def.kind !== "flag" && def.writeCapability) extra.add(def.writeCapability);
+  const guards = [platform.actorGuard(principal), ...[...extra].sort().map((cap) => platform.actorGuard(principal, cap))];
+  return async (tx) => {
+    for (const guard of guards) await guard(tx);
+  };
 }
 
 const manage = adminProcedure.use(requireCapability("platform.settings.manage"));
@@ -42,14 +60,14 @@ export const platformRouter = router({
         .input(z.strictObject({ key: settingKey, value: z.json(), expectedVersion: version }))
         .mutation(({ ctx, input }) => {
           const platform = impl(ctx.services);
-          return platform.updateSetting(input.key, input.value, input.expectedVersion, platform.actorGuard(ctx.session));
+          return platform.updateSetting(input.key, input.value, input.expectedVersion, settingWriteGuard(platform, ctx.session, [input.key]));
         }),
       setSecret: manage
         .input(z.strictObject({ key: settingKey, value: z.string().min(1).max(16384).nullable(), expectedVersion: version }))
         .mutation(async ({ ctx, input }) => {
           const platform = impl(ctx.services);
           const store = platform.settingsAdmin();
-          await store.updateSecret(input.key, input.value, { expectedVersion: input.expectedVersion, guard: platform.actorGuard(ctx.session) });
+          await store.updateSecret(input.key, input.value, { expectedVersion: input.expectedVersion, guard: settingWriteGuard(platform, ctx.session, [input.key]) });
           return store.describeOne(input.key);
         }),
     }),
@@ -100,7 +118,7 @@ export const platformRouter = router({
         .meta({ rateLimit: "expensive" })
         .mutation(({ ctx, input }) => {
           const platform = impl(ctx.services);
-          return platform.configTransfer().apply(input.document, input.expectedPreviewDigest, platform.actorGuard(ctx.session), input.passphrase);
+          return platform.configTransfer().apply(input.document, input.expectedPreviewDigest, settingWriteGuard(platform, ctx.session, "all"), input.passphrase);
         }),
     }),
   }),

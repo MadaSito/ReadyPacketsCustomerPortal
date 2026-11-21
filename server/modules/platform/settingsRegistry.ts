@@ -8,6 +8,7 @@
  */
 import { z } from "zod";
 import type { SettingsStore, Tx } from "../../core/types.js";
+import { CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
 
 export const SETTING_GROUPS = [
   "general",
@@ -51,6 +52,41 @@ export interface ValueSettingDefinition<T> extends CommonDefinition {
   sensitivity: "public" | "internal";
   /** Included in configuration export / accepted by import. */
   exportable: boolean;
+  /** Optional per-field labels / help for the generated form, keyed by dot path ("" = the value itself). */
+  fields?: Readonly<Record<string, SettingFieldText>>;
+  /** Extra capability (re-validated in-transaction, with fresh step-up when required) for generic writes. */
+  writeCapability?: Capability;
+  /** A dedicated admin page owns this setting; the generic settings page links there instead. */
+  managedBy?: SettingManagedBy;
+}
+
+export interface SettingFieldText {
+  label?: string;
+  help?: string;
+}
+
+export interface SettingManagedBy {
+  /** Same-origin console path, e.g. "/admin/mail". */
+  href: string;
+  label: string;
+}
+
+const FIELD_PATH_PATTERN = /^$|^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$/;
+
+function assertExtras(key: string, input: { fields?: Record<string, SettingFieldText>; writeCapability?: Capability; managedBy?: SettingManagedBy }): void {
+  for (const [path, text] of Object.entries(input.fields ?? {})) {
+    if (!FIELD_PATH_PATTERN.test(path) || path.length > 200) throw new Error(`invalid field path ${path} for ${key}`);
+    if (text.label !== undefined && (text.label.length === 0 || text.label.length > 80)) throw new Error(`invalid field label ${path} for ${key}`);
+    if (text.help !== undefined && text.help.length > 400) throw new Error(`field help too long ${path} for ${key}`);
+  }
+  if (input.writeCapability !== undefined && !(CAPABILITIES as readonly string[]).includes(input.writeCapability)) {
+    throw new Error(`unknown write capability for ${key}`);
+  }
+  if (input.managedBy) {
+    const { href, label } = input.managedBy;
+    if (!/^\/admin(\/[a-z0-9-]+)+$/.test(href) || href.length > 120) throw new Error(`invalid managedBy href for ${key}`);
+    if (label.length === 0 || label.length > 80) throw new Error(`invalid managedBy label for ${key}`);
+  }
 }
 
 export interface SecretSettingDefinition extends CommonDefinition {
@@ -58,6 +94,8 @@ export interface SecretSettingDefinition extends CommonDefinition {
   schema: z.ZodType<string>;
   sensitivity: "secret";
   exportable: boolean;
+  writeCapability?: Capability;
+  managedBy?: SettingManagedBy;
 }
 
 export interface FeatureFlagDefinition extends CommonDefinition {
@@ -100,8 +138,12 @@ export function defineSetting<T>(input: {
   default: T;
   sensitivity?: "public" | "internal";
   exportable?: boolean;
+  fields?: Record<string, SettingFieldText>;
+  writeCapability?: Capability;
+  managedBy?: SettingManagedBy;
 }): ValueSettingDefinition<T> {
   assertCommon(input);
+  assertExtras(input.key, input);
   if (input.key.startsWith("feature.")) throw new Error("use defineFeatureFlag for feature.* keys");
   const parsedDefault = input.schema.safeParse(input.default);
   if (!parsedDefault.success) throw new Error(`default for ${input.key} does not satisfy its schema`);
@@ -116,6 +158,9 @@ export function defineSetting<T>(input: {
     default: input.default,
     sensitivity: input.sensitivity ?? "internal",
     exportable: input.exportable ?? true,
+    ...(input.fields ? { fields: Object.freeze({ ...input.fields }) } : {}),
+    ...(input.writeCapability ? { writeCapability: input.writeCapability } : {}),
+    ...(input.managedBy ? { managedBy: Object.freeze({ ...input.managedBy }) } : {}),
   });
 }
 
@@ -129,8 +174,11 @@ export function defineSecret(input: {
   description: string;
   schema?: z.ZodType<string>;
   exportable?: boolean;
+  writeCapability?: Capability;
+  managedBy?: SettingManagedBy;
 }): SecretSettingDefinition {
   assertCommon(input);
+  assertExtras(input.key, input);
   if (input.key.startsWith("feature.")) throw new Error("secrets cannot use the feature.* namespace");
   return register<SecretSettingDefinition>({
     kind: "secret",
@@ -144,6 +192,8 @@ export function defineSecret(input: {
     // Secrets are NOT exportable unless the owning module opts in explicitly (and even then only into a
     // passphrase-encrypted export block).
     exportable: input.exportable ?? false,
+    ...(input.writeCapability ? { writeCapability: input.writeCapability } : {}),
+    ...(input.managedBy ? { managedBy: Object.freeze({ ...input.managedBy }) } : {}),
   });
 }
 
