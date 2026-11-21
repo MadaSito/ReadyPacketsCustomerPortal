@@ -15,11 +15,19 @@
 import "./settings.js";
 import "./automationTriggers.js";
 import type { ModuleDeps } from "../../container.js";
-import type { DbOrTx, ModuleHealth, ModuleLifecycle, Tx } from "../../core/types.js";
+import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import type { PublicApiProviders } from "../publicApi/ports.js";
 import { createIntakeService, type IntakeService } from "./intakeService.js";
 import {
+  type BookVerifiedProviderPaymentInput,
+  type BookVerifiedProviderPaymentResult,
+  type CheckoutInvoiceSnapshot,
   createInvoicesService,
+  type InvoicePaidEvent,
+  type InvoicePaidListener,
   type InvoicesService,
+  type IssueCheckoutInvoiceInput,
+  type IssuedCheckoutInvoice,
   type RecordProviderPaymentInput,
   type RecordProviderPaymentResult,
 } from "./invoicesService.js";
@@ -37,12 +45,20 @@ import {
   type PortableEvidenceBatch,
   type PortableEvidenceOptions,
 } from "./portableService.js";
+import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
 
 export type {
+  BookVerifiedProviderPaymentInput,
+  BookVerifiedProviderPaymentResult,
+  CheckoutInvoiceSnapshot,
   ImportPortableEvidenceInput,
   ImportPortableEvidenceReceipt,
   IntakeService,
+  InvoicePaidEvent,
+  InvoicePaidListener,
   InvoicesService,
+  IssueCheckoutInvoiceInput,
+  IssuedCheckoutInvoice,
   PoliciesService,
   PortableEvidenceBatch,
   PortableEvidenceOptions,
@@ -88,6 +104,39 @@ export interface ComplianceModule extends ModuleLifecycle {
     tx: Tx,
   ): Promise<ImportPortableEvidenceReceipt>;
 
+  /* ---- Increment 04 checkout, online payment & referral hooks ---- */
+  quoteTaxMinor(
+    input: {
+      subtotalAfterDiscountMinor: number;
+      currency: string;
+      billingCountry?: string | null;
+      billingRegion?: string | null;
+    },
+    tx?: DbOrTx,
+  ): Promise<{ taxRateBps: number; taxMinor: number }>;
+  issueCheckoutInvoiceInTx(
+    input: IssueCheckoutInvoiceInput,
+    tx: Tx,
+  ): Promise<IssuedCheckoutInvoice>;
+  recordCheckoutAcceptances(
+    input: {
+      principal: SessionPrincipal;
+      orderId?: number;
+      orderPublicId?: string;
+      items: readonly { versionPublicId: string; contentHash: string; signerName?: string }[];
+    },
+    tx: Tx,
+  ): Promise<{ recorded: number }>;
+  getInvoiceForCheckout(
+    invoicePublicId: string,
+    opts?: { principal?: SessionPrincipal; tx?: DbOrTx },
+  ): Promise<CheckoutInvoiceSnapshot>;
+  bookVerifiedProviderPayment(
+    input: BookVerifiedProviderPaymentInput,
+    tx: Tx,
+  ): Promise<BookVerifiedProviderPaymentResult>;
+  onInvoicePaid(listener: InvoicePaidListener): void;
+
   /* ---- sub-services consumed by router & http ---- */
   policies: PoliciesService;
   intake: IntakeService;
@@ -109,9 +158,31 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     recordProviderPayment: invoices.recordProviderPayment,
     portableEvidence: portable.portableEvidence,
     importPortableEvidence: portable.importPortableEvidence,
+    quoteTaxMinor: invoices.quoteTaxMinor,
+    issueCheckoutInvoiceInTx: invoices.issueCheckoutInvoiceInTx,
+    recordCheckoutAcceptances: policies.recordCheckoutAcceptances,
+    getInvoiceForCheckout: invoices.getInvoiceForCheckout,
+    bookVerifiedProviderPayment: invoices.bookVerifiedProviderPayment,
+    onInvoicePaid: invoices.onInvoicePaid,
     policies,
     intake,
     invoices,
+
+    async init(): Promise<void> {
+      const publicApiSvc = (
+        deps.services as unknown as {
+          publicApi?: {
+            registerProvider?: (
+              key: "invoices",
+              provider: PublicApiProviders["invoices"],
+            ) => void;
+          };
+        }
+      ).publicApi;
+      if (publicApiSvc && typeof publicApiSvc.registerProvider === "function") {
+        publicApiSvc.registerProvider("invoices", createInvoicesPublicApiProvider(deps));
+      }
+    },
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();

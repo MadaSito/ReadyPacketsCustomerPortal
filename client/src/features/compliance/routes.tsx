@@ -37,8 +37,21 @@ export const routes: RouteDef[] = [
   ...(adminMod?.complianceAdminRoutes ?? []),
 ];
 
+function normalizeCustomerNav(items: NavItem[]): NavItem[] {
+  return items.map((item) => {
+    if (item.href === "/invoices") {
+      const { group: _group, ...rest } = item;
+      return { ...rest, order: 40 };
+    }
+    if (item.href === "/policies") {
+      return { ...item, group: "Account", order: 230 };
+    }
+    return item;
+  });
+}
+
 export const nav: NavItem[] = [
-  ...(customerMod?.complianceCustomerNav ?? []),
+  ...normalizeCustomerNav(customerMod?.complianceCustomerNav ?? []),
   ...(adminMod?.complianceAdminNav ?? []),
 ];
 

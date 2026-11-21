@@ -576,6 +576,46 @@ export function createPoliciesService(deps: ModuleDeps) {
     return deps.db.transaction(run);
   }
 
+  async function recordCheckoutAcceptances(
+    input: {
+      principal: SessionPrincipal;
+      orderId?: number | undefined;
+      orderPublicId?: string | undefined;
+      items: readonly { versionPublicId: string; contentHash: string; signerName?: string | undefined }[];
+    },
+    tx: Tx,
+  ): Promise<{ recorded: number }> {
+    const liveActor = await assertLiveActorInTx(deps, input.principal, tx);
+    const livePrincipal: SessionPrincipal = { ...input.principal, role: liveActor.role };
+    let resolvedOrderId: number | null = input.orderId ?? null;
+    let resolvedOrderPublicId: string | null = input.orderPublicId ?? null;
+    if (input.orderPublicId) {
+      const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+      if (!ordersSvc) {
+        throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order verification is temporarily unavailable.");
+      }
+      const orderView = await ordersSvc.assertCanReadOrder(livePrincipal, input.orderPublicId, { tx });
+      resolvedOrderId = orderView.id;
+      resolvedOrderPublicId = orderView.publicId;
+    }
+    let recorded = 0;
+    for (const item of input.items) {
+      const res = await acceptPolicyInTx(tx, {
+        userId: liveActor.userId,
+        actorRole: liveActor.role,
+        resolvedOrderId,
+        resolvedOrderPublicId,
+        versionPublicId: item.versionPublicId,
+        contentHash: item.contentHash,
+        flow: "portal",
+        signerName: item.signerName,
+      });
+      if (!res.duplicate) recorded += 1;
+    }
+    return { recorded };
+  }
+
+
   /* --------------------------------------------------------- admin authoring */
 
   async function adminListDocuments(principal: SessionPrincipal): Promise<PolicyDocumentAdminSummary[]> {
@@ -1205,6 +1245,7 @@ export function createPoliciesService(deps: ModuleDeps) {
     myStatus,
     accept,
     recordRegistrationAcceptances,
+    recordCheckoutAcceptances,
     admin: {
       listDocuments: adminListDocuments,
       getDocument: adminGetDocument,
