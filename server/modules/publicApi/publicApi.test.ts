@@ -271,6 +271,16 @@ describe("public API engine (local fakes only)", () => {
     const retry = await mod.handle(post(token, "order-2"));
     expect(json(retry.body).code).toBe("IDEMPOTENCY_OUTCOME_UNKNOWN");
     expect(calls.filter((c) => c.op === "create")).toHaveLength(1);
+    const reservations = await db.db.select().from(apiIdempotency);
+    expect(reservations).toHaveLength(1);
+    expect(JSON.stringify(reservations)).not.toContain("order-2");
+    // Neither the unknown-outcome write, its refused retry, nor a write without Idempotency-Key is replayable.
+    await mod.handle(post(token, undefined));
+    const rows = (await mod.log.list(admin)).items;
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      await expect(mod.log.replay(admin, row.requestId, { confirmWrite: true })).rejects.toMatchObject({ reasonCode: "API_REPLAY_UNAVAILABLE" });
+    }
   });
 
   it("fails closed when the write audit is unavailable", async () => {
