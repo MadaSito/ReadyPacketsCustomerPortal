@@ -67,9 +67,9 @@ jobs:
           expect_refusal 'must differ' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --alias "$PORTAL_HOST" --tls-self-signed --yes
           expect_refusal '--swap takes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --swap maybe --yes
           expect_refusal 'add --yes' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed
-          # A link out of the clone, and a swap file that is not the private file this script makes.
+          # A link inside the clone, and a swap file that is not the private file this script makes.
           sudo ln -s /tmp deploy/ci-outside-link
-          expect_refusal 'leads outside it' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes
+          expect_refusal 'not a plain file or directory' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes
           sudo rm deploy/ci-outside-link
           sudo install -m 0644 /dev/null /swapfile.readypackets
           expect_refusal 'is not a private' sudo bash deploy/auto-install.sh --domain "$PORTAL_HOST" --tls-self-signed --yes

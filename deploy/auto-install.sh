@@ -55,21 +55,15 @@ if [[ $EUID == 0 ]]; then
         custody_dir=$(dirname -- "$custody_dir")
     done
     # Every entry, including anything mounted inside the clone: root-owned, not writable by others, and
-    # nothing but directories, regular files and links.
-    custody_bad=$(find "$custody_top" \( ! -user root -o \( ! -type l -perm /022 \) -o ! \( -type d -o -type f -o -type l \) \) -print -quit)
+    # nothing but directories and regular files. Links are refused outright (the repository has none): where
+    # a link leads can change after it has been checked.
+    custody_bad=$(find "$custody_top" \( ! -user root -o -perm /022 -o ! \( -type d -o -type f \) \) -print -quit)
     if [[ -n $custody_bad ]]; then
-        printf 'ReadyPackets: the clone holds files that do not belong to root or that others can change\n(for example %s, owner:mode %s).\nClone the repository again as root:\n  sudo sh -c "umask 022 && git clone <url> /opt/readypackets-src"\n' "$custody_bad" "$(stat -c '%u:%A' -- "$custody_bad")" >&2
+        printf 'ReadyPackets: the clone holds something that does not belong to root, that others can change, or that is\nnot a plain file or directory (for example %s, owner:mode %s).\nThis repository contains only plain files; clone it again as root into an empty directory:\n  sudo sh -c "umask 022 && git clone <repository> /opt/readypackets-src"\n' \
+            "$custody_bad" "$(stat -c '%u:%A' -- "$custody_bad")" >&2
         exit 1
     fi
-    # A link is only acceptable when it leads to something inside the checked clone.
-    while IFS= read -r -d '' custody_link; do
-        custody_target=$(realpath -e -- "$custody_link" 2>/dev/null || true)
-        if [[ $custody_target != "$custody_top" && $custody_target != "$custody_top"/* ]]; then
-            printf 'ReadyPackets: the clone holds a link that leads outside it or nowhere (%s).\nThis repository contains no such link; clone it again as root into an empty directory.\n' "$custody_link" >&2
-            exit 1
-        fi
-    done < <(find "$custody_top" -type l -print0)
-    unset custody_top custody_dir custody_bad custody_mode custody_link custody_target
+    unset custody_top custody_dir custody_bad custody_mode
 fi
 # shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
