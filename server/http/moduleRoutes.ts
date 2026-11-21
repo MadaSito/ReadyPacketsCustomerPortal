@@ -14,6 +14,7 @@ import { registerJobsHttpRoutes } from "../modules/jobs/http.js";
 import { registerPortableHttpRoutes } from "../modules/portable/http.js";
 import { registerBackupHttpRoutes } from "../modules/backup/http.js";
 import { registerIntegrationsHttpRoutes } from "../modules/integrations/http.js";
+import { registerStorageOAuthRoutes } from "../modules/storage/oauth/http.js";
 
 /** Returns one router to mount at `/api` AFTER request context, session resolution, CSRF/origin and rate limits. */
 export function createModuleHttpRouter(services: Services): Router {
@@ -31,5 +32,6 @@ export function createModuleHttpRouter(services: Services): Router {
   { const r = Router(); registerPortableHttpRoutes(r, services); api.use("/portable", r); }
   { const r = Router(); registerBackupHttpRoutes(r, services); api.use("/backup", r); }
   { const r = Router(); registerIntegrationsHttpRoutes(r, services); api.use("/integrations", r); }
+  registerStorageOAuthRoutes(api, services);
   return api;
 }
