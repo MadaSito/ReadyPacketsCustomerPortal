@@ -43,6 +43,7 @@ export function isNavigation(req: Request): boolean {
 const MODULES = new Set([
   "identity", "assurance", "orders", "files", "engagement", "compliance", "audit", "siem",
   "platform", "jobs", "portable", "backup", "integrations", "storage",
+  "knowledge", "referrals",
 ]);
 
 /** Only fixed labels are emitted; callback paths may carry credentials in their query. */
