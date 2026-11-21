@@ -5,13 +5,15 @@
 // Env (synthetic QA accounts only, never real people):
 //   QA_BASE_URL        exact QA origin; must also equal QA_EXPECT_ORIGIN (typo guard before credentials are typed)
 //   QA_EXPECT_ORIGIN   the same origin again
-//   QA_STATE_DIR       output directory OUTSIDE the repo (created 0700, files 0600)
+//   QA_STATE_DIR       new directory OUTSIDE the git work tree (must not exist; created 0700, files 0600)
 //   QA_<ROLE>_EMAIL, QA_<ROLE>_PASSWORD, QA_<ROLE>_TOTP_SECRET (base32) for ROLE in CUSTOMER, STAFF, ADMIN
 //   QA_ROLES           optional comma list (default customer,staff,admin)
 // Never prints credentials, codes, cookies or raw browser errors.
 import { createHmac } from "node:crypto";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { launchQaBrowser } from "./lib/browser.mjs";
 
 const ROLES = ["customer", "staff", "admin"];
@@ -47,7 +49,6 @@ function config() {
   const dir = process.env.QA_STATE_DIR;
   if (!dir) throw new Error("Set QA_STATE_DIR to a private directory outside the repository.");
   const out = resolve(dir);
-  if (!relative(process.cwd(), out).startsWith("..")) throw new Error("QA_STATE_DIR must be outside the repository.");
   const roles = (process.env.QA_ROLES ?? ROLES.join(",")).split(",").map((r) => r.trim()).filter(Boolean);
   for (const role of roles) {
     if (!ROLES.includes(role)) throw new Error(`Unknown QA role ${role}.`);
@@ -56,6 +57,18 @@ function config() {
     }
   }
   return { out, roles };
+}
+
+/** Outside the git work tree (canonical paths, symlinks resolved) and fresh: refuse an existing path. */
+async function privateOutputDir(out) {
+  const repo = await realpath(execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim());
+  const parent = await realpath(dirname(out)).catch(() => { throw new Error("The parent of QA_STATE_DIR must exist."); });
+  const target = join(parent, basename(out));
+  const rel = relative(repo, target);
+  if (rel === "" || !(rel === ".." || rel.startsWith(`..${sep}`))) throw new Error("QA_STATE_DIR must be outside the repository.");
+  if (await lstat(target).then(() => true, () => false)) throw new Error("QA_STATE_DIR must not exist yet (no stale or symlinked sessions).");
+  await mkdir(target, { mode: 0o700 });
+  return target;
 }
 
 async function capture(browser, baseUrl, role) {
@@ -76,7 +89,7 @@ async function capture(browser, baseUrl, role) {
     await code.fill(totp(env("TOTP_SECRET")));
     await code.press("Enter");
     await page.waitForURL((url) => !/^\/(sign-in|mfa)/.test(url.pathname), { timeout: 15_000 });
-    const probe = await page.request.get(new URL("/api/trpc/identity.me", baseUrl).href, { timeout: 8_000 });
+    const probe = await page.request.get(new URL("/api/trpc/identity.me", baseUrl).href, { timeout: 8_000, maxRedirects: 0 });
     const session = (await probe.json())?.result?.data?.json;
     if (session?.state !== "full" || session.user?.role !== role) throw new Error("role mismatch");
     return await context.storageState();
@@ -86,9 +99,8 @@ async function capture(browser, baseUrl, role) {
 }
 
 async function main() {
-  const { out, roles } = config();
-  await mkdir(out, { recursive: true, mode: 0o700 });
-  await chmod(out, 0o700);
+  const { out: requested, roles } = config();
+  const out = await privateOutputDir(requested);
   const { browser, baseUrl } = await launchQaBrowser();
   let failed = 0;
   try {
@@ -96,8 +108,7 @@ async function main() {
       try {
         const state = await capture(browser, baseUrl, role);
         const file = join(out, `${role}.state.json`);
-        await writeFile(file, JSON.stringify(state), { mode: 0o600 });
-        await chmod(file, 0o600);
+        await writeFile(file, JSON.stringify(state), { mode: 0o600, flag: "wx" });
         console.log(`Captured ${role} session state.`);
       } catch {
         failed++;
@@ -110,7 +121,7 @@ async function main() {
   if (failed) process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().catch((error) => {
     console.error(`QA setup failed: ${error.message}`);
     process.exitCode = 1;
