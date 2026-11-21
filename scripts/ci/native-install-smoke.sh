@@ -223,7 +223,7 @@ sign_in() {
     name=$(grep -i '^set-cookie: __Host-rp_csrf=' "$work/csrf.headers" | head -1 | sed -E 's/^[^:]+: ([^=]+)=.*/\1/')
     value=$(grep -i '^set-cookie: __Host-rp_csrf=' "$work/csrf.headers" | head -1 | sed -E 's/^[^:]+: [^=]+=([^;]*);.*/\1/')
     [[ -n $name && -n $value ]] || fail 'no anti-forgery cookie was issued'
-    token=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$value")
+    token=$(printf '%s' "$value" | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read()))')
     # The request body and the anti-forgery values travel in root-only files, not in command lines.
     python3 -c 'import json, sys; print(json.dumps({"json": {"email": sys.argv[1], "password": open(sys.argv[2]).read().rstrip("\n")}}))' \
         "$admin_email" "$work/password" > "$work/signin.body"

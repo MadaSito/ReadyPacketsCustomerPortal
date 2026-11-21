@@ -32,6 +32,8 @@
 set -euo pipefail
 # Never trace: this script handles passwords and keys.
 set +x
+# A fixed search path, before the first tool is looked up.
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin LC_ALL=C.UTF-8
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
 
 # Everything below runs as root, so the files it is about to read must be under root's control alone: the
@@ -52,12 +54,22 @@ if [[ $EUID == 0 ]]; then
         [[ $custody_dir != / ]] || break
         custody_dir=$(dirname -- "$custody_dir")
     done
-    custody_bad=$(find "$custody_top" -xdev \( ! -user root -o \( ! -type l -perm /022 \) \) -print -quit)
+    # Every entry, including anything mounted inside the clone: root-owned, not writable by others, and
+    # nothing but directories, regular files and links.
+    custody_bad=$(find "$custody_top" \( ! -user root -o \( ! -type l -perm /022 \) -o ! \( -type d -o -type f -o -type l \) \) -print -quit)
     if [[ -n $custody_bad ]]; then
         printf 'ReadyPackets: the clone holds files that do not belong to root or that others can change\n(for example %s, owner:mode %s).\nClone the repository again as root:\n  sudo sh -c "umask 022 && git clone <url> /opt/readypackets-src"\n' "$custody_bad" "$(stat -c '%u:%A' -- "$custody_bad")" >&2
         exit 1
     fi
-    unset custody_top custody_dir custody_bad custody_mode
+    # A link is only acceptable when it leads to something inside the checked clone.
+    while IFS= read -r -d '' custody_link; do
+        custody_target=$(realpath -e -- "$custody_link" 2>/dev/null || true)
+        if [[ $custody_target != "$custody_top" && $custody_target != "$custody_top"/* ]]; then
+            printf 'ReadyPackets: the clone holds a link that leads outside it or nowhere (%s).\nThis repository contains no such link; clone it again as root into an empty directory.\n' "$custody_link" >&2
+            exit 1
+        fi
+    done < <(find "$custody_top" -type l -print0)
+    unset custody_top custody_dir custody_bad custody_mode custody_link custody_target
 fi
 # shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
@@ -181,10 +193,16 @@ case $swap_mode in
     yes) add_swap=1 ;;
     auto) if ((ram_kb + swap_kb < 3000000)); then add_swap=1; fi ;;
 esac
-if [[ -e $swap_file ]]; then add_swap=0; fi  # added by an earlier run
+# A swap file added by an earlier run is kept and reused, but only if it is exactly what this script makes.
+swap_present=0
+if [[ -e $swap_file || -L $swap_file ]]; then
+    [[ ! -L $swap_file && -f $swap_file && $(stat -c '%a:%u:%h' -- "$swap_file") == 600:0:1 ]] ||
+        die "$swap_file exists but is not a private, root-owned regular file; remove it (after \"swapoff\" if it is in use) and run again"
+    swap_present=1 add_swap=0
+fi
 if ((add_swap)); then
     ((ram_kb >= 900000)) || die "this server has $((ram_kb / 1024)) MB of memory; at least 1 GB (2 GB recommended) is needed"
-elif [[ ! -e $swap_file ]]; then
+elif ((!swap_present)) || [[ $swap_mode == no ]]; then
     ((ram_kb + swap_kb >= 1800000)) || die "building the portal needs about 2 GB of memory including swap; this server has $(((ram_kb + swap_kb) / 1024)) MB.
 Run again without \"--swap no\" to let this script add a swap file, or add swap yourself first."
 fi
@@ -232,32 +250,48 @@ fetch() {  # fetch <https-url> <file>
 # --no-defaults: an option file left in root's home directory by a hosting image must not redirect this.
 mysql_root() { mysql --no-defaults --protocol=socket --batch --skip-column-names "$@"; }
 
+swap_active() { swapon --show=NAME --noheadings | grep -qxF -- "$swap_file"; }
+swap_in_fstab() {
+    if awk -v file="$swap_file" '$1 == file { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then return; fi
+    # Kept across restarts; "nofail" lets the server start even if the file is deleted later. To remove
+    # the swap file: swapoff, delete this line, delete the file.
+    [[ ! -s /etc/fstab || -z $(tail -c1 /etc/fstab) ]] || printf '\n' >> /etc/fstab
+    printf '%s none swap sw,nofail 0 0\n' "$swap_file" >> /etc/fstab
+}
 ensure_swap() {
-    if [[ -e $swap_file ]]; then
-        # Added by an earlier run; switched back on if a restart without the fstab entry dropped it.
-        if ! swapon --show=NAME --noheadings | grep -qxF -- "$swap_file"; then swapon -- "$swap_file" || true; fi
+    # Left behind by a run that was interrupted while writing the file.
+    rm -f -- "$swap_file.rp-new"
+    if ((swap_present)); then
+        # Added by an earlier run. "--swap no" leaves it exactly as it is.
+        if [[ $swap_mode == no ]]; then return; fi
+        if swap_active || swapon -- "$swap_file"; then
+            swap_in_fstab
+            return
+        fi
+        ((ram_kb + swap_kb >= 1800000)) ||
+            die "the existing $swap_file cannot be switched on; remove it and run again (this server needs about 2 GB of memory including swap)"
+        note "the existing $swap_file could not be switched on; continuing without it"
         return
     fi
     if ((!add_swap)); then return; fi
     say 'Adding a 2 GB swap file (the build needs more memory than this server has free)'
     local ok=0
     # Written out in full rather than preallocated: that works as swap on every file system that allows it.
-    if (umask 077; dd if=/dev/zero of="$swap_file" bs=1M count=2048 status=none) &&
-       chmod 0600 -- "$swap_file" && mkswap --quiet -- "$swap_file" >/dev/null && swapon -- "$swap_file"; then
+    # Prepared under another name, so an interrupted run never leaves a half-written file behind as "the" swap file.
+    if (umask 077; set -o noclobber; : > "$swap_file.rp-new") &&
+       dd if=/dev/zero of="$swap_file.rp-new" bs=1M count=2048 conv=notrunc status=none &&
+       chmod 0600 -- "$swap_file.rp-new" && mkswap --quiet -- "$swap_file.rp-new" >/dev/null &&
+       mv -T -- "$swap_file.rp-new" "$swap_file" && swapon -- "$swap_file"; then
         ok=1
     fi
     if ((!ok)); then
-        rm -f -- "$swap_file"
+        rm -f -- "$swap_file" "$swap_file.rp-new"
         ((ram_kb + swap_kb >= 1800000)) ||
             die 'the swap file could not be switched on (some virtual servers do not allow swap); this server needs about 2 GB of memory including swap'
         note 'the swap file could not be switched on here; continuing without it'
         return
     fi
-    if ! awk -v file="$swap_file" '$1 == file { found = 1 } END { exit !found }' /etc/fstab 2>/dev/null; then
-        # Kept across restarts. To remove it later: swapoff, delete this line, delete the file.
-        [[ ! -s /etc/fstab || -z $(tail -c1 /etc/fstab) ]] || printf '\n' >> /etc/fstab
-        printf '%s none swap sw 0 0\n' "$swap_file" >> /etc/fstab
-    fi
+    swap_in_fstab
     note "$swap_file is active and listed in /etc/fstab"
 }
 
@@ -455,6 +489,7 @@ provision_database() {
     done
     if ((present == 3)); then
         credentials_ok
+        rm -f -- "$db_marker"
         note 'credentials already in place; accounts left as they are'
         return
     fi
@@ -465,7 +500,8 @@ provision_database() {
         note 'discarding incomplete credential files left by an interrupted run (the database is still empty)'
         rm -f -- "$conf/secrets/database_url" "$conf/secrets/migrator_database_url" "$conf/secrets/backup_database_url"
     fi
-    # Accounts with these names are only ever replaced when this installer created them itself.
+    # Accounts with these names are only ever replaced while this installer is in the middle of creating
+    # them: the marker exists from just before the accounts are made until their credentials are saved.
     existing=$(mysql_root --execute="SELECT COUNT(*) FROM mysql.user WHERE user IN ('$db_app', '$db_migrator', '$db_backup')")
     if [[ $existing != 0 && ! -e $db_marker ]]; then
         die "MySQL already has an account named $db_app, $db_migrator or $db_backup that this installer did not create; remove or rename it first"
@@ -503,6 +539,7 @@ SQL
     write_dsn database_url "$db_app" "$app_pw"
     unset app_pw migrator_pw backup_pw
     credentials_ok
+    rm -f -- "$db_marker"
 }
 
 prepare_nginx() {
@@ -648,35 +685,68 @@ generate_password() {
     printf '%s-%s-%s-%s' "${out:0:5}" "${out:5:5}" "${out:10:5}" "${out:15:5}"
 }
 
-prepare_admin() {
-    if [[ -e $admin_marker ]]; then return; fi
-    if [[ -s $pending_password && -s $pending_email && -s $credentials ]]; then
-        # An earlier run stopped after preparing the account. Its details are kept so that the saved
-        # sign-in stays correct whether or not the account had already been created.
-        admin_email=$(<"$pending_email")
-        note "continuing with the administrator prepared by an earlier run ($admin_email)"
-        return
-    fi
-    # A new password: no earlier attempt can have created an account with it.
-    rm -f -- "$attempt_marker"
-    rm -f -- "$pending_password" "$pending_email"
-    local password
-    password=$(generate_password)
-    [[ $password =~ ^([bcdfghjkmnpqrstvwxyz23456789]{5}-){3}[bcdfghjkmnpqrstvwxyz23456789]{5}$ ]] || die 'random source failed'
-    # Saved before the account exists, so an interruption can never leave an account whose password is lost.
-    printf '%s\n' "$password" > "$pending_password"
-    printf '%s\n' "$admin_email" > "$pending_email"
+write_credentials() {  # write_credentials <e-mail> <password>
     printf '%s\n' \
         'ReadyPackets portal: first administrator' \
         '' \
         "  Portal address : https://$origin" \
-        "  Sign-in name   : $admin_email" \
-        "  Password       : $password   (temporary)" \
+        "  Sign-in name   : $1" \
+        "  Password       : $2   (temporary)" \
         '' \
         'At the first sign-in the portal asks for a new password and the enrolment of an authenticator app.' \
         "Delete this file afterwards:  sudo rm $credentials" > "$credentials.rp-new"
     chmod 0600 "$credentials.rp-new"
     mv -fT -- "$credentials.rp-new" "$credentials"
+}
+
+active_admins() {
+    # How many active administrators the database holds (0 before the tables exist).
+    local tables
+    tables=$(mysql_root --execute="SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema' AND table_name = 'users'")
+    if [[ $tables == 0 ]]; then printf '0\n'; return; fi
+    mysql_root --execute="SELECT COUNT(*) FROM \`$schema\`.users WHERE role = 'admin' AND status = 'active'"
+}
+
+prepare_admin() {
+    if [[ -e $admin_marker ]]; then return; fi
+    local password
+    if [[ -s $pending_password && -s $pending_email ]]; then
+        # An earlier run stopped after preparing the account. Its details are kept so that the saved
+        # sign-in stays correct whether or not the account had already been created.
+        admin_email=$(<"$pending_email")
+        if [[ ! -s $credentials ]]; then
+            password=$(<"$pending_password")
+            write_credentials "$admin_email" "$password"
+            unset password
+        fi
+        note "continuing with the administrator prepared by an earlier run ($admin_email)"
+        return
+    fi
+    # The saved password of an attempt that may have created the account is never replaced silently.
+    [[ ! -e $attempt_marker ]] ||
+        die "an earlier run may already have created the first administrator, but its saved password is no longer in $conf.
+If $credentials still exists, it holds that sign-in. To let this script continue (it creates an
+administrator only when the portal has none), remove $attempt_marker and run again."
+    rm -f -- "$pending_password" "$pending_email"
+    local admins
+    admins=$(active_admins)
+    [[ $admins =~ ^[0-9]+$ ]] || die 'the database could not be asked whether an administrator exists'
+    if ((admins > 0)); then
+        # Nothing to create, and no password to generate or show.
+        note 'this database already has an administrator; none is created'
+        printf 'unused\n' > "$conf/initial-admin-outcome"
+        printf 'preexisting\n' > "$admin_marker"
+        return
+    fi
+    # From here on the database is known to have had no administrator when this password was prepared, so
+    # an administrator found by a repeated attempt is the one an interrupted attempt created with it.
+    password=$(generate_password)
+    [[ $password =~ ^([bcdfghjkmnpqrstvwxyz23456789]{5}-){3}[bcdfghjkmnpqrstvwxyz23456789]{5}$ ]] || die 'random source failed'
+    # Saved before the account exists, so an interruption can never leave an account whose password is lost.
+    write_credentials "$admin_email" "$password"
+    printf '%s\n' "$admin_email" > "$pending_email"
+    printf '%s\n' "$password" > "$pending_password.rp-new"
+    mv -fT -- "$pending_password.rp-new" "$pending_password"
     unset password
 }
 
@@ -782,11 +852,12 @@ if [[ -s $conf/initial-admin-outcome ]]; then outcome=$(<"$conf/initial-admin-ou
 # only printed when --print-credentials asks for it; it always stays in the root-only file until deleted.
 if [[ -s $credentials && ! -e $shown_marker ]]; then
     if { : > /dev/tty; } 2>/dev/null; then
+        # Marked first: an interruption here must not lead to a second display. The file stays readable by root.
+        : > "$shown_marker"
         sed 's/^/  /' "$credentials" > /dev/tty
-        : > "$shown_marker"
     elif ((print_credentials)); then
-        sed 's/^/  /' "$credentials"
         : > "$shown_marker"
+        sed 's/^/  /' "$credentials"
     else
         printf '  The first administrator was created. No terminal is attached, so the sign-in details are not\n  printed. Read them as root:  sudo cat %s\n' "$credentials"
     fi

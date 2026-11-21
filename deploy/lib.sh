@@ -7,7 +7,8 @@ set -euo pipefail
 # Never trace: these scripts handle passwords and keys, and a trace would copy them to the terminal or a log.
 set +x
 umask 077
-export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+# A fixed locale as well: the output of several tools is read by these scripts.
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin LC_ALL=C.UTF-8
 
 readonly base=/opt/readypackets conf=/etc/readypackets storage=/var/lib/readypackets/storage
 readonly unit_dir=/etc/systemd/system nginx_dir=/etc/nginx

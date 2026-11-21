@@ -14,6 +14,12 @@ old=$(readlink -f "$base/current")
 [[ "$old" =~ ^"$base"/releases/[0-9a-f]{40}$ ]] || die 'unexpected current release layout'
 [[ "$old" != "$release" ]] || die 'release is already installed'
 [[ -L "$site" ]] || die 'the managed nginx site is required'
+# The web server files are rendered again further down; what they need is checked before anything is stopped.
+grep -qxF "RP_CANONICAL_ORIGIN=https://$origin" "$conf/portal.env" ||
+    die "the environment file and $site_conf name different portal hosts"
+[[ -r "$tls_dir/fullchain.pem" && -r "$tls_dir/privkey.pem" ]] ||
+    die "the web certificate is missing from $tls_dir"
+nginx -t 2>/dev/null || die 'the current web server configuration does not pass "nginx -t"; repair it before upgrading'
 prepare_dirs
 credentials_ok
 secret_ok rp_backup_key
