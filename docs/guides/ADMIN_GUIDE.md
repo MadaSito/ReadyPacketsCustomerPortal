@@ -26,6 +26,7 @@ Server installation, TLS, upgrades and go-live checks are in [Install on Ubuntu 
 - [SIEM forwarding](#siem-forwarding)
 - [Jobs, schedules, mail and maintenance](#jobs-schedules-mail-and-maintenance)
 - [Backups and restore](#backups-and-restore)
+- [Storage copy log](#storage-copy-log)
 - [Portable transfer](#portable-transfer)
 - [Integrations](#integrations)
 - [Production pipeline (Phase I and Phase II webhooks)](#production-pipeline-phase-i-and-phase-ii-webhooks)
@@ -33,6 +34,26 @@ Server installation, TLS, upgrades and go-live checks are in [Install on Ubuntu 
 - [Installing as an app (PWA)](#installing-as-an-app-pwa)
 - [Search engines](#search-engines)
 - [Feature status summary](#feature-status-summary)
+- [Increment 04 operating guides](#increment-04-operating-guides)
+
+## Increment 04 operating guides
+
+Use these chapters alongside the existing console guide. Installing a dependency or configuring a host path does not enable the corresponding portal feature.
+
+- [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
+- [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
+- [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
+- [Application Protection](../../server/modules/protection/ADMIN_GUIDE.md): manage protection policy, offline country lookups and recovery.
+
+## Storage copy log
+
+Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The log tracks attempts to copy order files, off-site backup archives and SharePoint order data. History begins at rollout; it does not reconstruct older attempts.
+
+- **Filter and inspect**: Filter by source kind, destination, state, or a UTC date range. The default is seven days and each search can span up to 90 days. Search by source or destination ID, destination name, correlation ID or safe error code. Open **Details** for the destination, bytes when known, attempt number, timestamps and verification method.
+- **Read the result**: **Written** means the provider accepted the write, not that a separate check confirmed it. **Verified** means a checksum matched or the provider read-back confirmed the result recorded by that integration. **Not written** can mean canceled or no change was needed. An interrupted job without a confirmed outcome is shown as **Failed**; check the provider before assuming nothing was written.
+- **Investigate and retry**: A **Copies failing** signal in System health flags recent recorded failures or unconfirmed outcomes. Search the Audit centre using the correlation ID from **Details**. For an eligible failed backup copy, **Retry backup copy** requires step-up verification and queues a new job; the original remains in the history. For other failed attempts, use the source module's recovery process.
+- **Export**: **Export CSV** downloads up to the 1,000 newest matching attempts and records an audit event. Narrow the date range or other filters if the export is truncated. Handle the file as an operational log; it contains customer-resource and destination identifiers.
 
 ## Step-up verification
 
