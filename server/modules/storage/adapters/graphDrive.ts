@@ -266,8 +266,8 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
             if (r && !(r.status >= 500 || r.status === 429)) throw fromStatus(r.status);
             if (attempt >= CHUNK_ATTEMPTS) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
             // Resume only if the server still expects exactly this chunk.
-            const status = await graph.uploadSessionControl({ url, method: "GET", signal: input.signal }).catch((e: unknown) => {
-              throw toAdapterError(e);
+            const status = await graph.uploadSessionControl({ url, method: "GET", signal: input.signal, beforeSend: fence }).catch((e: unknown) => {
+              throw fenceError ? e : toAdapterError(e);
             });
             const ranges = asRecord(status.body).nextExpectedRanges;
             const next = Array.isArray(ranges) && typeof ranges[0] === "string" ? Number.parseInt(ranges[0], 10) : Number.NaN;
