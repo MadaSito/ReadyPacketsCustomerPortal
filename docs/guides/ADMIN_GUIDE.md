@@ -356,6 +356,23 @@ Both are **off by default**, and both are opt-in per visitor. See [ADR 0011](../
    `/terms` with no query string or fragment (for unauthenticated visitors). Sign-in, account, order, file, message,
    invoice and admin paths are permanently excluded.
 
+## E-mail template centre
+
+Open **Console → Integrations → E-mail templates** (`/admin/email-templates`, requires `mail.manage` and fresh step-up
+confirmation) to customise built-in system notifications or create reusable custom templates (`custom.<slug>`) for
+automations:
+
+- **System vs custom templates:** Every built-in mailer template (`auth.*`, `orders.*`, `compliance.*`, `engagement.*`,
+  `platform.maintenance_window`) can be customised, versioned, and reset to its built-in default at any time while
+  preserving version history. Required variables (such as single-use reset or verification `{{link}}` placeholders) are
+  enforced before publishing in both HTML and plain-text bodies, and sensitive placeholders remain redacted in audit
+  copies and retained message previews.
+- **Safe HTML and mandatory plain text:** HTML templates are sanitised against an explicit server-side allow-list on
+  save and on send, and always include a plain-text alternative (derived automatically from HTML or edited manually).
+- **Inert preview & Send test to me:** Preview renders sample variables inside a sandboxed structure-only frame with no
+  scripts, outbound links, or external image requests. **Send test to me** queues a `[TEST]`-prefixed message addressed
+  solely to the signed-in administrator's own account.
+
 ## Installing as an app (PWA)
 
 The portal ships a web app manifest (`client/public/manifest.webmanifest`, "ReadyPackets Customer Portal") and a
