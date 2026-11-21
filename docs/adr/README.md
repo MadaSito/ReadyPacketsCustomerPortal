@@ -28,10 +28,10 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0021 | Analytics on the portal origin: quarantine and accepted residual | Accepted |
 | 0022 | Offerings matrix is catalog data; Packet 7 is a bundle rule; Packet 8 not loaded | Accepted (owner confirmation requested) |
 | 0023 | Production pipeline webhooks P101 / P201: manual, validated, outbox-delivered, off by default | Accepted |
-| 0024 | Microsoft Entra ID sign-in uses OpenID Connect with explicit account linking | Accepted |
-| 0025 | Mail delivery: two transports, audit copy, stored content, template centre | Accepted |
-| 0026 | Automations: curated triggers, registered actions, recorded runs | Accepted |
-| 0027 | Cloud storage connections are copy destinations; local storage stays the system of record | Accepted |
+| 0024 | Microsoft Entra ID sign-in uses OpenID Connect with explicit account linking | Accepted; owner confirmed 2026-11-21 |
+| 0025 | Mail delivery: two transports, audit copy, stored content, template centre | Accepted; owner confirmed 2026-11-21 |
+| 0026 | Automations: curated triggers, registered actions, recorded runs | Accepted; owner confirmed 2026-11-21 |
+| 0027 | Cloud storage connections are copy destinations; local storage stays the system of record | Accepted; owner confirmed 2026-11-21 |
 | 0028 | Order workflow designer edits drafts; publishing creates a version | Accepted |
 | 0029 | Workflow phases lock on exit; uploads and acknowledgements are requirements on a status | Accepted (owner confirmation requested) |
 | 0030 | Audio is recorded in the browser and converted to WebM by a sandboxed worker job | Accepted (owner confirmation requested) |
