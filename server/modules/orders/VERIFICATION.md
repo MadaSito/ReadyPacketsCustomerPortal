@@ -69,3 +69,23 @@ Evidence classes: **automated-test** (a named test asserts it), **manual-check**
 
 - The one-connection pool test only covers this module's own SQL. Audit, settings and mailer are in-memory fakes, so it cannot catch a second connection used through those adapters. The code passes `tx` to every settings read and high-impact `audit.record` inside a transaction. Denials raised while the caller holds a transaction are queued as a durable `audit.record` and not awaited (otherwise a one-slot pool would deadlock). Such a denial can be lost if the process exits before the write.
 - Actor re-validation runs against a test fake of `identity.sessions.assertCurrent`; it is exercised against the real identity module only in the integration suite (not owned here).
+
+## Increment 03 — workflow designer
+
+Server tests use a test database with fake identity, audit, files and engagement adapters (not the real identity module). Counts are as run by orders_engineer at commits bc092eb, e19a222 and 039ce05, one file at a time.
+
+| Requirement | Evidence | Where |
+| --- | --- | --- |
+| Validation with precise messages and field paths (standard clean, blank explained, every problem reported, unreachable/no-notice warnings, no path to finish) | automated-test | server/modules/orders/workflowDesigner.test.ts (16 tests) |
+| Only admins with `workflows.manage` reach the designer; customers/staff refused; unauthenticated refused | automated-test | workflowDesigner.test.ts › "customers and staff cannot reach the designer…" |
+| Save invalid work in progress, refuse to publish it, publish a NEW version with fresh step-up; existing orders keep their version | automated-test | workflowDesigner.test.ts › "drafts an edit, saves invalid work in progress…" |
+| Concurrent publish: draft refused after the workflow was published again; stale discard refused | automated-test | workflowDesigner.test.ts › "refuses to publish a draft whose workflow was published again…" |
+| Explicit standard install (step-up, audited, idempotent) | automated-test | workflowDesigner.test.ts › "installs the standard workflow explicitly…" |
+| Legacy direct create/publish not mounted; internal paths need step-up and designer validation | automated-test | workflowDesigner.test.ts › "legacy direct create/publish are not mounted…" |
+| Change listener in-tx (throw aborts), sync view, order ref, keyset id listing, automation trigger context | automated-test | workflowDesigner.test.ts |
+| Existing order behaviour unchanged | automated-test | server/modules/orders/orders.test.ts (35 tests) |
+| Workflows page (install standard, list, drafts, edit-as-copy, new workflow dialog), wizard (step blocking from server issues, all steps, publish payload), conflict message, canvas (form-based add transition, side panel edit, same draft as wizard), versions list, read-only version view; axe on each | automated-test (jsdom + axe; colour contrast not evaluable) | client/src/features/orders/pages/workflows/workflows.test.tsx (8 tests); client/src/features/orders/orders.test.tsx (29 tests) |
+| Canvas "Tidy layout" action (left-to-right arrangement) | automated-test (owned by ui_foundation) | client/src/ui/flow/types.ts `arrangeFlow`; client/src/ui/flow/arrange.test.ts |
+| Wizard + canvas + publish (new version; existing orders keep theirs) in a real browser | manual check by the lead on the preview build | — |
+
+Not verified here: the real identity module's step-up and actor re-validation (integration suite); assistive-technology use and 320–1920 px layouts beyond the lead's browser check; drag interactions on the canvas (jsdom tests use keyboard/form alternatives); behaviour under real concurrent connections (tests are sequential).
