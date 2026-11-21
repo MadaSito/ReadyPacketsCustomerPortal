@@ -104,7 +104,7 @@ Abbreviated paths: `id/` = `server/modules/identity/`, `as/` = `server/modules/a
 | MP-3.18 | Identifier changes "reserve retired references"; reassignment "transactional and revoke inappropriate prior access" | orders, identity | `or/orderService.ts` `changeReference`, `reassign` | `or/orders.test.ts` "retired references are reserved forever", "moves ownership, revokes every grant, rebinds files, audits, and is idempotent", "audit failure ⇒ nothing moved…"; `id/identity.test.ts` "reference change: permanent reservation of retired values…" [db] | Verified by automated test |
 | MP-3.19 | Password administration: reset link, generated temporary, admin-entered temporary; same policy, step-up, forced change, revocation, secret-free audit | assurance | `as/` admin credential modes (ADR 0004) | `as/assurance.test.ts` "keeps sessions and password unchanged on invalid temporary input or failed audit", "refuses email reset while SMTP is unavailable…" [db] | Verified by automated test ("clear from UI memory" not tested in a browser) |
 | MP-3.20 | Platform setup wizard/versioned import, preview/diff, config export "nonsecret by default"; config files are data only | platform | `pl/configTransfer.ts`, `pl/settingsStore.ts` | `pl/configTransfer.example.test.ts` (8) [db]; REVIEW-platform P5 closed ("default secret export is now opt-in") | Verified by automated test (an accessible wizard UI is only partly present; `platform.test.tsx` covers settings screens) |
-| MP-3.21 | Integration discovery, SharePoint site discovery | integrations | `in/` (SharePoint disabled scaffold) | `in/integrations.test.ts` "keeps SAML SSO & SharePoint strictly disabled scaffolds…" | Not implemented — SharePoint is a disabled scaffold |
+| MP-3.21 | Integration discovery, SharePoint site discovery | integrations | `in/` (SharePoint disabled scaffold) | `in/integrations.test.ts` "keeps SAML SSO & SharePoint strictly disabled scaffolds…" | Partially implemented — increment 03: SharePoint library connection, site list discovery and order sync exist (INC03-7, INC03-8); tested against local Graph fakes only, never a real tenant |
 
 ## MASTER_PROMPT §4 — Technical architecture
 
@@ -129,7 +129,7 @@ Abbreviated paths: `id/` = `server/modules/identity/`, `as/` = `server/modules/a
 | MP-5.6 | Revocable sessions, idle/absolute lifetimes, rotation on login/privilege/password change, fresh step-up | identity, assurance | `id/sessions.ts` | `id/identity.test.ts` "rejects malformed, unknown, revoked, idle and absolute-expired sessions", "rotation invalidates the previous token…", "requires the current password, revokes other sessions and rotates the current one" [db] | Verified by automated test |
 | MP-5.7 | "Do not store browser bearer credentials in local storage" | client | `cl/lib/sessionTransport.ts` | `tests/http/sessionTransport.test.ts` "holds preview credentials in memory, sends no ambient credentials…" [jsdom] | Verified by automated test (preview profile holds header token in memory by design, ADR 0002) |
 | MP-5.8 | Single account-transition service; remediation sessions cannot see data; no MFA bypass via reset/batching/direct calls | identity | `id/transitions.ts`, `server/trpc/` guards | `id/pure.test.ts` "completing the head step re-derives the next one until none remain (every starting state)"; `tests/foundation.test.ts` "denies anonymous and remediation sessions…"; `or/orders.test.ts` "remediation session is refused even for the owner"; `tests/http/app.test.ts` "rejects excessive batches…" [db] | Verified by automated test |
-| MP-5.9 | Enterprise SAML/Entra optional, disabled until configured, with full validation | identity, integrations | Disabled scaffold `in/` | `in/integrations.test.ts` "keeps SAML SSO … strictly disabled scaffolds…" | Not implemented — scaffold only (disabled, which is the required default) |
+| MP-5.9 | Enterprise SAML/Entra optional, disabled until configured, with full validation | identity, integrations | Disabled scaffold `in/` | `in/integrations.test.ts` "keeps SAML SSO … strictly disabled scaffolds…" | Partially implemented — increment 03: Entra ID OpenID Connect sign-in, disabled until configured (INC03-6); SAML is not implemented; tested against a local identity-provider fake only |
 | MP-5.10 | Authorization on every list/detail/search/share/export/upload/download/workflow/admin/background task; reject IDOR, mass assignment, stale grants, cross-order uploads, edits on read-only imports | all | `or/policy.ts`, `fi/`, strict Zod schemas | `or/orders.test.ts` "tampered / malformed / unknown identifiers are indistinguishable NOT_FOUND", "locking re-check sees a revocation committed after the caller's REPEATABLE READ snapshot", "imports read-only…"; `id/identity.test.ts` "rejects unknown input keys (strict schemas)"; `fi/files.test.ts` "binds owner and current order stage before and after a streamed upload"; `journey-admin.test.ts` "no staff/admin-guarded procedure accepts a full customer session or an anonymous caller"; `bk/backup.test.ts` "enforces negative authorization matrix on tRPC router…" [db] | Verified by automated test for orders, files, identity and backup; other modules per their `VERIFICATION.md` |
 | MP-5.11 | Last-admin invariant and actor re-validation for privilege changes | identity | `id/admin.ts` | `id/identity.test.ts` "two admins demoting each other concurrently: exactly one succeeds…", "last-admin protection and self-change refusal" [db] | Verified by automated test |
 | MP-5.12 | Uniform registration / sign-in / reset responses (no enumeration) | identity | `id/auth.ts` | `id/identity.test.ts` "existing address: same response shape, no link…", "uniform error for unknown account, wrong password…", "public response is identical for known, unknown and ineligible accounts…" [db]; `cl/app/review.test.tsx` "never renders a preview verification link…" [jsdom] | Partially implemented — response shapes verified; ID-04 open in part (registration still performs different DB/outbox work per branch; timing uniformity not measured) |
@@ -176,7 +176,7 @@ Abbreviated paths: `id/` = `server/modules/identity/`, `as/` = `server/modules/a
 | ID | Requirement (short quote) | Owner | Implementation | Evidence | Status |
 | --- | --- | --- | --- | --- | --- |
 | MP-8.1 | Consistent full backups (DB, objects, config evidence, key custody refs); "Never silently fall back to plaintext" | backup | `bk/`; `docs/operations/BACKUP_AND_RESTORE.md` | `bk/backup.test.ts` "refuses backup fail-closed when encryption key is missing, weak, or stored in a world-readable file", "completes real mysqldump + object backup, byte-level verify, isolated restore…" [db] | Verified by automated test — the review High findings at `1104eb0` (TLS bypass, snapshot boundary, continuity, offline restore, installer env) are reported fixed in `bk/VERIFICATION.md` but not independently re-reviewed |
-| MP-8.2 | Off-host + immutable/offline copies, separate key custody, RPO/RTO measured by isolated restores | backup, ops | Key tooling `scripts/ops/keys/` | `scripts/ops/keys/lib.test.ts` (4) [unit] | Not implemented — no off-host/immutable copy mechanism, no RPO/RTO definition or drill |
+| MP-8.2 | Off-host + immutable/offline copies, separate key custody, RPO/RTO measured by isolated restores | backup, ops | Key tooling `scripts/ops/keys/` | `scripts/ops/keys/lib.test.ts` (4) [unit] | Partially implemented — increment 03: off-host copies of verified backups and a 3-2-1 status (INC03-9); immutability is left to the storage provider; no RPO/RTO definition or drill |
 | MP-8.3 | No restore over a populated target; exact confirmation | backup | `bk/` restore; `bk/offlineRestore.ts`; `scripts/ops/restore/` | `bk/backup.test.ts` "refuses live database target, live credential reuse, over-broad grants, non-empty target database, overlapping storage dir, and wrong confirmation phrase" [db] | Verified by automated test (owner fixes not independently re-reviewed; see MP-8.1) |
 | MP-8.4 | Security-state continuity (never rewind spent MFA codes, tokens, revocations) | backup | `bk/continuity.ts` | `bk/backup.test.ts` "…isolated restore, and §7.3 security-state continuity" [db] | Verified by automated test (owner fix for HIGH-5 credential/revocation continuity not independently re-reviewed) |
 | MP-8.5 | Tampered/corrupt archive detection before touching targets | backup | `bk/` | `bk/backup.test.ts` "detects header bit-flips, ciphertext tampering, truncation, trailing bytes, and wrong keys before touching restore targets" [db] | Verified by automated test |
@@ -246,19 +246,39 @@ here when they report. Prices and offerings are data (`data/catalog/…`), never
 | INC02-B3 | `getProductionScope` in the caller's transaction; idempotent audited offerings import that never deletes | orders | `or/orderService.ts`, `or/catalog.ts` (`upsertFromOfferings`) | `or/packets.test.ts` "quotes the bundle hint…" (scope), "upsertFromOfferings is idempotent…", "admin bundle rule edit…" [db] | Verified by automated test — the ops script itself (`scripts/ops/catalog-import.ts`) is section A |
 | INC02-B4 | Admin catalog edits packet fields and the bundle rule; order detail shows tier, outcome, timeline, deliverables and subtotal/discount/total | orders | `cl/features/orders/pages/AdminCatalogPage.tsx`, `OrderDetailView.tsx`, `NewOrderPage.tsx` | `cl/features/orders/orders.test.tsx` "admin catalog shows packet groups and tiers…", "order detail shows tier, outcome…" [jsdom + axe] | Verified by automated test (jsdom only; no browser check recorded yet) |
 
+## Increment 03 — administration and integrations
+
+Source: `docs/engineering/INCREMENT_03_CONTRACT.md`, owner prompts 10 and 11 (`docs/session-logs/2026-11-21-session-01.md`).
+Evidence class [db]/[unit]/[jsdom] is the owning engineer's test file, run by the integrator as part of the full
+suite; [browser] is the integrator's own pass recorded in `docs/application-context/STATUS.md`. No row has been
+exercised against a real external service.
+
+| ID | Requirement (short quote) | Owner | Implementation | Evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| INC03-1 | "integrations to Sharepoint to sync order data or cloud data storage connections … Amazon S3, Wasabi S3, dropbox, Azure Blob, Backblaze, google drive, or Microsoft OneDrive" | storage, sharepoint | `server/modules/storage`, `server/modules/sharepoint`, `cl/features/storage` | module tests [db, local fakes]; `cl/features/storage/storage.test.tsx` [jsdom]; [browser] page, wizard with nine providers, failed test keeps a connection disabled | Verified by automated test — local fakes only; no real provider |
+| INC03-2 | "a wizard and canvas option to configure the order workflow" | orders | `server/modules/orders` (drafts, versions), `cl/features/orders/pages/workflows`, `cl/ui/flow` | orders module tests [db]; `workflows.test.tsx` [jsdom]; `cl/ui/flow/arrange.test.ts` [unit]; [browser] wizard, canvas, publish to version 2 | Verified by automated test |
+| INC03-3 | "view the message that was sent … BCC email address for all mail … set the outbound email address" | jobs (mail) | `server/modules/jobs/mail*.ts`, `cl/features/mail`, `cl/features/jobs/pages/MailPage.tsx` | `server/modules/jobs/jobs.test.ts` [db]; `cl/features/mail` tests [jsdom]; [browser] sender, audit mailbox and retention settings saved; "View message" itself not run in a browser | Verified by automated test — viewing needs retention turned on and covers later mail only |
+| INC03-4 | "Email via Microsoft Graph API in addition to SMTP with … a primary option and secondary" | integrations, jobs | `server/modules/integrations/graph`, mail routing | `graph.test.ts` [local fake]; `jobs.test.ts` routing and failover cases [db]; [browser] Graph tab and routing form | Verified by automated test — no real Microsoft 365 tenant |
+| INC03-5 | "an easy interface to enter the settings in addition to entering the json configuration" | platform | `cl/features/platform` (generated forms) | `platform.test.tsx` [jsdom]; [browser] Form and JSON tabs, value saved through the form | Verified by automated test |
+| INC03-6 | "email template center … rich html format or text format … triggered based on automation events" | mailTemplates | `server/modules/mailTemplates`, `cl/features/mailTemplates`, `cl/ui` RichTextEditor | module tests [db]/[unit]; `richtext.test.tsx` [jsdom]; [browser] 17 system templates, create, sanitizer refusals, preview, publish | Verified by automated test |
+| INC03-7 | "Enable Microsoft Entra ID SSO … add a Sign-in with SSO button to the login page" | identity | `server/modules/identity/sso`, `cl/features/identity/sso`, `cl/ui` SsoButton | `sso.test.ts` [db, local identity-provider fake]; `sso.test.tsx` [jsdom]; [browser, development profile] configure, enable, button shown, redirect to Microsoft with state / nonce / PKCE, forged callback refused | Verified by automated test — no completed sign-in against a real tenant |
+| INC03-8 | "an events automation trigger center where automations can be built by a wizard or on a blank canvas" | automations | `server/modules/automations`, `cl/features/automations` | `automations.test.ts` [db]; `automations.test.tsx` [jsdom]; [browser] recipes, wizard, canvas, test run, engine switch | Verified by automated test |
+| INC03-9 | "off system backups to cloud storage … 3-2-1 advance backup strategy" | backup | `server/modules/backup` (off-site copies, 3-2-1 status), `cl/features/backup` | backup module tests [db, local fakes]; [browser] page and "not met" status with no destinations | Verified by automated test — no copy to a real provider |
+| INC03-10 | Customer ID "RPCUS-Unique 9 characters using 0-9 and A-Z … never … incremental" | identity | `generateCustomerRef()` in `server/modules/identity/users.ts` | `server/modules/identity/pure.test.ts` [unit]; seeded database shows the format | Verified by automated test |
+
 ## Summary
 
-Counts by primary status across all 134 rows above (PI 17, MP 104, ARCH 9, INC02 4), computed from the Status
-column at refresh:
+Counts by primary status across all 144 rows above (PI 17, MP 104, ARCH 9, INC02 4, INC03 10), computed from the
+Status column at refresh:
 
 | Status | Count |
 | --- | --- |
-| Verified by automated test | 78 |
-| Partially implemented | 34 |
+| Verified by automated test | 88 |
+| Partially implemented | 37 |
 | Implemented, not independently verified | 11 |
-| Not implemented | 8 |
+| Not implemented | 5 |
 | Out of scope | 3 |
-| **Total** | **134** |
+| **Total** | **144** |
 
 "Verified by automated test" always means the tagged evidence class (unit, db, loopback, jsdom), never a
 deployed system. Where an owner fixed a review finding but no independent re-review is recorded, the row says
@@ -267,10 +287,7 @@ so.
 ### Not implemented
 
 - PI-13 GitHub push (no remote configured).
-- MP-3.21 Integration discovery and SharePoint (disabled scaffold).
-- MP-5.9 Enterprise SAML/Entra (disabled scaffold; disabled is the required default).
 - MP-6.11 Remote-folder naming rule.
-- MP-8.2 Off-host/immutable copies, RPO/RTO, restore drills.
 - MP-10.4 Anti-downgrade floor and update verification.
 - MP-11.6 Scans and dynamic testing (defined in `security.yml`, never run).
 - MP-11.8 Go-live gate.
@@ -314,3 +331,6 @@ so.
   recomputed; see "Changes at this refresh".
 - 2026-11-20 — increment 02 §B rows added (orders_engineer, commits `d0129c8`, `3bcfba9`); sections A, C, D, E pending
   their owners.
+- 2026-11-21 — increment 03 rows INC03-1 to INC03-10 added by the integrator; MP-3.21, MP-5.9 and MP-8.2 moved
+  from "Not implemented" to "Partially implemented". Other rows were not re-examined at this refresh (several
+  notes above, such as "CI never run" and "no remote configured", predate the GitHub push and are stale).

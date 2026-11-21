@@ -172,8 +172,8 @@ label; Unicode, length and collision handling); labels are display metadata only
 Server (`server/modules/identity/sso/**`): settings (enabled, tenant id — a single tenant GUID, `common`
 and `organizations` refused —, client id, client secret, button label, allowed e-mail domains, trust Entra
 MFA yes / no, just-in-time provisioning off / customers / staff with an Entra app-role mapping); the
-redirect URI to register is shown, not typed. Flow: `GET /api/auth/sso/start` (state, nonce, PKCE verifier
-bound to a short-lived pre-auth cookie) → Entra → `GET /api/auth/sso/callback` (code exchange, ID-token
+redirect URI to register is shown, not typed. Flow: `GET /api/identity/sso/start` (state, nonce, PKCE verifier
+bound to a short-lived pre-auth cookie) → Entra → `GET /api/identity/sso/callback` (code exchange, ID-token
 validation: signature against the tenant's keys, `iss`, `aud`, `tid`, `exp` / `nbf`, `nonce`; one-time
 use of `state`). Then: linked identity → portal session with `authMethod` recorded; unlinked → refuse with
 a clear page (or provision, if enabled and permitted). Linking: by the signed-in user from Account →
