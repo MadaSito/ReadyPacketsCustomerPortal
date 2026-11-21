@@ -109,7 +109,8 @@ describe("Jobs administration pages", () => {
         generation: 2, purpose: "manual_resend_after_unknown", transport: null, state: "queued", finishedAt: date,
       }] }),
     });
-    await user.click(await screen.findByRole("button", { name: `Resend message ${mailId}` }));
+    const outgoing = await screen.findByRole("table", { name: "Outgoing mail" });
+    await user.click(within(outgoing).getByRole("button", { name: `Resend message ${mailId}` }));
     const dialog = screen.getByRole("alertdialog", { name: "Resend after an unknown outcome?" });
     expect(within(dialog).getByText(/recipient may receive the message twice/i)).toBeVisible();
     expect(resend).not.toHaveBeenCalled();
@@ -117,8 +118,9 @@ describe("Jobs administration pages", () => {
     await user.click(within(dialog).getByRole("button", { name: "Acknowledge risk and queue resend" }));
     expect(await screen.findByText(/it has not been sent/i)).toBeVisible();
     expect(resend).toHaveBeenCalledExactlyOnceWith({ publicId: mailId, expectedGeneration: 1, acknowledgeDuplicateRisk: true });
-    await user.click(screen.getByRole("button", { name: `Attempts for message ${mailId}` }));
-    expect(await screen.findByText("Manual resend after unknown outcome")).toBeVisible();
+    await user.click(within(outgoing).getByRole("button", { name: `Attempts for message ${mailId}` }));
+    const history = await screen.findByRole("table", { name: "Message attempt history" });
+    expect(await within(history).findByText("Manual resend after unknown outcome")).toBeVisible();
   });
 
   it("displays both retained bodies without interpreting HTML or caching the mutation", async () => {
@@ -248,10 +250,12 @@ describe("Jobs administration pages", () => {
     renderConsole(<CustomerMaintenanceBanner />, {
       "jobs.maintenance.customerAccess": () => ({ active: true, message: "<img src=/public>", expectedEnd: date.toISOString() }),
     });
-    const banner = screen.getByRole("status");
-    expect(await within(banner).findByText("<img src=/public>")).toBeVisible();
-    expect(banner.querySelector("img")).toBeNull();
-    expect(banner.querySelector("time")).toHaveAttribute("datetime", date.toISOString());
+    const message = await screen.findByText("<img src=/public>");
+    expect(message).toBeVisible();
+    const banner = message.closest('[role="status"]');
+    expect(banner).not.toBeNull();
+    expect(banner?.querySelector("img")).toBeNull();
+    expect(banner?.querySelector("time")).toHaveAttribute("datetime", date.toISOString());
   });
 
   pageA11y("Maintenance console and customer banner", async () => {
