@@ -186,6 +186,23 @@ describe("sharepoint order sync (local fakes only)", () => {
     await expect(mod.orderSync.backfill(admin)).rejects.toMatchObject({ reasonCode: "SHAREPOINT_SYNC_DISABLED" });
   });
 
+  it("does not dispatch already-staged bulk jobs after the destination scope changes", async () => {
+    await enable();
+    (h.services.orders as unknown as Record<string, unknown>).listOrderPublicIdsForSync = async () => ({ publicIds: [ORDER], nextAfter: null });
+    await mod.orderSync.backfill(admin);
+    expect(await h.jobs.runAll(BACKFILL_JOB)).toEqual([{ outcome: "completed", safeCounts: { enqueued: 1 } }]);
+    expect((await mod.orderSync.get(admin)).backfill).toMatchObject({ state: "completed", enqueued: 1 });
+    const writes = graph.calls.filter((c) => c.method !== "GET").length;
+    destinationVersion += 1; // administrator re-points the destination before the bulk jobs drain
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" }]);
+    expect(items().size).toBe(0);
+    expect(graph.calls.filter((c) => c.method !== "GET")).toHaveLength(writes);
+    expect((await db.db.select().from(sharepointOrderSync))[0]).toMatchObject({ state: "failed", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED", claimToken: null });
+    // An ordinary order change afterwards follows the current settings.
+    await changeOrder();
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { created: 1 } }]);
+  });
+
   it("backfills existing orders in resumable bounded batches without duplicating list items", async () => {
     const all = [ORDER, "01JORDER000000000000000002", "01JORDER000000000000000003", "01JORDER000000000000000004", "01JORDER000000000000000005"];
     await expect(mod.orderSync.backfill(admin)).rejects.toMatchObject({ reasonCode: "SHAREPOINT_SYNC_DISABLED" });

@@ -45,6 +45,8 @@ const CLAIM_MS = 10 * 60 * 1000;
 
 export interface SyncJobPayload {
   orderPublicId: string;
+  /** Set for bulk (backfill) work: the authorized scope; the job is cancelled if the live scope differs. */
+  backfillScope?: string;
 }
 
 export interface OrderSyncSettingsView {
@@ -121,7 +123,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
   const assignedConnection = async (handle?: DbOrTx) => (await assignedDestination(handle))?.connectionPublicId ?? null;
 
   /** Bumps the desired version and enqueues one job per (order, version), in the caller's transaction. */
-  async function stage(orderPublicId: string, tx: Tx, options: { correlationId?: string; idempotencyKey?: string } = {}): Promise<boolean> {
+  async function stage(orderPublicId: string, tx: Tx, options: { correlationId?: string; idempotencyKey?: string; backfillScope?: string } = {}): Promise<boolean> {
     await tx
       .insert(sharepointOrderSync)
       .values({ orderPublicId, desiredVersion: 1, state: "pending" })
@@ -129,7 +131,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     const [row] = await tx.select({ v: sharepointOrderSync.desiredVersion }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
     await jobs.enqueue<SyncJobPayload>(
       SYNC_JOB,
-      { orderPublicId },
+      { orderPublicId, ...(options.backfillScope ? { backfillScope: options.backfillScope } : {}) },
       { idempotencyKey: options.idempotencyKey ?? `sharepoint:order:${orderPublicId}:v${row?.v ?? 1}`, ...(options.correlationId ? { correlationId: options.correlationId } : {}), maxAttempts: 6 },
       tx,
     );
@@ -153,7 +155,8 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     if (latestVersion <= targetVersion) return;
     await jobs.enqueue<SyncJobPayload>(
       SYNC_JOB,
-      { orderPublicId },
+      // Bulk work stays bound to its authorized scope; ordinary change dispatch follows current settings.
+      { orderPublicId, ...(job.payload.backfillScope ? { backfillScope: job.payload.backfillScope } : {}) },
       { idempotencyKey: `sharepoint:order:${orderPublicId}:v${latestVersion}:after:${job.jobId}`, correlationId: job.correlationId, maxAttempts: 6 },
       tx,
     );
@@ -218,11 +221,17 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
     const destination = await assignedDestination(db);
     if (!destination) {
-      await markFailure(orderPublicId, "SHAREPOINT_NOT_CONFIGURED", "failed", job, claimToken);
+      await markFailure(orderPublicId, "SHAREPOINT_NOT_CONFIGURED", "failed", job, claimToken, targetVersion);
       return { outcome: "failed", reasonCode: "SHAREPOINT_NOT_CONFIGURED", retryable: false };
     }
 
     const { connectionPublicId, destinationVersion } = destination;
+    // Bulk work: the settings revision and destination this run will use (pinned below by beforeWrite)
+    // must equal the scope the administrator authorized.
+    if (job.payload.backfillScope !== undefined && job.payload.backfillScope !== `${settingsVersion}:${connectionPublicId}:${destinationVersion}`) {
+      await markFailure(orderPublicId, "SHAREPOINT_BACKFILL_SCOPE_CHANGED", "failed", job, claimToken, targetVersion);
+      return { outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" };
+    }
     try {
       const readProvider = () => deps.services.storageConnections.readAssignedProvider({ purpose: "order_data", connectionPublicId, kind: "sharepoint", assertStillOwned: job.assertStillOwned });
       const provider = await readProvider();
@@ -233,7 +242,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
       const order = await deps.services.orders.getOrderSyncView(orderPublicId);
       if (!order) {
-        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken);
+        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken, targetVersion);
         return { outcome: "failed", reasonCode: "SHAREPOINT_ORDER_NOT_FOUND", retryable: false };
       }
       const owner = await deps.services.identity.getUser(order.ownerUserId);
@@ -496,7 +505,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
         await finish("failed", "SHAREPOINT_BACKFILL_SCOPE_CHANGED", tx);
         return { outcome: "canceled" as const, reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" };
       }
-      for (const id of ids) await stage(id, tx, { correlationId: job.correlationId });
+      for (const id of ids) await stage(id, tx, { correlationId: job.correlationId, backfillScope: locked.backfillScope });
       const last = ids[ids.length - 1] ?? cursor;
       const done = page.nextAfter === null || ids.length === 0;
       await tx

@@ -43,3 +43,4 @@ These tests run in `sharepoint.test.ts` against a fake orders listing and FakeGr
 The tests use a fake of the orders module's `listOrderPublicIdsForSync` (commit 039ce05). They don't run against the real implementation.
 - "a retryable failure on the final attempt still dispatches a newer staged version".
 - "cancels a backfill when its settings or destination scope changes after a page was read": when the destination generation changes, or the sync is disabled, between the listing and staging, nothing is staged. The run fails with `SCOPE_CHANGED`, and it is not resumed silently.
+- "does not dispatch already-staged bulk jobs after the destination scope changes": a batch completes under scope A and the destination then changes before the jobs drain. The order job is cancelled, nothing is written, and a later ordinary order change syncs normally.
