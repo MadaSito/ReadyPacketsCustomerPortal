@@ -9,5 +9,5 @@ Use **E-mail delivery** (`/admin/email-delivery`) to set the From address, displ
 
 ## Troubleshoot delivery
 
-- **Attempts**: Open **Mail** (`/admin/mail`) to see which transport was used for the primary, secondary and audit copy. Acceptance means the provider took the message, not that it arrived in the inbox. An `unknown` result requires independent reconciliation with the provider; the portal does not resend or fail over on that result.
+- **Attempts**: Open **Mail** (`/admin/mail`) to see which transport was used for the primary, secondary and audit copy. Acceptance means the provider took the message, not that it arrived in the inbox. The portal never automatically resends or fails over after an `unknown` result. Check with the provider first. If the encrypted payload has not expired, a verified administrator can acknowledge the duplicate risk and manually queue a new attempt. History keeps the unknown outcome and shows the separate resend.
 - **View message**: Where redacted content is still available, this action opens the recipient, subject, plain-text body and HTML source. Opening the dialog requires fresh verification and is audited. The HTML source is shown as text, so it cannot run code, open links or load images.

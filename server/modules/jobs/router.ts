@@ -40,7 +40,9 @@ export const jobsRouter = router({
     listMail: read.input(z.strictObject({ ...page, state: z.enum(MAIL_STATES).optional() }))
       .query(({ ctx, input }) => ctx.services.jobAdmin.listMail(ctx.session, input)),
     mailDetail: read.input(idInput).query(({ ctx, input }) => ctx.services.jobAdmin.mailDetail(ctx.session, input.publicId)),
-    resend: manage.input(idInput).mutation(({ ctx, input }) => ctx.services.jobAdmin.resend(ctx.session, input.publicId)),
+    resend: adminProcedure.input(z.strictObject({
+      publicId, acknowledgeDuplicateRisk: z.literal(true).optional(), expectedGeneration: z.number().int().min(1).max(20).optional(),
+    })).mutation(({ ctx, input }) => ctx.services.jobAdmin.resend(ctx.session, input.publicId, input)),
     capture: adminProcedure.use(requireCapability("jobs.mail.capture")).input(idInput)
       // A mutation (POST) keeps captured content out of GET and shared caches.
       .mutation(({ ctx, input }) => ctx.services.jobAdmin.capture(ctx.session, input.publicId)),

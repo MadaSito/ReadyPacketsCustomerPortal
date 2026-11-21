@@ -117,6 +117,13 @@ export const mailTransportAttempts = mysqlTable("mail_transport_attempts", {
   finishedAt: utcDateTime("finished_at"),
 }, (t) => [uniqueIndex("mail_transport_attempts_slot_uq").on(t.mailId, t.generation, t.purpose)]);
 
+export const mailManualResends = mysqlTable("mail_manual_resends", {
+  id: idColumn(),
+  mailId: refColumn("mail_id").notNull().references(() => mailOutbox.id),
+  generation: int("generation", { unsigned: true }).notNull(),
+  queuedAt: utcDateTime("queued_at").notNull(),
+}, (t) => [uniqueIndex("mail_manual_resends_generation_uq").on(t.mailId, t.generation)]);
+
 export const mailAuditVerification = mysqlTable("mail_audit_verification", {
   id: int("id", { unsigned: true }).primaryKey(),
   addressHash: char("address_hash", { length: 64 }).notNull(),

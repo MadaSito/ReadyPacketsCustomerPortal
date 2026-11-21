@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, validation } from "../../core/errors.js";
 import type { Db, SessionPrincipal, Tx } from "../../core/types.js";
+import { registerAutomationTrigger } from "../automations/contracts.js";
 import { customerMaintenance } from "./schema.js";
 
 const POLICY_ID = 1;
@@ -33,6 +34,33 @@ function parseUtc(value: string | null): Date | null {
   }
   return date;
 }
+
+export function customerMaintenanceNotice(attributes: Readonly<Record<string, unknown>>, canonicalOrigin: string) {
+  const asTime = (value: unknown) => typeof value === "string" && utcInstant.safeParse(value).success
+    ? `${value.slice(0, 10)} ${value.slice(11, 19)} UTC` : null;
+  const start = asTime(attributes.starts_at);
+  const end = asTime(attributes.ends_at);
+  return {
+    windowLabel: `${start ?? "Immediate start"} to ${end ?? "no scheduled end"}`,
+    summary: "Customer sign-in, registration and single sign-on may be unavailable during the configured window. Check the portal for current status.",
+    link: new URL("/sign-in", canonicalOrigin).href,
+  };
+}
+
+registerAutomationTrigger({
+  key: "customer_maintenance.configured",
+  entry: {
+    fields: [
+      { key: "windowLabel", label: "Customer maintenance window", type: "string", from: "context" },
+      { key: "summary", label: "Standard maintenance summary", type: "string", from: "context" },
+      { key: "link", label: "Portal sign-in page", type: "string", from: "context" },
+    ],
+  },
+  async resolveContext({ event, services, signal }) {
+    signal.throwIfAborted();
+    return { fields: customerMaintenanceNotice(event.attributes, services.config.canonicalOrigin) };
+  },
+});
 
 function project(row: Policy | undefined, now: Date): CustomerAccessStatus {
   return row?.enabled && (!row.startsAt || row.startsAt <= now) && (!row.endsAt || now < row.endsAt)

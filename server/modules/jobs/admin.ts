@@ -8,7 +8,7 @@ import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { createCustomerMaintenance } from "./customerMaintenance.js";
 import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
 import { engineFor, ensureMaintenanceGate, gateDraining, jobAudit, MAINTENANCE_ID } from "./queue.js";
-import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailOutbox, mailTransportAttempts } from "./schema.js";
+import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 type JobState = (typeof JOB_STATES)[number];
 type MailState = (typeof MAIL_STATES)[number];
@@ -326,7 +326,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
         && !!await mailEngineFor(deps.mailer)?.retentionDays();
       const safe = rows.map(({ hasPayload, contentExpiresAt, ...row }) => ({
         ...row,
-        canResend: hasPayload && ["held", "failed"].includes(row.state) && row.expiresAt > now && row.generation < 20,
+        canResend: hasPayload && ["held", "failed", "unknown"].includes(row.state) && row.expiresAt > now && row.generation < 20,
         canViewCapture: row.state === "captured" && row.expiresAt > now && canReadCaptures,
         canViewContent: canReadContent && !!contentExpiresAt && contentExpiresAt > now,
       }));
@@ -345,17 +345,29 @@ export function createJobsAdmin(deps: ModuleDeps) {
         reasonCode: mailTransportAttempts.reasonCode, startedAt: mailTransportAttempts.startedAt,
         finishedAt: mailTransportAttempts.finishedAt, transport: mailTransportAttempts.transport, purpose: mailTransportAttempts.purpose,
       }).from(mailTransportAttempts).where(eq(mailTransportAttempts.mailId, row.id)).orderBy(desc(mailTransportAttempts.id)).limit(60);
-      const attempts = [...deliveries, ...prior.map((item) => ({ ...item, transport: null, purpose: "legacy" as const }))]
+      const manual = await db.select({ generation: mailManualResends.generation, queuedAt: mailManualResends.queuedAt })
+        .from(mailManualResends).where(eq(mailManualResends.mailId, row.id)).orderBy(desc(mailManualResends.generation)).limit(20);
+      const attempts = [...deliveries, ...prior.map((item) => ({ ...item, transport: null, purpose: "legacy" as const })),
+        ...manual.map(({ generation, queuedAt }) => ({
+          generation, startedAt: queuedAt, finishedAt: queuedAt, transport: null,
+          purpose: "manual_resend_after_unknown" as const, state: "queued" as const, reasonCode: "MAIL_DUPLICATE_RISK_ACKNOWLEDGED",
+        }))]
         .sort((a, b) => b.generation - a.generation || b.startedAt.getTime() - a.startedAt.getTime());
       return { publicId, attempts };
     },
-    async resend(principal: SessionPrincipal | null, publicId: string) {
-      await authorize(principal, "jobs.manage");
+    async resend(principal: SessionPrincipal | null, publicId: string, options: {
+      acknowledgeDuplicateRisk?: true; expectedGeneration?: number;
+    } = {}) {
+      const acknowledged = options.acknowledgeDuplicateRisk === true;
+      await authorize(principal, acknowledged ? "mail.manage" : "jobs.manage");
       await ensureMaintenanceGate(deps);
-      return db.transaction(async (tx) => {
+      const queueResend = async (tx: Tx) => {
         if (await gateDraining(tx)) throw new DomainError("MAINTENANCE", "PORTAL_DRAINING", activeMessage);
-        return mailer().resend(tx, publicId);
-      });
+        return mailer().resend(tx, publicId, {
+          expectedGeneration: options.expectedGeneration, duplicateRiskAcceptedBy: acknowledged ? principal! : undefined,
+        });
+      };
+      return acknowledged ? withCurrentAdminActor(principal, "mail.manage", queueResend) : db.transaction(queueResend);
     },
     async capture(principal: SessionPrincipal | null, publicId: string) {
       await authorize(principal, "jobs.mail.capture");

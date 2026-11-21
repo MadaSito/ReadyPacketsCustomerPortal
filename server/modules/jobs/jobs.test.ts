@@ -8,22 +8,23 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
+import { customerMaintenanceNotice } from "./customerMaintenance.js";
 import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
 import { createJobQueue, createMailer, engineFor } from "./queue.js";
 import { jobsRouter } from "./router.js";
-import { customerMaintenance, jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailOutbox, mailTransportAttempts } from "./schema.js";
+import { customerMaintenance, jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 import { startWorker } from "./worker.js";
 
 let t: TestDb;
 beforeAll(async () => {
-  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, customerMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailAuditVerification, auditEvents } });
+  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, customerMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, auditEvents } });
 });
 afterAll(async () => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, customerMaintenance, auditEvents]) {
+  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, customerMaintenance, auditEvents]) {
     await t.db.delete(table);
   }
 });
@@ -81,6 +82,11 @@ describe("Customer maintenance policy", () => {
     expect(event).toMatchObject({ reasonCode: "CUSTOMER_MAINTENANCE_CONFIGURED",
       attributes: { enabled: true, starts_at: start, ends_at: end } });
     expect(Object.keys(event!.attributes).sort()).toEqual(["enabled", "ends_at", "starts_at"]);
+    expect(customerMaintenanceNotice(event!.attributes, "https://portal.example.test")).toEqual({
+      windowLabel: `${start.slice(0, 10)} ${start.slice(11, 19)} UTC to ${end.slice(0, 10)} ${end.slice(11, 19)} UTC`,
+      summary: expect.stringContaining("Check the portal for current status."),
+      link: "https://portal.example.test/sign-in",
+    });
   });
 
   it("rejects unsafe text and invalid dates, and rechecks the persisted actor and step-up before writing", async () => {
@@ -609,15 +615,54 @@ describe("MySQL transactional mail outbox", () => {
     await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
   });
 
-  it("keeps ambiguous transport outcomes unknown with no payload or resend", async () => {
+  it("requires explicit verified duplicate-risk acceptance and records a new generation with durable original-job evidence", async () => {
+    const f = fixture({}, true);
+    const smtp = setDelivery(f, "unknown");
+    await f.mailer.enqueue(input);
+    await f.engine.execute((await f.engine.claim())!);
+    const [row] = await t.db.select().from(mailOutbox);
+    const id = row!.publicId;
+    const options = { acknowledgeDuplicateRisk: true, expectedGeneration: 1 } as const;
+    expect(row).toMatchObject({ state: "unknown", payloadEnc: expect.any(String), generation: 1 });
+    expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
+    expect((await f.admin.listMail(f.operator, {})).items[0]?.canResend).toBe(true);
+    expect(await f.engine.claim()).toBeNull();
+    await expect(f.admin.resend(f.operator, id)).rejects.toMatchObject({ reasonCode: "MAIL_DUPLICATE_RISK_NOT_ACKNOWLEDGED" });
+    await expect(f.admin.resend(fakePrincipal({ role: "admin" }), id, options)).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    f.assertCurrent.mockRejectedValueOnce(forbidden("SESSION_NOT_CURRENT"));
+    await expect(f.admin.resend(f.operator, id, options)).rejects.toMatchObject({ reasonCode: "SESSION_NOT_CURRENT" });
+    expect(smtp.send).toHaveBeenCalledTimes(1);
+    const { jobId } = await f.admin.resend(f.operator, id, options);
+    expect(jobId).not.toEqual(row!.jobPublicId);
+    expect(smtp.send).toHaveBeenCalledTimes(1);
+    expect((await f.admin.mailDetail(f.operator, id)).attempts).toMatchObject([
+      { purpose: "manual_resend_after_unknown", generation: 2, state: "queued" },
+      { purpose: "primary", generation: 1, state: "unknown" },
+    ]);
+    const [event] = await t.db.select().from(auditEvents).where(eq(auditEvents.eventName, "job.mail.resent_after_unknown"));
+    expect(event).toMatchObject({ actorUserId: f.operator.userId, actorRole: "admin", jobId: row!.jobPublicId,
+      attributes: { resent_job_public_id: jobId, generation: 2 } });
+    await f.engine.execute((await f.engine.claim())!);
+    await expect(f.admin.resend(f.operator, id, options)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_CHANGED" });
+    expect(smtp.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses expired and purged unknown payloads while preserving the original unknown outcome", async () => {
     const f = fixture();
     setDelivery(f, "unknown");
     await f.mailer.enqueue(input);
     await f.engine.execute((await f.engine.claim())!);
     const [row] = await t.db.select().from(mailOutbox);
-    expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
-    expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
-    await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+    const options = { acknowledgeDuplicateRisk: true } as const;
+    f.h.clock.advance(row!.expiresAt.getTime() - f.h.clock.now().getTime());
+    await expect(f.admin.resend({ ...f.operator, stepUpAt: f.h.clock.now() }, row!.publicId, options))
+      .rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+    await f.jobs.enqueue("jobs.mail.expire", {});
+    await f.engine.execute((await f.engine.claim())!);
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({ state: "unknown", payloadEnc: null });
+    expect((await f.admin.listMail(f.operator, {})).items[0]?.canResend).toBe(false);
+    await expect(f.admin.resend({ ...f.operator, stepUpAt: f.h.clock.now() }, row!.publicId, options))
+      .rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
   });
 
   it("preserves automation origin through a failed submission and operator resend, suppressing only those tap events", async () => {
@@ -678,7 +723,7 @@ describe("MySQL transactional mail outbox", () => {
     }
     const [row] = await t.db.select().from(mailOutbox);
     expect(active.job.signal.aborted).toBe(true);
-    expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
+    expect(row).toMatchObject({ state: "unknown", payloadEnc: expect.any(String) });
     expect((await f.admin.mailDetail(f.operator, row!.publicId)).attempts[0]?.state).toBe("unknown");
   });
 
@@ -701,7 +746,8 @@ describe("MySQL transactional mail outbox", () => {
       expect(graph).toHaveBeenCalledTimes(switched ? 1 : 0);
       if (switched) expect(graph).toHaveBeenCalledWith(expect.objectContaining({ sender: configured }));
       const [row] = await t.db.select().from(mailOutbox);
-      expect(row).toMatchObject({ state: primary === "unknown" ? "unknown" : primary === "rejected" && !switched ? "failed" : "accepted", payloadEnc: null });
+      expect(row).toMatchObject({ state: primary === "unknown" ? "unknown" : primary === "rejected" && !switched ? "failed" : "accepted",
+        payloadEnc: primary === "unknown" ? expect.any(String) : null });
       const { attempts } = await f.admin.mailDetail(f.operator, row!.publicId);
       expect(attempts).toHaveLength(switched ? 2 : 1);
       expect(attempts).toContainEqual(expect.objectContaining({
