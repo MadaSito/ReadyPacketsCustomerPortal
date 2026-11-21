@@ -17,7 +17,7 @@ QA_ROUTE_FIXTURES=/private/qa/route-fixtures.json \
 node scripts/qa/a11y-check.mjs
 ```
 
-The same scenario catalogue is available to the responsive runner. Catalogue entries come from the current registry through a jsdom test (including attached order and customer tabs and a missing-route case). Static pages are included automatically under a role that can reach them; the public Accessibility route is checked anonymously and signed in. Staff routes have staff and admin cases. Parameterized routes and transitions require explicit concrete paths, test session state and a selector only visible in the intended fixture. Add cases for additional states, such as a modal open, an empty list, and a populated list. Do not include credentials or private content in selectors, names, fixture filenames or recorded evidence.
+The same scenario catalogue is available to the responsive runner. Catalogue entries come from the current registry through a jsdom test (including attached order and customer tabs and a missing-route case). Static pages are included automatically under a role that can reach them; the public Accessibility route is checked anonymously and signed in. Staff routes have staff and admin cases. Parameterized routes, remediation transitions, and token-dependent reset/verification/activation/SSO completion require explicit concrete paths and a selector only visible in the intended state. Authenticated cases also require the corresponding session. Add cases for additional states, such as a modal open, an empty list, and a populated list. Do not include credentials or private content in selectors, names, fixture filenames or recorded evidence.
 
 ```json
 {
@@ -34,6 +34,7 @@ The same scenario catalogue is available to the responsive runner. Catalogue ent
       { "role": "transition", "storageState": "mfa.state.json", "ready": "input[autocomplete='one-time-code']" }
     ],
     "/account/security": [
+      { "role": "customer", "ready": "[data-testid='seeded-security-card']" },
       { "role": "customer", "heading": "Account security", "steps": [{ "role": "button", "name": "Generate new recovery codes" }], "ready": "[role='alertdialog']" }
     ]
   }

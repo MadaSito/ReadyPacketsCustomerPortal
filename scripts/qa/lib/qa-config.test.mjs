@@ -36,12 +36,13 @@ const inventory = [
   { id: "/accessibility", path: "/accessibility", access: "public", title: "Accessibility" },
   { id: "/orders/:id", path: "/orders/:id", access: "customer", title: "Order" },
   { id: "/mfa", path: "/mfa", access: "transition", title: "MFA" },
+  { id: "/reset-password", path: "/reset-password", access: "public", title: "Reset password" },
 ];
 
 test("route resolution distinguishes missing authenticated/transition states from a pass", () => {
   const { cases, missing } = resolveQaScenarios(inventory);
   assert.deepEqual(cases.map(({ role }) => role), ["anonymous"]);
-  assert.equal(missing.length, 3);
+  assert.equal(missing.length, 4);
   assert.throws(() => resolveQaScenarios(inventory, { cases: { "/not-a-route": [] } }), /unknown route ID/);
 });
 
@@ -51,11 +52,13 @@ test("explicit route fixtures add roles and concrete paths without redirecting t
     cases: {
       "/orders/:id": [{ role: "customer", path: "/orders/example?tab=files", ready: "[data-testid='order-files']" }],
       "/mfa": [{ role: "transition", storageState: "mfa.json", ready: "form" }],
+      "/reset-password": [{ role: "anonymous", path: "/reset-password?token=synthetic", ready: "input[autocomplete=new-password]", storageState: "pre-auth.json" }],
     },
   }, "/tmp/qa");
-  assert.equal(result.cases.length, 4);
+  assert.equal(result.cases.length, 5);
   assert.deepEqual(result.missing, []);
   assert.equal(result.cases[2].storageState, "/tmp/qa/customer.json");
+  assert.equal(result.cases[4].storageState, "/tmp/qa/pre-auth.json");
   for (const rejected of ["//elsewhere.test/orders/id", "/orders/id#different", "/orders/../sign-in", "/\\elsewhere.test/orders/id"]) {
     assert.equal(matchesQaRoute("/orders/:id", rejected), false);
   }

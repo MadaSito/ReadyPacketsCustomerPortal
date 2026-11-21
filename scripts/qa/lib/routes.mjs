@@ -15,6 +15,7 @@ const roles = {
   staff: ["staff", "admin"],
   admin: ["admin"],
 };
+const explicitStates = new Set(["/reset-password", "/activate", "/verify-email", "/sso/complete"]);
 
 export async function qaRouteInventory() {
   const directory = await mkdtemp(join(tmpdir(), "rp-qa-routes-"));
@@ -50,13 +51,14 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
   for (const route of inventory) {
     if (!route.id.includes(filter)) continue;
     const requiredRoles = route.id === "/accessibility" ? ["anonymous", "customer"] : roles[route.access];
+    const needsReady = route.path.includes("/:") || route.access === "transition" || explicitStates.has(route.id);
     if (!requiredRoles) throw new Error(`Unknown QA route access for ${route.id}.`);
     const explicit = overrides[route.id] ?? [];
     if (!Array.isArray(explicit)) throw new Error(`QA fixtures: ${route.id} cases must be an array.`);
     const input = [...explicit];
     for (const role of requiredRoles) {
       if (input.some((item) => item.role === role)) continue;
-      if (route.path.includes("/:") || route.access === "transition") {
+      if (needsReady) {
         missing.push(`${route.id} [${role}]: supply a seeded fixture and readiness selector.`);
       } else input.push({ role });
     }
@@ -75,14 +77,14 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
         missing.push(`${name}: supply a disposable QA storage-state file.`);
         continue;
       }
-      if ((route.path.includes("/:") || route.access === "transition") && !item.ready) {
+      if (needsReady && !item.ready) {
         missing.push(`${name}: supply a readiness selector that only exists in the expected fixture state.`);
         continue;
       }
       cases.push({
         name, path, role: item.role, title: item.title ?? route.title,
         heading: item.heading, ready: item.ready, tab: route.tab, steps: item.steps ?? [],
-        storageState: state && item.role !== "anonymous" ? resolve(directory, state) : undefined,
+        storageState: state ? resolve(directory, state) : undefined,
       });
     }
   }
