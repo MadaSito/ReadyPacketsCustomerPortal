@@ -1,5 +1,6 @@
-ssl_certificate /etc/letsencrypt/live/readypackets-portal/fullchain.pem;
-ssl_certificate_key /etc/letsencrypt/live/readypackets-portal/privkey.pem;
+#@ TEMPLATE (see readypackets-portal.conf.template). @RP_TLS_DIR@ holds fullchain.pem and privkey.pem.
+ssl_certificate @RP_TLS_DIR@/fullchain.pem;
+ssl_certificate_key @RP_TLS_DIR@/privkey.pem;
 
 # Let's Encrypt does not issue OCSP URLs. For an alternate CA with an OCSP responder:
 # ssl_stapling on;

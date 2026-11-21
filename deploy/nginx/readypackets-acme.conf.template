@@ -1,8 +1,9 @@
+#@ TEMPLATE (see readypackets-portal.conf.template).
 # Temporary HTTP-only vhost, used before issuance. Remove once the full site is enabled.
 server {
     listen 80;
     listen [::]:80;
-    server_name my.readypackets.com portal.readypackets.com;
+    server_name @RP_SERVER_NAMES@;
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/readypackets-acme;
         default_type text/plain;

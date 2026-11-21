@@ -2,6 +2,7 @@
 # Deactivation only: deliberately offers no data-purge operation.
 set -euo pipefail
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
 [[ $# == 0 ]] || die 'usage: uninstall.sh'
 lock_deploy

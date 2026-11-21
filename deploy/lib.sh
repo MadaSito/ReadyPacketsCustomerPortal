@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Sourced by deploy entry points, never by the application.
+# The entry point sets deploy_src before sourcing this file; the names defined here are used by the entry points.
+# SC2016: the single-quoted snippets passed to "bash -c" are expanded by that inner shell, on purpose.
+# shellcheck disable=SC2016,SC2034,SC2154
 set -euo pipefail
 umask 077
 export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
@@ -12,7 +15,11 @@ readonly maintenance="$nginx_dir/readypackets-maintenance"
 readonly web=readypackets-portal.service worker=readypackets-worker.service
 readonly timer=readypackets-backup.timer
 readonly node=/usr/local/bin/node pnpm=/usr/local/bin/pnpm
-readonly origin=my.readypackets.com
+readonly site_conf="$conf/site.conf"
+# Site identity: the portal's host name, an optional alias that only redirects to it, and where the web
+# certificate lives. Defaults apply when site.conf is absent; load_site (end of this file) reads it as data.
+origin=my.readypackets.com alias_host=portal.readypackets.com tls_mode=letsencrypt
+tls_dir=/etc/letsencrypt/live/readypackets-portal
 readonly -a app_keys=(rp_data_keyring rp_index_key rp_pseudonym_key rp_token_hash_key rp_audit_chain_key)
 unset NODE_OPTIONS NODE_PATH
 
@@ -27,9 +34,83 @@ lock_deploy() {
     exec 9>/run/lock/readypackets-deploy.lock
     flock -n 9 || die 'an installation, upgrade, or uninstall is already running'
 }
+valid_host() {
+    # Lower-case DNS name with at least two labels; the last label starts with a letter, so bare IPs are refused.
+    [[ ${#1} -le 253 && $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+load_site() {
+    local key value
+    if [[ -e "$site_conf" || -L "$site_conf" ]]; then
+        [[ ! -L "$site_conf" && -f "$site_conf" && $(stat -c '%a:%u:%g' "$site_conf") == 600:0:0 ]] ||
+            die "expected a root-owned 0600 site file: $site_conf"
+        origin='' alias_host='' tls_mode=''
+        while IFS='=' read -r key value || [[ -n "$key" ]]; do
+            case $key in
+                canonical_host) origin=$value ;;
+                alias_host) alias_host=$value ;;
+                tls) tls_mode=$value ;;
+                *) die "unexpected line in $site_conf" ;;
+            esac
+        done < "$site_conf"
+    fi
+    valid_host "$origin" || die "invalid portal host name in $site_conf"
+    [[ -z "$alias_host" ]] || valid_host "$alias_host" || die "invalid alias host name in $site_conf"
+    [[ "$alias_host" != "$origin" ]] || die 'the alias must differ from the portal host name'
+    case $tls_mode in
+        letsencrypt) tls_dir=/etc/letsencrypt/live/readypackets-portal ;;
+        self-signed) tls_dir="$conf/tls" ;;
+        *) die "invalid tls setting in $site_conf" ;;
+    esac
+}
+write_site() {
+    # write_site <host> <alias-or-empty> <letsencrypt|self-signed>. The host name of an installation is fixed
+    # once its environment file exists: sessions, passkeys and links are bound to it.
+    local host=$1 alias=$2 mode=$3 temp installed_alias
+    valid_host "$host" || die "not a valid public host name: $host"
+    [[ -z "$alias" ]] || valid_host "$alias" || die "not a valid alias host name: $alias"
+    [[ "$alias" != "$host" ]] || die 'the alias must differ from the portal host name'
+    [[ "$mode" == letsencrypt || "$mode" == self-signed ]] || die 'the certificate mode must be letsencrypt or self-signed'
+    root_directory /etc 755
+    root_directory "$conf" 700
+    if [[ -e "$conf/portal.env" ]]; then
+        grep -qxF "RP_CANONICAL_ORIGIN=https://$host" "$conf/portal.env" ||
+            die 'this server is already installed under another host name; changing it is not supported by this kit'
+        installed_alias=$(sed -n 's/^RP_ALIAS_HOSTS=//p' "$conf/portal.env")
+        [[ "$installed_alias" == "$alias" ]] ||
+            die "this server is already installed with ${installed_alias:+the alias }${installed_alias:-no alias}; changing that is not supported by this kit"
+    fi
+    temp=$(mktemp "$conf/.site.XXXXXXXX")
+    printf 'canonical_host=%s\nalias_host=%s\ntls=%s\n' "$host" "$alias" "$mode" > "$temp"
+    mv -fT -- "$temp" "$site_conf"
+    load_site
+}
+render_site() {
+    # render_site <template> <destination>: substitutes the site identity into an nginx template.
+    local template=$1 dest=$2 line temp skip=0 names=$origin
+    [[ -z "$alias_host" ]] || names="$origin $alias_host"
+    temp=$(mktemp "$dest.XXXXXXXX")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case $line in
+            '#@alias{') if [[ -z "$alias_host" ]]; then skip=1; fi; continue ;;
+            '#@alias}') skip=0; continue ;;
+            '#@ '*) continue ;;
+        esac
+        if ((skip)); then continue; fi
+        line=${line//@RP_SERVER_NAMES@/$names}
+        line=${line//@RP_HOST@/$origin}
+        line=${line//@RP_ALIAS@/$alias_host}
+        line=${line//@RP_TLS_DIR@/$tls_dir}
+        printf '%s\n' "$line"
+    done < "$template" > "$temp"
+    if grep -q '@RP_[A-Z_]*@\|^#@' "$temp"; then rm -f -- "$temp"; die "unrendered placeholder in $template"; fi
+    chmod 0644 -- "$temp"
+    mv -fT -- "$temp" "$dest"
+}
 check_host() {
-    [[ $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") == ubuntu:24.04 ]] ||
-        die 'this kit supports Ubuntu 24.04 LTS'
+    case $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") in
+        ubuntu:24.04|ubuntu:26.04) ;;
+        *) die 'this kit supports Ubuntu 24.04 LTS and 26.04 LTS' ;;
+    esac
     "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number);process.exit(major===22&&minor>=12?0:1)' ||
         die 'install Node.js 22.12 or later in the Node 22 series at /usr/local/bin/node'
     mysql --version | grep -Eiq '\b(Ver[[:space:]]+8\.4\.|Distrib[[:space:]]+8\.4\.)' ||
@@ -96,7 +177,7 @@ resolve_release() {
     release="$base/releases/$commit"
 }
 build_release() (
-        local reviewed stage= publish= expected entry
+        local reviewed stage='' publish='' expected entry
         reviewed=$(mktemp -d "$base/releases/.reviewed.XXXXXXXX")
         trap 'rm -rf -- "$reviewed"; if [[ -n "$stage" ]]; then rm -rf -- "$stage"; fi; if [[ -n "$publish" ]]; then rm -rf -- "$publish"; fi' EXIT
         git -C "$repo" cat-file -e "$commit:migrations/meta/_journal.json" 2>/dev/null ||
@@ -112,9 +193,10 @@ build_release() (
             die 'reviewed release archive is incomplete'
         if [[ -e "$release" || -L "$release" ]]; then
             "$node" "$deploy_src/prepare-release.mjs" check "$commit" "$release"
-            cmp -s -- "$reviewed/package.json" "$release/package.json" &&
-                diff -qr -- "$reviewed/migrations" "$release/migrations" >/dev/null ||
+            if ! { cmp -s -- "$reviewed/package.json" "$release/package.json" &&
+                   diff -qr -- "$reviewed/migrations" "$release/migrations" >/dev/null; }; then
                 die 'existing release metadata or migrations differ from reviewed inputs'
+            fi
             exit 0
         fi
         stage=$(mktemp -d "$base/releases/.build.XXXXXXXX")
@@ -185,14 +267,19 @@ write_env() {
     local id
     if [[ ! -e "$conf/portal.env" && ! -L "$conf/portal.env" ]]; then
         id="rp-$(openssl rand -hex 12)"
-        printf '%s\n' NODE_ENV=production RP_DEPLOYMENT_PROFILE=production HOST=127.0.0.1 PORT=5000 \
-            RP_CANONICAL_ORIGIN=https://my.readypackets.com RP_ALIAS_HOSTS=portal.readypackets.com \
-            RP_TRUSTED_PROXIES=127.0.0.1 RP_LOG_LEVEL=info RP_SERVICE_NAME=readypackets \
-            "RP_INSTALLATION_ID=$id" "RP_STORAGE_DIR=$storage" \
-            "RP_STATIC_DIR=$base/current/dist/public" > "$conf/portal.env"
+        {
+            printf '%s\n' NODE_ENV=production RP_DEPLOYMENT_PROFILE=production HOST=127.0.0.1 PORT=5000 \
+                "RP_CANONICAL_ORIGIN=https://$origin"
+            if [[ -n "$alias_host" ]]; then printf 'RP_ALIAS_HOSTS=%s\n' "$alias_host"; fi
+            printf '%s\n' RP_TRUSTED_PROXIES=127.0.0.1 RP_LOG_LEVEL=info RP_SERVICE_NAME=readypackets \
+                "RP_INSTALLATION_ID=$id" "RP_STORAGE_DIR=$storage" \
+                "RP_STATIC_DIR=$base/current/dist/public"
+        } > "$conf/portal.env"
     fi
     [[ ! -L "$conf/portal.env" && -f "$conf/portal.env" && $(stat -c '%a:%u:%g' "$conf/portal.env") == 600:0:0 ]] ||
         die "expected a root-owned 0600 environment file: $conf/portal.env"
+    grep -qxF "RP_CANONICAL_ORIGIN=https://$origin" "$conf/portal.env" ||
+        die "the environment file and $site_conf name different portal hosts"
 }
 migrate_release() {
     local target=$1
@@ -207,17 +294,19 @@ migrate_release() {
         /bin/bash -c 'export DATABASE_URL_FILE="$CREDENTIALS_DIRECTORY/migrator_database_url"; exec "$@"' \
         bash "$node" "$target/dist/ops/migrate.js"
 }
-bootstrap_admin() {
-    local email name key
+ops_run() {
+    # ops_run <--pty|--pipe> <command> [args...]: runs an operator tool of the active release as the
+    # unprivileged service account, in the same sandbox and with the same credentials as the web service.
+    local io=$1 key
+    shift
     local -a creds=("--property=LoadCredential=database_url:$conf/secrets/database_url")
-    read -r -p 'First administrator email: ' email </dev/tty
-    read -r -p 'First administrator full name: ' name </dev/tty
     for key in "${app_keys[@]}"; do creds+=("--property=LoadCredential=$key:$conf/secrets/$key"); done
-    systemd-run --wait --collect --pty --service-type=exec \
+    systemd-run --wait --collect --quiet "$io" --service-type=exec \
         --property=User=readypackets --property=Group=readypackets --property=UMask=0077 \
         --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes \
         --property=PrivateTmp=yes --property=PrivateDevices=yes --property=CapabilityBoundingSet= \
         --property="ReadWritePaths=$storage" --property="EnvironmentFile=$conf/portal.env" \
+        --property="EnvironmentFile=$base/current/release.env" \
         "${creds[@]}" --working-directory="$base/current" --setenv=RP_ROLE=web \
         /bin/bash -c '
             export DATABASE_URL_FILE="$CREDENTIALS_DIRECTORY/database_url"
@@ -226,8 +315,33 @@ bootstrap_admin() {
             export RP_PSEUDONYM_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_pseudonym_key"
             export RP_TOKEN_HASH_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_token_hash_key"
             export RP_AUDIT_CHAIN_KEY_FILE="$CREDENTIALS_DIRECTORY/rp_audit_chain_key"
-            exec /usr/local/bin/node dist/ops/create-admin.js "$@"
-        ' bash --email "$email" --name "$name" </dev/tty
+            exec "$@"
+        ' bash "$@"
+}
+bootstrap_admin() {
+    local email name
+    read -r -p 'First administrator email: ' email </dev/tty
+    read -r -p 'First administrator full name: ' name </dev/tty
+    ops_run --pty /usr/local/bin/node dist/ops/create-admin.js --email "$email" --name "$name" </dev/tty
+}
+bootstrap_admin_unattended() {
+    # bootstrap_admin_unattended <email> <name> <password-file>. The password travels on standard input into a
+    # file in the unit's private temporary directory, readable only by the service account, and is removed
+    # before the unit exits. It never appears in a command line, the environment or a log.
+    local email=$1 name=$2 file=$3
+    [[ ! -L "$file" && -f "$file" && -s "$file" && $(stat -c '%a:%u:%g' "$file") == 600:0:0 ]] ||
+        die 'the administrator password file must be a root-owned 0600 regular file'
+    ops_run --pipe /bin/bash -c '
+        umask 077
+        file=$(mktemp "${TMPDIR:-/tmp}/rp-bootstrap.XXXXXXXX") || exit 1
+        trap "rm -f -- \"\$file\"" EXIT
+        cat > "$file" || exit 1
+        RP_BOOTSTRAP_ADMIN_PASSWORD_FILE=$file /usr/local/bin/node dist/ops/create-admin.js "$@"
+    ' bash --email "$email" --name "$name" < "$file"
+}
+import_catalog() {
+    # import_catalog [--dry-run]: loads the offerings matrix shipped with the active release.
+    ops_run --pipe /usr/local/bin/node dist/ops/catalog-import.js "$@" </dev/null
 }
 check_http() {
     local mode=$1 probe code attempt
@@ -235,6 +349,8 @@ check_http() {
     if [[ "$mode" == edge ]]; then
         probe="https://$origin"
         opts+=(--resolve "$origin:443:127.0.0.1")
+        # A self-signed certificate is trusted explicitly, so the check still verifies TLS and the name.
+        if [[ "$tls_mode" == self-signed ]]; then opts+=(--cacert "$tls_dir/fullchain.pem"); fi
     else
         probe=http://127.0.0.1:5000
     fi
@@ -248,3 +364,5 @@ check_http() {
     done
     die "$mode health/readiness or worker active check failed"
 }
+
+load_site

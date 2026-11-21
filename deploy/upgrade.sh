@@ -2,6 +2,7 @@
 # Usage: sudo bash deploy/upgrade.sh <reviewed-full-commit-sha>
 set -euo pipefail
 deploy_src=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=deploy/lib.sh
 source "$deploy_src/lib.sh"
 [[ $# == 1 ]] || die 'usage: upgrade.sh <reviewed-full-commit-sha>'
 lock_deploy
