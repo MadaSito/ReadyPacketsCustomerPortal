@@ -2,16 +2,18 @@
  * Outbound Egress & SSRF Policy (`services.integrations.egress`).
  *
  * Enforces:
- *  - Purpose-specific default schemes and ports
- *  - URL credential (`user:pass@host`) rejection
+ *  - Purpose-specific default schemes and ports (plus mandatory allowlist + public-only IP rules for
+ *    cloud/provider purposes: `graph`, `graph_upload`, `entra_oidc`, `storage_*`)
+ *  - URL credential (`user:pass@host`) rejection and bounded URL length (2 KiB default; 12 KiB for
+ *    signed/encoded cloud object-storage and upload-session URLs; URLs are never logged)
  *  - Hostname & numeric IPv4/IPv6 pre-validation (decimal/octal/hex/shorthand tricks, special TLDs, zone IDs)
  *  - Full A/AAAA DNS resolution with validation of EVERY returned address (mixed public + private refused)
- *  - Explicit step-up-protected administrator allowlist (`integration_egress_allowlist`) for legitimate
- *    private SIEM/SMTP destinations or custom ports — while unconditionally blocking cloud metadata,
- *    link-local, multicast, broadcast, unspecified, and production loopback addresses
+ *  - Explicit step-up-protected administrator allowlist (`integration_egress_allowlist`) and provider presets
  *  - Pinned IP address + TLS SNI `servername` return value to prevent DNS rebinding
- *  - `fetchPinned` HTTPS helper with pinned `lookup`, TLS >= 1.2, strict cert validation, streaming size bound,
- *    and automatic redirect refusal (`3xx` rejected)
+ *  - `fetchPinned` HTTPS helper with pinned `lookup`, TLS >= 1.2, strict cert validation, streaming `Readable`
+ *    request bodies with exact `Content-Length` enforcement (no buffering), bounded response size, and
+ *    automatic redirect refusal (`3xx` rejected; Google Drive `PUT` chunk `308` permitted only behind
+ *    explicit `acceptUploadIncomplete: true` with `Location` stripped)
  */
 import dns from "node:dns/promises";
 import https from "node:https";
@@ -20,7 +22,26 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
-import { assertIntegrationsManageInTx, assertIntegrationsManagePreflight } from "./authz.js";
+import {
+  assertAdminStepUpAnyInTx,
+  assertAdminStepUpAnyPreflight,
+  assertIntegrationsManageInTx,
+  assertIntegrationsManagePreflight,
+} from "./authz.js";
+import {
+  buildPresetView,
+  EGRESS_PRESET_KEYS,
+  FORBIDDEN_UPLOAD_SESSION_HEADERS,
+  getPresetMeta,
+  GRAPH_UPLOAD_WILDCARD_SUFFIXES,
+  MANDATORY_CLOUD_ALLOWLIST_PURPOSES,
+  PRESET_CATALOG,
+  resolvePresetHosts,
+  type EgressPresetKey,
+  type EgressPresetParams,
+  type EgressPresetView,
+  type SetEgressPresetInput,
+} from "./egressPresets.js";
 import {
   isNonCanonicalIpv4Trick,
   matchIpAgainstCidr,
@@ -32,13 +53,36 @@ import {
 } from "./ipPolicy.js";
 import { integrationEgressAllowlist } from "./schema.js";
 
-export const EGRESS_PURPOSES = ["siem", "smtp", "webhook", "sharepoint", "stripe", "antivirus"] as const;
+export {
+  EGRESS_PRESET_KEYS,
+  type EgressPresetKey,
+  type EgressPresetParams,
+  type EgressPresetView,
+  type SetEgressPresetInput,
+};
+
+export const EGRESS_PURPOSES = [
+  "siem",
+  "smtp",
+  "webhook",
+  "sharepoint",
+  "stripe",
+  "antivirus",
+  "graph",
+  "graph_upload",
+  "entra_oidc",
+  "storage_s3",
+  "storage_azure",
+  "storage_dropbox",
+  "storage_gdrive",
+] as const;
 export type EgressPurpose = (typeof EGRESS_PURPOSES)[number];
 
 export const EGRESS_PROTOCOLS = ["https:", "tls:", "smtp:", "smtps:"] as const;
 export type EgressProtocol = (typeof EGRESS_PROTOCOLS)[number];
 
 export type EgressMatchType = "host" | "ip" | "cidr";
+export type EgressHttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export type EgressTargetInput =
   | string
@@ -68,17 +112,28 @@ export interface ResolveEgressInput {
   allowApprovedPrivate?: boolean;
   requireAllowlistRule?: boolean;
   publicAddressesOnly?: boolean;
+  expectedHostSuffixes?: readonly string[];
 }
 
 export interface EgressFetchOptions {
-  method?: "GET" | "HEAD" | "POST" | "PUT";
+  method?: EgressHttpMethod;
   headers?: Record<string, string>;
-  body?: string | Uint8Array;
+  body?: string | Uint8Array | NodeJS.ReadableStream;
+  /** Required when `body` is a `NodeJS.ReadableStream` (`bodyLength` accepted as an alias); 0..5 GiB. */
+  contentLength?: number;
+  bodyLength?: number;
+  maxRequestBytes?: number;
   timeoutMs?: number;
   maxResponseBytes?: number;
   signal?: AbortSignal;
   requireAllowlistRule?: boolean;
   publicAddressesOnly?: boolean;
+  expectedHostSuffixes?: readonly string[];
+  /**
+   * Permits HTTP `308 Resume Incomplete` ONLY when `purpose === "storage_gdrive"` and `method === "PUT"`.
+   * Any `Location` header is stripped from the returned headers and redirects are never followed.
+   */
+  acceptUploadIncomplete?: boolean;
 }
 
 export interface EgressFetchResponse {
@@ -131,14 +186,42 @@ export type DnsLookupFn = (hostname: string) => Promise<readonly DnsResolvedAddr
 export type HttpsPinnedRequester = (
   pinned: PinnedEgressTarget,
   url: URL,
-  options: Required<Pick<EgressFetchOptions, "method" | "timeoutMs" | "maxResponseBytes">> &
-    Pick<EgressFetchOptions, "headers" | "body" | "signal">,
+  options: {
+    method: EgressHttpMethod;
+    headers?: Record<string, string>;
+    body?: string | Uint8Array | NodeJS.ReadableStream;
+    declaredStreamLength?: number;
+    timeoutMs: number;
+    maxResponseBytes: number;
+    signal?: AbortSignal;
+    allowStatus308?: boolean;
+  },
 ) => Promise<EgressFetchResponse>;
 
 export interface EgressPolicyOptions {
   dnsLookup?: DnsLookupFn;
   dnsTimeoutMs?: number;
   httpsRequester?: HttpsPinnedRequester;
+}
+
+const MAX_STREAM_REQUEST_BYTES = 5 * 1024 * 1024 * 1024; // 5 GiB single-PUT object storage ceiling
+const MAX_RESPONSE_BYTES_CAP = 16 * 1024 * 1024; // 16 MiB bounded metadata/list response ceiling
+const EXTENDED_URL_PURPOSES: ReadonlySet<EgressPurpose> = new Set<EgressPurpose>([
+  "graph_upload",
+  "storage_s3",
+  "storage_azure",
+  "storage_dropbox",
+  "storage_gdrive",
+]);
+
+function isReadableStream(value: unknown): value is NodeJS.ReadableStream {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !(value instanceof Uint8Array) &&
+    typeof (value as NodeJS.ReadableStream).pipe === "function" &&
+    typeof (value as NodeJS.ReadableStream).on === "function"
+  );
 }
 
 /**
@@ -178,6 +261,8 @@ export interface EgressPolicy {
   resolveAndAssertAllowed(input: ResolveEgressInput): Promise<PinnedEgressTarget>;
   fetchPinned(url: string | URL, purpose: EgressPurpose, options?: EgressFetchOptions): Promise<EgressFetchResponse>;
   listAllowlist(): Promise<EgressAllowlistRuleView[]>;
+  listPresets(): Promise<EgressPresetView[]>;
+  setPresetEnabled(principal: SessionPrincipal, input: SetEgressPresetInput): Promise<EgressPresetView>;
   createAllowlistRule(principal: SessionPrincipal, input: CreateEgressRuleInput): Promise<EgressAllowlistRuleView>;
   updateAllowlistRule(principal: SessionPrincipal, input: UpdateEgressRuleInput): Promise<EgressAllowlistRuleView>;
   deleteAllowlistRule(principal: SessionPrincipal, publicId: string): Promise<void>;
@@ -200,6 +285,13 @@ const DEFAULT_PURPOSE_POLICY: Record<
   sharepoint: { protocols: ["https:"], ports: [443] },
   stripe: { protocols: ["https:"], ports: [443] },
   antivirus: { protocols: ["https:"], ports: [443] },
+  graph: { protocols: ["https:"], ports: [443] },
+  graph_upload: { protocols: ["https:"], ports: [443] },
+  entra_oidc: { protocols: ["https:"], ports: [443] },
+  storage_s3: { protocols: ["https:"], ports: [443] },
+  storage_azure: { protocols: ["https:"], ports: [443] },
+  storage_dropbox: { protocols: ["https:"], ports: [443] },
+  storage_gdrive: { protocols: ["https:"], ports: [443] },
   siem: { protocols: ["tls:", "https:"], ports: [6514, 443] },
   smtp: { protocols: ["smtp:", "smtps:"], ports: [587, 465] },
 };
@@ -243,6 +335,25 @@ function extractRawHostFromUrlString(rawUrl: string): string | null {
   return colonIdx === -1 ? authority : authority.slice(0, colonIdx);
 }
 
+function hostMatchesLineage(normalizedHost: string, allowedSuffixes: readonly string[]): boolean {
+  for (const rawEntry of allowedSuffixes) {
+    const trimmed = rawEntry.trim().toLowerCase();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("*.")) {
+      const suffix = trimmed.slice(2);
+      if (suffix.length > 0 && normalizedHost.endsWith(`.${suffix}`) && normalizedHost.length > suffix.length + 1) {
+        return true;
+      }
+      continue;
+    }
+    const clean = trimmed.startsWith(".") ? trimmed.slice(1) : trimmed;
+    if (normalizedHost === clean || normalizedHost.endsWith(`.${clean}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const defaultDnsLookup: DnsLookupFn = async (hostname: string) => {
   const results = await dns.lookup(hostname, { all: true, verbatim: true });
   return results
@@ -257,19 +368,28 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
       return;
     }
 
+    const streaming = isReadableStream(options.body);
     const bodyBuffer =
-      options.body === undefined
+      options.body === undefined || streaming
         ? undefined
         : typeof options.body === "string"
           ? Buffer.from(options.body, "utf8")
-          : Buffer.from(options.body);
+          : Buffer.from(options.body as Uint8Array);
 
     const reqHeaders: Record<string, string> = {
       Accept: "application/json, text/plain;q=0.8",
       ...options.headers,
       Host: pinned.port === 443 ? pinned.hostname : `${pinned.hostname}:${pinned.port}`,
     };
-    if (bodyBuffer !== undefined && reqHeaders["Content-Length"] === undefined && reqHeaders["content-length"] === undefined) {
+    if (streaming && options.declaredStreamLength !== undefined) {
+      if (reqHeaders["Content-Length"] === undefined && reqHeaders["content-length"] === undefined) {
+        reqHeaders["Content-Length"] = String(options.declaredStreamLength);
+      }
+    } else if (
+      bodyBuffer !== undefined &&
+      reqHeaders["Content-Length"] === undefined &&
+      reqHeaders["content-length"] === undefined
+    ) {
       reqHeaders["Content-Length"] = String(bodyBuffer.byteLength);
     }
 
@@ -281,10 +401,17 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
         totalDeadlineTimer = undefined;
       }
     };
+    const destroyInputStream = () => {
+      const destroyFn = streaming ? (options.body as unknown as { destroy?: () => void }).destroy : undefined;
+      if (typeof destroyFn === "function") {
+        destroyFn.call(options.body);
+      }
+    };
     const finishError = (err: Error) => {
       if (settled) return;
       settled = true;
       clearDeadline();
+      destroyInputStream();
       reject(err);
     };
 
@@ -303,68 +430,71 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
       agent: false,
       lookup: createPinnedLookup(pinned) as never,
     };
+
     const req = https.request(reqOptions, (res) => {
-        const status = res.statusCode ?? 0;
-        // Refuse all HTTP redirects rather than following across hosts or leaking payloads.
-        if (status >= 300 && status < 400) {
-          res.resume();
+      const status = res.statusCode ?? 0;
+      const isPermitted308 = status === 308 && options.allowStatus308 === true;
+      // Refuse all HTTP redirects rather than following across hosts or leaking payloads.
+      if (status >= 300 && status < 400 && !isPermitted308) {
+        res.resume();
+        req.destroy();
+        finishError(
+          new DomainError(
+            "FORBIDDEN",
+            "EGRESS_REDIRECT_REFUSED",
+            "Outbound destination attempted an HTTP redirect, which is refused by egress policy.",
+          ),
+        );
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      res.on("data", (chunk: Buffer | string) => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += buf.byteLength;
+        if (totalBytes > options.maxResponseBytes) {
           req.destroy();
           finishError(
             new DomainError(
-              "FORBIDDEN",
-              "EGRESS_REDIRECT_REFUSED",
-              "Outbound destination attempted an HTTP redirect, which is refused by egress policy.",
+              "VALIDATION",
+              "EGRESS_RESPONSE_TOO_LARGE",
+              "The outbound destination returned a response exceeding the allowed size.",
             ),
           );
           return;
         }
+        chunks.push(buf);
+      });
+      res.on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearDeadline();
+        const headersOut: Record<string, string> = {};
+        for (const [k, v] of Object.entries(res.headers)) {
+          const lower = k.toLowerCase();
+          // Never expose a redirect Location header on permitted Google Drive 308 chunk status responses.
+          if (isPermitted308 && lower === "location") continue;
+          if (typeof v === "string") headersOut[lower] = v;
+          else if (Array.isArray(v)) headersOut[lower] = v.join(", ");
+        }
+        resolve({
+          status,
+          headers: headersOut,
+          body: Buffer.concat(chunks),
+        });
+      });
+      res.on("error", () => {
+        finishError(
+          new DomainError(
+            "UNAVAILABLE",
+            "EGRESS_STREAM_FAILED",
+            "Reading the outbound provider response failed.",
+          ),
+        );
+      });
+    });
 
-        const chunks: Buffer[] = [];
-        let totalBytes = 0;
-        res.on("data", (chunk: Buffer | string) => {
-          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-          totalBytes += buf.byteLength;
-          if (totalBytes > options.maxResponseBytes) {
-            req.destroy();
-            finishError(
-              new DomainError(
-                "VALIDATION",
-                "EGRESS_RESPONSE_TOO_LARGE",
-                "The outbound destination returned a response exceeding the allowed size.",
-              ),
-            );
-            return;
-          }
-          chunks.push(buf);
-        });
-        res.on("end", () => {
-          if (settled) return;
-          settled = true;
-          clearDeadline();
-          const headersOut: Record<string, string> = {};
-          for (const [k, v] of Object.entries(res.headers)) {
-            if (typeof v === "string") headersOut[k.toLowerCase()] = v;
-            else if (Array.isArray(v)) headersOut[k.toLowerCase()] = v.join(", ");
-          }
-          resolve({
-            status,
-            headers: headersOut,
-            body: Buffer.concat(chunks),
-          });
-        });
-        res.on("error", () => {
-          finishError(
-            new DomainError(
-              "UNAVAILABLE",
-              "EGRESS_STREAM_FAILED",
-              "Reading the outbound provider response failed.",
-            ),
-          );
-        });
-      },
-    );
-
-    // Hard wall-clock deadline across connect + TLS + headers + full body streaming (not just socket idle).
     totalDeadlineTimer = setTimeout(() => {
       req.destroy();
       finishError(
@@ -400,13 +530,83 @@ const defaultHttpsRequester: HttpsPinnedRequester = (pinned, url, options) =>
       options.signal?.removeEventListener("abort", onAbort);
     });
 
-    if (bodyBuffer !== undefined) req.write(bodyBuffer);
-    req.end();
+    if (streaming) {
+      const stream = options.body as NodeJS.ReadableStream;
+      const expectedBytes = options.declaredStreamLength ?? 0;
+      let sentBytes = 0;
+      stream.on("data", (chunk: Buffer | string) => {
+        if (settled) return;
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        sentBytes += buf.byteLength;
+        if (sentBytes > expectedBytes) {
+          req.destroy();
+          finishError(
+            new DomainError(
+              "VALIDATION",
+              "EGRESS_STREAM_LENGTH_MISMATCH",
+              "The outbound upload stream exceeded its declared Content-Length.",
+            ),
+          );
+          return;
+        }
+        if (!req.write(buf) && typeof stream.pause === "function") {
+          stream.pause();
+          req.once("drain", () => {
+            if (!settled && typeof stream.resume === "function") stream.resume();
+          });
+        }
+      });
+      stream.on("end", () => {
+        if (settled) return;
+        if (sentBytes !== expectedBytes) {
+          req.destroy();
+          finishError(
+            new DomainError(
+              "VALIDATION",
+              "EGRESS_STREAM_LENGTH_MISMATCH",
+              "The outbound upload stream ended before matching its declared Content-Length.",
+            ),
+          );
+          return;
+        }
+        req.end();
+      });
+      stream.on("error", () => {
+        req.destroy();
+        finishError(
+          new DomainError(
+            "UNAVAILABLE",
+            "EGRESS_REQUEST_STREAM_FAILED",
+            "Reading the local upload stream failed.",
+          ),
+        );
+      });
+    } else {
+      if (bodyBuffer !== undefined) req.write(bodyBuffer);
+      req.end();
+    }
   });
 
-function normalizeAndValidateRulePattern(matchType: EgressMatchType, rawPattern: string): string {
+function normalizeAndValidateRulePattern(
+  matchType: EgressMatchType,
+  rawPattern: string,
+  purpose: EgressPurpose,
+): string {
   const trimmed = rawPattern.trim();
   if (matchType === "host") {
+    if (trimmed.startsWith("*.")) {
+      const suffix = trimmed.slice(2).toLowerCase();
+      if (
+        purpose === "graph_upload" &&
+        (GRAPH_UPLOAD_WILDCARD_SUFFIXES as readonly string[]).includes(suffix)
+      ) {
+        return `*.${suffix}`;
+      }
+      throw validation(
+        "INVALID_ALLOWLIST_PATTERN",
+        "Wildcard host rules are permitted only for curated Microsoft upload-session suffixes.",
+      );
+    }
     const check = precheckHost(trimmed);
     if (!check.ok || check.kind !== "dns") {
       throw validation(
@@ -443,6 +643,21 @@ function normalizeAndValidateRulePattern(matchType: EgressMatchType, rawPattern:
     );
   }
   return cidr.normalized;
+}
+
+function assertCloudPurposeRuleConstraints(
+  purpose: EgressPurpose,
+  protocol: EgressProtocol,
+  port: number,
+  allowPrivateAddress: boolean,
+): void {
+  if (!MANDATORY_CLOUD_ALLOWLIST_PURPOSES.has(purpose)) return;
+  if (protocol !== "https:" || port !== 443 || allowPrivateAddress) {
+    throw validation(
+      "CLOUD_PURPOSE_REQUIRES_PUBLIC_HTTPS_443",
+      "Cloud storage, Graph, and OIDC egress rules must use public HTTPS on port 443.",
+    );
+  }
 }
 
 function toRuleView(row: typeof integrationEgressAllowlist.$inferSelect): EgressAllowlistRuleView {
@@ -491,6 +706,30 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     }
   }
 
+  async function loadAllRulesSafe(): Promise<EgressAllowlistRuleView[]> {
+    try {
+      const rows = await deps.db
+        .select()
+        .from(integrationEgressAllowlist)
+        .orderBy(asc(integrationEgressAllowlist.purpose), asc(integrationEgressAllowlist.pattern))
+        .limit(300);
+      return rows.map(toRuleView);
+    } catch (error) {
+      if (isTest) {
+        const msg = error instanceof Error ? error.message : String(error);
+        const code = (error as { code?: string } | null)?.code;
+        if (code === "ER_NO_SUCH_TABLE" || msg.includes("no db supplied") || msg.includes("doesn't exist")) {
+          return [];
+        }
+      }
+      throw new DomainError(
+        "UNAVAILABLE",
+        "EGRESS_POLICY_UNAVAILABLE",
+        "Outbound egress policy rules could not be loaded.",
+      );
+    }
+  }
+
   async function loadEnabledRulesForPurpose(purpose: EgressPurpose): Promise<EgressAllowlistRuleView[]> {
     try {
       const rows = await deps.db
@@ -509,7 +748,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         const msg = error instanceof Error ? error.message : String(error);
         const code = (error as { code?: string } | null)?.code;
         if (code === "ER_NO_SUCH_TABLE" || msg.includes("no db supplied") || msg.includes("doesn't exist")) {
-          // Fail closed to an empty allowlist when foreign module tests run with partial DB schemas.
           return [];
         }
       }
@@ -522,6 +760,7 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
   }
 
   function findMatchingRule(
+    purpose: EgressPurpose,
     rules: readonly EgressAllowlistRuleView[],
     protocol: EgressProtocol,
     port: number,
@@ -532,6 +771,16 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       if (rule.protocol !== protocol || rule.port !== port) continue;
       if (rule.matchType === "host") {
         if (rule.pattern === normalizedHost) return rule;
+        if (purpose === "graph_upload" && rule.pattern.startsWith("*.")) {
+          const suffix = rule.pattern.slice(2);
+          if (
+            (GRAPH_UPLOAD_WILDCARD_SUFFIXES as readonly string[]).includes(suffix) &&
+            normalizedHost.endsWith(`.${suffix}`) &&
+            normalizedHost.length > suffix.length + 1
+          ) {
+            return rule;
+          }
+        }
       } else if (rule.matchType === "ip") {
         if (resolvedIps.length > 0 && resolvedIps.every((ip) => ip.normalized === rule.pattern)) {
           return rule;
@@ -567,11 +816,17 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       allowApprovedPrivate?: boolean;
       requireAllowlistRule?: boolean;
       publicAddressesOnly?: boolean;
+      expectedHostSuffixes?: readonly string[];
     },
   ): Promise<PinnedEgressTarget> {
     if (!EGRESS_PURPOSES.includes(purpose)) {
       throw validation("INVALID_EGRESS_PURPOSE", "Unknown outbound egress purpose.");
     }
+
+    const mandatoryCloud = MANDATORY_CLOUD_ALLOWLIST_PURPOSES.has(purpose);
+    const effectiveRequireAllowlist = mandatoryCloud || extra?.requireAllowlistRule === true;
+    const effectivePublicOnly = mandatoryCloud || extra?.publicAddressesOnly === true;
+    const maxUrlChars = EXTENDED_URL_PURPOSES.has(purpose) ? 12_288 : 2_048;
 
     let rawHost: string;
     let protocol: EgressProtocol;
@@ -580,10 +835,9 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
 
     if (typeof target === "string" || target instanceof URL) {
       const rawString = typeof target === "string" ? target.trim() : target.toString();
-      if (rawString.length === 0 || rawString.length > 2048) {
+      if (rawString.length === 0 || rawString.length > maxUrlChars) {
         throw validation("INVALID_EGRESS_URL", "The outbound URL is empty or exceeds the maximum length.");
       }
-      // Inspect raw authority BEFORE WHATWG URL normalizes octal/decimal/hex IPv4 tricks!
       const extractedHost = extractRawHostFromUrlString(rawString);
       if (extractedHost !== null && isNonCanonicalIpv4Trick(extractedHost)) {
         recordDenialNote(purpose, "NON_CANONICAL_IP_HOST");
@@ -652,8 +906,11 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       port = target.port;
     }
 
-    if (extra?.allowedSchemes) {
-      const normalizedAllowed = extra.allowedSchemes.map((s) => (s.endsWith(":") ? s.toLowerCase() : `${s.toLowerCase()}:`));
+    const effectiveSchemes = mandatoryCloud ? ["https:"] : extra?.allowedSchemes;
+    if (effectiveSchemes) {
+      const normalizedAllowed = effectiveSchemes.map((s) =>
+        s.endsWith(":") ? s.toLowerCase() : `${s.toLowerCase()}:`,
+      );
       if (!normalizedAllowed.includes(protocol)) {
         recordDenialNote(purpose, "EGRESS_SCHEME_FORBIDDEN");
         throw new DomainError(
@@ -663,11 +920,39 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         );
       }
     }
+    if (mandatoryCloud && port !== 443) {
+      recordDenialNote(purpose, "EGRESS_PORT_FORBIDDEN");
+      throw new DomainError(
+        "FORBIDDEN",
+        "EGRESS_PORT_FORBIDDEN",
+        "Cloud provider egress is permitted only over HTTPS port 443.",
+      );
+    }
 
     const hostCheck = precheckHost(rawHost);
     if (!hostCheck.ok) {
       recordDenialNote(purpose, hostCheck.reasonCode);
       throw new DomainError("FORBIDDEN", hostCheck.reasonCode, hostCheck.safeMessage);
+    }
+    if (mandatoryCloud && hostCheck.kind !== "dns") {
+      recordDenialNote(purpose, "EGRESS_IP_LITERAL_FORBIDDEN");
+      throw new DomainError(
+        "FORBIDDEN",
+        "EGRESS_IP_LITERAL_FORBIDDEN",
+        "Cloud provider destinations require a verified DNS hostname.",
+      );
+    }
+    if (
+      extra?.expectedHostSuffixes &&
+      extra.expectedHostSuffixes.length > 0 &&
+      !hostMatchesLineage(hostCheck.normalizedHost, extra.expectedHostSuffixes)
+    ) {
+      recordDenialNote(purpose, "EGRESS_HOST_LINEAGE_MISMATCH");
+      throw new DomainError(
+        "FORBIDDEN",
+        "EGRESS_HOST_LINEAGE_MISMATCH",
+        "Outbound destination host is outside the permitted provider host lineage.",
+      );
     }
 
     let resolvedIps: ParsedIpAddress[];
@@ -707,7 +992,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       }
     }
 
-    // 1. Unconditionally forbidden classes (cloud metadata, link-local, multicast, broadcast, unspecified, IPv4-mapped/transition)
     for (const ip of resolvedIps) {
       if (isUnconditionallyForbiddenClass(ip.classification)) {
         const reason =
@@ -731,10 +1015,9 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       }
     }
 
-    // Load explicit administrator allowlist rules for this purpose
     const rules = await loadEnabledRulesForPurpose(purpose);
-    const matchingRule = findMatchingRule(rules, protocol, port, hostCheck.normalizedHost, resolvedIps);
-    if (extra?.requireAllowlistRule === true && !matchingRule) {
+    const matchingRule = findMatchingRule(purpose, rules, protocol, port, hostCheck.normalizedHost, resolvedIps);
+    if (effectiveRequireAllowlist && !matchingRule) {
       recordDenialNote(purpose, "EGRESS_ALLOWLIST_REQUIRED");
       throw new DomainError(
         "FORBIDDEN",
@@ -744,7 +1027,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     }
     const siemApprovedPrivate = purpose === "siem" && extra?.allowApprovedPrivate === true;
 
-    // 2. Validate protocol & port against default policy unless authorized by matching allowlist rule (or SIEM approved destination)
     const defaultPolicy = DEFAULT_PURPOSE_POLICY[purpose];
     if (!defaultPolicy.protocols.includes(protocol) && !matchingRule) {
       recordDenialNote(purpose, "EGRESS_SCHEME_FORBIDDEN");
@@ -763,9 +1045,8 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       );
     }
 
-    // 3. Validate EVERY resolved IP (prevents round-robin mixed public + private DNS bypass)
     for (const ip of resolvedIps) {
-      if (extra?.publicAddressesOnly === true && ip.classification !== "PUBLIC") {
+      if (effectivePublicOnly && ip.classification !== "PUBLIC") {
         recordDenialNote(purpose, "EGRESS_NON_PUBLIC_ADDRESS_BLOCKED");
         throw new DomainError(
           "FORBIDDEN",
@@ -774,7 +1055,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         );
       }
       if (ip.classification === "LOOPBACK") {
-        // Non-production only (prod already rejected above): still requires explicit private allowlist rule or SIEM approved flag
         const allowedLoopback = Boolean((matchingRule && matchingRule.allowPrivateAddress) || siemApprovedPrivate);
         if (!allowedLoopback) {
           recordDenialNote(purpose, "EGRESS_LOOPBACK_BLOCKED");
@@ -822,25 +1102,99 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         allowApprovedPrivate: input.allowApprovedPrivate,
         requireAllowlistRule: input.requireAllowlistRule,
         publicAddressesOnly: input.publicAddressesOnly,
+        expectedHostSuffixes: input.expectedHostSuffixes,
       });
     },
 
     async fetchPinned(url, purpose, fetchOptions = {}) {
+      const method: EgressHttpMethod = fetchOptions.method ?? "GET";
+      if (purpose === "graph_upload" && fetchOptions.headers) {
+        for (const headerName of Object.keys(fetchOptions.headers)) {
+          if (FORBIDDEN_UPLOAD_SESSION_HEADERS.has(headerName.toLowerCase())) {
+            recordDenialNote(purpose, "EGRESS_FORBIDDEN_UPLOAD_HEADER");
+            throw new DomainError(
+              "FORBIDDEN",
+              "EGRESS_FORBIDDEN_UPLOAD_HEADER",
+              "Pre-authenticated upload session requests must not carry bearer or cookie credentials.",
+            );
+          }
+        }
+      }
+      if (fetchOptions.acceptUploadIncomplete === true && !(purpose === "storage_gdrive" && method === "PUT")) {
+        recordDenialNote(purpose, "EGRESS_REDIRECT_REFUSED");
+        throw new DomainError(
+          "FORBIDDEN",
+          "EGRESS_REDIRECT_REFUSED",
+          "HTTP 308 upload-incomplete status is permitted only on Google Drive chunk PUT requests.",
+        );
+      }
+
+      const streaming = isReadableStream(fetchOptions.body);
+      const maxReqBytes = Math.min(
+        Math.max(fetchOptions.maxRequestBytes ?? MAX_STREAM_REQUEST_BYTES, 0),
+        MAX_STREAM_REQUEST_BYTES,
+      );
+      let declaredStreamLength: number | undefined;
+      if (streaming) {
+        const rawLen = fetchOptions.contentLength ?? fetchOptions.bodyLength;
+        if (typeof rawLen !== "number" || !Number.isSafeInteger(rawLen) || rawLen < 0) {
+          throw validation(
+            "EGRESS_STREAM_LENGTH_REQUIRED",
+            "Streaming outbound uploads require a known non-negative integer contentLength.",
+          );
+        }
+        if (rawLen > maxReqBytes) {
+          throw validation(
+            "EGRESS_REQUEST_TOO_LARGE",
+            "The outbound upload exceeds the maximum permitted request size.",
+          );
+        }
+        declaredStreamLength = rawLen;
+      } else if (fetchOptions.body !== undefined) {
+        const byteLen =
+          typeof fetchOptions.body === "string"
+            ? Buffer.byteLength(fetchOptions.body, "utf8")
+            : (fetchOptions.body as Uint8Array).byteLength;
+        if (byteLen > maxReqBytes) {
+          throw validation(
+            "EGRESS_REQUEST_TOO_LARGE",
+            "The outbound payload exceeds the maximum permitted request size.",
+          );
+        }
+      }
+
       const pinned = await evaluateTarget(url, purpose, {
         allowedSchemes: ["https:"],
         requireAllowlistRule: fetchOptions.requireAllowlistRule,
         publicAddressesOnly: fetchOptions.publicAddressesOnly,
+        expectedHostSuffixes: fetchOptions.expectedHostSuffixes,
       });
       const parsedUrl = new URL(pinned.normalizedUrl ?? String(url));
+      const maxTimeoutCap = streaming ? 600_000 : 30_000;
+      const allowStatus308 =
+        fetchOptions.acceptUploadIncomplete === true && purpose === "storage_gdrive" && method === "PUT";
+
       const resp = await requester(pinned, parsedUrl, {
-        method: fetchOptions.method ?? "GET",
+        method,
         headers: fetchOptions.headers,
         body: fetchOptions.body,
-        timeoutMs: Math.min(Math.max(fetchOptions.timeoutMs ?? 10_000, 100), 30_000),
-        maxResponseBytes: Math.min(Math.max(fetchOptions.maxResponseBytes ?? 262_144, 1024), 2 * 1024 * 1024),
+        declaredStreamLength,
+        timeoutMs: Math.min(Math.max(fetchOptions.timeoutMs ?? 10_000, 100), maxTimeoutCap),
+        maxResponseBytes: Math.min(
+          Math.max(fetchOptions.maxResponseBytes ?? 262_144, 1_024),
+          MAX_RESPONSE_BYTES_CAP,
+        ),
         signal: fetchOptions.signal,
+        allowStatus308,
       });
       if (resp.status >= 300 && resp.status < 400) {
+        if (resp.status === 308 && allowStatus308) {
+          const cleanHeaders: Record<string, string> = {};
+          for (const [k, v] of Object.entries(resp.headers)) {
+            if (k.toLowerCase() !== "location") cleanHeaders[k.toLowerCase()] = v;
+          }
+          return { status: resp.status, headers: cleanHeaders, body: resp.body };
+        }
         throw new DomainError(
           "FORBIDDEN",
           "EGRESS_REDIRECT_REFUSED",
@@ -851,12 +1205,119 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     },
 
     async listAllowlist() {
-      const rows = await deps.db
-        .select()
-        .from(integrationEgressAllowlist)
-        .orderBy(asc(integrationEgressAllowlist.purpose), asc(integrationEgressAllowlist.pattern))
-        .limit(200);
-      return rows.map(toRuleView);
+      return loadAllRulesSafe();
+    },
+
+    async listPresets() {
+      const rules = await loadAllRulesSafe();
+      return PRESET_CATALOG.map((meta) => buildPresetView(meta, rules));
+    },
+
+    async setPresetEnabled(principal, input) {
+      const now = deps.clock.now();
+      const meta = getPresetMeta(input.presetKey);
+      assertAdminStepUpAnyPreflight(principal, now, meta.capabilities);
+      const concreteHosts =
+        meta.parameterized && !input.enabled && !input.params?.region && !input.params?.accountName
+          ? undefined
+          : resolvePresetHosts(input.presetKey, input.params);
+
+      await deps.db.transaction(async (tx) => {
+        await assertAdminStepUpAnyInTx(deps, principal, tx, meta.capabilities);
+
+        if (!concreteHosts) {
+          // Disable all existing rules belonging to this parameterized preset family.
+          const existingRows = await tx
+            .select()
+            .from(integrationEgressAllowlist)
+            .where(eq(integrationEgressAllowlist.purpose, meta.purpose))
+            .for("update");
+          const matchingView = buildPresetView(meta, existingRows.map(toRuleView));
+          for (const row of existingRows) {
+            if (matchingView.matchingRulePublicIds.includes(row.publicId) && row.enabled) {
+              await tx
+                .update(integrationEgressAllowlist)
+                .set({
+                  enabled: false,
+                  updatedByUserId: principal.userId,
+                  version: row.version + 1,
+                  updatedAt: now,
+                })
+                .where(eq(integrationEgressAllowlist.id, row.id));
+            }
+          }
+        } else {
+          for (const hostPattern of concreteHosts) {
+            const normalizedPattern = normalizeAndValidateRulePattern("host", hostPattern, meta.purpose);
+            const [existing] = await tx
+              .select()
+              .from(integrationEgressAllowlist)
+              .where(
+                and(
+                  eq(integrationEgressAllowlist.purpose, meta.purpose),
+                  eq(integrationEgressAllowlist.pattern, normalizedPattern),
+                  eq(integrationEgressAllowlist.port, 443),
+                  eq(integrationEgressAllowlist.protocol, "https:"),
+                ),
+              )
+              .limit(1)
+              .for("update");
+
+            if (existing) {
+              if (existing.enabled !== input.enabled || existing.allowPrivateAddress) {
+                await tx
+                  .update(integrationEgressAllowlist)
+                  .set({
+                    enabled: input.enabled,
+                    allowPrivateAddress: false,
+                    updatedByUserId: principal.userId,
+                    version: existing.version + 1,
+                    updatedAt: now,
+                  })
+                  .where(eq(integrationEgressAllowlist.id, existing.id));
+              }
+            } else if (input.enabled) {
+              await tx.insert(integrationEgressAllowlist).values({
+                publicId: ulid(),
+                purpose: meta.purpose,
+                matchType: "host",
+                pattern: normalizedPattern,
+                port: 443,
+                protocol: "https:",
+                allowPrivateAddress: false,
+                enabled: true,
+                justification: meta.justification,
+                createdByUserId: principal.userId,
+                updatedByUserId: principal.userId,
+                version: 1,
+                createdAt: now,
+                updatedAt: now,
+              });
+            }
+          }
+        }
+
+        await deps.audit.record(
+          {
+            category: "integration",
+            eventName: "integration.egress.preset_updated",
+            action: "update",
+            outcome: "completed",
+            severity: "INFO",
+            resource: { type: "egress_preset", publicId: meta.key },
+            attributes: {
+              preset: meta.key,
+              purpose: meta.purpose,
+              enabled: input.enabled,
+              host_count: concreteHosts ? concreteHosts.length : 0,
+            },
+          },
+          tx,
+        );
+      });
+
+      const updatedRules = await loadAllRulesSafe();
+      return buildPresetView(meta, updatedRules, concreteHosts);
     },
 
     async createAllowlistRule(principal, input) {
@@ -871,12 +1332,13 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
       if (!Number.isInteger(input.port) || input.port < 1 || input.port > 65535) {
         throw validation("INVALID_EGRESS_PORT", "Port must be between 1 and 65535.");
       }
+      assertCloudPurposeRuleConstraints(input.purpose, input.protocol, input.port, input.allowPrivateAddress);
       const justification = input.justification.trim();
       if (justification.length < 8 || justification.length > 280) {
         throw validation("INVALID_JUSTIFICATION", "Provide a justification between 8 and 280 characters.");
       }
 
-      const normalizedPattern = normalizeAndValidateRulePattern(input.matchType, input.pattern);
+      const normalizedPattern = normalizeAndValidateRulePattern(input.matchType, input.pattern, input.purpose);
       const publicId = ulid();
       const enabled = input.enabled ?? true;
 
@@ -978,6 +1440,12 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
         const nextPort = input.port ?? existing.port;
         const nextAllowPrivate = input.allowPrivateAddress ?? existing.allowPrivateAddress;
         const nextEnabled = input.enabled ?? existing.enabled;
+        assertCloudPurposeRuleConstraints(
+          existing.purpose as EgressPurpose,
+          existing.protocol as EgressProtocol,
+          nextPort,
+          nextAllowPrivate,
+        );
 
         await tx
           .update(integrationEgressAllowlist)
@@ -1032,7 +1500,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
           .for("update");
         if (!existing) throw notFound("EGRESS_RULE_NOT_FOUND");
 
-        // Record durable audit BEFORE deletion inside the same transaction.
         await deps.audit.record(
           {
             category: "integration",
@@ -1056,7 +1523,6 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     async checkTarget(principal, input) {
       const now = deps.clock.now();
       assertIntegrationsManagePreflight(principal, now);
-      // Perform DNS lookup & policy evaluation BEFORE touching any transaction connection!
       let pinned: PinnedEgressTarget | undefined;
       let domainErr: DomainError | null = null;
       try {

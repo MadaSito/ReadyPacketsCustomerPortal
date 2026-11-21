@@ -316,11 +316,13 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
           return dnsAnswers[hostname] ?? [];
         },
         httpsRequester: async (pinned, url, options) => {
+          const nonStreamBody =
+            typeof options.body === "string" || options.body instanceof Uint8Array ? options.body : undefined;
           const bodyStr =
-            typeof options.body === "string"
-              ? options.body
-              : options.body
-                ? Buffer.from(options.body).toString("utf8")
+            typeof nonStreamBody === "string"
+              ? nonStreamBody
+              : nonStreamBody
+                ? Buffer.from(nonStreamBody).toString("utf8")
                 : "";
           httpCalls.push({
             pinned,
@@ -329,7 +331,7 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
             headers: options.headers,
             body: bodyStr,
           });
-          return nextHttpHandler({ pinned, url, headers: options.headers, body: options.body });
+          return nextHttpHandler({ pinned, url, headers: options.headers, body: nonStreamBody });
         },
       },
     });
