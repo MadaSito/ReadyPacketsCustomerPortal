@@ -2,6 +2,18 @@
 
 The local private store remains authoritative. Storage connections are optional, disabled on creation, and represent copy destinations, not replacement storage. No storage adapter may bypass the integration egress policy; use HTTPS, an enabled purpose-specific allowlist rule, public addresses only, and no redirects. Never log credentials, provider response text, remote IDs, URLs or path labels.
 
+## Copy log (Increment 04, package R)
+
+Owner modules keep their authoritative ledgers and policy. Call `recordCopyAttempt(deps, input, tx)` from `storage/copyLogWriter.ts` in the owner transaction, after checking existing fences. It returns `Promise<void>`.
+
+`input` shares `{ kind: "order_file" | "backup_archive" | "sharepoint_order"; sourcePublicId: string; connectionPublicId: string; jobPublicId: string; attempt: number; correlationId?: string | null; bytes?: number | null }` and one of:
+
+- `{ phase: "queued" }`: stage attempt `1` with the returned job ID when the job was not deduplicated. Automatic retries may first appear at start.
+- `{ phase: "started" }`: register a running attempt in the secured worker transition; do not weaken an existing fence.
+- `{ phase: "finished"; result: "written" | "verified" | "failed" | "not_written"; verification?: "checksum" | "provider_readback"; errorCode?: string; alreadyAudited?: true }`: close only this attempt. `verification` is required for `verified`; report only the evidence available. `errorCode` is a fixed server-owned reason token, never provider text. Use `not_written` for an intentional no-op, not a successful copy. Set `alreadyAudited` only when that same transaction records the owner's result event. Attempts are keyed by job + attempt; terminal results cannot be overwritten.
+
+`storage.copies` tRPC procedures: `list`, `detail`, `connections`, `exportCsv` use admin-only `storage.copies.read` without step-up. `retry` uses existing owner policy (no generic job replay); expose it only for eligible failures the owner can safely retry. The log does not store credentials, remote paths/IDs, file names, customer fields, or raw provider errors. Older attempts cannot be reconstructed where the previous release retained only the latest copy state.
+
 ## Adapter registration
 
 Import the ports from `server/modules/storage/contracts.ts`. During the provider module's `init()`, call `deps.services.storageConnections.registerAdapter(kind, { configSchema, credentialsSchema, purposes, create })`. `deps.services.storage` remains the local object storage port. The schemas are strict Zod objects: config is non-secret `Record<string, string | number | boolean>`; credentials are secret `Record<string, string>`. `create({ publicId, config, credentials })` returns a `StorageAdapter`. Register a kind once, including both `sharepoint` and `onedrive` if supporting both. Only the adapter defines provider-specific keys; communicate those keys to the storage UI owner.
