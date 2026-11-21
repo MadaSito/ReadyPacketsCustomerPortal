@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { sql } from "drizzle-orm";
 import { mysqlTable, varchar } from "drizzle-orm/mysql-core";
 import { AuditUnavailableError } from "../../core/errors.js";
 import { newRequestContext, runWithRequestContext } from "../../core/requestContext.js";
@@ -140,6 +141,40 @@ describe("audit tap (real MySQL)", () => {
     expect((await t.db.select().from(things)).map((r) => r.label)).toEqual(["business"]);
   });
 
+  it("fails closed when the transaction was really rolled back under the tap and the callback threw (J-A02)", async () => {
+    install({
+      listens: () => true,
+      onRecorded: async (_e, tx) => { await (tx as Tx).execute(sql`ROLLBACK`); throw new Error("enqueue failed after rollback"); },
+    });
+    let reachedLaterWrite = false;
+    await expect(t.db.transaction(async (tx) => {
+      await tx.insert(things).values({ label: "business" });
+      await emitter.record(event(), tx);
+      reachedLaterWrite = true;
+      await tx.insert(things).values({ label: "later" });
+    })).rejects.toBeInstanceOf(AuditUnavailableError);
+    expect(reachedLaterWrite).toBe(false);
+    expect(await t.db.select().from(things)).toHaveLength(0);
+    expect(await t.db.select().from(auditEvents)).toHaveLength(0);
+  });
+
+  it("fails closed when the savepoint vanished even though the callback returned normally (J-A02)", async () => {
+    install({ listens: () => true, onRecorded: async (_e, tx) => { await (tx as Tx).execute(sql`ROLLBACK`); } });
+    let reachedLaterWrite = false;
+    await expect(t.db.transaction(async (tx) => {
+      await tx.insert(things).values({ label: "business" });
+      await emitter.record(event(), tx);
+      reachedLaterWrite = true;
+      await tx.insert(things).values({ label: "later" });
+    })).rejects.toBeInstanceOf(AuditUnavailableError);
+    expect(reachedLaterWrite).toBe(false);
+    expect(await t.db.select().from(things)).toHaveLength(0);
+  });
+
+  it("recognises a missing savepoint as transaction-ending", () => {
+    expect(abortsTransaction(Object.assign(new Error("SAVEPOINT sp1 does not exist"), { errno: 1305 }))).toBe(true);
+  });
+
   it("allows one tap at a time", () => {
     install({ listens: () => false, onRecorded: async () => undefined });
     expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/already installed/u);
@@ -182,6 +217,7 @@ describe("trigger catalogue", () => {
       for (const field of entry.fields) if (field.personal) expect(field.from).toBe("context");
     }
     expect(CATALOGUE_EVENT_NAMES.has("backup.archive.failed")).toBe(true);
+    expect(CATALOGUE_EVENT_NAMES.has("backup.policy.unmet")).toBe(true);
   });
 
   it("covers the initial list from the contract", () => {

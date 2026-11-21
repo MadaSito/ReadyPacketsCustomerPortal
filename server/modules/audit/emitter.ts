@@ -91,17 +91,30 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
       return;
     }
     tapStats.offered += 1;
+    const tapEvent = toTapEvent(envelope);
+    let callbackError: unknown;
     try {
-      const tapEvent = toTapEvent(envelope);
-      // Savepoint: a tap with several writes either lands completely or not at all (review J-A01 advisory).
-      if (tx) await tx.transaction((savepoint) => current.onRecorded(tapEvent, savepoint));
-      else await current.onRecorded(tapEvent, undefined);
+      // Savepoint: a tap with several writes either lands completely or not at all. The callback's own error is kept,
+      // because Drizzle's ROLLBACK TO SAVEPOINT replaces it with 1305 when InnoDB has already dropped the transaction.
+      if (tx) {
+        await tx.transaction(async (savepoint) => {
+          try {
+            await current.onRecorded(tapEvent, savepoint);
+          } catch (error) {
+            callbackError = error;
+            throw error;
+          }
+        });
+      } else {
+        await current.onRecorded(tapEvent, undefined);
+      }
     } catch (error) {
       tapStats.failures += 1;
       tapStats.lastFailureAt = deps.clock.now().toISOString();
-      log.error("audit tap failed; automation trigger not enqueued", { event_name: envelope.event_name, in_transaction: tx !== undefined, error });
-      // The database already rolled the transaction back: carrying on would commit the rest outside it.
-      if (tx !== undefined && abortsTransaction(error)) throw new AuditUnavailableError();
+      const fatal = tx !== undefined && (abortsTransaction(callbackError) || abortsTransaction(error));
+      log.error("audit tap failed; automation trigger not enqueued", { event_name: envelope.event_name, in_transaction: tx !== undefined, transaction_lost: fatal, error: callbackError ?? error });
+      // The surrounding transaction is gone or unknown: carrying on would autocommit the rest of the caller's writes.
+      if (fatal) throw new AuditUnavailableError();
     }
   }
 

@@ -223,6 +223,14 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     fields: [f("reason_code", "Reason", "string"), f("connection_public_id", "Storage connection", "public_id"), f("attempt_count", "Attempts", "number")], recipients: [ADMINS],
   },
   {
+    key: "backup.policy_unmet", label: "3-2-1 backup policy not met", group: "Operations", owner: "backup",
+    description: "Recent verified backups do not satisfy all three 3-2-1 conditions (three copies, two storage systems, one off-site).",
+    eventName: "backup.policy.unmet", outcomes: ["failed"], resourceType: "backup_policy",
+    fields: [f("reason_code", "Reason", "string"), f("verified_copies", "Verified copies", "number"), f("storage_systems", "Storage systems", "number"),
+      f("offsite_copies", "Off-site copies", "number"), f("window_days", "Evaluation window (days)", "number")],
+    recipients: [ADMINS],
+  },
+  {
     key: "mail.delivery_failed", label: "E-mail delivery failed", group: "Operations", owner: "jobs",
     description: "An e-mail could not be delivered. Failures of mail sent by an automation never trigger automations.",
     eventName: "job.mail.failed", outcomes: ["failed"], resourceType: "mail",

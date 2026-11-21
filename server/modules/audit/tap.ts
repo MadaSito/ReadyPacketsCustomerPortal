@@ -84,8 +84,12 @@ export function toTapEvent(envelope: AuditEnvelope): AuditTapEvent {
   });
 }
 
-/** MySQL errors after which InnoDB has rolled back (or may have rolled back) the whole transaction. */
-const TX_ABORTING_ERRNO = new Set([1213, 1205]);
+/**
+ * MySQL errors after which the caller's transaction can no longer be trusted: 1213 deadlock and 1205 lock-wait
+ * timeout (InnoDB rolls back the transaction, or may with innodb_rollback_on_timeout) and 1305 "savepoint does not
+ * exist" (the savepoint vanished because the transaction was rolled back underneath it). Review J-A02.
+ */
+const TX_ABORTING_ERRNO = new Set([1213, 1205, 1305]);
 
 export function abortsTransaction(error: unknown): boolean {
   let current: unknown = error;
