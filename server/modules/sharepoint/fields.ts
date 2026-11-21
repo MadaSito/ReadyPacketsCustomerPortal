@@ -14,15 +14,16 @@ export interface ListColumn {
   name: string;
   displayName: string;
   type: ListColumnType;
-  /** Only the idempotency column is indexed (needed for $filter on large lists). */
+  /** Only the idempotency column is indexed and unique (needed for $filter; refuses a second item per order). */
   indexed?: boolean;
+  unique?: boolean;
 }
 
 export const ORDER_ID_COLUMN = "RpOrderId";
 export const PORTAL_LINK_COLUMN = "RpPortalLink";
 
 export const LIST_COLUMNS: readonly ListColumn[] = [
-  { name: ORDER_ID_COLUMN, displayName: "Order ID", type: "text", indexed: true },
+  { name: ORDER_ID_COLUMN, displayName: "Order ID", type: "text", indexed: true, unique: true },
   { name: "RpCustomerRef", displayName: "Customer reference", type: "text" },
   { name: "RpStatus", displayName: "Status", type: "text" },
   { name: "RpPackets", displayName: "Packets", type: "text" },
@@ -71,7 +72,7 @@ export function safeText(value: string, max = TEXT_MAX): string {
 
 /** Minor units → major units using the currency's ISO exponent (JPY 0, USD 2, KWD 3). */
 export function toMajor(minor: number, currency: string): number {
-  let digits = 2;
+  let digits: number;
   try {
     digits = new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits ?? 2;
   } catch {
@@ -126,16 +127,23 @@ export function portalLinkFor(canonicalOrigin: string, orderPublicId: string): s
 /** Graph column definition for list creation. */
 export function columnDefinition(column: ListColumn): Record<string, unknown> {
   const base: Record<string, unknown> = { name: column.name, displayName: column.displayName, indexed: column.indexed === true };
+  if (column.unique) base.enforceUniqueValues = true;
   if (column.type === "text") base.text = { maxLength: TEXT_MAX };
   if (column.type === "number") base.number = { decimalPlaces: "automatic" };
   if (column.type === "dateTime") base.dateTime = { format: "dateTime" };
   return base;
 }
 
-/** A list is compatible when every required column exists with the expected type. */
+/** A list is compatible when every required column exists with the expected type (and uniqueness for the key). */
 export function isCompatible(columns: readonly Record<string, unknown>[]): boolean {
   return LIST_COLUMNS.every((required) =>
-    columns.some((c) => c.name === required.name && typeof c[required.type] === "object" && c[required.type] !== null),
+    columns.some(
+      (c) =>
+        c.name === required.name &&
+        typeof c[required.type] === "object" &&
+        c[required.type] !== null &&
+        (!required.unique || (c.enforceUniqueValues === true && c.indexed === true)),
+    ),
   );
 }
 

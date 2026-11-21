@@ -16,6 +16,7 @@
 import { and, asc, count, eq, gt, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
+import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, DbOrTx, JobResult, SessionPrincipal, Tx } from "../../core/types.js";
 import { graphDriveDiscovery } from "../storage/adapters/graphDrive.js";
 import { StorageAdapterError } from "../storage/adapters/graphDriveErrors.js";
@@ -29,6 +30,7 @@ export const SYNC_JOB = "sharepoint.sync_order";
 const CONFIG_ID = 1;
 const MAX_STATUS_PAGE = 100;
 const RESYNC_BATCH = 500;
+const CLAIM_MS = 10 * 60 * 1000;
 
 export interface SyncJobPayload {
   orderPublicId: string;
@@ -130,20 +132,20 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     await stage(event.orderPublicId, tx);
   }
 
-  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>): Promise<void> {
+  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string): Promise<void> {
     await db.transaction(async (tx) => {
       await job.assertStillOwned(tx);
       await tx
         .update(sharepointOrderSync)
-        .set({ state, reasonCode, attempts: sql`${sharepointOrderSync.attempts} + 1` })
-        .where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+        .set({ state, reasonCode, attempts: sql`${sharepointOrderSync.attempts} + 1`, claimJobId: null, claimToken: null, claimedUntil: null })
+        .where(and(eq(sharepointOrderSync.orderPublicId, orderPublicId), eq(sharepointOrderSync.claimToken, claimToken)));
       await tx.update(sharepointSyncConfig).set({ lastErrorCode: reasonCode, lastErrorAt: clock.now() }).where(eq(sharepointSyncConfig.id, CONFIG_ID));
       await audit.record(
         {
           category: "integration",
           eventName: "sharepoint.order.sync",
           action: "sync",
-          outcome: state === "unknown" ? "unknown" : "failure",
+          outcome: state === "unknown" ? "unknown" : "failed",
           reasonCode,
           actor: { role: "system" },
           resource: { type: "order", publicId: orderPublicId },
@@ -161,14 +163,31 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     const config = await readConfig(db);
     if (!config?.enabled || !config.listId) return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_DISABLED" };
     const listId = config.listId;
-    const [row] = await db.select().from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
-    if (!row) return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_NOT_STAGED" };
-    if (row.syncedVersion >= row.desiredVersion && row.listId === listId) return { outcome: "completed", safeCounts: { unchanged: 1 } };
+    const settingsVersion = config.version;
+
+    // Durable per-order write claim: jobs for different versions of one order never write concurrently.
+    // Everything below uses the snapshot locked here (never an earlier, possibly stale read).
+    const now = clock.now();
+    const claimToken = ulid(now.getTime());
+    const claim = await db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      const [locked] = await tx.select().from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
+      if (!locked) return { kind: "missing" as const };
+      if (locked.claimToken && locked.claimJobId !== job.jobId && locked.claimedUntil && locked.claimedUntil > now) return { kind: "busy" as const };
+      if (locked.syncedVersion >= locked.desiredVersion && locked.listId === listId) return { kind: "caught_up" as const };
+      await tx.update(sharepointOrderSync).set({ claimJobId: job.jobId, claimToken, claimedUntil: new Date(now.getTime() + CLAIM_MS) }).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+      return { kind: "claimed" as const, row: locked };
+    });
+    if (claim.kind === "missing") return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_NOT_STAGED" };
+    if (claim.kind === "caught_up") return { outcome: "completed", safeCounts: { unchanged: 1 } };
+    if (claim.kind === "busy") return { outcome: "failed", reasonCode: "SHAREPOINT_SYNC_BUSY", retryable: true };
+    const row = claim.row;
     const targetVersion = row.desiredVersion;
+    const ownsClaim = and(eq(sharepointOrderSync.orderPublicId, orderPublicId), eq(sharepointOrderSync.claimToken, claimToken));
 
     const destination = await assignedDestination(db);
     if (!destination) {
-      await markFailure(orderPublicId, "SHAREPOINT_NOT_CONFIGURED", "failed", job);
+      await markFailure(orderPublicId, "SHAREPOINT_NOT_CONFIGURED", "failed", job, claimToken);
       return { outcome: "failed", reasonCode: "SHAREPOINT_NOT_CONFIGURED", retryable: false };
     }
 
@@ -183,7 +202,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
       const order = await deps.services.orders.getOrderSyncView(orderPublicId);
       if (!order) {
-        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job);
+        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken);
         return { outcome: "failed", reasonCode: "SHAREPOINT_ORDER_NOT_FOUND", retryable: false };
       }
       const owner = await deps.services.identity.getUser(order.ownerUserId);
@@ -203,7 +222,10 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
           throw new StorageAdapterError("DESTINATION_DENIED", false);
         }
         const current = await readConfig(db);
-        if (!current?.enabled || current.listId !== listId) throw new StorageAdapterError("NOT_CONFIGURED", false);
+        // Any settings change (list, portal-link policy, disable) invalidates the rendered fields.
+        if (!current?.enabled || current.listId !== listId || current.version !== settingsVersion) throw new StorageAdapterError("NOT_CONFIGURED", false);
+        const [mine] = await db.select({ token: sharepointOrderSync.claimToken, until: sharepointOrderSync.claimedUntil }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+        if (mine?.token !== claimToken || !mine.until || mine.until <= clock.now()) throw new StorageAdapterError("OUTCOME_UNKNOWN", false);
       };
 
       let itemId: string | null = null;
@@ -219,34 +241,49 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
         action = "updated";
       } else {
         await beforeWrite();
-        itemId = await list.createItem(listId, fields, beforeWrite);
-        action = "created";
+        try {
+          itemId = await list.createItem(listId, fields, beforeWrite);
+          action = "created";
+        } catch (error) {
+          // The unique RpOrderId column refused a second item: read the existing one back and update it.
+          if (!(error instanceof StorageAdapterError && error.code === "DESTINATION_CONFLICT")) throw error;
+          const existing = await list.findByOrderId(listId, orderPublicId);
+          if (!existing) throw error;
+          itemId = existing;
+          await beforeWrite();
+          await list.updateItem(listId, itemId, fields, beforeWrite);
+          action = "updated";
+        }
       }
       // Identity of the object after the write (§4.1 H).
       if (action !== "unchanged" && !(await list.verifyItem(listId, itemId, orderPublicId))) throw new StorageAdapterError("INTEGRITY_MISMATCH", false);
 
       await db.transaction(async (tx) => {
         await job.assertStillOwned(tx);
-        const [latest] = await tx.select({ v: sharepointOrderSync.desiredVersion }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
+        const [latest] = await tx.select({ v: sharepointOrderSync.desiredVersion, token: sharepointOrderSync.claimToken }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
+        if (latest?.token !== claimToken) throw new StorageAdapterError("OUTCOME_UNKNOWN", false);
         await tx
           .update(sharepointOrderSync)
           .set({
             listId,
             remoteItemId: itemId,
             contentHash: hash,
-            syncedVersion: targetVersion,
+            syncedVersion: sql`GREATEST(${sharepointOrderSync.syncedVersion}, ${targetVersion})`,
             state: (latest?.v ?? targetVersion) > targetVersion ? "pending" : "synced",
             reasonCode: null,
             attempts: sql`${sharepointOrderSync.attempts} + 1`,
             lastSyncedAt: clock.now(),
+            claimJobId: null,
+            claimToken: null,
+            claimedUntil: null,
           })
-          .where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
+          .where(ownsClaim);
         await audit.record(
           {
             category: "integration",
             eventName: "sharepoint.order.sync",
             action: "sync",
-            outcome: "success",
+            outcome: "completed",
             actor: { role: "system" },
             resource: { type: "order", publicId: orderPublicId },
             jobId: job.jobId,
@@ -261,7 +298,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     } catch (error) {
       if (!(error instanceof StorageAdapterError) && !(error instanceof DomainError)) throw error; // lost fence etc.
       const { reasonCode, retryable } = reasonFor(error);
-      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job);
+      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken);
       return { outcome: "failed", reasonCode, retryable };
     }
   }
@@ -308,13 +345,13 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     return { list: createListClient(port, creds, siteId), connectionPublicId, siteId, siteLabel: view.name };
   }
 
-  async function adminAudit(principal: SessionPrincipal, eventName: string, action: string, tx: Tx, extra: { reasonCode?: string; outcome?: "success" | "failure"; safeCounts?: Record<string, number> } = {}) {
+  async function adminAudit(principal: SessionPrincipal, eventName: string, action: string, tx: Tx, extra: { reasonCode?: string; outcome?: "completed" | "failed"; safeCounts?: Record<string, number> } = {}) {
     await audit.record(
       {
         category: "admin",
         eventName,
         action,
-        outcome: extra.outcome ?? "success",
+        outcome: extra.outcome ?? "completed",
         ...(extra.reasonCode ? { reasonCode: extra.reasonCode } : {}),
         ...(extra.safeCounts ? { safeCounts: extra.safeCounts } : {}),
         actor: { userId: principal.userId, role: principal.role },
@@ -449,7 +486,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       async test(principal: SessionPrincipal) {
         const config = await guard(principal, (tx) => readConfig(tx));
         const result = await testList(principal, config?.listId ?? null);
-        await guard(principal, (tx) => adminAudit(principal, "sharepoint.sync.tested", "test", tx, { outcome: result.ok ? "success" : "failure", reasonCode: result.code }));
+        await guard(principal, (tx) => adminAudit(principal, "sharepoint.sync.tested", "test", tx, { outcome: result.ok ? "completed" : "failed", reasonCode: result.code }));
         return result;
       },
 

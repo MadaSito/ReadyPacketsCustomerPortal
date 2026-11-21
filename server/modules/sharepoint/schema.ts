@@ -37,6 +37,11 @@ export const sharepointOrderSync = mysqlTable(
     attempts: int("attempts", { unsigned: true }).notNull().default(0),
     reasonCode: varchar("reason_code", { length: 64 }),
     lastSyncedAt: utcDateTime("last_synced_at"),
+    /** Durable per-order write claim across queued versions (one writer per order at a time). */
+    claimJobId: varchar("claim_job_id", { length: 64 }),
+    /** Fresh per claim (a retry of the same job gets a new token); publish/release require it. */
+    claimToken: char("claim_token", { length: 26 }),
+    claimedUntil: utcDateTime("claimed_until"),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
   },

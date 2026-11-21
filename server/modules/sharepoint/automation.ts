@@ -13,11 +13,14 @@ export const syncOrderAction: AutomationActionRegistration<z.infer<typeof config
   configSchema,
   configFields: [],
   requiresOrderContext: true,
+  // External order-data sink: never driven by staff-only triggers (J-A01).
+  forbidOnStaffOnlyTrigger: true,
   supportedTriggerModes: ["event", "manual"],
   // Only enqueues a DB job keyed by the step idempotency key; the job itself is idempotent by order public id.
   retrySafe: true,
   async run(ctx) {
     if (ctx.dryRun) return { outcome: "skipped", reasonCode: "SHAREPOINT_SYNC_DRY_RUN" };
+    if (ctx.staffOnlyTrigger) return { outcome: "skipped", reasonCode: "SHAREPOINT_SYNC_STAFF_ONLY_TRIGGER" };
     if (!ctx.orderPublicId) return { outcome: "skipped", reasonCode: "SHAREPOINT_SYNC_NO_ORDER" };
     await ctx.assertStillOwned();
     const sharepoint = (ctx.deps.services as { sharepoint?: { enqueueOrder: (id: string, o: { correlationId: string; idempotencyKey: string }) => Promise<string> } }).sharepoint;

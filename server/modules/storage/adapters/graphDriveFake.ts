@@ -28,6 +28,8 @@ interface FakeDrive {
 export interface FakeListColumn {
   name: string;
   type: "text" | "number" | "dateTime" | "hyperlinkOrPicture";
+  /** Graph `enforceUniqueValues` (requires `indexed`). */
+  unique?: boolean;
 }
 
 interface FakeList {
@@ -296,7 +298,11 @@ export class FakeGraph implements GraphHttpPort {
         const list: FakeList = {
           id: randomUUID(),
           displayName: String(body.displayName),
-          columns: columns.map((c) => ({ name: String(c.name), type: (["text", "number", "dateTime", "hyperlinkOrPicture"] as const).find((t) => t in c) ?? "text" })),
+          columns: columns.map((c) => ({
+            name: String(c.name),
+            type: (["text", "number", "dateTime", "hyperlinkOrPicture"] as const).find((t) => t in c) ?? "text",
+            unique: c.enforceUniqueValues === true && c.indexed === true,
+          })),
           items: new Map(),
         };
         if ([...site.lists.values()].some((l) => l.displayName.toLowerCase() === list.displayName.toLowerCase())) return err(409);
@@ -308,11 +314,13 @@ export class FakeGraph implements GraphHttpPort {
     const list = site.lists.get(listId);
     if (!list) return err(404);
     if (!sub && method === "GET") return ok(200, { id: list.id, displayName: list.displayName });
-    if (sub === "columns" && method === "GET") return ok(200, { value: list.columns.map((c) => ({ name: c.name, [c.type]: {} })) });
+    if (sub === "columns" && method === "GET") return ok(200, { value: list.columns.map((c) => ({ name: c.name, [c.type]: {}, indexed: c.unique === true, enforceUniqueValues: c.unique === true })) });
     if (sub === "items" && !itemId && method === "POST") {
       const fields = (body.fields ?? {}) as Record<string, unknown>;
       const unknown = Object.keys(fields).filter((k) => k !== "Title" && !list.columns.some((c) => c.name === k));
       if (unknown.length > 0) return err(400, "invalidRequest");
+      const duplicate = list.columns.some((c) => c.unique && fields[c.name] !== undefined && [...list.items.values()].some((i) => i.fields[c.name] === fields[c.name]));
+      if (duplicate) return err(409, "nameAlreadyExists");
       const id = String(list.items.size + 1);
       list.items.set(id, { id, fields: { ...fields } });
       return ok(201, { id, fields });

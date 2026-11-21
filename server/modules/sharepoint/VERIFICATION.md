@@ -1,0 +1,29 @@
+# SharePoint module: verification (increment 03)
+
+All tests ran against **local fakes only**: `FakeGraph` (`storage/adapters/graphDriveFake.ts`), fake storage connections, fake orders and identity, and the local dev MySQL test database. **Nothing was tested against a real Microsoft 365 tenant or the real integrations Graph client.** That client (`server/modules/integrations/graph/**`) did not exist when these tests ran. The binding is typed structurally from integrations API.md §1.2 and tested against a stub only.
+
+| File | Result |
+| --- | --- |
+| storage/adapters/graphDrive.test.ts | 16 passed |
+| storage/adapters/graphDriveGraph.test.ts | 5 passed |
+| storage/adapters/graphDriveQuickXor.test.ts | 2 passed. Vectors come from https://github.com/shawze/quickxorhash and https://pkg.go.dev/github.com/excelano/quickxorhash@v1.0.0 |
+| sharepoint/folderLabels.test.ts | 6 passed |
+| sharepoint/sharepoint.test.ts | 16 passed |
+
+The scoped typecheck (`tc.sh`) and lint are clean for these paths.
+
+What the tests cover:
+- Host-lineage refusal before any bytes are sent; no auth on upload calls; session cancel; resume.
+- Fence loss, both in the adapter and in the transport.
+- Integrity mismatch; idempotent existing objects and conflicts.
+- Discovery.
+- Ships disabled.
+- List compatibility (including the uniqueness requirement); create and update idempotency by order ID; recovery after a lost remote ID.
+- Unique-conflict readback; claim serialisation; a stale job is not allowed to regress the version.
+- A settings-version change before dispatch; revocation and destination-generation changes; lost fence.
+- Step-up denial audit; the staff-only trigger veto.
+
+Not verified:
+- Real Graph behaviour, including `enforceUniqueValues` on list columns, `$filter` on indexed columns, upload-session semantics and throttling.
+- Container start-up wiring, which is only covered by typechecking.
+- The UI.
