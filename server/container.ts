@@ -41,6 +41,7 @@ import { createIntegrationsModule, type IntegrationsModule } from "./modules/int
 import { createStorageModule, type StorageModule } from "./modules/storage/index.js";
 import { registerStorageOAuthAdapters } from "./modules/storage/oauth/register.js";
 import { createSharepointModule, type SharepointModule } from "./modules/sharepoint/index.js";
+import { createMailTemplatesModule, type MailTemplatesModule } from "./modules/mailTemplates/index.js";
 
 export interface ModuleRegistry {
   identity: IdentityModule;
@@ -60,6 +61,7 @@ export interface ModuleRegistry {
   integrations: IntegrationsModule;
   storageConnections: StorageModule;
   sharepoint: SharepointModule;
+  mailTemplates: MailTemplatesModule;
 }
 
 /** Everything a request handler can reach: infrastructure + every module. */
@@ -127,6 +129,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.storageConnections = createStorageModule(deps);
   registerStorageOAuthAdapters(services);
   services.sharepoint = createSharepointModule(deps);
+  services.mailTemplates = createMailTemplatesModule(deps);
   services.sessionResolver = {
     // Late-bound so the identity module owns session truth without the container knowing its shape.
     resolve: (credentials) => services.identity.sessionResolver.resolve(credentials),
@@ -149,6 +152,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.integrations,
     services.storageConnections,
     services.sharepoint,
+    services.mailTemplates,
   ];
   services.allModules = modules;
   for (const module of modules) module.init?.();
