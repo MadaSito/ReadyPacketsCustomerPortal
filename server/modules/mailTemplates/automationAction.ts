@@ -182,7 +182,7 @@ async function runSendTemplateAction(
 
   const execWithAutomationCorrelation = <T>(fn: () => Promise<T>): Promise<T> =>
     runWithRequestContext(
-      newRequestContext({ origin: "worker", correlationId: ctx.correlationId }),
+      newRequestContext("worker", { correlationId: ctx.correlationId }),
       fn,
     );
 
@@ -199,7 +199,7 @@ async function runSendTemplateAction(
     const vars = resolveTemplateVarsForRecipient(
       declaredVars,
       ctx.fields,
-      deps.config.canonicalOrigin,
+      deps.services.config.canonicalOrigin,
       null,
     );
     await execWithAutomationCorrelation(() =>
@@ -273,7 +273,7 @@ async function runSendTemplateAction(
     const vars = resolveTemplateVarsForRecipient(
       declaredVars,
       ctx.fields,
-      deps.config.canonicalOrigin,
+      deps.services.config.canonicalOrigin,
       displayName,
     );
 
