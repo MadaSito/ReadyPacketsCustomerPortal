@@ -18,7 +18,7 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0011 | Consent-gated analytics (Microsoft Clarity, PostHog) | Accepted |
 | 0012 | Toolchain: TypeScript 7 for type checking, TypeScript 6 for lint | Accepted |
 | 0013 | Transaction and lock discipline | Accepted |
-| 0014 | Payments recorded manually; Stripe adapter disabled | Accepted |
+| 0014 | Payments recorded manually; Stripe adapter disabled | Partially superseded by 0035 |
 | 0015 | Restore is an operator procedure, never a web action | Accepted |
 | 0016 | Preview profile requires a synthetic-data acknowledgement | Accepted |
 | 0017 | SIEM delivery states what was actually confirmed | Accepted |
@@ -33,3 +33,12 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0026 | Automations: curated triggers, registered actions, recorded runs | Accepted |
 | 0027 | Cloud storage connections are copy destinations; local storage stays the system of record | Accepted |
 | 0028 | Order workflow designer edits drafts; publishing creates a version | Accepted |
+| 0029 | Workflow phases lock on exit; uploads and acknowledgements are requirements on a status | Accepted (owner confirmation requested) |
+| 0030 | Audio is recorded in the browser and converted to WebM by a sandboxed worker job | Accepted (owner confirmation requested) |
+| 0031 | Application-level protection layer: managed rules, IP lists, country rules, tunable rate limits | Accepted (owner confirmation requested) |
+| 0032 | Session centre, restrictions, forced ends and a customer maintenance mode | Accepted (owner confirmation requested) |
+| 0033 | Knowledge base, optional community forum and referral programme | Accepted (owner confirmation requested) |
+| 0034 | Inbound API v1 with scoped keys, signed webhooks, searchable logs and audited re-run | Accepted (owner confirmation requested) |
+| 0035 | Card payments through hosted Stripe or Square checkout (partially supersedes 0014) | Accepted (owner confirmation requested) |
+| 0036 | Consent before any non-essential storage, with a server-side ledger (extends 0011) | Accepted (owner confirmation requested) |
+| 0037 | Accessibility target WCAG 2.2 AA; customer sidebar navigation and visible theme control | Accepted (owner confirmation requested) |
