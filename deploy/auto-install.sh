@@ -507,7 +507,7 @@ SQL
 
 prepare_nginx() {
     say 'Preparing Nginx'
-    local entry stock
+    local entry stock removed_default=0
     shopt -s nullglob
     for entry in "$nginx_dir"/sites-enabled/* "$nginx_dir"/conf.d/*; do
         case $entry in
@@ -525,12 +525,19 @@ prepare_nginx() {
            $(md5sum < "$nginx_dir/sites-available/default" | cut -d' ' -f1) == "$stock" ]] ||
             die 'the Nginx default site was modified; disable it yourself after checking it serves nothing else'
         rm -f -- "$entry"
+        removed_default=1
         note 'switched off the packaged default page'
     fi
     nginx -t
     systemctl enable --quiet nginx
-    systemctl start nginx
-    systemctl reload nginx
+    if ((removed_default)) && systemctl is-active --quiet nginx; then
+        # A restart rather than a reload: a reload is applied in the background, and until then the
+        # packaged page would still answer (and log) the checks that follow. Nothing else is served yet.
+        systemctl restart nginx
+    else
+        systemctl start nginx
+        systemctl reload nginx
+    fi
 }
 
 names_in_certificate() {  # names_in_certificate <pem>: succeeds when every configured name is covered
