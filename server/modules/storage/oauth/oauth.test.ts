@@ -142,9 +142,18 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
   it("checks authorization again after exchange and refuses malformed or missing offline grants", async () => {
     const f = await fixture("google_drive");
     f.network.mockResolvedValueOnce(response(200, { ...grant, refresh_token: undefined }));
-    const makeHandle = async () => f.oauth.park("google_drive", callbackData(await f.oauth.start(f.principal, f.target)));
+    const makeHandle = async () => {
+      const start = await f.oauth.start(f.principal, f.target);
+      const authorize = new URL(start.authorizeUrl);
+      expect(authorize.origin).toBe("https://accounts.google.com");
+      expect(authorize.searchParams.get("scope")).toBe("https://www.googleapis.com/auth/drive.file");
+      expect(authorize.searchParams.get("prompt")).toBe("consent select_account");
+      return f.oauth.park("google_drive", callbackData(start));
+    };
     await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
     f.network.mockResolvedValueOnce(response(200, { ...grant, token_type: "invalid" }));
+    await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
+    f.network.mockResolvedValueOnce(response(200, { ...grant, scope: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.file" }));
     await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
     f.network.mockImplementationOnce(async () => { f.revokeSession(); return response(200, grant); });
     await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();

@@ -149,7 +149,7 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
       const row = await claimParked(handle);
       const provider = row.provider === "dropbox" || row.provider === "google_drive" ? row.provider : undefined;
       if (!provider) throw callbackDenied();
-      const target = { provider, publicId: row.connectionPublicId, expectedVersion: row.expectedVersion };
+      const target: OAuthTarget = { provider, publicId: row.connectionPublicId, expectedVersion: row.expectedVersion };
       let initiator: AuditActor | undefined;
       let grantAcquired = false;
       try {

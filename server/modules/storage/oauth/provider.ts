@@ -46,7 +46,7 @@ export function authorizationUrl(provider: StorageOAuthProvider, redirectUri: st
     client_id: clientId, redirect_uri: redirectUri, response_type: "code", state,
     code_challenge_method: "S256", code_challenge: createHash("sha256").update(verifier).digest("base64url"),
     ...(provider === "dropbox" ? { token_access_type: "offline", scope: DROPBOX_SCOPE } :
-      { access_type: "offline", prompt: "consent", scope: DRIVE_SCOPE }),
+      { access_type: "offline", prompt: "consent select_account", scope: DRIVE_SCOPE }),
   }).toString();
   return url.href;
 }
@@ -58,8 +58,8 @@ function form(parameters: Record<string, string>, signal?: AbortSignal): EgressF
 
 function grantedScopes(provider: StorageOAuthProvider, scope: string): boolean {
   const requested = (provider === "dropbox" ? DROPBOX_SCOPE : DRIVE_SCOPE).split(" ");
-  const granted = new Set(scope.split(/\s+/));
-  return requested.every((value) => granted.has(value));
+  const granted = new Set(scope.trim().split(/\s+/));
+  return granted.size === requested.length && requested.every((value) => granted.has(value));
 }
 
 async function requestGrant(
