@@ -12,7 +12,7 @@
  *                                                              the SAME live session; effect in one tx
  * Nothing in the callback URL is logged; nothing sensitive is ever placed in a redirect.
  */
-import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../../core/errors.js";
 import { randomToken, ulid } from "../../../core/ids.js";
@@ -268,10 +268,10 @@ export function createSsoService(i: SsoInternals) {
       if (!isTenantGuid(t)) throw bad("tenantId", "The tenant ID must be a directory (tenant) ID in GUID format.");
     }
     if (input.clientId !== null && !isTenantGuid(input.clientId.trim().toLowerCase())) throw bad("clientId", "The application (client) ID must be a GUID.");
-    if (typeof input.clientSecret === "string" && (input.clientSecret.length < 16 || input.clientSecret.length > 512 || /[\s\u0000-\u001f]/.test(input.clientSecret))) {
+    if (typeof input.clientSecret === "string" && (input.clientSecret.length < 16 || input.clientSecret.length > 512 || /[\s\p{Cc}]/u.test(input.clientSecret))) {
       throw bad("clientSecret", "The client secret value looks incomplete. Paste the secret's Value, not its ID.");
     }
-    if (input.buttonLabel !== null && (input.buttonLabel.trim().length < 3 || input.buttonLabel.length > 40 || /[\u0000-\u001f<>]/.test(input.buttonLabel))) {
+    if (input.buttonLabel !== null && (input.buttonLabel.trim().length < 3 || input.buttonLabel.length > 40 || /[\p{Cc}<>]/u.test(input.buttonLabel))) {
       throw bad("buttonLabel", "The button label must be 3–40 characters.");
     }
     if (input.allowedDomains.length > 20 || !input.allowedDomains.every((d) => isValidDomain(d.trim().toLowerCase()))) {
@@ -288,13 +288,8 @@ export function createSsoService(i: SsoInternals) {
   async function adminView(tx?: Tx): Promise<SsoAdminView> {
     const row = await loadConfig(tx);
     const [linked] = await (tx ?? deps.db).select({ n: sql<number>`count(*)` }).from(ssoIdentities).where(eq(ssoIdentities.provider, "entra"));
-    let breakGlass: SsoAdminView["breakGlass"] = null;
-    try {
-      // Same transaction (never a second pool connection while locks are held).
-      breakGlass = await deps.services.assurance.breakGlassHealth(tx);
-    } catch {
-      breakGlass = null;
-    }
+    // Same transaction (never a second pool connection while locks are held). Advisory only: a failure hides the card.
+    const breakGlass: SsoAdminView["breakGlass"] = await deps.services.assurance.breakGlassHealth(tx).catch(() => null);
     return {
       enabled: row?.enabled === true,
       tenantId: row?.tenantId ?? null,
@@ -807,18 +802,20 @@ export function createSsoService(i: SsoInternals) {
   function verifyIdTokenWithNonceHash(idToken: string, key: Jwk, config: { tenantId: string; clientId: string }, nonceHash: string, nowSeconds: number): VerifiedEntraClaims {
     // The plaintext nonce is not stored; the claim is accepted only if hashToken(claim) equals the stored hash.
     const payload = idToken.split(".")[1] ?? "";
-    let claimNonce = "";
-    try {
-      const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { nonce?: unknown };
-      claimNonce = typeof parsed.nonce === "string" && parsed.nonce.length <= 128 ? parsed.nonce : "";
-    } catch {
-      throw new OidcValidationError("TOKEN_MALFORMED");
-    }
-    if (!claimNonce || hash(claimNonce) !== nonceHash) {
-      // Still verify the signature first so a forged token is reported as such.
-      verifyIdToken(idToken, key, { ...config, nonce: "\u0000", nowSeconds });
-    }
-    return verifyIdToken(idToken, key, { ...config, nonce: claimNonce, nowSeconds });
+    const readNonce = (): string => {
+      try {
+        const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { nonce?: unknown };
+        return typeof parsed.nonce === "string" && parsed.nonce.length <= 128 ? parsed.nonce : "";
+      } catch {
+        throw new OidcValidationError("TOKEN_MALFORMED");
+      }
+    };
+    const claimNonce = readNonce();
+    // Full validation first (signature, issuer, audience, tenant, times), so a forged token is reported as such.
+    const verified = verifyIdToken(idToken, key, { ...config, nonce: claimNonce || "\u0000", nowSeconds });
+    // Then the nonce must be the one this request stored. This check never depends on the token's own value.
+    if (!claimNonce || hash(claimNonce) !== nonceHash) throw new OidcValidationError("TOKEN_NONCE_MISMATCH");
+    return verified;
   }
 
   async function exchangeAndVerify(row: SsoConfigurationRow, req: SsoAuthRequestRow, code: string): Promise<VerifiedEntraClaims> {
