@@ -15,6 +15,7 @@ const targetSchema = z.strictObject({
   publicId: z.string().regex(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/),
   expectedVersion: z.number().int().min(1).max(4_294_967_295),
 });
+const finishSchema = z.strictObject({ attemptHandle: z.string().regex(opaqueSecret) });
 const cookieOptions = { httpOnly: true, secure: true, sameSite: "lax", path: "/" } as const;
 const cookieName = (state: string) => `__Host-rp_storage_oauth_${state.slice(0, 22)}`;
 
@@ -58,31 +59,40 @@ export function registerStorageOAuthRoutes(router: Router, services: Services): 
     await budget(`admin:${actor.userId}`);
     res.json(await oauth.disconnect(actor, target(req)));
   });
+  router.post("/storage/oauth/finish", async (req, res) => {
+    privateResponse(res);
+    const { context, session } = getHttpState(req);
+    await budget(session ? `admin:${session.userId}` : `ip:${rateLimitAddress(context.ipAddress)}`);
+    const parsed = finishSchema.safeParse(req.body);
+    if (!parsed.success) throw validation("STORAGE_OAUTH_INPUT_INVALID", "Restart storage consent from the storage connections page.");
+    await oauth.finish(parsed.data.attemptHandle, session);
+    res.json({ connected: true });
+  });
   router.get("/storage/oauth/callback/:provider", async (req, res) => {
     privateResponse(res);
     // Express GET routes also match HEAD. A preflight/probe must never consume one-time state.
     if (req.method !== "GET") { res.status(405).setHeader("Allow", "GET").end(); return; }
-    const { context, session } = getHttpState(req);
+    const { context } = getHttpState(req);
     await budget(`ip:${rateLimitAddress(context.ipAddress)}`);
     const provider = providerSchema.safeParse(req.params.provider);
     const { state, code, error } = req.query;
-    let outcome = "failed";
+    let destination = "/admin/storage?oauth=failed";
     if (provider.success && req.path === `/storage/oauth/callback/${provider.data}` && typeof state === "string" && opaqueSecret.test(state)) {
       const name = cookieName(state);
       const binder = readCookie(req, name);
       if (binder) {
         res.clearCookie(name, cookieOptions);
         try {
-          await oauth.callback(provider.data, {
-            state, binder, currentSession: session,
+          const handle = await oauth.park(provider.data, {
+            state, binder,
             code: error === undefined && typeof code === "string" && /^[\x21-\x7E]{1,3072}$/.test(code) ? code : undefined,
           });
-          outcome = "connected";
+          destination = `/admin/storage?oauth=finish#oauth-attempt=${handle}`;
         } catch {
           // A fixed redirect never discloses provider data, OAuth material or underlying exceptions.
         }
       }
     }
-    res.redirect(303, `/admin/storage?oauth=${outcome}`);
+    res.redirect(303, destination);
   });
 }

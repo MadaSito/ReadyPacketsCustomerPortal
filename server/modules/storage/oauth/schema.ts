@@ -8,7 +8,7 @@ export const storageOAuthAttempts = mysqlTable("storage_oauth_attempts", {
   expectedVersion: int("expected_version", { unsigned: true }).notNull(),
   redirectUri: varchar("redirect_uri", { length: 1024 }).notNull(),
   expiresAt: utcDateTime("expires_at").notNull(),
-  phase: varchar("phase", { length: 12 }).notNull(), // pending, exchanging or revoking
+  phase: varchar("phase", { length: 12 }).notNull(), // pending, parked, exchanging or revoking
   stateHash: char("state_hash", { length: 64 }).unique(),
   binderHash: char("binder_hash", { length: 64 }),
   payloadEnc: text("payload_enc"),

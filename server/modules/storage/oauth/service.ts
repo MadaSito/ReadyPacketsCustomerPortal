@@ -3,26 +3,29 @@ import { and, eq, lte } from "drizzle-orm";
 import type { Services } from "../../../container.js";
 import { conflict, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
-import { setRequestActor } from "../../../core/requestContext.js";
 import type { AuditOutcome, SessionPrincipal, Tx } from "../../../core/types.js";
 import { authorizationUrl, exchangeCode, revokeGrant, type OAuthApp, type StorageOAuthProvider, type StorageRequest } from "./provider.js";
 import { storageOAuthAttempts as attempts } from "./schema.js";
 
 export const OAUTH_TTL_MS = 5 * 60_000;
+export const OAUTH_PARK_TTL_MS = 2 * 60_000;
+const EXCHANGE_TTL_MS = 60_000;
 export const opaqueSecret = /^[A-Za-z0-9_-]{43}$/;
 export type OAuthTarget = { provider: StorageOAuthProvider; publicId: string; expectedVersion: number };
 type Attempt = typeof attempts.$inferSelect;
-type Material = { principal: SessionPrincipal; verifier: string };
-type DateKeys = "authenticatedAt" | "mfaVerifiedAt" | "stepUpAt";
-type SerializedMaterial = {
-  principal: Omit<SessionPrincipal, DateKeys> & { authenticatedAt: string; mfaVerifiedAt: string | null; stepUpAt: string | null };
+type Material = {
+  userId: number;
+  sessionId: string;
+  sessionBinding: string;
   verifier: string;
 };
+type Parked = { initiationEnc: string; code: string };
+type AuditActor = Pick<SessionPrincipal, "userId" | "role">;
 
 function aad(id: string): string { return `storage_oauth_attempts.payload:${id}`; }
 function randomSecret(): string { return randomBytes(32).toString("base64url"); }
 function sameHex(a: string | null, b: string): boolean {
-  return a !== null && a.length === b.length && timingSafeEqual(Buffer.from(a, "ascii"), Buffer.from(b, "ascii"));
+  return typeof a === "string" && a.length === b.length && timingSafeEqual(Buffer.from(a, "ascii"), Buffer.from(b, "ascii"));
 }
 
 export function storageRedirectUri(services: Pick<Services, "config">, provider: StorageOAuthProvider): string {
@@ -43,7 +46,7 @@ function readApp(setup: { config: Record<string, unknown>; credentials: Record<s
 }
 
 function audit(services: Services, target: OAuthTarget, action: "connect" | "disconnect" | "revoke", outcome: AuditOutcome,
-  actor: SessionPrincipal, attemptId: string, tx?: Tx, reasonCode?: string): Promise<void> {
+  actor: AuditActor, attemptId: string, tx?: Tx, reasonCode?: string): Promise<void> {
   return services.audit.record({
     category: "integration", eventName: `storage.oauth.${action}`, action, outcome, reasonCode, provider: target.provider,
     actor: { userId: actor.userId, role: actor.role }, resource: { type: "storage_connection", publicId: target.publicId },
@@ -66,30 +69,57 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
     await tx.insert(attempts).values(record);
   }
   const seal = (value: Material, id: string) => services.crypto.encrypt(JSON.stringify(value), aad(id));
-  function open(value: string, id: string): Material {
-    const { principal, verifier } = JSON.parse(services.crypto.decrypt(value, aad(id))) as SerializedMaterial;
-    return { principal: {
-      ...principal, authenticatedAt: new Date(principal.authenticatedAt), mfaVerifiedAt: principal.mfaVerifiedAt ? new Date(principal.mfaVerifiedAt) : null,
-      stepUpAt: principal.stepUpAt ? new Date(principal.stepUpAt) : null,
-    }, verifier };
-  }
+  const open = (value: string, id: string) => JSON.parse(services.crypto.decrypt(value, aad(id))) as Material;
+  const bindSession = (principal: SessionPrincipal) =>
+    services.crypto.blindIndex(principal.csrfSecret, "storage-oauth-session");
   async function assertMarker(tx: Tx, row: Attempt): Promise<void> {
     const [current] = await tx.select().from(attempts).where(owned(row.connectionPublicId, row.attemptId)).limit(1).for("update");
     if (!current || current.phase !== "exchanging" || current.expiresAt <= services.clock.now()) throw callbackDenied();
   }
   const callbackDenied = () => validation("STORAGE_OAUTH_CALLBACK_REJECTED", "The storage consent request expired or did not match. Try connecting again.");
-  async function claim(provider: StorageOAuthProvider, state: string, binder: string): Promise<Attempt> {
+  async function park(provider: StorageOAuthProvider, { state, binder, code }: {
+    state: string; binder: string; code?: string;
+  }): Promise<string> {
     if (!opaqueSecret.test(state) || !opaqueSecret.test(binder)) throw callbackDenied();
     const redirectUri = storageRedirectUri(services, provider);
     const stateHash = services.crypto.hashToken(state);
     const binderHash = services.crypto.hashToken(binder);
-    // Separate tx: the one-time claim commits before any provider work, including rejected codes.
-    return services.db.transaction(async (tx) => {
+    const handle = randomSecret();
+    const accepted = await services.db.transaction(async (tx) => {
       const [row] = await tx.select().from(attempts).where(eq(attempts.stateHash, stateHash)).limit(1).for("update");
       if (!row || row.provider !== provider || row.redirectUri !== redirectUri || row.phase !== "pending" ||
           row.expiresAt <= services.clock.now() || !row.payloadEnc || !sameHex(row.binderHash, binderHash)) throw callbackDenied();
-      await tx.update(attempts).set({ phase: "exchanging", stateHash: null, binderHash: null, payloadEnc: null })
-        .where(owned(row.connectionPublicId, row.attemptId));
+      if (!code) {
+        const material = open(row.payloadEnc, row.attemptId);
+        await audit(services, { provider, publicId: row.connectionPublicId, expectedVersion: row.expectedVersion },
+          "connect", "refused", { userId: material.userId, role: "admin" }, row.attemptId, tx, "STORAGE_OAUTH_CONSENT_NOT_GRANTED");
+        await tx.delete(attempts).where(owned(row.connectionPublicId, row.attemptId));
+        return false;
+      }
+      const payload: Parked = { initiationEnc: row.payloadEnc, code };
+      await tx.update(attempts).set({
+        phase: "parked", stateHash: services.crypto.hashToken(handle), binderHash: null,
+        payloadEnc: services.crypto.encrypt(JSON.stringify(payload), `${aad(row.attemptId)}:parked`),
+        expiresAt: new Date(services.clock.now().getTime() + OAUTH_PARK_TTL_MS),
+      }).where(owned(row.connectionPublicId, row.attemptId));
+      return true;
+    });
+    if (!accepted) throw callbackDenied();
+    return handle;
+  }
+
+  async function claimParked(handle: string): Promise<Attempt> {
+    if (!opaqueSecret.test(handle)) throw callbackDenied();
+    const handleHash = services.crypto.hashToken(handle);
+    // Commit the one-time claim before any live identity check or provider work. Missing/mismatched sessions
+    // burn a presented handle, and a failed or ambiguous exchange cannot repeat the provider effect.
+    return services.db.transaction(async (tx) => {
+      const [row] = await tx.select().from(attempts).where(eq(attempts.stateHash, handleHash)).limit(1).for("update");
+      if (!row || row.phase !== "parked" || row.expiresAt <= services.clock.now() || !row.payloadEnc) throw callbackDenied();
+      await tx.update(attempts).set({
+        phase: "exchanging", stateHash: null, binderHash: null, payloadEnc: null,
+        expiresAt: new Date(services.clock.now().getTime() + EXCHANGE_TTL_MS),
+      }).where(owned(row.connectionPublicId, row.attemptId));
       return row;
     });
   }
@@ -107,35 +137,36 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
           connectionPublicId: input.publicId, expectedVersion: input.expectedVersion, provider: input.provider, attemptId, redirectUri,
           expiresAt: new Date(services.clock.now().getTime() + OAUTH_TTL_MS), phase: "pending",
           stateHash: services.crypto.hashToken(state), binderHash: services.crypto.hashToken(binder),
-          payloadEnc: seal({ principal, verifier }, attemptId),
+          payloadEnc: seal({ userId: principal.userId, sessionId: principal.sessionId, sessionBinding: bindSession(principal), verifier }, attemptId),
         });
         await audit(services, input, "connect", "attempted", principal, attemptId, tx);
         return app.clientId;
       });
       return { authorizeUrl: authorizationUrl(input.provider, redirectUri, clientId, state, verifier), binder };
     },
-    async callback(provider: StorageOAuthProvider, input: {
-      state: string; binder: string; code?: string; currentSession?: SessionPrincipal | null;
-    }): Promise<void> {
-      const row = await claim(provider, input.state, input.binder);
+    park,
+    async finish(handle: string, currentSession: SessionPrincipal | null): Promise<void> {
+      const row = await claimParked(handle);
+      const provider = row.provider === "dropbox" || row.provider === "google_drive" ? row.provider : undefined;
+      if (!provider) throw callbackDenied();
       const target = { provider, publicId: row.connectionPublicId, expectedVersion: row.expectedVersion };
-      let principal: SessionPrincipal | undefined;
+      let initiator: AuditActor | undefined;
       let grantAcquired = false;
       try {
-        const material = open(row.payloadEnc!, row.attemptId);
-        principal = material.principal;
-        const actor = principal;
-        if (input.currentSession && (input.currentSession.sessionId !== actor.sessionId || input.currentSession.userId !== actor.userId)) {
+        const parked = JSON.parse(services.crypto.decrypt(row.payloadEnc!, `${aad(row.attemptId)}:parked`)) as Parked;
+        const material = open(parked.initiationEnc, row.attemptId);
+        initiator = { userId: material.userId, role: "admin" };
+        if (!currentSession || currentSession.sessionId !== material.sessionId || currentSession.userId !== material.userId ||
+            !sameHex(material.sessionBinding, bindSession(currentSession)) || storageRedirectUri(services, provider) !== row.redirectUri) {
           throw callbackDenied();
         }
+        const actor = currentSession;
         const app = await services.db.transaction(async (tx) => {
           const setup = await readSetup(actor, target, tx);
           await assertMarker(tx, row);
           return readApp(setup);
         });
-        setRequestActor({ userId: actor.userId, role: actor.role, sessionId: actor.sessionId });
-        if (!input.code) throw callbackDenied();
-        const grant = await exchangeCode(requestFor(provider), provider, app, { code: input.code, verifier: material.verifier, redirectUri: row.redirectUri });
+        const grant = await exchangeCode(requestFor(provider), provider, app, { code: parked.code, verifier: material.verifier, redirectUri: row.redirectUri });
         grantAcquired = true;
         await services.db.transaction(async (tx) => {
           await readSetup(actor, target, tx);
@@ -150,7 +181,7 @@ export function storageOAuthService(services: Services, requestFor: (provider: S
       } catch {
         // Deliberately do not revoke here: an ambiguous COMMIT or an expired revision could otherwise
         // revoke a valid grant. Incomplete connections can be removed in the provider's console.
-        if (principal) await audit(services, target, "connect", grantAcquired ? "unknown" : "failed", principal, row.attemptId, undefined,
+        if (initiator) await audit(services, target, "connect", grantAcquired ? "unknown" : "failed", initiator, row.attemptId, undefined,
           grantAcquired ? "STORAGE_OAUTH_GRANT_NOT_CONFIRMED" : "STORAGE_OAUTH_CALLBACK_REJECTED");
         throw callbackDenied();
       } finally {

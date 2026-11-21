@@ -21,7 +21,7 @@ import { reserveGoogleDriveFolder } from "./googleDriveFolders.js";
 import type { StorageRequest } from "./provider.js";
 import { registerStorageOAuthAdapters, requestForOAuthProvider } from "./register.js";
 import { storageGoogleDriveFolders, storageOAuthAttempts } from "./schema.js";
-import { OAUTH_TTL_MS, storageOAuthService } from "./service.js";
+import { OAUTH_PARK_TTL_MS, OAUTH_TTL_MS, storageOAuthService } from "./service.js";
 
 vi.mock("../../../trpc/root.js", () => ({ appRouter: undefined }));
 vi.mock("../../../http/moduleRoutes.js", () => ({ createModuleHttpRouter: vi.fn() }));
@@ -80,10 +80,18 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     expect(pending?.binderHash).not.toBe(input.binder);
     expect(pending?.payloadEnc).toMatch(/^rpenc:/);
     expect(JSON.stringify(pending)).not.toContain(f.principal.csrfSecret);
-    await expect(f.oauth.callback("google_drive", input)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
-    await expect(f.oauth.callback("dropbox", { ...input, binder: "Z".repeat(43) })).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
+    await expect(f.oauth.park("google_drive", input)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
+    await expect(f.oauth.park("dropbox", { ...input, binder: "Z".repeat(43) })).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
     expect(f.network).not.toHaveBeenCalled();
-    const results = await Promise.allSettled([f.oauth.callback("dropbox", input), f.oauth.callback("dropbox", input)]);
+    const parked = await Promise.allSettled([f.oauth.park("dropbox", input), f.oauth.park("dropbox", input)]);
+    expect(parked.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const handle = parked.find((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled")!.value;
+    const [stage] = await t.db.select().from(storageOAuthAttempts).where(eq(storageOAuthAttempts.connectionPublicId, f.target.publicId));
+    expect(stage).toMatchObject({ binderHash: null, phase: "parked", payloadEnc: expect.stringMatching(/^rpenc:/) });
+    expect(stage?.stateHash).not.toBe(pending?.stateHash);
+    expect(JSON.stringify(stage)).not.toContain(code);
+    expect(f.network).not.toHaveBeenCalled();
+    const results = await Promise.allSettled([f.oauth.finish(handle, f.principal), f.oauth.finish(handle, f.principal)]);
     expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
     expect(f.network).toHaveBeenCalledTimes(1);
     const [tokenUrl, opts] = f.network.mock.calls[0]!;
@@ -108,33 +116,38 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
   it("rejects admin session mismatch, expiration, config drift and revocation before reaching the provider", async () => {
     const f = await fixture();
     const first = await f.oauth.start(f.principal, f.target);
-    await expect(f.oauth.callback("dropbox", { ...callbackData(first), currentSession: fakePrincipal({ role: "admin" }) })).rejects.toThrow();
-    await expect(f.oauth.callback("dropbox", callbackData(first))).rejects.toThrow();
+    const handle = await f.oauth.park("dropbox", callbackData(first));
+    await expect(f.oauth.finish(handle, fakePrincipal({ role: "admin" }))).rejects.toThrow();
+    await expect(f.oauth.finish(handle, f.principal)).rejects.toThrow();
+    const withoutSession = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, f.target)));
+    await expect(f.oauth.finish(withoutSession, null)).rejects.toThrow();
+    await expect(f.oauth.finish(withoutSession, f.principal)).rejects.toThrow();
+    const parkExpired = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, f.target)));
+    f.h.clock.advance(OAUTH_PARK_TTL_MS + 1);
+    await expect(f.oauth.finish(parkExpired, f.principal)).rejects.toThrow();
     const expired = await f.oauth.start(f.principal, f.target);
     f.h.clock.advance(OAUTH_TTL_MS + 1);
-    await expect(f.oauth.callback("dropbox", callbackData(expired))).rejects.toThrow();
-    const changed = await f.oauth.start(f.principal, f.target);
+    await expect(f.oauth.park("dropbox", callbackData(expired))).rejects.toThrow();
+    const changed = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, f.target)));
     const updated = await f.h.services.storageConnections.connections.update(f.principal, {
       publicId: f.target.publicId, expectedVersion: f.target.expectedVersion, name: "Updated",
     });
-    await expect(f.oauth.callback("dropbox", callbackData(changed))).rejects.toThrow();
-    const revoked = await f.oauth.start(f.principal, { ...f.target, expectedVersion: updated.version });
+    await expect(f.oauth.finish(changed, f.principal)).rejects.toThrow();
+    const revoked = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, { ...f.target, expectedVersion: updated.version })));
     f.revokeSession();
-    await expect(f.oauth.callback("dropbox", callbackData(revoked))).rejects.toThrow();
+    await expect(f.oauth.finish(revoked, f.principal)).rejects.toThrow();
     expect(f.network).not.toHaveBeenCalled();
   });
 
   it("checks authorization again after exchange and refuses malformed or missing offline grants", async () => {
     const f = await fixture("google_drive");
     f.network.mockResolvedValueOnce(response(200, { ...grant, refresh_token: undefined }));
-    const first = await f.oauth.start(f.principal, f.target);
-    await expect(f.oauth.callback("google_drive", callbackData(first))).rejects.toThrow();
-    const second = await f.oauth.start(f.principal, f.target);
+    const makeHandle = async () => f.oauth.park("google_drive", callbackData(await f.oauth.start(f.principal, f.target)));
+    await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
     f.network.mockResolvedValueOnce(response(200, { ...grant, token_type: "invalid" }));
-    await expect(f.oauth.callback("google_drive", callbackData(second))).rejects.toThrow();
-    const third = await f.oauth.start(f.principal, f.target);
+    await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
     f.network.mockImplementationOnce(async () => { f.revokeSession(); return response(200, grant); });
-    await expect(f.oauth.callback("google_drive", callbackData(third))).rejects.toThrow();
+    await expect(f.oauth.finish(await makeHandle(), f.principal)).rejects.toThrow();
     const [row] = await t.db.select().from(storageConnections).where(eq(storageConnections.publicId, f.target.publicId));
     expect(row?.oauthConnected).toBe(false);
     expect(f.h.audit.named("storage.oauth.connect").map(({ outcome }) => outcome)).not.toContain("completed");
@@ -142,11 +155,11 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
 
   it("fails closed and consumes state if the high-impact audit cannot be persisted", async () => {
     const f = await fixture();
-    const start = callbackData(await f.oauth.start(f.principal, f.target));
+    const handle = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, f.target)));
     f.network.mockImplementationOnce(async () => { f.h.audit.failRecords = true; return response(200, grant); });
-    await expect(f.oauth.callback("dropbox", start)).rejects.toThrow();
+    await expect(f.oauth.finish(handle, f.principal)).rejects.toThrow();
     f.h.audit.failRecords = false;
-    await expect(f.oauth.callback("dropbox", start)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
+    await expect(f.oauth.finish(handle, f.principal)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
     expect(f.network).toHaveBeenCalledOnce();
     const [row] = await t.db.select().from(storageConnections).where(eq(storageConnections.publicId, f.target.publicId));
     expect(row?.oauthConnected).toBe(false);
@@ -155,7 +168,7 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
   it.each(["google_drive", "dropbox"] as const)("detaches %s before provider revocation and reports the actual outcome", async (kind) => {
     const f = await fixture(kind);
     const started = await f.oauth.start(f.principal, f.target);
-    await f.oauth.callback(kind, callbackData(started));
+    await f.oauth.finish(await f.oauth.park(kind, callbackData(started)), f.principal);
     f.network.mockImplementation(async (url, opts) => {
       const [row] = await t.db.select().from(storageConnections).where(eq(storageConnections.publicId, f.target.publicId));
       expect(row).toMatchObject({ enabled: false, oauthConnected: false });
@@ -203,16 +216,42 @@ describe("storage OAuth with isolated MySQL and local provider protocol fakes", 
     expect(alias.headers.location).toBeUndefined();
     await http.head(url).set("Host", host).set("Cookie", binderCookie!.split(";")[0]!).expect(405);
     await http.get(url).set("Host", host).expect(303).expect("Location", "/admin/storage?oauth=failed");
-    await http.get(url).set("Host", host).set("Cookie", binderCookie!.split(";")[0]!).expect(303)
-      .expect("Location", "/admin/storage?oauth=connected").expect("Cache-Control", "no-store").expect("Referrer-Policy", "no-referrer");
+    const callback = await http.get(url).set("Host", host).set("Cookie", binderCookie!.split(";")[0]!).expect(303)
+      .expect("Cache-Control", "no-store").expect("Referrer-Policy", "no-referrer");
+    expect(callback.headers.location).toMatch(/^\/admin\/storage\?oauth=finish#oauth-attempt=[A-Za-z0-9_-]{43}$/);
+    expect(callback.headers.location).not.toContain(state);
+    expect(callback.headers.location).not.toContain(code);
     const replay = await http.get(url).set("Host", host).set("Cookie", binderCookie!.split(";")[0]!).expect(303);
     expect(replay.headers.location).toBe("/admin/storage?oauth=failed");
+    expect(f.fetchPinned).not.toHaveBeenCalled();
+    const attemptHandle = String(callback.headers.location).split("#oauth-attempt=")[1]!;
+    const finishRequest = () => http.post("/api/storage/oauth/finish").set("Host", host).set("Origin", origin)
+      .set("Cookie", `${authCookie}; ${f.h.config.csrfCookieName}=${csrfToken}`).send({ attemptHandle });
+    await finishRequest().expect(403);
+    await finishRequest().set(HEADER_CSRF, csrfToken).expect(200, { connected: true });
+    await finishRequest().set(HEADER_CSRF, csrfToken).expect(400);
     expect(f.fetchPinned).toHaveBeenCalledOnce();
     expect(f.fetchPinned).toHaveBeenCalledWith("https://api.dropboxapi.com/oauth2/token", "storage_dropbox",
       expect.objectContaining({ requireAllowlistRule: true, publicAddressesOnly: true }));
     expect(logs).toHaveBeenCalledWith("http request", expect.objectContaining({ route: "/api/storage/oauth/callback/:provider", status: 303 }));
     expect(JSON.stringify(logs.mock.calls)).not.toContain(code);
     expect(JSON.stringify(logs.mock.calls)).not.toContain(state);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(attemptHandle);
+  });
+
+  it("burns a finish handle presented through valid anonymous CSRF without a live portal session", async () => {
+    const f = await fixture();
+    const moduleRouter = Router();
+    registerStorageOAuthRoutes(moduleRouter, f.h.services);
+    const http = request(createApp(f.h.services, { trpcRouter: router({}), moduleRouter }));
+    const attemptHandle = await f.oauth.park("dropbox", callbackData(await f.oauth.start(f.principal, f.target)));
+    const csrf = await http.get("/api/csrf").set("Host", host).set("Origin", origin).expect(204);
+    const [anonymousCookie] = csrf.headers["set-cookie"] as unknown as string[];
+    const cookie = anonymousCookie!.split(";")[0]!;
+    await http.post("/api/storage/oauth/finish").set("Host", host).set("Origin", origin)
+      .set("Cookie", cookie).set(HEADER_CSRF, decodeURIComponent(cookie.split("=")[1]!)).send({ attemptHandle }).expect(400);
+    await expect(f.oauth.finish(attemptHandle, f.principal)).rejects.toMatchObject({ reasonCode: "STORAGE_OAUTH_CALLBACK_REJECTED" });
+    expect(f.fetchPinned).not.toHaveBeenCalled();
   });
 
   it("uses one encrypted generated Drive ID when workers create the same folder concurrently", async () => {
