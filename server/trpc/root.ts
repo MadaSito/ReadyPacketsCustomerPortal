@@ -13,6 +13,7 @@ import { jobsRouter } from "../modules/jobs/router.js";
 import { portableRouter } from "../modules/portable/router.js";
 import { backupRouter } from "../modules/backup/router.js";
 import { integrationsRouter } from "../modules/integrations/router.js";
+import { storageRouter } from "../modules/storage/router.js";
 
 export const appRouter = router({
   identity: identityRouter,
@@ -28,6 +29,7 @@ export const appRouter = router({
   portable: portableRouter,
   backup: backupRouter,
   integrations: integrationsRouter,
+  storage: storageRouter,
 });
 
 export type AppRouter = typeof appRouter;
