@@ -103,6 +103,16 @@ Automated, whole project, at the head of `feat/increment-03` before merge:
 - full test run: 117 files, 1363 tests passed, 5 placeholders (`todo`), no failures
 - migration `0002_integrations_mail_sso_automations.sql` applies on a database that already holds rows
 - preview build and production client build succeed
+- native upgrade on a GitHub-hosted Ubuntu 26.04 runner (`native-install` workflow, job "upgrade from
+  d964a3b"), passed at commit `35b0d0b`, tested as the pull request merge with `main` ([run 44947983659](https://github.com/MadaSito/ReadyPacketsCustomerPortal/actions/runs/44947983659)): the previous release is installed, an
+  administrator enrols an authenticator, a customer and an order are created, maintenance is drained,
+  `deploy/upgrade.sh --yes` runs, and afterwards the sign-in, the customer (old `RP-` reference kept), the
+  order, the verified pre-upgrade archive, a new customer with an `RPCUS-` reference and the full install
+  smoke test are checked. The first runs of this job failed and found a real defect in `deploy/upgrade.sh`:
+  it disabled the services before reading their exit record, systemd had already dropped that record, and
+  the upgrade stopped at the draining phase with the services down. Fixed in `35b0d0b` (stop, check, then
+  disable); the behaviour was reproduced separately on systemd 259. Three wrong field / procedure names in
+  the job's own script were corrected as well.
 
 In a real browser (Chromium) with synthetic data. Preview profile unless stated:
 
@@ -150,7 +160,9 @@ checks listed in each module's `VERIFICATION.md`, and the second-engineer securi
   single sign-on round trip (code exchange, token validation, session) was not run in a browser.
 - "View message" for a delivered e-mail and an off-site backup copy were not exercised in a browser (both
   need a working external service); they are covered by the module tests.
-- the native upgrade on a real server; see the `native-install` workflow for the runner check.
+- the native upgrade on a real server. The runner check above uses a fresh machine, a self-signed
+  certificate, one customer and one order, and the unattended `--yes` mode; the typed confirmations of the
+  interactive mode and an installation older than `d964a3b` were not exercised.
 
 - production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to any real
   receiver; TLS to the real host, receiver-side de-duplication across retries, and a full

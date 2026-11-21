@@ -56,6 +56,9 @@ procedure.
 
 - Dialogs no longer make the browser report a Content-Security-Policy violation: the scroll lock used by the
   dialog library tried to add a `<style>` element, which the portal's policy forbids. It now relies on rules in the portal's own stylesheet.
+- `deploy/upgrade.sh` no longer stops at the draining phase with "clean shutdown not proved": it read each
+  service's exit record after disabling the service, when systemd had already dropped the record. It now
+  stops, checks and then disables, and the refusal prints the record it read.
 - Forced password change after the first sign-in: the page now asks for the "Temporary password" (with a
   hint), no longer shows the misleading advice about passwords "used here before", reports a wrong
   temporary password on that field, and gives password managers the account's sign-in name so that a
