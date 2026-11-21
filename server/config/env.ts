@@ -63,7 +63,7 @@ export const ENV_VARIABLES: readonly EnvVariable[] = [
   { name: "RP_FFMPEG_PATH", secret: false, required: false, description: "Absolute path to the operator-managed FFmpeg executable (default /usr/bin/ffmpeg)" },
   { name: "PROTECTION_MMDB_PATH", secret: false, required: false, description: "Absolute path to an optional local IP-to-country MMDB file; no network lookup" },
   { name: "PROTECTION_DISABLED", secret: false, required: false, description: "0 (default) or 1 (emergency application Protection bypass; does not bypass authorization)" },
-  { name: "PROTECTION_COUNTRY_HEADER", secret: false, required: false, description: "Optional lowercase country header supplied and overwritten by an explicitly trusted direct proxy" },
+  { name: "PROTECTION_COUNTRY_HEADER", secret: false, required: false, description: "Optional x-readypackets-country header supplied and overwritten by an explicitly trusted custom direct proxy" },
   // Read and validated by the owning module (documented here so the doctor recognizes them).
   { name: "RP_BACKUP_KEY", secret: true, required: false, consumer: "backup", description: "Backup encryption keyring JSON or 32-byte key; prefer RP_BACKUP_KEY_FILE (0600)" },
   { name: "RP_BACKUP_KEY_ID", secret: false, required: false, consumer: "backup", description: "Key id used for new backup archives" },
@@ -175,7 +175,7 @@ const configSchema = z.object({
   ffmpegPath: absoluteFilePath,
   protectionMmdbPath: absoluteFilePath.optional(),
   protectionDisabled: z.enum(["0", "1"]).transform((value) => value === "1"),
-  protectionCountryHeader: z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "must be a lowercase HTTP header name").optional(),
+  protectionCountryHeader: z.literal("x-readypackets-country").optional(),
 });
 
 export type AppConfig = Readonly<z.infer<typeof configSchema>> & {

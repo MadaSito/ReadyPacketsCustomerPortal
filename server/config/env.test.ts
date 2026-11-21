@@ -62,18 +62,18 @@ describe("config: strict validation", () => {
     expect(loadConfig(prodEnv({
       RP_FFMPEG_PATH: "/opt/readypackets/bin/ffmpeg",
       PROTECTION_MMDB_PATH: "/var/lib/readypackets/geo/country.mmdb",
-      PROTECTION_COUNTRY_HEADER: "x-edge-country",
+      PROTECTION_COUNTRY_HEADER: "x-readypackets-country",
       PROTECTION_DISABLED: "1",
     }))).toMatchObject({
       ffmpegPath: "/opt/readypackets/bin/ffmpeg",
       protectionMmdbPath: "/var/lib/readypackets/geo/country.mmdb",
-      protectionCountryHeader: "x-edge-country",
+      protectionCountryHeader: "x-readypackets-country",
       protectionDisabled: true,
     });
     const issues = problemsOf(prodEnv({
       RP_FFMPEG_PATH: "ffmpeg",
       PROTECTION_MMDB_PATH: "/tmp/country.mmdb\nunexpected",
-      PROTECTION_COUNTRY_HEADER: "X-Edge-Country",
+      PROTECTION_COUNTRY_HEADER: "x-other-valid-header",
       PROTECTION_DISABLED: "true",
     }));
     expect(issues.map((issue) => issue.split(":")[0])).toEqual([

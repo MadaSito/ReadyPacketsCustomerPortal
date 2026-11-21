@@ -45,6 +45,7 @@
 		header_up X-Forwarded-Host {$RP_DOMAIN}
 		header_up X-Forwarded-Port 443
 		header_up -Forwarded
+		header_up -X-ReadyPackets-Country
 		header_up -traceparent
 		header_up -tracestate
 		transport http {
