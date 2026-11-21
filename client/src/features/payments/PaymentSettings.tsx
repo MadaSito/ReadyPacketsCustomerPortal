@@ -1,6 +1,7 @@
 import { KeyRound, ShieldCheck } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { PaymentsConfigValue } from "@server/modules/payments/settings";
+import type { PaymentsAdminSettingsView } from "@server/modules/payments/service";
 import { Badge, Button, Callout, Card, ConfirmDialog, CopyField, Field, Input, Select } from "@/ui";
 import { errorMessage } from "@/lib/trpc";
 
@@ -15,7 +16,8 @@ type SecretKey = "stripeSecretKey" | "stripeWebhookSecret" | "squareAccessToken"
 const emptySecrets: Record<SecretKey, string> = { stripeSecretKey: "", stripeWebhookSecret: "", squareAccessToken: "", squareWebhookSignatureKey: "" };
 type PaymentConfig = Pick<PaymentsConfigValue, "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "squareLocationId">;
 export type PaymentSettingsInput = PaymentConfig & Partial<Record<SecretKey, string>>;
-export type PaymentSettingsView = PaymentsConfigValue & { webhookUrls: { stripe: string; square: string }; onlineEnabled: boolean };
+export type PaymentSettingsView = Pick<PaymentsAdminSettingsView, "provider" | "mode" | "currency" | "successPath" | "cancelPath" |
+  "webhookToleranceSeconds" | "onlineEnabled" | "stripe" | "square">;
 
 function safePath(value: string) {
   return /^\/(?:checkout|invoices|orders)(?:\/[A-Za-z0-9_-]{1,64}){0,4}$/u.test(value) && value.length <= 200;
@@ -33,11 +35,14 @@ export function PaymentSettings({ settings, saving, onSave }: {
   const [successPath, setSuccessPath] = useState(settings.successPath);
   const [cancelPath, setCancelPath] = useState(settings.cancelPath);
   const [tolerance, setTolerance] = useState(String(settings.webhookToleranceSeconds));
-  const [locationId, setLocationId] = useState(settings.squareLocationId ?? "");
+  const [locationId, setLocationId] = useState(settings.square.locationId ?? "");
   const [secrets, setSecrets] = useState(emptySecrets);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<PaymentSettingsInput | null>(null);
-  const webhookUrl = provider === "none" ? undefined : settings.webhookUrls[provider];
+  const activeSettings = provider === "none" ? undefined : settings[provider];
+  const egressHost = provider === "square" && mode !== settings.mode ?
+    (mode === "live" ? "connect.squareup.com" : "connect.squareupsandbox.com") : activeSettings?.egressHost;
+  const egressConfirmed = provider !== "square" || mode === settings.mode;
   const changingLive = mode === "live" && provider !== "none" && (settings.mode !== "live" || settings.provider !== provider);
   const newCredentialsRequired = provider !== "none" && (settings.mode !== mode || settings.provider !== provider);
 
@@ -66,7 +71,7 @@ export function PaymentSettings({ settings, saving, onSave }: {
       provider === "square" ? ["squareAccessToken", "squareWebhookSignatureKey"] : [];
     const input: PaymentSettingsInput = {
       provider, mode, currency: normalizedCurrency, successPath, cancelPath, webhookToleranceSeconds: seconds,
-      squareLocationId: provider === "square" ? locationId.trim() : settings.squareLocationId,
+      squareLocationId: provider === "square" ? locationId.trim() : settings.square.locationId,
     };
     for (const name of activeSecrets) {
       const value = secrets[name].trim();
@@ -123,19 +128,26 @@ export function PaymentSettings({ settings, saving, onSave }: {
         {provider !== "none" ? <fieldset className="grid min-w-0 gap-4 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 sm:p-4">
           <legend className="px-1 font-semibold text-ink"><span className="inline-flex items-center gap-2"><KeyRound className="size-4" aria-hidden />Provider credentials</span></legend>
           {provider === "stripe" ? <>
-            {keyInput("stripeSecretKey", "Stripe API secret key", settings.stripeSecretKeyLast4)}
-            {keyInput("stripeWebhookSecret", "Stripe webhook signing secret", settings.stripeWebhookSecretLast4)}
+            {keyInput("stripeSecretKey", "Stripe API secret key", settings.stripe.secretKeyLast4)}
+            {keyInput("stripeWebhookSecret", "Stripe webhook signing secret", settings.stripe.webhookSecretLast4)}
           </> : <>
-            {keyInput("squareAccessToken", "Square access token", settings.squareAccessTokenLast4)}
-            {keyInput("squareWebhookSignatureKey", "Square webhook signature key", settings.squareWebhookSignatureKeyLast4)}
+            {keyInput("squareAccessToken", "Square access token", settings.square.accessTokenLast4)}
+            {keyInput("squareWebhookSignatureKey", "Square webhook signature key", settings.square.webhookSignatureKeyLast4)}
           </>}
         </fieldset> : null}
         {notice ? <Callout title="Payment settings not saved" tone="danger" live="assertive">{notice}</Callout> : null}
         <div><Button type="submit" loading={saving} disabled={saving}>Save payment settings</Button></div>
       </form>
     </Card>
-    {webhookUrl ? <Card title="Provider webhook" description="Register this exact HTTPS URL with the selected provider. Only verified provider events can confirm a payment.">
-      <CopyField label="Webhook notification URL" value={webhookUrl} copyLabel="Copy webhook URL" monospace />
+    {activeSettings ? <Card title="Provider webhook" description="Register this exact HTTPS URL with the selected provider. Only verified provider events can confirm a payment.">
+      <div className="grid gap-4">
+        <CopyField label="Webhook notification URL" value={activeSettings.webhookUrl} copyLabel="Copy webhook URL" monospace />
+        <Callout tone={egressConfirmed && activeSettings.egressAllowlisted ? "success" : "warning"} title="Provider network access">
+          <span className="break-all font-mono">{egressHost}</span>: {egressConfirmed
+            ? (activeSettings.egressAllowlisted ? "Allowlist rule enabled." : "No enabled provider allowlist rule confirmed.")
+            : "Verify the rule for this environment before enabling checkout."}
+        </Callout>
+      </div>
     </Card> : null}
     <ConfirmDialog title="Enable live payments?" open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }}
       description="Customers will use the live provider to make real payments. Verify the provider account and live webhook before enabling it."

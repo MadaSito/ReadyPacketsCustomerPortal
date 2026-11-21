@@ -12,16 +12,27 @@ const invoiceId = `01J${"0".repeat(22)}2`;
 const date = new Date("2026-11-21T12:00:00Z");
 const config: PaymentSettingsView = {
   provider: "square", mode: "test", currency: "USD", successPath: "/checkout/return", cancelPath: "/checkout/cancel",
-  webhookToleranceSeconds: 300, squareLocationId: "LOCATION_01", stripeSecretKeyLast4: null, stripeWebhookSecretLast4: null,
-  squareAccessTokenLast4: "a1b2", squareWebhookSignatureKeyLast4: "c3d4",
-  webhookUrls: { stripe: "https://portal.example.test/api/payments/webhooks/stripe", square: "https://portal.example.test/api/payments/webhooks/square" },
+  webhookToleranceSeconds: 300,
+  stripe: {
+    secretKeyConfigured: false, secretKeyLast4: null, webhookSecretConfigured: false, webhookSecretLast4: null,
+    webhookUrl: "https://portal.example.test/api/payments/webhooks/stripe",
+    returnUrlPattern: "https://portal.example.test/api/payments/return/stripe/<attemptId>",
+    egressHost: "api.stripe.com", egressAllowlisted: false,
+  },
+  square: {
+    locationId: "LOCATION_01", accessTokenConfigured: true, accessTokenLast4: "a1b2",
+    webhookSignatureKeyConfigured: true, webhookSignatureKeyLast4: "c3d4",
+    webhookUrl: "https://portal.example.test/api/payments/webhooks/square",
+    returnUrlPattern: "https://portal.example.test/api/payments/return/square/<attemptId>",
+    egressHost: "connect.squareupsandbox.com", egressAllowlisted: true,
+  },
   onlineEnabled: true,
 };
 const attempt = {
-  publicId: id, invoicePublicId: invoiceId, provider: "square", environment: "test", status: "redirected",
+  attemptPublicId: id, invoicePublicId: invoiceId, provider: "square", environment: "test", status: "redirected",
   amountMinor: 1299, currency: "USD", createdAt: date, failureReasonCode: null,
 };
-const receipt = { publicId: id, provider: "square", environment: "test", status: "retry_pending", eventType: "payment.updated",
+const receipt = { webhookPublicId: id, provider: "square", environment: "test", status: "retry_pending", eventType: "payment.updated",
   receivedAt: date, reasonCode: "SYNTHETIC_PENDING" };
 
 vi.mock("@/lib/trpc", async (original) => ({
@@ -79,6 +90,8 @@ it("requires fresh credentials for switching environments and confirms live acti
   const save = vi.fn<(input: PaymentSettingsInput) => Promise<void>>().mockResolvedValue(undefined);
   renderUi(<PaymentSettings settings={config} saving={false} onSave={save} />);
   await user.selectOptions(screen.getByRole("combobox", { name: /^Environment/u }), "live");
+  expect(screen.getByText("connect.squareup.com")).toBeInTheDocument();
+  expect(screen.getByText(/verify the rule for this environment/i)).toBeInTheDocument();
   await user.type(screen.getByLabelText(/^Square access token/u), "synthetic_live_square_token");
   await user.click(screen.getByRole("button", { name: "Save payment settings" }));
   expect(await screen.findByText("Enter both credentials for the selected provider and environment before activating it.")).toBeInTheDocument();

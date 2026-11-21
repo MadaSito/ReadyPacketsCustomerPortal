@@ -75,7 +75,7 @@ function Attempts() {
       <Field label="Attempt status"><Select options={options(attemptStates)} value={status} onChange={(e) => setStatus(e.target.value as typeof status)} /></Field>
     </FilterBar>
     {invalid ? <p className="mb-4 text-sm text-danger" role="alert">Enter a valid 26-character invoice public ID.</p> : null}
-    <DataTable caption="Hosted checkout attempts" rows={rows} rowKey={(row) => row.publicId} loading={list.isPending}
+    <DataTable caption="Hosted checkout attempts" rows={rows} rowKey={(row) => row.attemptPublicId} loading={list.isPending}
       error={list.error} onRetry={() => { void list.refetch(); }}
       empty={<EmptyState icon={CreditCard} title="No matching payment attempts" description="Try changing the filters. New attempts appear after customers start checkout." />}
       columns={[
@@ -85,7 +85,7 @@ function Attempts() {
         { key: "amount", header: "Amount", align: "end", cell: (row) => <Money value={{ amountMinor: row.amountMinor, currency: row.currency }} /> },
         { key: "created", header: "Created", hideOnMobile: true, cell: (row) => <DateTime value={row.createdAt} /> },
       ]}
-      rowActions={(row) => <Button variant="secondary" size="sm" aria-label={`Details for attempt ${row.publicId}`} onClick={() => setSelected(row.publicId)}>
+      rowActions={(row) => <Button variant="secondary" size="sm" aria-label={`Details for attempt ${row.attemptPublicId}`} onClick={() => setSelected(row.attemptPublicId)}>
         Details
       </Button>} />
     <LoadMore hasMore={list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => { void list.fetchNextPage(); }} />
@@ -104,17 +104,19 @@ function AttemptDetails({ id }: { id: string }) {
   const { attempt, webhooks } = detail.data;
   return <div className="grid min-w-0 gap-4">
     <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
-      <div><dt className="font-semibold">Attempt ID</dt><dd>{smallId(attempt.publicId)}</dd></div>
+      <div><dt className="font-semibold">Attempt ID</dt><dd>{smallId(attempt.attemptPublicId)}</dd></div>
       <div><dt className="font-semibold">Invoice ID</dt><dd>{smallId(attempt.invoicePublicId)}</dd></div>
       <div><dt className="font-semibold">Status</dt><dd>{attemptBadge(attempt.status)}</dd></div>
       <div><dt className="font-semibold">Provider</dt><dd>{providerBadge(attempt.provider, attempt.environment)}</dd></div>
       <div><dt className="font-semibold">Amount</dt><dd><Money value={{ amountMinor: attempt.amountMinor, currency: attempt.currency }} /></dd></div>
       <div><dt className="font-semibold">Created</dt><dd><DateTime value={attempt.createdAt} /></dd></div>
+      {attempt.providerRef ? <div><dt className="font-semibold">Checkout reference</dt><dd>{smallId(attempt.providerRef)}</dd></div> : null}
+      {attempt.providerPaymentRef ? <div><dt className="font-semibold">Provider payment ID</dt><dd>{smallId(attempt.providerPaymentRef)}</dd></div> : null}
       {attempt.failureReasonCode ? <div><dt className="font-semibold">Reason code</dt><dd>{smallId(attempt.failureReasonCode)}</dd></div> : null}
     </dl>
     <h3 className="font-semibold">Verified receipts</h3>
     {webhooks.length ? <ul className="grid gap-2">
-      {webhooks.map((row) => <li key={row.publicId} className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-2">
+      {webhooks.map((row) => <li key={row.webhookPublicId} className="flex flex-wrap items-center gap-2 rounded-lg border border-line p-2">
         {smallId(row.eventType)} {webhookBadge(row.status)} <DateTime value={row.receivedAt} />
       </li>)}
     </ul> : <p className="text-sm text-muted">No verified receipts are linked to this attempt.</p>}
@@ -133,7 +135,7 @@ function Webhooks() {
       <Field label="Webhook provider"><Select options={providers} value={provider} onChange={(e) => setProvider(e.target.value as typeof provider)} /></Field>
       <Field label="Webhook status"><Select options={options(webhookStates)} value={status} onChange={(e) => setStatus(e.target.value as typeof status)} /></Field>
     </FilterBar>
-    <DataTable caption="Verified payment notifications" rows={rows} rowKey={(row) => row.publicId} loading={list.isPending}
+    <DataTable caption="Verified payment notifications" rows={rows} rowKey={(row) => row.webhookPublicId} loading={list.isPending}
       error={list.error} onRetry={() => { void list.refetch(); }}
       empty={<EmptyState icon={ShieldCheck} title="No verified webhooks match" description="Try changing the filters or verify the notification URL with your provider." />}
       columns={[
