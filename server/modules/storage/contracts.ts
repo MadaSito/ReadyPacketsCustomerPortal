@@ -85,6 +85,12 @@ export interface StorageAssignmentView {
   connectionPublicId: string;
 }
 
+export interface StorageAssignedDestination extends StorageAssignmentView {
+  destinationVersion: number;
+  kind: StorageProviderKind;
+  name: string;
+}
+
 export interface StorageConnectionCreate {
   kind: StorageProviderKind;
   name: string;
@@ -132,7 +138,7 @@ export interface StorageModule extends ModuleLifecycle {
     set(principal: SessionPrincipal, input: { purpose: StoragePurpose; connectionPublicIds: string[] }): Promise<StorageAssignmentView[]>;
   };
   /** Worker-side: only enabled, currently assigned connections. Includes no config or credentials. */
-  listAssigned(purpose: StoragePurpose, tx?: DbOrTx): Promise<StorageAssignmentView[]>;
+  listAssigned(purpose: StoragePurpose, tx?: DbOrTx): Promise<StorageAssignedDestination[]>;
   /** Server-only OAuth support; lock and check the live administrator, kind and version in caller's tx. */
   readProviderSetup(principal: SessionPrincipal, input: {
     publicId: string; kind: StorageProviderKind; expectedVersion: number;

@@ -4,7 +4,7 @@ import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
 import {
-  fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedSize, pathFor, prefixParts, prefixSchema, removeKey,
+  fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedEtag, observedSize, pathFor, prefixParts, prefixSchema, removeKey,
   statusError, testError, transportError, WRITE_TIMEOUT_MS,
 } from "./objectProtocol.js";
 
@@ -114,10 +114,10 @@ export function azureBlobAdapter(egress: () => Pick<EgressPolicy, "fetchPinned">
             if (put.status !== 201) throw statusError(put.status, true);
             md5 = stream.verify().md5;
           } finally { stream.body.destroy(); }
-          const uploaded = await request("HEAD", url, { signal: input.signal,
-            ...(put.headers.etag ? { headers: { "if-match": put.headers.etag } } : {}) })
+          const etag = observedEtag(put.headers);
+          const uploaded = await request("HEAD", url, { signal: input.signal, headers: { "if-match": etag } })
             .catch(() => { throw new StorageAdapterError("OUTCOME_UNKNOWN"); });
-          if (uploaded.status === 412 || (put.headers.etag && uploaded.status === 200 && put.headers.etag !== uploaded.headers.etag)) {
+          if (uploaded.status === 412 || (uploaded.status === 200 && observedEtag(uploaded.headers) !== etag)) {
             throw new StorageAdapterError("INTEGRITY_MISMATCH");
           }
           if (uploaded.status !== 200) throw new StorageAdapterError("OUTCOME_UNKNOWN");

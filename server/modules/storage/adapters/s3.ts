@@ -4,7 +4,7 @@ import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
 import {
-  encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedSize, pathFor, prefixParts,
+  encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedEtag, observedSize, pathFor, prefixParts,
   prefixSchema, removeKey, statusError, testError, transportError, WRITE_TIMEOUT_MS,
 } from "./objectProtocol.js";
 
@@ -116,8 +116,10 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
         async put(input) {
           const key = objectKey(prefix, input);
           const url = urlFor(key.split("/"));
-          const head = () => request("HEAD", url, { signal: input.signal,
-            ...(nativeChecksum ? { headers: { "x-amz-checksum-mode": "ENABLED" } } : {}) });
+          const head = (etag?: string) => request("HEAD", url, { signal: input.signal, headers: {
+            ...(nativeChecksum ? { "x-amz-checksum-mode": "ENABLED" } : {}),
+            ...(etag ? { "if-match": etag } : {}),
+          } });
           const existing = await head();
           if (existing.status === 200) {
             if (observedSize(existing.headers) === input.size && checksum(existing.headers) === input.sha256) {
@@ -137,9 +139,11 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
             if (put.status !== 200) throw statusError(put.status, true);
             stream.verify();
           } finally { stream.body.destroy(); }
-          const uploaded = await head().catch(() => { throw new StorageAdapterError("OUTCOME_UNKNOWN"); });
+          const etag = observedEtag(put.headers);
+          const uploaded = await head(etag).catch(() => { throw new StorageAdapterError("OUTCOME_UNKNOWN"); });
+          if (uploaded.status === 412) throw new StorageAdapterError("INTEGRITY_MISMATCH");
           if (uploaded.status !== 200) throw new StorageAdapterError("OUTCOME_UNKNOWN");
-          if (put.headers.etag && uploaded.headers.etag !== put.headers.etag) throw new StorageAdapterError("INTEGRITY_MISMATCH");
+          if (observedEtag(uploaded.headers) !== etag) throw new StorageAdapterError("INTEGRITY_MISMATCH");
           const size = observedSize(uploaded.headers);
           const sha256 = checksum(uploaded.headers) ?? checksum(put.headers);
           if (nativeChecksum && !sha256) throw new StorageAdapterError("INTEGRITY_MISMATCH");

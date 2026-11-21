@@ -118,6 +118,18 @@ function appFor(principal: SessionPrincipal) {
 }
 
 describe("private file admission and authorization", () => {
+  it("stages cloud copy work in the active upload transaction and rolls back admission if staging fails", async () => {
+    const stageOrderFile = vi.fn(async (publicId: string, tx: Tx) => {
+      expect((await tx.select().from(orderFiles)).some((candidate) => candidate.publicId === publicId)).toBe(true);
+      throw new Error("synthetic outbox failure");
+    });
+    h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
+    await expect(add()).rejects.toThrow("synthetic outbox failure");
+    expect(stageOrderFile).toHaveBeenCalledOnce();
+    expect(await t.db.select().from(orderFiles)).toEqual([]);
+    expect(h.storage.objects.size).toBe(0);
+  });
+
   it("binds owner and current order stage before and after a streamed upload", async () => {
     await expect(files.beginUpload(stranger, orderPublicId, upload)).rejects.toMatchObject({ code: "NOT_FOUND" });
     const remediation = { ...owner, state: "remediation" as const };

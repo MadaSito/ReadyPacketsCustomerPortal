@@ -52,6 +52,9 @@ export function statusError(status: number, write = false): StorageAdapterError 
 
 export function transportError(error: unknown, write = false): StorageAdapterError {
   if (error instanceof StorageAdapterError) return error;
+  if (error instanceof DomainError && write && ["EGRESS_RESPONSE_TOO_LARGE", "EGRESS_REDIRECT_REFUSED"].includes(error.reasonCode)) {
+    return new StorageAdapterError("OUTCOME_UNKNOWN");
+  }
   if (error instanceof DomainError && (error.code === "FORBIDDEN" || error.code === "VALIDATION")) {
     return new StorageAdapterError("EGRESS_DENIED");
   }
@@ -71,6 +74,12 @@ export function observedSize(headers: Record<string, string>): number {
   const parsed = value && /^[0-9]{1,16}$/u.test(value) ? Number(value) : NaN;
   if (!Number.isSafeInteger(parsed)) throw new StorageAdapterError("INTEGRITY_MISMATCH");
   return parsed;
+}
+
+export function observedEtag(headers: Record<string, string>): string {
+  const etag = headers.etag;
+  if (!etag || !/^"[\x21\x23-\x7e]{1,250}"$/u.test(etag)) throw new StorageAdapterError("INTEGRITY_MISMATCH");
+  return etag;
 }
 
 export function measuredBody(input: StoragePutInput, recordMd5 = false) {

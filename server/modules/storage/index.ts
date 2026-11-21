@@ -268,7 +268,9 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
       },
     },
     async listAssigned(purpose, tx = db) {
-      return assignmentView(purpose, (await activeRows(purpose, tx)).map(({ publicId }) => publicId));
+      return (await activeRows(purpose, tx)).map(({ publicId, destinationVersion, kind, name }) => ({
+        purpose, connectionPublicId: publicId, destinationVersion, kind, name,
+      }));
     },
     readProviderSetup: (principal, input, tx) => admin(principal, async (handle) => {
       const row = await find(input.publicId, handle, true);

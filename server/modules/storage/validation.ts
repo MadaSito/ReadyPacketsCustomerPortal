@@ -24,7 +24,7 @@ export const storageAssignment = z.strictObject({
   purpose: z.enum(STORAGE_PURPOSES),
   connectionPublicIds: z.array(storagePublicId).max(8),
 }).refine(({ purpose, connectionPublicIds }) =>
-  (purpose === "order_files" || connectionPublicIds.length <= 1) && new Set(connectionPublicIds).size === connectionPublicIds.length);
+  (purpose !== "order_data" || connectionPublicIds.length <= 1) && new Set(connectionPublicIds).size === connectionPublicIds.length);
 
 export const copySegment = z.string().min(1).max(180).refine((text) => text === text.normalize("NFC") &&
   text !== "." && text !== ".." && !/[\\/%]|\p{C}/u.test(text) && !/^[ .]|[ .]$/u.test(text));
