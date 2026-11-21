@@ -102,17 +102,22 @@ describe("Azure Blob adapter through a pinned transport fake", () => {
       sas.replace("sr=c", "sr=b"), `https://testaccount.blob.core.windows.net/private-archive?${sas}`]) {
       expect(azureBlobCredentials.safeParse({ sasToken: token }).success).toBe(false);
     }
+    let errorCode = "BlobNotFound";
     const fetchPinned: EgressPolicy["fetchPinned"] = vi.fn(async (raw, purpose, options) => {
       const url = new URL(raw);
       expect(url.origin).toBe("https://testaccount.blob.core.windows.net");
-      expect(url.search).toBe(`?restype=container&${sas}`);
+      expect(url.pathname).toBe("/private-archive/__readypackets_connection_probe__");
+      expect(url.search).toBe(`?${sas}`);
       expect(purpose).toBe("storage_azure");
+      expect(options?.method).toBe("HEAD");
       expect(options?.headers?.authorization).toBeUndefined();
-      return response(200);
+      return response(404, { "x-ms-error-code": errorCode });
     });
     const adapter = azureBlobAdapter(() => ({ fetchPinned }), clock)
       .create({ publicId, credentials, config: { ...cfg, auth: "sas" } });
     await expect(adapter.test()).resolves.toEqual({ ok: true, code: "OK" });
+    errorCode = "ContainerNotFound";
+    await expect(adapter.test()).resolves.toEqual({ ok: false, code: "DESTINATION_NOT_FOUND" });
   });
 
   it("uses Shared Key and checks stored size and provider MD5 without calling it SHA-256", async () => {

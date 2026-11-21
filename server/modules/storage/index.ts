@@ -345,6 +345,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
     },
     async stageOrderFilesForAutomation(input) {
       const orderPublicId = checked(storagePublicId, input.orderPublicId);
+      const filePublicId = input.filePublicId === undefined ? undefined : checked(storagePublicId, input.filePublicId);
       const connectionPublicId = input.connectionPublicId === undefined ? undefined : checked(storagePublicId, input.connectionPublicId);
       if (!/^automation:[A-Za-z0-9_-]{10,40}$/u.test(input.correlationId)) {
         throw validation("STORAGE_AUTOMATION_ORIGIN_INVALID", "This copy must be staged by an automation run.");
@@ -352,7 +353,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
       return db.transaction(async (tx) => {
         input.signal.throwIfAborted();
         await input.assertStillOwned(tx);
-        const files = await deps.services.files.listOrderFileCopyCandidates(orderPublicId, tx);
+        const files = await deps.services.files.listOrderFileCopyCandidates(orderPublicId, tx, filePublicId);
         if (files === null) return { queued: 0, cause: "STORAGE_COPY_SOURCE_INACTIVE" };
         if (files.length > 50) return { queued: 0, cause: "STORAGE_COPY_BATCH_LIMIT" };
         const destinations = (await activeRows("order_files", tx)).filter((row) => !connectionPublicId || row.publicId === connectionPublicId);

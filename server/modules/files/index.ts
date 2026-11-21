@@ -117,11 +117,12 @@ export interface FilesModule extends ModuleLifecycle {
   /** Fenced storage-copy worker only; locks current order/file scope and returns private source metadata. */
   getOrderFileCopySource(filePublicId: string, tx: Tx): Promise<{
     storageKey: string; size: number; sha256: string; contentType: string; displayName: string; extension: string;
+    visibility: FileVisibility; currentVersion: boolean;
     ownerUserId: number; customerName: string; customerReference: string; customerPublicId: string;
     orderReference: string; orderPublicId: string; filePublicId: string;
   }>;
   /** Automation-only bounded traversal: null for unknown/held orders, ≥51 means do not copy the batch. */
-  listOrderFileCopyCandidates(orderPublicId: string, tx: Tx): Promise<string[] | null>;
+  listOrderFileCopyCandidates(orderPublicId: string, tx: Tx, filePublicId?: string): Promise<string[] | null>;
   /** Trusted audit-trigger resolver; returns IDs/category only, never file bytes or names. */
   getUploadAutomationContext(filePublicId: string, handle: DbOrTx): Promise<{
     orderPublicId: string; orderOwnerUserId: number; category: FileCategory;
@@ -139,7 +140,7 @@ registerAutomationTrigger({
     const order = await services.orders.getOrderSyncView(context.orderPublicId, db);
     if (!order || order.ownerUserId !== context.orderOwnerUserId) return {};
     return {
-      orderPublicId: order.publicId,
+      orderPublicId: order.publicId, filePublicId,
       fields: { file_category: context.category, order_reference: order.reference, order_status_label: order.status.label,
         order_link: new URL(`/orders/${order.publicId}`, services.config.canonicalOrigin).href },
       recipients: { order_owner: [order.ownerUserId] },
@@ -389,7 +390,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     }
     await audit.record({ ...event(principal, input.imported ? "file.imported" : "file.uploaded",
       input.imported ? "import" : "upload", "completed", publicId),
-      ...(!input.imported ? { attributes: { order_public_id: input.orderPublicId } } : {}) }, tx);
+      ...(!input.imported ? { attributes: { order_public_id: input.orderPublicId, file_visibility: input.visibility } } : {}) }, tx);
     return output(await findFile(publicId, tx, true));
   }
 
@@ -794,12 +795,13 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           row.ownerUserId !== owner.id || row.deletedAt || row.purgedAt) throw unavailable();
       return {
         storageKey: row.storageKey, size: row.byteSize, sha256: row.sha256, contentType: row.contentType,
-        displayName: output(row).displayName, extension: row.extension, ownerUserId: owner.id,
+        displayName: output(row).displayName, extension: row.extension, visibility: row.visibility,
+        currentVersion: row.supersededAt === null, ownerUserId: owner.id,
         customerName: owner.name, customerReference: owner.customerRef ?? owner.publicId,
         customerPublicId: owner.publicId, orderReference: order.reference, orderPublicId: order.publicId, filePublicId: row.publicId,
       };
     },
-    async listOrderFileCopyCandidates(orderPublicId, tx) {
+    async listOrderFileCopyCandidates(orderPublicId, tx, filePublicId) {
       const order = await deps.services.orders.getOrderRefByPublicId(orderPublicId, tx, { forUpdate: true });
       if (!order || order.lockState !== "none") return null;
       const owner = await deps.services.identity.getUser(order.ownerUserId, { tx, forUpdate: true });
@@ -807,7 +809,9 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const rows = await tx.select({ publicId: orderFiles.publicId }).from(orderFiles)
         .where(and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
           eq(orderFiles.ownerUserId, order.ownerUserId), isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt),
-          isNull(orderFiles.supersededAt))).orderBy(orderFiles.publicId).limit(51);
+          eq(orderFiles.visibility, "customer_visible"), isNull(orderFiles.supersededAt),
+          filePublicId ? eq(orderFiles.publicId, filePublicId) : undefined)).orderBy(orderFiles.publicId).limit(51);
+      if (filePublicId && rows.length === 0) return null;
       return rows.map(({ publicId }) => publicId);
     },
     async getUploadAutomationContext(filePublicId, handle) {
@@ -815,7 +819,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const [row] = await handle.select({
         orderPublicId: orderFiles.orderPublicId, orderOwnerUserId: orderFiles.ownerUserId, category: orderFiles.category,
       }).from(orderFiles).where(and(eq(orderFiles.publicId, filePublicId), isNull(orderFiles.deletedAt),
-        isNull(orderFiles.purgedAt))).limit(1);
+        isNull(orderFiles.purgedAt), isNull(orderFiles.supersededAt), eq(orderFiles.visibility, "customer_visible"))).limit(1);
       return row ?? null;
     },
   };

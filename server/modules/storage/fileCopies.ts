@@ -5,6 +5,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { ClaimedJob, JobResult, Tx } from "../../core/types.js";
+import { isAutomationOrigin } from "../audit/tap.js";
 import type { StorageModule } from "./contracts.js";
 import { storageFileCopies } from "./schema.js";
 import { copySegment, storagePublicId } from "./validation.js";
@@ -68,15 +69,20 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
     const [row] = await db.select().from(storageFileCopies)
       .where(eq(storageFileCopies.publicId, parsed.data.copyPublicId)).limit(1);
     if (!row || row.state === "copied" || row.state === "skipped") return { outcome: "completed" };
+    const automationOrigin = isAutomationOrigin(job.correlationId);
+    const automationSourceInactive = (source: { visibility: string; currentVersion: boolean }) =>
+      automationOrigin && (source.visibility !== "customer_visible" || !source.currentVersion);
+    const sourceInactive = () => new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "The local copy source is not available.");
     let body: Readable | undefined;
     try {
       const prepared = await currentTx(async (tx) => {
         await job.assertStillOwned(tx);
         const source = await deps.services.files.getOrderFileCopySource(row.filePublicId, tx);
+        if (automationSourceInactive(source)) throw sourceInactive();
         const target = row.targetEnc ? encryptedTarget.parse(JSON.parse(crypto.decrypt(row.targetEnc, targetAad(row.publicId)))) :
           { ...orderFileTarget(source), ownerUserId: source.ownerUserId };
         if (source.ownerUserId !== target.ownerUserId) {
-          throw new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "The local copy source is not available.");
+          throw sourceInactive();
         }
         await tx.update(storageFileCopies).set({ state: "copying", attempts: job.attempt, reasonCode: null,
           targetEnc: row.targetEnc ?? crypto.encrypt(JSON.stringify(target), targetAad(row.publicId)),
@@ -101,8 +107,9 @@ export function registerFileCopies(deps: ModuleDeps, service: StorageModule) {
         body, signal: job.signal, assertStillOwned: job.assertStillOwned, correlationId: job.correlationId,
         assertSourceCurrent: async (tx) => {
           const current = await deps.services.files.getOrderFileCopySource(row.filePublicId, tx);
-          if (current.ownerUserId !== source.ownerUserId || current.storageKey !== source.storageKey || current.sha256 !== source.sha256) {
-            throw new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "The local copy source is not available.");
+          if (current.ownerUserId !== source.ownerUserId || current.storageKey !== source.storageKey || current.sha256 !== source.sha256 ||
+              automationSourceInactive(current)) {
+            throw sourceInactive();
           }
         },
       });

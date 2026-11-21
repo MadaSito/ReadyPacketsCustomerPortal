@@ -153,7 +153,7 @@ export interface StorageModule extends ModuleLifecycle {
   stageOrderFile(filePublicId: string, tx: Tx): Promise<void>;
   /** Automation-only bulk staging, bounded and constrained to the current order_files assignment. */
   stageOrderFilesForAutomation(input: {
-    orderPublicId: string; connectionPublicId?: string; correlationId: string; signal: AbortSignal;
+    orderPublicId: string; filePublicId?: string; connectionPublicId?: string; correlationId: string; signal: AbortSignal;
     assertStillOwned: (tx?: Tx) => Promise<void>;
   }): Promise<{ queued: number; cause?: "STORAGE_ASSIGNMENT_INACTIVE" | "STORAGE_COPY_SOURCE_INACTIVE" | "STORAGE_COPY_BATCH_LIMIT" }>;
 }

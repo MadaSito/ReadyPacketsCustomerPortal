@@ -91,10 +91,18 @@ export function azureBlobAdapter(egress: () => Pick<EgressPolicy, "fetchPinned">
       }
       return {
         async test(signal) {
-          const target = urlFor([]);
-          target.searchParams.set("restype", "container");
+          const viaSas = config.auth === "sas";
+          // A container SAS with read/create rights need not be able to read container properties.
+          // Probe a blob name without creating/listing anything. Only BlobNotFound is a positive
+          // authenticated absence; generic 404 or ContainerNotFound remains a failed test.
+          const target = urlFor(viaSas ? [...prefix, "__readypackets_connection_probe__"] : []);
+          if (!viaSas) target.searchParams.set("restype", "container");
           try {
-            return fromStatus((await request("HEAD", target, { signal })).status);
+            const result = await request("HEAD", target, { signal });
+            if (viaSas && result.status === 404 && result.headers["x-ms-error-code"] === "BlobNotFound") {
+              return { ok: true, code: "OK" };
+            }
+            return fromStatus(result.status);
           } catch (error) { return testError(error); }
         },
         async ensureFolder() { /* Blob names provide virtual folders; no directory creation. */ },

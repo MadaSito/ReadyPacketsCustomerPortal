@@ -6,6 +6,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
+import { orderFilesCopyAction } from "./automation.js";
 import { StorageAdapterError, type StorageConnectionView } from "./contracts.js";
 import { createStorageModule, type StorageModule } from "./index.js";
 import { storageAssignments, storageConnections, storageFileCopies } from "./schema.js";
@@ -26,6 +27,8 @@ let providerFault: StorageAdapterError | undefined;
 let overrideDigest: string | undefined;
 let visitEnsure: (() => Promise<void>) | undefined;
 let sourceUnavailable: boolean;
+let sourceVisibility: "customer_visible" | "staff_only";
+let currentVersion: boolean;
 let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string, data: Buffer) => void>>;
 let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
@@ -42,6 +45,8 @@ beforeEach(async () => {
   overrideDigest = undefined;
   visitEnsure = undefined;
   sourceUnavailable = false;
+  sourceVisibility = "customer_visible";
+  currentVersion = true;
   adapterPuts = vi.fn();
   adapterRemovals = vi.fn();
   h.services.identity = {
@@ -90,7 +95,7 @@ async function stage() {
       if (sourceUnavailable) throw new DomainError("NOT_FOUND", "STORAGE_COPY_SOURCE_INACTIVE", "Source unavailable.");
       return {
         storageKey, size: sourceBytes.length, sha256: local.sha256, contentType: "application/octet-stream",
-        displayName: "Synthetic ../Doc.pdf", extension: "pdf", ownerUserId: 42,
+        displayName: "Synthetic ../Doc.pdf", extension: "pdf", ownerUserId: 42, visibility: sourceVisibility, currentVersion,
         customerName: "E\u0301lodie Beispiel", customerReference: "RPCUS-TEST00001", customerPublicId: ulid(),
         orderReference: "Order / synthetic", orderPublicId, filePublicId,
       };
@@ -255,5 +260,45 @@ describe("fenced order-file copy jobs", () => {
     await h.jobs.runAll(jobType);
     expect(h.audit.named("storage.order_file.copy").map((row) => row.correlationId))
       .toEqual([input.correlationId, input.correlationId]);
+  });
+
+  it("does not send an automation-staged file after it becomes staff only", async () => {
+    const { orderPublicId, filePublicId } = await stage();
+    const active = await create();
+    await module.assignments.set(admin, { purpose: "order_files", connectionPublicIds: [active.publicId] });
+    await module.stageOrderFilesForAutomation({ orderPublicId, filePublicId, signal: new AbortController().signal,
+      assertStillOwned: async () => {}, correlationId: `automation:${ulid()}` });
+    sourceVisibility = "staff_only";
+    expect(await h.jobs.runAll(jobType)).toEqual([{ outcome: "completed", safeCounts: { skipped: 1 } }]);
+    expect(adapterPuts).not.toHaveBeenCalled();
+  });
+
+  it("blocks an automation write if the staged file version is superseded before the write", async () => {
+    const { orderPublicId, filePublicId } = await stage();
+    const active = await create();
+    await module.assignments.set(admin, { purpose: "order_files", connectionPublicIds: [active.publicId] });
+    await module.stageOrderFilesForAutomation({ orderPublicId, filePublicId, signal: new AbortController().signal,
+      assertStillOwned: async () => {}, correlationId: `automation:${ulid()}` });
+    visitEnsure = async () => { currentVersion = false; };
+    expect(await h.jobs.runAll(jobType)).toEqual([{ outcome: "completed", safeCounts: { skipped: 1 } }]);
+    expect(adapterPuts).not.toHaveBeenCalled();
+  });
+
+  it("refuses all staff-only triggers and file upload triggers lacking the canonical file ID", async () => {
+    const orderPublicId = ulid();
+    const runPublicId = ulid();
+    const ctx: Parameters<typeof orderFilesCopyAction.run>[0] = {
+      automationPublicId: ulid(), automationVersion: 1, runPublicId, stepIndex: 0, stepKey: "step_1",
+      idempotencyKey: `auto:${runPublicId}:step:step_1`, correlationId: `automation:${runPublicId}`,
+      triggerMode: "event", triggerKey: "file.uploaded", triggerEventId: ulid(), config: {}, secrets: {},
+      fields: {}, recipients: {}, orderPublicId, filePublicId: ulid(), staffOnlyTrigger: true, dryRun: false,
+      assertStillOwned: async () => {}, signal: new AbortController().signal, deps: h.deps,
+    };
+    const stageCopy = vi.spyOn(module, "stageOrderFilesForAutomation");
+    expect(orderFilesCopyAction.forbidOnStaffOnlyTrigger).toBe(true);
+    await expect(orderFilesCopyAction.run(ctx)).resolves.toMatchObject({ outcome: "skipped" });
+    await expect(orderFilesCopyAction.run({ ...ctx, staffOnlyTrigger: false, filePublicId: null }))
+      .resolves.toMatchObject({ outcome: "skipped" });
+    expect(stageCopy).not.toHaveBeenCalled();
   });
 });
