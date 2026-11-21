@@ -91,7 +91,12 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const replacementSlot = replacement?.slotKey && slots?.statusKey === replacement.statusKey
     ? slots?.slots.find((slot) => slot.key === replacement.slotKey) : undefined;
   const canChange = first?.canUpload === true;
-  const reload = async () => { await queryClient.invalidateQueries({ queryKey: trpc.files.list.pathKey() }); };
+  const reload = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: trpc.files.list.pathKey() }),
+      queryClient.invalidateQueries({ queryKey: trpc.orders.requirements.forOrder.queryKey({ orderId }) }),
+    ]);
+  };
 
   async function readBlob(file: FileRecord, signal?: AbortSignal) {
     // Keep the one-time bearer ticket out of the client query/mutation caches.

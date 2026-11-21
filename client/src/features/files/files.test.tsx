@@ -20,6 +20,7 @@ vi.mock("@/lib/trpc", async (original) => ({
   useTRPC: () => {
     const mutation = { mutationOptions: () => ({ mutationFn: async () => ({}) }) };
     return {
+      orders: { requirements: { forOrder: { queryKey: (input: { orderId: string }) => ["requirements", input.orderId] } } },
       files: {
         list: {
           infiniteQueryOptions: () => ({
