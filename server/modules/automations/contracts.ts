@@ -147,6 +147,11 @@ export interface AutomationResolvedTriggerContext {
    * Automatically populated from `event.resource.publicId` when `event.resource.type === "order"`.
    */
   orderPublicId?: string | null;
+  /**
+   * Canonical file `publicId` when the trigger event is for a specific file (`file.uploaded`),
+   * automatically populated from `event.resource.publicId` when `event.resource.type === "file"`.
+   */
+  filePublicId?: string | null;
 }
 
 export type AutomationTriggerContextResolver = (
@@ -252,6 +257,10 @@ export interface AutomationActionRunContext<C = Record<string, unknown>> {
   recipients: Readonly<Record<string, readonly number[]>>;
   /** Canonical order `publicId` when available in the trigger/manual context, otherwise `null`. */
   orderPublicId: string | null;
+  /** Canonical file `publicId` when triggered by a file event (`file.uploaded`), otherwise `null`. */
+  filePublicId: string | null;
+  /** True when the trigger is marked `staffOnly: true` (forbids customer recipients, fixed external emails, and webhooks). */
+  staffOnlyTrigger: boolean;
   /** True only during dry-run `testRun` when `executeLive === false` (actions MUST NOT perform side effects). */
   dryRun: boolean;
   /** Worker lease fence from `ClaimedJob.assertStillOwned`. Call before any non-idempotent external write. */
@@ -323,6 +332,11 @@ export interface AutomationActionRegistration<C = Record<string, unknown>> {
   configFields: readonly AutomationActionConfigField[];
   /** When true, builder & validator require a trigger (or manual input) that supplies `orderPublicId`. */
   requiresOrderContext?: boolean;
+  /**
+   * When true, this action cannot be used on `staffOnly: true` triggers (e.g. `webhook.call` or external sinks),
+   * enforced both on save and at run time (`J-A01`).
+   */
+  forbidOnStaffOnlyTrigger?: boolean;
   /** Defaults to all trigger modes (`["event", "manual", "schedule"]`). */
   supportedTriggerModes?: readonly AutomationTriggerMode[];
   /**
@@ -501,6 +515,7 @@ export interface AutomationCatalogueView {
     owner: AutomationActionRegistration["owner"];
     configFields: readonly AutomationActionConfigField[];
     requiresOrderContext: boolean;
+    forbidOnStaffOnlyTrigger: boolean;
     supportedTriggerModes: readonly AutomationTriggerMode[];
     retrySafe: boolean;
   }[];

@@ -48,6 +48,8 @@ export interface AutomationResolvedTriggerContext {
   recipients?: Readonly<Record<string, readonly number[]>>;
   /** Canonical order `publicId` when the resource belongs to an order (auto-populated when `event.resource?.type === "order"`). */
   orderPublicId?: string | null;
+  /** Canonical file `publicId` when triggered by `file.uploaded` (auto-populated when `event.resource?.type === "file"`). */
+  filePublicId?: string | null;
 }
 
 export interface AutomationTriggerRegistration {
@@ -100,7 +102,7 @@ Hard guardrail (`assertAllowedActionKey`): **no action may mutate order status, 
   - Every run stamps `correlationId = automationCorrelationId(runPublicId)` (`"automation:<runPublicId>"`).
   - Worker execution runs inside `withRequestContext({ origin: "worker", correlationId })` and passes `correlationId` to every `jobs.enqueue`, `audit.record`, and outbound mail/webhook/sync call.
   - Both `audit/tap.ts` and `automations` drop any event where `isAutomationOrigin(event.correlationId)` is `true` (including asynchronous descendants such as `job.mail.failed`).
-  - Defense-in-depth visibility filter: internal order messages (`engagement.message.sent` with `visibility === "internal"`) and internal ticket replies (`internal_only === true`) never match customer-addressable triggers.
+  - Defense-in-depth `staffOnly` isolation (`J-A01`): when a trigger catalogue entry has `staffOnly: true` (e.g. `message.internal_note`), **both save-time validation and worker-time execution** reject `webhook.call` (`forbidOnStaffOnlyTrigger: true`), fixed external e-mail addresses (`recipientMode === "fixed"`), and any resolved recipient whose current `users.role` is `"customer"`. Internal order messages (`visibility === "internal"`) and internal ticket replies (`internal_only === true`) never fire customer-addressable triggers.
 - **Deduplication**:
   - `automation_runs` enforces `UNIQUE (automation_id, trigger_event_id)` so duplicate tap deliveries never create two runs for the same `(automation, event)`.
   - `automation_run_steps` enforces `UNIQUE (run_id, step_index)` and supplies deterministic `idempotencyKey = "auto:" + runPublicId + ":step:" + stepKey`.
