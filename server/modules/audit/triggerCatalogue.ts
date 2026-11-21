@@ -193,6 +193,13 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     fields: [], recipients: [ACTOR, ADMINS, STAFF],
   },
   {
+    key: "customer_maintenance.configured", label: "Customer maintenance scheduled or changed", group: "Operations", owner: "jobs",
+    description: "An administrator switched customer maintenance on, scheduled it or changed its window. Fires when the setting changes, not when the window starts.",
+    eventName: "job.customer_maintenance.changed", outcomes: ["completed"], match: { reason_code: "CUSTOMER_MAINTENANCE_CONFIGURED" }, resourceType: "customer_maintenance",
+    fields: [f("starts_at", "Starts", "datetime"), f("ends_at", "Expected end", "datetime"), f("enabled", "Switched on", "boolean")],
+    recipients: [ACTOR, ADMINS, STAFF],
+  },
+  {
     key: "backup.completed", label: "Backup completed", group: "Operations", owner: "backup",
     description: "An encrypted backup archive was written.",
     eventName: "backup.archive.completed", outcomes: ["completed"], resourceType: "backup_archive",

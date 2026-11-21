@@ -242,6 +242,12 @@ describe("trigger catalogue", () => {
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_ENABLED" })).map((e) => e.key)).toEqual(["maintenance.enabled"]);
   });
 
+  it("customer maintenance triggers on configuration only, not when it is switched off", () => {
+    const res = { type: "customer_maintenance", publicId: null };
+    expect(entriesForEvent(tapEvent({ eventName: "job.customer_maintenance.changed", resource: res, reasonCode: "CUSTOMER_MAINTENANCE_CONFIGURED", attributes: { enabled: true, starts_at: null, ends_at: null } })).map((e) => e.key)).toEqual(["customer_maintenance.configured"]);
+    expect(entriesForEvent(tapEvent({ eventName: "job.customer_maintenance.changed", resource: res, reasonCode: "CUSTOMER_MAINTENANCE_DISABLED", attributes: { enabled: false } }))).toEqual([]);
+  });
+
   it("only customer-visible uploads reach file.uploaded (staff-only and legacy events never match)", () => {
     const file = { type: "file", publicId: "01JD0000000000000000000005" };
     expect(entriesForEvent(tapEvent({ eventName: "file.uploaded", resource: file, attributes: { file_visibility: "customer_visible" } })).map((e) => e.key)).toEqual(["file.uploaded"]);
