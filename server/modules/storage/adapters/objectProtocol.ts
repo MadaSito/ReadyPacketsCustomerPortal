@@ -64,6 +64,27 @@ export function transportError(error: unknown, write = false): StorageAdapterErr
   return new StorageAdapterError(write ? "OUTCOME_UNKNOWN" : "PROVIDER_UNAVAILABLE", !write);
 }
 
+/** Preserve pre-wire fence failures: no provider write was attempted. */
+export async function objectRequest<T>(
+  request: (beforeSend?: () => Promise<void>) => Promise<T>,
+  write: boolean,
+  beforeWrite?: () => Promise<void>,
+): Promise<T> {
+  const fenceFailure: { cause?: unknown } = {};
+  const beforeSend = beforeWrite && (async () => {
+    try { await beforeWrite(); }
+    catch (error) {
+      fenceFailure.cause = error;
+      throw error;
+    }
+  });
+  try { return await request(beforeSend); }
+  catch (error) {
+    if (Object.hasOwn(fenceFailure, "cause")) throw fenceFailure.cause;
+    throw transportError(error, write);
+  }
+}
+
 export function testError(error: unknown): StorageTestResult {
   const code = transportError(error).code;
   return { ok: false, code: code === "EGRESS_DENIED" || code === "NOT_CONFIGURED" ? code : "PROVIDER_UNAVAILABLE" };

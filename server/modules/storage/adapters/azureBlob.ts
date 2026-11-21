@@ -4,8 +4,8 @@ import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
 import {
-  fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedEtag, observedSize, pathFor, prefixParts, prefixSchema, removeKey,
-  statusError, testError, transportError, WRITE_TIMEOUT_MS,
+  fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, objectRequest, observedEtag, observedSize, pathFor,
+  prefixParts, prefixSchema, removeKey, statusError, testError, WRITE_TIMEOUT_MS,
 } from "./objectProtocol.js";
 
 export const azureBlobConfig = z.strictObject({
@@ -68,6 +68,7 @@ export function azureBlobAdapter(egress: () => Pick<EgressPolicy, "fetchPinned">
       const authMatches = config.auth === "shared_key" ? "accountKey" in credentials : "sasToken" in credentials;
       async function request(method: Method, target: URL, options: {
         headers?: Record<string, string>; body?: ReturnType<typeof measuredBody>["body"]; signal?: AbortSignal;
+        beforeWrite?: () => Promise<void>;
       } = {}) {
         if (!authMatches) throw new StorageAdapterError("NOT_CONFIGURED");
         const headers: Record<string, string> = { "x-ms-date": clock.now().toUTCString(), "x-ms-version": storageVersion,
@@ -78,16 +79,12 @@ export function azureBlobAdapter(egress: () => Pick<EgressPolicy, "fetchPinned">
         } else {
           url.search += `${url.search ? "&" : "?"}${credentials.sasToken.replace(/^\?/u, "")}`;
         }
-        try {
-          return await egress().fetchPinned(url, "storage_azure", {
-            method, headers, body: options.body, signal: options.signal,
-            maxResponseBytes: 16 * 1024, requireAllowlistRule: true, publicAddressesOnly: true,
-            ...(options.body ? { contentLength: Number(headers["content-length"]), maxRequestBytes: MAX_OBJECT_BYTES,
-              timeoutMs: WRITE_TIMEOUT_MS } : { timeoutMs: 10_000 }),
-          });
-        } catch (error) {
-          throw transportError(error, method !== "HEAD");
-        }
+        return objectRequest((beforeSend) => egress().fetchPinned(url, "storage_azure", {
+          method, headers, body: options.body, signal: options.signal, beforeSend,
+          maxResponseBytes: 16 * 1024, requireAllowlistRule: true, publicAddressesOnly: true,
+          ...(options.body ? { contentLength: Number(headers["content-length"]), maxRequestBytes: MAX_OBJECT_BYTES,
+            timeoutMs: WRITE_TIMEOUT_MS } : { timeoutMs: 10_000 }),
+        }), method !== "HEAD", options.beforeWrite);
       }
       return {
         async test(signal) {
@@ -110,12 +107,11 @@ export function azureBlobAdapter(egress: () => Pick<EgressPolicy, "fetchPinned">
           if (input.size > maxAzureBytes) throw new StorageAdapterError("TOO_LARGE");
           const key = objectKey(prefix, input);
           const url = urlFor(key.split("/"));
-          await input.beforeWrite?.();
           const stream = measuredBody(input, true);
           let md5: string | undefined;
           let put;
           try {
-            put = await request("PUT", url, { signal: input.signal, body: stream.body, headers: {
+            put = await request("PUT", url, { signal: input.signal, body: stream.body, beforeWrite: input.beforeWrite, headers: {
               "content-type": input.contentType, "content-length": String(input.size), "if-none-match": "*",
               "x-ms-blob-type": "BlockBlob",
             } });

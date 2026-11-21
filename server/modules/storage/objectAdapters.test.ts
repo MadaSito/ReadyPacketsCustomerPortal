@@ -57,6 +57,7 @@ describe("S3 adapter through a pinned transport fake", () => {
       expect(url.pathname).toBe("/private-copy/pre/R%C3%A9sum%C3%A9%20%26%20Plans/synthetic%20quote%21.bin");
       if (options?.method === "HEAD") return written ? response(200, { ...putHeaders, "content-length": String(bytes.length) }) : response(404);
       expect(options?.method).toBe("PUT");
+      await options.beforeSend?.();
       expect(beforeWrite).toHaveBeenCalledOnce();
       expect(options.headers).toMatchObject({ "x-amz-checksum-sha256": putHeaders["x-amz-checksum-sha256"],
         "x-amz-content-sha256": hash("sha256").digest("hex"), "if-none-match": "*" });
@@ -75,13 +76,7 @@ describe("S3 adapter through a pinned transport fake", () => {
     await expect(adapter.remove("unrelated/removable.bin")).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
-  it("does not follow destination redirects or write on a lost fence", async () => {
-    const fetchPinned: EgressPolicy["fetchPinned"] = vi.fn(async () => response(404));
-    const adapter = s3Adapter(() => ({ fetchPinned }), clock).create({ publicId, credentials: s3Secret,
-      config: s3Config.parse({ preset: "custom", region: "test-region", bucket: "private-copy", endpoint: "https://s3.example.test" }) });
-    const beforeWrite = async () => { throw new Error("lease lost"); };
-    await expect(adapter.put({ ...request(), beforeWrite })).rejects.toThrow("lease lost");
-    expect(fetchPinned).toHaveBeenCalledOnce();
+  it("does not follow destination redirects", async () => {
     const redirected: EgressPolicy["fetchPinned"] = async () => {
       throw new DomainError("UNAVAILABLE", "EGRESS_REDIRECT_REFUSED", "No redirect.");
     };
@@ -89,6 +84,33 @@ describe("S3 adapter through a pinned transport fake", () => {
       config: { preset: "aws", region: "us-east-1", bucket: "private-copy" } });
     await expect(blocked.test()).resolves.toEqual({ ok: false, code: "EGRESS_DENIED" });
   });
+});
+
+it.each(["S3", "Azure"] as const)("%s sends no PUT if the lease is revoked during destination resolution", async (provider) => {
+  const leaseFailure = new DomainError("FORBIDDEN", "STORAGE_COPY_SOURCE_INACTIVE", "Synthetic source revocation.");
+  const sendPut = vi.fn();
+  let revoked = false;
+  const beforeWrite = vi.fn(async () => {
+    if (revoked) throw leaseFailure;
+  });
+  const fetchPinned: EgressPolicy["fetchPinned"] = vi.fn(async (_raw, _purpose, options) => {
+    if (options?.method === "HEAD") return response(404);
+    expect(options?.method).toBe("PUT");
+    expect(beforeWrite).not.toHaveBeenCalled();
+    await Promise.resolve(); // Destination policy/DNS resolution completes before the pre-wire fence.
+    revoked = true;
+    await options?.beforeSend?.();
+    sendPut();
+    throw new Error("Synthetic PUT must not reach the requester.");
+  });
+  const adapter = provider === "S3"
+    ? s3Adapter(() => ({ fetchPinned }), clock).create({ publicId, credentials: s3Secret,
+      config: s3Config.parse({ preset: "aws", region: "us-east-1", bucket: "private-copy" }) })
+    : azureBlobAdapter(() => ({ fetchPinned }), clock).create({ publicId, credentials: azureSecret,
+      config: azureBlobConfig.parse({ account: "testaccount", container: "private-archive", auth: "shared_key" }) });
+  await expect(adapter.put({ ...request(), beforeWrite })).rejects.toBe(leaseFailure);
+  expect(beforeWrite).toHaveBeenCalledOnce();
+  expect(sendPut).not.toHaveBeenCalled();
 });
 
 describe("Azure Blob adapter through a pinned transport fake", () => {

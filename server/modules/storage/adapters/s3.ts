@@ -4,8 +4,8 @@ import type { Clock } from "../../../core/types.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import { StorageAdapterError, type StorageAdapterDefinition } from "../contracts.js";
 import {
-  encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, observedEtag, observedSize, pathFor, prefixParts,
-  prefixSchema, removeKey, statusError, testError, transportError, WRITE_TIMEOUT_MS,
+  encodeSegment, fromStatus, MAX_OBJECT_BYTES, measuredBody, objectKey, objectRequest, observedEtag, observedSize, pathFor,
+  prefixParts, prefixSchema, removeKey, statusError, testError, WRITE_TIMEOUT_MS,
 } from "./objectProtocol.js";
 
 const endpointSchema = z.string().max(300).transform((value, ctx) => {
@@ -90,21 +90,18 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
       const urlFor = (parts: readonly string[]) => new URL(pathFor([config.bucket, ...parts]), origin);
       async function request(method: Method, url: URL, options: {
         headers?: Record<string, string>; sha256?: string; body?: ReturnType<typeof measuredBody>["body"]; signal?: AbortSignal;
+        beforeWrite?: () => Promise<void>;
       } = {}) {
         const headers = signS3({ method, url, region: config.region, credentials, date: clock.now(),
           payloadHash: options.sha256 ?? emptyDigest, headers: options.headers });
         // The pinned transport writes Host itself. Sign exactly the host used by the connection.
         delete headers.host;
-        try {
-          return await egress().fetchPinned(url, "storage_s3", {
-            method, headers, body: options.body, signal: options.signal,
-            maxResponseBytes: 16 * 1024, requireAllowlistRule: true, publicAddressesOnly: true,
-            ...(options.body ? { contentLength: Number(headers["content-length"]), maxRequestBytes: MAX_OBJECT_BYTES,
-              timeoutMs: WRITE_TIMEOUT_MS } : { timeoutMs: 10_000 }),
-          });
-        } catch (error) {
-          throw transportError(error, method !== "HEAD");
-        }
+        return objectRequest((beforeSend) => egress().fetchPinned(url, "storage_s3", {
+          method, headers, body: options.body, signal: options.signal, beforeSend,
+          maxResponseBytes: 16 * 1024, requireAllowlistRule: true, publicAddressesOnly: true,
+          ...(options.body ? { contentLength: Number(headers["content-length"]), maxRequestBytes: MAX_OBJECT_BYTES,
+            timeoutMs: WRITE_TIMEOUT_MS } : { timeoutMs: 10_000 }),
+        }), method !== "HEAD", options.beforeWrite);
       }
       return {
         async test(signal) {
@@ -128,11 +125,11 @@ export function s3Adapter(egress: () => Pick<EgressPolicy, "fetchPinned">, clock
             throw new StorageAdapterError("DESTINATION_CONFLICT");
           }
           if (existing.status !== 404) throw statusError(existing.status);
-          await input.beforeWrite?.();
           const stream = measuredBody(input);
           let put;
           try {
-            put = await request("PUT", url, { signal: input.signal, body: stream.body, sha256: input.sha256, headers: {
+            put = await request("PUT", url, { signal: input.signal, body: stream.body, sha256: input.sha256,
+              beforeWrite: input.beforeWrite, headers: {
               "content-type": input.contentType, "content-length": String(input.size), "if-none-match": "*",
               ...(nativeChecksum ? { "x-amz-checksum-sha256": bodyChecksum(input.sha256) } : {}),
             } });
