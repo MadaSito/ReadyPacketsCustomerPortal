@@ -25,6 +25,7 @@ import { getRequestContext, newRequestContext, runWithRequestContext, setRequest
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
 import { createInboundWebhooksHttpRouter } from "../modules/integrations/webhooks/http.js";
+import { createPaymentReturnHttpRouter, createPaymentWebhooksHttpRouter } from "../modules/payments/http.js";
 import { createPublicApiHttpRouter } from "../modules/publicApi/http.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
@@ -238,6 +239,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? {
     publicApi: createPublicApiHttpRouter,
     inboundWebhooks: createInboundWebhooksHttpRouter,
+    paymentWebhooks: createPaymentWebhooksHttpRouter,
+    paymentReturn: createPaymentReturnHttpRouter,
   }, async (_req, _res, next) => {
     await applyRateLimit(services, "api", `ip:${currentAddress()}`);
     next();

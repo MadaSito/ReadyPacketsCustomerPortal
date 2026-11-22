@@ -455,6 +455,39 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(h.sessionResolver).not.toHaveBeenCalled();
   });
 
+  it("mounts the default payment adapters with a fixed return and canonical notification target", async () => {
+    const h = harness();
+    const handleSignedWebhook = vi.fn(async () => ({
+      httpStatus: 200, accepted: true, duplicate: false, booked: false, reasonCode: "SYNTHETIC",
+    }));
+    Object.assign(h.services, { payments: { handleSignedWebhook } });
+    const attempt = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const body = '{\n "id":"synthetic"\n}';
+    await h.http.post("/api/payments/webhooks/square").set("Host", HOST).type("json")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).send(body).expect(200);
+    expect(handleSignedWebhook).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "square", rawBody: Buffer.from(body), notificationUrl: `${ORIGIN}/api/payments/webhooks/square`,
+    }));
+    await h.http.get(`/api/payments/return/stripe/${attempt}?flow=checkout&next=https://other.example.test`).set("Host", HOST)
+      .expect(303).expect("Location", `/checkout/return?attempt=${attempt}`);
+    expect(handleSignedWebhook).toHaveBeenCalledTimes(1);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("does not log the payment receiver's exception message", async () => {
+    const h = harness();
+    const error = vi.fn();
+    h.services.logger.error = error;
+    Object.assign(h.services, { payments: { handleSignedWebhook: async () => { throw new Error("synthetic-sensitive-provider-detail"); } } });
+    await h.http.post("/api/payments/webhooks/stripe").set("Host", HOST)
+      .type("json").send({ id: "synthetic" }).expect(500)
+      .expect({ ok: false, reasonCode: "INTERNAL_WEBHOOK_ERROR" });
+    expect(error).toHaveBeenCalledWith("Unhandled error in payment webhook receiver", expect.objectContaining({
+      provider: "stripe", reasonCode: "UNHANDLED_EXCEPTION", errorName: "Error",
+    }));
+    expect(JSON.stringify(error.mock.calls)).not.toContain("synthetic-sensitive-provider-detail");
+  });
+
   it("passes only narrow webhook bytes ahead of JSON parsing and enforces request body limits", async () => {
     const signedWebhookRouter = Router();
     signedWebhookRouter.post("/synthetic", (req, res) => {
