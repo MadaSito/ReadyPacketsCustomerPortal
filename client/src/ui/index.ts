@@ -29,7 +29,7 @@ export { Dialog, DialogClose, ConfirmDialog, Drawer, DropdownMenu, Tooltip, type
 export { Tabs, Breadcrumbs, type TabsProps, type TabItem, type Crumb } from "./Navigation";
 export { RouteTabs, RouteTabPanel, routeTabId, routeTabPanelId, type RouteTabsProps, type RouteTabItem, type RouteTabPanelProps } from "./RouteTabs";
 export { ToastProvider, useToast, type ToastApi, type ToastInput, type ToastTone } from "./Toast";
-export { DataTable, type Column, type DataTableProps, type SortState } from "./DataTable";
+export { DataTable, type Column, type DataTableProps, type DataTableSelection, type SortState } from "./DataTable";
 export { FilterBar, type FilterBarProps } from "./FilterBar";
 export { FileDropzone, type FileDropzoneProps } from "./FileDropzone";
 export { CopyButton, CodeBlock, DateTime, Money, formatDateTime, type CopyButtonProps, type CodeBlockProps, type DateTimeProps, type MoneyProps } from "./Data";
