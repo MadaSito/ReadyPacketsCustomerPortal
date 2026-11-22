@@ -11,7 +11,7 @@ The owner asks for an acceptance gateway based on a policy (increment 04 part B,
   - a signature mode: a checkbox or a typed full name;
   - "ask again when the policy has a new version" (default off).
 - While a gate is unmet, the customer can open and read the order. They cannot upload, record, answer intake or submit a phase on it.
-- The server refuses those mutations with `CONFLICT` (HTTP 409), reason `ORDER_ACCEPTANCE_REQUIRED`, through the orders gate port. This differs from the `PRECONDITION_FAILED` in the part B contract. Cancelling an order is never gated. The client shows a full-width gate with the policy text but is never the gate itself.
+- The server refuses those mutations with `CONFLICT` (HTTP 409), reason `ORDER_ACCEPTANCE_REQUIRED`, through the orders gate port. This differs from the `PRECONDITION_FAILED` in the part B contract. Cancelling an order is never gated. If gates exist but no gate provider is registered, the work is refused with `ORDER_GATES_UNAVAILABLE` (fail closed). The client shows a full-width gate with the policy text but is never the gate itself.
 - Each acting user accepts for themselves: the owner and every person with access. Staff are not gated.
 - Evidence is append-only. Each record holds:
   - the order, the user, the policy public id and version;

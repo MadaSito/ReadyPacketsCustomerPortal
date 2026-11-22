@@ -43,8 +43,8 @@ procedure.
 
 ### Added — part B, console order workspace
 
-- **Console order page** (`/admin/orders/:orderId`): a header with Rename order, Change reference, Reassign customer, Invoice and Refund, then status, payment and total badges. The tabs, in order, are Overview, Phases, Intake, Files, Messages, Automation, SharePoint sync, Invoices, Refund, Order history, Acceptances and Sharing, and each has its own address. No feature switch.
-- **Rename an order**: needs `orders.rename` (staff and administrators). The check is version-aware, it writes the audit event `order.renamed` and an Order history entry, and the reference does not change.
+- **Console order page** (`/admin/orders/:orderId`): a header with Rename order, Change reference, Reassign customer, Invoice and Refund, then status, payment and total badges. The tabs, in order, are Overview, Phases, Intake, Files, Messages, Automation, Sync, Invoices, Refund, Order history, Acceptances, Notes and Sharing. Each has its own address, and on narrow screens they become a drop-down list. No feature switch.
+- **Rename an order**: needs `orders.rename` (staff and administrators). The check is version-aware and the reference does not change. Each rename writes the audit event `order.renamed`, which records lengths only, and keeps the old and new names in the order's name history. Staff see "Renamed: old → new" in Order history; customers see "Order renamed".
 - **Order history** (replaces Activity): the order's status transitions next to its audited activity, paginated and filterable by category. Customers see only the subset meant for them.
 - **Automation tab** (formerly Production), per [ADR 0041](docs/adr/0041-order-automation-tab.md):
   - The Phase I and Phase II cards say why a button is disabled.

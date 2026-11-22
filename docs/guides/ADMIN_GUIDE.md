@@ -62,15 +62,28 @@ Use these chapters alongside the existing console guide. Installing a dependency
 
 ## Working on an order
 
-Open **Orders** and select an order (`/admin/orders/:orderId`). The header shows the order name, then the reference, the customer and the date it was placed, followed by badges for status, payment state and total. The actions are **Rename order**, **Change reference**, **Reassign customer**, **Invoice** and **Refund**, followed by the status actions. Each tab has its own address, so you can bookmark or share a link to it. On narrow screens the tab strip scrolls, and the remaining tabs move into a **More** menu.
+Open **Orders** and select an order (`/admin/orders/:orderId`). The header shows the order name, then the reference, the customer and the date it was placed, with badges for status, payment and lock.
+
+The actions are **Rename order**, **Change reference** (administrators), **Reassign customer** (administrators), **Invoice** and **Refund**, followed by **Change lock**, **Access for other users** and **New order for a customer**.
+
+The tabs are Overview, Phases, Intake, Files, Messages, Automation, Sync, Invoices, Refund, Order history, Acceptances, Notes and Sharing. Each tab has its own address, so you can bookmark or share a link to it. On narrow screens they become a drop-down list.
 
 ### Rename an order
 
-**Rename order** changes the order's display name (1–120 characters) and never its reference. Staff and administrators with `orders.rename` can use it. If someone else changed the order first, the rename is refused; reload the order and try again. Every rename is audited as `order.renamed` with the old and new name and appears in **Order history**.
+**Rename order** changes only the order's display name (1–120 characters); the reference stays the same. Staff and administrators with `orders.rename` can use it. If someone else changed the order first, the rename is refused; reload the order and try again. Every rename is audited as `order.renamed`, and the old and new names are kept in the order's name history. Staff see "Renamed: old → new" in **Order history**, and customers see a plain "Order renamed".
 
 ### Order history
 
-**Order history** replaces Activity. The left column lists every status transition (from → to, note, time and who made it). The right column lists the order's audited activity, such as renames, reference changes, reassignment, access grants, phase reviews, acceptances, file uploads and storage copies, production dispatches, stage-action runs and refunds. Filter by category and page through older entries. Customers see only their own subset, with staff shown as "ReadyPackets staff" and no IP addresses.
+**Order history** replaces Activity; customers see it as **History**.
+
+- **Left column:** every status change, with who made it, any note, and every rename.
+- **Right column:** the activity recorded on the order, with event names, outcomes and correlation IDs. Use a correlation ID to trace an event in the Audit centre. You can filter by category: details, status, sharing, phases, acceptance, files, storage, production, automations and payments.
+
+Customers see a reduced view:
+
+- Staff appear only as "ReadyPackets staff".
+- Internal notes and former order names are hidden.
+- Only successful, customer-relevant events are shown, and file events appear only for files visible to the customer.
 
 ### Automation
 
@@ -88,7 +101,8 @@ When a Start button is disabled, the card explains why: the pipeline is switched
 
 **Workflow stage actions** lists every step of the order's workflow version with the enabled automations bound to it. These are **Order created** rules on the first step, and **Order status changed** rules that target that step.
 
-- Staff and administrators with `orders.automations.run` can select **Run actions** to run them for this order now. No step-up is needed.
+- Staff and administrators with `orders.automations.run` see this panel at the top of the Automation tab, with the current step marked.
+- **Run actions** queues a step's automations for this order after you confirm. No step-up is needed, and repeating the request never queues them twice.
 - Administrators also get a link to **Automations** (`/admin/automations`).
 - If the automations engine is off, **Run actions** is disabled with an explanation.
 - Each run uses an idempotency key and obeys rate limits. It appears in the run history and in **Order history**.
