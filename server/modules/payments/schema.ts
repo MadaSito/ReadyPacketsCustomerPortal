@@ -7,6 +7,7 @@
  *  - `payment_webhook_events`: Deduplicated, signature-verified provider webhook receipts (`provider, external_event_id`) with SHA-256 payload digest for replay vs tamper detection.
  */
 import {
+  boolean,
   char,
   foreignKey,
   index,
@@ -55,6 +56,14 @@ export const PAYMENT_WEBHOOK_STATUSES = [
   "verification_mismatch",
 ] as const;
 export type PaymentWebhookStatus = (typeof PAYMENT_WEBHOOK_STATUSES)[number];
+
+export const PAYMENT_REFUND_STATUSES = [
+  "pending",
+  "succeeded",
+  "failed",
+  "unknown",
+] as const;
+export type PaymentRefundStatus = (typeof PAYMENT_REFUND_STATUSES)[number];
 
 export const paymentAttempts = mysqlTable(
   "payment_attempts",
@@ -126,9 +135,12 @@ export const paymentWebhookEvents = mysqlTable(
     payloadSha256: char("payload_sha256", { length: 64 }).notNull(),
     attemptId: refColumn("attempt_id"),
     attemptPublicId: char("attempt_public_id", { length: 26 }),
+    refundId: refColumn("refund_id"),
+    refundPublicId: char("refund_public_id", { length: 26 }),
     providerRef: varchar("provider_ref", { length: 128 }),
     providerOrderRef: varchar("provider_order_ref", { length: 128 }),
     providerPaymentRef: varchar("provider_payment_ref", { length: 128 }),
+    providerRefundRef: varchar("provider_refund_ref", { length: 128 }),
     status: mysqlEnum("status", PAYMENT_WEBHOOK_STATUSES).notNull(),
     reasonCode: varchar("reason_code", { length: 64 }),
     occurredAt: utcDateTime("occurred_at").notNull(),
@@ -144,8 +156,78 @@ export const paymentWebhookEvents = mysqlTable(
     uniqueIndex("pmt_wh_prov_ext_uq").on(t.provider, t.externalEventId),
     index("pmt_wh_st_rec_idx").on(t.status, t.receivedAt),
     index("pmt_wh_att_idx").on(t.attemptId),
+    index("pmt_wh_rfd_idx").on(t.refundId),
+  ],
+);
+
+export const paymentRefunds = mysqlTable(
+  "payment_refunds",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    /** Logical reference to `orders.id` (verified via `services.orders`). */
+    orderId: refColumn("order_id").notNull(),
+    orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+    /** Logical reference to `compliance_invoices.id`. */
+    invoiceId: refColumn("invoice_id").notNull(),
+    invoicePublicId: char("invoice_public_id", { length: 26 }).notNull(),
+    /** Logical reference to `compliance_invoice_payments.id` (locked FOR UPDATE during refundable calculation). */
+    compliancePaymentId: refColumn("compliance_payment_id").notNull(),
+    compliancePaymentPublicId: char("compliance_payment_public_id", { length: 26 }).notNull(),
+    /** Optional FK to `payment_attempts.id` when payment originated from a hosted portal attempt. */
+    attemptId: refColumn("attempt_id"),
+    provider: mysqlEnum("provider", ACTIVE_PAYMENT_PROVIDERS).notNull(),
+    environment: mysqlEnum("environment", PAYMENT_ENVIRONMENT_MODES).notNull(),
+    /** Captured provider payment reference (`pi_...`/`ch_...` for Stripe, `payment_id` for Square). */
+    providerPaymentRef: varchar("provider_payment_ref", { length: 128 }).notNull(),
+    /** Provider refund object identifier (`re_...` for Stripe, `refund.id` for Square) once known. */
+    providerRefundRef: varchar("provider_refund_ref", { length: 128 }),
+    status: mysqlEnum("status", PAYMENT_REFUND_STATUSES).notNull().default("pending"),
+    amountMinor: amountMinorColumn("amount_minor").notNull(),
+    currency: currencyColumn("currency").notNull(),
+    reasonCode: varchar("reason_code", { length: 64 }).notNull(),
+    /** AES-256-GCM encrypted operator refund reason (`payment_refunds.reason:<publicId>`). */
+    reasonEnc: text("reason_enc").notNull(),
+    sendCustomerNotice: boolean("send_customer_notice").notNull().default(false),
+    customerNoticeSentAt: utcDateTime("customer_notice_sent_at"),
+    /** Resulting `compliance_invoice_refunds.public_id` once booked into the invoice ledger on `succeeded`. */
+    complianceRefundPublicId: char("compliance_refund_public_id", { length: 26 }),
+    /** Caller UI idempotency key preventing duplicate refund intents on retries. */
+    idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+    /** Deterministic provider idempotency key derived from `publicId` (`rp-refund-<publicId>`). */
+    providerIdempotencyKey: varchar("provider_idempotency_key", { length: 64 }).notNull(),
+    failureReasonCode: varchar("failure_reason_code", { length: 64 }),
+    requestedByUserId: refColumn("requested_by_user_id").notNull(),
+    verifiedWebhookEventId: varchar("verified_webhook_event_id", { length: 128 }),
+    reconcileJobId: varchar("reconcile_job_id", { length: 64 }),
+    settledAt: utcDateTime("settled_at"),
+    lastReconciledAt: utcDateTime("last_reconciled_at"),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    foreignKey({
+      name: "pmt_rfd_att_fk",
+      columns: [t.attemptId],
+      foreignColumns: [paymentAttempts.id],
+    }),
+    foreignKey({
+      name: "pmt_rfd_req_user_fk",
+      columns: [t.requestedByUserId],
+      foreignColumns: [users.id],
+    }),
+    uniqueIndex("pmt_rfd_pmt_idem_uq").on(t.compliancePaymentId, t.idempotencyKey),
+    uniqueIndex("pmt_rfd_prov_idem_uq").on(t.providerIdempotencyKey),
+    uniqueIndex("pmt_rfd_prov_ref_uq").on(t.provider, t.providerRefundRef),
+    index("pmt_rfd_ord_pub_idx").on(t.orderPublicId, t.id),
+    index("pmt_rfd_inv_id_idx").on(t.invoiceId, t.id),
+    index("pmt_rfd_cmp_pmt_idx").on(t.compliancePaymentId, t.status),
+    index("pmt_rfd_st_upd_idx").on(t.status, t.updatedAt),
+    index("pmt_rfd_prov_pmt_idx").on(t.provider, t.providerPaymentRef),
   ],
 );
 
 export type PaymentAttemptRow = typeof paymentAttempts.$inferSelect;
 export type PaymentWebhookEventRow = typeof paymentWebhookEvents.$inferSelect;
+export type PaymentRefundRow = typeof paymentRefunds.$inferSelect;
