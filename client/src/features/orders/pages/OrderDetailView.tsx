@@ -7,7 +7,7 @@ import { Suspense, useState, type FormEvent } from "react";
 import { useLocation, useParams } from "wouter";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
-import { ORDER_TABS } from "@/app/registry";
+import { FEATURES, ORDER_TABS } from "@/app/registry";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
@@ -19,6 +19,9 @@ import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 type Area = "customer" | "console";
+
+/** Part B: full-width banners contributed by other features (e.g. the acceptance gate), between header and tabs. */
+const ORDER_BANNERS = FEATURES.flatMap((feature) => feature.orderBanners ?? []).sort((a, b) => a.order - b.order);
 
 export function OrderDetailView({ area }: { area: Area }) {
   const { orderId = "", tab } = useParams<{ orderId: string; tab?: string }>();
@@ -92,6 +95,14 @@ export function OrderDetailView({ area }: { area: Area }) {
         </div>
       ) : null}
       {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      {ORDER_BANNERS.filter((b) => b.area === "both" || b.area === area).map((b) => {
+        const Banner = b.component;
+        return (
+          <Suspense key={b.key} fallback={null}>
+            <Banner orderId={order.publicId} area={area} />
+          </Suspense>
+        );
+      })}
       <Tabs
         label="Order sections"
         value={active}

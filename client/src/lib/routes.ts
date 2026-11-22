@@ -85,6 +85,18 @@ export interface DetailTab<Props> {
   labelComponent?: ComponentType<Props>;
 }
 export type OrderTab = DetailTab<{ orderId: string; area: "customer" | "console" }>;
+/**
+ * Full-width block a feature contributes to the order page, rendered between the header and the tab strip
+ * (host: orders feature; e.g. the acceptance gate). Rendered inside Suspense with no fallback; the component
+ * renders null when it has nothing to show. Server checks stay authoritative.
+ */
+export interface OrderBanner {
+  key: string;
+  /** Lower first. */
+  order: number;
+  area: "customer" | "console" | "both";
+  component: LazyExoticComponent<ComponentType<{ orderId: string; area: "customer" | "console" }>> | ComponentType<{ orderId: string; area: "customer" | "console" }>;
+}
 export type CustomerTab = DetailTab<{ customerId: string }>;
 /** Cards a feature contributes to the customer dashboard or console overview. */
 export interface DashboardWidget {
@@ -125,6 +137,8 @@ export interface FeatureRoutes {
   nav?: NavItem[];
   /** Tabs contributed to the order detail page (host: orders feature). */
   orderTabs?: OrderTab[];
+  /** Full-width banners on the order page between header and tabs (host: orders feature). */
+  orderBanners?: OrderBanner[];
   /** Tabs contributed to the console customer detail page (host: identity feature). */
   customerTabs?: CustomerTab[];
   /** Cards contributed to the dashboards (host: dashboard feature). */
