@@ -401,6 +401,12 @@ This is a business-data transfer between ReadyPackets installations, **not a bac
   4. Review **Reconciliation**.
   5. A **different administrator** gives final acceptance after independently confirming access, locks and downloads.
 - Checkpoints, held content and uncertain outcomes (`held-unknown`) are shown on the import page.
+- **Not transferred**: promotions (codes, batches, redemptions), cart upsell offers and carts. Recreate promotions
+  on the target. Imported orders keep their promo discount amount and label as history.
+- **Workflows** are moved separately with workflow export/import (drafts only). Portable transfer carries the
+  workflow key only as inert history.
+- **Backups** cover every table, but encrypted promo codes and keyed hashes restore correctly only with the same
+  encryption and blind-index keys.
 
 Package format and the offline `verify` tool: [portable/docs/CONTRACT.md](../../portable/docs/CONTRACT.md), [portable/API.md](../../portable/API.md) and `server/modules/portable/API.md`.
 
