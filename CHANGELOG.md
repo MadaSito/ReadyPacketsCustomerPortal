@@ -5,6 +5,33 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 05
+
+<!-- platform_engineer: drafted from INCREMENT_05_CONTRACT.md. Page paths and setting names are confirmed against the owners' API.md when they report; verification facts come from /root. -->
+
+### Added
+
+- **Workflow export and import** (`/admin/workflows`), per [ADR 0042](docs/adr/0042-workflow-transfer.md):
+  - Export one workflow, a selection or all of them as an integrity-checked JSON package (`workflows.export`).
+  - Import with a preview, then choose for each workflow to create it, add it as a draft or skip it (`workflows.import`, administrators, step-up).
+  - Imports are always drafts. Automations are not transferred.
+- **Cart suggestions** ([ADR 0043](docs/adr/0043-cart-upsell.md)): enable `feature.cart.upsell` (needs `feature.cart`). Up to three server-priced add-on, tier-upgrade or bundle-completion suggestions appear in the cart. Nothing is added without the customer's action. Administrators manage offers with `carts.upsells.manage`.
+- **Discount codes and links** ([ADR 0044](docs/adr/0044-discount-codes.md)): enable `feature.promotions`.
+  - Percent or fixed codes with scope, dates, limits, allow-lists and single-use batches of up to 5,000 codes.
+  - Links carry the code in the URL fragment.
+  - Redemption is atomic at order creation. The "Largest discount per order" guard defaults to 50%.
+  - Codes work in the cart and the order wizard, not in API v1.
+- **Policy acceptance log centre** ([ADR 0045](docs/adr/0045-policy-acceptance-log-centre.md)): Log, Coverage and Policy updates tabs, and a **Policies** tab on the admin customer profile. It is always on and read-only. Reading needs `policies.acceptances.read`; CSV export needs `policies.acceptances.export` and step-up.
+
+### Security
+
+- **Discount code abuse controls:** each code check is rate limited per account and per address. After 5 failed checks in 15 minutes, checking is paused for 15 minutes, and `promotion.attempts_blocked` is sent to the SIEM. Every refusal uses the same message, a verified e-mail is required, staff cannot redeem for themselves, and codes are never logged.
+- **Import package handling:** size, depth and count limits, strict schema, digest check (not a signature), and no rendering of imported text as HTML.
+
+### Operations
+
+- **Migration `0005_increment_05`**: additive. Details: _placeholder — /root to supply table and column counts._
+
 ## Increment 04
 
 ### Added

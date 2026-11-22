@@ -169,6 +169,17 @@ The owner asked for this on 2026-11-21 (prompt 19). The contract is [INCREMENT_0
 
 New capabilities (all in `shared/capabilities.ts`): `orders.rename`, `orders.automations.run`, `orders.production.redeliver` (step-up) and `payments.refund` (step-up).
 
+## Increment 05: workflow transfer, cart upsell, discount codes, acceptance log centre
+
+Requested by the owner on 2026-11-22 (prompt 21). The contract is [INCREMENT_05_CONTRACT.md](../engineering/INCREMENT_05_CONTRACT.md), decisions D1–D4. Migration `0005_increment_05` is additive. _Verification status: placeholder — /root supplies verified / not verified facts at the end of the increment._
+
+| Area | What it does | Switch and guard |
+| --- | --- | --- |
+| Workflow transfer (`orders`) | Exports one, a selection or all workflows as a JSON package with a SHA-256 digest (which detects damage; it is not a signature). Import has two stateless steps (preview, then apply) and always creates drafts ([ADR 0042](../adr/0042-workflow-transfer.md)). | No switch. Export needs `workflows.export`; import needs `workflows.import` (administrators, step-up). |
+| Cart upsell (`cart`) | Up to three server-priced suggestions (add-on, tier upgrade, bundle completion); accept is atomic and idempotent; offers can be dismissed ([ADR 0043](../adr/0043-cart-upsell.md)). | `feature.cart.upsell`, off; offers managed with `carts.upsells.manage`. |
+| Discount codes (`promotions`, `orders`, `cart`, `compliance`) | Codes, batches and fragment links. Redemption is atomic inside order creation through `services.promotions` (`preview`, `redeemInTx`, `releaseForOrderInTx`). A global guard caps the discount, refusals are uniform, and there is a rate limit and pause. The invoice shows the discount label ([ADR 0044](../adr/0044-discount-codes.md)). | `feature.promotions`, off; `promotions.read` (staff), `promotions.manage` (administrators, step-up). |
+| Acceptance log centre (`compliance`) | A read view over `policy_acceptances` and `order_policy_acceptances`: Log, Coverage and Policy updates tabs, and a customer profile Policies tab ([ADR 0045](../adr/0045-policy-acceptance-log-centre.md)). | Always on. Reading needs `policies.acceptances.read`; export needs `policies.acceptances.export` (step-up). Typed names are shown only with `policies.manage`. |
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |
