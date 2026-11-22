@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Suspense, useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "wouter";
 import type { RequiredPolicySummary } from "@server/modules/compliance/policiesService";
 import { errorMessage, useTRPC } from "@/lib/trpc";
@@ -117,7 +117,20 @@ export function RequiredPolicyGate({ children }: { children: ReactNode }) {
   if (allowed && !wizardStarted) setWizardStarted(true);
   return (
     <>
-      {allowed || wizardStarted ? <div hidden={!allowed}>{children}</div> : null}
+      {allowed || wizardStarted ? (
+        <div hidden={!allowed}>
+          <Suspense
+            fallback={
+              <>
+                <PageHeader title="New order" />
+                <Skeleton lines={3} />
+              </>
+            }
+          >
+            {children}
+          </Suspense>
+        </div>
+      ) : null}
       {!allowed ? !status.isFetchedAfterMount || status.isError || !status.data ? <>
         <PageHeader title="New order" />
         {status.isFetching ? <Skeleton lines={3} /> : <ErrorState title="We couldn't verify your policy status" onRetry={() => void status.refetch()} />}

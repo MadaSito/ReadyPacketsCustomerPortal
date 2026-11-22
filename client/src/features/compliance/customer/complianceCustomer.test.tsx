@@ -1,5 +1,6 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { lazy, Suspense, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InvoiceDetailView } from "@server/modules/compliance/invoicesService";
 import type { OrderIntakeItemView } from "@server/modules/compliance/intakeService";
@@ -179,6 +180,34 @@ describe("customer policy review", () => {
     mocks.policyStatus.mockResolvedValue({ pendingRequired: [], published: [document], acceptances: [] });
     await act(async () => { await queryClient.invalidateQueries({ queryKey: ["status"] }); });
     expect(await screen.findByRole("textbox", { name: "Project draft" })).toHaveValue("My project");
+  });
+
+  it("keeps an h1 heading visible inside a local Suspense boundary while a lazy child page loads after policy check", async () => {
+    mocks.policyStatus.mockResolvedValue({ pendingRequired: [], published: [document], acceptances: [] });
+    let resolveLazy!: (mod: { default: () => ReactElement }) => void;
+    const LazyChild = lazy(
+      () =>
+        new Promise<{ default: () => ReactElement }>((resolve) => {
+          resolveLazy = resolve;
+        }),
+    );
+    const { container } = renderUi(
+      <Suspense fallback={<p>Outer route loading without heading</p>}>
+        <RequiredPolicyGate>
+          <LazyChild />
+        </RequiredPolicyGate>
+      </Suspense>,
+    );
+    await waitFor(() => expect(resolveLazy).toBeTypeOf("function"));
+    expect(screen.getByRole("heading", { level: 1, name: "New order" })).toBeVisible();
+    expect(screen.queryByText("Outer route loading without heading")).not.toBeInTheDocument();
+    await expectNoAxeViolations(container);
+
+    await act(async () => {
+      resolveLazy({ default: () => <h1>New order wizard loaded</h1> });
+    });
+    expect(await screen.findByRole("heading", { level: 1, name: "New order wizard loaded" })).toBeVisible();
+    await expectNoAxeViolations(container);
   });
 
   it("renders legal markup as safe text and shows only server-returned acceptance history", async () => {
