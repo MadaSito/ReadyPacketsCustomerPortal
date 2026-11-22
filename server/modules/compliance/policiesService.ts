@@ -382,7 +382,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       resolvedOrderPublicId: string | null;
       versionPublicId: string;
       contentHash: string;
-      flow: "portal" | "registration";
+      flow: "portal" | "registration" | "checkout";
       signerName?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
@@ -504,6 +504,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       requestId,
       sourceAddressPseudonym,
       method: effectiveMethod,
+      context: input.flow,
       signerNameEnc,
       orderId: input.resolvedOrderId,
       orderPublicId: input.resolvedOrderPublicId,
@@ -629,7 +630,7 @@ export function createPoliciesService(deps: ModuleDeps) {
         resolvedOrderPublicId,
         versionPublicId: item.versionPublicId,
         contentHash: item.contentHash,
-        flow: "portal",
+        flow: "checkout",
         signerName: item.signerName,
       });
       if (!res.duplicate) recorded += 1;
