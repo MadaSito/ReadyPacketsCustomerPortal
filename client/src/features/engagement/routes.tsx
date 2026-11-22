@@ -68,8 +68,9 @@ export const engagementFeature: FeatureRoutes = {
       href: "/support",
       icon: LifeBuoy,
       area: "customer",
+      group: "Support",
       access: "customer",
-      order: 25,
+      order: 100,
     },
     {
       label: "Notifications",

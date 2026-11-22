@@ -1,4 +1,13 @@
-import { useRef, useState, type FormEvent } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  useRef,
+  useState,
+  type ComponentType,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "wouter";
 import type { TicketCategory } from "@server/modules/engagement/types";
@@ -16,6 +25,27 @@ import {
   useToast,
 } from "@/ui";
 import { makeIdempotencyKey, TICKET_CATEGORY_OPTIONS } from "../helpers";
+
+interface RelatedSlotProps {
+  query: string;
+  category?: string;
+}
+
+const relatedSlotModules = import.meta.glob<{ default: ComponentType<RelatedSlotProps> }>(
+  "../../knowledge/RelatedArticlesSlot.tsx",
+);
+const RelatedSlotEntry = Object.values(relatedSlotModules)[0];
+const LazyRelatedArticlesSlot = RelatedSlotEntry ? lazy(RelatedSlotEntry) : null;
+
+class OptionalSlotBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
 
 export default function NewSupportTicketPage() {
   const trpc = useTRPC();
@@ -127,6 +157,14 @@ export default function NewSupportTicketPage() {
               placeholder="e.g. Question about exhibit formatting"
             />
           </Field>
+
+          {LazyRelatedArticlesSlot ? (
+            <OptionalSlotBoundary>
+              <Suspense fallback={null}>
+                <LazyRelatedArticlesSlot query={subject} category={category} />
+              </Suspense>
+            </OptionalSlotBoundary>
+          ) : null}
 
           <Field label="Category" required error={fieldErrors.category}>
             <Select
