@@ -33,6 +33,6 @@ export default function SchedulesPage() {
         { key: "outcome", header: "Last job", cell: (row) => row.last ? <StatusBadge state={row.last.state} /> : "Not yet queued" },
         { key: "next", header: "Next slot", cell: (row) => result.data?.paused ? "Paused" : <DateTime value={row.nextSlot} /> },
       ]}
-      rowActions={(row) => row.last ? <Button asChild variant="secondary"><Link aria-label={`View last job for ${row.name}`} href={`/admin/jobs/${row.last.jobId}`}>View job</Link></Button> : null} />
+      rowActions={(row) => row.last ? <Button asChild variant="secondary"><Link aria-label={`View job for ${row.name}`} href={`/admin/jobs/${row.last.jobId}`}>View job</Link></Button> : null} />
   </>;
 }

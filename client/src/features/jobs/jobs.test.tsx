@@ -183,6 +183,19 @@ describe("Jobs administration pages", () => {
     await expectNoAxeViolations();
   });
 
+  it("includes the visible View job label in the schedule link's accessible name", async () => {
+    renderConsole(<SchedulesPage />, {
+      "jobs.admin.schedules": () => ({ paused: false, items: [
+        { name: "test.daily", everyMs: 86_400_000, nextSlot: date, last: { slot: date, state: "completed", jobId } },
+      ] }),
+    });
+    const table = await screen.findByRole("table", { name: "Recurring work" });
+    const link = within(table).getByRole("link", { name: "View job for test.daily" });
+    expect(link).toHaveAttribute("href", `/admin/jobs/${jobId}`);
+    expect(within(link).getByText("View job")).toBeVisible();
+    await expectNoAxeViolations(table);
+  });
+
   it("confirms before enabling maintenance and blocks reopening with unresolved work", async () => {
     const user = userEvent.setup();
     let active = false;
