@@ -422,6 +422,16 @@ export interface AdminCartUpsellsListResult {
 
 export type CheckoutCartResult =
   | {
+      mode: "no_payment_due";
+      cartPublicId: string;
+      orderPublicId: string;
+      orderReference: string;
+      invoicePublicId: string;
+      invoiceNumber: string;
+      currency: string;
+      totalMinor: 0;
+    }
+  | {
       mode: "invoice";
       cartPublicId: string;
       orderPublicId: string;
@@ -449,6 +459,7 @@ export type CheckoutCartResult =
 export type CheckoutConfirmationState =
   | "pending_confirmation"
   | "paid"
+  | "no_payment_due"
   | "invoice_issued"
   | "cancelled"
   | "failed";
@@ -456,7 +467,7 @@ export type CheckoutConfirmationState =
 export interface CheckoutStatusResult {
   cartPublicId: string;
   confirmationState: CheckoutConfirmationState;
-  paymentMode: "invoice" | "redirect";
+  paymentMode: "invoice" | "redirect" | "no_payment_due";
   provider: "none" | "stripe" | "square";
   attemptPublicId: string | null;
   attemptStatus: "created" | "redirected" | "paid" | "failed" | "expired" | "cancelled" | null;

@@ -24,6 +24,8 @@ import { createOrdersModule, type OrdersModule } from "../orders/index.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, insertUser, type TestUser } from "../orders/testSupport.js";
 import * as complianceTables from "../compliance/schema.js";
 import { createComplianceModule, type ComplianceModule } from "../compliance/index.js";
+import * as promotionsTables from "../promotions/schema.js";
+import { createPromotionsModule } from "../promotions/index.js";
 import * as cartTables from "./schema.js";
 import { CART_FEATURE_FLAG, CART_UPSELL_FEATURE_FLAG } from "./settings.js";
 import type {
@@ -44,6 +46,7 @@ const testSchema = {
   users,
   ...orderTables,
   ...complianceTables,
+  ...promotionsTables,
   ...cartTables,
 };
 
@@ -477,21 +480,42 @@ beforeEach(async () => {
 });
 
 describe("Increment 05 Package B — Cart upsell (D2) & Discount codes in cart (D3 / §3)", () => {
-  it("enforces admin upsell authz matrix: anonymous -> UNAUTHORIZED, customer -> NOT_FOUND (404), staff -> FORBIDDEN (403), admin -> allowed", async () => {
-    await expect(callerFor(null).cart.admin.upsells.list()).rejects.toSatisfy((err) => {
-      const c = extractCodes(err);
-      return c.trpcCode === "UNAUTHORIZED" && c.domainCode === "UNAUTHENTICATED";
-    });
+  it("enforces admin upsell authz before input parsing: anonymous -> UNAUTHORIZED, customer/unprivileged staff -> FORBIDDEN even on empty {} input, admin -> allowed", async () => {
+    for (const call of [
+      () => callerFor(null).cart.admin.upsells.list(),
+      () => callerFor(null).cart.admin.upsells.create({} as never),
+      () => callerFor(null).cart.admin.upsells.update({} as never),
+      () => callerFor(null).cart.admin.upsells.setActive({} as never),
+      () => callerFor(null).cart.admin.upsells.delete({} as never),
+    ]) {
+      await expect(call()).rejects.toSatisfy((err) => {
+        const c = extractCodes(err);
+        return c.trpcCode === "UNAUTHORIZED" && c.domainCode === "UNAUTHENTICATED";
+      });
+    }
 
-    await expect(callerFor(alice.principal).cart.admin.upsells.list()).rejects.toSatisfy((err) => {
-      const c = extractCodes(err);
-      return c.trpcCode === "NOT_FOUND" && c.domainCode === "NOT_FOUND";
-    });
+    for (const principal of [alice.principal, staff.principal]) {
+      for (const call of [
+        () => callerFor(principal).cart.admin.upsells.list(),
+        () => callerFor(principal).cart.admin.upsells.create({} as never),
+        () => callerFor(principal).cart.admin.upsells.update({} as never),
+        () => callerFor(principal).cart.admin.upsells.setActive({} as never),
+        () => callerFor(principal).cart.admin.upsells.delete({} as never),
+      ]) {
+        await expect(call()).rejects.toSatisfy((err) => {
+          const c = extractCodes(err);
+          return c.trpcCode === "FORBIDDEN" && c.domainCode === "FORBIDDEN";
+        });
+      }
+    }
 
-    await expect(callerFor(staff.principal).cart.admin.upsells.list()).rejects.toSatisfy((err) => {
-      const c = extractCodes(err);
-      return c.trpcCode === "FORBIDDEN" && c.domainCode === "FORBIDDEN";
-    });
+    // Service-side defence-in-depth still rejects direct non-admin callers.
+    await expect(cartMod.adminListUpsellOffers(alice.principal)).rejects.toSatisfy(
+      (err) => err instanceof DomainError && err.code === "NOT_FOUND",
+    );
+    await expect(cartMod.adminListUpsellOffers(staff.principal)).rejects.toSatisfy(
+      (err) => err instanceof DomainError && err.code === "FORBIDDEN",
+    );
 
     const listRes = await callerFor(admin.principal).cart.admin.upsells.list();
     expect(listRes.featureCartEnabled).toBe(true);
@@ -991,6 +1015,181 @@ describe("Increment 05 Package B — Cart upsell (D2) & Discount codes in cart (
       expect(promoApplied.totals.promo?.label).toBe("Single Pool 15% Off");
     } finally {
       await singlePool.end();
+    }
+  });
+
+  it("completes zero-total checkout with a 100% code (guard at 100) as no_payment_due without calling payments.startCheckout, idempotent on replay", async () => {
+    const realPromos = createPromotionsModule(h.deps);
+    (h.services as unknown as Record<string, unknown>).promotions = realPromos;
+
+    let startCheckoutCalls = 0;
+    const stripePaymentsGuard: CartPaymentsPort = {
+      async isOnlineCheckoutEnabled() {
+        return true;
+      },
+      async getPublicCheckoutConfig() {
+        return { provider: "stripe", mode: "test", currency: "USD" };
+      },
+      async startCheckout(invoicePublicId: string) {
+        startCheckoutCalls += 1;
+        const [inv] = await t.db
+          .select()
+          .from(complianceTables.complianceInvoices)
+          .where(eq(complianceTables.complianceInvoices.publicId, invoicePublicId))
+          .limit(1);
+        if (inv?.status === "paid") {
+          throw new DomainError("CONFLICT", "INVOICE_ALREADY_PAID", "This invoice is already paid.");
+        }
+        return {
+          mode: "redirect",
+          attemptPublicId: ulid(),
+          invoicePublicId,
+          provider: "stripe",
+          environment: "test",
+          redirectUrl: "https://checkout.stripe.com/c/pay/cs_test_unused",
+          expiresAt: null,
+        };
+      },
+      async getCheckoutStatus(principal: SessionPrincipal, query: { invoicePublicId?: string }) {
+        const [inv] = await t.db
+          .select()
+          .from(complianceTables.complianceInvoices)
+          .where(eq(complianceTables.complianceInvoices.publicId, query.invoicePublicId!))
+          .limit(1);
+        const [ord] = await t.db
+          .select()
+          .from(orderTables.orders)
+          .where(eq(orderTables.orders.id, inv!.orderId))
+          .limit(1);
+        if (!ord || ord.ownerUserId !== principal.userId) {
+          throw new DomainError("NOT_FOUND", "INVOICE_NOT_FOUND", "The requested item was not found.");
+        }
+        return {
+          invoicePublicId: inv!.publicId,
+          invoiceNumber: inv!.invoiceNumber,
+          invoiceStatus: inv!.status,
+          amountMinor: inv!.totalMinor,
+          balanceDueMinor: inv!.status === "paid" ? 0 : inv!.totalMinor,
+          currency: inv!.currency,
+          providerConfigured: "stripe",
+          environment: "test",
+          attempt: null,
+        };
+      },
+      async cancelAttemptIfUnpaid() {
+        return { cancelled: false, attemptPublicId: null, status: null };
+      },
+    };
+    const prevPayments = h.services.payments;
+    h.services.payments = stripePaymentsGuard as unknown as Services["payments"];
+
+    try {
+      h.settings.flags.add("promotions");
+      await realPromos.admin.updateSettings(admin.principal, {
+        enabled: true,
+        maxDiscountPercent: 100,
+      });
+      await realPromos.admin.create(admin.principal, {
+        name: "100% Executive Comp",
+        label: "Complimentary order",
+        type: "percent",
+        percentBps: 10_000,
+        scope: { kind: "all" },
+        code: "COMP100FREE",
+        maxRedemptions: 5,
+        maxPerCustomer: 1,
+      });
+
+      const aliceCaller = callerFor(alice.principal);
+      await aliceCaller.cart.addItems({
+        items: [{ productPublicId: p1Basic, quantity: 1 }],
+      });
+      const withFreePromo = await aliceCaller.cart.applyCode({
+        code: "COMP100FREE",
+        idempotencyKey: "idem-comp100-apply-01",
+      });
+      expect(withFreePromo.totals.subtotalMinor).toBe(200_00);
+      expect(withFreePromo.totals.discountMinor).toBe(200_00);
+      expect(withFreePromo.totals.totalMinor).toBe(0);
+
+      const sampleBilling: BillingDetailsInput = {
+        fullName: "Alice Example",
+        company: "Alice Co",
+        email: "alice@example.test",
+        country: "US",
+        region: "NY",
+        addressLine1: "100 Main St",
+        addressLine2: "",
+        city: "New York",
+        postalCode: "10001",
+        taxId: "",
+      };
+
+      const checkoutPayload = {
+        cartPublicId: withFreePromo.cartPublicId!,
+        expectedVersion: withFreePromo.version,
+        expectedTotalMinor: 0,
+        projectName: "Zero-Total Comp Project",
+        note: "100% covered",
+        billing: sampleBilling,
+        policyAcceptances: [
+          {
+            versionPublicId: publishedPolicyVersionId,
+            contentHash: publishedPolicyHash,
+          },
+        ],
+        idempotencyKey: "idem-comp100-checkout-01",
+      };
+
+      const firstRes = await aliceCaller.cart.checkout(checkoutPayload);
+      expect(firstRes).toMatchObject({
+        mode: "no_payment_due",
+        cartPublicId: withFreePromo.cartPublicId,
+        currency: "USD",
+        totalMinor: 0,
+      });
+      expect(startCheckoutCalls).toBe(0);
+
+      // Idempotent replay with the same idempotencyKey returns the exact same result without extra audits or provider calls.
+      const replayRes = await aliceCaller.cart.checkout(checkoutPayload);
+      expect(replayRes).toEqual(firstRes);
+      expect(startCheckoutCalls).toBe(0);
+
+      const [storedCart] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, withFreePromo.cartPublicId!));
+      expect(storedCart?.status).toBe("checked_out");
+      expect(storedCart?.paymentMode).toBeNull();
+      expect(storedCart?.paymentAttemptPublicId).toBeNull();
+      expect(storedCart?.checkedOutTotalMinor).toBe(0);
+
+      const checkedOutEvents = h.audit.events.filter(
+        (ev) => ev.eventName === "cart.checked_out" && ev.resource?.publicId === withFreePromo.cartPublicId,
+      );
+      expect(checkedOutEvents).toHaveLength(1);
+      expect(checkedOutEvents[0]?.attributes).toMatchObject({
+        payment_mode: "no_payment_due",
+        total_minor: 0,
+        promo_discount_minor: 200_00,
+      });
+
+      const statusRes = await aliceCaller.cart.checkoutStatus({
+        cartPublicId: withFreePromo.cartPublicId!,
+      });
+      expect(statusRes.confirmationState).toBe("no_payment_due");
+      expect(statusRes.paymentMode).toBe("no_payment_due");
+      expect(statusRes.invoiceStatus).toBe("paid");
+      expect(statusRes.totalMinor).toBe(0);
+      expect(statusRes.balanceDueMinor).toBe(0);
+      expect(statusRes.canRestoreToCart).toBe(false);
+
+      await expect(
+        aliceCaller.cart.restoreCheckout({ cartPublicId: withFreePromo.cartPublicId! }),
+      ).rejects.toSatisfy((err) => extractCodes(err).reasonCode === "CHECKOUT_ALREADY_PAID");
+    } finally {
+      h.settings.flags.delete("promotions");
+      h.services.payments = prevPayments;
     }
   });
 });

@@ -21,6 +21,7 @@ When the shopping cart is enabled for your portal, you can gather packets and ad
 1. In **Cart** (`/cart`), optionally save a project name and project notes, then select **Continue to checkout** (`/cart/checkout`).
 2. Enter your billing contact and address details and review any required customer policies. If a policy requires a typed signature, enter your full legal name in the signature field.
 3. Submit your checkout:
+   - **Zero-balance order (`$0.00`):** When a discount covers your full order total, ReadyPackets places your order immediately without sending you to a payment provider and confirms **Nothing to pay - your discount covers this order**.
    - **Online payment enabled:** ReadyPackets creates your order and issued invoice and redirects you to the payment provider's hosted checkout page.
    - **Pay by invoice:** ReadyPackets creates your order and issues an invoice immediately with remittance instructions on your confirmation screen.
 

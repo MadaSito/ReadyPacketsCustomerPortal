@@ -1554,13 +1554,16 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
             const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
             const promoLabel = createdOrder.promoLabel ?? null;
+            const zeroTotal = issuedInvoice.totalMinor === 0;
 
             const nextVersion = targetCart.version + 1;
             const [casUpdate] = await tx
               .update(carts)
               .set({
                 activeOwnerSlot: null,
-                status: "awaiting_payment",
+                status: zeroTotal ? "checked_out" : "awaiting_payment",
+                paymentMode: null,
+                paymentAttemptPublicId: null,
                 projectName: input.projectName,
                 noteEnc: encryptNote(input.note ?? "", targetCart.publicId),
                 billingEnc: encryptBilling(input.billing, targetCart.publicId),
@@ -1604,6 +1607,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 attributes: {
                   order_public_id: createdOrder.publicId,
                   invoice_public_id: issuedInvoice.invoicePublicId,
+                  ...(zeroTotal ? { payment_mode: "no_payment_due" } : {}),
                   currency: issuedInvoice.currency,
                   subtotal_minor: issuedInvoice.subtotalMinor,
                   discount_minor: issuedInvoice.discountMinor,
@@ -1713,6 +1717,38 @@ export function createCartService(deps: ModuleDeps): CartModule {
             });
           }
         }
+      }
+
+      // Zero-total checkout (e.g. 100% discount): invoice is already issued as paid (`totalMinor === 0`);
+      // never invoke `payments.startCheckout` (which rejects `INVOICE_ALREADY_PAID`), and return idempotently on replay.
+      if (committed.totalMinor === 0) {
+        if (existingByIdem && existingByIdem.status !== "checked_out") {
+          await deps.db.transaction(async (tx) => {
+            const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
+            if (!locked || locked.status === "checked_out") return;
+            const now = deps.clock.now();
+            await tx
+              .update(carts)
+              .set({
+                status: "checked_out",
+                paymentMode: null,
+                paymentAttemptPublicId: null,
+                version: locked.version + 1,
+                updatedAt: now,
+              })
+              .where(eq(carts.id, locked.id));
+          });
+        }
+        return {
+          mode: "no_payment_due",
+          cartPublicId: committed.cartPublicId,
+          orderPublicId: committed.orderPublicId,
+          orderReference: committed.orderReference,
+          invoicePublicId: committed.invoicePublicId,
+          invoiceNumber: committed.invoiceNumber,
+          currency: committed.currency,
+          totalMinor: 0,
+        } satisfies CheckoutCartResult;
       }
 
       // Start hosted payment session or settle into pay-by-invoice mode OUTSIDE the DB transaction
@@ -1834,9 +1870,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
             : {}),
       });
 
+      const isNoPaymentDue =
+        (cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor) === 0 && cartRow.paymentMode === null;
       const attempt = paymentStatus.attempt;
       let confirmationState: CheckoutConfirmationState;
-      if (paymentStatus.invoiceStatus === "paid") {
+      if (isNoPaymentDue && paymentStatus.invoiceStatus === "paid") {
+        confirmationState = "no_payment_due";
+      } else if (paymentStatus.invoiceStatus === "paid") {
         confirmationState = "paid";
       } else if (cartRow.paymentMode === "invoice" && paymentStatus.invoiceStatus === "issued") {
         confirmationState = "invoice_issued";
@@ -1857,7 +1897,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
       return {
         cartPublicId: cartRow.publicId,
         confirmationState,
-        paymentMode: cartRow.paymentMode ?? "invoice",
+        paymentMode: isNoPaymentDue ? "no_payment_due" : (cartRow.paymentMode ?? "invoice"),
         provider: attempt?.provider ?? paymentStatus.providerConfigured,
         attemptPublicId: attempt?.attemptPublicId ?? cartRow.paymentAttemptPublicId ?? null,
         attemptStatus: attempt?.status ?? null,
@@ -1933,6 +1973,10 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
           if (!sourceCart.checkoutInvoicePublicId) {
             throw conflict("CART_NOT_RESTORABLE", "This cart cannot be restored.");
+          }
+
+          if (sourceCart.checkedOutTotalMinor === 0 && sourceCart.status === "checked_out") {
+            throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
           }
 
           const resolvedAttemptId = input.attemptPublicId ?? sourceCart.paymentAttemptPublicId ?? undefined;

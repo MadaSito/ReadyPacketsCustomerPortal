@@ -1,11 +1,13 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Route, Switch } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { renderUi } from "@/ui/testing";
 import { CartPage, type CartViewData } from "./CartPage";
 import { CheckoutPage } from "./CheckoutPage";
+import { CheckoutReturnPage, type CheckoutStatus } from "./CheckoutReturnPage";
 
 const { handlers, calls } = vi.hoisted(() => ({
   handlers: new Map<string, (input: unknown) => unknown>(),
@@ -468,5 +470,145 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
       { path: "/cart/checkout" },
     );
     await screen.findByLabelText("Discount code");
+  });
+
+  it("completes zero-total checkout with a 100% discount and renders 'Nothing to pay - your discount covers this order' on confirmation", async () => {
+    const user = userEvent.setup();
+    const zeroCartId = "01JQACART00000000000000001";
+    const zeroOrderId = "01JQAORDER0000000000000001";
+    const zeroInvoiceId = "01JQAINV000000000000000001";
+
+    handlers.set("cart.get", () =>
+      makeCart({
+        cartPublicId: zeroCartId,
+        upsells: [],
+        onlinePaymentEnabled: true,
+        paymentProvider: "stripe",
+        paymentEnvironment: "test",
+        totals: {
+          currency: "USD",
+          subtotalMinor: 25000,
+          discountMinor: 25000,
+          discountLabel: "Complimentary order",
+          subtotalAfterDiscountMinor: 0,
+          taxRateBps: 0,
+          taxMinor: 0,
+          totalMinor: 0,
+          bundle: null,
+          promo: {
+            promoPublicId: "01JQAPROMO0000000000000100",
+            label: "Complimentary order",
+            promoDiscountMinor: 25000,
+            bundleDiscountMinor: 0,
+          },
+        },
+      }),
+    );
+
+    handlers.set("cart.checkout", () => ({
+      mode: "no_payment_due" as const,
+      cartPublicId: zeroCartId,
+      orderPublicId: zeroOrderId,
+      orderReference: "RP-2026-0100",
+      invoicePublicId: zeroInvoiceId,
+      invoiceNumber: "INV-2026-0100",
+      currency: "USD",
+      totalMinor: 0 as const,
+    }));
+
+    const zeroStatus: CheckoutStatus = {
+      cartPublicId: zeroCartId,
+      confirmationState: "no_payment_due",
+      paymentMode: "no_payment_due",
+      provider: "stripe",
+      attemptPublicId: null,
+      attemptStatus: null,
+      failureReasonCode: null,
+      orderPublicId: zeroOrderId,
+      orderReference: "RP-2026-0100",
+      invoicePublicId: zeroInvoiceId,
+      invoiceNumber: "INV-2026-0100",
+      invoiceStatus: "paid",
+      currency: "USD",
+      subtotalMinor: 25000,
+      discountMinor: 25000,
+      discountLabel: "Complimentary order",
+      promoDiscountMinor: 25000,
+      promoLabel: "Complimentary order",
+      taxRateBps: 0,
+      taxMinor: 0,
+      totalMinor: 0,
+      balanceDueMinor: 0,
+      canRestoreToCart: false,
+      alreadyRestored: false,
+      checkedOutAt: new Date("2026-11-22T12:00:00Z"),
+    };
+    handlers.set("cart.checkoutStatus", () => zeroStatus);
+
+    renderUi(
+      <main>
+        <Switch>
+          <Route path="/cart/checkout" component={CheckoutPage} />
+          <Route path="/checkout/return" component={CheckoutReturnPage} />
+        </Switch>
+      </main>,
+      { path: "/cart/checkout" },
+    );
+
+    expect(
+      await screen.findByText("Nothing to pay - your discount covers this order"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Place order" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Checkout status" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Nothing to pay - your discount covers this order"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("RP-2026-0100")).toBeInTheDocument();
+  });
+
+  pageA11y("checkout confirmation page for zero-total no_payment_due state", async () => {
+    document.title = "Checkout status · ReadyPackets";
+    const zeroCartId = "01JQACART00000000000000001";
+    const zeroStatus: CheckoutStatus = {
+      cartPublicId: zeroCartId,
+      confirmationState: "no_payment_due",
+      paymentMode: "no_payment_due",
+      provider: "stripe",
+      attemptPublicId: null,
+      attemptStatus: null,
+      failureReasonCode: null,
+      orderPublicId: "01JQAORDER0000000000000001",
+      orderReference: "RP-2026-0100",
+      invoicePublicId: "01JQAINV000000000000000001",
+      invoiceNumber: "INV-2026-0100",
+      invoiceStatus: "paid",
+      currency: "USD",
+      subtotalMinor: 25000,
+      discountMinor: 25000,
+      discountLabel: "Complimentary order",
+      promoDiscountMinor: 25000,
+      promoLabel: "Complimentary order",
+      taxRateBps: 0,
+      taxMinor: 0,
+      totalMinor: 0,
+      balanceDueMinor: 0,
+      canRestoreToCart: false,
+      alreadyRestored: false,
+      checkedOutAt: new Date("2026-11-22T12:00:00Z"),
+    };
+    handlers.set("cart.checkoutStatus", () => zeroStatus);
+
+    renderUi(
+      <main>
+        <CheckoutReturnPage />
+      </main>,
+      { path: `/checkout/return?cart=${zeroCartId}` },
+    );
+
+    await screen.findByText("Nothing to pay - your discount covers this order");
   });
 });

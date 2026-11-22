@@ -33,6 +33,8 @@ function requireCartModule(services: unknown): CartModule {
   return mod;
 }
 
+const upsellsManageProcedure = staffProcedure.use(requireCapability("carts.upsells.manage"));
+
 export const cartRouter = router({
   badgeCount: protectedProcedure.query(({ ctx }) => requireCartModule(ctx.services).getBadgeCount(ctx.session)),
 
@@ -111,36 +113,37 @@ export const cartRouter = router({
       .query(({ ctx, input }) => requireCartModule(ctx.services).adminGetOpen(ctx.session, input)),
 
     /**
-     * Uses `protectedProcedure` so the service returns `NOT_FOUND` (`404`) to customer sessions and
-     * `FORBIDDEN` (`403`) to staff sessions without `carts.upsells.manage` (Contract §4).
+     * Enforces `staffProcedure.use(requireCapability("carts.upsells.manage"))` BEFORE `.input(...)`
+     * so anonymous/customer/unprivileged-staff callers are rejected before input parsing, while
+     * keeping service-side session + capability checks as defence in depth.
      */
     upsells: router({
-      list: protectedProcedure.query(({ ctx }) =>
+      list: upsellsManageProcedure.query(({ ctx }) =>
         requireCartModule(ctx.services).adminListUpsellOffers(ctx.session),
       ),
 
-      create: protectedProcedure
+      create: upsellsManageProcedure
         .meta({ rateLimit: "form_submission" })
         .input(adminUpsellCreateInputSchema)
         .mutation(({ ctx, input }) =>
           requireCartModule(ctx.services).adminCreateUpsellOffer(ctx.session, input),
         ),
 
-      update: protectedProcedure
+      update: upsellsManageProcedure
         .meta({ rateLimit: "form_submission" })
         .input(adminUpsellUpdateInputSchema)
         .mutation(({ ctx, input }) =>
           requireCartModule(ctx.services).adminUpdateUpsellOffer(ctx.session, input),
         ),
 
-      setActive: protectedProcedure
+      setActive: upsellsManageProcedure
         .meta({ rateLimit: "form_submission" })
         .input(adminUpsellSetActiveInputSchema)
         .mutation(({ ctx, input }) =>
           requireCartModule(ctx.services).adminSetUpsellOfferActive(ctx.session, input),
         ),
 
-      delete: protectedProcedure
+      delete: upsellsManageProcedure
         .meta({ rateLimit: "form_submission" })
         .input(adminUpsellDeleteInputSchema)
         .mutation(({ ctx, input }) =>

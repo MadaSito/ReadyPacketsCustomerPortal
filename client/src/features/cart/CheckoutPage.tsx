@@ -113,7 +113,8 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   const request = useRef<{ version: number; key: string } | null>(null);
   const inFlight = useRef(false);
   const statusHref = `/checkout/return?cart=${encodeURIComponent(cart.cartPublicId)}`;
-  const online = cart.onlinePaymentEnabled && cart.paymentProvider !== "none";
+  const noPaymentDue = cart.totals.totalMinor === 0;
+  const online = !noPaymentDue && cart.onlinePaymentEnabled && cart.paymentProvider !== "none";
 
   function updatePolicy(policy: Policy, update: Partial<PolicyDraft>) {
     const key = policyKey(policy);
@@ -205,12 +206,16 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   }
 
   const submitLabel = reconfirmNotice
-    ? online
-      ? "Confirm new total and continue to payment"
-      : "Confirm new total and receive invoice"
-    : online
-      ? "Place order and continue to payment"
-      : "Place order and receive invoice";
+    ? noPaymentDue
+      ? "Confirm new total and place order"
+      : online
+        ? "Confirm new total and continue to payment"
+        : "Confirm new total and receive invoice"
+    : noPaymentDue
+      ? "Place order"
+      : online
+        ? "Place order and continue to payment"
+        : "Place order and receive invoice";
 
   return <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
     <form id={checkoutFormId} onSubmit={(event) => { void submit(event); }} className="grid min-w-0 gap-6">
@@ -250,7 +255,9 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     </form>
     <div className="grid min-w-0 gap-4">
       <CheckoutSummary cart={cart} submitting={submitting} onApplyPromo={handleApplyPromo} onRemovePromo={handleRemovePromo} />
-      {online ? <Callout tone={cart.paymentEnvironment === "test" ? "warning" : "info"} title={cart.paymentEnvironment === "test" ? "Test checkout" : "Secure hosted payment"}>
+      {noPaymentDue ? <Callout tone="success" title="Nothing to pay - your discount covers this order">
+        We’ll place your order and issue a settled zero-balance invoice. No payment is collected.
+      </Callout> : online ? <Callout tone={cart.paymentEnvironment === "test" ? "warning" : "info"} title={cart.paymentEnvironment === "test" ? "Test checkout" : "Secure hosted payment"}>
         {cart.paymentEnvironment === "test" ? "This checkout uses a test environment. No real money is collected." :
           "You’ll continue to the payment provider. ReadyPackets never collects your card details."}
       </Callout> : <Callout tone="info" title="Pay by invoice">We’ll issue an invoice when you place the order. No online payment is collected now.</Callout>}

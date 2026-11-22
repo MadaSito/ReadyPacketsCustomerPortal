@@ -29,7 +29,7 @@ Administrators granted **`carts.upsells.manage`** can open **Console -> Operatio
   - **Add-on product (`add_on`):** Suggests an active catalogue product not yet in the cart.
   - **Packet tier upgrade (`tier_upgrade`):** Suggests stepping up from a lower-priced tier of the same packet already in the cart; only higher-priced packet tiers can be selected as targets, and the customer sees the exact `+price` difference.
 - Configure trigger conditions (**Any non-empty cart** or **When specific products are in the cart**), optional start/end windows, and active status.
-- **Anti-dark-pattern & pricing guarantees:** Copy is plain text only (`<= 200` characters, no HTML, countdown timers, pre-ticked checkboxes, or confirm-shaming labels). If a target product is deactivated or repriced in the catalogue, eligibility and prices update live on the server and stale offers disappear automatically without breaking customer carts.
+- **Anti-dark-pattern & pricing rules:** Copy is plain text only (`<= 200` characters, no HTML, countdown timers, pre-ticked checkboxes, or confirm-shaming labels). If a target product is deactivated or repriced in the catalogue, eligibility and prices update live on the server and stale offers disappear automatically without breaking customer carts.
 
 ## Viewing Open Carts (`/admin/carts`)
 
@@ -42,6 +42,7 @@ Staff and administrators granted **`carts.read_all`** can open **Console -> Oper
 
 ## Checkout Reconfirmation, Payment Return & Abandonment Semantics
 
+- **Zero-total checkout (`totalMinor === 0`):** When a `100%` discount (with `promotions.policy.maxDiscountPercent` set to `100`) brings the order total to `$0.00`, checkout settles the invoice immediately as `paid`, skips external payment-provider session creation, marks the cart `checked_out`, and shows **Nothing to pay - your discount covers this order** on the confirmation page.
 - **Discount code expiry or change before checkout (`PROMO_RECONFIRM_TOTAL`):** If an applied discount code expires, reaches its redemption cap, or becomes ineligible before the customer submits checkout, ReadyPackets **does not place the order**. Instead, it clears the stale code, refreshes the cart total, and prompts the customer to review and confirm the updated total before placing the order.
 - Returning to `/checkout/return` is **strictly read-only**: an invoice is marked `paid` only after verified payment webhook or provider reconciliation in `payments`, never by loading the return URL.
 - Visiting `/checkout/cancel` inspects checkout state on `GET` without side effects; clicking **Restore items to cart** sends an explicit `POST` (`cart.restoreCheckout`) that cancels any unpaid payment attempt and restores the items to the customer's open cart unless payment has already completed.

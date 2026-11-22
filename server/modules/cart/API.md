@@ -16,7 +16,7 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 - **Cart discount codes & checkout reconfirmation (Decision D3 / ADR 0044):**
   - `cart.applyCode` calls `promotions.preview({ code, customerUserId, currency, lines }, { recordAttempt: true, ipHash, tx })`, encrypts the normalized code into `carts.promo_code_enc` (`FieldCrypto`, AAD `{ table: "carts", column: "promo_code_enc", recordId: cart.publicId }`), stores non-secret `promo_public_id` + `promo_label`, and never logs raw code strings.
   - Every `cart.get` re-evaluates an applied code with `{ recordAttempt: false, tx }`. If the code became invalid, `cart.get` clears the stale code in `tx` and returns a structured `promoNotice` (`CartPromoNoticeView`).
-  - At `cart.checkout`, if the cart had an applied promo code that is now rejected by `promotions.preview` (or `expectedTotalMinor` changed), `cart.checkout` clears the invalid code in a committed transaction, emits `cart.promo_invalidated_at_checkout`, and throws `CONFLICT:PROMO_RECONFIRM_TOTAL` (**order not placed**). When valid, `promoCode` is passed directly into `orders.createOrderFromCheckoutInTx(..., promoCode)` so `promotions.redeemInTx` runs atomically inside the order+invoice transaction.
+  - At `cart.checkout`, if the cart had an applied promo code that is now rejected by `promotions.preview` (or `expectedTotalMinor` changed), `cart.checkout` clears the invalid code in a committed transaction, emits `cart.promo.invalidated_at_checkout`, and throws `CONFLICT:PROMO_RECONFIRM_TOTAL` (**order not placed**). When valid, `promoCode` is passed directly into `orders.createOrderFromCheckoutInTx(..., promoCode)` so `promotions.redeemInTx` runs atomically inside the order+invoice transaction. When the issued invoice total is `0` (for example, a `100%` discount with `promotions.policy.maxDiscountPercent = 100`), `cart.checkout` skips `payments.startCheckout`, commits `carts.status = "checked_out"` (`payment_mode = "no_payment_due"` in `cart.checked_out` audit), returns `{ mode: "no_payment_due", totalMinor: 0, ... }` idempotently on replay, and `cart.checkoutStatus` reports `confirmationState: "no_payment_due"`.
 
 ---
 
@@ -47,11 +47,11 @@ Import types from `server/modules/cart/index.ts`; reach the runtime instance at 
 | --- | --- | --- | --- |
 | `cart.admin.listOpen` | query | `staff`/`admin` + `carts.read_all` | Paginated read-only open carts (`AdminOpenCartSummary[]`; zero decrypted notes, billing PII, or raw promo codes) |
 | `cart.admin.getOpen` | query | `staff`/`admin` + `carts.read_all` | Read-only open cart detail (`AdminOpenCartDetail`) |
-| `cart.admin.upsells.list` | query | `admin` + `carts.upsells.manage` | `AdminCartUpsellsListResult` (`featureCartEnabled`, `featureUpsellEnabled`, `bundleRuleEnabled`, `bundleRuleLabel`, `offers`, `catalogProducts` with `canBeTierUpgradeTarget`) |
-| `cart.admin.upsells.create` | mutation | `admin` + `carts.upsells.manage` | Creates plain-text add-on or tier-upgrade offer -> `AdminCartUpsellOfferView` |
-| `cart.admin.upsells.update` | mutation | `admin` + `carts.upsells.manage` | Updates offer with `expectedVersion` CAS -> `AdminCartUpsellOfferView` |
-| `cart.admin.upsells.setActive` | mutation | `admin` + `carts.upsells.manage` | Toggles offer `active` with `expectedVersion` CAS -> `AdminCartUpsellOfferView` |
-| `cart.admin.upsells.delete` | mutation | `admin` + `carts.upsells.manage` | Deletes offer -> `{ deleted: true, offerPublicId }` |
+| `cart.admin.upsells.list` | query | `staffProcedure` + `carts.upsells.manage` | `AdminCartUpsellsListResult` (`featureCartEnabled`, `featureUpsellEnabled`, `bundleRuleEnabled`, `bundleRuleLabel`, `offers`, `catalogProducts` with `canBeTierUpgradeTarget`) |
+| `cart.admin.upsells.create` | mutation | `staffProcedure` + `carts.upsells.manage` (before `.input()`) | Creates plain-text add-on or tier-upgrade offer -> `AdminCartUpsellOfferView` |
+| `cart.admin.upsells.update` | mutation | `staffProcedure` + `carts.upsells.manage` (before `.input()`) | Updates offer with `expectedVersion` CAS -> `AdminCartUpsellOfferView` |
+| `cart.admin.upsells.setActive` | mutation | `staffProcedure` + `carts.upsells.manage` (before `.input()`) | Toggles offer `active` with `expectedVersion` CAS -> `AdminCartUpsellOfferView` |
+| `cart.admin.upsells.delete` | mutation | `staffProcedure` + `carts.upsells.manage` (before `.input()`) | Deletes offer -> `{ deleted: true, offerPublicId }` |
 
 ---
 
