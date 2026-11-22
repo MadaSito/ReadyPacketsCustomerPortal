@@ -8,7 +8,7 @@
  *   4. cheap address admission, origin checks, durable edge budgets and bounded body parsers
  *      (signed webhooks use a separate raw body route with no browser credentials)
  *   5. session resolution (services.sessionResolver) → request actor
- *   6. session-bound CSRF validation for unsafe methods
+ *   6. session-bound CSRF validation for unsafe methods, then the two workflow import body exceptions
  *   7. CSRF bootstrap  8. /api/trpc (independent procedure budgets)  9. module raw routes
  *  10. health endpoints  11. static assets + SPA fallback (prebuilt dist/public; no dev server in production)
  *  12. safe JSON error handler (never stacks/SQL/paths)
@@ -58,6 +58,12 @@ export interface AppOptions {
 }
 
 const JSON_LIMIT_BYTES = 256 * 1024;
+// A 2 MiB workflow JSON document may nearly double when encoded as a JSON string; allow an apply envelope.
+const WORKFLOW_IMPORT_JSON_LIMIT_BYTES = 4 * 1024 * 1024 + JSON_LIMIT_BYTES;
+const WORKFLOW_IMPORT_PROCEDURES = new Set([
+  "orders.admin.workflows.transfer.preview",
+  "orders.admin.workflows.transfer.applyImport",
+]);
 const MAX_BATCH_SIZE = TRPC_MAX_BATCH_SIZE;
 const MAX_REQUEST_TARGET = MAX_REQUEST_TARGET_LENGTH;
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -126,6 +132,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   const anonymousKey = Buffer.from(config.tokenHashKey, "base64");
   const admission = createEdgeAdmission(anonymousKey);
   const limitedRequests = new WeakMap<Request, RateLimitBucket>();
+  const expandedWorkflowBodies = new WeakSet<Request>();
   const admissionBucket = (req: Request) => options.staticDir ? edgeAdmissionBucket(req.method, req.path) : "edge_requests";
   const currentAddress = () => rateLimitAddress(getRequestContext()?.ipAddress);
   async function applyRateLimit(req: Request, category: RateLimitCategory, key: string, cost = 1): Promise<void> {
@@ -293,11 +300,18 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     const subject = `ip:${currentAddress()}`;
     if (pathIn(TRPC_PATH, req.path)) {
       const calls = tRpcCalls(req);
+      const workflowImport = calls.some((call) => WORKFLOW_IMPORT_PROCEDURES.has(call));
+      if (workflowImport && (calls.length !== 1 || req.query.batch !== undefined)) {
+        throw validation("WORKFLOW_IMPORT_BATCH_NOT_ALLOWED", "Workflow imports must be submitted individually.");
+      }
       if (!calls.length || (calls.length > 1 && req.query.batch !== "1")) {
         throw validation("INVALID_PROCEDURE_PATH", "The requested operation is not valid.");
       }
       if (calls.length > MAX_BATCH_SIZE) throw validation("BATCH_TOO_LARGE", "This batch includes too many operations.");
       await applyRateLimit(req, tRpcBudget(router, calls), `edge:${subject}`, calls.length);
+      if (workflowImport && req.method === "POST" && req.path === `${TRPC_PATH}/${calls[0]}`) {
+        expandedWorkflowBodies.add(req);
+      }
     } else if (API_PATH.test(req.path)) {
       const category = pathIn("/api/files", req.path) || pathIn("/api/knowledge/attachments", req.path.toLowerCase()) ||
           pathIn("/api/portable", req.path) || pathIn("/api/backup", req.path)
@@ -311,7 +325,11 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   });
 
   // 4. Reject oversized/malformed JSON (no inflation); multipart and binary remain untouched.
-  app.use("/api", express.json({ limit: JSON_LIMIT_BYTES, inflate: false, strict: true }));
+  const standardJson = express.json({ limit: JSON_LIMIT_BYTES, inflate: false, strict: true });
+  app.use("/api", (req, res, next) => {
+    if (expandedWorkflowBodies.has(req)) return next();
+    standardJson(req, res, next);
+  });
 
   // 5. Resolve authoritative identity once, before CSRF, including remediation sessions.
   app.use(async (req, res, next) => {
@@ -340,6 +358,20 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       : isAnonymousCsrfToken(token, services.clock.now(), anonymousKey));
     if (!matches) denyBrowserRequest("CSRF_INVALID");
     next();
+  });
+
+  // Buffer the larger JSON only after the existing session resolver and CSRF checks have run.
+  // The normal tRPC capability, step-up, and package validation rules remain authoritative.
+  const workflowImportJson = express.json({ limit: WORKFLOW_IMPORT_JSON_LIMIT_BYTES, inflate: false, strict: true });
+  app.use((req, res, next) => {
+    if (!expandedWorkflowBodies.has(req)) return next();
+    if (!getHttpState(req).session) {
+      throw new DomainError("UNAUTHENTICATED", "NO_SESSION", "Please sign in to continue.");
+    }
+    if (!req.is("application/json")) {
+      throw validation("UNSUPPORTED_WORKFLOW_IMPORT_CONTENT", "Workflow imports require a JSON request.");
+    }
+    workflowImportJson(req, res, next);
   });
 
   app.get("/api/csrf", async (req, res) => {
