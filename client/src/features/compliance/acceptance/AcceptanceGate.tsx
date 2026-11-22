@@ -172,9 +172,13 @@ export default function AcceptanceGate({ orderId, area }: AcceptanceGateProps) {
     <Card
       as="section"
       aria-label="Policy acceptance required"
-      title="Please review and accept before you continue"
+      title={
+        <span className="inline-flex items-center gap-2">
+          <ShieldCheck className="h-5 w-5 shrink-0 text-brand" aria-hidden />
+          Please review and accept before you continue
+        </span>
+      }
       description="You can read this order, but uploads, recordings, questionnaire answers, acknowledgements and phase submissions are paused until you accept. Everyone with access to the order accepts for themselves."
-      actions={<ShieldCheck className="h-5 w-5 text-brand" aria-hidden />}
     >
       <div className="flex flex-col gap-8">
         {pending.map((gate) =>

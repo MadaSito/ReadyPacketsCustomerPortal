@@ -93,7 +93,6 @@ export function OrderDetailView({ area }: { area: Area }) {
           </Callout>
         </div>
       ) : null}
-      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
       {ORDER_BANNERS.filter((b) => b.area === "both" || b.area === area).map((b) => {
         const Banner = b.component;
         return (
@@ -102,6 +101,8 @@ export function OrderDetailView({ area }: { area: Area }) {
           </Suspense>
         );
       })}
+      {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
+      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
       <RouteTabs
         idBase="order-tabs"
         label="Order sections"

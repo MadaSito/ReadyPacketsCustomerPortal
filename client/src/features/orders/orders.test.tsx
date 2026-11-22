@@ -790,8 +790,19 @@ describe("increment 04 part B — console order workspace (S1)", () => {
     session.role = "customer";
   });
 
-  it("customer order page shows only customer/both banners", async () => {
+  it("customer order page shows only customer/both banners, before the requirements checklist", async () => {
     handlers.set("orders.get", () => detail);
+    handlers.set("orders.requirements.forOrder", () => ({
+      phases: [],
+      status: { key: "submitted", label: "Submitted", phaseKey: null },
+      uploads: [{ key: "brief", label: "Synthetic brief", hint: null, kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"], count: 0, met: false, canUpload: true }],
+      acknowledgements: [],
+      unmet: 1,
+      readOnly: false,
+      readOnlyReason: null,
+      canUnlock: false,
+      acceptancePending: true,
+    }));
     renderUi(
       <Route path="/orders/:orderId">
         <OrderDetailPage />
@@ -801,6 +812,10 @@ describe("increment 04 part B — console order workspace (S1)", () => {
     expect(await screen.findByText(`Gate banner for ${ORDER_ID} in customer`)).toBeInTheDocument();
     expect(screen.queryByText("Console only banner")).not.toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "Order actions" })).not.toBeInTheDocument();
+    // The blocking gate comes first, then the checklist it pauses.
+    const checklist = await screen.findByRole("heading", { name: "Needed before the next step (Submitted)" });
+    const banner = screen.getByText(`Gate banner for ${ORDER_ID} in customer`);
+    expect(banner.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("Rename order: keyboard opens the dialog, Escape returns focus to the button, saving keeps the reference", async () => {
