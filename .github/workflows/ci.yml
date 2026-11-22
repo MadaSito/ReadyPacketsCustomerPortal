@@ -91,6 +91,10 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends mysql-community-client
           mysqldump --version
           mysqldump --version | grep -Eq 'Ver 8\.4\.' || { echo "mysqldump is not 8.4"; exit 1; }
+      - name: FFmpeg (the audio conversion tests run the real binary, as the installer provides it)
+        run: |
+          sudo apt-get install -y -q --no-install-recommends ffmpeg
+          ffmpeg -version | head -n 1
       - name: Server, shared, scripts, portable and integration tests (node)
         run: pnpm test:server
       - name: Client component tests (jsdom)

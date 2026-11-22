@@ -78,6 +78,11 @@ function fromArticle(a: KnowledgeAdminArticleDetailView): ArticleForm {
   };
 }
 
+/** Text a reader would see. Parsed as an inert document (never inserted into the page); used only for the "is it empty" check. */
+function visibleText(html: string): string {
+  return (new DOMParser().parseFromString(html, "text/html").body.textContent ?? "").trim();
+}
+
 /** Client-side checks mirror the server's zod limits so errors appear next to the field; the server still decides. */
 export function validateArticle(form: ArticleForm): FormErrors {
   const errors: FormErrors = {};
@@ -86,7 +91,7 @@ export function validateArticle(form: ArticleForm): FormErrors {
   if (title.length < 2 || title.length > 200) errors.title = "Enter a title of 2 to 200 characters.";
   if (summary.length < 5 || summary.length > 500) errors.summary = "Enter a summary of 5 to 500 characters.";
   if (form.slug.length < 2 || form.slug.length > 120 || !SLUG.test(form.slug)) errors.slug = "Use 2 to 120 lowercase letters, numbers and single hyphens.";
-  if (!form.bodyHtml.replace(/<[^>]*>/g, "").trim()) errors.bodyHtml = "Write the article before saving.";
+  if (!visibleText(form.bodyHtml)) errors.bodyHtml = "Write the article before saving.";
   if (form.reviewedOn && !/^\d{4}-\d{2}-\d{2}$/.test(form.reviewedOn)) errors.reviewedOn = "Use a date such as 2026-11-21.";
   if (form.changeNote.length > 255) errors.changeNote = "Keep the change note under 255 characters.";
   return errors;

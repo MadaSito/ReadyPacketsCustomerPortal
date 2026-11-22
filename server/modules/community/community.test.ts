@@ -358,7 +358,7 @@ describe("community forum (package M)", () => {
       const demoted = { ...staff.principal, role: "admin" as const };
       expect(await code(community.queue(demoted))).toMatch(/^UNAUTHENTICATED:SESSION_NOT_CURRENT/u);
       // ids are validated
-      expect(await code(caller(carol.principal).community.topics.get({ topicPublicId: "1 OR 1=1" }))).toMatch(/^ERR|VALIDATION|BAD_REQUEST/u);
+      expect(await code(caller(carol.principal).community.topics.get({ topicPublicId: "1 OR 1=1" }))).toMatch(/^(?:ERR|VALIDATION|BAD_REQUEST)/u);
     });
 
     it("search escapes LIKE wildcards and only returns published content", async () => {
