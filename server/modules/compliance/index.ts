@@ -14,11 +14,15 @@
  */
 import "./settings.js";
 import "./automationTriggers.js";
+import { createAcceptanceService, type AcceptanceService } from "./acceptance.js";
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import type { PublicApiProviders } from "../publicApi/ports.js";
+import { type InvoicePaymentState, type OrderHeaderPaymentState } from "./domain.js";
 import { createIntakeService, type IntakeService } from "./intakeService.js";
 import {
+  type BookSettledRefundInput,
+  type BookSettledRefundResult,
   type BookVerifiedProviderPaymentInput,
   type BookVerifiedProviderPaymentResult,
   type CheckoutInvoiceSnapshot,
@@ -28,6 +32,11 @@ import {
   type InvoicesService,
   type IssueCheckoutInvoiceInput,
   type IssuedCheckoutInvoice,
+  type LockedOrderPaymentForRefund,
+  type OrderInvoicePaymentLedgerEntry,
+  type OrderInvoiceRefundLedgerEntry,
+  type OrderPaymentSummary,
+  type OrderRefundLedgerSnapshot,
   type RecordProviderPaymentInput,
   type RecordProviderPaymentResult,
 } from "./invoicesService.js";
@@ -35,6 +44,8 @@ import { registerComplianceMailTemplates } from "./mail.js";
 import {
   createPoliciesService,
   type PoliciesService,
+  type PolicyForGateView,
+  type PolicyGateVersionView,
   type PublishedPolicyView,
   type RequiredPolicySummary,
 } from "./policiesService.js";
@@ -48,6 +59,8 @@ import {
 import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
 
 export type {
+  BookSettledRefundInput,
+  BookSettledRefundResult,
   BookVerifiedProviderPaymentInput,
   BookVerifiedProviderPaymentResult,
   CheckoutInvoiceSnapshot,
@@ -56,10 +69,19 @@ export type {
   IntakeService,
   InvoicePaidEvent,
   InvoicePaidListener,
+  InvoicePaymentState,
   InvoicesService,
   IssueCheckoutInvoiceInput,
   IssuedCheckoutInvoice,
+  LockedOrderPaymentForRefund,
+  OrderHeaderPaymentState,
+  OrderInvoicePaymentLedgerEntry,
+  OrderInvoiceRefundLedgerEntry,
+  OrderPaymentSummary,
+  OrderRefundLedgerSnapshot,
   PoliciesService,
+  PolicyForGateView,
+  PolicyGateVersionView,
   PortableEvidenceBatch,
   PortableEvidenceOptions,
   PublishedPolicyView,
@@ -139,6 +161,7 @@ export interface ComplianceModule extends ModuleLifecycle {
 
   /* ---- sub-services consumed by router & http ---- */
   policies: PoliciesService;
+  acceptance: AcceptanceService;
   intake: IntakeService;
   invoices: InvoicesService;
 }
@@ -149,6 +172,7 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
   const intake = createIntakeService(deps);
   const invoices = createInvoicesService(deps);
   const portable = createPortableComplianceService(deps);
+  const acceptance = createAcceptanceService(deps);
 
   return {
     listPublishedPolicies: policies.listPublished,
@@ -167,8 +191,28 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     policies,
     intake,
     invoices,
+    acceptance,
 
     async init(): Promise<void> {
+      acceptance.register();
+      const ordersSvc = (
+        deps.services as unknown as {
+          orders?: {
+            registerPaymentSummaryProvider?: (
+              fn: (
+                orderPublicIds: string[],
+                tx: DbOrTx,
+              ) => Promise<Map<string, OrderPaymentSummary>>,
+            ) => void;
+          };
+        }
+      ).orders;
+      if (ordersSvc && typeof ordersSvc.registerPaymentSummaryProvider === "function") {
+        ordersSvc.registerPaymentSummaryProvider((orderPublicIds, tx) =>
+          invoices.getOrderPaymentSummaries(orderPublicIds, tx),
+        );
+      }
+
       const publicApiSvc = (
         deps.services as unknown as {
           publicApi?: {

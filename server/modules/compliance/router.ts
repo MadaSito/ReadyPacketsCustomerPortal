@@ -28,6 +28,7 @@ import {
   updatePolicyDraftSchema,
   updateQuestionnaireSchema,
 } from "./domain.js";
+import { acceptanceRouter } from "./acceptanceRouter.js";
 
 const policiesManageProc = protectedProcedure.use(requireCapability("policies.manage"));
 const intakeManageProc = protectedProcedure.use(requireCapability("intake.manage"));
@@ -35,6 +36,8 @@ const intakeReviewProc = staffProcedure.use(requireCapability("intake.review"));
 const invoicesManageProc = staffProcedure.use(requireCapability("invoices.manage"));
 
 export const complianceRouter = router({
+  /** Order policy acceptance gateway (package V). */
+  acceptance: acceptanceRouter,
   /* ---------------------------------------------------------------- policies */
   policies: router({
     /** Public read of currently published policies (used by `/register` and `/legal`). */
