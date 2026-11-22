@@ -332,6 +332,44 @@ describe("new order wizard", () => {
     expect(create[0]!.input).toMatchObject({ promoCode: "SAVE10" });
   });
 
+  it("C3 discount code dropped after a selection change stays removed when the selection is restored", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    handlers.set("platform.bootstrap", () => ({ features: { promotions: true }, consent: { enabled: false, policyVersion: 1, renewMonths: 12 } }));
+    handlers.set("orders.quoteWithPromo", (input) => {
+      const { items } = input as { items: { quantity: number }[] };
+      if (items[0]?.quantity !== 2) throw Object.assign(new Error("promo"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "PROMO_NOT_APPLICABLE", safeMessage: "This code cannot be applied.", requestId: "r1" } } });
+      const base = fakeQuote(input);
+      return { ...base, discountMinor: 100, discountLabel: "Synthetic promo", totalMinor: base.totalMinor - 100, promo: { label: "Synthetic promo", promoDiscountMinor: 100 } };
+    });
+    handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));
+    const user = userEvent.setup();
+    const { location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByText("Synthetic A");
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Promo project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(await screen.findByLabelText("Discount code"), "SAVE10");
+    await user.click(screen.getByRole("button", { name: /^Apply/ }));
+    await screen.findByText(/Discount Synthetic promo applied\. New total/);
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await user.clear(screen.getByLabelText("Quantity of Synthetic A"));
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "3");
+    expect(await screen.findByText("The discount code does not apply to this selection and was removed.")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText("Quantity of Synthetic A"));
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    // Not re-applied: the field offers entry again and create carries no code.
+    expect(await screen.findByLabelText("Discount code")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const create = calls.filter((c) => c.path === "orders.create");
+    expect(create).toHaveLength(1);
+    expect(create[0]!.input).not.toHaveProperty("promoCode");
+  });
+
   it("packet catalog: picker + server quote, bundle discount on review, one tier per packet sent as quantity 1", async () => {
     handlers.set("orders.catalog.list", () => packetCatalog);
     handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));

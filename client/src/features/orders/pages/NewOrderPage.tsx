@@ -97,38 +97,52 @@ export default function NewOrderPage() {
   // With a code the quote comes from `orders.quoteWithPromo` (POST: the code never travels in a URL).
   const promoRequested = promoCode !== null && promotionsEnabled && !cartEnabled && items.length > 0 && !mixedCurrency;
   const promoInput = { items: items.map((item) => ({ productPublicId: item.productPublicId, quantity: item.quantity })) };
+  // One always-mounted polite region for discount-code changes (the step-1 estimate has its own live line).
+  const [promoMessage, setPromoMessage] = useState("");
+  const [promoNotice, setPromoNotice] = useState<string | null>(null);
   const promoQuery = useQuery({
     queryKey: ["orders", "quoteWithPromo", promoInput.items, promoCode],
-    queryFn: () => trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: promoCode ?? "" }),
+    queryFn: async () => {
+      try {
+        return await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: promoCode ?? "" });
+      } catch (err) {
+        // A selection change made the code inapplicable: remove it for good (never re-applied silently, never
+        // sent on create) and say so; the plain quote is shown again.
+        if (safeError(err)?.reasonCode === "PROMO_NOT_APPLICABLE") {
+          const notice = "The discount code does not apply to this selection and was removed.";
+          setPromoCode(null);
+          setPromoNotice(notice);
+          setPromoMessage(notice);
+        }
+        throw err;
+      }
+    },
     enabled: promoRequested,
     staleTime: 30_000,
     retry: false,
     gcTime: 0,
   });
-  // A selection change can make the code inapplicable: it is then treated as removed (never sent on create) and
-  // the plain quote is shown. Derived, not stored, so it re-applies if the selection goes back.
-  const promoRejected = promoRequested && promoQuery.error !== null && safeError(promoQuery.error)?.reasonCode === "PROMO_NOT_APPLICABLE";
-  const usePromo = promoRequested && !promoRejected;
+  const usePromo = promoRequested;
   const quote: { quote: (OrderQuote & { promo?: { label: string; promoDiscountMinor: number } | null }) | null; pending: boolean; error: unknown } = usePromo
     ? { quote: promoQuery.error ? null : (promoQuery.data ?? null), pending: promoQuery.isFetching, error: promoQuery.error }
     : baseQuote;
-  const promoNotice = promoRejected ? "The discount code does not apply to this selection and was removed." : null;
   const appliedPromo =
     usePromo && quote.quote?.promo ? { label: quote.quote.promo.label, discountMinor: quote.quote.promo.promoDiscountMinor, currency: quote.quote.currency } : null;
   const applyPromo = async (code: string) => {
+    setPromoNotice(null);
     // Rethrows the server's uniform refusal for the field to show.
     const result = await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: code });
     queryClient.setQueryData(["orders", "quoteWithPromo", promoInput.items, code], result);
     setPromoCode(code);
   };
-  // One always-mounted polite region for discount-code changes (the step-1 estimate has its own live line).
-  const [promoMessage, setPromoMessage] = useState("");
   const promoTotalText =
     usePromo && quote.quote && !quote.pending ? `Discount ${quote.quote.promo?.label ?? ""} applied. New total ${formatMinor(quote.quote.totalMinor, quote.quote.currency)}.` : null;
-  const promoAnnouncement = promoNotice ?? promoTotalText ?? promoMessage;
-  // The field's own messages go to that region; "applied" is replaced by the new-total line.
+  const promoAnnouncement = promoTotalText ?? promoMessage;
+  // The field's own messages go to that region (they replace any earlier notice); "applied" is replaced by the
+  // new-total line.
   const announcePromo = (message: string) => {
     if (message === "Discount code applied.") return;
+    setPromoNotice(null);
     if (message === "Discount code removed." && baseQuote.quote) {
       setPromoMessage(`Discount code removed. Total ${formatMinor(baseQuote.quote.totalMinor, baseQuote.quote.currency)}.`);
       return;
