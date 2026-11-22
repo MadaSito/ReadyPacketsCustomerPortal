@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
+import { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput";
 import { safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, Checkbox, ConfirmDialog, DataTable, DateTime, EmptyState, ErrorState, Field,
@@ -56,13 +57,14 @@ function RefundDialog({ payment, submit, close, finish }: {
   payment: Payment; submit: (values: InputValues) => Promise<Result>; close: () => void; finish: (result: Result) => void;
 }) {
   const manual = payment.executionKind === "recorded_only";
-  const [amount, setAmount] = useState("");
+  const fullAmount = formatMinorToDecimalInput(payment.refundableMinor, payment.currency);
+  const [amount, setAmount] = useState(fullAmount);
   const [reason, setReason] = useState("");
   const [sendCustomerNotice, setSendCustomerNotice] = useState(false);
   const [problem, setProblem] = useState<string>();
   const [idempotencyKey] = useState(() => `order-refund:${crypto.randomUUID()}`);
-  const amountMinor = Number(amount);
-  const validAmount = /^[0-9]+$/u.test(amount) && Number.isSafeInteger(amountMinor) && amountMinor > 0 && amountMinor <= payment.refundableMinor;
+  const amountMinor = parseDecimalToMinor(amount, false, payment.currency);
+  const validAmount = amountMinor !== null && amountMinor <= payment.refundableMinor;
   return <ConfirmDialog open onOpenChange={(open) => { if (!open) close(); }} destructive confirmText="REFUND ORDER"
     title={manual ? "Record refund" : "Prepare refund"} confirmLabel={manual ? "Record refund" : "Send refund"}
     description={manual ? "Use this only for a refund handled outside ReadyPackets." :
@@ -70,7 +72,8 @@ function RefundDialog({ payment, submit, close, finish }: {
     onConfirm={async () => {
       setProblem(undefined);
       if (!validAmount || !reason.trim()) {
-        const message = !validAmount ? "Enter a positive whole number no higher than the refundable balance." : "Enter a refund reason.";
+        const message = amountMinor === null ? `Enter a positive ${payment.currency} amount with valid decimal places.`
+          : !validAmount ? "Enter an amount no higher than the refundable balance." : "Enter a refund reason.";
         setProblem(message);
         throw new Error(message);
       }
@@ -95,11 +98,11 @@ function RefundDialog({ payment, submit, close, finish }: {
     }}>
     <div className="grid gap-3">
       {manual ? <Callout tone="info" title="Recorded only">No money is moved by the portal.</Callout> : null}
-      <Field label={`Amount (${payment.currency} minor units)`} hint={`Enter a whole number up to ${payment.refundableMinor}.`} required>
-        <Input inputMode="numeric" autoComplete="off" maxLength={16} value={amount} onChange={(event) => setAmount(event.target.value)} />
+      <Field label={`Amount (${payment.currency})`} hint={<>Up to {money(payment.refundableMinor, payment.currency)}</>} required>
+        <Input inputMode="decimal" autoComplete="off" maxLength={20} value={amount} onChange={(event) => setAmount(event.target.value)} />
       </Field>
       <div className="flex flex-wrap items-center gap-2">
-        <Button variant="secondary" size="sm" onClick={() => setAmount(String(payment.refundableMinor))}>Use full refundable balance</Button>
+        <Button variant="secondary" size="sm" onClick={() => setAmount(fullAmount)}>Use full refundable balance</Button>
         {validAmount ? <span>Amount: {money(amountMinor, payment.currency)}</span> : null}
       </div>
       <Field label="Refund reason" hint="Do not include card details." required>

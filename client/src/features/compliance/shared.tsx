@@ -8,6 +8,8 @@ import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { Badge } from "@/ui";
 
+export { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput";
+
 export type PolicyContentFormat = "plain_text" | "safe_markdown";
 export type InvoiceStatus = "draft" | "issued" | "paid" | "void";
 export type IntakeSubmissionStatus = "not_started" | "draft" | "submitted" | "returned_for_changes" | "accepted";
@@ -17,30 +19,6 @@ export function newIdempotencyKey(): string {
     return crypto.randomUUID();
   }
   return `ik-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-}
-
-/**
- * Parses a human decimal money input (e.g. "125.50" or "125") into exact integer minor units (`12550` or `12500`)
- * without floating-point arithmetic. Returns `null` if invalid or negative.
- */
-export function parseDecimalToMinor(raw: string, allowZero = true): number | null {
-  const trimmed = raw.trim();
-  if (!/^\d+(?:\.\d{1,2})?$/.test(trimmed)) return null;
-  const [wholePart = "0", fracPart = ""] = trimmed.split(".");
-  const whole = Number(wholePart);
-  const frac = Number(fracPart.padEnd(2, "0"));
-  if (!Number.isSafeInteger(whole) || !Number.isSafeInteger(frac)) return null;
-  const total = whole * 100 + frac;
-  if (!Number.isSafeInteger(total)) return null;
-  if (!allowZero && total <= 0) return null;
-  return total;
-}
-
-export function formatMinorToDecimalInput(minor: number): string {
-  const safe = Math.max(0, Math.trunc(minor));
-  const whole = Math.floor(safe / 100);
-  const cents = String(safe % 100).padStart(2, "0");
-  return `${whole}.${cents}`;
 }
 
 export function InvoiceStatusBadge({ status }: { status: InvoiceStatus }) {

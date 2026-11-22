@@ -2,6 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { expect, it, vi } from "vitest";
+import { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput";
 import { pageA11y } from "@/test/a11y";
 import { StepUpCancelledError } from "@/ui";
 import { renderUi } from "@/ui/testing";
@@ -29,6 +30,18 @@ async function open() {
 pageA11y("Refund balances and read-only history", () => { panel({ canIssueRefund: false }); });
 pageA11y("Prepare refund dialog", async () => { panel(); await open(); });
 
+it("uses exact currency exponents and rejects unsupported fractional and nonpositive values", () => {
+  expect(parseDecimalToMinor("625.00", false)).toBe(62500);
+  expect(parseDecimalToMinor("625", false, "JPY")).toBe(625);
+  expect(parseDecimalToMinor("625.0", false, "JPY")).toBeNull();
+  expect(parseDecimalToMinor("6.251", false, "KWD")).toBe(6251);
+  expect(formatMinorToDecimalInput(6251, "KWD")).toBe("6.251");
+  expect(formatMinorToDecimalInput(625, "JPY")).toBe("625");
+  for (const amount of ["1.500", "-1.50", "0.00", "1e2", "90071992547409.92"]) {
+    expect(parseDecimalToMinor(amount, false, "USD")).toBeNull();
+  }
+});
+
 it("shows history and balances but no action for staff without refund permission", () => {
   panel({ canIssueRefund: false });
   expect(screen.getByText("Read-only refund history")).toBeVisible();
@@ -53,11 +66,15 @@ it("focuses Cancel on open and restores the actual row launcher when Escape canc
 
 it("requires the exact phrase and prevents another attempt after an unknown result", async () => {
   const submit = vi.fn<Props["submit"]>().mockResolvedValue({ status: "unknown", executionKind: "provider_refund" });
-  panel({ submit });
+  panel({ submit, payments: [{ ...payment, capturedMinor: 263000, refundableMinor: 262500 }] });
   const dialog = within(await open());
   const confirm = dialog.getByRole("button", { name: "Send refund" });
   expect(confirm).toBeDisabled();
-  await userEvent.type(dialog.getByLabelText(/Amount \(USD minor units\)/u), "150");
+  const amount = dialog.getByLabelText(/^Amount \(USD\)/u);
+  expect(amount).toHaveValue("2625.00");
+  expect(amount).toHaveAccessibleDescription("Up to $2,625.00");
+  await userEvent.clear(amount);
+  await userEvent.type(amount, "1.50");
   await userEvent.type(dialog.getByLabelText(/Refund reason/u), "Customer request");
   await userEvent.click(dialog.getByRole("checkbox", { name: "Email the customer when the refund is confirmed" }));
   const phrase = dialog.getByLabelText(/type REFUND ORDER to confirm/i);
@@ -113,7 +130,9 @@ it("labels manual refunds as recorded only and prevents submitting more than the
   await userEvent.click(paymentsTable().getByRole("button", { name: /record refund for manual payment/i }));
   const dialog = within(await screen.findByRole("alertdialog", { name: "Record refund" }));
   expect(dialog.getByText("No money is moved by the portal.")).toBeVisible();
-  await userEvent.type(dialog.getByLabelText(/Amount \(USD minor units\)/u), "1601");
+  const amount = dialog.getByLabelText(/^Amount \(USD\)/u);
+  await userEvent.clear(amount);
+  await userEvent.type(amount, "16.01");
   await userEvent.type(dialog.getByLabelText(/Refund reason/u), "Refunded offline");
   await userEvent.type(dialog.getByLabelText(/type REFUND ORDER to confirm/i), "REFUND ORDER");
   const confirm = dialog.getByRole("button", { name: "Record refund" });
@@ -121,6 +140,7 @@ it("labels manual refunds as recorded only and prevents submitting more than the
   expect(await dialog.findByText(/no higher than the refundable balance/u)).toBeVisible();
   expect(submit).not.toHaveBeenCalled();
   await userEvent.click(dialog.getByRole("button", { name: "Use full refundable balance" }));
+  expect(amount).toHaveValue("16.00");
   await userEvent.click(confirm);
   expect(await screen.findByText("No money was moved by the portal.")).toBeVisible();
   expect(submit).toHaveBeenCalledWith(expect.objectContaining({ amountMinor: 1600 }));
