@@ -188,3 +188,29 @@ changed / reassigned, file uploaded, order message posted (customer-visible only
 maintenance switched on (`job.maintenance.changed` + `MAINTENANCE_ENABLED`; there is no separate "maintenance window
 announced" event yet), backup completed / failed / verification failed / off-host copy completed / failed, e-mail delivery failed.
 Tests: `tap.test.ts` (real MySQL).
+
+## Increment 04 Part B — S2 Order history (B3)
+
+**Envelope.** `audit_events.order_public_id` (nullable, index `ix_audit_order_time`, migration 0004). It is derived from the explicit `orderPublicId` input, then an `order` resource, then the attribute `order_public_id`. It enters the hash chain only when non-null, so older hashes are unchanged.
+
+**`trpc.audit.orderActivity({ orderPublicId, category?, cursor?, limit≤50 })`** (`protectedProcedure`, orders read policy via `services.orders.assertCanReadOrder`).
+- It returns `{ view: "customer" | "staff", items, nextCursor }`, made of events whose `order_public_id` (or legacy order resource) is the order.
+- Categories: details, status, access, phases, acceptance, files, storage, production, automation, payments, other (catalogue `ORDER_ACTIVITY_CATALOGUE`).
+- Customer projection:
+  - Only catalogue entries marked customer, and only successful outcomes.
+  - File events only when `file_visibility = customer_visible`.
+  - Actor is one of "You", "ReadyPackets staff", "Someone with access to this order" or "ReadyPackets".
+  - details are limited to from_status, to_status, phase, phase_key and lock_state.
+  - The key is an HMAC pseudonym. There are no event ids, staff identities, IP addresses or internal ids.
+- Staff projection: event name, outcome, reason code, actor name and role, correlation id, and details without `*_ref`, `*_hash` or address keys.
+
+**`trpc.audit.orderStatusHistory({ orderPublicId, cursor?, limit≤50 })`** (same policy).
+- It merges `services.orders.listStatusTransitions` and `services.orders.listNameHistory` with a two-lane keyset merge, so there is no fixed window. Ties are deterministic: at equal timestamps, transitions come before renames, and within a lane the port's id order applies.
+- Items: `{ key, kind: "transition" | "rename", at, actor, from?, fromLabel?, to?, toLabel?, note?, oldName?, newName? }`.
+- Customers get rename items without `oldName`/`newName` (lead decision: the client shows "Order renamed"), no staff identity, and no internal notes. Staff see "Renamed: old → new" and names.
+
+**Cursors.** Both are opaque: AES-GCM via `deps.crypto.encrypt`, base64url, with AAD bound to the order, the reader, the view (and the category for activity). A cursor replayed by another user or view, or a tampered one, fails with `CURSOR_INVALID`.
+
+**Client.**
+- `client/src/features/audit/OrderHistoryTab.tsx` is registered as `orderTabs` key `history`, order 90, access customer. Its label is "History" in the customer area and "Order history" in the console. It has a left status lane and a right activity feed with a category filter; customers see customer categories only.
+- `client/src/features/automations/OrderWorkflowStageActionsPanel.tsx` is the T2 panel for the T1 Automation tab slot (server: `trpc.automations.orderStageActions.*`).
