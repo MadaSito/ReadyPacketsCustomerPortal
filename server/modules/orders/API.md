@@ -276,3 +276,111 @@ Setting `orders.console_access.enabled` (default **false**) gates `access.grant`
 - `FeatureRoutes.orderBanners?: OrderBanner[]` (`{ key, order, area: "customer" | "console" | "both", component({ orderId, area }) }`) renders full width between the order header and the tabs. Each banner is in Suspense with no fallback.
 - `DetailTab.labelComponent?`: a live tab label, with `label` as the fallback and as the narrow-screen select text.
 - Tab order: Overview 0, Phases 10 (console), Intake 20, Files 30, Messages 40, Automation 50, Sync 60, Invoices 70, Refund 80, Order history 90, Acceptances 100, Notes 105, Sharing 110. `/activity` opens Notes.
+
+## Increment 05 — C3 discount codes on orders, A1 workflow export / import
+
+### C3: tRPC
+
+| Procedure | Guard | Notes |
+| --- | --- | --- |
+| `quote` | protected (GET) | unchanged; **does not accept** `promoCode` (a code must never travel in a URL) |
+| `quoteWithPromo` | protected, rate limit `form_submission` (POST mutation) | `{ items, promoCode, forCustomerPublicId? }` ⇒ `OrderQuote & { promo: { label, promoDiscountMinor } \| null }`. `discountMinor` / `discountLabel` / `totalMinor` already include the code. Preview only: nothing is redeemed |
+| `create` | as before | optional `promoCode`; redeemed by the promotions port **inside** the create transaction **before** the order row is inserted; failure ⇒ nothing written |
+| `admin.createForCustomer` | as before | optional `promoCode`; eligibility is judged for the customer, never for the staff member |
+
+- Uniform refusal: `VALIDATION PROMO_NOT_APPLICABLE` "This code cannot be applied." for every reason a code cannot be used, **including** `feature.promotions` off and the promotions module absent. Without a code nothing changes.
+- An inconsistent outcome from the promotions port (negative total, wrong currency, more than the subtotal) is refused (fail closed).
+- API v1 (system) order creation does not accept codes in this increment.
+- `createOrderFromCheckoutInTx(tx, principal, { …, promoCode? })` (cart) returns `promoDiscountMinor` and `promoLabel`.
+
+### C3: stored figures and views
+
+- `orders.promo_discount_minor` (int, default 0) and `orders.promo_label` (nullable, ≤ 120 characters) are written once at create.
+- Order detail and summary views expose `promoDiscountMinor` and `promoLabel`.
+- `OrderAccessView` (ports) gains these optional fields: `discountMinor`, `discountLabel` (the combined label), `promoDiscountMinor`, `promoLabel` and `bundleDiscountMinor`. They are used for compliance invoices; no bundle label is stored separately.
+- Portable order records carry `promoDiscountMinor` / `promoLabel` (optional on import, default 0 / null).
+
+### C3: release on cancel (decision G-C3-02)
+
+On cancellation the orders transaction asks `services.compliance.orderPaymentExposureInTx(tx, orderPublicId)`. It calls `promotions.releaseForOrderInTx(tx, { orderPublicId, reason: "order_cancelled" })` only when the answer is **exactly** `{ grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false }`.
+
+Any exposure, a missing port or an error keeps the redemption used, and the cancel still succeeds. A refund never releases a redemption. A manual release is `promotions.admin.releaseRedemption`, which the promotions module owns.
+
+### C3: ports
+
+`PromotionsPort { preview, redeemInTx, releaseForOrderInTx, isEnabled? }` and `OrderPaymentExposure` / `releaseIsSafe` are defined in `ports.ts`, matching contract §3.
+
+### A1: tRPC `orders.admin.workflows.transfer.*`
+
+All procedures are admin only. Customers and staff get `FORBIDDEN`, the existing `adminProcedure` behaviour. When the setting `orders.workflow_transfer.enabled` (env `ORDER_WORKFLOW_TRANSFER_ENABLED`, default **false**) is off, every step except `status` fails with `FORBIDDEN WORKFLOW_TRANSFER_DISABLED`.
+
+| Procedure | Capability | Input ⇒ output |
+| --- | --- | --- |
+| `status` (query) | `workflows.manage` | ⇒ `{ enabled, canExport, canImport, maxBytes: 2097152, maxWorkflows: 50 }` |
+| `export` (mutation) | `workflows.export` | `{ selection: { all: true } \| { workflowKeys: string[1..50] } }` ⇒ `{ fileName, packageText, digest, … }`; unknown key ⇒ `NOT_FOUND` |
+| `preview` (mutation, `form_submission`) | `workflows.import` + step-up | `{ packageText ≤ 2 MiB }` ⇒ `TransferPreview` |
+| `applyImport` (mutation, `form_submission`) | `workflows.import` + step-up (re-checked in the tx) | `TransferApplyInput` ⇒ `TransferApplyResult`. Named `applyImport` because `apply` is reserved by tRPC |
+
+`TransferPreview`:
+
+```
+{ digest, formatVersion, exportedAt, source: { release, label },
+  blocking: { code, message }[],
+  workflows: { key, name, unpublished, valid, findings: { severity, code, path, message }[],
+               existing: { workflowPublicId, name, hasDraft } | null, suggestedKey }[],
+  references: { policies: { ref, slug, title, audience, usedBy: string[],
+                            resolution: { status: "matched", localPolicyPublicId, title } | { status: "not_found" } }[] } }
+```
+
+`TransferApplyInput`:
+
+```
+{ packageText, idempotencyKey /^[A-Za-z0-9_-]{16,80}$/,
+  decisions: { key, action: "create" | "draft" | "skip" }[],        // one per workflow in the package
+  policyMappings: { ref, localPolicyPublicId } | { ref, removeGates: true } [] }
+```
+
+The result is `{ importPublicId, replayed, results: { key, action, workflowKey, draftPublicId }[] }`.
+
+**Package format** `readypackets.workflows` v1:
+
+```
+{ format, formatVersion: 1, exportedAt, source: { release, label },
+  workflows: [{ key, name, description: null, unpublished, definition, layout }],
+  references: { policies: [{ ref: "policy_N", slug, title, audience }] },
+  integrity: { algorithm: "sha256", digest } }
+```
+
+- The digest is sha256 over the canonical JSON (keys sorted at every level) of `{ references, workflows }`.
+- Gates carry `policyRef` instead of a local id. No local ids, customers, orders or users are exported.
+- An unpublished policy is exported with slug `""` and must be mapped on import.
+- `description` is always null, because there is no column for it.
+
+**Errors**
+
+- Structural (thrown, `VALIDATION`): `PACKAGE_TOO_LARGE` (UTF-8 bytes), `PACKAGE_TOO_DEEP` (> 24), `PACKAGE_NOT_JSON`, `PACKAGE_FORBIDDEN_KEY` (`__proto__`, `constructor`, `prototype`), `PACKAGE_FORMAT_UNSUPPORTED`, `PACKAGE_INVALID` (strict schemas, unknown keys refused).
+- Blocking (returned in the preview; `applyImport` ⇒ `PACKAGE_BLOCKED`): `DIGEST_MISMATCH` (there is no "import anyway"), `NO_WORKFLOWS`, `TOO_MANY_WORKFLOWS`, `WORKFLOW_KEY_INVALID`, `DUPLICATE_WORKFLOW_KEY`, `DUPLICATE_REFERENCE`.
+- Per-workflow findings: `TEXT_MARKUP`, `NAME_INVALID`, `GATE_REFERENCE_UNKNOWN`, the designer's `validateDraft` codes, `DEFINITION_INVALID`, and `RULES_DISABLED` (warning). An invalid workflow can only be skipped (`WORKFLOW_INVALID`).
+- `applyImport`:
+  - `DECISION_DUPLICATE`, `DECISIONS_INCOMPLETE`;
+  - `POLICY_MAPPING_DUPLICATE`, `POLICY_MAPPING_UNKNOWN_REF`, `POLICY_MAPPING_REQUIRED`;
+  - `POLICY_MAPPING_INVALID` (the target must be a published `all` or `customer` policy);
+  - `IMPORT_NO_EXISTING_WORKFLOW` ("draft" needs an existing workflow);
+  - `CONFLICT WORKFLOW_DRAFT_EXISTS`;
+  - `CONFLICT IDEMPOTENCY_KEY_REUSED` (same actor and key, different request).
+
+**Semantics**
+
+- An import only creates **drafts**; nothing is published.
+  - `create` makes a new workflow under a unique key (`key_2`, …).
+  - `draft` attaches a draft to the existing workflow with that key.
+- The draft's source is stored as `"blank"`, because the schema is frozen and has no `import` value. Provenance lives in `order_workflow_imports`: actor, key, requestHash, digest and source label.
+- The same actor, key and request is replayed with `replayed: true`. A concurrent duplicate falls back to the replay.
+
+**Audit** (in the tx, snake_case, safe values):
+
+- `workflow.exported` (digest, keys, selection; counts);
+- `workflow.import_previewed` (outcome `denied` plus reason_code when blocked);
+- `workflow.imported` (digest, source_label, outcome, gates_removed; counts created / drafted / skipped; import id).
+
+**Body size:** `packageText` is capped at 2 MiB by zod. The per-path HTTP body cap (about 6 MiB for preview and applyImport) is owned by http_security_engineer.
