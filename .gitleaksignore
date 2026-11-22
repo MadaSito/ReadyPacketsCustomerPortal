@@ -40,3 +40,20 @@ b1c079bd3c0d8760d02cfe57ab6338547d9b6808:server/modules/cart/cart.test.ts:generi
 5dcf4934e26cffe7c8714e4b223088a8b5b929dc:client/src/features/integrations/webhooks/webhooks.test.tsx:generic-api-key:105
 a7049a166dd9c3897199a7b8e705601a0d9ecbcf:server/modules/orders/requirements.test.ts:generic-api-key:372
 4f1b504b2f7d37318c492a8b1b68997012c151d0:server/modules/orders/requirements.test.ts:generic-api-key:138
+# Increment 04 part B, second batch: synthetic idempotency keys and fake sandbox tokens in test files (reviewed line by line)
+978ce691df9ac7e700770f3a7c650a4dbeef67eb:server/modules/payments/refunds.test.ts:generic-api-key:1627
+e8a86bc495038213cf2e0fea62d0d64874197b38:server/modules/payments/refunds.test.ts:generic-api-key:1138
+e8a86bc495038213cf2e0fea62d0d64874197b38:server/modules/payments/refunds.test.ts:generic-api-key:1204
+e8a86bc495038213cf2e0fea62d0d64874197b38:server/modules/payments/refunds.test.ts:square-access-token:1144
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2452
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2462
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2495
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2508
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2521
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2657
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2671
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2691
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2705
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2723
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2734
+f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2855
