@@ -599,5 +599,26 @@ describe("3-2-1 off-site backup strategy UI", () => {
     );
     await expectNoAxeViolations(container);
   });
+
+  it("wraps restore CLI command code and long backup action buttons for 240 px viewports", async () => {
+    const restoreView = renderUi(<RestorePage />, { path: "/admin/backups/restore" });
+    const commandRegion = await screen.findByRole("region", { name: "Restore command for the operator" });
+    expect(commandRegion.className).toContain("break-all");
+    expect(commandRegion.className).toContain("whitespace-pre-wrap");
+    expect(commandRegion.parentElement?.className).toContain("[&_code]:break-all");
+    expect(commandRegion.parentElement?.className).toContain("[&_code]:[overflow-wrap:anywhere]");
+    expect(commandRegion.querySelector("code")?.textContent).toContain("RP_RECOVERY_DATABASE_URL_FILE=");
+    await expectNoAxeViolations(restoreView.container);
+    restoreView.unmount();
+
+    const backupsView = renderUi(<BackupsPage />, { path: "/admin/backups" });
+    const manageStorageLink = await screen.findByRole("link", { name: "Manage storage connections" });
+    expect(manageStorageLink.className).toContain("whitespace-normal");
+    expect(manageStorageLink.className).toContain("max-w-full");
+    const runBackupBtn = screen.getByRole("button", { name: "Run backup now" });
+    expect(runBackupBtn.className).toContain("whitespace-normal");
+    expect(runBackupBtn.className).toContain("max-w-full");
+    await expectNoAxeViolations(backupsView.container);
+  });
 });
 
