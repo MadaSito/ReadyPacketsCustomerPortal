@@ -60,6 +60,9 @@ export const importOrderInputSchema = z.strictObject({
   subtotalMinor: money.optional(),
   discountMinor: money.optional(),
   discountLabel: text(120).nullable().optional(),
+  /** Optional (increment 05): the promotion code's part of discountMinor (historical fact only; no redemption row). */
+  promoDiscountMinor: z.number().int().min(0).refine(Number.isSafeInteger).optional(),
+  promoLabel: text(120).nullable().optional(),
   totalMinor: money,
   currency: z.string().length(3),
   createdAt: z.date(),
@@ -152,6 +155,7 @@ export function preflightImportOrder(raw: unknown): { ok: true; input: ImportOrd
   const discount = input.discountMinor ?? 0;
   if (discount < 0 || discount > subtotal || subtotal - discount !== input.totalMinor)
     return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
+  if ((input.promoDiscountMinor ?? 0) > discount) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["promoDiscountMinor"] };
   if (input.lineItems.length > 0 && sum !== subtotal) return { ok: false, reasonCode: "IMPORT_TOTAL_MISMATCH", paths: ["totalMinor"] };
   for (const [index, item] of input.lineItems.entries())
     if ((item.packetNumber ?? null) === null !== ((item.tier ?? null) === null))
@@ -260,6 +264,8 @@ export function createPortableHooks(deps: PortableDeps) {
           subtotalMinor: order.subtotalMinor,
           discountMinor: order.discountMinor,
           discountLabel: order.discountLabel,
+          promoDiscountMinor: order.promoDiscountMinor,
+          promoLabel: order.promoLabel,
           totalMinor: order.totalMinor,
           currency: order.currency,
           origin: order.origin,
@@ -350,6 +356,8 @@ export function createPortableHooks(deps: PortableDeps) {
         subtotalMinor: input.subtotalMinor ?? input.totalMinor + (input.discountMinor ?? 0),
         discountMinor: input.discountMinor ?? 0,
         discountLabel: input.discountLabel ?? null,
+        promoDiscountMinor: input.promoDiscountMinor ?? 0,
+        promoLabel: input.promoLabel ?? null,
         totalMinor: input.totalMinor,
         currency: input.currency,
         origin: "import",

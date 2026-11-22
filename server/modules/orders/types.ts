@@ -116,6 +116,8 @@ export interface PortableOrder {
   subtotalMinor: number;
   discountMinor: number;
   discountLabel: string | null;
+  promoDiscountMinor: number;
+  promoLabel: string | null;
   totalMinor: number;
   currency: string;
   origin: "portal" | "import";
@@ -169,6 +171,8 @@ export interface OrderQuote {
   discountLabel: string | null;
   totalMinor: number;
   bundle: BundleQuote | null;
+  /** Increment 05: the code's part of discountMinor and its label; null without a code. */
+  promo: { label: string; promoDiscountMinor: number } | null;
 }
 
 /** Trusted production scope for P101/P201 payloads (`OrdersModule.getProductionScope`). */

@@ -164,12 +164,17 @@ const sharing = router({
     .mutation(({ ctx, input }) => ctx.services.orders.sharing.respond(ctx.session, input)),
 });
 
+/** Increment 05: raw code text; promotions normalises it. Bounded and printable only; never logged. */
+const promoCode = z.string().trim().min(1).max(64).regex(/^[\x21-\x7E ]+$/);
+
 export const ordersRouter = router({
   catalog: router({
     list: protectedProcedure.query(({ ctx }) => ctx.services.orders.catalog.listActive()),
   }),
   /** Server price of a selection (packet rules + bundle discount); same validation as create, writes nothing. */
-  quote: protectedProcedure.input(z.strictObject({ items: orderItems })).query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
+  quote: protectedProcedure
+    .input(z.strictObject({ items: orderItems, promoCode: promoCode.optional(), forCustomerPublicId: id.optional() }))
+    .query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
   list: protectedProcedure
     .input(z.strictObject({ cursor, limit, status: statusKey.optional() }))
     .query(({ ctx, input }) => ctx.services.orders.orders.list(ctx.session, input)),
@@ -184,6 +189,7 @@ export const ordersRouter = router({
         items: orderItems,
         note: nfc(1, 5000).optional(),
         idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+        promoCode: promoCode.optional(),
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.orders.create(ctx.session, input)),
@@ -249,6 +255,7 @@ export const ordersRouter = router({
             .max(50),
           note: nfc(1, 5000).optional(),
           idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+          promoCode: promoCode.optional(),
         }),
       )
       .mutation(({ ctx, input }) => {

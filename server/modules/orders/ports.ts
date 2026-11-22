@@ -70,3 +70,68 @@ export function compliancePort(services: Services): CompliancePort | null {
   const fn = method<CompliancePort["assertRequiredPoliciesAccepted"]>((services as Partial<Services>).compliance, "assertRequiredPoliciesAccepted");
   return fn ? { assertRequiredPoliciesAccepted: fn } : null;
 }
+
+/* ---------------- Increment 05 (C3): promotions port, binding signatures from INCREMENT_05_CONTRACT §3 ---------------- */
+
+export interface PromotionLine {
+  productPublicId: string;
+  packetNumber: number | null;
+  tierKey: string | null;
+  lineTotalMinor: number;
+}
+export interface PromotionContext {
+  /** Raw input; normalised by promotions. Never logged. */
+  code: string;
+  /** The order owner, not the actor. */
+  customerUserId: number;
+  actorUserId: number;
+  currency: string;
+  lines: readonly PromotionLine[];
+  subtotalMinor: number;
+  /** 0 when the bundle rule did not apply. */
+  bundleDiscountMinor: number;
+  bundleLabel: string | null;
+}
+export interface PromotionOutcome {
+  promoPublicId: string;
+  /** Customer-facing label. */
+  label: string;
+  /** The part due to the code. */
+  promoDiscountMinor: number;
+  /** May be 0 when the code replaced the bundle discount. */
+  bundleDiscountMinor: number;
+  /** Total discount to store on the order. */
+  discountMinor: number;
+  /** Combined label for order and invoice. */
+  discountLabel: string;
+  totalMinor: number;
+}
+export interface PromotionsPort {
+  preview(ctx: PromotionContext, opts?: { tx?: DbOrTx }): Promise<PromotionOutcome>;
+  redeemInTx(tx: Tx, ctx: PromotionContext & { orderPublicId: string; correlationId: string }): Promise<PromotionOutcome>;
+  releaseForOrderInTx(tx: Tx, input: { orderPublicId: string; reason: "order_cancelled" }): Promise<{ released: boolean }>;
+  /** Optional: `feature.promotions`. When present and false, orders refuses codes with the uniform error. */
+  isEnabled?(opts?: { tx?: DbOrTx }): Promise<boolean>;
+}
+
+/** The one message for every refusal that must not reveal whether a code exists (contract D3). */
+export const promoNotApplicable = () => new DomainError("VALIDATION", "PROMO_NOT_APPLICABLE", "This code cannot be applied.");
+
+/** Promotions module, or null when it is absent (callers refuse a code with the uniform error). */
+export function promotionsPort(services: Services): PromotionsPort | null {
+  const holder: unknown = (services as unknown as Partial<Record<string, unknown>>).promotions;
+  const preview = method<PromotionsPort["preview"]>(holder, "preview");
+  const redeemInTx = method<PromotionsPort["redeemInTx"]>(holder, "redeemInTx");
+  const releaseForOrderInTx = method<PromotionsPort["releaseForOrderInTx"]>(holder, "releaseForOrderInTx");
+  if (!preview || !redeemInTx || !releaseForOrderInTx) return null;
+  const isEnabled = method<NonNullable<PromotionsPort["isEnabled"]>>(holder, "isEnabled");
+  return { preview, redeemInTx, releaseForOrderInTx, ...(isEnabled ? { isEnabled } : {}) };
+}
+
+/** Port for a code, or the uniform refusal when the module is absent or `feature.promotions` is off. */
+export async function requirePromotions(services: Services, tx?: DbOrTx): Promise<PromotionsPort> {
+  const port = promotionsPort(services);
+  if (!port) throw promoNotApplicable();
+  if (port.isEnabled && !(await port.isEnabled(tx ? { tx } : undefined))) throw promoNotApplicable();
+  return port;
+}
