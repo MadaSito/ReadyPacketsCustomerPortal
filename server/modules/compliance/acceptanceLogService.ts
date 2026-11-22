@@ -563,9 +563,13 @@ export function createAcceptanceLogService(
 
   /**
    * Re-verifies the persisted user + session currency (`identity.sessions.assertCurrent` under lock)
-   * and `policies.manage` capability right before decrypting `typedSignerName`.
+   * and `policies.manage` capability, invoking `decrypt()` inside the same transaction before commit
+   * so decryption executes strictly under the verified session lock.
    */
-  async function assertLiveSignerDecryptAccess(principal: SessionPrincipal): Promise<void> {
+  async function decryptSignerWithLiveAccess<T>(
+    principal: SessionPrincipal,
+    decrypt: () => T,
+  ): Promise<T> {
     const identity = identityPort();
     if (!identity?.sessions?.assertCurrent) {
       throw new DomainError(
@@ -574,7 +578,7 @@ export function createAcceptanceLogService(
         "Your session is no longer active. Please sign in again.",
       );
     }
-    await deps.db.transaction(async (tx) => {
+    return deps.db.transaction(async (tx) => {
       const current = await identity.sessions.assertCurrent(principal, tx);
       if (current.pendingSteps.length > 0) {
         throw new DomainError(
@@ -589,6 +593,7 @@ export function createAcceptanceLogService(
       if (!roleHasCapability(current.role, "policies.manage")) {
         throw forbidden("CAPABILITY_NOT_GRANTED");
       }
+      return decrypt();
     });
   }
 
@@ -1699,10 +1704,8 @@ export function createAcceptanceLogService(
       let signerNameRedacted = false;
       if (hasSig) {
         if (canViewSignerName) {
-          await assertLiveSignerDecryptAccess(principal);
-          typedSignerName = deps.crypto.decrypt(
-            acctRow.signerNameEnc!,
-            signerNameAad(acctRow.publicId),
+          typedSignerName = await decryptSignerWithLiveAccess(principal, () =>
+            deps.crypto.decrypt(acctRow.signerNameEnc!, signerNameAad(acctRow.publicId)),
           );
           signerNameRedacted = false;
         } else {
@@ -1802,8 +1805,9 @@ export function createAcceptanceLogService(
     let signerNameRedacted = false;
     if (hasSig) {
       if (canViewSignerName) {
-        await assertLiveSignerDecryptAccess(principal);
-        typedSignerName = deps.crypto.decrypt(gateItem.signerNameEnc!, gateItem.signerNameAad!);
+        typedSignerName = await decryptSignerWithLiveAccess(principal, () =>
+          deps.crypto.decrypt(gateItem.signerNameEnc!, gateItem.signerNameAad!),
+        );
         signerNameRedacted = false;
       } else {
         typedSignerName = null;
