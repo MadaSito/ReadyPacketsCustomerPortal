@@ -39,6 +39,10 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0032 | Session centre, restrictions, forced ends and a customer maintenance mode | Accepted (owner confirmation requested) |
 | 0033 | Knowledge base, optional community forum and referral programme | Accepted (owner confirmation requested) |
 | 0034 | Inbound API v1 with scoped keys, signed webhooks, searchable logs and audited re-run | Accepted (owner confirmation requested) |
-| 0035 | Card payments through hosted Stripe or Square checkout (partially supersedes 0014) | Accepted (owner confirmation requested) |
+| 0035 | Card payments through hosted Stripe or Square checkout (partially supersedes 0014) | Accepted; refund clause superseded by 0038 |
 | 0036 | Consent before any non-essential storage, with a server-side ledger (extends 0011) | Accepted (owner confirmation requested) |
 | 0037 | Accessibility target WCAG 2.2 AA; customer sidebar navigation and visible theme control | Accepted (owner confirmation requested) |
+| 0038 | Refunds through the Stripe or Square refund API; recorded refunds for manual payments (supersedes "refunds are manual" in 0035) | Accepted (owner confirmation requested) |
+| 0039 | Policy acceptance gateway on workflows, enforced by the server with append-only evidence | Accepted (owner confirmation requested) |
+| 0040 | Order files copied to assigned storage with folder templates and a per-order sync view (extends 0027) | Accepted (owner confirmation requested) |
+| 0041 | Order Automation tab: pipeline history, guarded redelivery, optional Phase III / IV, workflow stage actions | Accepted (owner confirmation requested for Phase III / IV) |

@@ -41,6 +41,31 @@ procedure.
 - **Native upgrade** (`deploy/upgrade.sh`): `0003_increment_04` is additive, with 48 new tables and 10 nullable columns on existing tables. Keep the encrypted backup and keys off-host before migration.
 - **Media and country data**: native install, upgrade and the image include FFmpeg and `prlimit` for optional audio conversion. The operator provides any optional country MMDB locally; no network lookup.
 
+### Added — part B, console order workspace
+
+- **Console order page** (`/admin/orders/:orderId`): a header with Rename order, Change reference, Reassign customer, Invoice and Refund, then status, payment and total badges. The tabs, in order, are Overview, Phases, Intake, Files, Messages, Automation, SharePoint sync, Invoices, Refund, Order history, Acceptances and Sharing, and each has its own address. No feature switch.
+- **Rename an order**: needs `orders.rename` (staff and administrators). The check is version-aware, it writes the audit event `order.renamed` and an Order history entry, and the reference does not change.
+- **Order history** (replaces Activity): the order's status transitions next to its audited activity, paginated and filterable by category. Customers see only the subset meant for them.
+- **Automation tab** (formerly Production), per [ADR 0041](docs/adr/0041-order-automation-tab.md):
+  - The Phase I and Phase II cards say why a button is disabled.
+  - Pipeline history per order, with Retry for failed dispatches.
+  - Redeliver needs `orders.production.redeliver`, step-up, a reason and the phrase `REDELIVER`.
+  - Optional Phase III and Phase IV endpoints, hidden until configured.
+  - "Run actions" for workflow stage automations needs `orders.automations.run`.
+- **Refunds**, per [ADR 0038](docs/adr/0038-provider-refunds.md), which supersedes "refunds are manual" in ADR 0035:
+  - Stripe and Square refunds go through the provider's API, idempotent per refund; an unknown outcome is reconciled and never resent.
+  - Manual payments get recorded refunds.
+  - Needs `payments.refund` (administrators), step-up and the phrase `REFUND ORDER`.
+- **Policy acceptance gateway**, per [ADR 0039](docs/adr/0039-policy-acceptance-gateway.md): a workflow gate at order start or before a named step, with a checkbox or typed-name signature. The server refuses work on the order until each acting user accepts, and the evidence is append-only. There is an Acceptances tab and a printable receipt.
+- **Order file sync and folder routing**, per [ADR 0040](docs/adr/0040-order-file-sync-folder-routing.md):
+  - Folder templates per slot, with a workflow default, edited in the workflow designer and validated on save and at copy time.
+  - Uploads, recordings and converted audio are copied to the connections assigned to order files.
+  - Per-order SharePoint sync (or File sync) tab, with Retry for failed transfers (`files.manage`).
+
+### Operations — part B
+
+- **Migration `0004_increment_04_part_b`**: additive only (new tables, nullable columns, appended enum values), applied by `deploy/upgrade.sh`. See [UPGRADE.md](docs/operations/UPGRADE.md).
+
 ## [Unreleased]
 
 ### Added

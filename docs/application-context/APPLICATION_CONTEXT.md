@@ -154,6 +154,21 @@ Migration [`0003_increment_04`](../../migrations/0003_increment_04.sql) adds 48 
 - **Environment**: `RP_FFMPEG_PATH` defaults to `/usr/bin/ffmpeg`; optional `PROTECTION_MMDB_PATH` names an offline country file; `PROTECTION_COUNTRY_HEADER` allows only `x-readypackets-country` from an explicitly trusted direct proxy that overwrites it (bundled proxies strip it). `PROTECTION_DISABLED=1` temporarily bypasses Application Protection and restores baseline rate limits, not authentication or MFA. See [media and country setup](../operations/MEDIA_AND_GEOIP.md).
 - **Customer navigation**: expanded/collapsible sidebar on large screens, drawer below that, and up to four phone shortcuts plus More. Support and Account have separate groupings; switched-off feature links disappear. System, Light and Dark use the shared theme control; the current theme choice is held in memory. The UI is designed and tested against WCAG 2.2 AA; see [coverage and gaps](../verification/ACCESSIBILITY.md).
 
+## Increment 04 part B: console order workspace
+
+The owner asked for this on 2026-11-21 (prompt 19). The contract is [INCREMENT_04_PART_B.md](../engineering/INCREMENT_04_PART_B.md), and its decisions are B1–B9. Migration `0004_increment_04_part_b` is additive. Every item below is implemented and tested by its owner; the integrator has not yet verified it.
+
+| Area | What it does | Guard |
+| --- | --- | --- |
+| Order page shell (`orders`) | `/admin/orders/:orderId/:tab` has header actions (Rename, Change reference, Reassign, Invoice, Refund) and twelve tabs, each with its own address. The tab strip scrolls and collapses into a menu below 480 px. | `orders.read_all`; rename needs `orders.rename` |
+| Order history (`audit`) | Status transitions alongside order-scoped audit activity, read through an audit port scoped to one order. Customers see a redacted subset ("ReadyPackets staff", no IP addresses). | Ownership on every read |
+| Automation tab (`integrations`, `automations`) | P101/P201 cards with the reason a button is disabled; per-order pipeline history; Retry; Redeliver, which creates a new delivery marked `redeliveryOf`; optional P301/P401 endpoints; "Run actions" for workflow stage automations ([ADR 0041](../adr/0041-order-automation-tab.md)). | `orders.production.trigger`; `orders.production.redeliver` (administrators, step-up, phrase `REDELIVER`); `orders.automations.run` |
+| Refunds (`payments`, `compliance`, `jobs`) | Stripe/Square refund API with an idempotency key from the refund public id. The intent is committed before the call. Results are `succeeded`, `failed` or `unknown`; unknown is reconciled, never resent. Manual payments get a recorded refund ([ADR 0038](../adr/0038-provider-refunds.md)). | `payments.refund` (administrators, step-up, phrase `REFUND ORDER`) |
+| Policy acceptance gateway (`compliance`, `orders`) | Workflow gates at `order_start` or a named step. The server refuses customer work with `PRECONDITION_FAILED` / `ORDER_ACCEPTANCE_REQUIRED`. Evidence is append-only (policy version, SHA-256 of the text shown, typed name, encrypted source address) ([ADR 0039](../adr/0039-policy-acceptance-gateway.md)). | Staff are not gated; source address shown only with `sessions.read_all` |
+| Order file sync (`storage`, `files`, `sharepoint`) | Slot, then workflow, then assignment folder templates, with tokens and validation on save and at copy time. The target path is recorded on each copy attempt. Per-order sync tab `storage.copies.forOrder`; retry `storage.copies.retryOrderFile` ([ADR 0040](../adr/0040-order-file-sync-folder-routing.md)). | `orders.read_all`; retry needs `files.manage` |
+
+New capabilities (all in `shared/capabilities.ts`): `orders.rename`, `orders.automations.run`, `orders.production.redeliver` (step-up) and `payments.refund` (step-up).
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

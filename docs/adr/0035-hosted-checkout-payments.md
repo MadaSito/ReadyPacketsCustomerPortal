@@ -1,6 +1,6 @@
 # 0035 — Card payments through hosted Stripe or Square checkout (partially supersedes 0014)
 
-Status: Accepted (2026-11-21; owner confirmation requested)
+Status: Accepted (2026-11-21; owner confirmation requested). The "refunds stay manual" clause is superseded by [0038](0038-provider-refunds.md).
 
 ## Context
 ADR 0014 kept payments manual. The owner now asks for a cart that redirects to Stripe or Square.
