@@ -292,7 +292,7 @@ The first 14 rows follow the [owner's requirements](../engineering/INCREMENT_04_
 | INC04-B2 | Order history and a SharePoint sync view of the order's files | [Audit](../../server/modules/audit/VERIFICATION.md) and [Storage](../../server/modules/storage/VERIFICATION.md). Evidence pending the owners' reports. | implemented; tested by owner / not verified by integrator / not verified in a browser |
 | INC04-B3 | Refund button and refund capability on each order | [Payments](../../server/modules/payments/VERIFICATION.md) and [Compliance](../../server/modules/compliance/VERIFICATION.md); [ADR 0038](../adr/0038-provider-refunds.md). Evidence pending the owners' reports. | implemented; tested by owner / not verified by integrator / not verified against the real provider |
 | INC04-B4 | Acceptance gateway based on a policy | [Compliance](../../server/modules/compliance/VERIFICATION.md) and [Orders](../../server/modules/orders/VERIFICATION.md); [ADR 0039](../adr/0039-policy-acceptance-gateway.md). Evidence pending the owners' reports. | implemented; tested by owner / not verified by integrator / not verified in a browser |
-| INC04-B5 | Rename an order | [Orders](../../server/modules/orders/VERIFICATION.md). Evidence pending the owner's report. | implemented; tested by owner / not verified by integrator |
+| INC04-B5 | Rename an order | [Orders](../../server/modules/orders/VERIFICATION.md): `orders.console.rename` + Rename dialog; consoleOrder.test.ts (12), orders.test.tsx (39). Commits 802f0e1, e53b2d1, 8966d18, 8b84775. | implemented; tested by owner / not verified by integrator / not verified in a browser |
 | INC04-B6 | Order files sync to SharePoint after upload or recording; destination folder configurable in the workflow | [Storage](../../server/modules/storage/VERIFICATION.md), [Files](../../server/modules/files/VERIFICATION.md) and [SharePoint](../../server/modules/sharepoint/VERIFICATION.md); [ADR 0040](../adr/0040-order-file-sync-folder-routing.md). Evidence pending the owners' reports. | implemented; tested by owner / not verified by integrator / not verified against the real provider |
 
 ## Summary
@@ -365,3 +365,4 @@ so.
   notes above, such as "CI never run" and "no remote configured", predate the GitHub push and are stale).
 - 2026-11-21 — increment 04 rows INC04-A1 to INC04-A4 and INC04-13 added by orders_engineer.
 - 2026-11-21 — increment 04 part B rows INC04-B1 to INC04-B6 added by platform_engineer. Their status is the owners' claims until the integrator verifies them.
+- 2026-11-21 — orders_engineer filled in the INC04-B5 evidence. INC04-B4 and INC04-B6 have orders-side evidence (gate port, designer fields, folder routing) in the orders VERIFICATION.md.

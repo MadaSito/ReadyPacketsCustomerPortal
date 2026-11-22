@@ -114,3 +114,20 @@ Run by orders_engineer one file at a time on `feat/increment-04`. The server sui
 | WCAG 2.2 AA page checks in light and dark: order page with rules, acknowledgement dialog open, console customer orders tab (axe, single h1/main, theme applied) | automated-test (`pageA11y`) | rules.test.tsx › "increment 04 page accessibility" (6 cases) |
 
 Not checked here: the real identity step-up and session re-validation (integration suite); the real Files slot counting (fake adapter); real notification delivery; colour contrast, 320 px layout, 400 % zoom and screen-reader use in a real browser (those are for the lead's browser pass); behaviour under truly concurrent connections. The `/cart` page that the wizard hands off to belongs to the cart package and is not tested here.
+
+
+## Increment 04 part B (S1) — console order workspace
+
+| Requirement | Method | Evidence |
+| --- | --- | --- |
+| Rename: NFC, version bump, reference unchanged, history row, name-free audit in the tx; no-op, stale, invalid names, customers refused; audit failure rolls back | automated-test | consoleOrder.test.ts › "orders.console.rename (B2)" (3 tests) |
+| Name history: staff old → new across pages, stable order, customer view generic, bad cursor refused | automated-test | consoleOrder.test.ts › "listNameHistory…" |
+| Status transitions port, customer view notes | automated-test | consoleOrder.test.ts › "listStatusTransitions (S2 port)" |
+| Gates: no provider → UNAVAILABLE; customer blocked with CONFLICT ORDER_ACCEPTANCE_REQUIRED until accepted; staff pass; cancel never gated; step gates at the FROM status; API checked against the owner; context scoped; invalid provider refused | automated-test | consoleOrder.test.ts › "orders.gates (B6)" (6 tests) |
+| Folder routing port | automated-test | consoleOrder.test.ts › "getOrderFileFolderRouting" |
+| Designer validation of gates and folders (including traversal, absolute, backslash, unknown token, control characters, reserved names); gates need workflow rules on | automated-test | workflowDesigner.test.ts (20 tests) |
+| Console header (reference · customer · placed, badges), B1 action row order, tab order, `/activity` → Notes, banners per area, Rename dialog (keyboard open, Escape returns focus, validation, success keeps reference), staff vs admin actions, page axe light and dark incl. dialog open | automated-test | client/src/features/orders/orders.test.tsx (39 tests) |
+| Rules panel in the console Phases tab; hint punctuation not doubled | automated-test | rules.test.tsx (20 tests) |
+| Designer gate editor (published policies only, final steps not offered, server issue at field, payload), storage folder fields with live example (invalid shows a message), slot override, policy list failure | automated-test | workflows.test.tsx (10 tests) |
+
+Not checked here: a real browser (RouteTabs overflow and select below 480 px, focus, contrast, 320 px, zoom); the real acceptance provider (compliance), tested only with a fake provider; the real payment-summary provider; real SharePoint copies using the folder templates; behaviour under truly concurrent connections.

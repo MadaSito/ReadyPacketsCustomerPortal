@@ -246,3 +246,33 @@ Setting `orders.console_access.enabled` (default **false**) gates `access.grant`
 ### Workflow actor `api` and the public API provider
 - `WORKFLOW_ACTORS = ["customer", "staff", "admin", "api"]`. `api` may appear in `allowedBy` and `uploadedBy`; the designer labels it "API integration". Only the public API (`/api/v1`, API-key callers) acts as `api`; no session ever does.
 - `OrdersModule.init()` registers the `orders` provider with the public API module (`publicApiProvider.ts`): `list` (keyset, newest first, ≤100, filters `customerId`, `status`, `updatedSince`), `get`, `create` (`createAsSystem`, owner = the given customer, item `tierKey` = the product tier in lowercase or `default`, mismatch refused) and `transition` (`transitionAsSystem`, allowed only where the pinned workflow lists `api`; requirements and phase locks apply). Writes audit as `system` with the API request id as correlation id; scopes are checked by the public API module before the provider runs.
+
+
+## Increment 04 part B (S1) — console order workspace
+
+### tRPC
+| Procedure | Who | Input | Output / notes |
+| --- | --- | --- | --- |
+| `orders.console.rename` (mutation) | staff/admin + `orders.rename` | `{ orderId, expectedVersion, name }` | `{ version, changed }`. Name is NFC and trimmed, 1–120 characters, no control characters (`VALIDATION:ORDER_NAME_INVALID`). Stale → `CONFLICT:STALE_VERSION`. The reference does not change. It bumps `updatedAt`, emits change kind `updated`, writes `order_name_history`, and records the audit event `order.renamed` `{ order_public_id, renamed, old_length, new_length }`, which never carries names. |
+| `orders.admin.get` | staff | (unchanged) | adds `console: { customer: { publicId, name, customerRef } \| null, payment: { state, totalMinor, currency } \| null }` (payment comes from the registered payment-summary provider; null when none is registered). |
+
+### Workflow definition (pinned per version)
+- `acceptanceGates?: { key, policyPublicId, point: "order_start" \| { stepKey }, signatureMode: "checkbox" \| "typed_name", askAgainOnNewVersion }[]` (at most 10). Key format `^[a-z][a-z0-9_]{1,47}$`, unique; step must exist and must not be final. Designer codes: `GATE_KEY_FORMAT`, `GATE_KEY_DUPLICATE`, `GATE_POLICY_REQUIRED`, `GATE_STEP_REQUIRED`, `GATE_STEP_UNKNOWN`, `GATE_STEP_TERMINAL`. Gates count as workflow rules, so publishing needs `orders.workflow_rules.enabled` (`WORKFLOW_RULES_DISABLED`).
+- `storageFolder?` on the workflow and on each upload slot: validated with `isOrderFileFolderTemplate` (shared/orderFileFolder.ts). Codes: `WORKFLOW_FOLDER_INVALID`, `UPLOAD_FOLDER_INVALID`. Precedence at copy time: slot, then workflow, then assignment default.
+
+### Ports
+- `gates` (`services.orders.gates`): `registerProvider("acceptance", { assertMet({ tx, orderId, workflowVersionId, gates, actor: { userId, role }, point }) })`. Other members:
+  - `context(orderPublicId, actor, tx?)` returns `{ orderId, orderPublicId, reference, name, customerUserId, workflowVersionId, currentStatusKey, gates, actorAccess }`, or null when the actor cannot read the order.
+  - `assertCustomerMayWork({ tx, orderId, actor, action, statusKey })` and `assertSystemMayWork({ tx, orderId, action, statusKey })`. The system variant checks the owner.
+  - `gatesOf(definition)`.
+  - Rules: staff pass. `order_start` gates always apply. A step gate applies when `statusKey ?? order.statusKey` equals its step; phase_submit passes the FROM status. Gates with no provider registered → `UNAVAILABLE:ORDER_GATES_UNAVAILABLE`. Cancellation is never gated. Orders calls the port in `transition` (customer side) and in `transitionAsSystem`.
+- `getOrderFileFolderRouting({ orderPublicId, statusKey, slotKey }, tx)` returns `{ slotTemplate, workflowTemplate, phaseLabel }`, or null for an unknown order. It is trusted and reads the pinned version.
+- `listStatusTransitions(orderId, { cursor, limit, customerView, tx })` returns `{ items: { at, from, fromLabel, to, toLabel, note, actorUserId, actorRole }[], nextCursor }`. It is trusted (the caller authorizes). customerView uses customer labels and only customer-visible notes.
+- `listNameHistory(orderId, { cursor, limit, customerView, tx })` returns `{ items: { at, oldName, newName, actorUserId, actorRole }[], nextCursor }`. It is ordered by (created_at, id) DESC with a keyset cursor on that pair. customerView returns null names and a null actor, which shows as a generic "Order renamed".
+- `registerPaymentSummaryProvider(fn: (orderIds, tx) => Promise<Map<orderId, { state, totalMinor, currency }>>)` supplies the console header payment badge.
+- `OrderRef.name`: the order name, used for folder tokens.
+
+### Client
+- `FeatureRoutes.orderBanners?: OrderBanner[]` (`{ key, order, area: "customer" | "console" | "both", component({ orderId, area }) }`) renders full width between the order header and the tabs. Each banner is in Suspense with no fallback.
+- `DetailTab.labelComponent?`: a live tab label, with `label` as the fallback and as the narrow-screen select text.
+- Tab order: Overview 0, Phases 10 (console), Intake 20, Files 30, Messages 40, Automation 50, Sync 60, Invoices 70, Refund 80, Order history 90, Acceptances 100, Notes 105, Sharing 110. `/activity` opens Notes.

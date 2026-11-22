@@ -299,6 +299,15 @@ or SharePoint destination is verified here. The historical base sections above a
 | Console to `orders.admin.access.*` / `createForCustomer` | Over-sharing, enumeration, unaudited creation on behalf | Features ship off; capability + step-up; uniform refusals; audit in the transaction; both parties notified. Not verified against the real identity step-up. |
 | Public API to the `orders` provider | Integration moves or creates orders beyond its scope | Scopes checked by the public API module; provider acts as `system`, transitions only where the workflow lists `api`, tier must match. Tested through the provider directly, not over HTTP. |
 
+## 10b. Increment 04 part B — console order workspace (orders_engineer, S1)
+
+| Boundary | Main abuse case | Control and evidence boundary |
+| --- | --- | --- |
+| Console to `orders.console.rename` | Customer renames, stale overwrite, hidden characters, names leaking through audit/SIEM | staffProcedure + `orders.rename` re-checked in the tx; optimistic version; NFC, 1–120 characters, control characters refused. The audit event carries only `renamed` and the old/new lengths. Names go to `order_name_history` (orders-owned, never exported); the customer view of that history has no names and no staff identity. consoleOrder.test.ts. |
+| Other modules to `orders.gates` | Customer side-steps a required acceptance (upload, record, intake, submit) or an integration acts for a customer who has not accepted | One server check in the caller's tx: staff pass; system/API v1 checked against the owner; gates but no provider → `UNAVAILABLE ORDER_GATES_UNAVAILABLE` (fail closed); unmet → `CONFLICT ORDER_ACCEPTANCE_REQUIRED`. Cancellation is never gated. Tested with a fake provider; the real provider (compliance) is not covered here. |
+| Designer to `storageFolder` templates | Path traversal or reserved names in a SharePoint folder | `isOrderFileFolderTemplate` at save and publish (tokens only, no `..`, absolute paths, backslashes, control characters or reserved names). The copy worker re-checks the resolved path. Pure tests only; no real SharePoint. |
+| Contributed order banners/tabs | A feature's UI hides or fakes a gate | UI only; every rule is enforced by the server. |
+
 ## 11. Non-goals (explicit)
 
 - Native iOS/Android apps (Day-2, MP §3).
