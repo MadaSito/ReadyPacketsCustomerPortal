@@ -197,6 +197,27 @@ export const orderWorkflowDrafts = mysqlTable(
   (t) => [uniqueIndex("order_workflow_drafts_workflow_uq").on(t.workflowId), uniqueIndex("order_workflow_drafts_key_uq").on(t.workflowKey)],
 );
 
+/**
+ * Increment 05 (A1): one row per applied workflow import, for idempotent replay of `transfer.apply`.
+ * Holds no package content: digest, source label and the per-key outcome only.
+ */
+export const orderWorkflowImports = mysqlTable(
+  "order_workflow_imports",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    actorUserId: refColumn("actor_user_id")
+      .notNull()
+      .references(() => users.id),
+    idempotencyKey: varchar("idempotency_key", { length: 80 }).notNull(),
+    digest: char("digest", { length: 64 }).notNull(),
+    sourceLabel: varchar("source_label", { length: 120 }),
+    outcome: json("outcome").$type<{ key: string; action: "create" | "draft" | "skip"; draftPublicId: string | null; workflowKey: string | null }[]>().notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [uniqueIndex("order_workflow_imports_idem_uq").on(t.actorUserId, t.idempotencyKey)],
+);
+
 /* ------------------------------------------------------------------- orders */
 
 export const orders = mysqlTable(
@@ -218,6 +239,9 @@ export const orders = mysqlTable(
     subtotalMinor: amountMinorColumn("subtotal_minor").notNull(),
     discountMinor: amountMinorColumn("discount_minor").notNull().default(0),
     discountLabel: varchar("discount_label", { length: 120 }),
+    /** Increment 05 (C3): the part of discountMinor due to a promotion code, and its customer-facing label. */
+    promoDiscountMinor: amountMinorColumn("promo_discount_minor").notNull().default(0),
+    promoLabel: varchar("promo_label", { length: 120 }),
     totalMinor: amountMinorColumn("total_minor").notNull(),
     currency: currencyColumn().notNull(),
     origin: mysqlEnum("origin", ORDER_ORIGINS).notNull().default("portal"),
