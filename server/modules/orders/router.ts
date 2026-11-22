@@ -94,7 +94,42 @@ const catalogAdmin = router({
     .mutation(({ ctx, input }) => ctx.services.orders.catalog.updateBundleRule(ctx.session, input.rule)),
 });
 
+/* ---- increment 05 (A1): workflow export / import. Bodies travel in POST (http caps these two paths). ---- */
+const transferPackageText = z.string().min(1).max(2_097_152);
+const workflowTransfer = router({
+  status: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflowTransfer.status(ctx.session)),
+  export: adminProcedure
+    .use(requireCapability("workflows.export"))
+    .input(z.strictObject({ selection: z.union([z.strictObject({ all: z.literal(true) }), z.strictObject({ workflowKeys: z.array(statusKey).min(1).max(50) })]) }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.exportPackage(ctx.session, input)),
+  preview: adminProcedure
+    .use(requireCapability("workflows.import"))
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject({ packageText: transferPackageText }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.preview(ctx.session, input)),
+  // `apply` is a reserved word in tRPC routers.
+  applyImport: adminProcedure
+    .use(requireCapability("workflows.import"))
+    .meta({ rateLimit: "form_submission" })
+    .input(
+      z.strictObject({
+        packageText: transferPackageText,
+        idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+        decisions: z.array(z.strictObject({ key: z.string().max(48), action: z.enum(["create", "draft", "skip"]) })).max(50),
+        policyMappings: z
+          .array(
+            z
+              .strictObject({ ref: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/), localPolicyPublicId: id.optional(), removeGates: z.literal(true).optional() })
+              .refine((mapping) => (mapping.localPolicyPublicId === undefined) !== (mapping.removeGates === undefined), { message: "Map to a policy or remove the gates." }),
+          )
+          .max(100),
+      }),
+    )
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.applyImport(ctx.session, input)),
+});
+
 const workflowsAdmin = router({
+  transfer: workflowTransfer,
   list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.list()),
   // Increment 03: the direct create/publish procedures are no longer mounted. Every new version goes through a draft
   // (drafts.publish), which requires a fresh step-up and passes the designer's validation.

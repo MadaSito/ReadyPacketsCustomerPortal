@@ -39,7 +39,9 @@ export type { OrderFileFolderRouting } from "./folders.js";
 import type { OrderPaymentSummaryProvider } from "./orderService.js";
 export type { OrderPaymentState, OrderPaymentSummaryProvider } from "./orderService.js";
 import { readSetting } from "../platform/index.js";
-import { ORDER_WORKFLOW_RULES_ENABLED } from "./settings.js";
+import { ORDER_WORKFLOW_RULES_ENABLED, ORDER_WORKFLOW_TRANSFER_ENABLED } from "./settings.js";
+import { createWorkflowTransferService, type WorkflowTransferService } from "./workflowTransferService.js";
+export type { TransferApplyInput, TransferApplyResult, TransferPreview, TransferSelection, TransferStatus } from "./workflowTransferService.js";
 
 export type * from "./types.js";
 
@@ -105,6 +107,8 @@ export interface OrdersModule extends ModuleLifecycle {
   access: AccessService;
   catalog: CatalogService;
   workflows: WorkflowService;
+  /** Increment 05 (A1): workflow export / import (`orders.admin.workflows.transfer.*`). */
+  workflowTransfer: WorkflowTransferService;
   orders: OrderService;
   sharing: SharingService;
 }
@@ -129,6 +133,18 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const getOrderFileFolderRouting = createFolderRouting({ workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
+
+  const workflowTransfer = createWorkflowTransferService({
+    db: deps.db,
+    clock: deps.clock,
+    audit: deps.audit,
+    services: deps.services,
+    actorCheck,
+    enabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_TRANSFER_ENABLED, tx),
+    rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
+    release: deps.config.releaseRef,
+    installationLabel: deps.config.installationId,
+  });
 
   const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
 
@@ -174,6 +190,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     access,
     catalog,
     workflows,
+    workflowTransfer,
     orders,
     sharing,
     async health(): Promise<ModuleHealth[]> {
