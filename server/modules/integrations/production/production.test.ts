@@ -2968,4 +2968,209 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
       cause: expect.objectContaining({ reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE" }),
     });
   });
+
+  it("Part B security: carries original root Idempotency-Key across 5xx dead-letter exhaustion into operator retry (including chained retries), while deliberate redeliver issues a distinct key", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 970,
+      orderPublicId: "01JORDER000000000000000970",
+      reference: "ORD-2026-0970",
+      customerRef: "RP-RETRY-DEDUPE-970",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+
+    const exhaustWith5xx = async (dispatchPublicId: string, httpStatus: number) => {
+      const enqueuedJobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+      h.jobs.enqueued = [];
+      nextHttpHandler = async ({ headers, body }) => {
+        const key = headers?.["Idempotency-Key"] ?? "";
+        // Simulate downstream committing side effects on attempt 3 before gateway returns 5xx!
+        if (!downstreamCommittedByKey.has(key) && httpCalls.length === 3) {
+          downstreamCommittedByKey.set(key, String(body ?? ""));
+          downstreamSideEffectRuns += 1;
+        }
+        return {
+          status: httpStatus,
+          headers: { "content-type": "text/plain" },
+          body: Buffer.from(`upstream ${httpStatus}`, "utf8"),
+        };
+      };
+
+      for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+        const res = await handler({
+          jobId: enqueuedJobId,
+          type: PRODUCTION_DELIVERY_JOB,
+          payload: { dispatchId: dispatchPublicId } as never,
+          attempt,
+          fencingToken: attempt,
+          correlationId: `corr_5xx_${dispatchPublicId}`,
+          signal: new AbortController().signal,
+          assertStillOwned: async () => {},
+        });
+        expect(res).toEqual({
+          outcome: "failed",
+          reasonCode: "PRODUCTION_HTTP_5XX",
+          retryable: attempt < PRODUCTION_MAX_ATTEMPTS,
+        });
+      }
+    };
+
+    const downstreamCommittedByKey = new Map<string, string>();
+    let downstreamSideEffectRuns = 0;
+
+    // 1. Initial P101 dispatch exhausts all 5 attempts on HTTP 503 -> `dead` (after committing side effects on attempt 3)
+    const initialDispatch = await staffCaller.production.order.requestP101({ orderPublicId });
+    const rootKey = initialDispatch.idempotencyKey;
+    expect(rootKey).toBe(`rp-prod:p101:${initialDispatch.publicId}`);
+
+    await exhaustWith5xx(initialDispatch.publicId, 503);
+    expect(downstreamSideEffectRuns).toBe(1);
+
+    const [deadInitial] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, initialDispatch.publicId));
+    expect(deadInitial?.state).toBe("dead");
+
+    // 2. Staff retries `dead` initialDispatch -> `retry1` carries root `Idempotency-Key`, while DB column stays unique (`<= 96` chars)
+    const retry1 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: initialDispatch.publicId,
+    });
+    expect(retry1.publicId).not.toBe(initialDispatch.publicId);
+    expect(retry1.retryOf).toBe(initialDispatch.publicId);
+    expect(retry1.resendReason).toBe("OPERATOR_RETRY_AFTER_DEAD_LETTER");
+    expect(retry1.idempotencyKey).toBe(rootKey);
+
+    const [retry1DbRow] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, retry1.publicId));
+    expect(retry1DbRow?.idempotencyKey).toBe(`${rootKey}:r:${retry1.publicId}`);
+    expect(retry1DbRow!.idempotencyKey.length).toBeLessThanOrEqual(96);
+
+    // 3. Chained 5xx exhaustion: `retry1` ALSO exhausts 5x HTTP 502 -> `dead`, then staff retries `retry1` -> `retry2`
+    await exhaustWith5xx(retry1.publicId, 502);
+    const retry2 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: retry1.publicId,
+    });
+    expect(retry2.retryOf).toBe(retry1.publicId);
+    expect(retry2.idempotencyKey).toBe(rootKey);
+
+    // Downstream recovers and deduplicates `retry2` via the preserved root `Idempotency-Key`!
+    nextHttpHandler = async ({ headers, body }) => {
+      const key = headers?.["Idempotency-Key"] ?? "";
+      if (!downstreamCommittedByKey.has(key)) {
+        downstreamCommittedByKey.set(key, String(body ?? ""));
+        downstreamSideEffectRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true,"deduped":true}', "utf8"),
+      };
+    };
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // All 11 HTTP attempts (5 on initialDispatch + 5 on retry1 + 1 on retry2) sent the EXACT same root Idempotency-Key!
+    expect(httpCalls).toHaveLength(PRODUCTION_MAX_ATTEMPTS * 2 + 1);
+    for (const call of httpCalls) {
+      expect(call.headers?.["Idempotency-Key"]).toBe(rootKey);
+      expect(call.headers?.["X-ReadyPackets-Redelivery-Of"]).toBeUndefined();
+    }
+    expect(downstreamSideEffectRuns).toBe(1);
+
+    const deliveryHeaders = new Set(httpCalls.map((c) => c.headers?.["X-ReadyPackets-Delivery"]));
+    expect(deliveryHeaders).toEqual(
+      new Set([initialDispatch.publicId, retry1.publicId, retry2.publicId]),
+    );
+
+    // Audit event for `retried` records the wire root Idempotency-Key
+    const retryAudits = h.audit.events.filter(
+      (e) => e.eventName === "integration.production.dispatch.retried" && e.orderPublicId === orderPublicId,
+    );
+    expect(retryAudits).toHaveLength(2);
+    expect(retryAudits[0]!.attributes?.idempotency_key).toBe(rootKey);
+    expect(retryAudits[1]!.attributes?.idempotency_key).toBe(rootKey);
+
+    // 4. Contrast with deliberate `redeliver`: issues a DISTINCT `Idempotency-Key` + `X-ReadyPackets-Redelivery-Of`
+    //    so the receiver intentionally executes a second run (`downstreamSideEffectRuns === 2`), while post-delivery
+    //    replay of the same `idempotencyKey` is deduplicated and staff `retry` on an already-delivered phase remains blocked!
+    nextHttpHandler = async ({ headers, body }) => {
+      const key = headers?.["Idempotency-Key"] ?? "";
+      if (!downstreamCommittedByKey.has(key)) {
+        downstreamCommittedByKey.set(key, String(body ?? ""));
+        downstreamSideEffectRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true,"freshRun":true}', "utf8"),
+      };
+    };
+    const deliberateRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: retry2.publicId,
+      reason: "Deliberate operator re-run after downstream purge",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-after-5xx-recovery-001",
+    });
+    expect(deliberateRedeliver.idempotencyKey).not.toBe(rootKey);
+    expect(deliberateRedeliver.idempotencyKey).toMatch(/^rp-prod:p101:rdlv:[0-9a-f]{40}$/);
+    expect(deliberateRedeliver.redeliveryOf).toBe(retry2.publicId);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const redeliverHttp = httpCalls[httpCalls.length - 1]!;
+    expect(redeliverHttp.headers?.["Idempotency-Key"]).toBe(deliberateRedeliver.idempotencyKey);
+    expect(redeliverHttp.headers?.["X-ReadyPackets-Redelivery-Of"]).toBe(retry2.publicId);
+    expect(downstreamSideEffectRuns).toBe(2);
+
+    // Replaying the admin's `idempotencyKey` after delivery returns `deliberateRedeliver` without another run
+    const callsBeforeReplay = httpCalls.length;
+    const replayedRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: retry2.publicId,
+      reason: "Deliberate operator re-run after downstream purge",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-after-5xx-recovery-001",
+    });
+    expect(replayedRedeliver.publicId).toBe(deliberateRedeliver.publicId);
+    expect(replayedRedeliver.state).toBe("delivered");
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(callsBeforeReplay);
+    expect(downstreamSideEffectRuns).toBe(2);
+
+    // And if a subsequent redelivery attempt fails (`404`), staff `retry` (without `orders.production.redeliver`)
+    // remains blocked by `PRODUCTION_ALREADY_DELIVERED` because the phase already has a delivered dispatch!
+    nextHttpHandler = async () => ({
+      status: 404,
+      headers: { "content-type": "text/plain" },
+      body: Buffer.from("temporary ingress route reload", "utf8"),
+    });
+    const failedRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: retry2.publicId,
+      reason: "Second redelivery attempt during ingress reload",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-after-5xx-failed-002",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId,
+        dispatchPublicId: failedRedeliver.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+    });
+  });
 });

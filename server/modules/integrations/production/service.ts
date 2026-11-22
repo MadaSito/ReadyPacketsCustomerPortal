@@ -438,6 +438,27 @@ class CandidateMovedRollback extends Error {
   }
 }
 
+const RETRY_STORAGE_SUFFIX_RE = /:r:[0-9A-HJKMNP-TV-Z]{26}$/;
+
+function toWireIdempotencyKey(storedKey: string): string {
+  return storedKey.replace(RETRY_STORAGE_SUFFIX_RE, "");
+}
+
+function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: DispatchRow[]): string {
+  const byPublicId = new Map(existingRows.map((r) => [r.publicId, r]));
+  const visited = new Set<string>();
+  let current: DispatchRow = targetRow;
+  while (current.retryOfPublicId && !visited.has(current.publicId)) {
+    visited.add(current.publicId);
+    const parent = byPublicId.get(current.retryOfPublicId);
+    if (!parent) {
+      break;
+    }
+    current = parent;
+  }
+  return toWireIdempotencyKey(current.idempotencyKey);
+}
+
 function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
   return {
     publicId: row.publicId,
@@ -447,7 +468,7 @@ function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
     state: row.state as ProductionDispatchState,
     attemptCount: row.attemptCount,
     maxAttempts: PRODUCTION_MAX_ATTEMPTS,
-    idempotencyKey: row.idempotencyKey,
+    idempotencyKey: toWireIdempotencyKey(row.idempotencyKey),
     payloadSha256: row.payloadSha256,
     identityTriple: {
       customerId: row.sentCustomerId,
@@ -497,7 +518,7 @@ function buildSafeDispatchAuditAttributes(
     bundle_scope_manifest: row.bundleScopeManifest ?? null,
     http_status: row.httpStatus ?? null,
     attempt_count: row.attemptCount,
-    idempotency_key: row.idempotencyKey,
+    idempotency_key: toWireIdempotencyKey(row.idempotencyKey),
     retry_of_public_id: row.retryOfPublicId ?? null,
     redelivery_of_public_id: row.redeliveryOfPublicId ?? null,
     ...extra,
@@ -1184,6 +1205,7 @@ export function createProductionWebhookService(
       retryOfPublicId?: string | null;
       redeliveryOfPublicId?: string | null;
       idempotencyKeyOverride?: string;
+      retryRootWireKey?: string;
       dispatchKind?: DispatchActionKind;
       reasonLength?: number;
       phase1ArtifactsConfirmed: boolean;
@@ -1191,8 +1213,13 @@ export function createProductionWebhookService(
   ): Promise<ProductionDispatchItem> {
     const now = deps.clock.now();
     const publicId = ulid();
-    const idempotencyKey =
-      params.idempotencyKeyOverride ?? `rp-prod:${params.phase.toLowerCase()}:${publicId}`;
+    // Retry rows carry the root delivery's wire `Idempotency-Key` upstream (so receiver dedupe protects
+    // operator retries after 5xx exhaustion to `dead`) while appending `:r:<publicId>` (`<= 87 <= 96`)
+    // in `integration_production_dispatches.idempotency_key` to satisfy `uq_prod_dispatch_idempotency`.
+    const storedIdempotencyKey = params.retryRootWireKey
+      ? `${params.retryRootWireKey}:r:${publicId}`
+      : (params.idempotencyKeyOverride ?? `rp-prod:${params.phase.toLowerCase()}:${publicId}`);
+    const wireIdempotencyKey = toWireIdempotencyKey(storedIdempotencyKey);
     const payloadJson = JSON.stringify(params.payloadObject);
     const payloadSha256 = sha256Hex(payloadJson);
     const payloadEnc = deps.crypto.encrypt(payloadJson, dispatchPayloadAad(publicId));
@@ -1226,7 +1253,7 @@ export function createProductionWebhookService(
       phase: params.phase,
       state: "queued",
       attemptCount: 0,
-      idempotencyKey,
+      idempotencyKey: storedIdempotencyKey,
       payloadSha256,
       payloadEnc,
       sentCustomerId: params.sentCustomerId,
@@ -1261,7 +1288,7 @@ export function createProductionWebhookService(
       tier: params.tier,
       bundle_scope_manifest: params.bundleScopeManifest,
       http_status: null,
-      idempotency_key: idempotencyKey,
+      idempotency_key: wireIdempotencyKey,
       retry_of_public_id: retryOfPublicId,
       redelivery_of_public_id: redeliveryOfPublicId,
     };
@@ -1666,7 +1693,7 @@ export function createProductionWebhookService(
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Idempotency-Key": decision.row.idempotencyKey,
+      "Idempotency-Key": toWireIdempotencyKey(decision.row.idempotencyKey),
       "X-ReadyPackets-Delivery": decision.row.publicId,
       "X-Correlation-Id": job.correlationId,
     };
@@ -3913,6 +3940,7 @@ export function createProductionWebhookService(
 
           const resendReasonCode: ControlledResendReason =
             targetRow.state === "dead" ? "OPERATOR_RETRY_AFTER_DEAD_LETTER" : "OPERATOR_RETRY_AFTER_FAILURE";
+          const retryRootWireKey = resolveRetryRootWireKey(targetRow, existingRows);
 
           const item = await enqueueDispatchInTx(tx, {
             principal,
@@ -3934,6 +3962,7 @@ export function createProductionWebhookService(
             resendReasonCode,
             retryOfPublicId: targetRow.publicId,
             redeliveryOfPublicId: null,
+            retryRootWireKey,
             dispatchKind: "retry",
             phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
           });
@@ -4005,6 +4034,7 @@ export function createProductionWebhookService(
 
           // Durable operator-intent idempotency: a replay of the same confirmed mutation (even after
           // delivery completes) returns the existing redelivery row without enqueuing another run.
+          const phase = targetRow.phase as ProductionPhase;
           const intentDigest = deps.crypto
             .blindIndex(
               `${access.id}:${operatorIdempotencyKey}`,
@@ -4012,8 +4042,11 @@ export function createProductionWebhookService(
             )
             .slice(0, 40);
           const intentSuffix = `:rdlv:${intentDigest}`;
+          const expectedRedeliverKey = `rp-prod:${phase.toLowerCase()}${intentSuffix}`;
           const existingForIntent =
-            existingRows.find((r) => r.idempotencyKey.endsWith(intentSuffix)) ?? null;
+            existingRows.find(
+              (r) => r.redeliveryOfPublicId !== null && r.idempotencyKey.endsWith(intentSuffix),
+            ) ?? null;
           if (existingForIntent) {
             if (existingForIntent.redeliveryOfPublicId !== targetRow.publicId) {
               throw conflict(
@@ -4021,7 +4054,11 @@ export function createProductionWebhookService(
                 "This idempotencyKey was already used for a different dispatch on this order.",
               );
             }
-            return { ok: true, item: toDispatchItem(existingForIntent) };
+            const latestInIntentChain =
+              existingRows.find(
+                (r) => toWireIdempotencyKey(r.idempotencyKey) === expectedRedeliverKey,
+              ) ?? existingForIntent;
+            return { ok: true, item: toDispatchItem(latestInIntentChain) };
           }
 
           if (targetRow.state !== "delivered") {
@@ -4031,7 +4068,6 @@ export function createProductionWebhookService(
             );
           }
 
-          const phase = targetRow.phase as ProductionPhase;
           const phaseRows = existingRows.filter((r) => r.phase === phase);
           if (phaseRows.some((r) => r.state === "queued" || r.state === "sending")) {
             throw conflict(
