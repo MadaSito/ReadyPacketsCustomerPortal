@@ -6,7 +6,7 @@ import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, DateTime, Dialog, Field, Input, Select, StepUpCancelledError, useStepUp, useToast } from "@/ui";
-import { AccessDialog, CustomerPicker, NewOrderForCustomerDialog, type PickedCustomer } from "./ConsoleOrderTools";
+import { AccessDialog, CustomerPicker, type PickedCustomer } from "./ConsoleOrderTools";
 import { LOCK_LABELS, newIdempotencyKey, type LockState } from "./shared";
 
 type Props = { orderId: string; version: number; lockState: LockState; reference: string; name: string };
@@ -79,7 +79,7 @@ export function ConsoleActions({ orderId, version, lockState, reference, name }:
   const [reasonCode, setReasonCode] = useState("");
   const [newReference, setNewReference] = useState("");
   const [targetCustomer, setTargetCustomer] = useState<PickedCustomer | null>(null);
-  const [panel, setPanel] = useState<"access" | "new" | null>(null);
+  const [panel, setPanel] = useState<"access" | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [error, setError] = useState<string | null>(null);
   // Stable per dialog opening so a retried reassignment is idempotent on the server.
@@ -173,11 +173,6 @@ export function ConsoleActions({ orderId, version, lockState, reference, name }:
         <Button variant="secondary" onClick={() => setPanel("access")}>
           Access for other users
         </Button>
-        {canManage ? (
-          <Button variant="secondary" onClick={() => setPanel("new")}>
-            New order for a customer
-          </Button>
-        ) : null}
       </div>
 
       <Dialog
@@ -306,7 +301,6 @@ export function ConsoleActions({ orderId, version, lockState, reference, name }:
         </div>
       </Dialog>
       <AccessDialog open={panel === "access"} onClose={() => setPanel(null)} scope={{ orderId }} subject={reference} />
-      {canManage ? <NewOrderForCustomerDialog open={panel === "new"} onClose={() => setPanel(null)} /> : null}
     </>
   );
 }

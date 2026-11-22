@@ -88,15 +88,13 @@ afterAll(() => {
 });
 
 const POLICY_A = "01JTESTPOL0000000000000000";
-const policyDocs = [
-  { documentPublicId: POLICY_A, slug: "order-terms", title: "Synthetic order terms", active: true, requiresAcceptance: true, currentPublishedVersion: { versionNumber: 1 } },
-  { documentPublicId: "01JTESTPOL0000000000000001", slug: "draft-only", title: "Unpublished synthetic policy", active: true, requiresAcceptance: true, currentPublishedVersion: null },
-];
+// Shape of compliance.policies.listPublished (only currently published customer-audience policies are returned).
+const policyDocs = [{ documentPublicId: POLICY_A, slug: "order-terms", title: "Synthetic order terms", audience: "customer", requiresAcceptance: true, versionNumber: 1 }];
 
 beforeEach(() => {
   handlers.clear();
   calls.length = 0;
-  handlers.set("compliance.policies.admin.listDocuments", () => policyDocs);
+  handlers.set("compliance.policies.listPublished", () => policyDocs);
 });
 
 const designer = () => renderUi(<Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route>, { path: `/admin/workflows/drafts/${DRAFT}` });
@@ -291,8 +289,8 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     await user.click(within(gates).getByRole("button", { name: "Add acceptance gate" }));
     const policy = within(gates).getByLabelText(/Gate 1 policy/);
     await waitFor(() => expect(within(policy).getByRole("option", { name: "Synthetic order terms" })).toBeInTheDocument());
-    // Only published, active policies are offered.
-    expect(within(policy).queryByRole("option", { name: "Unpublished synthetic policy" })).not.toBeInTheDocument();
+    // Options come from the public published list, without the admin policy list (no step-up for designers).
+    expect(calls.some((call) => call.path === "compliance.policies.admin.listDocuments")).toBe(false);
     const applies = within(gates).getByLabelText(/Gate 1 applies/);
     // Final statuses cannot be gated (nothing is submitted from them).
     expect(within(applies).getAllByRole("option").map((o) => o.textContent)).toEqual(["Before any work on the order", "Before submitting from “Submitted”"]);
@@ -338,7 +336,7 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
   it("a gate can be removed and the policy list failing still leaves the editor usable", async () => {
     handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition: { states, transitions: [transition], acceptanceGates: [{ key: "terms", policyPublicId: "01JTESTPOL00000000000000ZZ", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true }] } }));
     handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
-    handlers.set("compliance.policies.admin.listDocuments", () => {
+    handlers.set("compliance.policies.listPublished", () => {
       throw new Error("FORBIDDEN");
     });
     const user = userEvent.setup();

@@ -60,11 +60,12 @@ export function StorageFolderEditor({ definition, issues, onChange }: { definiti
  */
 export function AcceptanceGatesEditor({ definition, issues, onChange }: { definition: DraftDefinition; issues: readonly WorkflowIssue[]; onChange: (definition: DraftDefinition) => void }) {
   const trpc = useTRPC();
-  const policies = useQuery(trpc.compliance.policies.admin.listDocuments.queryOptions());
+  // Public read of currently published customer-audience policies: no policies.manage or step-up needed to design.
+  const policies = useQuery(trpc.compliance.policies.listPublished.queryOptions());
   const gates = definition.acceptanceGates ?? [];
-  const published = (policies.data ?? []).filter((doc) => doc.active && doc.currentPublishedVersion);
+  const published = [...new Map((policies.data ?? []).map((doc) => [doc.documentPublicId, doc.title] as const))];
   const policyOptions = (gate: DraftGate) => {
-    const options = published.map((doc) => ({ value: doc.documentPublicId, label: doc.title }));
+    const options = published.map(([value, label]) => ({ value, label }));
     if (gate.policyPublicId && !options.some((option) => option.value === gate.policyPublicId))
       options.unshift({ value: gate.policyPublicId, label: "Policy not available (unpublished or removed)" });
     return options;
