@@ -172,4 +172,23 @@ describe("consent store", () => {
     expect(commitConsentDecision(rev, ALL, { policyVersion: 2, receipt: RECEIPT })).toBe(true);
     expect(consent.has("analytics")).toBe(true);
   });
+
+  it("drops a pending grant when the feature is switched off (and on again) meanwhile", () => {
+    configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
+    const rev = consentRevision();
+    configureConsent({ enabled: false, policyVersion: 1, renewMonths: 12 });
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(false);
+    configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(false);
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.snapshot().decided).toBe(false);
+  });
+
+  it("a fresh choice submitted before the renewal deadline and confirmed after it still applies", () => {
+    __setConsentForTests({ enabled: true, policyVersion: 1, renewMonths: 6, choices: NONE, clock });
+    const rev = consentRevision();
+    t += 6 * MONTH + 1;
+    expect(commitConsentDecision(rev, ALL, { policyVersion: 1, receipt: RECEIPT })).toBe(true);
+    expect(consent.has("analytics")).toBe(true);
+  });
 });

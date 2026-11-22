@@ -115,6 +115,8 @@ function readChoice(): StoredChoice | null {
 }
 
 let writeSeq = 0;
+/** Bumped whenever the feature is switched on/off or the policy version changes. */
+let configEpoch = 0;
 
 function writeChoice(choice: StoredChoice | null): void {
   writeSeq += 1;
@@ -326,6 +328,7 @@ export const consent = {
 /** Fed by the platform consent component from the public bootstrap. */
 export function configureConsent(next: ConsentConfig): void {
   const previous = snapshot();
+  if (next.enabled !== config.enabled || next.policyVersion !== config.policyVersion) configEpoch += 1;
   config = { enabled: next.enabled, policyVersion: next.policyVersion, renewMonths: Math.min(13, Math.max(6, next.renewMonths)) };
   emit(previous);
 }
@@ -362,7 +365,7 @@ export function consentRevision(): string {
       raw = "";
     }
   }
-  return `${writeSeq}|${raw}|${config.policyVersion ?? ""}|${browserSignalsOptOut() ? 1 : 0}`;
+  return `${writeSeq}|${configEpoch}|${config.enabled ? 1 : 0}|${raw}|${config.policyVersion ?? ""}|${browserSignalsOptOut() ? 1 : 0}`;
 }
 
 /**
@@ -371,7 +374,9 @@ export function consentRevision(): string {
  * the newer state then stands. Synchronous, so the check and the write cannot interleave in this tab.
  */
 export function commitConsentDecision(revision: string, choices: ConsentChoices, meta: { policyVersion: number; receipt?: string | null; bySignal?: boolean }): boolean {
-  if (consentRevision() !== revision || config.policyVersion !== meta.policyVersion) {
+  // A renewal deadline passing while the request was pending is fine: this is a fresh explicit choice and it
+  // gets a new decidedAt. Anything else that changed (feature off/on, policy, newer decision) wins.
+  if (!config.enabled || consentRevision() !== revision || config.policyVersion !== meta.policyVersion) {
     refresh();
     return false;
   }
@@ -457,6 +462,7 @@ export function __resetConsentForTests(): void {
   memoryChoice = null;
   loaded = false;
   writeSeq = 0;
+  configEpoch = 0;
   now = () => Date.now();
   snapshotCache = null;
   unwatch();
