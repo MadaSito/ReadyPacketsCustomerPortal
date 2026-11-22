@@ -310,6 +310,14 @@ Checks on pull request 10 (GitHub-hosted runners), at commit `788c18c`: `ci`, `s
 - the first run of this pull request failed in five jobs because the new probe script re-declared a
   read-only shell variable, and in CodeQL because the migration bundle check read a file after checking it
   by name; both were fixed (`788c18c`) and the runs repeated
+- a later documentation-only commit (`20e74ed`) failed `ci` on one client test: after verification for a
+  workflow import preview, keyboard focus was sometimes left on the page behind the dialog instead of the
+  "Review import plan" heading. This was a real timing fault, not only a test problem: the closing
+  verification dialog could restore focus after the single check the import dialog made. `13ef9db` repeats
+  the check for a short time and stops as soon as the user presses a key or pointer. The integrator ran the
+  test file 16 times (4 of them under full processor load) without a failure and confirmed in Chromium that
+  focus lands on the heading and that a following Tab is not overridden. The check results for the merged
+  commit are on the pull request.
 
 Reported by the engineering team and reviewed, but not re-run individually by the integrator: the
 per-package test notes in each module's `VERIFICATION.md`; the security review
