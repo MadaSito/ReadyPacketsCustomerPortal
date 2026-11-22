@@ -258,6 +258,10 @@ A code counts as used as soon as an order is placed with it. It is given back on
 
 When an order is cancelled and all three hold, ReadyPackets releases the redemption automatically. After you have voided or settled the invoice by hand, an administrator can choose **Release** on the redemptions list. Release needs a reason of at least 5 characters, and the server checks the same rule and refuses otherwise. In every other case the redemption stays used, even after a refund, and the cancellation still goes ahead. To make it up to the customer, give them a new code.
 
+### On invoices
+
+Invoices (`/invoices/:invoiceId`, `/admin/invoices/:invoiceId` and the PDF) show **Bundle discount** and **Discount (<label>)** as separate lines, never the code. An invoice whose total is 0 is marked paid when it is issued, so no payment can be recorded against it. Server notes are in the [compliance section](../../server/modules/compliance/ADMIN_GUIDE_SECTION.md).
+
 ### Exports
 
 The CSV exports of codes and redemptions are built by the server with formula-safe cells. They need step-up and are audited. Store them as secrets.

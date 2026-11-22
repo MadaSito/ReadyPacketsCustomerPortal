@@ -79,6 +79,7 @@ Packages C1/C2 and B, as reported by the owners (server notes: `server/modules/p
 - **Release fence as implemented (C1):** automatic release (`releaseForOrderInTx`) and manual release (`promotions.admin.releaseRedemption`) run only inside the transaction. Both need the order to be in a terminal cancel state of its bound workflow version (`isCancelState`). `compliance.orderPaymentExposureInTx` must also return `grossPaidMinor === 0`, `payableInvoiceOpen === false`, `providerCapturePending === false` and `providerAttemptEver === false`. A missing or failing port keeps the redemption used.
 - **Manual release:** needs a reason of at least 5 characters, and the client shows the server's refusal as returned.
 - **Stale code at checkout:** returns `PROMO_RECONFIRM_TOTAL`, and the order is not placed.
+- **Invoice (C4):** separate `Bundle discount` and `Discount (<promoLabel>)` lines, never the raw code. A zero-total invoice is derived as paid on issue (balance 0, no payment recording).
 - **Cart code storage:** the code is stored encrypted on the cart (`promo_code_enc`).
 
 ## Consequences

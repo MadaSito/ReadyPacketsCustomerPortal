@@ -22,6 +22,15 @@ Opening a discount link saves the code in this browser tab only, and you see **C
 
 Closing the tab forgets the code. You can also select **Forget the saved code** at any time. A link never applies a discount without your action.
 
+## On your invoice
+
+Each discount has its own line above tax and the total, on the invoice page (`/invoices/:invoiceId`) and in the PDF:
+
+- **Bundle discount**: the multi-packet saving.
+- **Discount (name of the offer)**: the saving from your code or link. The code itself is never printed.
+
+If the discounts bring the total to $0.00, the invoice is issued as **Paid** with nothing to pay, and you can download the PDF straight away.
+
 ## Good to know
 
 - You can use one code per order. Codes are not case-sensitive.
