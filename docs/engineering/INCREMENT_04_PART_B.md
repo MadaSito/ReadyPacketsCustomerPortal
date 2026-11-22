@@ -82,12 +82,14 @@ B6. **Policy acceptance gateway** (ADR 0039). An administrator attaches a policy
     "ask again when the policy has a new version" (default off). While a gate is unmet, the customer can
     open the order and read it but cannot upload, record, answer intake or submit a phase on it; the
     order page shows a full-width gate with the policy text, and the server refuses those mutations
-    (`PRECONDITION_FAILED`, reason `ORDER_ACCEPTANCE_REQUIRED`) — the client is never the gate. Each
+    (domain code `CONFLICT`, reason `ORDER_ACCEPTANCE_REQUIRED`; no new error code is introduced) — the client is never the gate. Each
     acting user accepts for themselves (owner and people with access). The evidence record is
     append-only: order, user, policy public id, version, SHA-256 of the exact text shown, typed name,
     time, source address (encrypted) and user agent. Console tab "Acceptances (n)" lists the records
     ("Signed by <name> using typed signature", accepted time, policy and version; the source address is
-    shown only with `sessions.read_all`). Staff are not gated. A printable receipt is available to the
+    shown only with `sessions.read_all`). Staff are not gated. Transitions made by the system or
+    through API v1 are checked against the order owner's acceptance and fail closed when it is missing.
+    A printable receipt is available to the
     customer and the console.
 B7. **Order file sync and folder routing** (ADR 0040). Every order file that becomes available — an
     upload that passed scanning, a saved recording, a converted WebM — is copied to the storage
