@@ -173,8 +173,13 @@ export const ordersRouter = router({
   }),
   /** Server price of a selection (packet rules + bundle discount); same validation as create, writes nothing. */
   quote: protectedProcedure
-    .input(z.strictObject({ items: orderItems, promoCode: promoCode.optional(), forCustomerPublicId: id.optional() }))
+    .input(z.strictObject({ items: orderItems, forCustomerPublicId: id.optional() }))
     .query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
+  /** Increment 05 (C3): quote with a discount code. A mutation so the code travels in the POST body, never a URL. */
+  quoteWithPromo: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject({ items: orderItems, promoCode, forCustomerPublicId: id.optional() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
   list: protectedProcedure
     .input(z.strictObject({ cursor, limit, status: statusKey.optional() }))
     .query(({ ctx, input }) => ctx.services.orders.orders.list(ctx.session, input)),

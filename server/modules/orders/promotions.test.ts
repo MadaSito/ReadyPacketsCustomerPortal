@@ -12,6 +12,7 @@ import type { Services } from "../../container.js";
 import type { Tx } from "../../core/types.js";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
+import { ordersRouter } from "./router.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
 import type { OrderPaymentState } from "./orderService.js";
 import type { PromotionContext, PromotionOutcome } from "./ports.js";
@@ -180,7 +181,13 @@ describe("promotion codes on orders (C3)", () => {
   });
 
   it("cancelling before payment releases the redemption; a paid order keeps it; an order without a code calls nothing", async () => {
+    promos.remaining = 5;
+    // No payment row for the order ⇒ not definitively unpaid ⇒ kept (fail closed).
+    const unknown = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+    await mod.orders.transition(alice.principal, { orderId: unknown.publicId, expectedVersion: (await rowOf(unknown.publicId)).version, toStatus: "canceled" });
+    expect(promos.released).toEqual([]);
     const unpaid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+    payment.set(unpaid.publicId, "unpaid");
     await mod.orders.transition(alice.principal, { orderId: unpaid.publicId, expectedVersion: (await rowOf(unpaid.publicId)).version, toStatus: "canceled" });
     expect(promos.released).toEqual([unpaid.publicId]);
     const paid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
@@ -190,6 +197,12 @@ describe("promotion codes on orders (C3)", () => {
     const plain = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey() });
     await mod.orders.transition(alice.principal, { orderId: plain.publicId, expectedVersion: (await rowOf(plain.publicId)).version, toStatus: "canceled" });
     expect(promos.released).toEqual([unpaid.publicId]);
+  });
+
+  it("a code never travels in a URL: quote (GET) refuses it, quoteWithPromo is a POST mutation", () => {
+    const procedures = ordersRouter._def.procedures as unknown as Record<string, { _def: { type: string } }>;
+    expect(procedures.quote!._def.type).toBe("query");
+    expect(procedures.quoteWithPromo!._def.type).toBe("mutation");
   });
 
   it("an inconsistent outcome from promotions is refused (fail closed), never a negative total", async () => {

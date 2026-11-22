@@ -232,23 +232,24 @@ export function createOrderService(deps: OrderServiceDeps) {
 
   /**
    * Increment 05 (C3): an order with a code that is cancelled BEFORE payment releases its redemption (promotions
-   * restores the counters; idempotent). Paid or refunded orders keep it used. When the payment state cannot be
-   * read the redemption is kept (conservative); a release failure aborts the cancellation's transaction.
+   * restores the counters; idempotent). Paid or refunded orders keep it used. When the payment state is not
+   * definitively unpaid/void the redemption is kept (fail closed); a release failure aborts the cancellation's transaction.
    */
   async function releasePromotionOnCancel(tx: Tx, orderId: number) {
     const [row] = await tx.select({ publicId: orders.publicId, promoLabel: orders.promoLabel, promoDiscountMinor: orders.promoDiscountMinor }).from(orders).where(eq(orders.id, orderId)).limit(1);
     if (!row || (row.promoLabel === null && row.promoDiscountMinor === 0)) return;
     const port = promotionsPort(deps.services);
     if (!port) return;
+    // Fail closed: release only on a DEFINITIVE unpaid/void answer read in this transaction. No provider, no row
+    // for the order, or a read error ⇒ the redemption stays used (an administrator can release it in promotions).
     const provider = deps.paymentSummary();
-    if (provider) {
-      try {
-        const state = (await provider([row.publicId], tx)).get(row.publicId)?.state ?? "unpaid";
-        if (state !== "unpaid" && state !== "void") return;
-      } catch {
-        deps.logger.warn("order payment state unavailable; promotion kept", { orderPublicId: row.publicId });
-        return;
-      }
+    if (!provider) return;
+    try {
+      const state = (await provider([row.publicId], tx)).get(row.publicId)?.state;
+      if (state !== "unpaid" && state !== "void") return;
+    } catch {
+      deps.logger.warn("order payment state unavailable; promotion kept", { orderPublicId: row.publicId });
+      return;
     }
     await port.releaseForOrderInTx(tx, { orderPublicId: row.publicId, reason: "order_cancelled" });
   }
