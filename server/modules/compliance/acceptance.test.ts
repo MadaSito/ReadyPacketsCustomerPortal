@@ -306,10 +306,17 @@ describe("order acceptance gateway (MySQL)", () => {
 
     const forAll = await makePolicy("Terms for everyone.", "all");
     const second = makeOrder(owner, [gate(forAll.documentPublicId)]);
-    await acceptCurrent(owner, second);
+    const { receipt } = await acceptCurrent(owner, second);
     await mayWork(second, owner);
-    await db.db.update(policyDocuments).set({ audience: "staff" }).where(eq(policyDocuments.id, forAll.documentId));
+    await db.db.update(policyDocuments).set({ audience: "staff", title: "Internal escalation playbook" }).where(eq(policyDocuments.id, forAll.documentId));
     await rejects(mayWork(second, owner), "CONFLICT", "ORDER_ACCEPTANCE_REQUIRED");
+    // The historical receipt stays readable, but a reclassified + renamed document's current title is withheld.
+    const mine = await svc.receipt(owner, { receiptId: receipt.receiptId });
+    expect(mine.policy.title).toBe("Policy");
+    expect(mine.textSha256).toBe(receipt.textSha256);
+    expect(JSON.stringify(mine)).not.toContain("Internal escalation playbook");
+    const staff = await makeUser("staff");
+    expect((await svc.receipt(staff, { receiptId: receipt.receiptId })).policy.title).toBe("Internal escalation playbook");
   });
 
   it("evidence is bound to the order's pinned workflow version: a re-pinned order asks again", async () => {

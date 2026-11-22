@@ -207,16 +207,24 @@ export function createAcceptanceService(deps: ModuleDeps) {
     };
   }
 
-  async function versionLabels(dbOrTx: DbOrTx, versionIds: readonly number[]) {
+  /**
+   * Version label + document title for receipts. The title is read from the CURRENT document row, so for a
+   * customer reader it is withheld ("Policy") once the document is inactive or no longer customer-visible —
+   * otherwise a rename + reclassification to staff-only would leak through an old receipt. Staff see it.
+   */
+  async function versionLabels(dbOrTx: DbOrTx, versionIds: readonly number[], customerReader = false) {
     const out = new Map<number, { label: string; title: string }>();
     const unique = [...new Set(versionIds)];
     if (unique.length === 0) return out;
     const rows = await dbOrTx
-      .select({ id: policyVersions.id, label: policyVersions.versionLabel, title: policyDocuments.title })
+      .select({ id: policyVersions.id, label: policyVersions.versionLabel, title: policyDocuments.title, active: policyDocuments.active, audience: policyDocuments.audience })
       .from(policyVersions)
       .innerJoin(policyDocuments, eq(policyDocuments.id, policyVersions.documentId))
       .where(inArray(policyVersions.id, unique));
-    for (const r of rows) out.set(r.id, { label: r.label, title: r.title });
+    for (const r of rows) {
+      const visible = r.active && (GATE_AUDIENCES as readonly string[]).includes(r.audience);
+      out.set(r.id, { label: r.label, title: customerReader && !visible ? "Policy" : r.title });
+    }
     return out;
   }
 
@@ -357,10 +365,10 @@ export function createAcceptanceService(deps: ModuleDeps) {
       if (!staff && row.userId !== principal.userId) throw notFound("RECEIPT_NOT_FOUND");
       const ctx = await gatesPort().context(row.orderPublicId, principal);
       if (!ctx || ctx.actorAccess === null) throw notFound("RECEIPT_NOT_FOUND");
-      const labels = await versionLabels(deps.db, [row.policyVersionId]);
+      const labels = await versionLabels(deps.db, [row.policyVersionId], !staff);
       const names = await userNames(deps.db, [row.userId]);
       const label = labels.get(row.policyVersionId);
-      return receiptView(row, { orderReference: ctx.reference, orderName: ctx.name, policyTitle: label?.title ?? "", versionLabel: label?.label ?? String(row.policyVersionNumber), signerName: names.get(row.userId) ?? "" });
+      return receiptView(row, { orderReference: ctx.reference, orderName: ctx.name, policyTitle: label?.title ?? "Policy", versionLabel: label?.label ?? String(row.policyVersionNumber), signerName: names.get(row.userId) ?? "" });
     },
 
     /** Console tab label count (one indexed COUNT). Staff/admin with order access only. */
