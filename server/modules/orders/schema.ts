@@ -211,6 +211,8 @@ export const orderWorkflowImports = mysqlTable(
       .references(() => users.id),
     idempotencyKey: varchar("idempotency_key", { length: 80 }).notNull(),
     digest: char("digest", { length: 64 }).notNull(),
+    /** SHA-256 of the canonical request (package digest + decisions + reference mappings); a replay with other decisions is refused. */
+    requestHash: char("request_hash", { length: 64 }).notNull(),
     sourceLabel: varchar("source_label", { length: 120 }),
     outcome: json("outcome").$type<{ key: string; action: "create" | "draft" | "skip"; draftPublicId: string | null; workflowKey: string | null }[]>().notNull(),
     createdAt: createdAtColumn(),
