@@ -173,6 +173,51 @@ Reported by the engineers, not rerun individually by the integrator beyond the f
 checks listed in each module's `VERIFICATION.md`, and the second-engineer security review
 (`docs/security/INCREMENT_03_REVIEW.md`).
 
+## Verified for increment 04 (integrator's own runs)
+
+Automated, whole project, on branch `feat/increment-04` at commit `1c55cb8` (the two later commits change one
+example string, re-tested, and documentation):
+
+- type check clean; ESLint clean with `--max-warnings 0`
+- full test run: 168 files, 2034 tests passed, 4 placeholders (`todo`), no failures. This includes
+  `tests/migrations.test.ts` (committed migrations produce exactly the declared schema). Two earlier full
+  runs on the same branch each had one test fail under load and pass when run alone
+  (`consent.test.tsx`, `mailTemplates.test.tsx`); neither failed in the final run
+- production build and preview build succeed (at `efb7fa8`)
+- `shellcheck -x` clean on the deployment and CI scripts listed in the `native-install` and `container`
+  workflows
+- migrations `0003_increment_04` and `0004_increment_04_part_b` applied to a populated development
+  database with the operator command (`node dist/ops/migrate.js`)
+
+Browser, development profile with cookie sessions and synthetic data, Chromium, by the integrator:
+
+- console order page: rename (header and "Order history" updated with old and new name); draft invoice
+  created from the order, issued and paid by a manual payment (step-up with password and authenticator code;
+  typed invoice number); partial refund, then refund of the remainder, both "recorded only" — the submit
+  button stays disabled until `REFUND ORDER` is typed exactly, the amount is entered in dollars, the
+  refundable balance and the header badge ("Partially refunded", then "Refunded") update without a reload
+- "Order history": status lane with the rename; activity lane with readable labels and the "Payments"
+  category for invoice, payment and refund events
+- production pipeline settings page shows the P101 / P201 and optional P301 / P401 endpoints; with no
+  endpoint configured the start buttons on the order are disabled (nothing was sent anywhere)
+- workflow designer: an acceptance gate added on the canvas, review step lists phases, requirements, gates
+  and the folder template, publish with step-up creates version 3
+- customer: order placed through the cart and "Pay by invoice" (order and invoice numbers shown); on the
+  order page the gate is shown above the checklist at 1280 px and 390 px with no horizontal overflow; upload
+  and acknowledgement controls are disabled with an explanation; a direct upload request and a direct
+  acknowledgement request are both refused by the server with HTTP 409 `ORDER_ACCEPTANCE_REQUIRED`; after
+  acceptance the gate disappears and the receipt link appears
+- console "Acceptances (1)" tab shows the record (who, when, policy and version, text fingerprint, receipt)
+
+Checks on pull request 8 (GitHub-hosted runners): see the pull request for the final run of `ci`,
+`security`, `container` and `native-install`. The `native-install` workflow includes an upgrade from the
+previous release (`89c5cb8`) that asserts both new migrations are applied.
+
+Reported by the engineering team and reviewed, but not re-run by the integrator: the per-module test
+files quoted in each module's `VERIFICATION.md`; the security review
+(`docs/verification/INCREMENT_04_SECURITY_REVIEW.md`, no open release blockers); the accessibility and
+responsive browser sweeps of part A and part B (`docs/verification/ACCESSIBILITY.md`).
+
 ## Not verified
 
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
