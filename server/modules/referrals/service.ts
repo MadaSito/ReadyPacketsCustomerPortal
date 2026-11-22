@@ -92,6 +92,30 @@ export interface OnInvoicePaidReferralResult {
   currency?: string;
 }
 
+export interface InvoiceRefundedReferralEvent {
+  invoicePublicId: string;
+  orderPublicId: string;
+  customerUserId: number;
+  currency: string;
+  totalMinor: number;
+  refundedMinor: number;
+  fullyRefunded: boolean;
+  refundedAt: Date;
+}
+
+export type OnInvoiceRefundedReferralOutcome =
+  | "not_fully_refunded"
+  | "not_qualifying_invoice"
+  | "already_in_manual_review"
+  | "already_rejected"
+  | "credited_manual_review_flagged"
+  | "moved_to_manual_review";
+
+export interface OnInvoiceRefundedReferralResult {
+  outcome: OnInvoiceRefundedReferralOutcome;
+  referralPublicId?: string;
+}
+
 export interface CustomerReferralOverviewView {
   code: string;
   shareUrl: string;
@@ -946,6 +970,177 @@ export function createReferralsService(deps: ModuleDeps) {
     return deps.db.transaction((tx) => onInvoicePaidInTx(tx, event));
   }
 
+  /**
+   * Part B Package U -> G port (`deps.services.referrals.onInvoiceRefunded`):
+   * When a referred customer's qualifying first invoice transitions to fully refunded,
+   * moves any pending or approved referral reward tied to that invoice into manual review
+   * (`qualified_pending_approval`, `qualificationNoteCode = "QUALIFYING_INVOICE_REFUNDED"`),
+   * or flags an already-credited referral for manual recovery.
+   */
+  async function onInvoiceRefundedInTx(
+    tx: Tx,
+    event: InvoiceRefundedReferralEvent,
+  ): Promise<OnInvoiceRefundedReferralResult> {
+    if (
+      !ULID_PATTERN.test(event.invoicePublicId) ||
+      !ULID_PATTERN.test(event.orderPublicId) ||
+      !Number.isSafeInteger(event.refundedMinor) ||
+      event.refundedMinor < 0
+    ) {
+      throw validation("INVALID_REFUND_EVENT", "Invalid invoice refunded event payload.");
+    }
+
+    if (!event.fullyRefunded) {
+      return { outcome: "not_fully_refunded" };
+    }
+
+    const [row] = await tx
+      .select()
+      .from(referrals)
+      .where(eq(referrals.qualifyingInvoicePublicId, event.invoicePublicId))
+      .for("update")
+      .limit(1);
+
+    if (!row) {
+      return { outcome: "not_qualifying_invoice" };
+    }
+
+    if (row.status === "rejected") {
+      return {
+        outcome: "already_rejected",
+        referralPublicId: row.publicId,
+      };
+    }
+
+    if (
+      row.status === "qualified_pending_approval" &&
+      row.qualificationNoteCode === "QUALIFYING_INVOICE_REFUNDED"
+    ) {
+      return {
+        outcome: "already_in_manual_review",
+        referralPublicId: row.publicId,
+      };
+    }
+
+    const now = event.refundedAt ?? deps.clock.now();
+
+    if (row.status === "credited") {
+      if (row.qualificationNoteCode !== "QUALIFYING_INVOICE_REFUNDED") {
+        const updateCredited = await tx
+          .update(referrals)
+          .set({
+            qualificationNoteCode: "QUALIFYING_INVOICE_REFUNDED",
+            version: row.version + 1,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(referrals.id, row.id),
+              eq(referrals.status, "credited"),
+              eq(referrals.version, row.version),
+            ),
+          );
+        if (affectedRows(updateCredited) !== 1) {
+          throw conflict("REFERRAL_CAS_CONFLICT", "Referral state changed concurrently.");
+        }
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "referral.refund_review_flagged",
+            action: "transition",
+            outcome: "completed",
+            severity: "WARN",
+            reasonCode: "ALREADY_CREDITED_MANUAL_RECOVERY",
+            actor: { role: "system" },
+            resource: { type: "referral", publicId: row.publicId },
+            attributes: {
+              invoice_public_id: event.invoicePublicId,
+              order_public_id: event.orderPublicId,
+              previous_status: row.status,
+              refunded_minor: event.refundedMinor,
+              currency: event.currency,
+            },
+          },
+          tx,
+        );
+      }
+      return {
+        outcome: "credited_manual_review_flagged",
+        referralPublicId: row.publicId,
+      };
+    }
+
+    const updateRes = await tx
+      .update(referrals)
+      .set({
+        status: "qualified_pending_approval",
+        qualificationNoteCode: "QUALIFYING_INVOICE_REFUNDED",
+        reviewedAt: null,
+        reviewedByUserId: null,
+        reviewReason:
+          "Qualifying first invoice was fully refunded — manual review required.",
+        version: row.version + 1,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(referrals.id, row.id),
+          eq(referrals.status, row.status),
+          eq(referrals.version, row.version),
+        ),
+      );
+
+    if (affectedRows(updateRes) !== 1) {
+      throw conflict("REFERRAL_CAS_CONFLICT", "Referral state changed concurrently.");
+    }
+
+    if (row.status === "approved") {
+      await tx
+        .delete(referralRewardLedger)
+        .where(
+          and(
+            eq(referralRewardLedger.referralId, row.id),
+            eq(referralRewardLedger.entryType, "reward_approved"),
+          ),
+        );
+    }
+
+    await deps.audit.record(
+      {
+        category: "business",
+        eventName: "referral.moved_to_manual_review",
+        action: "transition",
+        outcome: "completed",
+        reasonCode: "QUALIFYING_INVOICE_REFUNDED",
+        actor: { role: "system" },
+        resource: { type: "referral", publicId: row.publicId },
+        attributes: {
+          invoice_public_id: event.invoicePublicId,
+          order_public_id: event.orderPublicId,
+          previous_status: row.status,
+          refunded_minor: event.refundedMinor,
+          currency: event.currency,
+        },
+      },
+      tx,
+    );
+
+    return {
+      outcome: "moved_to_manual_review",
+      referralPublicId: row.publicId,
+    };
+  }
+
+  async function onInvoiceRefunded(
+    event: InvoiceRefundedReferralEvent,
+    opts?: { tx?: DbOrTx },
+  ): Promise<OnInvoiceRefundedReferralResult> {
+    if (opts?.tx && "rollback" in opts.tx) {
+      return onInvoiceRefundedInTx(opts.tx as Tx, event);
+    }
+    return deps.db.transaction((tx) => onInvoiceRefundedInTx(tx, event));
+  }
+
   /* ------------------------------------------------------ customer endpoints */
 
   async function customerOverview(
@@ -1667,19 +1862,45 @@ export function createReferralsService(deps: ModuleDeps) {
           throw conflict("REFERRAL_CAS_CONFLICT", "Referral state changed concurrently.");
         }
 
-        const ledgerPublicId = ulid();
-        await tx.insert(referralRewardLedger).values({
-          publicId: ledgerPublicId,
-          referralId: row.id,
-          referrerUserId: row.referrerUserId,
-          entryType: "reward_approved",
-          amountMinor: approvedMinor,
-          currency: row.currency,
-          reference: row.qualifyingInvoicePublicId,
-          note: trimmedNote,
-          actorUserId: liveActor.userId,
-          createdAt: now,
-        });
+        const [existingLedger] = await tx
+          .select({ id: referralRewardLedger.id, publicId: referralRewardLedger.publicId })
+          .from(referralRewardLedger)
+          .where(
+            and(
+              eq(referralRewardLedger.referralId, row.id),
+              eq(referralRewardLedger.entryType, "reward_approved"),
+            ),
+          )
+          .for("update")
+          .limit(1);
+
+        const ledgerPublicId = existingLedger?.publicId ?? ulid();
+        if (existingLedger) {
+          await tx
+            .update(referralRewardLedger)
+            .set({
+              amountMinor: approvedMinor,
+              currency: row.currency,
+              reference: row.qualifyingInvoicePublicId,
+              note: trimmedNote,
+              actorUserId: liveActor.userId,
+              createdAt: now,
+            })
+            .where(eq(referralRewardLedger.id, existingLedger.id));
+        } else {
+          await tx.insert(referralRewardLedger).values({
+            publicId: ledgerPublicId,
+            referralId: row.id,
+            referrerUserId: row.referrerUserId,
+            entryType: "reward_approved",
+            amountMinor: approvedMinor,
+            currency: row.currency,
+            reference: row.qualifyingInvoicePublicId,
+            note: trimmedNote,
+            actorUserId: liveActor.userId,
+            createdAt: now,
+          });
+        }
 
         await deps.audit.record(
           {
@@ -2105,6 +2326,7 @@ export function createReferralsService(deps: ModuleDeps) {
     validateCode,
     attributeRegistration,
     onInvoicePaid,
+    onInvoiceRefunded,
     customerOverview,
     customerHistory,
     sendInviteEmail,

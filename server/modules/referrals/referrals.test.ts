@@ -1042,4 +1042,242 @@ describe("server/modules/referrals (Package G)", () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it("moves pending or auto-approved referrals to manual review when the qualifying first invoice is fully refunded (B5 port)", async () => {
+    const admin = await seedUserWithSession({
+      email: "admin-refund-port@example.test",
+      name: "Refund Port Admin",
+      role: "admin",
+      stepUpFresh: true,
+    });
+    await enableProgram(admin.principal, {
+      rewardMode: "fixed",
+      fixedAmountMinor: 2500,
+      currency: "USD",
+      manualApprovalRequired: false,
+    });
+
+    const referrer = await seedUserWithSession({
+      email: "referrer-refund@example.test",
+      name: "Referrer Refund",
+      customerRef: "RP-CUST-710001",
+    });
+    const referredA = await seedUserWithSession({
+      email: "referred-a@example.test",
+      name: "Referred A",
+      customerRef: "RP-CUST-710002",
+    });
+    const referredB = await seedUserWithSession({
+      email: "referred-b@example.test",
+      name: "Referred B",
+      customerRef: "RP-CUST-710003",
+    });
+
+    const { code } = await callAs(referrer.principal, (c) => c.me.overview());
+
+    await tdb.db.transaction((tx) => mod.attributeRegistration(code, referredA.userId, tx));
+    await tdb.db.transaction((tx) => mod.attributeRegistration(code, referredB.userId, tx));
+
+    const invoiceA = ulid();
+    const orderA = ulid();
+    const paidA = await tdb.db.transaction((tx) =>
+      mod.onInvoicePaid(
+        {
+          invoicePublicId: invoiceA,
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          subtotalMinor: 10_000,
+          discountMinor: 0,
+          taxMinor: 0,
+          totalMinor: 10_000,
+          paidAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(paidA.outcome).toBe("auto_approved");
+
+    // Partial refund does not move the referral to manual review
+    const partialRes = await tdb.db.transaction((tx) =>
+      mod.onInvoiceRefunded(
+        {
+          invoicePublicId: invoiceA,
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          totalMinor: 10_000,
+          refundedMinor: 4000,
+          fullyRefunded: false,
+          refundedAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(partialRes).toEqual({ outcome: "not_fully_refunded" });
+
+    // Non-qualifying invoice refund is ignored cleanly
+    const nonQualRes = await tdb.db.transaction((tx) =>
+      mod.onInvoiceRefunded(
+        {
+          invoicePublicId: ulid(),
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          totalMinor: 10_000,
+          refundedMinor: 10_000,
+          fullyRefunded: true,
+          refundedAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(nonQualRes).toEqual({ outcome: "not_qualifying_invoice" });
+
+    // Full refund moves the auto-approved referral to qualified_pending_approval and clears uncredited ledger row
+    const fullRefundA = await tdb.db.transaction((tx) =>
+      mod.onInvoiceRefunded(
+        {
+          invoicePublicId: invoiceA,
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          totalMinor: 10_000,
+          refundedMinor: 10_000,
+          fullyRefunded: true,
+          refundedAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(fullRefundA).toEqual({
+      outcome: "moved_to_manual_review",
+      referralPublicId: paidA.referralPublicId,
+    });
+
+    // Idempotent replay returns already_in_manual_review
+    const replayA = await tdb.db.transaction((tx) =>
+      mod.onInvoiceRefunded(
+        {
+          invoicePublicId: invoiceA,
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          totalMinor: 10_000,
+          refundedMinor: 10_000,
+          fullyRefunded: true,
+          refundedAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(replayA).toEqual({
+      outcome: "already_in_manual_review",
+      referralPublicId: paidA.referralPublicId,
+    });
+
+    const listAfterRefund = await callAs(admin.principal, (c) => c.admin.list({ limit: 10 }));
+    const itemA = listAfterRefund.items.find((r) => r.referralPublicId === paidA.referralPublicId);
+    expect(itemA?.status).toBe("qualified_pending_approval");
+    expect(itemA?.qualificationNoteCode).toBe("QUALIFYING_INVOICE_REFUNDED");
+
+    const ledgerWhilePending = await callAs(admin.principal, (c) => c.admin.ledger({ limit: 10 }));
+    expect(
+      ledgerWhilePending.items.filter((l) => l.referralPublicId === paidA.referralPublicId),
+    ).toHaveLength(0);
+
+    expect(h.audit.named("referral.moved_to_manual_review")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reasonCode: "QUALIFYING_INVOICE_REFUNDED",
+          resource: expect.objectContaining({ publicId: paidA.referralPublicId }),
+        }),
+      ]),
+    );
+
+    // Administrator can re-approve without hitting a duplicate-ledger-key collision, and then credit;
+    // a subsequent full-refund signal on an already-credited referral flags manual recovery (`credited_manual_review_flagged`).
+    const reapprovedA = await callAs(admin.principal, (c) =>
+      c.admin.approve({
+        referralPublicId: itemA!.referralPublicId,
+        expectedVersion: itemA!.version,
+        note: "Replacement invoice paid offline; reward honoured.",
+      }),
+    );
+    expect(reapprovedA.status).toBe("approved");
+
+    const creditedA = await callAs(admin.principal, (c) =>
+      c.admin.markCredited({
+        referralPublicId: reapprovedA.referralPublicId,
+        expectedVersion: reapprovedA.version,
+        payoutMethod: "account_credit",
+        reference: "CM-REFUND-TEST-01",
+      }),
+    );
+    expect(creditedA.status).toBe("credited");
+
+    const creditedRefundRes = await tdb.db.transaction((tx) =>
+      mod.onInvoiceRefunded(
+        {
+          invoicePublicId: invoiceA,
+          orderPublicId: orderA,
+          customerUserId: referredA.userId,
+          currency: "USD",
+          totalMinor: 10_000,
+          refundedMinor: 10_000,
+          fullyRefunded: true,
+          refundedAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(creditedRefundRes).toEqual({
+      outcome: "credited_manual_review_flagged",
+      referralPublicId: paidA.referralPublicId,
+    });
+
+    // Second customer: auto-approved -> full refund -> manual review -> admin rejects cleanly
+    const invoiceB = ulid();
+    const orderB = ulid();
+    const paidB = await tdb.db.transaction((tx) =>
+      mod.onInvoicePaid(
+        {
+          invoicePublicId: invoiceB,
+          orderPublicId: orderB,
+          customerUserId: referredB.userId,
+          currency: "USD",
+          subtotalMinor: 8000,
+          discountMinor: 0,
+          taxMinor: 0,
+          totalMinor: 8000,
+          paidAt: h.clock.now(),
+        },
+        { tx },
+      ),
+    );
+    expect(paidB.outcome).toBe("auto_approved");
+
+    const fullRefundB = await mod.onInvoiceRefunded({
+      invoicePublicId: invoiceB,
+      orderPublicId: orderB,
+      customerUserId: referredB.userId,
+      currency: "USD",
+      totalMinor: 8000,
+      refundedMinor: 8000,
+      fullyRefunded: true,
+      refundedAt: h.clock.now(),
+    });
+    expect(fullRefundB.outcome).toBe("moved_to_manual_review");
+
+    const listB = await callAs(admin.principal, (c) => c.admin.list({ limit: 10 }));
+    const itemB = listB.items.find((r) => r.referralPublicId === paidB.referralPublicId)!;
+    const rejectedB = await callAs(admin.principal, (c) =>
+      c.admin.reject({
+        referralPublicId: itemB.referralPublicId,
+        expectedVersion: itemB.version,
+        reason: "First order was cancelled and refunded in full.",
+      }),
+    );
+    expect(rejectedB.status).toBe("rejected");
+  });
 });

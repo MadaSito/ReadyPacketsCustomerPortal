@@ -102,6 +102,18 @@ export interface ReferralsModule extends ModuleLifecycle {
     event: InvoicePaidReferralEvent,
     opts?: { tx?: Tx },
   ): Promise<OnInvoicePaidReferralResult>;
+
+  /**
+   * Part B (B5) domain port invoked by `compliance` when an invoice transitions to
+   * fully refunded (`refundedMinor >= grossPaidMinor`). Moves any pending or auto-approved
+   * referral qualified by that invoice into `qualified_pending_approval` with
+   * `qualificationNoteCode = "QUALIFYING_INVOICE_REFUNDED"`, or flags an already-credited
+   * referral for manual recovery (`credited_manual_review_flagged`).
+   */
+  onInvoiceRefunded(
+    event: InvoiceRefundedReferralEvent,
+    opts?: { tx?: DbOrTx },
+  ): Promise<OnInvoiceRefundedReferralResult>;
 }
 ```
 

@@ -767,6 +767,11 @@ export default function AdminReferralsPage() {
                 Currency mismatch
               </Badge>
             ) : null}
+            {row.qualificationNoteCode === "QUALIFYING_INVOICE_REFUNDED" ? (
+              <Badge tone="warning" icon={<AlertTriangle aria-hidden="true" />}>
+                Qualifying invoice refunded
+              </Badge>
+            ) : null}
           </div>
         );
       },
