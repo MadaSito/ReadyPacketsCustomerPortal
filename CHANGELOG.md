@@ -11,7 +11,7 @@ procedure.
 
 ### Added
 
-- **Workflow export and import** (`/admin/workflows`), per [ADR 0042](docs/adr/0042-workflow-transfer.md):
+- **Workflow export and import** (`/admin/workflows`), per [ADR 0042](docs/adr/0042-workflow-transfer.md). Enable `orders.workflow_transfer.enabled` first.
   - Export one workflow, a selection or all of them as an integrity-checked JSON package (`workflows.export`).
   - Import with a preview, then choose for each workflow to create it, add it as a draft or skip it (`workflows.import`, administrators, step-up).
   - Imports are always drafts. Automations are not transferred.
