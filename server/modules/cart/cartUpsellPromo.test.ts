@@ -6,13 +6,15 @@
  *    passive `recheck: true` re-evaluation, checkout redemption, and `"order not placed, confirm new total"` on stale code).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import mysql from "mysql2/promise";
+import { drizzle } from "drizzle-orm/mysql2";
 import { eq } from "drizzle-orm";
 import { TRPCError } from "@trpc/server";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { newRequestContext } from "../../core/requestContext.js";
 import type { Services } from "../../container.js";
-import type { DbOrTx, Logger, SessionPrincipal, Tx } from "../../core/types.js";
+import type { Db, DbOrTx, Logger, SessionPrincipal, Tx } from "../../core/types.js";
 import { createCallerFactory, router } from "../../trpc/trpc.js";
 import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
@@ -907,5 +909,88 @@ describe("Increment 05 Package B — Cart upsell (D2) & Discount codes in cart (
     expect(checkedOutRow?.appliedPromoCodeEnc).toBeNull();
     expect(checkedOutRow?.checkedOutPromoDiscountMinor).toBe(60_00);
     expect(checkedOutRow?.checkedOutPromoLabel).toBe("Launch 20% Off");
+  });
+
+  it("executes acceptUpsell and applyCode on a connectionLimit: 1 MySQL pool without taking a second connection inside tx", async () => {
+    const singlePool = mysql.createPool({
+      uri: t.url,
+      connectionLimit: 1,
+      timezone: "Z",
+      supportBigNumbers: true,
+      charset: "utf8mb4",
+    });
+    try {
+      const singleDb = drizzle(singlePool, { mode: "default" }) as unknown as Db;
+      const singleHarness = createTestDeps({ db: singleDb });
+      singleHarness.settings.flags.add(CART_FEATURE_FLAG.flag);
+      singleHarness.settings.flags.add(CART_UPSELL_FEATURE_FLAG.flag);
+      await singleHarness.settings.set("orders.bundle_rule", {
+        enabled: true,
+        requiredPacketNumbers: [1, 2, 3],
+        discountPercent: 10,
+        label: "Full 3-Packet Bundle (10% off)",
+      });
+
+      const singleOrders = createOrdersModule(singleHarness.deps);
+      const singleCompliance = createComplianceModule(singleHarness.deps);
+      const singleCart = createCartModule(singleHarness.deps);
+
+      singleHarness.services.identity = fakeIdentity(singleHarness, singleDb) as unknown as Services["identity"];
+      singleHarness.services.files = new FakeFiles() as unknown as Services["files"];
+      singleHarness.services.engagement = new FakeEngagement() as unknown as Services["engagement"];
+      singleHarness.services.orders = singleOrders;
+      singleHarness.services.compliance = singleCompliance;
+      singleHarness.services.payments = new SimpleInvoicePayments() as unknown as Services["payments"];
+      (singleHarness.services as unknown as Record<string, unknown>).promotions = promosFake;
+      singleHarness.services.cart = singleCart;
+
+      promosFake.defs.set("POOL1", {
+        promoPublicId: ulid(),
+        code: "POOL1",
+        label: "Single Pool 15% Off",
+        percentOff: 15,
+        minSubtotalMinor: 100_00,
+        maxRedemptions: 5,
+        redeemedCount: 0,
+        active: true,
+      });
+
+      const singleCaller = (principal: SessionPrincipal) =>
+        createCaller({
+          services: singleHarness.services,
+          session: principal,
+          request: newRequestContext("test"),
+          transport: { issue() {}, clear() {} },
+        });
+
+      const offer = await singleCaller(admin.principal).cart.admin.upsells.create({
+        kind: "add_on",
+        title: "Single-Pool Add-on",
+        shortText: "Runs cleanly on 1 DB connection.",
+        triggerMode: "any_cart",
+        triggerProductPublicIds: [],
+        targetProductPublicId: addonWorkshop,
+        priority: 1,
+        active: true,
+      });
+
+      await singleCaller(alice.principal).cart.addItems({
+        items: [{ productPublicId: p1Basic, quantity: 1 }],
+      });
+
+      const accepted = await singleCaller(alice.principal).cart.upsell.accept({
+        offerPublicId: offer.offerPublicId,
+        idempotencyKey: "idem-pool1-accept-01",
+      });
+      expect(accepted.items.some((i) => i.productPublicId === addonWorkshop)).toBe(true);
+
+      const promoApplied = await singleCaller(alice.principal).cart.applyCode({
+        code: "POOL1",
+        idempotencyKey: "idem-pool1-promo-01",
+      });
+      expect(promoApplied.totals.promo?.label).toBe("Single Pool 15% Off");
+    } finally {
+      await singlePool.end();
+    }
   });
 });

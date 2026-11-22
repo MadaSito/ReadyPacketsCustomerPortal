@@ -685,12 +685,10 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
           stateRows.filter((s) => s.dismissedAt !== null).map((s) => s.offerKey),
         );
 
-        // 5. Read live catalog + bundle rule INSIDE the transaction under locks so deactivated or repriced
-        //    products and updated bundle rules are evaluated atomically against the locked cart state.
-        const [catalogGroups, bundleRule] = await Promise.all([
-          ordersSvc.listActiveCatalog(),
-          ordersSvc.getBundleRule(tx),
-        ]);
+        // 5. Read live catalog + bundle rule INSIDE the transaction under `tx` (`forShare: true`) so deactivated
+        //    or repriced products and updated bundle rules are evaluated atomically without taking a 2nd pool connection.
+        const catalogGroups = await ordersSvc.listActiveCatalog(tx, { forShare: true });
+        const bundleRule = await ordersSvc.getBundleRule(tx);
         const catalogMap = indexCatalog(catalogGroups);
         const liveLines = await computeLiveLines(cart.id, catalogMap, tx);
         const availableLines = liveLines.filter((l) => l.available);

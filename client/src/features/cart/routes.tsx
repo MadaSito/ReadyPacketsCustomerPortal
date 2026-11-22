@@ -1,9 +1,9 @@
 /**
  * Cart & checkout client feature routes, navigation, and `/orders/new` companion wrapper.
- * Owner: recovery_ops_engineer (Increment 04, Package L).
+ * Owner: recovery_ops_engineer (Increment 04 Package L + Increment 05 Package B).
  */
 import { lazy } from "react";
-import { ShoppingCart } from "lucide-react";
+import { ShoppingCart, Sparkles } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
 import { OrderFormCartBanner } from "./OrderFormCartBanner";
 
@@ -12,6 +12,7 @@ const CheckoutPage = lazy(() => import("./CheckoutPage"));
 const CheckoutReturnPage = lazy(() => import("./CheckoutReturnPage"));
 const CheckoutCancelPage = lazy(() => import("./CheckoutCancelPage"));
 const AdminOpenCartsPage = lazy(() => import("./AdminOpenCartsPage"));
+const AdminCartUpsellsPage = lazy(() => import("./AdminCartUpsellsPage"));
 
 export const cartFeature: FeatureRoutes = {
   routes: [
@@ -25,6 +26,13 @@ export const cartFeature: FeatureRoutes = {
       title: "Open carts",
       component: AdminOpenCartsPage,
       capability: "carts.read_all",
+    },
+    {
+      path: "/admin/carts/suggestions",
+      access: "admin",
+      title: "Cart suggestions",
+      component: AdminCartUpsellsPage,
+      capability: "carts.upsells.manage",
     },
   ],
   nav: [
@@ -46,6 +54,16 @@ export const cartFeature: FeatureRoutes = {
       access: "staff",
       capability: "carts.read_all",
       order: 18,
+    },
+    {
+      label: "Cart suggestions",
+      href: "/admin/carts/suggestions",
+      icon: Sparkles,
+      area: "console",
+      group: "Operations",
+      access: "admin",
+      capability: "carts.upsells.manage",
+      order: 19,
     },
   ],
   routeWrappers: [{ path: "/orders/new", order: 20, component: OrderFormCartBanner }],

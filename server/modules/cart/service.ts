@@ -468,7 +468,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
 
     const [catalogGroups, bundleRule, paymentConfig, onlineEnabled, pendingPolicies, promotionsEnabled] =
       await Promise.all([
-        ordersSvc.listActiveCatalog(),
+        ordersSvc.listActiveCatalog(tx),
         ordersSvc.getBundleRule(tx),
         paymentsSvc.getPublicCheckoutConfig(dbOrTx),
         paymentsSvc.isOnlineCheckoutEnabled(dbOrTx),
@@ -1237,10 +1237,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
           .where(eq(cartItems.cartId, lockedCart.id))
           .orderBy(asc(cartItems.position), asc(cartItems.id))
           .for("update");
-        const [lockedCatalogGroups, lockedBundleRule] = await Promise.all([
-          ordersSvc.listActiveCatalog(),
-          ordersSvc.getBundleRule(tx),
-        ]);
+        const lockedCatalogGroups = await ordersSvc.listActiveCatalog(tx, { forShare: true });
+        const lockedBundleRule = await ordersSvc.getBundleRule(tx);
         const lockedCatalogMap = indexCatalog(lockedCatalogGroups);
         const lockedLines = mapRowsToLiveLines(lockedItemRows, lockedCatalogMap).filter((l) => l.available);
         const lockedCurrencies = new Set(lockedLines.map((l) => l.currency));
@@ -1687,17 +1685,19 @@ export function createCartService(deps: ModuleDeps): CartModule {
             });
 
             const refreshed = await hydrateOpenCartForUser(principal.userId);
+            const reconfirmData: Record<string, string | number | boolean | readonly string[]> = {
+              promoReasonCode: err.reasonCode,
+              newTotalMinor: refreshed.totals.totalMinor,
+              cartVersion: refreshed.version,
+            };
+            const prevLabel: string | null = invalidatedPromoLabel;
+            if (prevLabel) reconfirmData.previousPromoLabel = prevLabel;
+            if (refreshed.totals.currency) reconfirmData.currency = refreshed.totals.currency;
             throw new DomainError(
               "CONFLICT",
               "PROMO_RECONFIRM_TOTAL",
               "That discount code is no longer valid. Your order was not placed — please review the updated total and confirm again.",
-              {
-                ...(invalidatedPromoLabel ? { previousPromoLabel: invalidatedPromoLabel } : {}),
-                promoReasonCode: err.reasonCode,
-                newTotalMinor: refreshed.totals.totalMinor,
-                ...(refreshed.totals.currency ? { currency: refreshed.totals.currency } : {}),
-                cartVersion: refreshed.version,
-              },
+              reconfirmData,
             );
           }
           throw err;

@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState, type FormEvent } from "react";
+import { useId, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
+import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, EmptyState, ErrorState, Field, Input, Money, PageHeader, Skeleton, Textarea } from "@/ui";
 import { SafePolicyText } from "../compliance/shared";
@@ -40,8 +41,27 @@ export function isHostedCheckoutUrl(raw: string, provider: "stripe" | "square", 
   } catch { return false; }
 }
 
-function CheckoutSummary({ cart }: { cart: CartViewData }) {
+function CheckoutSummary({
+  cart,
+  submitting,
+  onApplyPromo,
+  onRemovePromo,
+}: {
+  cart: CartViewData;
+  submitting: boolean;
+  onApplyPromo: (code: string) => Promise<void>;
+  onRemovePromo: () => Promise<void>;
+}) {
   const currency = cart.totals.currency!;
+  const showPromo = cart.promotionsEnabled || cart.totals.promo !== null || cart.promoNotice !== null;
+  const appliedPromo = cart.totals.promo
+    ? {
+        label: cart.totals.promo.label,
+        discountMinor: cart.totals.promo.promoDiscountMinor,
+        currency,
+      }
+    : null;
+
   return <Card title="Order summary">
     <ul className="divide-y divide-line">
       {cart.items.map((item) => <li key={item.itemPublicId} className="flex justify-between gap-3 py-3 text-sm">
@@ -50,13 +70,29 @@ function CheckoutSummary({ cart }: { cart: CartViewData }) {
       </li>)}
     </ul>
     <dl className="mt-3 grid gap-2 border-t border-line pt-3 text-sm">
-      <div className="flex justify-between gap-3"><dt>Subtotal</dt><dd><Money value={{ amountMinor: cart.totals.subtotalMinor, currency }} /></dd></div>
-      {cart.totals.discountMinor > 0 ? <div className="flex justify-between gap-3"><dt>{cart.totals.discountLabel ?? "Discount"}</dt>
+      <div className="flex justify-between gap-3"><dt className="min-w-0 break-words">Subtotal</dt><dd><Money value={{ amountMinor: cart.totals.subtotalMinor, currency }} /></dd></div>
+      {cart.totals.discountMinor > 0 ? <div className="flex justify-between gap-3"><dt className="min-w-0 break-words">{cart.totals.discountLabel ?? "Discount"}</dt>
         <dd><Money value={{ amountMinor: -cart.totals.discountMinor, currency }} /></dd></div> : null}
       <div className="flex justify-between gap-3"><dt>Tax</dt><dd><Money value={{ amountMinor: cart.totals.taxMinor, currency }} /></dd></div>
       <div className="flex justify-between gap-3 border-t border-line pt-3 text-base font-semibold"><dt>Total</dt>
         <dd><Money value={{ amountMinor: cart.totals.totalMinor, currency }} /></dd></div>
     </dl>
+    {showPromo ? <div className="mt-4 border-t border-line pt-4">
+      <PromoCodeField
+        applied={appliedPromo}
+        onApply={onApplyPromo}
+        onRemove={onRemovePromo}
+        disabled={submitting}
+      />
+      {cart.totals.promo && cart.totals.promo.promoDiscountMinor === 0 && cart.totals.promo.bundleDiscountMinor > 0 ? (
+        <p className="mt-2 text-xs text-muted">Your bundle discount saves more and is applied automatically.</p>
+      ) : null}
+      {cart.promoNotice ? (
+        <Callout tone="warning" className="mt-3" title="Discount code not currently applied">
+          <p>{cart.promoNotice.message}</p>
+        </Callout>
+      ) : null}
+    </div> : null}
   </Card>;
 }
 
@@ -64,6 +100,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   const trpc = useTRPC();
   const client = useTRPCClient();
   const queryClient = useQueryClient();
+  const checkoutFormId = useId();
   const [, navigate] = useLocation();
   const [projectName, setProjectName] = useState(cart.projectName);
   const [note, setNote] = useState(cart.note);
@@ -71,6 +108,8 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   const [policies, setPolicies] = useState<Record<string, PolicyDraft>>({});
   const [submitting, setSubmitting] = useState(false);
   const [failure, setFailure] = useState<{ message: string; checkStatus: boolean }>();
+  const [reconfirmNotice, setReconfirmNotice] = useState<string | null>(null);
+  const reconfirmRef = useRef<HTMLDivElement>(null);
   const request = useRef<{ version: number; key: string } | null>(null);
   const inFlight = useRef(false);
   const statusHref = `/checkout/return?cart=${encodeURIComponent(cart.cartPublicId)}`;
@@ -79,6 +118,23 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   function updatePolicy(policy: Policy, update: Partial<PolicyDraft>) {
     const key = policyKey(policy);
     setPolicies((previous) => ({ ...previous, [key]: { ...(previous[key] ?? emptyPolicy), ...update } }));
+  }
+
+  async function handleApplyPromo(code: string) {
+    const next = await client.cart.applyCode.mutate({
+      code,
+      idempotencyKey: `checkout-promo:${crypto.randomUUID()}`,
+    });
+    queryClient.setQueryData(trpc.cart.get.queryKey(), next);
+    setReconfirmNotice(null);
+    setFailure(undefined);
+  }
+
+  async function handleRemovePromo() {
+    const next = await client.cart.removeCode.mutate({ expectedVersion: cart.version });
+    queryClient.setQueryData(trpc.cart.get.queryKey(), next);
+    setReconfirmNotice(null);
+    setFailure(undefined);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -101,6 +157,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     inFlight.current = true;
     setSubmitting(true);
     setFailure(undefined);
+    setReconfirmNotice(null);
     try {
       const result = await client.cart.checkout.mutate({
         cartPublicId: cart.cartPublicId, expectedVersion: cart.version, projectName: projectName.trim(), note: note.trim(),
@@ -120,10 +177,21 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       navigate(`/checkout/return?cart=${encodeURIComponent(result.cartPublicId)}`, { replace: true });
     } catch (error) {
       const code = safeError(error);
-      if (code?.reasonCode === "STALE_VERSION") {
+      if (code?.reasonCode === "PROMO_RECONFIRM_TOTAL" || code?.reasonCode === "TOTAL_CHANGED_RECONFIRM") {
+        request.current = null;
+        await reload();
+        const message =
+          code.reasonCode === "PROMO_RECONFIRM_TOTAL"
+            ? "Your discount code is no longer valid, so your order was not placed. Review the updated total in your order summary and confirm again below."
+            : "Your order total changed, so your order was not placed. Review the updated total in your order summary and confirm again below.";
+        setReconfirmNotice(message);
+        requestAnimationFrame(() => reconfirmRef.current?.focus());
+      } else if (code?.reasonCode === "STALE_VERSION") {
+        request.current = null;
         await reload();
         setFailure({ message: "Your cart changed. Review the refreshed details and totals before placing your order.", checkStatus: false });
       } else if (code?.reasonCode && ["POLICY_VERSION_NOT_FOUND", "POLICY_VERSION_SUPERSEDED", "POLICY_HASH_MISMATCH", "POLICY_ACCEPTANCE_REQUIRED"].includes(code.reasonCode)) {
+        request.current = null;
         await reload();
         setFailure({ message: "The required policies changed. Review the refreshed versions and accept them before placing your order.", checkStatus: false });
       } else {
@@ -136,8 +204,16 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     }
   }
 
-  return <form onSubmit={(event) => { void submit(event); }} className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
-    <div className="grid min-w-0 gap-6">
+  const submitLabel = reconfirmNotice
+    ? online
+      ? "Confirm new total and continue to payment"
+      : "Confirm new total and receive invoice"
+    : online
+      ? "Place order and continue to payment"
+      : "Place order and receive invoice";
+
+  return <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
+    <form id={checkoutFormId} onSubmit={(event) => { void submit(event); }} className="grid min-w-0 gap-6">
       <Card title="Project details">
         <div className="grid gap-4">
           <Field label="Project name" required><Input value={projectName} onChange={(e) => setProjectName(e.target.value)} maxLength={160} required disabled={submitting} /></Field>
@@ -171,20 +247,25 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
           })}
         </div>
       </Card> : null}
-    </div>
+    </form>
     <div className="grid min-w-0 gap-4">
-      <CheckoutSummary cart={cart} />
+      <CheckoutSummary cart={cart} submitting={submitting} onApplyPromo={handleApplyPromo} onRemovePromo={handleRemovePromo} />
       {online ? <Callout tone={cart.paymentEnvironment === "test" ? "warning" : "info"} title={cart.paymentEnvironment === "test" ? "Test checkout" : "Secure hosted payment"}>
         {cart.paymentEnvironment === "test" ? "This checkout uses a test environment. No real money is collected." :
           "You’ll continue to the payment provider. ReadyPackets never collects your card details."}
       </Callout> : <Callout tone="info" title="Pay by invoice">We’ll issue an invoice when you place the order. No online payment is collected now.</Callout>}
+      {reconfirmNotice ? <div ref={reconfirmRef} tabIndex={-1} className="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-action">
+        <Callout tone="warning" live="assertive" title="Order not placed — confirm new total">
+          <p>{reconfirmNotice}</p>
+        </Callout>
+      </div> : null}
       {failure ? <Callout tone="danger" live="assertive" title="Checkout not confirmed">
         <p>{failure.message}</p>
         {failure.checkStatus ? <Link className="mt-2 inline-block text-action underline" href={statusHref}>Check order status</Link> : null}
       </Callout> : null}
-      <Button type="submit" size="lg" loading={submitting} disabled={submitting}>{online ? "Place order and continue to payment" : "Place order and receive invoice"}</Button>
+      <Button type="submit" form={checkoutFormId} size="lg" loading={submitting} disabled={submitting}>{submitLabel}</Button>
     </div>
-  </form>;
+  </div>;
 }
 
 export function CheckoutPage() {

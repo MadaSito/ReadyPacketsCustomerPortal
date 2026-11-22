@@ -108,7 +108,7 @@ export interface CreatedCheckoutOrder {
 }
 
 export interface CartOrdersPort {
-  listActiveCatalog(): Promise<CatalogGroupView[]>;
+  listActiveCatalog(tx?: Tx, opts?: { forShare?: boolean }): Promise<CatalogGroupView[]>;
   getBundleRule(tx?: Tx): Promise<BundleRule>;
   createOrderFromCheckoutInTx(
     principal: SessionPrincipal,

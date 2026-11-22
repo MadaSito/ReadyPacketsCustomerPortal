@@ -120,11 +120,18 @@ describe("cartFeature routes & console Open carts view", () => {
       "/checkout/return",
       "/checkout/cancel",
       "/admin/carts",
+      "/admin/carts/suggestions",
     ]);
     const customerNav = cartFeature.nav?.find((n) => n.href === "/cart");
     const adminNav = cartFeature.nav?.find((n) => n.href === "/admin/carts");
+    const suggestionsNav = cartFeature.nav?.find((n) => n.href === "/admin/carts/suggestions");
+    const suggestionsRoute = cartFeature.routes.find((r) => r.path === "/admin/carts/suggestions");
     expect(customerNav?.enabledBy).toBe("cart");
     expect(adminNav?.capability).toBe("carts.read_all");
+    expect(suggestionsNav?.capability).toBe("carts.upsells.manage");
+    expect(suggestionsNav?.access).toBe("admin");
+    expect(suggestionsRoute?.capability).toBe("carts.upsells.manage");
+    expect(suggestionsRoute?.access).toBe("admin");
   });
 
   it("renders open carts and appends cursor pages via LoadMore", async () => {
