@@ -6,6 +6,26 @@ import { Badge, Button, Callout, Checkbox, Dialog, Field, Input, Select, StepUpC
 import { newIdempotencyKey } from "../../shared";
 import { readWorkflowFile, workflowFileProblem } from "./transferFiles";
 
+/**
+ * Runs a focus check on the next frame and again shortly afterwards. A closing nested dialog restores focus
+ * asynchronously, sometimes after the first frame, so one check is not enough. The checks stop as soon as
+ * the user presses a key or pointer, so focus the user has chosen is never moved. Returns a cancel function.
+ */
+function settleFocus(check: () => void): () => void {
+  const frame = requestAnimationFrame(check);
+  const timers = [60, 180, 400].map((delay) => window.setTimeout(check, delay));
+  const cancel = () => {
+    cancelAnimationFrame(frame);
+    for (const timer of timers) window.clearTimeout(timer);
+    document.removeEventListener("keydown", cancel, true);
+    document.removeEventListener("pointerdown", cancel, true);
+  };
+  document.addEventListener("keydown", cancel, true);
+  document.addEventListener("pointerdown", cancel, true);
+  timers.push(window.setTimeout(cancel, 450));
+  return cancel;
+}
+
 type WorkflowChoice = TransferApplyInput["decisions"][number]["action"];
 type Step = "file" | "plan" | "confirm";
 const steps = [
@@ -53,22 +73,23 @@ export function WorkflowImportDialog({ close, preview, apply, policies, policyAv
     if (!result) return;
     resultHeading.current?.focus();
     // A nested step-up dialog can restore focus as it unmounts; keep the receipt reachable after its cleanup.
-    const frame = requestAnimationFrame(() => {
+    return settleFocus(() => {
       if (!resultHeading.current?.closest("[role=dialog]")?.contains(document.activeElement)) resultHeading.current?.focus();
     });
-    return () => cancelAnimationFrame(frame);
   }, [result]);
   useEffect(() => {
     if (step !== "plan" || !previewLauncher.current) return;
     const launcher = previewLauncher.current;
     previewLauncher.current = null;
-    const frame = requestAnimationFrame(() => {
+    // The step-up dialog closes after the plan arrives and then restores focus to the launcher, which is
+    // gone by now. Focus the step heading unless the user has already moved inside this dialog.
+    return settleFocus(() => {
       const root = wizardRoot.current;
-      if (document.activeElement === launcher || !root?.contains(document.activeElement)) {
+      const dialog = root?.closest("[role=dialog]") ?? root;
+      if (document.activeElement === launcher || !dialog?.contains(document.activeElement)) {
         root?.querySelector<HTMLHeadingElement>("form > h2")?.focus();
       }
     });
-    return () => cancelAnimationFrame(frame);
   }, [step]);
 
   const chosen = plan?.workflows.filter((workflow) => choices.has(workflow.key) && choices.get(workflow.key) !== "skip") ?? [];
