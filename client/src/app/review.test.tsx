@@ -1,4 +1,5 @@
 import { act, fireEvent, screen } from "@testing-library/react";
+import type * as SlotsModule from "./slots";
 import { describe, expect, it, vi } from "vitest";
 import type { PublicPresentation } from "@/lib/authApi";
 import { readFileSync } from "node:fs";
@@ -12,7 +13,7 @@ import { PublicFrame } from "./shell/PublicFrame";
 
 // Partial mock: keep every real export (new slots stay defined) and silence the network-backed feature slots.
 vi.mock("./slots", async (importOriginal) => {
-  const real = await importOriginal<typeof import("./slots")>();
+  const real = await importOriginal<typeof SlotsModule>();
   const silent = Object.fromEntries(Object.keys(real).filter((name) => name.endsWith("Slot")).map((name) => [name, () => null]));
   return { ...real, ...silent };
 });
