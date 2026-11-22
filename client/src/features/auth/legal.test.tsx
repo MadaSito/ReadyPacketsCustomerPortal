@@ -105,6 +105,9 @@ describe("public legal pages", () => {
     expect(
       screen.getByText(/does not automatically delete copies already written to configured cloud storage destinations/i),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Stripe Checkout/)).toBeInTheDocument();
+    expect(screen.getByText(/Square Payment Links/)).toBeInTheDocument();
+    expect(screen.getByText(/redirects your browser to the provider's hosted payment page/i)).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
 });

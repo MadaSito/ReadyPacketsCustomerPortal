@@ -64,7 +64,7 @@ export const PAYMENTS_STRIPE_SECRET_KEY = defineSecret({
   group: "compliance",
   label: "Stripe secret API key",
   description: "Restricted Stripe secret key (`sk_test_...` or `sk_live_...`) for Checkout Session creation and verification.",
-  schema: z.string().regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]{10,200}$/u),
+  schema: z.string().regex(/^(?:sk|rk)_(?:test|live)_[A-Za-z0-9_]{10,200}$/u),
   exportable: false,
   writeCapability: "payments.manage",
   managedBy: { label: "Payments", href: "/admin/payments" },

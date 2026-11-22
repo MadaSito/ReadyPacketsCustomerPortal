@@ -1822,12 +1822,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       const rotatedSecrets: string[] = [];
 
+      function parseCredential(schema: { safeParse: (v: unknown) => { success: true; data: string } | { success: false } }, raw: string, label: string): string {
+        const res = schema.safeParse(raw);
+        if (!res.success) {
+          throw validation("INVALID_CREDENTIAL_FORMAT", `${label} is not in the expected format.`);
+        }
+        return res.data;
+      }
+
       if (input.clearStripeSecretKey) {
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, null, tx);
         nextConfig.stripeSecretKeyLast4 = null;
         rotatedSecrets.push("stripe_secret_key_cleared");
       } else if (input.stripeSecretKey !== undefined && input.stripeSecretKey.trim() !== "") {
-        const parsed = PAYMENTS_STRIPE_SECRET_KEY.schema.parse(input.stripeSecretKey.trim());
+        const parsed = parseCredential(PAYMENTS_STRIPE_SECRET_KEY.schema, input.stripeSecretKey.trim(), "Stripe secret key");
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, parsed, tx);
         nextConfig.stripeSecretKeyLast4 = maskLast4(parsed);
         rotatedSecrets.push("stripe_secret_key");
@@ -1838,7 +1846,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         nextConfig.stripeWebhookSecretLast4 = null;
         rotatedSecrets.push("stripe_webhook_secret_cleared");
       } else if (input.stripeWebhookSecret !== undefined && input.stripeWebhookSecret.trim() !== "") {
-        const parsed = PAYMENTS_STRIPE_WEBHOOK_SECRET.schema.parse(input.stripeWebhookSecret.trim());
+        const parsed = parseCredential(PAYMENTS_STRIPE_WEBHOOK_SECRET.schema, input.stripeWebhookSecret.trim(), "Stripe webhook signing secret");
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, parsed, tx);
         nextConfig.stripeWebhookSecretLast4 = maskLast4(parsed);
         rotatedSecrets.push("stripe_webhook_secret");
@@ -1849,7 +1857,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         nextConfig.squareAccessTokenLast4 = null;
         rotatedSecrets.push("square_access_token_cleared");
       } else if (input.squareAccessToken !== undefined && input.squareAccessToken.trim() !== "") {
-        const parsed = PAYMENTS_SQUARE_ACCESS_TOKEN.schema.parse(input.squareAccessToken.trim());
+        const parsed = parseCredential(PAYMENTS_SQUARE_ACCESS_TOKEN.schema, input.squareAccessToken.trim(), "Square access token");
         await deps.settings.setSecret(PAYMENTS_SQUARE_ACCESS_TOKEN.key, parsed, tx);
         nextConfig.squareAccessTokenLast4 = maskLast4(parsed);
         rotatedSecrets.push("square_access_token");
@@ -1863,8 +1871,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         input.squareWebhookSignatureKey !== undefined &&
         input.squareWebhookSignatureKey.trim() !== ""
       ) {
-        const parsed = PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.schema.parse(
+        const parsed = parseCredential(
+          PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.schema,
           input.squareWebhookSignatureKey.trim(),
+          "Square webhook signature key",
         );
         await deps.settings.setSecret(PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY.key, parsed, tx);
         nextConfig.squareWebhookSignatureKeyLast4 = maskLast4(parsed);

@@ -66,6 +66,13 @@ export default function PrivacyPage() {
             outbound HTTPS automation webhooks, allow-listed event metadata may be delivered to those endpoints.
           </li>
           <li>
+            <strong>Hosted online payment providers (if enabled):</strong> When our administrators enable online checkout via{" "}
+            <strong>Stripe Checkout</strong> or <strong>Square Payment Links</strong> and you choose to pay an invoice online, the portal sends
+            bounded checkout metadata — internal payment attempt, invoice and order identifiers, invoice number, and the balance due and currency —
+            over HTTPS to that provider and redirects your browser to the provider&apos;s hosted payment page. Payment card and wallet details are
+            collected directly by the hosted provider and never touch or are stored on our servers.
+          </li>
+          <li>
             <strong>Security monitoring (if enabled):</strong> Pseudonymised security and audit events may be forwarded over TLS to a security
             monitoring (SIEM) receiver configured by our administrators.
           </li>

@@ -86,11 +86,13 @@ export function createPaymentWebhooksHttpRouter(services: Services): Router {
       });
     } catch (err) {
       const ctx = getRequestContext();
+      const correlationId = ctx?.correlationId ?? ctx?.requestId;
       services.logger.error("Unhandled error in payment webhook receiver", {
         provider,
         reasonCode: err instanceof DomainError ? err.reasonCode : "UNHANDLED_EXCEPTION",
         errorName: err instanceof Error ? err.name : "UnknownError",
-        ...(ctx?.correlationId ? { correlationId: ctx.correlationId } : {}),
+        ...(correlationId ? { correlationId } : {}),
+        ...(ctx?.requestId ? { requestId: ctx.requestId } : {}),
       });
       res.status(500).json({ ok: false, reasonCode: "INTERNAL_WEBHOOK_ERROR" });
     }
