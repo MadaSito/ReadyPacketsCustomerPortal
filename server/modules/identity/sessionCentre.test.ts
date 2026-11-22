@@ -431,4 +431,50 @@ describe("session centre (MySQL)", () => {
       expect(h.audit.named("identity.sign_in_log.exported")[0]).toBeDefined();
     });
   });
+
+  describe("public API customers provider", () => {
+    const caller = { kind: "api_key" as const, keyPublicId: "01JD00000000000000000KEY01", scopes: ["customers:read" as const], requestId: ulid(), replay: false };
+    type Provider = { list: (q: unknown, c: typeof caller) => Promise<{ items: { id: string; email: string; status: string; createdAt: string }[]; nextCursor: string | null }>; get: (id: string, c: typeof caller) => Promise<{ id: string } | null> };
+
+    function registered(): Provider {
+      let provider: Provider | null = null;
+      (h.services as unknown as Record<string, unknown>).publicApi = { registerProvider: (key: string, impl: Provider) => { if (key === "customers") provider = impl; } };
+      identity.init?.();
+      expect(provider).not.toBeNull();
+      return provider!;
+    }
+
+    it("lists customers only, filters by exact e-mail and status, pages by cursor and audits as system", async () => {
+      const api = registered();
+      const a = await makeUser("customer");
+      await makeUser("customer");
+      const staff = await makeUser("staff");
+      const all = await api.list({ limit: 100, filter: {} }, caller);
+      const ids = all.items.map((i) => i.id);
+      expect(ids).toContain(a.publicId);
+      expect(ids).not.toContain(staff.publicId);
+      expect(all.items[0]!.createdAt).toMatch(/Z$/);
+      const byEmail = await api.list({ limit: 10, filter: { search: a.email } }, caller);
+      expect(byEmail.items.map((i) => i.id)).toEqual([a.publicId]);
+      expect((await api.list({ limit: 10, filter: { search: staff.email } }, caller)).items).toEqual([]);
+      expect((await api.list({ limit: 10, filter: { status: "suspended", search: a.email } }, caller)).items).toEqual([]);
+      await rejects(api.list({ limit: 10, filter: { status: "bogus" } }, caller), "FILTER_INVALID");
+      const first = await api.list({ limit: 1, filter: {} }, caller);
+      expect(first.nextCursor).not.toBeNull();
+      const second = await api.list({ limit: 1, cursor: first.nextCursor, filter: {} }, caller);
+      expect(second.items[0]!.id).not.toBe(first.items[0]!.id);
+      const audit = h.audit.named("api.customer.listed")[0]!;
+      expect(audit.correlationId).toBe(caller.requestId);
+      expect(JSON.stringify(audit)).not.toContain(a.email);
+    });
+
+    it("get returns customers only (staff/admin ⇒ null)", async () => {
+      const api = registered();
+      const c = await makeUser("customer");
+      const admin = await makeUser("admin");
+      expect((await api.get(c.publicId, caller))?.id).toBe(c.publicId);
+      expect(await api.get(admin.publicId, caller)).toBeNull();
+      expect(h.audit.named("api.customer.read")).toHaveLength(2);
+    });
+  });
 });

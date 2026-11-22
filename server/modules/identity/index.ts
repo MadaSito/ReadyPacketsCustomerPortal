@@ -174,6 +174,11 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     admin,
     sso,
     centre,
+    /** Package H: the public API reads customers through this module (customers only, audited as system). */
+    init() {
+      const publicApi = (deps.services as { publicApi?: { registerProvider?: (key: "customers", provider: typeof admin.apiCustomers) => void } }).publicApi;
+      publicApi?.registerProvider?.("customers", admin.apiCustomers);
+    },
     listSessions: (principal) => sessions.listForUser(principal.userId, principal.sessionId, principal.role),
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();

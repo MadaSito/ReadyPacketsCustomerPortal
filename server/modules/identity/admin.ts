@@ -3,7 +3,7 @@
  * Every method re-checks the capability server-side (defence in depth behind the router guards) and every
  * mutation is audited inside its transaction (audit failure ⇒ no write).
  */
-import { and, asc, desc, eq, gt, inArray, like, lt, or, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, like, lt, or, type SQL } from "drizzle-orm";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../../shared/capabilities.js";
@@ -11,7 +11,8 @@ import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import type { UserRole } from "../../../shared/domain.js";
 import type { AuthInternals, AuthService } from "./auth.js";
 import { namePrefixes, normalizeEmail, normalizeName } from "./normalize.js";
-import { customerRefHistory, users, type UserRow, type UserStatus } from "./schema.js";
+import type { ApiCaller, ApiListQuery, ApiPage, CustomerDto } from "../publicApi/ports.js";
+import { customerRefHistory, USER_STATUSES, users, type UserRow, type UserStatus } from "./schema.js";
 import { RESEND_MIN_INTERVAL_MS } from "./settings.js";
 import { emailIndexOf, nameColumns, namePrefixIndex, toView } from "./users.js";
 
@@ -232,7 +233,67 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
     });
   }
 
+  /* ---------------------------------------------------------------- public API v1 provider (package H port) */
+
+  function customerDto(row: UserRow): CustomerDto {
+    const view = toView(deps.crypto, row);
+    return {
+      id: view.publicId,
+      customerRef: view.customerRef,
+      displayName: view.name,
+      email: view.email,
+      status: view.status,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: (row.updatedAt ?? row.createdAt).toISOString(),
+    };
+  }
+
+  /** API-key PII reads are durably audited as system (fail closed: no audit row ⇒ no data). */
+  async function auditApiRead(caller: ApiCaller, eventName: string, results: number) {
+    await deps.audit.record({
+      category: "admin", eventName, action: "read", outcome: "completed",
+      actor: { role: "system" }, correlationId: caller.requestId,
+      attributes: { api_key: caller.keyPublicId, replay: caller.replay ? "yes" : "no" },
+      safeCounts: { results },
+    });
+  }
+
+  const apiCustomers = {
+    /** Customers only (never staff/admin). Filters: `status`, `search` (exact e-mail, reference or name prefix). */
+    async list(query: ApiListQuery, caller: ApiCaller): Promise<ApiPage<CustomerDto>> {
+      const limit = Math.min(Math.max(query.limit, 1), MAX_LIMIT);
+      const after = decodeCursor(query.cursor);
+      const conditions: (SQL | undefined)[] = [eq(users.role, "customer")];
+      const status = query.filter.status;
+      if (status !== undefined) {
+        if (!(USER_STATUSES as readonly string[]).includes(status)) throw validation("FILTER_INVALID", "Unknown status filter.", { field: "status" });
+        conditions.push(eq(users.status, status as UserStatus));
+      }
+      if (query.updatedSince) conditions.push(gte(users.updatedAt, query.updatedSince));
+      if (after !== null) conditions.push(lt(users.id, after));
+      let nameFilter: ((name: string) => boolean) | undefined;
+      const search = query.filter.search?.slice(0, 100);
+      if (search && search.trim()) {
+        const found = searchCondition(search);
+        conditions.push(found.where);
+        nameFilter = found.nameFilter;
+      }
+      const rows = await deps.db.select().from(users).where(and(...conditions)).orderBy(desc(users.id)).limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const upper = search?.trim().toUpperCase() ?? "";
+      const items = page.map(customerDto).filter((item) => !nameFilter || nameFilter(item.displayName) || (item.customerRef ?? "").startsWith(upper));
+      await auditApiRead(caller, "api.customer.listed", items.length);
+      return { items, nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null };
+    },
+    async get(publicId: string, caller: ApiCaller): Promise<CustomerDto | null> {
+      const [row] = await deps.db.select().from(users).where(and(eq(users.publicId, publicId), eq(users.role, "customer"))).limit(1);
+      await auditApiRead(caller, "api.customer.read", row ? 1 : 0);
+      return row ? customerDto(row) : null;
+    },
+  };
+
   return {
+    apiCustomers,
     /** Internal (SSO service): the same in-tx actor guard as every admin mutation. Not on tRPC. */
     authorizeInTx: authorizeInTx as (tx: Tx, principal: SessionPrincipal, capability: Capability, targetPublicId?: string) => Promise<UserRow | null>,
     async searchCustomers(principal: SessionPrincipal, input: { query?: string; status?: UserStatus; cursor?: string; limit?: number }) {
