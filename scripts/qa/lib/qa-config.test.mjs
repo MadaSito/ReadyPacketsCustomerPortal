@@ -64,6 +64,14 @@ test("explicit route fixtures add roles and concrete paths without redirecting t
   }
 });
 
+test("redirect aliases declare a same-origin destination", () => {
+  const ok = resolveQaScenarios(inventory, { cases: { "/accessibility": [{ role: "anonymous", redirectsTo: "/accessibility/statement", title: "Statement" }] } }, "/tmp/qa", "/accessibility");
+  assert.equal(ok.cases[0].redirectsTo, "/accessibility/statement");
+  for (const redirectsTo of ["//elsewhere.test/", "https://elsewhere.test/", "/\\elsewhere.test", 7]) {
+    assert.throws(() => resolveQaScenarios(inventory, { cases: { "/accessibility": [{ role: "anonymous", redirectsTo }] } }), /redirectsTo/);
+  }
+});
+
 test("literal zoom requires browser-reported zoom and waits for the matching DPR and viewport", async () => {
   const worker = { evaluate: async (_fn, zoom) => zoom };
   const page = {

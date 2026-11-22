@@ -4,5 +4,14 @@
     "staff": "staff.state.json",
     "admin": "admin.state.json"
   },
-  "cases": {}
+  "cases": {
+    "/account/sessions": [
+      {
+        "role": "customer",
+        "redirectsTo": "/account/security",
+        "title": "Account security · ReadyPackets",
+        "heading": "Account security"
+      }
+    ]
+  }
 }

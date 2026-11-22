@@ -81,8 +81,11 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
         missing.push(`${name}: supply a readiness selector that only exists in the expected fixture state.`);
         continue;
       }
+      if (item.redirectsTo !== undefined && (typeof item.redirectsTo !== "string" || !item.redirectsTo.startsWith("/") || item.redirectsTo.startsWith("//") || /[\\\r\n]/.test(item.redirectsTo))) {
+        throw new Error(`QA fixtures: ${route.id} redirectsTo must be a same-origin path.`);
+      }
       cases.push({
-        name, path, role: item.role, title: item.title ?? route.title,
+        name, path, redirectsTo: item.redirectsTo, role: item.role, title: item.title ?? route.title,
         heading: item.heading, ready: item.ready, tab: route.tab, steps: item.steps ?? [],
         storageState: state ? resolve(directory, state) : undefined,
       });
@@ -212,6 +215,8 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
   } catch {
     throw new Error("Expected route title, heading, theme, interactive state, or seeded fixture was not reached.");
   }
-  if (page.url() !== expected.href) throw new Error("Navigation redirected away from the intended QA route.");
+  // A route kept only as a redirect alias (old bookmarks) declares its destination; anything else must not redirect.
+  const landing = scenario.redirectsTo ? new URL(scenario.redirectsTo, baseUrl).href : expected.href;
+  if (page.url() !== landing) throw new Error("Navigation redirected away from the intended QA route.");
   if (await page.locator("h1").count() !== 1 || await main.count() !== 1) throw new Error("Expected exactly one h1 and one main landmark.");
 }

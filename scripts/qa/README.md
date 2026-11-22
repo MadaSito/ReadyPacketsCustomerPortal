@@ -26,6 +26,10 @@ writes `<role>.state.json` (0600) into `QA_STATE_DIR` (0700, which must be outsi
 credentials unless `QA_EXPECT_ORIGIN` equals `QA_BASE_URL`. Credentials come from `QA_<ROLE>_EMAIL` / `_PASSWORD` /
 `_TOTP_SECRET`. Put the fixture file in the same directory so relative session paths resolve.
 
+A route kept only as a redirect alias (for example `/account/sessions` → `/account/security`) needs a case with
+`redirectsTo`, the full document `title` and `heading` for its destination; the check then scans the destination and fails if the alias
+lands anywhere else. Any other redirect still fails the case.
+
 ## Rate limits
 
 Every QA browser shares one client IP, so a full run can exceed the instance's per-IP budgets (each page load makes
