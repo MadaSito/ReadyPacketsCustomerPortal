@@ -82,7 +82,7 @@ export default function InvoicesAdminPage() {
               header: "Invoice",
               primary: true,
               cell: (row) => (
-                <Link href={`/admin/invoices/${row.invoicePublicId}`} className="font-semibold break-all text-action underline-offset-2 hover:underline">
+                <Link href={`/admin/invoices/${row.invoicePublicId}`} className="inline-flex min-h-6 items-center py-0.5 font-semibold break-all text-action underline-offset-2 hover:underline">
                   {row.invoiceNumber ?? "Draft invoice"}
                   {row.invoiceNumber ? null : <span className="sr-only">{` for ${row.orderReference}`}</span>}
                 </Link>

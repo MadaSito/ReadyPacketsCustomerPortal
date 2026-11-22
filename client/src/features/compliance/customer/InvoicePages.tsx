@@ -37,7 +37,7 @@ function InvoiceList({
   return <ul className="grid gap-3">
     {items.map((invoice) => (
       <li key={invoice.invoicePublicId}>
-        <Card title={<Link href={`${baseHref}/${encodeURIComponent(invoice.invoicePublicId)}`} className="text-action underline underline-offset-2">
+        <Card title={<Link href={`${baseHref}/${encodeURIComponent(invoice.invoicePublicId)}`} className="inline-flex min-h-6 items-center py-0.5 text-action underline underline-offset-2">
           {invoice.invoiceNumber ?? fallbackLabel}
         </Link>} actions={<InvoiceStatusBadge status={invoice.status} />}>
           <KeyValueList columns={3} items={[

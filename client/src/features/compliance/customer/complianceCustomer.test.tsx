@@ -261,7 +261,9 @@ describe("customer invoices", () => {
     mocks.invoiceList.mockResolvedValue({ items: [invoice, draft], nextCursor: null });
     mocks.orderInvoices.mockResolvedValue({ items: [invoice, draft] });
     const list = renderUi(<InvoicesPage />);
-    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    const invoiceLink = await screen.findByRole("link", { name: "RP-INV-123" });
+    expect(invoiceLink).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    expect(invoiceLink).toHaveClass("inline-flex", "min-h-6", "items-center");
     expect(screen.getByText("Issued")).toBeVisible();
     expect(screen.getByText("Due date")).toBeVisible();
     expect(screen.getByText("$70.00")).toBeVisible();
