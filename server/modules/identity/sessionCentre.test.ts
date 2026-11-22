@@ -339,6 +339,24 @@ describe("session centre (MySQL)", () => {
       expect(limited).toHaveLength(2);
     });
 
+    it("concurrency limit with more than 1 000 historical (stale, unrevoked) rows: only the newest stay live", async () => {
+      const customer = await makeUser("customer");
+      await insertSessions(customer.id, 1_100, new Date(h.clock.now().getTime() - 6 * 60 * 60_000));
+      await insertSessions(customer.id, 4);
+      const admin = await makeUser("admin");
+      const a = await signIn(admin.email, { stepUp: true });
+      await at(ADMIN_IP, async () => identity.centre.updateRestrictions(a, await restrictionsInput(a, { enabled: true, maxConcurrentPerUser: 2 })));
+      h.clock.advance(6_000);
+      const fresh = await signIn(customer.email);
+      const live = await db.db.select().from(userSessions).where(and(eq(userSessions.userId, customer.id), isNull(userSessions.revokedAt)));
+      const effectivelyLive = live.filter((r) => r.lastSeenAt.getTime() > h.clock.now().getTime() - 60 * 60_000);
+      expect(effectivelyLive).toHaveLength(2);
+      expect(effectivelyLive.map((r) => r.publicId)).toContain(fresh.sessionId);
+      // A later request still resolves: the historical rows never count against the limit.
+      const second = await signIn(customer.email);
+      expect(second.sessionId).not.toBe(fresh.sessionId);
+    });
+
     it("idle timeout is role-specific", async () => {
       const admin = await makeUser("admin");
       const a = await signIn(admin.email, { stepUp: true });
@@ -346,8 +364,13 @@ describe("session centre (MySQL)", () => {
         identity.centre.updateRestrictions(a, await restrictionsInput(a, { enabled: true, idleMinutes: { customer: 240, staff: 5, admin: null } })));
       const staff = await makeUser("staff");
       const customer = await makeUser("customer");
-      const st = await at(ADMIN_IP, async () => identity.sessions.markMfaVerified((await identity.auth.signIn({ email: staff.email, password: PW }, {})).sessionId));
-      const cu = await at(ADMIN_IP, async () => identity.sessions.markMfaVerified((await identity.auth.signIn({ email: customer.email, password: PW }, {})).sessionId));
+      const stSigned = await at(ADMIN_IP, () => identity.auth.signIn({ email: staff.email, password: PW }, {}));
+      const cuSigned = await at(ADMIN_IP, () => identity.auth.signIn({ email: customer.email, password: PW }, {}));
+      const st = await at(ADMIN_IP, () => identity.sessions.markMfaVerified(stSigned.sessionId));
+      const cu = await at(ADMIN_IP, () => identity.sessions.markMfaVerified(cuSigned.sessionId));
+      // What identity.me reports (sessions.timing) follows the same per-role policy as the resolver.
+      expect((await identity.sessions.timing(stSigned.sessionId))?.idleTimeoutSeconds).toBe(5 * 60);
+      expect((await identity.sessions.timing(cuSigned.sessionId))?.idleTimeoutSeconds).toBe(240 * 60);
       h.clock.advance(10 * 60_000);
       expect(await at(ADMIN_IP, () => identity.sessionResolver.resolve({ token: st.token, transport: "cookie" }))).toBeNull();
       expect(await at(ADMIN_IP, () => identity.sessionResolver.resolve({ token: cu.token, transport: "cookie" }))).not.toBeNull();

@@ -274,6 +274,22 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       expect(ok.location).toMatch(/^\/sso\/complete/);
     });
 
+    it("refuses customers with SSO_MAINTENANCE during customer maintenance (no session); staff still sign in", async () => {
+      await configure();
+      const customer = await makeUser({ role: "customer" });
+      const cid = oid();
+      await bind(customer.publicId, cid);
+      const staff = await makeUser({ role: "staff", mfa: true });
+      const sid = oid();
+      await bind(staff.publicId, sid);
+      (h.services as unknown as Record<string, unknown>).jobAdmin = { maintenance: { customerAccess: async () => ({ active: true, message: null, expectedEnd: null }) } };
+      const before = await db.db.select().from(userSessions).where(eq(userSessions.userId, customer.id));
+      await rejects((await signIn({ oid: cid })).finish(), "SSO_MAINTENANCE");
+      expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, customer.id))).toHaveLength(before.length);
+      const done = await (await signIn({ oid: sid })).finish();
+      expect(done.purpose).toBe("sign_in");
+    });
+
     it("refuses unlinked identities, deactivated accounts and pending local remediation", async () => {
       await configure();
       await rejects((await signIn({ oid: oid() })).finish(), "SSO_NOT_LINKED");
