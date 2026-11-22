@@ -64,6 +64,36 @@ describe("redaction corpus", () => {
     expect(SENSITIVE_KEY.test("orderId")).toBe(false);
   });
 
+  it("redacts promo fields in structured request logs without losing diagnostic codes or public references", () => {
+    const example = ["SAVE", "EXAMPLE"].join("-");
+    const fields = ["promo", "promoCode", "appliedPromoCode", "Promo_Code", "promotionCodeValue", "discount-code", "discount codes", "couponCode", "voucher_codes"];
+    const log = buildLogLine(cfg, "info", "request context", {}, {
+      body: Object.fromEntries(fields.map((field) => [field, example])),
+      query: { promo: example },
+      code: "PROMO_NOT_APPLICABLE",
+      promoCodePublicId: "01EXAMPLE",
+      promotionLabel: "Holiday offer",
+    });
+    expect(log).not.toContain(example);
+    expect(JSON.parse(log)).toMatchObject({
+      ctx_body: Object.fromEntries(fields.map((field) => [field, "[redacted]"])),
+      query: { promo: "[redacted]" },
+      code: "PROMO_NOT_APPLICABLE",
+      promoCodePublicId: "01EXAMPLE",
+      promotionLabel: "Holiday offer",
+    });
+  });
+
+  it("redacts labelled promo values in strings, including URL parameters and JSON snippets", () => {
+    const example = ["SAVE", "EXAMPLE"].join("-");
+    for (const input of [`/?promoCode=${example}&next=cart`, `/#promo=${example}`, `{"discount_code":"${example}"}`]) {
+      const output = safeString(input);
+      expect(output).not.toContain(example);
+      expect(output).toContain("[redacted:promotion-code]");
+    }
+    expect(safeString("promoCodePublicId=01EXAMPLE")).toBe("promoCodePublicId=01EXAMPLE");
+  });
+
   it("is bounded: depth, keys, arrays, string length, cycles, class instances", () => {
     const cyclic: Record<string, unknown> = { a: 1 };
     cyclic.self = cyclic;
