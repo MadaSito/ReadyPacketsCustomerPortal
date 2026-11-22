@@ -24,7 +24,7 @@ export function isPlausiblePromoCode(code: string): boolean {
 
 function storage(): Storage | null {
   try {
-    // eslint-disable-next-line no-restricted-properties -- contract D3 (increment 05): a promotion link's code is kept for this tab only (sessionStorage, never a cookie); only the normalised code is stored and it is removed once applied or forgotten.
+    // eslint-disable-next-line no-restricted-properties -- approved exception, docs/adr/0044-discount-codes.md (contract D3, increment 05): a promotion link's code is kept for this tab only (sessionStorage, never a cookie); only the normalised code is stored and it is removed once applied or forgotten.
     return typeof window === "undefined" ? null : window.sessionStorage;
   } catch {
     return null;
