@@ -140,15 +140,24 @@ describe("Order history tab (S2)", () => {
     expect(screen.getByText("File uploaded")).toBeTruthy();
   });
 
-  it("keyboard: on the last page focus moves to the list instead of falling back to the body", async () => {
+  it("keyboard: on the last page focus moves to the shared LoadMore summary instead of falling back to the body", async () => {
     const user = userEvent.setup();
     page("customer");
     await screen.findByText("File uploaded");
     screen.getByRole("button", { name: "Load more activity" }).focus();
     await user.keyboard("{Enter}");
     await screen.findByText("File removed");
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("list", { name: "Activity entries" })));
+    await waitFor(() => expect(document.activeElement?.textContent).toBe("Showing 2 activities"));
     expect(screen.queryByRole("button", { name: "Load more activity" })).toBeNull();
+  });
+
+  it("shows invoice events with their server label in the Payments category", async () => {
+    handlers["audit.orderActivity"] = () => ({ view: "customer", items: [{ key: "i1", at: AT, category: "payments", label: "Refund recorded", actor: "ReadyPackets staff", details: {} }], nextCursor: null });
+    page("customer");
+    const item = within(await screen.findByRole("list", { name: "Activity entries" })).getByRole("listitem");
+    expect(item.textContent).toContain("Refund recorded");
+    expect(item.textContent).toContain("Payments");
+    expect(item.textContent).not.toMatch(/invoice\./u);
   });
 
   it("shows an error state with retry when the server refuses", async () => {

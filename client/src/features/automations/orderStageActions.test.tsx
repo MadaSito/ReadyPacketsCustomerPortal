@@ -118,12 +118,14 @@ describe("Workflow stage actions panel (T2)", () => {
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
   });
 
-  it("cancel closes the dialog without running and returns focus to the trigger", async () => {
+  it("keyboard: Enter opens, Escape cancels without running and returns focus to the trigger", async () => {
     const user = userEvent.setup();
     page();
     const trigger = await screen.findByRole("button", { name: "Run actions for In review" });
-    await user.click(trigger);
-    await user.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
+    trigger.focus();
+    await user.keyboard("{Enter}");
+    await screen.findByRole("alertdialog");
+    await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(calls.some((c) => c.path === "automations.orderStageActions.runForOrder")).toBe(false);
     await waitFor(() => expect(document.activeElement).toBe(trigger));
@@ -145,6 +147,16 @@ describe("Workflow stage actions panel (T2)", () => {
     await user.click(screen.getByRole("button", { name: "Load more runs" }));
     expect(await screen.findByText("Synthetic run 2")).toBeTruthy();
     expect(calls).toContainEqual({ path: "automations.orderStageActions.listRuns", input: { orderPublicId: ORDER, limit: 10, cursor: "c1" } });
+  });
+
+  it("keyboard: loading the last page of runs keeps focus on the shared LoadMore summary", async () => {
+    const user = userEvent.setup();
+    page();
+    await screen.findByText("Synthetic run 1");
+    screen.getByRole("button", { name: "Load more runs" }).focus();
+    await user.keyboard("{Enter}");
+    await screen.findByText("Synthetic run 2");
+    await waitFor(() => expect(document.activeElement?.textContent).toBe("Showing 2 runs"));
   });
 
   pageA11y("order automation stage actions", async () => {

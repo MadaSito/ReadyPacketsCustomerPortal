@@ -4,7 +4,7 @@
  * (`audit.orderActivity`) with a category filter. Both use opaque cursors and the server's projection: customers
  * never receive staff identities, internal notes, former order names, addresses or internal ids.
  */
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { ArrowRight, History, ListChecks } from "lucide-react";
 import { Badge, DateTime, EmptyState, ErrorState, Field, LoadMore, Section, Select, Skeleton } from "@/ui";
@@ -43,18 +43,10 @@ export default function OrderHistoryTab({ orderId, area }: OrderHistoryTabProps)
 
 function StatusHistory({ orderId }: { orderId: string }) {
   const trpc = useTRPC();
-  const listRef = useRef<HTMLOListElement>(null);
   const list = useInfiniteQuery(
     trpc.audit.orderStatusHistory.infiniteQueryOptions({ orderPublicId: orderId, limit: 25 }, { getNextPageParam: (page) => page.nextCursor ?? undefined }),
   );
   const items = list.data?.pages.flatMap((page) => page.items) ?? [];
-  /** LoadMore unmounts its button on the last page; move focus to the list so keyboard users don't fall back to <body>. */
-  const handleLoadMore = () => {
-    const hadFocus = document.activeElement instanceof HTMLButtonElement;
-    void list.fetchNextPage().then((result) => {
-      if (!result.hasNextPage && hadFocus) listRef.current?.focus();
-    });
-  };
   return (
     <Section title="Status history" description="Status changes and renames, newest first." className="min-w-0">
       {list.isPending ? (
@@ -65,13 +57,13 @@ function StatusHistory({ orderId }: { orderId: string }) {
         <EmptyState headingLevel={3} icon={History} title="No status changes yet" description="Status changes appear here as the order moves forward." />
       ) : (
         <>
-          <ol ref={listRef} tabIndex={-1} className="divide-y divide-line rounded-lg border border-line focus:outline-none focus-visible:ring-2 focus-visible:ring-action" aria-label="Status history entries">
+          <ol className="divide-y divide-line rounded-lg border border-line" aria-label="Status history entries">
             {items.map((item) => <StatusEntry key={item.key} item={item} />)}
           </ol>
           <LoadMore
             hasMore={Boolean(list.hasNextPage)}
             loading={list.isFetchingNextPage}
-            onLoadMore={handleLoadMore}
+            onLoadMore={() => list.fetchNextPage()}
             summary={`Showing ${items.length} entr${items.length === 1 ? "y" : "ies"}`}
             label="Load more status history"
           />
@@ -122,7 +114,6 @@ function StatusEntry({ item }: { item: OrderStatusHistoryItem }) {
 
 function ActivityFeed({ orderId, area }: OrderHistoryTabProps) {
   const trpc = useTRPC();
-  const listRef = useRef<HTMLOListElement>(null);
   const [category, setCategory] = useState<OrderActivityCategory | "">("");
   const categories = area === "customer" ? CUSTOMER_CATEGORIES : (Object.keys(CATEGORY_LABELS) as OrderActivityCategory[]);
   const list = useInfiniteQuery(
@@ -134,13 +125,6 @@ function ActivityFeed({ orderId, area }: OrderHistoryTabProps) {
   const pages = list.data?.pages ?? [];
   const staffView = pages[0]?.view === "staff";
   const items: (OrderActivityCustomerItem | OrderActivityStaffItem)[] = pages.flatMap((page): (OrderActivityCustomerItem | OrderActivityStaffItem)[] => page.items);
-  /** LoadMore unmounts its button on the last page; move focus to the list so keyboard users don't fall back to <body>. */
-  const handleLoadMore = () => {
-    const hadFocus = document.activeElement instanceof HTMLButtonElement;
-    void list.fetchNextPage().then((result) => {
-      if (!result.hasNextPage && hadFocus) listRef.current?.focus();
-    });
-  };
   return (
     <Section title="Activity" description="Recorded actions on this order, newest first." className="min-w-0">
       <Field label="Show">
@@ -158,7 +142,7 @@ function ActivityFeed({ orderId, area }: OrderHistoryTabProps) {
         <EmptyState headingLevel={3} icon={ListChecks} title="No activity" description={category ? "Nothing recorded in this category yet." : "Nothing has been recorded for this order yet."} />
       ) : (
         <>
-          <ol ref={listRef} tabIndex={-1} className="mt-3 divide-y divide-line rounded-lg border border-line focus:outline-none focus-visible:ring-2 focus-visible:ring-action" aria-label="Activity entries">
+          <ol className="mt-3 divide-y divide-line rounded-lg border border-line" aria-label="Activity entries">
             {items.map((item) => (
               <li key={item.key} className="min-w-0 space-y-1 p-3">
                 <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
@@ -191,7 +175,7 @@ function ActivityFeed({ orderId, area }: OrderHistoryTabProps) {
           <LoadMore
             hasMore={Boolean(list.hasNextPage)}
             loading={list.isFetchingNextPage}
-            onLoadMore={handleLoadMore}
+            onLoadMore={() => list.fetchNextPage()}
             summary={`Showing ${items.length} activit${items.length === 1 ? "y" : "ies"}`}
             label="Load more activity"
           />
