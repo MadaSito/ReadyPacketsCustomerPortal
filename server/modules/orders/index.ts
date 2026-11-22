@@ -32,6 +32,12 @@ import { createOrdersApiProvider } from "./publicApiProvider.js";
 import { createAccessService, type AccessService } from "./access.js";
 import { createRequirementsService, type FileUploadSlot, type FileUploadSlots, type RequirementsService } from "./requirements.js";
 export type { FileUploadSlot, FileUploadSlots, RequirementsView } from "./requirements.js";
+import { createGatesService, type OrderGatesService } from "./gates.js";
+export type { AcceptanceGate, OrderGateAction, OrderGateContext, OrderGatePoint, OrderGateProvider, OrderGatesService } from "./gates.js";
+import { createFolderRouting, type OrderFileFolderRouting } from "./folders.js";
+export type { OrderFileFolderRouting } from "./folders.js";
+import type { OrderPaymentSummaryProvider } from "./orderService.js";
+export type { OrderPaymentState, OrderPaymentSummaryProvider } from "./orderService.js";
 import { readSetting } from "../platform/index.js";
 import { ORDER_WORKFLOW_RULES_ENABLED } from "./settings.js";
 
@@ -83,6 +89,15 @@ export interface OrdersModule extends ModuleLifecycle {
   /** Increment 04 (cart checkout): customer order creation inside the caller's transaction. */
   createOrderFromCheckoutInTx: OrderService["createOrderFromCheckoutInTx"];
 
+  /** Part B (B6): acceptance gate port — call `gates.assertCustomerMayWork` inside the protected write's tx. */
+  gates: OrderGatesService;
+  /** Part B (B7, trusted): storage folder templates from the pinned version; null for an unknown order. */
+  getOrderFileFolderRouting(input: { orderPublicId: string; statusKey: string; slotKey: string | null }, tx: Tx): Promise<OrderFileFolderRouting | null>;
+  /** Part B (S2, trusted — caller authorised first): status transitions newest first. */
+  listStatusTransitions: OrderService["listStatusTransitions"];
+  /** Part B (B1): compliance registers the console payment badge source at init. */
+  registerPaymentSummaryProvider(provider: OrderPaymentSummaryProvider): void;
+
   /* ---- services used by the router ---- */
   requirements: RequirementsService;
   access: AccessService;
@@ -106,7 +121,10 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   });
   const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck });
   const access = createAccessService({ ...deps, policy, actorCheck });
-  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access });
+  const gates = createGatesService({ db: deps.db, policy, workflows });
+  let paymentProvider: OrderPaymentSummaryProvider | null = null;
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, paymentSummary: () => paymentProvider });
+  const getOrderFileFolderRouting = createFolderRouting({ workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
 
@@ -142,6 +160,13 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     isStatusPhaseLocked: requirements.isStatusPhaseLocked,
     getFileSlotForCustody: requirements.getFileSlotForCustody,
     createOrderFromCheckoutInTx: orders.createOrderFromCheckoutInTx,
+    gates,
+    getOrderFileFolderRouting,
+    listStatusTransitions: orders.listStatusTransitions,
+    registerPaymentSummaryProvider(provider) {
+      if (typeof provider !== "function") throw new Error("invalid payment summary provider");
+      paymentProvider = provider;
+    },
     requirements,
     access,
     catalog,

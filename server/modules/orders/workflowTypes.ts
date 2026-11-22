@@ -2,6 +2,7 @@
  * Admin-configurable order workflow definitions (data only — never code, scripts or URLs).
  */
 import { z } from "zod";
+import { isOrderFileFolderTemplate } from "../../../shared/orderFileFolder.js";
 
 /** `api` (increment 04): an integration calling /api/v1 with an `orders:write` key. */
 export const WORKFLOW_ACTORS = ["customer", "staff", "admin", "api"] as const;
@@ -39,6 +40,26 @@ export const MAX_ACKNOWLEDGEMENTS = 5;
 export const MAX_SLOT_COUNT = 20;
 export const ACK_BODY_MAX = 8000;
 
+export const MAX_ACCEPTANCE_GATES = 10;
+export const GATE_SIGNATURE_MODES = ["checkbox", "typed_name"] as const;
+export const FOLDER_TEMPLATE_MAX = 400;
+
+/** Part B (B7): storage folder template; validated by the shared path rules (portable_ops_engineer). */
+export const storageFolderSchema = z
+  .string()
+  .trim()
+  .max(FOLDER_TEMPLATE_MAX)
+  .refine((value) => isOrderFileFolderTemplate(value), "Use a relative folder path of at most 8 parts with the listed tokens only.");
+
+/** Part B (B6): a policy acceptance gate pinned in the workflow version. */
+export const acceptanceGateSchema = z.strictObject({
+  key,
+  policyPublicId: z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/),
+  point: z.union([z.literal("order_start"), z.strictObject({ stepKey: key })]),
+  signatureMode: z.enum(GATE_SIGNATURE_MODES),
+  askAgainOnNewVersion: z.boolean(),
+});
+
 export const workflowPhaseSchema = z.strictObject({ key, label });
 
 export const uploadRequirementSchema = z
@@ -51,6 +72,7 @@ export const uploadRequirementSchema = z
     maxCount: z.number().int().min(1).max(MAX_SLOT_COUNT),
     allowedTypes: z.array(z.string().regex(/^[a-z0-9]{1,10}$/, "Use a lowercase extension without a dot.")).max(20),
     uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(4),
+    storageFolder: storageFolderSchema.optional(),
   })
   .refine((slot) => slot.minCount <= slot.maxCount, { message: "Minimum cannot exceed maximum.", path: ["minCount"] });
 
@@ -92,6 +114,8 @@ export const workflowDefinitionSchema = z
     states: z.array(workflowStateSchema).min(2).max(30),
     transitions: z.array(workflowTransitionSchema).min(1).max(200),
     phases: z.array(workflowPhaseSchema).max(MAX_PHASES).optional(),
+    acceptanceGates: z.array(acceptanceGateSchema).max(MAX_ACCEPTANCE_GATES).optional(),
+    storageFolder: storageFolderSchema.optional(),
   })
   .superRefine((definition, ctx) => {
     const keys = new Set<string>();
@@ -116,6 +140,13 @@ export const workflowDefinitionSchema = z
       if (phaseKeys.has(phase.key)) ctx.addIssue({ code: "custom", message: `Duplicate phase ${phase.key}.`, path: ["phases"] });
       phaseKeys.add(phase.key);
     }
+    const gateKeys = new Set<string>();
+    for (const gate of definition.acceptanceGates ?? []) {
+      if (gateKeys.has(gate.key)) ctx.addIssue({ code: "custom", message: `Duplicate acceptance gate ${gate.key}.`, path: ["acceptanceGates"] });
+      gateKeys.add(gate.key);
+      if (gate.point !== "order_start" && !keys.has(gate.point.stepKey))
+        ctx.addIssue({ code: "custom", message: `Acceptance gate ${gate.key} names an unknown status.`, path: ["acceptanceGates"] });
+    }
     for (const state of definition.states) {
       if (state.phase && !phaseKeys.has(state.phase))
         ctx.addIssue({ code: "custom", message: `State ${state.key} names an unknown phase.`, path: ["states"] });
@@ -135,11 +166,13 @@ export type WorkflowTransition = WorkflowDefinition["transitions"][number];
 export type WorkflowPhase = NonNullable<WorkflowDefinition["phases"]>[number];
 export type UploadRequirement = z.output<typeof uploadRequirementSchema>;
 export type AcknowledgementRequirement = z.output<typeof acknowledgementRequirementSchema>;
+export type AcceptanceGate = z.output<typeof acceptanceGateSchema>;
 
 /** True when a definition uses increment-04 rules (phases or any requirement). */
 export function usesWorkflowRules(definition: WorkflowDefinition): boolean {
   return (
     (definition.phases?.length ?? 0) > 0 ||
+    (definition.acceptanceGates?.length ?? 0) > 0 ||
     definition.states.some((state) => state.phase !== undefined || (state.requirements && (state.requirements.uploads.length > 0 || state.requirements.acknowledgements.length > 0)))
   );
 }

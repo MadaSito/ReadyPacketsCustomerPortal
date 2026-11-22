@@ -22,6 +22,7 @@ import type { PacketTier } from "./schema.js";
 import { priceOrder } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import type { RequirementsService } from "./requirements.js";
+import type { OrderGatesService } from "./gates.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
 export interface OrderServiceDeps {
@@ -40,7 +41,17 @@ export interface OrderServiceDeps {
   requirements: Pick<RequirementsService, "onTransition">;
   /** Increment 04: copies active customer-wide console grants onto a new order (inside the create tx). */
   access: { onOrderCreated(tx: Tx, input: { orderId: number; ownerUserId: number; now: Date }): Promise<number> };
+  /** Part B (B6): acceptance gate, run inside the transition tx. */
+  gates: Pick<OrderGatesService, "assertCustomerMayWork" | "assertSystemMayWork">;
+  /** Part B (B1): console payment badge; registered by compliance at init. Null ⇒ badge hidden. */
+  paymentSummary: () => OrderPaymentSummaryProvider | null;
 }
+
+export type OrderPaymentState = "unpaid" | "paid" | "partially_refunded" | "refunded" | "void";
+export type OrderPaymentSummaryProvider = (
+  orderPublicIds: string[],
+  tx: DbOrTx,
+) => Promise<Map<string, { state: OrderPaymentState; totalMinor: number; currency: string }>>;
 
 export const MAX_PAGE = 100;
 
@@ -122,6 +133,21 @@ export function createOrderService(deps: OrderServiceDeps) {
    */
   const snapshot = <T>(fn: (tx: Tx) => Promise<T>) =>
     deps.db.transaction(fn, { isolationLevel: "repeatable read", withConsistentSnapshot: true });
+
+  /** B1 console header extras. A failing payment provider never breaks the order page (badge hidden). */
+  async function consoleHeader(tx: Tx, orderPublicId: string, ownerUserId: number) {
+    const owner = await identityPort(deps.services).getUser(ownerUserId, { tx });
+    let payment: { state: OrderPaymentState; totalMinor: number; currency: string } | null = null;
+    const provider = deps.paymentSummary();
+    if (provider) {
+      try {
+        payment = (await provider([orderPublicId], tx)).get(orderPublicId) ?? null;
+      } catch {
+        deps.logger.warn("order payment summary unavailable", { orderPublicId });
+      }
+    }
+    return { customer: owner ? { publicId: owner.publicId, name: owner.name, customerRef: owner.customerRef } : null, payment };
+  }
 
   const encryptNote = (body: string, publicId: string) => deps.crypto.encrypt(body, `order_notes.body:${publicId}`);
   const decryptNote = (bodyEnc: string, publicId: string) => {
@@ -617,6 +643,8 @@ export function createOrderService(deps: OrderServiceDeps) {
             requiresNote: t.requiresNote,
           };
         }),
+        /** Part B (B1): console header only — customer name and payment badge (null when unknown or hidden). */
+        console: consoleView ? await consoleHeader(tx, order.publicId, order.ownerUserId) : null,
       };
       });
     },
@@ -672,6 +700,88 @@ export function createOrderService(deps: OrderServiceDeps) {
       });
     },
 
+    /**
+     * Part B (B2): console rename. Capability orders.rename (router + in-tx re-check), optimistic version,
+     * reference untouched, audit `order.renamed` with old and new name, change event for the SharePoint row.
+     */
+    async rename(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; name: string }) {
+      const name = normalizeOrderName(input.name);
+      return deps.db.transaction(async (tx) => {
+        const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
+        if (view.accessRole !== "staff" && view.accessRole !== "admin") throw forbidden("STAFF_ONLY");
+        await assertActorCurrent(principal, tx, "orders.rename");
+        if (view.version !== input.expectedVersion) throw staleVersion();
+        const [row] = await tx.select({ projectName: orders.projectName }).from(orders).where(eq(orders.id, view.id)).limit(1);
+        const oldName = row?.projectName ?? "";
+        if (oldName === name) return { version: view.version, changed: false };
+        const result = await tx
+          .update(orders)
+          .set({ projectName: name, version: view.version + 1, updatedAt: deps.clock.now() })
+          .where(and(eq(orders.id, view.id), eq(orders.version, view.version)));
+        if (affectedRows(result) !== 1) throw staleVersion();
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "order.renamed",
+            action: "update",
+            outcome: "completed",
+            actor: actorOf(principal),
+            resource: { type: "order", publicId: view.publicId },
+            attributes: { old_name: oldName, new_name: name },
+          },
+          tx,
+        );
+        await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "updated" });
+        return { version: view.version + 1, changed: true };
+      });
+    },
+
+    /**
+     * Part B (S2 port, trusted — caller ran assertCanReadOrder): status transitions newest first, keyset on
+     * order_status_history.id. `customerView` hides internal notes (note → null) and uses customer labels.
+     */
+    async listStatusTransitions(orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean; tx?: DbOrTx }) {
+      const db = opts.tx ?? deps.db;
+      const limit = Math.min(Math.max(Math.trunc(opts.limit) || 1, 1), MAX_PAGE);
+      const before = decodeCursor(opts.cursor);
+      const [order] = await db.select({ workflowVersionId: orders.workflowVersionId }).from(orders).where(eq(orders.id, orderId)).limit(1);
+      if (!order) return { items: [], nextCursor: null };
+      const rows = await db
+        .select()
+        .from(orderStatusHistory)
+        .where(before === null ? eq(orderStatusHistory.orderId, orderId) : and(eq(orderStatusHistory.orderId, orderId), lt(orderStatusHistory.id, before)))
+        .orderBy(desc(orderStatusHistory.id))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const noteIds = page.map((entry) => entry.noteId).filter((id): id is number => id !== null);
+      const notes = noteIds.length ? await db.select().from(orderNotes).where(and(eq(orderNotes.orderId, orderId), inArray(orderNotes.id, noteIds))) : [];
+      const noteById = new Map(notes.map((note) => [note.id, note]));
+      const bound = await workflows.byVersionId(db, order.workflowVersionId);
+      const label = (key: string | null) => {
+        if (key === null) return null;
+        const state = findState(bound.definition, key);
+        return (opts.customerView ? state?.customerLabel : state?.label) ?? key;
+      };
+      const roleOf = (role: string): "customer" | "staff" | "admin" | "system" => (role === "admin" || role === "staff" || role === "system" ? role : "customer");
+      return {
+        items: page.map((entry) => {
+          const note = entry.noteId === null ? undefined : noteById.get(entry.noteId);
+          const visible = note !== undefined && (!opts.customerView || note.visibility === "customer");
+          return {
+            at: entry.occurredAt,
+            from: entry.fromStatus,
+            fromLabel: label(entry.fromStatus),
+            to: entry.toStatus,
+            toLabel: label(entry.toStatus)!,
+            note: visible ? decryptNote(note.bodyEnc, note.publicId) : null,
+            actorUserId: entry.actorUserId,
+            actorRole: roleOf(entry.actorRole),
+          };
+        }),
+        nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null,
+      };
+    },
+
     async addNote(principal: SessionPrincipal, input: { orderId: string; body: string; visibility?: NoteVisibility }) {
       const result = await deps.db.transaction(async (tx) => {
         const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
@@ -714,6 +824,9 @@ export function createOrderService(deps: OrderServiceDeps) {
           const transition = actor ? transitionsFrom(bound.definition, view.statusKey, actor).find((t) => t.to === input.toStatus) : undefined;
           if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
           if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+          // B6: a customer-side phase submit (any move out of a gated status) needs the gate met; cancel is always allowed.
+          if (actor === "customer" && !isCancelTarget(bound, transition.to))
+            await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });
           await deps.requirements.onTransition(tx, principal, view, bound, transition.to);
           const now = deps.clock.now();
           const staffSide = actor !== "customer";
@@ -798,6 +911,9 @@ export function createOrderService(deps: OrderServiceDeps) {
         const transition = transitionsFrom(bound.definition, row.statusKey, "api").find((candidate) => candidate.to === input.toStatus);
         if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
         if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+        // B6: integrations act for the owner; the owner's acceptance is required (fail closed). Cancel is exempt.
+        if (!isCancelTarget(bound, transition.to))
+          await deps.gates.assertSystemMayWork({ tx, orderId: row.id, action: "phase_submit", statusKey: row.statusKey });
         const owner = await identityPort(deps.services).getUser(row.ownerUserId, { tx });
         const view: OrderAccessView = {
           id: row.id,
@@ -1273,7 +1389,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       if (!ULID_LIKE.test(orderPublicId)) return null;
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.publicId, orderPublicId))
         .limit(1);
@@ -1284,7 +1400,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.id, orderId))
         .limit(1);
@@ -1296,6 +1412,20 @@ export function createOrderService(deps: OrderServiceDeps) {
 }
 
 const ULID_LIKE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+function isCancelTarget(bound: BoundWorkflow, to: string): boolean {
+  const target = findState(bound.definition, to);
+  return target ? isCancelState(target) : false;
+}
+
+/** B2: 1–120 characters after NFC + trim, no control characters. */
+export function normalizeOrderName(value: string): string {
+  const name = value.normalize("NFC").trim();
+  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
+  if (name.length < 1 || name.length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(name))
+    throw validation("ORDER_NAME_INVALID", "Enter an order name of 1 to 120 characters without control characters.");
+  return name;
+}
 
 export function affectedRows(result: unknown): number {
   const header = Array.isArray(result) ? result[0] : result;

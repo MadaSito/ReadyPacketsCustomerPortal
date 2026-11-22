@@ -57,6 +57,8 @@ export interface OrderRef {
   id: number;
   publicId: string;
   reference: string;
+  /** Part B: the order name (projectName), for storage folder tokens and copy sources. */
+  name: string;
   ownerUserId: number;
   lockState: OrderLockState;
   statusKey: string;

@@ -206,6 +206,13 @@ export const ordersRouter = router({
     )
     .mutation(({ ctx, input }) => ctx.services.orders.orders.transition(ctx.session, input)),
   sharing,
+  /** Part B (S1): console order workspace actions. */
+  console: router({
+    rename: staffProcedure
+      .use(requireCapability("orders.rename"))
+      .input(z.strictObject({ orderId: id, expectedVersion: version, name: z.string().max(400) }))
+      .mutation(({ ctx, input }) => ctx.services.orders.orders.rename(ctx.session, input)),
+  }),
   admin: router({
     list: staffProcedure
       .use(requireCapability("orders.read_all"))
