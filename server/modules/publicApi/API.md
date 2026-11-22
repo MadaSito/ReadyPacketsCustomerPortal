@@ -104,7 +104,7 @@ replayable (`API_REPLAY_UNAVAILABLE`), nor bodies > 64 KiB or purged rows.
 
 ## Jobs
 
-`publicApi.log.purge` — hourly, deletes log rows past the retention (default 30 days) and expired
+`public_api.log.purge` — hourly, deletes log rows past the retention (default 30 days) and expired
 idempotency / signature-replay rows in bounded batches.
 
 ## Schema (additive)

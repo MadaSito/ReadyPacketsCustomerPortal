@@ -13,7 +13,7 @@ export type { ApiHttpRequest, ApiHttpResponse } from "./engine.js";
 export type { KeyInput, KeyView, LogFilter } from "./service.js";
 export * from "./ports.js";
 
-export const PURGE_JOB = "publicApi.log.purge";
+export const PURGE_JOB = "public_api.log.purge";
 
 export interface PublicApiModule extends ModuleLifecycle, PublicApiService {
   /** Called by owning modules in their `init()`. A second registration for the same key is refused. */
@@ -31,7 +31,7 @@ export function createPublicApiModule(deps: ModuleDeps): PublicApiModule {
     const deleted = await engine.purge();
     return { outcome: "completed", safeCounts: { deleted } };
   }, { retrySafe: true });
-  deps.jobs.registerSchedule({ name: "publicApi.log.purge.hourly", type: PURGE_JOB, everyMs: 3_600_000 });
+  deps.jobs.registerSchedule({ name: "public_api.log.purge.hourly", type: PURGE_JOB, everyMs: 3_600_000 });
 
   return {
     ...service,

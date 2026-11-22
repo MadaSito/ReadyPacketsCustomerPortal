@@ -6,6 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
+import { createJobQueue } from "../jobs/queue.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { TOKEN_RE, computeSignature, generateKeyToken, hasControlChar, ipAllowed, normaliseCidr, parseBearer } from "./credentials.js";
 import type { ApiHttpRequest } from "./engine.js";
@@ -388,6 +389,12 @@ describe("public API administration", () => {
     const denied = await mod.log.replay(admin, write!.requestId, { confirmWrite: true });
     expect(denied.status).toBe(403);
     expect((await mod.log.list(admin, { replay: true })).items).toHaveLength(2);
+  });
+
+  it("registers its job and schedule with the real job queue", () => {
+    const real = createTestDeps({ db: db.db });
+    real.deps.jobs = createJobQueue(real.deps);
+    expect(() => createPublicApiModule(real.deps)).not.toThrow();
   });
 
   it("purges expired log rows on schedule", async () => {
