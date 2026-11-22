@@ -3,7 +3,7 @@
  * Saves the code from the fragment for this browser tab (sessionStorage), strips the fragment at once, and says
  * so. Nothing is applied here: PromoCodeField in the cart and the order wizard offers the saved code.
  */
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "wouter";
 import { CheckCircle2 } from "lucide-react";
 import { Button, Callout, Card, PageHeader } from "@/ui";
@@ -23,10 +23,12 @@ export default function PromoLandingPage() {
   const { view } = useSession();
   const [state, setState] = useState<LandingState>(initialState);
   const signedIn = view.status === "full";
+  const resultRef = useRef<HTMLDivElement>(null);
 
   return (
     <article className="ph-no-capture mx-auto w-full min-w-0 max-w-2xl space-y-6 px-4 py-8 sm:px-6 sm:py-12" data-clarity-mask="true">
       <PageHeader title="Discount code" description="Codes from a ReadyPackets link are kept for this browser tab only." />
+      <div ref={resultRef} tabIndex={-1} className="outline-none">
       {state.kind === "saved" ? (
         <Callout tone="success" title="Code saved" live="polite">
           <span className="inline-flex items-start gap-1">
@@ -39,10 +41,11 @@ export default function PromoLandingPage() {
           Check the link you received, or enter the code yourself in your cart.
         </Callout>
       ) : (
-        <Callout tone="info" title="No code saved">
+        <Callout tone="info" title="No code saved" live="polite">
           Open the link you received again, or enter the code yourself in your cart.
         </Callout>
       )}
+      </div>
       <Card as="section" aria-labelledby="promo-next" className="space-y-3">
         <h2 id="promo-next" className="text-lg font-semibold text-ink">Next steps</h2>
         {signedIn ? (
@@ -65,6 +68,8 @@ export default function PromoLandingPage() {
             onClick={() => {
               clearSavedPromoCode();
               setState({ kind: "none" });
+              // The focused button disappears: keep keyboard focus on the (live) result.
+              requestAnimationFrame(() => resultRef.current?.focus());
             }}
           >
             Forget the saved code

@@ -90,6 +90,10 @@ export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze
   { pattern: "invoice.voided", category: "payments", label: "Invoice voided", customer: true },
   { pattern: "invoice.downloaded", category: "payments", label: "Invoice downloaded", customer: false },
   { pattern: "invoice.provider_event.scaffold_recorded", category: "payments", label: "Payment provider event recorded", customer: false },
+  /* Increment 05 (D3): discount codes on an order. Audit carries the promotion public id and label, never the code. */
+  { pattern: "promotion.redeemed", category: "payments", label: "Discount code applied", customer: true },
+  { pattern: "promotion.released", category: "payments", label: "Discount code released", customer: true },
+  /* Increment 05 (D4): order gate acceptance evidence is already "order.acceptance.recorded" above. */
   /* Wildcards label with the humanised event name (see `humanizeEventName`). */
   { pattern: "payment.*", category: "payments", label: "", customer: false },
   { pattern: "invoice.*", category: "payments", label: "", customer: false },

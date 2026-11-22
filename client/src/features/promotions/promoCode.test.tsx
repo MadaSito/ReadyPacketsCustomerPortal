@@ -115,7 +115,7 @@ describe("PromoCodeField", () => {
     const onApply = vi.fn(async () => undefined);
     page(<Host onApply={onApply} />);
     expect(onApply).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "Use saved code LINK-CODE-77" }));
+    await user.click(screen.getByRole("button", { name: "Use saved code" }));
     expect(onApply).toHaveBeenCalledWith("LINK-CODE-77");
     await screen.findByText(/Spring offer/u);
     expect(readSavedPromoCode()).toBeNull();
@@ -133,13 +133,30 @@ describe("PromoCodeField", () => {
     expect(root?.classList.contains("ph-no-capture")).toBe(true);
   });
 
-  it("empty input asks for a code without calling the server", async () => {
+  it("keyboard: Enter on the empty field asks for a code, announces it, links it, and calls nothing", async () => {
     const user = userEvent.setup();
     const onApply = vi.fn(async () => undefined);
     page(<Host onApply={onApply} />);
-    await user.click(screen.getByRole("button", { name: "Apply" }));
-    expect(await screen.findByText("Enter a discount code.")).toBeTruthy();
+    screen.getByLabelText("Discount code").focus();
+    await user.keyboard("{Enter}");
+    const message = await errorText("Enter a discount code.");
+    expect(live().textContent).toBe("Enter a discount code.");
+    expect(screen.getByLabelText("Discount code").getAttribute("aria-describedby")).toContain(message.parentElement!.id);
     expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it("the saved-code offer does not speak the code and does not steal focus after a slow apply", async () => {
+    const user = userEvent.setup();
+    savePromoCode("LINK-CODE-77");
+    let release: () => void = () => undefined;
+    page(<><Host onApply={() => new Promise<void>((r) => { release = r; })} /><button type="button">Elsewhere</button></>);
+    expect(screen.getByRole("button", { name: "Use saved code" }).textContent).not.toContain("LINK");
+    await user.click(screen.getByRole("button", { name: "Use saved code" }));
+    screen.getByRole("button", { name: "Elsewhere" }).focus();
+    await act(async () => release());
+    await screen.findByText(/Spring offer/u);
+    await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Elsewhere" }));
   });
 
   pageA11y("PromoCodeField empty with saved code", () => {
@@ -199,10 +216,11 @@ describe("promotion link landing page", () => {
     const user = userEvent.setup();
     savePromoCode("SPRING-2026");
     landing();
-    await user.click(screen.getByRole("button", { name: "Forget the saved code" }));
+    screen.getByRole("button", { name: "Forget the saved code" }).focus();
+    await user.keyboard("{Enter}");
     expect(readSavedPromoCode()).toBeNull();
     expect(screen.getByText("No code saved")).toBeTruthy();
-    await act(async () => undefined);
+    await waitFor(() => expect(document.activeElement?.textContent).toContain("No code saved"));
   });
 
   pageA11y("/promo saved", () => {

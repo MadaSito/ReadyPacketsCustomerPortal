@@ -59,6 +59,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
   const inputId = useId();
   const errorId = `${inputId}-error`;
   const savedId = `${inputId}-saved`;
+  const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const removeRef = useRef<HTMLButtonElement>(null);
   const [value, setValue] = useState("");
@@ -67,6 +68,13 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
   const [announcement, setAnnouncement] = useState("");
   const [saved, setSaved] = useState<string | null>(() => readSavedPromoCode());
 
+  /** Move focus only if it is still inside the field (or was lost to <body>) — never steal it from elsewhere. */
+  const focusIfOurs = (target: () => HTMLElement | null) => {
+    requestAnimationFrame(() => {
+      const active = document.activeElement;
+      if (!active || active === document.body || rootRef.current?.contains(active)) target()?.focus();
+    });
+  };
   const announce = (message: string) => {
     if (onAnnounce) onAnnounce(message);
     else setAnnouncement(message);
@@ -76,6 +84,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
     const code = normalizePromoCode(raw);
     if (!code) {
       setError("Enter a discount code.");
+      announce("Enter a discount code.");
       inputRef.current?.focus();
       return;
     }
@@ -95,12 +104,12 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
       }
       setValue("");
       announce("Discount code applied.");
-      requestAnimationFrame(() => removeRef.current?.focus());
+      focusIfOurs(() => removeRef.current);
     } catch (e) {
       const text = promoErrorText(e);
       setError(text);
       announce(text);
-      inputRef.current?.focus();
+      focusIfOurs(() => inputRef.current);
     } finally {
       setBusy(null);
     }
@@ -111,7 +120,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
     try {
       await onRemove();
       announce("Discount code removed.");
-      requestAnimationFrame(() => inputRef.current?.focus());
+      focusIfOurs(() => inputRef.current);
     } catch {
       announce("The discount code could not be removed. Please try again.");
     } finally {
@@ -125,7 +134,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
   };
 
   return (
-    <div className={cn("ph-no-capture min-w-0 space-y-2", className)} data-clarity-mask="true">
+    <div ref={rootRef} className={cn("ph-no-capture min-w-0 space-y-2", className)} data-clarity-mask="true">
       {applied ? (
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-line p-3">
           <p className="flex min-w-0 items-center gap-2 text-sm text-ink">
@@ -184,7 +193,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
             <p id={savedId} className="flex flex-wrap items-center gap-2 text-sm text-muted">
               <span>A code from your link is saved.</span>
               <Button type="button" variant="link" size="sm" disabled={disabled || busy !== null} onClick={() => void apply(saved)}>
-                Use saved code {saved}
+                Use saved code
               </Button>
             </p>
           ) : null}

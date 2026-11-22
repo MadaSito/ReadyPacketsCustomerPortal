@@ -275,5 +275,8 @@ describe("order activity port (real MySQL)", () => {
     expect(classifyOrderEvent("payment.refund.failed")).toMatchObject({ customer: false });
     expect(classifyOrderEvent("order.acceptance.recorded")).toMatchObject({ customer: true });
     expect(classifyOrderEvent("unrelated.event")).toBeNull();
+    expect(classifyOrderEvent("promotion.redeemed")).toMatchObject({ category: "payments", label: "Discount code applied", customer: true });
+    expect(classifyOrderEvent("promotion.released")).toMatchObject({ category: "payments", customer: true });
+    expect(classifyOrderEvent("promotion.attempts_blocked")).toBeNull();
   });
 });
