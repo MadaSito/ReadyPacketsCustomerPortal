@@ -1,6 +1,7 @@
 import { HardDrive, HardDriveDownload, RefreshCw } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
 import { CopyLogPage } from "./CopyLogPage";
+import { OrderFileSyncTab, OrderFileSyncTabLabel } from "./OrderFileSyncTab";
 import { SharePointOrderSyncPage } from "./SharePointOrderSyncPage";
 import { StorageConnectionWizardPage } from "./StorageConnectionWizardPage";
 import { StorageConnectionsPage } from "./StorageConnectionsPage";
@@ -68,6 +69,16 @@ export const storageFeature: FeatureRoutes = {
       area: "console",
       group: "Integrations",
       order: 64.5,
+    },
+  ],
+  orderTabs: [
+    {
+      key: "sync",
+      label: "File sync",
+      labelComponent: OrderFileSyncTabLabel,
+      access: "staff",
+      order: 60,
+      component: OrderFileSyncTab,
     },
   ],
 };
