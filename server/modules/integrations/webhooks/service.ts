@@ -984,7 +984,9 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       return cat.some((entry) => !entry.staffOnly && entry.eventName === eventName);
     },
 
-    async onRecorded(event: AuditTapEvent, tx: Tx): Promise<void> {
+    async onRecorded(event: AuditTapEvent, tx: Tx | undefined): Promise<void> {
+      if (event.correlationId?.startsWith("automation:")) return;
+      const dbOrTx = tx ?? deps.db;
       const cfg = await readConfig(tx);
       if (!cfg.enabled) return;
 
@@ -993,7 +995,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
       ).filter((entry) => entry.staffOnly !== true);
       if (matchedEntries.length === 0) return;
 
-      const activeSubs = await tx
+      const activeSubs = await dbOrTx
         .select()
         .from(integrationWebhookSubscriptions)
         .where(eq(integrationWebhookSubscriptions.status, "active"));
@@ -1026,7 +1028,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             event.correlationId,
           ]);
 
-          const existing = await tx
+          const existing = await dbOrTx
             .select({ id: integrationWebhookDeliveries.id })
             .from(integrationWebhookDeliveries)
             .where(
@@ -1050,7 +1052,7 @@ export function createWebhooksService(deps: ModuleDeps, egress: EgressPolicy): W
             tx,
           );
 
-          await tx.insert(integrationWebhookDeliveries).values({
+          await dbOrTx.insert(integrationWebhookDeliveries).values({
             publicId: deliveryPublicId,
             direction: "outbound",
             subscriptionId: sub.id,
