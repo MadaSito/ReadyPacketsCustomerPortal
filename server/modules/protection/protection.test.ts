@@ -30,6 +30,12 @@ describe("application protection", () => {
     app.use((req, res, next) => {
       runWithRequestContext(newRequestContext("http", { ipAddress: req.ip }), () => {
         void (async () => {
+          if (req.path === "/test-rate-limit") {
+            await module.recordRateLimit(req, "/safe-template", "edge_requests");
+            await module.recordRateLimit(req, "/safe-template", "edge_static");
+            await module.recordRateLimit(req, "/safe-template", "edge_static");
+            return res.status(429).end();
+          }
           const decision = await module.inspect(req);
           if (decision.action === "block") return res.status(403).end();
           if (req.path === "/test-save" && change) {
@@ -71,6 +77,23 @@ describe("application protection", () => {
     expect(isRecoveryPath("/api/trpc/assurance.beginpasskeyauthentication", "POST")).toBe(true);
     expect(isRecoveryPath("/api/trpc/assurance.challenge,orders.admin.create", "POST")).toBe(false);
     expect(isRecoveryPath("/api/trpc/assurance.challenge", "GET")).toBe(false);
+  });
+
+  it("samples both rate-limit buckets before policy inspection without retaining raw request data", async () => {
+    const f = fixture();
+    await f.get("/test-rate-limit?private=synthetic-marker", "198.51.100.70").expect(429);
+    for (const bucket of ["edge_requests", "edge_static"]) {
+      const rule = `rate_limit.${bucket}`;
+      const events = await f.module.exportEvents(f.admin, { rule });
+      expect(events.items).toEqual([expect.objectContaining({
+        action: "block", rule, route: "/safe-template", correlationId: expect.any(String), country: null,
+      })]);
+      expect(JSON.stringify(events)).not.toContain("synthetic-marker");
+      expect(f.audit.events).toContainEqual(expect.objectContaining({
+        reasonCode: "RATE_LIMITED", attributes: { rule, route: "/safe-template", method: "GET", rateLimitBucket: bucket },
+      }));
+    }
+    expect(JSON.stringify(f.audit.events)).not.toContain("198.51.100.70");
   });
 
   it("checks live authorization, step-up, atomic audit, recovery reachability and cross-request policy", async () => {
@@ -121,8 +144,9 @@ describe("application protection", () => {
     await expect(f.module.releaseBlock(f.admin, { source: "automatic", publicId: block!.publicId })).resolves.toEqual({ released: true });
     await f.get("/another", "198.51.100.91", "US").expect(200);
     const all = await f.module.exportEvents(f.admin, {});
-    expect(all.items.length).toBeGreaterThan(0);
-    expect(all.items.length).toBeLessThanOrEqual(16);
+    const policyEvents = all.items.filter(({ rule }) => !rule.startsWith("rate_limit."));
+    expect(policyEvents.length).toBeGreaterThan(0);
+    expect(policyEvents.length).toBeLessThanOrEqual(16);
     expect(JSON.stringify(all)).not.toContain("example-marker");
     expect(JSON.stringify(f.audit.events)).not.toContain("198.51.100.91");
     expect(f.audit.events.some((event) => event.eventName === "protection.events_exported")).toBe(true);

@@ -7,6 +7,7 @@ import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import { RATE_LIMIT_CATEGORIES, type ModuleLifecycle, type RateLimitCategory, type RequestContext, type SessionPrincipal, type Tx } from "../../core/types.js";
 import { clientAddress } from "../../http/edge.js";
+import type { RateLimitBucket } from "../../http/edgeAdmission.js";
 import { readSetting, writeSetting } from "../platform/index.js";
 import { boundedBudget, DEFAULT_BUDGETS, RATE_LIMIT_BOUNDS, rateLimitSettings, type DbRateLimiter, type RateLimitBudget } from "../../security/rateLimiter.js";
 import { hasFreshStepUp } from "../../trpc/trpc.js";
@@ -20,6 +21,7 @@ const CACHE_MS = 2_000;
 const CLOCK_MINUTE = 60_000;
 const AUTO_SLOTS = 4096;
 const EVENT_SLOTS = 16;
+const OTHER_RATE_EVENT_SLOTS = 2;
 const RETENTION_MS = 14 * 86_400_000;
 const MAX_EXPORT = 1000;
 const IDENTIFIER = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -92,22 +94,28 @@ function buildProtection(deps: ModuleDeps) {
     return loading;
   }
 
-  async function detectEvent(req: Request, source: RequestSignals, action: "detect" | "block", rule: string) {
+  async function detectEvent(
+    source: Pick<RequestSignals, "address" | "country">, action: "detect" | "block", rule: string,
+    labels: ReturnType<typeof requestEventLabels>, rateLimitBucket?: RateLimitBucket,
+  ) {
     const now = clock.now();
     const minute = Math.floor(now.getTime() / CLOCK_MINUTE);
     const ctx = getRequestContext();
     if (!ctx) return;
     const address = source.address?.text;
     const key = crypto.blindIndex(`${address ?? "unknown"}:${rule}`, "protection.event-slot");
-    const slot = Number.parseInt(key.slice(0, 8), 16) % EVENT_SLOTS;
+    // Reserve independent rate-limit slots so a 429 flood cannot consume policy-event samples.
+    const hash = Number.parseInt(key.slice(0, 8), 16);
+    const slot = rateLimitBucket === "edge_requests" ? EVENT_SLOTS :
+      rateLimitBucket === "edge_static" ? EVENT_SLOTS + 1 :
+      rateLimitBucket ? EVENT_SLOTS + 2 + hash % OTHER_RATE_EVENT_SLOTS : hash % EVENT_SLOTS;
     if (localSampleMinute !== minute) { localSampleMinute = minute; localSampleSlots = 0; }
     if ((localSampleSlots & (1 << slot)) !== 0) return;
     localSampleSlots |= 1 << slot;
     const publicId = ulid(now.getTime());
-    const labels = requestEventLabels(req, source.headers["user-agent"]);
     try {
       await db.transaction(async (tx) => {
-        // Exactly EVENT_SLOTS globally per minute; duplicate slots never create additional audit events.
+        // Unique (minute, slot) across replicas; duplicate slots never create additional audit events.
         const [inserted] = await tx.insert(protectionEvents).ignore().values({
           publicId, minute, slot, action, rule, ...labels, country: source.country, correlationId: ctx.correlationId ?? ctx.requestId,
           addressEnc: address ? crypto.encrypt(address, `protection_events.address_enc:${publicId}`) : null, createdAt: now,
@@ -116,9 +124,10 @@ function buildProtection(deps: ModuleDeps) {
         await audit.record({
           category: "security", eventName: "protection.request_evaluated", action: "evaluate",
           severity: action === "block" ? "WARN" : "INFO", outcome: action === "block" ? "denied" : "completed",
-          reasonCode: action === "block" ? "PROTECTION_BLOCK" : "PROTECTION_DETECT",
+          reasonCode: rateLimitBucket ? "RATE_LIMITED" : action === "block" ? "PROTECTION_BLOCK" : "PROTECTION_DETECT",
           resource: { type: "protection_event", publicId },
-          attributes: { rule, method: labels.method, route: labels.route, ...(source.country ? { country: source.country } : {}) },
+          attributes: { rule, method: labels.method, route: labels.route, ...(source.country ? { country: source.country } : {}),
+            ...(rateLimitBucket ? { rateLimitBucket } : {}) },
         }, tx);
       });
     } catch {
@@ -192,6 +201,13 @@ function buildProtection(deps: ModuleDeps) {
       const ctx = getRequestContext();
       return ctx ? signalsByContext.get(ctx)?.country ?? null : null;
     },
+    async recordRateLimit(req: Request, route: string, bucket: RateLimitBucket): Promise<void> {
+      const ctx = getRequestContext();
+      if (!ctx || config.protectionDisabled) return;
+      const country = signalsByContext.get(ctx)?.country ?? null;
+      await detectEvent({ address: addressOf(ctx.ipAddress), country }, "block", `rate_limit.${bucket}`,
+        { ...requestEventLabels(req, ctx.userAgent?.toLowerCase()), route }, bucket);
+    },
     async inspect(req: Request): Promise<{ action: "allow" | "block" }> {
       if (isProtectionExempt(req)) return { action: "allow" };
       const ctx = getRequestContext();
@@ -210,12 +226,14 @@ function buildProtection(deps: ModuleDeps) {
         const [blocked] = await db.select({ addressKey: protectionBlocks.addressKey }).from(protectionBlocks)
           .where(and(eq(protectionBlocks.bucket, bucket), gt(protectionBlocks.expiresAt, now))).limit(1);
         if (blocked?.addressKey === key) {
-          await detectEvent(req, source, "block", "ip.automatic");
+          await detectEvent(source, "block", "ip.automatic", requestEventLabels(req, source.headers["user-agent"]));
           return { action: "block" };
         }
         if (decision.action === "block") await incrementStrike(address, key, bucket, policy);
       }
-      if (decision.action !== "allow") await detectEvent(req, source, decision.action, decision.rule);
+      if (decision.action !== "allow") {
+        await detectEvent(source, decision.action, decision.rule, requestEventLabels(req, source.headers["user-agent"]));
+      }
       return { action: decision.action === "block" ? "block" : "allow" };
     },
     getPolicy(principal: ReadActor) {
