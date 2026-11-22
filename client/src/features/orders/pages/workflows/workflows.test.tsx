@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
+import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminWorkflowsPage from "../AdminWorkflowsPage";
 import WorkflowDesignerPage from "./WorkflowDesignerPage";
@@ -350,6 +351,24 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     await user.click(within(gates).getByRole("button", { name: "Remove gate 1" }));
     expect(within(gates).getByText("No gates.")).toBeInTheDocument();
   });
+});
+
+describe("designer part B page accessibility", () => {
+  // The rules step with a gate and the folder fields (with the live example), checked as a page in light and dark.
+  const prepare = async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition: { states, transitions: [transition], acceptanceGates: [{ key: "terms", policyPublicId: "01JTESTPOL00000000000000ZZ", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true }] } }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    document.title = "Workflow draft · Console";
+    renderUi(<main><Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route></main>, { path: `/admin/workflows/drafts/${DRAFT}` });
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements"]) {
+      fireEvent.click(screen.getByRole("button", { name: "Save and continue" }));
+      await screen.findByRole("heading", { level: 2, name: next });
+    }
+    await screen.findByRole("group", { name: "Acceptance gates" });
+  };
+  pageA11y("designer rules step with an acceptance gate and storage folders", prepare);
 });
 
 describe("published versions", () => {
