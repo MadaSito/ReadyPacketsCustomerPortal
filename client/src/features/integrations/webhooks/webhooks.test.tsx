@@ -7,9 +7,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { AppRouter } from "@server/trpc/root";
 import type { WebhookDeliveryDetailView, WebhookDeliveryListItemView } from "@server/modules/integrations/webhooks/types";
 import { RouteFocus } from "@/app/RouteFocus";
+import { visibleNav } from "@/app/shell/common";
 import { TRPCProvider } from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
+import { integrationsFeature } from "../routes";
 import DeliveriesPage from "./DeliveriesPage";
 import InboundPage from "./InboundPage";
 import SubscriptionsPage from "./SubscriptionsPage";
@@ -88,6 +90,17 @@ function renderWebhooks(page: ReactElement, title: string, path: string,
 }
 
 describe("Webhooks administration", () => {
+  it("registers the three admin routes and leaves webhook settings discoverable when disabled", () => {
+    for (const path of Object.values(WEBHOOK_PATHS)) {
+      expect(integrationsFeature.routes.find((route) => route.path === path)).toMatchObject({ access: "admin", capability: "webhooks.manage" });
+    }
+    const webhookNav = (integrationsFeature.nav ?? []).filter((item) => item.href === WEBHOOK_PATHS.subscriptions);
+    expect(visibleNav(webhookNav, "console", "admin")).toHaveLength(1);
+    expect(webhookNav[0]?.enabledBy).toBeUndefined();
+    expect(visibleNav(webhookNav, "console", "staff")).toEqual([]);
+    expect(visibleNav(webhookNav, "console", "customer")).toEqual([]);
+  });
+
   const pages = [
     { key: "subscriptions", Page: SubscriptionsPage, title: "Webhook subscriptions", table: "Outbound subscriptions" },
     { key: "inbound", Page: InboundPage, title: "Inbound webhook endpoints", table: "Inbound endpoints" },
@@ -192,7 +205,7 @@ describe("Webhooks administration", () => {
     const get = vi.fn(() => detail);
     const verify = vi.fn(async () => ({ ok: true as const }));
     const view = renderWebhooks(<DeliveriesPage />, "Webhook deliveries", WEBHOOK_PATHS.deliveries,
-      { "deliveries.get": get, "deliveries.redeliver": redeliver }, fakeAuthApi({ stepUp: verify }));
+      { "settings.get": () => ({ ...settings, enabled: true }), "deliveries.get": get, "deliveries.redeliver": redeliver }, fakeAuthApi({ stepUp: verify }));
     const table = await screen.findByRole("table", { name: "Webhook delivery records" });
     expect(get).not.toHaveBeenCalled();
     await user.click(within(table).getByRole("button", { name: `Details for delivery ${deliveryId}` }));
@@ -232,6 +245,7 @@ describe("Webhooks administration", () => {
     const reprocess = vi.fn(() => ({ ...eventDetail, publicId: rerunId, isReplay: true }));
     const redeliver = vi.fn();
     renderWebhooks(<DeliveriesPage />, "Webhook deliveries", WEBHOOK_PATHS.deliveries, {
+      "settings.get": () => ({ ...settings, enabled: true }),
       "deliveries.get": () => eventDetail, "deliveries.reprocessInbound": reprocess, "deliveries.redeliver": redeliver,
     });
     const table = await screen.findByRole("table", { name: "Webhook delivery records" });
@@ -244,5 +258,16 @@ describe("Webhooks administration", () => {
     expect(await screen.findByRole("button", { name: "View rerun" })).toBeVisible();
     expect(reprocess).toHaveBeenCalledExactlyOnceWith({ publicId: deliveryId });
     expect(redeliver).not.toHaveBeenCalled();
+  });
+
+  it("keeps delivery details available while off without offering rerun", async () => {
+    const user = userEvent.setup();
+    renderWebhooks(<DeliveriesPage />, "Webhook deliveries", WEBHOOK_PATHS.deliveries);
+    const table = await screen.findByRole("table", { name: "Webhook delivery records" });
+    await user.click(within(table).getByRole("button", { name: `Details for delivery ${deliveryId}` }));
+    const dialog = screen.getByRole("dialog", { name: "Webhook delivery detail" });
+    expect(await within(dialog).findByText(/enable webhooks under subscriptions/iu)).toBeVisible();
+    expect(within(dialog).getByRole("table", { name: "Delivery attempts" })).toBeVisible();
+    expect(within(dialog).queryByRole("button", { name: "Redeliver webhook" })).not.toBeInTheDocument();
   });
 });

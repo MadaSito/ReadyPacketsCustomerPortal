@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link } from "wouter";
 import type { ListWebhookDeliveriesInput, WebhookDeliveryDetailView, WebhookDeliveryStatus } from "@server/modules/integrations/webhooks/types";
@@ -43,10 +43,10 @@ function DeliveryFilters({ apply }: { apply: (input: ListWebhookDeliveriesInput)
       });
     }}>
       <div className="grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        <Field label="Search"><Input type="search" value={form.search} maxLength={128} onChange={(event) => update("search", event.target.value)} /></Field>
+        <Field label="Search"><Input type="search" value={form.search} maxLength={120} onChange={(event) => update("search", event.target.value)} /></Field>
         <Field label="Direction"><Select options={directions} value={form.direction} onChange={(event) => update("direction", event.target.value)} /></Field>
         <Field label="Status"><Select options={statusOptions} value={form.status} onChange={(event) => update("status", event.target.value)} /></Field>
-        <Field label="Event key"><Input value={form.eventKey} maxLength={128} onChange={(event) => update("eventKey", event.target.value)} /></Field>
+        <Field label="Event key"><Input value={form.eventKey} maxLength={120} onChange={(event) => update("eventKey", event.target.value)} /></Field>
         <Field label="Subscription ID"><Input value={form.subscriptionPublicId} maxLength={26} pattern={ulidPattern} onChange={(event) => update("subscriptionPublicId", event.target.value)} /></Field>
         <Field label="Inbound endpoint ID"><Input value={form.inboundEndpointPublicId} maxLength={26} pattern={ulidPattern} onChange={(event) => update("inboundEndpointPublicId", event.target.value)} /></Field>
         <Field label="Start date (UTC)"><Input type="date" value={form.from} onChange={(event) => { update("from", event.target.value); setTimeError(undefined); }} /></Field>
@@ -75,7 +75,8 @@ function Payload({ label, value }: { label: string; value: string | Record<strin
 function DeliveryDetails({ id, close, onReplay }: { id: string; close: () => void; onReplay: (publicId: string) => void }) {
   const client = useTRPCClient();
   const rpc = client.integrations.admin.webhooks.deliveries;
-  const trpc = useTRPC().integrations.admin.webhooks.deliveries;
+  const trpc = useTRPC().integrations.admin.webhooks;
+  const settings = useQuery(trpc.settings.get.queryOptions());
   const act = useWebhookAction();
   const qc = useQueryClient();
   const [result, setResult] = useState<WebhookDeliveryDetailView | null>(null);
@@ -98,14 +99,14 @@ function DeliveryDetails({ id, close, onReplay }: { id: string; close: () => voi
   const replayBlocked = result && (result.bodyTruncated || result.bodyPurged || !result.canReplay);
 
   async function replay() {
-    if (!agreed || busy || replayBlocked || !result) return;
+    if (!agreed || busy || replayBlocked || !result || !settings.data?.enabled) return;
     setReplayError(null);
     setBusy(true);
     try {
       const next = await act(() => inbound ? rpc.reprocessInbound.mutate({ publicId: id }) : rpc.redeliver.mutate({ publicId: id }),
         { reason: "Re-running a webhook requires fresh verification." });
       if (next) {
-        void qc.invalidateQueries(trpc.list.pathFilter());
+        void qc.invalidateQueries(trpc.deliveries.list.pathFilter());
         onReplay(next.publicId);
       }
     } catch (failure) {
@@ -144,6 +145,9 @@ function DeliveryDetails({ id, close, onReplay }: { id: string; close: () => voi
       ]} />
       {replayBlocked ? <Callout tone="info">{result.bodyTruncated ? "The stored body was truncated and cannot be rerun."
         : result.bodyPurged ? "The stored body was removed and cannot be rerun." : "This delivery is not eligible for a rerun."}</Callout>
+        : settings.isError ? <ErrorState title="Could not check webhook settings" error={settings.error} onRetry={() => void settings.refetch()} />
+        : settings.isPending ? <Skeleton lines={2} />
+        : !settings.data.enabled ? <Callout tone="info">Enable webhooks under Subscriptions → Settings to rerun this delivery.</Callout>
         : <Card title={replayAction} headingLevel={3}>
           <div className="grid min-w-0 gap-3">
             <Checkbox label={inbound ? "I understand this may start automations again." : "I understand the destination may receive this event again."}
