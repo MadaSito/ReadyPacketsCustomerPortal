@@ -293,4 +293,66 @@ describe("Order acceptance on assembled customer write paths", () => {
     expect(reclassified).toMatchObject({ blocking: true, gates: [expect.objectContaining({ policy: null, acceptance: null })] });
     expect(JSON.stringify(reclassified)).not.toContain(updatedText);
   });
+
+  it("applies a named gate on leaving its step and retains evidence when reacceptance is disabled", async () => {
+    Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
+    const policy = Browser.ok(await admin.browser.mutate<{
+      documentPublicId: string; draftVersionPublicId: string; contentHash: string;
+    }>(`${policyAdmin}.createDocument`, {
+      slug: "synthetic-step-policy", title: "Synthetic step policy", audience: "customer", requiresAcceptance: false,
+      requiresTypedSignature: false, versionLabel: "1.0", contentFormat: "plain_text", bodyText: "Synthetic policy for the review step.",
+    }));
+    Browser.ok(await admin.browser.mutate(`${policyAdmin}.publishVersion`, { versionPublicId: policy.draftVersionPublicId }));
+    const name = "Synthetic named acceptance step";
+    const { publicId: draftId } = Browser.ok(await admin.browser.mutate<{ publicId: string }>(`${workflowDrafts}.create`, {
+      from: "blank", workflowKey: "named_acceptance_fixture", name,
+    }));
+    const edge = (from: string, to: string) => ({ from, to, allowedBy: ["customer", "admin"], notifyCustomer: false, requiresNote: false });
+    Browser.ok(await admin.browser.mutate(`${workflowDrafts}.save`, {
+      draftId, expectedVersion: 1, name,
+      definition: {
+        acceptanceGates: [{
+          key: gateKey, policyPublicId: policy.documentPublicId, point: { stepKey: "review" },
+          signatureMode: "checkbox", askAgainOnNewVersion: false,
+        }],
+        states: [
+          { key: "submitted", label: "Submitted", customerLabel: "Submitted", kind: "initial", tone: "info" },
+          { key: "review", label: "Review", customerLabel: "Review", kind: "active", tone: "info" },
+          { key: "completed", label: "Completed", customerLabel: "Completed", kind: "terminal", tone: "success" },
+        ],
+        transitions: [edge("submitted", "review"), edge("review", "completed")],
+      },
+    }));
+    Browser.ok(await admin.browser.mutate(`${workflowDrafts}.publish`, { draftId, expectedVersion: 2, makeDefault: true }));
+
+    const { publicId: orderId, version } = await createOrder("named-gate");
+    const read = async () => Browser.ok(await owner.browser.query("compliance.acceptance.forOrder", { orderId }));
+    expect(await read()).toMatchObject({ blocking: false, gates: [expect.objectContaining({ applies: false })] });
+    const entered = Browser.ok(await owner.browser.mutate<{ version: number }>("orders.transition", { orderId, expectedVersion: version, toStatus: "review" }));
+    expect(await read()).toMatchObject({ blocking: true, gates: [expect.objectContaining({ applies: true })] });
+    const submit = { orderId, expectedVersion: entered.version, toStatus: "completed" };
+    expectBlocked(await owner.browser.mutate("orders.transition", submit));
+    Browser.ok(await owner.browser.mutate("compliance.acceptance.accept", {
+      orderId, gateKey, policyVersionId: policy.draftVersionPublicId, textSha256: policy.contentHash,
+    }));
+    const latest = Browser.ok(await admin.browser.mutate<{ versionPublicId: string }>(`${policyAdmin}.createDraftVersion`, {
+      documentPublicId: policy.documentPublicId, versionLabel: "2.0", contentFormat: "plain_text", bodyText: "Updated synthetic review policy.",
+    }));
+    Browser.ok(await admin.browser.mutate(`${policyAdmin}.publishVersion`, { versionPublicId: latest.versionPublicId }));
+    expect(await read()).toMatchObject({
+      blocking: false, gates: [expect.objectContaining({
+        policy: expect.objectContaining({ versionId: latest.versionPublicId }),
+        acceptance: expect.objectContaining({ versionNumber: 1 }),
+      })],
+    });
+    Browser.ok(await owner.browser.mutate("orders.transition", submit));
+
+    const staffControl = await createOrder("named-gate-staff");
+    const reviewed = Browser.ok(await admin.browser.mutate<{ version: number }>("orders.transition", {
+      orderId: staffControl.publicId, expectedVersion: staffControl.version, toStatus: "review",
+    }));
+    Browser.ok(await admin.browser.mutate("orders.transition", {
+      orderId: staffControl.publicId, expectedVersion: reviewed.version, toStatus: "completed",
+    }));
+  });
 });
