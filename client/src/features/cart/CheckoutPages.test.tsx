@@ -46,8 +46,9 @@ const cart: CartViewData = {
     tierOptions: [], name: "Synthetic add-on", description: "", outcome: "", timeline: "", quantity: 1,
     unitPriceMinor: 1600, lineTotalMinor: 1600, currency: "USD", available: true }],
   hasUnavailableItems: false, mixedCurrency: false, paymentProvider: "none", paymentEnvironment: "test", onlinePaymentEnabled: false,
+  promotionsEnabled: false, promoNotice: null, upsells: [],
   totals: { currency: "USD", subtotalMinor: 1600, discountMinor: 200, discountLabel: "Bundle savings", subtotalAfterDiscountMinor: 1400,
-    taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, bundle: null },
+    taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, bundle: null, promo: null },
   pendingPolicies: [requiredPolicy], updatedAt: date,
 };
 const pending: CheckoutStatus = {
@@ -55,6 +56,7 @@ const pending: CheckoutStatus = {
   attemptPublicId: attemptId, attemptStatus: "redirected", failureReasonCode: null, orderPublicId: orderId,
   orderReference: "RP-SYNTHETIC", invoicePublicId: invoiceId, invoiceNumber: "INV-SYNTHETIC",
   invoiceStatus: "issued", currency: "USD", subtotalMinor: 1600, discountMinor: 200, discountLabel: "Bundle savings",
+  promoDiscountMinor: 0, promoLabel: null,
   taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, balanceDueMinor: 1540, canRestoreToCart: true, alreadyRestored: false,
   checkedOutAt: date,
 };

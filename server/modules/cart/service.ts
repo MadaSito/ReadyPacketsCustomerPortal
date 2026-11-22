@@ -21,11 +21,16 @@ import { users } from "../identity/schema.js";
 import type { CatalogGroupView, CatalogProductView } from "../orders/catalog.js";
 import { readSetting } from "../platform/index.js";
 import {
+  assertValidPromotionOutcome,
   cartCompliancePort,
   cartOrdersPort,
   cartPaymentsPort,
   computeCartBundlePricing,
   createCartActorCheck,
+  isPromotionsEnabledForCart,
+  promoNotApplicable,
+  requireCartPromotionsPort,
+  type CartPromotionContext,
 } from "./ports.js";
 import { cartItems, carts, type CartItemRow, type CartRow } from "./schema.js";
 import { CART_ABANDONED_TTL_HOURS, CART_FEATURE_FLAG } from "./settings.js";
@@ -34,8 +39,10 @@ import {
   type AdminOpenCartDetail,
   type AdminOpenCartSummary,
   type BillingDetailsInput,
+  type CartAppliedPromoView,
   type CartLineView,
   type CartModule,
+  type CartPromoNoticeView,
   type CartTierOptionView,
   type CartTotalsView,
   type CartView,
@@ -44,6 +51,7 @@ import {
   type PacketTierName,
   type RestoreCheckoutResult,
 } from "./types.js";
+import { createCartUpsellService } from "./upsell.js";
 
 export const CART_JOB_EXPIRE_ABANDONED = "cart.abandoned.expire";
 export const CART_SCHEDULE_EXPIRE_ABANDONED = "cart.abandoned.hourly";
@@ -144,6 +152,20 @@ export function createCartService(deps: ModuleDeps): CartModule {
     }
   };
 
+  /** Encrypts raw promo code with cart-bound AAD (`carts.promo_code:<publicId>`). Never log raw codes! */
+  const encryptPromoCode = (code: string, cartPublicId: string): string =>
+    deps.crypto.encrypt(code, `carts.promo_code:${cartPublicId}`);
+
+  const decryptPromoCode = (promoEnc: string | null, cartPublicId: string): string | null => {
+    if (!promoEnc) return null;
+    try {
+      return deps.crypto.decrypt(promoEnc, `carts.promo_code:${cartPublicId}`);
+    } catch {
+      deps.logger.warn("cart promotional code ciphertext could not be decrypted", { cartPublicId });
+      return null;
+    }
+  };
+
   async function denyCartAuthz(
     principal: SessionPrincipal,
     reasonCode: string,
@@ -188,21 +210,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
     if (!enabled) throw cartFeatureDisabled();
   }
 
-  /** Computes live line items + server totals from active catalogue, bundle rule, and compliance tax rate. */
-  async function computeLiveLinesAndTotals(
+  function mapRowsToLiveLines(
     itemRows: readonly CartItemRow[],
     catalogMap: ReadonlyMap<string, IndexedCatalogProduct>,
-    bundleRule: Awaited<ReturnType<ReturnType<typeof cartOrdersPort>["getBundleRule"]>>,
-    billingCountry: string | null,
-    billingRegion: string | null,
-    tx?: DbOrTx,
-  ): Promise<{
-    lines: CartLineView[];
-    hasUnavailableItems: boolean;
-    mixedCurrency: boolean;
-    totals: CartTotalsView;
-  }> {
-    const lines: CartLineView[] = itemRows.map((row) => {
+  ): CartLineView[] {
+    return itemRows.map((row) => {
       const entry = catalogMap.get(row.productPublicId);
       if (!entry || !entry.product.active) {
         const unitPriceMinor = row.snapshotUnitPriceMinor ?? 0;
@@ -248,6 +260,31 @@ export function createCartService(deps: ModuleDeps): CartModule {
         available: true,
       };
     });
+  }
+
+  /** Computes live line items + server totals from active catalogue, bundle rule, promotions, and compliance tax rate. */
+  async function computeLiveLinesAndTotals(
+    itemRows: readonly CartItemRow[],
+    catalogMap: ReadonlyMap<string, IndexedCatalogProduct>,
+    bundleRule: Awaited<ReturnType<ReturnType<typeof cartOrdersPort>["getBundleRule"]>>,
+    billingCountry: string | null,
+    billingRegion: string | null,
+    tx?: DbOrTx,
+    promoInput?: {
+      ownerUserId: number;
+      actorUserId: number;
+      hasStoredPromo: boolean;
+      storedCode: string | null;
+      storedLabel: string | null;
+    },
+  ): Promise<{
+    lines: CartLineView[];
+    hasUnavailableItems: boolean;
+    mixedCurrency: boolean;
+    totals: CartTotalsView;
+    promoNotice: CartPromoNoticeView | null;
+  }> {
+    const lines = mapRowsToLiveLines(itemRows, catalogMap);
 
     const availableLines = lines.filter((l) => l.available);
     const hasUnavailableItems = availableLines.length !== lines.length;
@@ -256,10 +293,18 @@ export function createCartService(deps: ModuleDeps): CartModule {
     const currency = currencies.size === 1 ? [...currencies][0]! : null;
 
     if (availableLines.length === 0 || mixedCurrency || !currency) {
+      const promoNotice: CartPromoNoticeView | null = promoInput?.hasStoredPromo
+        ? {
+            reasonCode: "PROMO_NOT_ELIGIBLE_ITEMS",
+            message: "Add eligible items to your cart to apply your discount code.",
+            previousLabel: promoInput.storedLabel,
+          }
+        : null;
       return {
         lines,
         hasUnavailableItems,
         mixedCurrency,
+        promoNotice,
         totals: {
           currency,
           subtotalMinor: 0,
@@ -270,6 +315,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
           taxMinor: 0,
           totalMinor: 0,
           bundle: null,
+          promo: null,
         },
       };
     }
@@ -283,9 +329,70 @@ export function createCartService(deps: ModuleDeps): CartModule {
       bundleRule,
     );
 
+    let discountMinor = bundlePricing.discountMinor;
+    let discountLabel = bundlePricing.discountLabel;
+    let subtotalAfterDiscountMinor = bundlePricing.subtotalAfterDiscountMinor;
+    let appliedPromo: CartAppliedPromoView | null = null;
+    let promoNotice: CartPromoNoticeView | null = null;
+
+    if (promoInput?.hasStoredPromo) {
+      if (!promoInput.storedCode) {
+        promoNotice = {
+          reasonCode: "PROMO_NOT_APPLICABLE",
+          message: "Your previously applied discount code is no longer valid and was removed from the total.",
+          previousLabel: promoInput.storedLabel,
+        };
+      } else {
+        try {
+          const promoPort = await requireCartPromotionsPort(deps.services, tx);
+          const promoCtx: CartPromotionContext = {
+            code: promoInput.storedCode,
+            customerUserId: promoInput.ownerUserId,
+            actorUserId: promoInput.actorUserId,
+            currency,
+            lines: availableLines.map((l) => ({
+              productPublicId: l.productPublicId,
+              packetNumber: l.packetNumber,
+              tierKey: l.tier,
+              lineTotalMinor: l.lineTotalMinor,
+            })),
+            subtotalMinor: bundlePricing.subtotalMinor,
+            bundleDiscountMinor: bundlePricing.discountMinor,
+            bundleLabel: bundlePricing.discountLabel,
+          };
+          const outcome = await promoPort.preview(promoCtx, {
+            ...(tx ? { tx } : {}),
+            recheck: true,
+          });
+          assertValidPromotionOutcome(outcome, bundlePricing.subtotalMinor);
+          discountMinor = outcome.discountMinor;
+          discountLabel = outcome.discountLabel;
+          subtotalAfterDiscountMinor = outcome.totalMinor;
+          appliedPromo = {
+            promoPublicId: outcome.promoPublicId,
+            label: outcome.label,
+            promoDiscountMinor: outcome.promoDiscountMinor,
+            bundleDiscountMinor: outcome.bundleDiscountMinor,
+          };
+        } catch (err) {
+          const reasonCode = err instanceof DomainError ? err.reasonCode : "PROMO_NOT_APPLICABLE";
+          const specificSafe =
+            err instanceof DomainError &&
+            (err.reasonCode === "PROMO_MIN_SUBTOTAL" || err.reasonCode === "PROMO_NOT_ELIGIBLE_ITEMS")
+              ? err.safeMessage
+              : "Your previously applied discount code is no longer valid and was removed from the total.";
+          promoNotice = {
+            reasonCode,
+            message: specificSafe,
+            previousLabel: promoInput.storedLabel,
+          };
+        }
+      }
+    }
+
     const taxQuote = await cartCompliancePort(deps.services).quoteTaxMinor(
       {
-        subtotalAfterDiscountMinor: bundlePricing.subtotalAfterDiscountMinor,
+        subtotalAfterDiscountMinor,
         currency,
         billingCountry,
         billingRegion,
@@ -293,7 +400,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
       tx,
     );
 
-    const totalMinor = bundlePricing.subtotalAfterDiscountMinor + taxQuote.taxMinor;
+    const totalMinor = subtotalAfterDiscountMinor + taxQuote.taxMinor;
     if (!Number.isSafeInteger(totalMinor)) {
       throw validation("AMOUNT_TOO_LARGE", "The cart total is too large.");
     }
@@ -302,21 +409,44 @@ export function createCartService(deps: ModuleDeps): CartModule {
       lines,
       hasUnavailableItems,
       mixedCurrency,
+      promoNotice,
       totals: {
         currency,
         subtotalMinor: bundlePricing.subtotalMinor,
-        discountMinor: bundlePricing.discountMinor,
-        discountLabel: bundlePricing.discountLabel,
-        subtotalAfterDiscountMinor: bundlePricing.subtotalAfterDiscountMinor,
+        discountMinor,
+        discountLabel,
+        subtotalAfterDiscountMinor,
         taxRateBps: taxQuote.taxRateBps,
         taxMinor: taxQuote.taxMinor,
         totalMinor,
         bundle: bundlePricing.bundle,
+        promo: appliedPromo,
       },
     };
   }
 
-  async function hydrateOpenCartForUser(userId: number, tx?: Tx): Promise<CartView> {
+  async function computeLiveLinesForCart(
+    cartId: number,
+    catalogMap: ReadonlyMap<string, IndexedCatalogProduct>,
+    dbOrTx: DbOrTx,
+  ): Promise<CartLineView[]> {
+    const rows = await dbOrTx
+      .select()
+      .from(cartItems)
+      .where(eq(cartItems.cartId, cartId))
+      .orderBy(asc(cartItems.position), asc(cartItems.id));
+    return mapRowsToLiveLines(rows, catalogMap);
+  }
+
+  // Forward-declared so `upsellService` and `hydrateOpenCartForUser` can reference one another cleanly.
+  // eslint-disable-next-line prefer-const
+  let upsellService: ReturnType<typeof createCartUpsellService>;
+
+  async function hydrateOpenCartForUser(
+    userId: number,
+    tx?: Tx,
+    opts?: { recordImpressions?: boolean },
+  ): Promise<CartView> {
     const dbOrTx: DbOrTx = tx ?? deps.db;
     const ordersSvc = cartOrdersPort(deps.services);
     const complianceSvc = cartCompliancePort(deps.services);
@@ -336,17 +466,21 @@ export function createCartService(deps: ModuleDeps): CartModule {
           .orderBy(asc(cartItems.position), asc(cartItems.id))
       : [];
 
-    const [catalogGroups, bundleRule, paymentConfig, onlineEnabled, pendingPolicies] = await Promise.all([
-      ordersSvc.listActiveCatalog(),
-      ordersSvc.getBundleRule(tx),
-      paymentsSvc.getPublicCheckoutConfig(dbOrTx),
-      paymentsSvc.isOnlineCheckoutEnabled(dbOrTx),
-      complianceSvc.requiredAcceptancesFor(userId, { audience: "customer", ...(tx ? { tx } : {}) }),
-    ]);
+    const [catalogGroups, bundleRule, paymentConfig, onlineEnabled, pendingPolicies, promotionsEnabled] =
+      await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(tx),
+        paymentsSvc.getPublicCheckoutConfig(dbOrTx),
+        paymentsSvc.isOnlineCheckoutEnabled(dbOrTx),
+        complianceSvc.requiredAcceptancesFor(userId, { audience: "customer", ...(tx ? { tx } : {}) }),
+        isPromotionsEnabledForCart(deps.services, dbOrTx),
+      ]);
 
     const catalogMap = indexCatalog(catalogGroups);
     const billing = openCart ? decryptBilling(openCart.billingEnc, openCart.publicId) : null;
     const note = openCart ? decryptNote(openCart.noteEnc, openCart.publicId) : "";
+    const hasStoredPromo = Boolean(openCart?.appliedPromoCodeEnc);
+    const storedPromoCode = openCart ? decryptPromoCode(openCart.appliedPromoCodeEnc, openCart.publicId) : null;
 
     const computed = await computeLiveLinesAndTotals(
       itemRows,
@@ -355,7 +489,27 @@ export function createCartService(deps: ModuleDeps): CartModule {
       openCart?.billingCountry ?? billing?.country ?? null,
       openCart?.billingRegion ?? billing?.region ?? null,
       dbOrTx,
+      openCart
+        ? {
+            ownerUserId: openCart.ownerUserId,
+            actorUserId: userId,
+            hasStoredPromo,
+            storedCode: storedPromoCode,
+            storedLabel: openCart.appliedPromoLabel ?? null,
+          }
+        : undefined,
     );
+
+    const availableLines = computed.lines.filter((l) => l.available);
+    const upsells = await upsellService.computeForOpenCart({
+      openCart,
+      availableLines,
+      catalogGroups,
+      catalogMap,
+      bundleRule,
+      dbOrTx,
+      recordImpressions: Boolean(opts?.recordImpressions && !tx),
+    });
 
     const itemCount = computed.lines.reduce((sum, l) => sum + l.quantity, 0);
 
@@ -371,6 +525,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
       hasUnavailableItems: computed.hasUnavailableItems,
       mixedCurrency: computed.mixedCurrency,
       totals: computed.totals,
+      upsells,
+      promotionsEnabled,
+      promoNotice: computed.promoNotice,
       paymentProvider: paymentConfig.provider,
       paymentEnvironment: paymentConfig.mode,
       onlinePaymentEnabled: onlineEnabled,
@@ -504,6 +661,18 @@ export function createCartService(deps: ModuleDeps): CartModule {
     });
   }
 
+  upsellService = createCartUpsellService({
+    deps,
+    actorCheck,
+    indexCatalog,
+    assertCustomerPrecheck,
+    assertCartEnabled,
+    denyCartAuthz,
+    bumpCartVersionInTx,
+    hydrateOpenCartForUser,
+    computeLiveLines: computeLiveLinesForCart,
+  });
+
   let initialized = false;
 
   return {
@@ -571,7 +740,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
     async getMyCart(principal) {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
     },
 
     async addItems(principal, input) {
@@ -731,7 +900,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
     },
 
     async updateItem(principal, input) {
@@ -825,7 +994,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
     },
 
     async removeItem(principal, input) {
@@ -863,7 +1032,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
     },
 
     async clearCart(principal, input) {
@@ -879,7 +1048,12 @@ export function createCartService(deps: ModuleDeps): CartModule {
         const cart = await requireOpenCartWithVersionInTx(tx, principal.userId, input.expectedVersion);
         const [deleted] = await tx.delete(cartItems).where(eq(cartItems.cartId, cart.id));
 
-        await bumpCartVersionInTx(tx, cart, now);
+        await bumpCartVersionInTx(tx, cart, now, {
+          appliedPromoCodeEnc: null,
+          appliedPromoPublicId: null,
+          appliedPromoLabel: null,
+          appliedPromoIdempotencyKey: null,
+        });
 
         await deps.audit.record(
           {
@@ -895,7 +1069,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
     },
 
     async saveDraftDetails(principal, input) {
@@ -943,7 +1117,253 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId);
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+    },
+
+    async applyCode(principal, input) {
+      await assertCustomerPrecheck(principal);
+      await assertCartEnabled();
+
+      // Verify promotions module & feature switch first; uniform error when disabled or absent (D3 / §3).
+      const promoPort = await requireCartPromotionsPort(deps.services);
+
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [openCartRows, catalogGroups, bundleRule] = await Promise.all([
+        deps.db
+          .select()
+          .from(carts)
+          .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.status, "open")))
+          .limit(1),
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
+
+      const openCart = openCartRows[0];
+      if (!openCart) {
+        throw validation("PROMO_NOT_ELIGIBLE_ITEMS", "Add items to your cart before applying a discount code.");
+      }
+
+      // Idempotent replay with the same `(idempotencyKey, normalized code)` produces one effect (§4);
+      // reusing the same idempotencyKey for a different code is rejected (`CONFLICT`).
+      const normalizedInputCode = input.code.trim().toUpperCase();
+      if (
+        input.idempotencyKey &&
+        openCart.appliedPromoIdempotencyKey === input.idempotencyKey &&
+        openCart.appliedPromoCodeEnc
+      ) {
+        const existingCode = decryptPromoCode(openCart.appliedPromoCodeEnc, openCart.publicId);
+        if (existingCode?.trim().toUpperCase() !== normalizedInputCode) {
+          throw conflict("IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different discount code.");
+        }
+        return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      }
+
+      const itemRows = await deps.db
+        .select()
+        .from(cartItems)
+        .where(eq(cartItems.cartId, openCart.id))
+        .orderBy(asc(cartItems.position), asc(cartItems.id));
+
+      const catalogMap = indexCatalog(catalogGroups);
+      const lines = mapRowsToLiveLines(itemRows, catalogMap);
+      const availableLines = lines.filter((l) => l.available);
+      const currencies = new Set(availableLines.map((l) => l.currency));
+      const currency = currencies.size === 1 ? [...currencies][0]! : null;
+
+      if (availableLines.length === 0 || !currency) {
+        throw validation("PROMO_NOT_ELIGIBLE_ITEMS", "Add eligible items to your cart before applying a discount code.");
+      }
+
+      const bundlePricing = computeCartBundlePricing(
+        availableLines.map((l) => ({
+          packetNumber: l.packetNumber,
+          quantity: l.quantity,
+          lineTotalMinor: l.lineTotalMinor,
+        })),
+        bundleRule,
+      );
+
+      // Call `preview` BEFORE opening the cart write transaction so failed guesses commit their rate-limit counters in `promotions`.
+      const outcome = await promoPort.preview({
+        code: input.code,
+        customerUserId: principal.userId,
+        actorUserId: principal.userId,
+        currency,
+        lines: availableLines.map((l) => ({
+          productPublicId: l.productPublicId,
+          packetNumber: l.packetNumber,
+          tierKey: l.tier,
+          lineTotalMinor: l.lineTotalMinor,
+        })),
+        subtotalMinor: bundlePricing.subtotalMinor,
+        bundleDiscountMinor: bundlePricing.discountMinor,
+        bundleLabel: bundlePricing.discountLabel,
+      });
+      assertValidPromotionOutcome(outcome, bundlePricing.subtotalMinor);
+
+      await deps.db.transaction(async (tx) => {
+        const liveActor = await actorCheck(principal, tx, "orders.create");
+        if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+        await assertCartEnabled(tx);
+        await requireCartPromotionsPort(deps.services, tx);
+
+        const [lockedCart] = await tx
+          .select()
+          .from(carts)
+          .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.status, "open")))
+          .for("update")
+          .limit(1);
+        if (!lockedCart) {
+          throw validation("PROMO_NOT_ELIGIBLE_ITEMS", "Add items to your cart before applying a discount code.");
+        }
+
+        if (
+          input.idempotencyKey &&
+          lockedCart.appliedPromoIdempotencyKey === input.idempotencyKey &&
+          lockedCart.appliedPromoCodeEnc
+        ) {
+          const existingCode = decryptPromoCode(lockedCart.appliedPromoCodeEnc, lockedCart.publicId);
+          if (existingCode?.trim().toUpperCase() !== normalizedInputCode) {
+            throw conflict("IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different discount code.");
+          }
+          return;
+        }
+
+        // Re-verify live cart lines and promotion eligibility inside the cart lock (`recheck: true` so passive
+        // verification inside `tx` does not double-count entry rate limits).
+        const lockedItemRows = await tx
+          .select()
+          .from(cartItems)
+          .where(eq(cartItems.cartId, lockedCart.id))
+          .orderBy(asc(cartItems.position), asc(cartItems.id))
+          .for("update");
+        const [lockedCatalogGroups, lockedBundleRule] = await Promise.all([
+          ordersSvc.listActiveCatalog(),
+          ordersSvc.getBundleRule(tx),
+        ]);
+        const lockedCatalogMap = indexCatalog(lockedCatalogGroups);
+        const lockedLines = mapRowsToLiveLines(lockedItemRows, lockedCatalogMap).filter((l) => l.available);
+        const lockedCurrencies = new Set(lockedLines.map((l) => l.currency));
+        const lockedCurrency = lockedCurrencies.size === 1 ? [...lockedCurrencies][0]! : null;
+        if (lockedLines.length === 0 || !lockedCurrency) {
+          throw validation("PROMO_NOT_ELIGIBLE_ITEMS", "Add eligible items to your cart before applying a discount code.");
+        }
+        const lockedBundle = computeCartBundlePricing(
+          lockedLines.map((l) => ({
+            packetNumber: l.packetNumber,
+            quantity: l.quantity,
+            lineTotalMinor: l.lineTotalMinor,
+          })),
+          lockedBundleRule,
+        );
+        const verifiedOutcome = await promoPort.preview(
+          {
+            code: input.code,
+            customerUserId: principal.userId,
+            actorUserId: principal.userId,
+            currency: lockedCurrency,
+            lines: lockedLines.map((l) => ({
+              productPublicId: l.productPublicId,
+              packetNumber: l.packetNumber,
+              tierKey: l.tier,
+              lineTotalMinor: l.lineTotalMinor,
+            })),
+            subtotalMinor: lockedBundle.subtotalMinor,
+            bundleDiscountMinor: lockedBundle.discountMinor,
+            bundleLabel: lockedBundle.discountLabel,
+          },
+          { tx, recheck: true },
+        );
+        assertValidPromotionOutcome(verifiedOutcome, lockedBundle.subtotalMinor);
+
+        const now = deps.clock.now();
+        await bumpCartVersionInTx(tx, lockedCart, now, {
+          appliedPromoCodeEnc: encryptPromoCode(input.code, lockedCart.publicId),
+          appliedPromoPublicId: verifiedOutcome.promoPublicId,
+          appliedPromoLabel: verifiedOutcome.label,
+          appliedPromoIdempotencyKey: input.idempotencyKey ?? null,
+        });
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "cart.promo.applied",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: liveActor.role },
+            resource: { type: "cart", publicId: lockedCart.publicId },
+            attributes: {
+              promo_public_id: verifiedOutcome.promoPublicId,
+              promo_label: verifiedOutcome.label,
+              promo_discount_minor: verifiedOutcome.promoDiscountMinor,
+            },
+          },
+          tx,
+        );
+      });
+
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+    },
+
+    async removeCode(principal, input) {
+      await assertCustomerPrecheck(principal);
+      await assertCartEnabled();
+
+      await deps.db.transaction(async (tx) => {
+        const liveActor = await actorCheck(principal, tx, "orders.create");
+        if (liveActor.role !== "customer") throw forbidden("CUSTOMER_ROLE_REQUIRED");
+        await assertCartEnabled(tx);
+
+        const [lockedCart] = await tx
+          .select()
+          .from(carts)
+          .where(and(eq(carts.ownerUserId, principal.userId), eq(carts.status, "open")))
+          .for("update")
+          .limit(1);
+        if (!lockedCart) return;
+
+        if (input?.expectedVersion !== undefined && lockedCart.version !== input.expectedVersion) {
+          throw staleCartVersion();
+        }
+        if (!lockedCart.appliedPromoCodeEnc) return;
+
+        const prevPromoPublicId = lockedCart.appliedPromoPublicId;
+        const prevPromoLabel = lockedCart.appliedPromoLabel;
+        const now = deps.clock.now();
+
+        await bumpCartVersionInTx(tx, lockedCart, now, {
+          appliedPromoCodeEnc: null,
+          appliedPromoPublicId: null,
+          appliedPromoLabel: null,
+          appliedPromoIdempotencyKey: null,
+        });
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "cart.promo.removed",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: liveActor.role },
+            resource: { type: "cart", publicId: lockedCart.publicId },
+            attributes: {
+              promo_public_id: prevPromoPublicId,
+              promo_label: prevPromoLabel,
+            },
+          },
+          tx,
+        );
+      });
+
+      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+    },
+
+    acceptUpsell(principal, input) {
+      return upsellService.acceptUpsell(principal, input);
+    },
+
+    dismissUpsell(principal, input) {
+      return upsellService.dismissUpsell(principal, input);
     },
 
     async checkout(principal, input) {
@@ -996,6 +1416,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
         };
       } else {
         let deniedOtherCustomerCart = false;
+        let hadAppliedPromoOnCart = false;
+        let invalidatedPromoPublicId: string | null = null;
+        let invalidatedPromoLabel: string | null = null;
         try {
           committed = await deps.db.transaction(async (tx) => {
             const liveActor = await actorCheck(principal, tx, "orders.create");
@@ -1021,6 +1444,17 @@ export function createCartService(deps: ModuleDeps): CartModule {
               throw staleCartVersion();
             }
 
+            hadAppliedPromoOnCart = Boolean(targetCart.appliedPromoCodeEnc);
+            invalidatedPromoPublicId = targetCart.appliedPromoPublicId ?? null;
+            invalidatedPromoLabel = targetCart.appliedPromoLabel ?? null;
+
+            const storedPromoCode = targetCart.appliedPromoCodeEnc
+              ? decryptPromoCode(targetCart.appliedPromoCodeEnc, targetCart.publicId)
+              : null;
+            if (hadAppliedPromoOnCart && !storedPromoCode) {
+              throw promoNotApplicable();
+            }
+
             const itemsInCart = await tx
               .select()
               .from(cartItems)
@@ -1043,7 +1477,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
             }
             await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
 
-            // Recompute live catalogue prices & bundle discount via orders.createOrderFromCheckoutInTx
+            // Recompute live catalogue prices, bundle discount & promo redemption via orders.createOrderFromCheckoutInTx
             const createdOrder = await ordersSvc.createOrderFromCheckoutInTx(
               principal,
               {
@@ -1053,12 +1487,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   quantity: item.quantity,
                 })),
                 ...(input.note ? { note: input.note } : {}),
+                ...(storedPromoCode ? { promoCode: storedPromoCode } : {}),
                 idempotencyKey: input.idempotencyKey,
               },
               tx,
             );
 
-            // Recompute server-side tax in minor units on subtotal after bundle discount
+            // Recompute server-side tax in minor units on subtotal after discount
             const taxQuote = await complianceSvc.quoteTaxMinor(
               {
                 subtotalAfterDiscountMinor: createdOrder.totalMinor,
@@ -1088,6 +1523,18 @@ export function createCartService(deps: ModuleDeps): CartModule {
               tx,
             );
 
+            if (input.expectedTotalMinor !== undefined && issuedInvoice.totalMinor !== input.expectedTotalMinor) {
+              throw new DomainError(
+                "CONFLICT",
+                "TOTAL_CHANGED_RECONFIRM",
+                "Your order total has changed. Your order was not placed — please review the updated total and confirm again.",
+                {
+                  newTotalMinor: issuedInvoice.totalMinor,
+                  currency: issuedInvoice.currency,
+                },
+              );
+            }
+
             const now = deps.clock.now();
 
             // Persist authoritative billed snapshots onto cart_items for auditability & cancel-restoration display
@@ -1107,6 +1554,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
               }
             }
 
+            const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
+            const promoLabel = createdOrder.promoLabel ?? null;
+
             const nextVersion = targetCart.version + 1;
             const [casUpdate] = await tx
               .update(carts)
@@ -1118,6 +1568,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 billingEnc: encryptBilling(input.billing, targetCart.publicId),
                 billingCountry: input.billing.country,
                 billingRegion: input.billing.region || null,
+                // Wipe raw code ciphertext post-checkout; retain public ID & customer-facing label snapshot only.
+                appliedPromoCodeEnc: null,
+                appliedPromoIdempotencyKey: null,
                 checkoutIdempotencyKey: input.idempotencyKey,
                 checkoutOrderId: createdOrder.id,
                 checkoutOrderPublicId: createdOrder.publicId,
@@ -1129,6 +1582,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 checkedOutSubtotalMinor: issuedInvoice.subtotalMinor,
                 checkedOutDiscountMinor: issuedInvoice.discountMinor,
                 checkedOutDiscountLabel: createdOrder.discountLabel,
+                checkedOutPromoDiscountMinor: promoDiscountMinor,
+                checkedOutPromoLabel: promoLabel,
                 checkedOutTaxRateBps: taxQuote.taxRateBps,
                 checkedOutTaxMinor: issuedInvoice.taxMinor,
                 checkedOutTotalMinor: issuedInvoice.totalMinor,
@@ -1154,6 +1609,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
                   currency: issuedInvoice.currency,
                   subtotal_minor: issuedInvoice.subtotalMinor,
                   discount_minor: issuedInvoice.discountMinor,
+                  promo_public_id: promoDiscountMinor > 0 ? targetCart.appliedPromoPublicId : null,
+                  promo_discount_minor: promoDiscountMinor,
                   tax_minor: issuedInvoice.taxMinor,
                   total_minor: issuedInvoice.totalMinor,
                 },
@@ -1178,6 +1635,70 @@ export function createCartService(deps: ModuleDeps): CartModule {
         } catch (err) {
           if (deniedOtherCustomerCart) {
             await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: input.cartPublicId });
+            throw err;
+          }
+          // Decision D3: if an applied code stopped being valid before checkout completed, DO NOT place the order;
+          // clear the invalid code on the cart and surface the updated total for customer re-confirmation.
+          if (
+            hadAppliedPromoOnCart &&
+            err instanceof DomainError &&
+            (err.reasonCode === "PROMO_NOT_APPLICABLE" ||
+              err.reasonCode === "PROMO_MIN_SUBTOTAL" ||
+              err.reasonCode === "PROMO_NOT_ELIGIBLE_ITEMS" ||
+              err.code === "RATE_LIMITED")
+          ) {
+            await deps.db.transaction(async (cleanupTx) => {
+              const [openRow] = await cleanupTx
+                .select()
+                .from(carts)
+                .where(
+                  and(
+                    eq(carts.publicId, input.cartPublicId),
+                    eq(carts.ownerUserId, principal.userId),
+                    eq(carts.status, "open"),
+                  ),
+                )
+                .for("update")
+                .limit(1);
+              if (!openRow || !openRow.appliedPromoCodeEnc) return;
+              const now = deps.clock.now();
+              await bumpCartVersionInTx(cleanupTx, openRow, now, {
+                appliedPromoCodeEnc: null,
+                appliedPromoPublicId: null,
+                appliedPromoLabel: null,
+                appliedPromoIdempotencyKey: null,
+              });
+              await deps.audit.record(
+                {
+                  category: "business",
+                  eventName: "cart.promo.invalidated_at_checkout",
+                  action: "transition",
+                  outcome: "refused",
+                  reasonCode: err.reasonCode,
+                  actor: { userId: principal.userId, role: principal.role },
+                  resource: { type: "cart", publicId: openRow.publicId },
+                  attributes: {
+                    promo_public_id: invalidatedPromoPublicId,
+                    promo_label: invalidatedPromoLabel,
+                  },
+                },
+                cleanupTx,
+              );
+            });
+
+            const refreshed = await hydrateOpenCartForUser(principal.userId);
+            throw new DomainError(
+              "CONFLICT",
+              "PROMO_RECONFIRM_TOTAL",
+              "That discount code is no longer valid. Your order was not placed — please review the updated total and confirm again.",
+              {
+                ...(invalidatedPromoLabel ? { previousPromoLabel: invalidatedPromoLabel } : {}),
+                promoReasonCode: err.reasonCode,
+                newTotalMinor: refreshed.totals.totalMinor,
+                ...(refreshed.totals.currency ? { currency: refreshed.totals.currency } : {}),
+                cartVersion: refreshed.version,
+              },
+            );
           }
           throw err;
         }
@@ -1350,6 +1871,8 @@ export function createCartService(deps: ModuleDeps): CartModule {
         subtotalMinor: cartRow.checkedOutSubtotalMinor ?? paymentStatus.amountMinor,
         discountMinor: cartRow.checkedOutDiscountMinor ?? 0,
         discountLabel: cartRow.checkedOutDiscountLabel ?? null,
+        promoDiscountMinor: cartRow.checkedOutPromoDiscountMinor ?? 0,
+        promoLabel: cartRow.checkedOutPromoLabel ?? null,
         taxRateBps: cartRow.checkedOutTaxRateBps ?? 0,
         taxMinor: cartRow.checkedOutTaxMinor ?? 0,
         totalMinor: cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor,
@@ -1605,6 +2128,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
           const summaries: AdminOpenCartSummary[] = [];
           for (const row of slice) {
             const cItems = itemsByCartId.get(row.cart.id) ?? [];
+            const storedPromo = row.cart.appliedPromoCodeEnc
+              ? decryptPromoCode(row.cart.appliedPromoCodeEnc, row.cart.publicId)
+              : null;
             const computed = await computeLiveLinesAndTotals(
               cItems,
               catalogMap,
@@ -1612,6 +2138,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
               row.cart.billingCountry,
               row.cart.billingRegion,
               tx,
+              {
+                ownerUserId: row.cart.ownerUserId,
+                actorUserId: row.cart.ownerUserId,
+                hasStoredPromo: Boolean(row.cart.appliedPromoCodeEnc),
+                storedCode: storedPromo,
+                storedLabel: row.cart.appliedPromoLabel ?? null,
+              },
             );
             const itemCount = computed.lines.reduce((sum, l) => sum + l.quantity, 0);
             const packetSummary =
@@ -1684,6 +2217,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
             .where(eq(cartItems.cartId, row.cart.id))
             .orderBy(asc(cartItems.position), asc(cartItems.id));
 
+          const storedPromo = row.cart.appliedPromoCodeEnc
+            ? decryptPromoCode(row.cart.appliedPromoCodeEnc, row.cart.publicId)
+            : null;
           const computed = await computeLiveLinesAndTotals(
             cItems,
             catalogMap,
@@ -1691,6 +2227,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
             row.cart.billingCountry,
             row.cart.billingRegion,
             tx,
+            {
+              ownerUserId: row.cart.ownerUserId,
+              actorUserId: row.cart.ownerUserId,
+              hasStoredPromo: Boolean(row.cart.appliedPromoCodeEnc),
+              storedCode: storedPromo,
+              storedLabel: row.cart.appliedPromoLabel ?? null,
+            },
           );
           const itemCount = computed.lines.reduce((sum, l) => sum + l.quantity, 0);
           const packetSummary =
@@ -1724,6 +2267,26 @@ export function createCartService(deps: ModuleDeps): CartModule {
         },
         { isolationLevel: "repeatable read", withConsistentSnapshot: true },
       );
+    },
+
+    adminListUpsellOffers(principal) {
+      return upsellService.adminListUpsellOffers(principal);
+    },
+
+    adminCreateUpsellOffer(principal, input) {
+      return upsellService.adminCreateUpsellOffer(principal, input);
+    },
+
+    adminUpdateUpsellOffer(principal, input) {
+      return upsellService.adminUpdateUpsellOffer(principal, input);
+    },
+
+    adminSetUpsellOfferActive(principal, input) {
+      return upsellService.adminSetUpsellOfferActive(principal, input);
+    },
+
+    adminDeleteUpsellOffer(principal, input) {
+      return upsellService.adminDeleteUpsellOffer(principal, input);
     },
 
     expireAbandonedCarts(options) {

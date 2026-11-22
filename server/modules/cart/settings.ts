@@ -1,9 +1,9 @@
 /**
- * Cart & checkout settings and feature switch (Increment 04, Package L).
+ * Cart, checkout, and upsell settings and feature switches (Increments 04 & 05, Packages L & B).
  * Owner: recovery_ops_engineer.
  *
- * Ships disabled by default (`feature.cart = false`); toggling requires admin + step-up
- * and is durably audited (`platform.feature.changed`).
+ * Both feature flags ship disabled by default (`feature.cart = false`, `feature.cart.upsell = false`);
+ * toggling requires admin + step-up and is durably audited (`platform.feature.changed`).
  */
 import { z } from "zod";
 import { defineFeatureFlag, defineSetting } from "../platform/index.js";
@@ -14,6 +14,15 @@ export const CART_FEATURE_FLAG = defineFeatureFlag({
   label: "Shopping cart and checkout",
   description:
     "Allow customers to add packets and items to a persistent server-side cart and check out via invoice or hosted card payment.",
+  clientVisible: true,
+});
+
+export const CART_UPSELL_FEATURE_FLAG = defineFeatureFlag({
+  flag: "cart.upsell",
+  owner: "cart",
+  label: "Cart suggestions (upsell)",
+  description:
+    "Show up to three relevant add-on, tier-upgrade, or bundle-completion suggestions inside the customer cart when the cart feature is enabled.",
   clientVisible: true,
 });
 

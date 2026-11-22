@@ -1,27 +1,53 @@
 /**
- * Public contracts and strict Zod input schemas for Cart & Checkout (Increment 04, Package L).
+ * Public contracts and strict Zod input schemas for Cart, Checkout, Upsell & Promo Codes (Increments 04 & 05, Packages L & B).
  * Owner: recovery_ops_engineer.
  *
  * Security rule (§4): Every input schema uses `.strict()` and explicit bounds. Clients never submit
- * prices, discounts, tax rates, or totals; any extra field is rejected with `BAD_INPUT` (`unrecognized_keys`).
+ * prices, discounts, tax rates, or totals as authoritative values; any extra field is rejected with `BAD_INPUT`.
  */
 import { z } from "zod";
 import type { ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
 import type { PublishedPolicyView } from "../compliance/index.js";
 
 const ulidSchema = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/, "Identifier format is not valid.");
+const idempotencyKeySchema = z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/, "Idempotency key is not valid.");
 
+/** Plain-text string with NFC normalisation and control-character rejection (rendered strictly as text). */
 const nfcTrim = (min: number, max: number) =>
   z
     .string()
     .transform((value) => value.normalize("NFC").trim())
-    .pipe(z.string().min(min).max(max));
+    .pipe(
+      z
+        .string()
+        .min(min)
+        .max(max)
+        // eslint-disable-next-line no-control-regex
+        .refine((v) => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(v), {
+          message: "Control characters are not allowed.",
+        }),
+    );
 
 const nfcOptional = (max: number) =>
   z
     .string()
     .transform((value) => value.normalize("NFC").trim())
-    .pipe(z.string().max(max));
+    .pipe(
+      z
+        .string()
+        .max(max)
+        // eslint-disable-next-line no-control-regex
+        .refine((v) => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(v), {
+          message: "Control characters are not allowed.",
+        }),
+    );
+
+export const BUNDLE_COMPLETION_OFFER_KEY = "bundle_completion" as const;
+
+export const upsellOfferIdentifierSchema = z.union([
+  ulidSchema,
+  z.literal(BUNDLE_COMPLETION_OFFER_KEY),
+]);
 
 export const billingDetailsSchema = z
   .object({
@@ -93,6 +119,95 @@ export const saveDraftDetailsInputSchema = z
   })
   .strict();
 
+/** Raw promotional code input (bounded, printable; normalised by `promotions`; NEVER written to logs). */
+export const applyCodeInputSchema = z
+  .object({
+    code: nfcTrim(1, 64),
+    idempotencyKey: idempotencyKeySchema.optional(),
+  })
+  .strict();
+
+export const removeCodeInputSchema = z
+  .object({
+    expectedVersion: z.number().int().min(1).max(1_000_000_000).optional(),
+  })
+  .strict()
+  .optional()
+  .default({});
+
+export const acceptUpsellInputSchema = z
+  .object({
+    offerPublicId: upsellOfferIdentifierSchema,
+    idempotencyKey: idempotencyKeySchema,
+  })
+  .strict();
+
+export const dismissUpsellInputSchema = z
+  .object({
+    offerPublicId: upsellOfferIdentifierSchema,
+  })
+  .strict();
+
+export const adminUpsellOfferFieldsSchema = z
+  .object({
+    kind: z.enum(["add_on", "tier_upgrade"]),
+    title: nfcTrim(1, 120),
+    shortText: nfcTrim(1, 200),
+    triggerMode: z.enum(["any_cart", "products"]),
+    triggerProductPublicIds: z.array(ulidSchema).max(50).optional().default([]),
+    targetProductPublicId: ulidSchema,
+    priority: z.number().int().min(1).max(9999).optional().default(100),
+    active: z.boolean().optional().default(true),
+    startsAt: z.date().nullable().optional().default(null),
+    endsAt: z.date().nullable().optional().default(null),
+  })
+  .strict()
+  .refine((val) => val.triggerMode === "any_cart" || val.triggerProductPublicIds.length > 0, {
+    message: "Select at least one trigger product, or switch trigger mode to any cart.",
+  })
+  .refine((val) => !val.startsAt || !val.endsAt || val.endsAt.getTime() > val.startsAt.getTime(), {
+    message: "End time must be after start time.",
+  });
+
+export const adminUpsellCreateInputSchema = adminUpsellOfferFieldsSchema;
+
+export const adminUpsellUpdateInputSchema = z
+  .object({
+    offerPublicId: ulidSchema,
+    expectedVersion: z.number().int().min(1).max(1_000_000_000),
+    kind: z.enum(["add_on", "tier_upgrade"]),
+    title: nfcTrim(1, 120),
+    shortText: nfcTrim(1, 200),
+    triggerMode: z.enum(["any_cart", "products"]),
+    triggerProductPublicIds: z.array(ulidSchema).max(50).optional().default([]),
+    targetProductPublicId: ulidSchema,
+    priority: z.number().int().min(1).max(9999),
+    active: z.boolean(),
+    startsAt: z.date().nullable().optional().default(null),
+    endsAt: z.date().nullable().optional().default(null),
+  })
+  .strict()
+  .refine((val) => val.triggerMode === "any_cart" || val.triggerProductPublicIds.length > 0, {
+    message: "Select at least one trigger product, or switch trigger mode to any cart.",
+  })
+  .refine((val) => !val.startsAt || !val.endsAt || val.endsAt.getTime() > val.startsAt.getTime(), {
+    message: "End time must be after start time.",
+  });
+
+export const adminUpsellSetActiveInputSchema = z
+  .object({
+    offerPublicId: ulidSchema,
+    expectedVersion: z.number().int().min(1).max(1_000_000_000),
+    active: z.boolean(),
+  })
+  .strict();
+
+export const adminUpsellDeleteInputSchema = z
+  .object({
+    offerPublicId: ulidSchema,
+  })
+  .strict();
+
 export const policyAcceptanceInputSchema = z
   .object({
     versionPublicId: ulidSchema,
@@ -105,11 +220,13 @@ export const checkoutInputSchema = z
   .object({
     cartPublicId: ulidSchema,
     expectedVersion: z.number().int().min(1).max(1_000_000_000),
+    /** Optional client-observed grand total guard so price/promo changes require explicit customer re-confirmation. */
+    expectedTotalMinor: z.number().int().min(0).max(1_000_000_000_000).optional(),
     projectName: nfcTrim(1, 160),
     note: nfcOptional(4000).optional().default(""),
     billing: billingDetailsSchema,
     policyAcceptances: z.array(policyAcceptanceInputSchema).max(25).optional().default([]),
-    idempotencyKey: z.string().regex(/^[A-Za-z0-9._:-]{8,128}$/, "Idempotency key is not valid."),
+    idempotencyKey: idempotencyKeySchema,
   })
   .strict();
 
@@ -175,6 +292,19 @@ export interface CartBundleQuoteView {
   applied: boolean;
 }
 
+export interface CartAppliedPromoView {
+  promoPublicId: string;
+  label: string;
+  promoDiscountMinor: number;
+  bundleDiscountMinor: number;
+}
+
+export interface CartPromoNoticeView {
+  reasonCode: string;
+  message: string;
+  previousLabel: string | null;
+}
+
 export interface CartTotalsView {
   currency: string | null;
   subtotalMinor: number;
@@ -185,6 +315,41 @@ export interface CartTotalsView {
   taxMinor: number;
   totalMinor: number;
   bundle: CartBundleQuoteView | null;
+  promo: CartAppliedPromoView | null;
+}
+
+export type CartUpsellKind = "add_on" | "tier_upgrade" | "bundle_completion";
+
+export interface CartUpsellTargetProductView {
+  productPublicId: string;
+  name: string;
+  groupName: string;
+  packetNumber: number | null;
+  tier: PacketTierName | null;
+  unitPriceMinor: number;
+  currency: string;
+}
+
+export interface CartUpsellSuggestionView {
+  offerPublicId: string;
+  kind: CartUpsellKind;
+  title: string;
+  shortText: string;
+  currency: string;
+  /** Net incremental price in minor units (`unitPriceMinor` for add-on, `+delta` for tier upgrade, net after saving for bundle completion). */
+  priceMinor: number;
+  /** Unadjusted sum of target product price(s) in minor units. */
+  fullTargetPriceMinor: number;
+  /** Computed bundle discount unlocked in minor units (`bundle_completion` only; null otherwise). */
+  savingMinor: number | null;
+  targetProducts: CartUpsellTargetProductView[];
+  currentProduct: {
+    productPublicId: string;
+    name: string;
+    packetNumber: number | null;
+    tier: PacketTierName | null;
+    unitPriceMinor: number;
+  } | null;
 }
 
 export interface CartView {
@@ -199,11 +364,60 @@ export interface CartView {
   hasUnavailableItems: boolean;
   mixedCurrency: boolean;
   totals: CartTotalsView;
+  upsells: CartUpsellSuggestionView[];
+  promotionsEnabled: boolean;
+  promoNotice: CartPromoNoticeView | null;
   paymentProvider: "none" | "stripe" | "square";
   paymentEnvironment: "test" | "live";
   onlinePaymentEnabled: boolean;
   pendingPolicies: PublishedPolicyView[];
   updatedAt: Date | null;
+}
+
+export interface AdminCartUpsellCatalogProductView {
+  productPublicId: string;
+  name: string;
+  groupName: string;
+  packetNumber: number | null;
+  tier: PacketTierName | null;
+  priceMinor: number;
+  currency: string;
+  active: boolean;
+  canBeTierUpgradeTarget: boolean;
+}
+
+export interface AdminCartUpsellOfferView {
+  offerPublicId: string;
+  version: number;
+  kind: "add_on" | "tier_upgrade";
+  title: string;
+  shortText: string;
+  triggerMode: "any_cart" | "products";
+  triggerProductPublicIds: string[];
+  triggerProductNames: string[];
+  targetProductPublicId: string;
+  targetProductName: string;
+  targetProductAvailable: boolean;
+  targetProductPriceMinor: number | null;
+  targetProductCurrency: string | null;
+  priority: number;
+  active: boolean;
+  startsAt: Date | null;
+  endsAt: Date | null;
+  shownCount: number;
+  acceptedCount: number;
+  dismissedCount: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface AdminCartUpsellsListResult {
+  featureCartEnabled: boolean;
+  featureUpsellEnabled: boolean;
+  bundleRuleEnabled: boolean;
+  bundleRuleLabel: string | null;
+  offers: AdminCartUpsellOfferView[];
+  catalogProducts: AdminCartUpsellCatalogProductView[];
 }
 
 export type CheckoutCartResult =
@@ -256,6 +470,8 @@ export interface CheckoutStatusResult {
   subtotalMinor: number;
   discountMinor: number;
   discountLabel: string | null;
+  promoDiscountMinor: number;
+  promoLabel: string | null;
   taxRateBps: number;
   taxMinor: number;
   totalMinor: number;
@@ -304,6 +520,10 @@ export interface CartModule extends ModuleLifecycle {
   removeItem(principal: SessionPrincipal, input: z.infer<typeof removeItemInputSchema>): Promise<CartView>;
   clearCart(principal: SessionPrincipal, input: z.infer<typeof clearCartInputSchema>): Promise<CartView>;
   saveDraftDetails(principal: SessionPrincipal, input: z.infer<typeof saveDraftDetailsInputSchema>): Promise<CartView>;
+  applyCode(principal: SessionPrincipal, input: z.infer<typeof applyCodeInputSchema>): Promise<CartView>;
+  removeCode(principal: SessionPrincipal, input?: z.infer<typeof removeCodeInputSchema>): Promise<CartView>;
+  acceptUpsell(principal: SessionPrincipal, input: z.infer<typeof acceptUpsellInputSchema>): Promise<CartView>;
+  dismissUpsell(principal: SessionPrincipal, input: z.infer<typeof dismissUpsellInputSchema>): Promise<CartView>;
   checkout(principal: SessionPrincipal, input: z.infer<typeof checkoutInputSchema>): Promise<CheckoutCartResult>;
   getCheckoutStatus(principal: SessionPrincipal, input: z.infer<typeof checkoutTargetInputSchema>): Promise<CheckoutStatusResult>;
   restoreCheckout(principal: SessionPrincipal, input: z.infer<typeof checkoutTargetInputSchema>): Promise<RestoreCheckoutResult>;
@@ -317,5 +537,22 @@ export interface CartModule extends ModuleLifecycle {
     nextCursor: string | null;
   }>;
   adminGetOpen(principal: SessionPrincipal, input: z.infer<typeof adminGetOpenInputSchema>): Promise<AdminOpenCartDetail>;
+  adminListUpsellOffers(principal: SessionPrincipal): Promise<AdminCartUpsellsListResult>;
+  adminCreateUpsellOffer(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellCreateInputSchema>,
+  ): Promise<AdminCartUpsellOfferView>;
+  adminUpdateUpsellOffer(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellUpdateInputSchema>,
+  ): Promise<AdminCartUpsellOfferView>;
+  adminSetUpsellOfferActive(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellSetActiveInputSchema>,
+  ): Promise<AdminCartUpsellOfferView>;
+  adminDeleteUpsellOffer(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellDeleteInputSchema>,
+  ): Promise<{ deleted: true; offerPublicId: string }>;
   expireAbandonedCarts(options?: { limit?: number }): Promise<{ expiredCount: number }>;
 }

@@ -3,7 +3,7 @@
  * Owner: recovery_ops_engineer.
  *
  * Every external capability is resolved dynamically from `deps.services` at call time and fails closed
- * (`UNAVAILABLE` / `FORBIDDEN`) if missing.
+ * (`UNAVAILABLE` / `FORBIDDEN` / uniform `PROMO_NOT_APPLICABLE`) if missing.
  */
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import type { UserRole } from "../../../shared/domain.js";
@@ -93,6 +93,8 @@ export interface CreatedCheckoutOrder {
   subtotalMinor: number;
   discountMinor: number;
   discountLabel: string | null;
+  promoDiscountMinor?: number;
+  promoLabel?: string | null;
   totalMinor: number;
   lineItems: {
     productPublicId: string;
@@ -115,6 +117,7 @@ export interface CartOrdersPort {
       items: { productPublicId: string; quantity: number }[];
       note?: string;
       idempotencyKey: string;
+      promoCode?: string;
     },
     tx: Tx,
   ): Promise<CreatedCheckoutOrder>;
@@ -142,6 +145,99 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
       return createOrderFromCheckoutInTx(principal, input, tx);
     },
   };
+}
+
+/* ---------------- Increment 05 (D3 / §3): promotions port ---------------- */
+
+export interface CartPromotionLine {
+  productPublicId: string;
+  packetNumber: number | null;
+  tierKey: string | null;
+  lineTotalMinor: number;
+}
+
+export interface CartPromotionContext {
+  /** Raw input; normalised by `promotions`. Never logged. */
+  code: string;
+  customerUserId: number;
+  actorUserId: number;
+  currency: string;
+  lines: readonly CartPromotionLine[];
+  subtotalMinor: number;
+  bundleDiscountMinor: number;
+  bundleLabel: string | null;
+}
+
+export interface CartPromotionOutcome {
+  promoPublicId: string;
+  label: string;
+  promoDiscountMinor: number;
+  bundleDiscountMinor: number;
+  discountMinor: number;
+  discountLabel: string;
+  totalMinor: number;
+}
+
+export interface CartPromotionsPort {
+  preview(ctx: CartPromotionContext, opts?: { tx?: DbOrTx; recheck?: boolean }): Promise<CartPromotionOutcome>;
+  redeemInTx(tx: Tx, ctx: CartPromotionContext & { orderPublicId: string; correlationId: string }): Promise<CartPromotionOutcome>;
+  releaseForOrderInTx(tx: Tx, input: { orderPublicId: string; reason: "order_cancelled" }): Promise<{ released: boolean }>;
+  isEnabled?(opts?: { tx?: DbOrTx }): Promise<boolean>;
+}
+
+/** Uniform customer-facing refusal that never reveals whether a promotional code exists (D3). */
+export const promoNotApplicable = () =>
+  new DomainError("VALIDATION", "PROMO_NOT_APPLICABLE", "This code cannot be applied.");
+
+export function cartPromotionsPort(services: Services): CartPromotionsPort | null {
+  const holder: unknown = (services as unknown as Partial<Record<string, unknown>>).promotions;
+  const preview = method<CartPromotionsPort["preview"]>(holder, "preview");
+  const redeemInTx = method<CartPromotionsPort["redeemInTx"]>(holder, "redeemInTx");
+  const releaseForOrderInTx = method<CartPromotionsPort["releaseForOrderInTx"]>(holder, "releaseForOrderInTx");
+  if (!preview || !redeemInTx || !releaseForOrderInTx) return null;
+  const isEnabled = method<NonNullable<CartPromotionsPort["isEnabled"]>>(holder, "isEnabled");
+  return { preview, redeemInTx, releaseForOrderInTx, ...(isEnabled ? { isEnabled } : {}) };
+}
+
+export async function isPromotionsEnabledForCart(services: Services, tx?: DbOrTx): Promise<boolean> {
+  const port = cartPromotionsPort(services);
+  if (!port) return false;
+  if (port.isEnabled) {
+    return port.isEnabled(tx ? { tx } : undefined);
+  }
+  return true;
+}
+
+export async function requireCartPromotionsPort(services: Services, tx?: DbOrTx): Promise<CartPromotionsPort> {
+  const port = cartPromotionsPort(services);
+  if (!port) throw promoNotApplicable();
+  if (port.isEnabled && !(await port.isEnabled(tx ? { tx } : undefined))) {
+    throw promoNotApplicable();
+  }
+  return port;
+}
+
+/** Fail-closed arithmetic verification of `PromotionOutcome` before any cart display or write. */
+export function assertValidPromotionOutcome(outcome: CartPromotionOutcome, subtotalMinor: number): void {
+  const ints = [
+    outcome.promoDiscountMinor,
+    outcome.bundleDiscountMinor,
+    outcome.discountMinor,
+    outcome.totalMinor,
+  ];
+  if (
+    !outcome.promoPublicId ||
+    typeof outcome.label !== "string" ||
+    outcome.label.trim().length === 0 ||
+    typeof outcome.discountLabel !== "string" ||
+    outcome.discountLabel.trim().length === 0 ||
+    ints.some((n) => !Number.isSafeInteger(n) || n < 0) ||
+    outcome.discountMinor > subtotalMinor ||
+    outcome.promoDiscountMinor + outcome.bundleDiscountMinor !== outcome.discountMinor ||
+    subtotalMinor - outcome.discountMinor !== outcome.totalMinor
+  ) {
+    throw promoNotApplicable();
+  }
 }
 
 export interface CartCompliancePort {
