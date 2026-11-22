@@ -392,6 +392,25 @@ export const orderReassignments = mysqlTable(
   (t) => [uniqueIndex("order_reassignments_operation_uq").on(t.operationId), index("order_reassignments_order_idx").on(t.orderId)],
 );
 
+/**
+ * Part B (B2): order name history. The audit envelope never carries names (PII filter), so the rename
+ * transaction writes the old and new name here; read through `services.orders.listNameHistory` only
+ * (order-scoped, never exported to the SIEM). `actor_user_id` is null for system renames.
+ */
+export const orderNameHistory = mysqlTable(
+  "order_name_history",
+  {
+    id: idColumn(),
+    orderId: refColumn("order_id").notNull(),
+    oldName: varchar("old_name", { length: 160 }).notNull(),
+    newName: varchar("new_name", { length: 160 }).notNull(),
+    actorUserId: refColumn("actor_user_id").references(() => users.id),
+    actorRole: varchar("actor_role", { length: 16 }).notNull(),
+    createdAt: utcDateTime("created_at").notNull(),
+  },
+  (t) => [index("order_name_history_order_idx").on(t.orderId, t.createdAt)],
+);
+
 export const orderImportProvenance = mysqlTable(
   "order_import_provenance",
   {
