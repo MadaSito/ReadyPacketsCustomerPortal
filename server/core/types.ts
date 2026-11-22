@@ -150,6 +150,11 @@ export interface AuditEventInput {
   /** Defaults to the request-context actor. Use `{ role: "system" }` for jobs, `{ role: "anonymous" }` pre-auth. */
   actor?: { userId?: number | null; role: UserRole | "system" | "anonymous" };
   resource?: { type: string; id?: number | string | null; publicId?: string | null };
+  /**
+   * Order this event belongs to when `resource` is something else (file, refund, dispatch…). Makes it appear in
+   * the order's history (audit `orderActivity`). Not needed when `resource` is `{ type: "order", publicId }`.
+   */
+  orderPublicId?: string | null;
   correlationId?: string;
   parentCorrelationId?: string;
   jobId?: string;
