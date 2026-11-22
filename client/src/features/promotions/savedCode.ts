@@ -8,8 +8,11 @@
  */
 const KEY = "rp.promotions.savedCode";
 const FRAGMENT_KEYS = ["promo", "code"] as const;
-/** Chosen codes are 6–32 characters; batch codes may carry a prefix plus at least 12 characters. */
-const CODE_PATTERN = /^[A-Z0-9](?:[A-Z0-9-]{4,46})[A-Z0-9]$/u;
+/**
+ * Contract D3: codes are A–Z, 0–9 and hyphen, 6–32 characters (batch codes = optional prefix + ≥ 12 characters,
+ * within the same 32). Deliberately no stricter than the server: the server decides, and answers uniformly.
+ */
+const CODE_PATTERN = /^[A-Z0-9-]{6,32}$/u;
 
 export function normalizePromoCode(raw: string): string {
   return raw.normalize("NFKC").trim().replace(/\s+/gu, "").toUpperCase();
@@ -81,4 +84,31 @@ export function promoLink(origin: string, code: string): string {
 export function maskPromoCode(code: string): string {
   if (code.length <= 4) return "•".repeat(code.length);
   return `${code.slice(0, 2)}${"•".repeat(Math.min(code.length - 4, 8))}${code.slice(-2)}`;
+}
+
+/** The only path whose fragment is read at startup. */
+export const PROMO_LANDING_PATH = "/promo";
+
+/**
+ * Synchronous startup capture, called from the entry point BEFORE the router, providers or any analytics
+ * module exist: on exactly `/promo` with a fragment, the code is saved and the fragment removed, so no later
+ * reader (router, analytics, replay) ever sees it. Any other path is left untouched. Never throws.
+ */
+export function capturePromoLinkAtStartup(loc: Pick<Location, "hash" | "pathname" | "search"> = window.location, hist: Pick<History, "replaceState" | "state"> = window.history): FragmentCapture {
+  try {
+    if (loc.pathname !== PROMO_LANDING_PATH || !loc.hash) return { kind: "none" };
+    const result = capturePromoCodeFromFragment(loc, hist);
+    if (result.kind === "invalid") lastStartupCapture = "invalid";
+    return result;
+  } catch {
+    return { kind: "none" };
+  }
+}
+
+let lastStartupCapture: "invalid" | null = null;
+/** Lets the landing page say "That link does not contain a valid code" after the startup capture ran. Read once. */
+export function takeStartupInvalidCapture(): boolean {
+  const invalid = lastStartupCapture === "invalid";
+  lastStartupCapture = null;
+  return invalid;
 }

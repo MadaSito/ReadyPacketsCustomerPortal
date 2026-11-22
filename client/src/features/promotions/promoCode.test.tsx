@@ -6,7 +6,7 @@ import { pageA11y } from "@/test/a11y";
 import { renderUi } from "@/ui/testing";
 import { PROMO_UNIFORM_ERROR, PromoCodeField, type AppliedPromo } from "./PromoCodeField";
 import PromoLandingPage from "./PromoLandingPage";
-import { capturePromoCodeFromFragment, clearSavedPromoCode, maskPromoCode, normalizePromoCode, promoLink, readSavedPromoCode, savePromoCode } from "./savedCode";
+import { capturePromoCodeFromFragment, capturePromoLinkAtStartup, clearSavedPromoCode, isPlausiblePromoCode, maskPromoCode, normalizePromoCode, promoLink, readSavedPromoCode, savePromoCode, takeStartupInvalidCapture } from "./savedCode";
 
 const session = vi.hoisted(() => ({ status: "anonymous" as string }));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ view: { status: session.status }, me: undefined }) }));
@@ -19,6 +19,37 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/");
 });
 afterEach(() => vi.restoreAllMocks());
+
+describe("capturePromoLinkAtStartup (entry bootstrap, before routing)", () => {
+  const fakeHistory = () => ({ state: null, replaceState: vi.fn() });
+  it("on exactly /promo saves the code and strips the fragment before anything else runs", () => {
+    const hist = fakeHistory();
+    expect(capturePromoLinkAtStartup({ pathname: "/promo", search: "", hash: "#promo=spring-2026" }, hist)).toEqual({ kind: "saved", code: "SPRING-2026" });
+    expect(hist.replaceState).toHaveBeenCalledWith(null, "", "/promo");
+    expect(readSavedPromoCode()).toBe("SPRING-2026");
+  });
+  it("leaves every other path and fragment alone", () => {
+    const hist = fakeHistory();
+    expect(capturePromoLinkAtStartup({ pathname: "/cart", search: "", hash: "#promo=SPRING-2026" }, hist)).toEqual({ kind: "none" });
+    expect(capturePromoLinkAtStartup({ pathname: "/promo/x", search: "", hash: "#promo=SPRING-2026" }, hist)).toEqual({ kind: "none" });
+    expect(hist.replaceState).not.toHaveBeenCalled();
+    expect(readSavedPromoCode()).toBeNull();
+  });
+  it("an invalid code is still stripped and reported once to the landing page", () => {
+    const hist = fakeHistory();
+    expect(capturePromoLinkAtStartup({ pathname: "/promo", search: "", hash: "#promo=%3Cx%3E" }, hist).kind).toBe("invalid");
+    expect(hist.replaceState).toHaveBeenCalled();
+    expect(takeStartupInvalidCapture()).toBe(true);
+    expect(takeStartupInvalidCapture()).toBe(false);
+  });
+  it("plausibility matches the contract: 6–32 of A–Z 0–9 hyphen", () => {
+    expect(isPlausiblePromoCode("ABCDE")).toBe(false);
+    expect(isPlausiblePromoCode("ABCDEF")).toBe(true);
+    expect(isPlausiblePromoCode("A".repeat(32))).toBe(true);
+    expect(isPlausiblePromoCode("A".repeat(33))).toBe(false);
+    expect(isPlausiblePromoCode("AB_CDEF")).toBe(false);
+  });
+});
 
 describe("saved promotion code (link landing storage)", () => {
   it("captures #promo= into sessionStorage, strips the whole fragment and never sets a cookie", () => {

@@ -8,13 +8,15 @@ import { Link } from "wouter";
 import { CheckCircle2 } from "lucide-react";
 import { Button, Callout, Card, PageHeader } from "@/ui";
 import { useSession } from "@/lib/session";
-import { capturePromoCodeFromFragment, clearSavedPromoCode, readSavedPromoCode, type FragmentCapture } from "./savedCode";
+import { capturePromoCodeFromFragment, clearSavedPromoCode, readSavedPromoCode, takeStartupInvalidCapture, type FragmentCapture } from "./savedCode";
 
 type LandingState = { kind: "saved" } | { kind: "invalid" } | { kind: "none" };
 
 function initialState(): LandingState {
+  // Normally the entry point already captured and stripped the fragment (capturePromoLinkAtStartup); this is the
+  // fallback for in-app navigation to a `/promo#…` URL.
   const capture: FragmentCapture = typeof window === "undefined" ? { kind: "none" } : capturePromoCodeFromFragment();
-  if (capture.kind === "invalid") return { kind: "invalid" };
+  if (capture.kind === "invalid" || takeStartupInvalidCapture()) return { kind: "invalid" };
   // A repeated render (or a reload after the fragment was stripped) still finds the code saved for this tab.
   return readSavedPromoCode() ? { kind: "saved" } : { kind: "none" };
 }
