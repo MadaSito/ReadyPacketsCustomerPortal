@@ -22,8 +22,8 @@ export const identityFeature: FeatureRoutes = {
   routes: [
     { path: "/account", access: "customer", title: "Your account", component: AccountPage },
     { path: "/account/sessions", access: "customer", title: "Security", component: SessionsPage },
-    { path: "/admin/sessions", access: "staff", title: "Session centre", component: AdminSessionsPage, capability: "sessions.read_all" },
-    { path: "/admin/sign-in-log", access: "staff", title: "Sign-in log", component: SignInLogPage, capability: "sessions.read_all" },
+    { path: "/admin/sessions", access: "admin", title: "Session centre", component: AdminSessionsPage, capability: "sessions.read_all" },
+    { path: "/admin/sign-in-log", access: "admin", title: "Sign-in log", component: SignInLogPage, capability: "sessions.read_all" },
     { path: "/admin/session-restrictions", access: "admin", title: "Session restrictions", component: SessionRestrictionsPage, capability: "sessions.policy.manage" },
     { path: "/admin/customers", access: "staff", title: "Customers", component: CustomersPage, capability: "customers.read_all" },
     { path: "/admin/customers/:customerId", access: "staff", title: "Customer", component: CustomerDetailPage, capability: "customers.read_all" },
@@ -34,8 +34,8 @@ export const identityFeature: FeatureRoutes = {
   ],
   nav: [
     { label: "Settings", href: "/account", icon: Settings, area: "customer", group: "Account", placement: "account", access: "customer", order: 200 },
-    { label: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone, area: "console", group: "Security", access: "staff", capability: "sessions.read_all", order: 40 },
-    { label: "Sign-in log", href: "/admin/sign-in-log", icon: History, area: "console", group: "Security", access: "staff", capability: "sessions.read_all", order: 45 },
+    { label: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone, area: "console", group: "Security", access: "admin", capability: "sessions.read_all", order: 40 },
+    { label: "Sign-in log", href: "/admin/sign-in-log", icon: History, area: "console", group: "Security", access: "admin", capability: "sessions.read_all", order: 45 },
     { label: "Session restrictions", href: "/admin/session-restrictions", icon: SlidersHorizontal, area: "console", group: "Security", access: "admin", capability: "sessions.policy.manage", order: 50 },
     { label: "Customers", href: "/admin/customers", icon: Users, area: "console", group: "Operations", access: "staff", capability: "customers.read_all", order: 20 },
     { label: "Staff", href: "/admin/staff", icon: ShieldCheck, area: "console", group: "Security", access: "admin", capability: "staff.manage", order: 30 },

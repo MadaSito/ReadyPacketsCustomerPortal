@@ -110,8 +110,9 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
   }
 
   /** Sign-in log row for every session ended by revoke()/revokeAllForUser()/resolver expiry. */
-  function endEvents(rows: { publicId: string; userId: number; role: UserRole; authMethod: AuthMethod; deviceSummary: string | null }[], reason: string) {
-    const actor = getRequestContext()?.actor;
+  function endEvents(rows: { publicId: string; userId: number; role: UserRole; authMethod: AuthMethod; deviceSummary: string | null }[], reason: string, actorUserId?: number) {
+    // Explicit actor (session centre) wins; otherwise the request's resolved actor.
+    const actor = actorUserId !== undefined ? { userId: actorUserId } : getRequestContext()?.actor;
     const kind = signInKindForReason(reason);
     // Rows describe OTHER sessions: never stamp them with the caller's address/country.
     const facts: RequestFacts | undefined = kind === "forced_end" || kind === "expiry" ? { ip: null, country: null } : undefined;
@@ -136,7 +137,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
    * this call and logged exactly once; outside a transaction each row is ended by its own compare-and-set
    * update and logged only when that update changed it (idempotent under concurrency).
    */
-  async function endWhere(tx: DbOrTx, condition: SQL | undefined, reason: string, inTx: boolean, onRow?: (row: EndRow) => void): Promise<number> {
+  async function endWhere(tx: DbOrTx, condition: SQL | undefined, reason: string, inTx: boolean, onRow?: (row: EndRow) => void, actorUserId?: number): Promise<number> {
     let lastId = 0;
     let ended = 0;
     for (;;) {
@@ -170,7 +171,7 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       }
       ended += done.length;
       done.forEach((row) => onRow?.(row));
-      const events = endEvents(done, reason);
+      const events = endEvents(done, reason, actorUserId);
       if (inTx) await centre.log.recordMany(events, tx as Tx);
       else for (const event of events) await centre.log.note(event);
       if (rows.length < END_BATCH) break;
@@ -391,22 +392,22 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       await endWhere(db(opts.tx), eq(userSessions.publicId, sessionId), reason, opts.tx !== undefined);
     },
 
-    async revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx }): Promise<number> {
+    async revokeAllForUser(userId: number, opts: { exceptSessionId?: string; reason: string; tx?: Tx; actorUserId?: number }): Promise<number> {
       const conditions = [eq(userSessions.userId, userId), isNull(userSessions.revokedAt)];
       if (opts.exceptSessionId) conditions.push(ne(userSessions.publicId, opts.exceptSessionId));
-      return endWhere(db(opts.tx), and(...conditions), opts.reason, opts.tx !== undefined);
+      return endWhere(db(opts.tx), and(...conditions), opts.reason, opts.tx !== undefined, undefined, opts.actorUserId);
     },
 
     /** Package D: ends every live CUSTOMER session (bounded batches). Caller authorises + audits in `tx`. */
-    async revokeAllCustomers(reason: string, tx: Tx): Promise<number> {
+    async revokeAllCustomers(reason: string, tx: Tx, actorUserId?: number): Promise<number> {
       const customers = tx.select({ id: users.id }).from(users).where(eq(users.role, "customer"));
-      return endWhere(tx, and(inArray(userSessions.userId, customers), gt(userSessions.absoluteExpiresAt, deps.clock.now())), reason, true);
+      return endWhere(tx, and(inArray(userSessions.userId, customers), gt(userSessions.absoluteExpiresAt, deps.clock.now())), reason, true, undefined, actorUserId);
     },
 
     /** Package D: ends one session of any user (admin). Returns the row it ended, or null when none was live. */
-    async revokeAny(sessionId: string, reason: string, tx: Tx): Promise<{ userId: number } | null> {
+    async revokeAny(sessionId: string, reason: string, tx: Tx, actorUserId?: number): Promise<{ userId: number } | null> {
       let owner: number | null = null;
-      const ended = await endWhere(tx, eq(userSessions.publicId, sessionId), reason, true, (row) => (owner = row.userId));
+      const ended = await endWhere(tx, eq(userSessions.publicId, sessionId), reason, true, (row) => (owner = row.userId), actorUserId);
       return ended === 1 && owner !== null ? { userId: owner } : null;
     },
 

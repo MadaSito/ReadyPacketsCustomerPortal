@@ -271,7 +271,7 @@ export function createSessionCentre(i: {
       }
       return deps.db.transaction(async (tx) => {
         await authorizeInTx(tx, principal, "sessions.revoke_any");
-        const ended = await sessions.revokeAny(sessionId, "admin_ended", tx);
+        const ended = await sessions.revokeAny(sessionId, "admin_ended", tx, principal.userId);
         if (!ended) throw notFound("SESSION_NOT_FOUND");
         const [owner] = await tx.select({ publicId: users.publicId }).from(users).where(eq(users.id, ended.userId)).limit(1);
         await deps.audit.record(
@@ -293,6 +293,7 @@ export function createSessionCentre(i: {
         const ended = await sessions.revokeAllForUser(target.id, {
           reason: "admin_ended",
           tx,
+          actorUserId: principal.userId,
           ...(target.id === principal.userId ? { exceptSessionId: principal.sessionId } : {}),
         });
         await deps.audit.record(
@@ -309,7 +310,7 @@ export function createSessionCentre(i: {
       require(principal, "sessions.revoke_any");
       return deps.db.transaction(async (tx) => {
         await authorizeInTx(tx, principal, "sessions.revoke_any");
-        const ended = await sessions.revokeAllCustomers("admin_ended_all_customers", tx);
+        const ended = await sessions.revokeAllCustomers("admin_ended_all_customers", tx, principal.userId);
         await deps.audit.record(
           { category: "security", eventName: "auth.session.ended_all_customers", action: "revoke", outcome: "completed", severity: "WARN", reasonCode: input.reasonCode, resource: { type: "session" }, safeCounts: { sessions_revoked: ended } },
           tx,
@@ -334,6 +335,8 @@ export function createSessionCentre(i: {
 
     async exportSignInLog(principal: SessionPrincipal, filter: SignInLogFilter): Promise<{ csv: string; rows: number; truncated: boolean }> {
       require(principal, "sessions.read_all");
+      // Bulk export of personal data (addresses): fresh step-up, as for other privileged admin actions.
+      requireFreshStepUp(principal.stepUpAt ?? null);
       const userId = await userIdOf(filter.userId);
       const rows = await deps.db.select().from(signInEvents).where(and(...signInConditions(filter, userId))).orderBy(desc(signInEvents.id)).limit(EXPORT_MAX + 1);
       const items = await signInItems(rows.slice(0, EXPORT_MAX));

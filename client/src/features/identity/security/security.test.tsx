@@ -136,15 +136,8 @@ describe("Session centre", () => {
     await waitFor(() => expect(calls.find((c) => c.path === "identity.admin.sessions.endAllCustomers")?.input).toEqual({ reasonCode: "SUSPECTED_COMPROMISE" }));
   });
 
-  it("staff can read but get no end actions", async () => {
-    page("/admin/sessions", adminSessions, "staff");
-    await screen.findAllByText("Cara Customer");
-    expect(screen.queryByRole("button", { name: "Sign out all customers" })).toBeNull();
-    expect(screen.queryByRole("button", { name: /Actions for/ })).toBeNull();
-  });
-
-  it("customers are refused the console route", async () => {
-    const { calls } = page("/admin/sessions", adminSessions, "customer");
+  it.each(["customer", "staff"] as const)("%s is refused the console route (admin-only capability)", async (role) => {
+    const { calls } = page("/admin/sessions", adminSessions, role);
     await waitFor(() => expect(screen.queryByRole("heading", { level: 1, name: "Session centre" })).toBeNull());
     expect(calls.some((c) => c.path === "identity.admin.sessions.list")).toBe(false);
   });
@@ -172,10 +165,11 @@ describe("Sign-in log", () => {
     await waitFor(() => expect(calls.some((c) => (c.input as { ip?: string } | undefined)?.ip === "198.51.100.9")).toBe(true));
   });
 
-  it("export is offered to admins only", async () => {
-    page("/admin/sign-in-log", signInLog, "staff");
+  it("exports through step-up and offers the CSV as a download", async () => {
+    const { calls } = page("/admin/sign-in-log", signInLog);
     await screen.findAllByText("Cara Customer");
-    expect(screen.queryByRole("button", { name: "Export CSV" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "identity.admin.signInLog.export")).toBe(true));
   });
 });
 
