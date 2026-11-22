@@ -155,6 +155,6 @@ Not checked here: a real browser (RouteTabs overflow and select below 480 px, fo
 
 Run: `scripts/dev/test.sh` per file (above), `scripts/dev/tc.sh` (no errors under `orders/`; errors at the time were in other packages' in-progress files), ESLint on all changed paths.
 
-Tested only against fakes: the promotions port (real module is audit_engineer's); the compliance `orderPaymentExposureInTx` port (live in 76ad28d, but until it returns `providerAttemptEver` every cancel keeps the redemption, which is fail closed); the real `guardAttempt` (siem_engineer); `compliance.listPublishedPolicies` for policy mapping.
+Tested only against fakes: the promotions port (real module is audit_engineer's); the compliance `orderPaymentExposureInTx` port (real implementation with `providerAttemptEver` in 97f2178, using `FOR SHARE NOWAIT` that fails closed; orders tests use a fake exposure port, and the end-to-end cancel → compliance → release path has not been run here); the real `guardAttempt` (siem_engineer); `compliance.listPublishedPolicies` for policy mapping.
 
 Not verified: real concurrent redemptions across connections; the HTTP body cap for transfer procedures; a real browser (320 px, zoom, dark mode contrast, screen-reader reading of the announcement); the transfer UI (files_engineer).

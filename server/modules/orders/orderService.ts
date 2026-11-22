@@ -241,8 +241,9 @@ export function createOrderService(deps: OrderServiceDeps) {
     const port = promotionsPort(deps.services);
     if (!port) return;
     // Fail closed (/root G-C3-02): release only on compliance's authoritative exposure read in THIS transaction:
-    // nothing ever paid (partial payments count), no open payable invoice, no pending provider capture. Port
-    // absent, error or any exposure ⇒ the redemption stays used; the cancellation itself still succeeds.
+    // nothing ever paid (partial payments count), no open payable invoice, no pending provider capture, and no
+    // provider payment attempt ever created (any status). Port absent, error (incl. compliance's NOWAIT lock
+    // contention) or any exposure ⇒ the redemption stays used; the cancellation itself still succeeds.
     const exposure = paymentExposurePort(deps.services);
     if (!exposure) return;
     try {
