@@ -9,7 +9,7 @@ import { createTestDeps } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createIdentityModule } from "../identity/index.js";
 import { identityRouter } from "../identity/router.js";
-import { identityTokens, userSessions, users } from "../identity/schema.js";
+import { identityTokens, sessionRestrictions, signInEvents, userSessions, users } from "../identity/schema.js";
 import { createAssuranceModule } from "./index.js";
 import { assuranceRouter } from "./router.js";
 import * as assuranceSchema from "./schema.js";
@@ -19,7 +19,7 @@ const caller = createCallerFactory(router({ identity: identityRouter, assurance:
 
 describe("assurance against real identity policies and sessions", () => {
   let db: TestDb;
-  beforeAll(async () => { db = await createTestDb({ schema: { users, userSessions, identityTokens, ...assuranceSchema } }); });
+  beforeAll(async () => { db = await createTestDb({ schema: { users, userSessions, identityTokens, sessionRestrictions, signInEvents, ...assuranceSchema } }); });
   afterAll(() => db?.cleanup());
 
   it("rotates every assurance elevation, revokes target sessions in all modes and enforces the next password step", async () => {

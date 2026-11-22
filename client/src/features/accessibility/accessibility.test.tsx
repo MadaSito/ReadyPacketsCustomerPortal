@@ -6,7 +6,13 @@ import { pageA11y } from "@/test/a11y";
 import { fakeAuthApi, renderUi } from "@/ui/testing";
 import { accessibilityFeature } from "./routes";
 
-vi.mock("@/app/slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
+vi.mock("@/app/slots", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/app/slots")>(),
+  NotificationSlot: () => null,
+  GlobalSearchSlot: () => null,
+  AnalyticsConsentSlot: () => null,
+  CookieConsentSlot: () => null,
+}));
 
 const anonymous = () => Promise.reject(Object.assign(new Error("UNAUTHENTICATED"), { data: { safe: { domainCode: "UNAUTHENTICATED" } } }));
 const customer: MeResult = {

@@ -7,7 +7,7 @@ import type { Services } from "../../container.js";
 import { randomToken, ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { createIdentityModule } from "../identity/index.js";
-import { identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../identity/schema.js";
+import { identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../identity/schema.js";
 import { entraEndpoints, pkceChallenge, verifyIdToken } from "../identity/sso/oidc.js";
 import { emailColumns, nameColumns } from "../identity/users.js";
 import { assessEntraSignIn, isFreshEntraAuthentication } from "./entra.js";
@@ -67,7 +67,7 @@ describe("Assurance through the Entra callback and completion service", () => {
   const endpoint = entraEndpoints(tenantId);
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, ...assuranceSchema } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, ...assuranceSchema } });
   });
   afterAll(() => db?.cleanup());
   beforeEach(async () => {
