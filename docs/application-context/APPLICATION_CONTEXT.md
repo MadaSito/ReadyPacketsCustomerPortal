@@ -156,7 +156,7 @@ Migration [`0003_increment_04`](../../migrations/0003_increment_04.sql) adds 48 
 
 ## Increment 04 part B: console order workspace
 
-The owner asked for this on 2026-11-21 (prompt 19). The contract is [INCREMENT_04_PART_B.md](../engineering/INCREMENT_04_PART_B.md), and its decisions are B1–B9. Migration `0004_increment_04_part_b` is additive. Every item below is implemented and tested by its owner; the integrator has not yet verified it.
+The owner asked for this on 2026-11-21 (prompt 19). The contract is [INCREMENT_04_PART_B.md](../engineering/INCREMENT_04_PART_B.md), and its decisions are B1–B9. Migration [`0004_increment_04_part_b`](../../migrations/0004_increment_04_part_b.sql) is additive: 3 tables and 13 nullable columns. Every item below is implemented and tested by its owner; the integrator has not yet verified it.
 
 | Area | What it does | Guard |
 | --- | --- | --- |

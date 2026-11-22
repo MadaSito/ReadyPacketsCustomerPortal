@@ -64,7 +64,7 @@ procedure.
 
 ### Operations — part B
 
-- **Migration `0004_increment_04_part_b`**: additive only (new tables, nullable columns, appended enum values), applied by `deploy/upgrade.sh`. See [UPGRADE.md](docs/operations/UPGRADE.md).
+- **Migration `0004_increment_04_part_b`**: additive only. It adds 3 tables (`order_name_history`, `order_policy_acceptances`, `payment_refunds`), 13 nullable columns and indexes, and is applied by `deploy/upgrade.sh`. See [UPGRADE.md](docs/operations/UPGRADE.md).
 
 ## [Unreleased]
 
