@@ -2,7 +2,7 @@
 /* global document, window -- These globals are used inside Chromium page.evaluate. */
 import axe from "axe-core";
 import { launchQaBrowser } from "./lib/browser.mjs";
-import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
+import { openQaRoute, qaRouteScenarios, QaRateLimitedError, routeQaContext, withQaRateLimitRetry } from "./lib/routes.mjs";
 import { createQaZoomDriver, setLiteralZoom } from "./lib/zoom.mjs";
 
 const tags = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"];
@@ -68,7 +68,7 @@ async function main() {
                 page = await context.newPage();
               }
               // A disposable instance should not contact external analytics, fonts, or services during QA.
-              await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+              await routeQaContext(context, baseUrl);
               await openQaRoute(page, baseUrl, scenario, theme, zoom);
             }, (line) => console.log(line));
             const result = await scan(page);

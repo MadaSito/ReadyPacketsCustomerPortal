@@ -101,6 +101,32 @@ export async function qaRouteScenarios() {
   return resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
 }
 
+const assetCache = new Map();
+const HASHED_ASSET = /^\/(assets|fonts)\/[^/]+[.-][A-Za-z0-9_-]{8,}\.(js|css|woff2?|svg|png|webp)$/u;
+
+/**
+ * Same-origin routing for a fresh QA context: blocks other origins and serves immutable, content-hashed
+ * /assets and /fonts files from a per-process memory cache after their first successful fetch. Every scan still
+ * uses a fresh context, but chunks are not downloaded again for each one (the edge pre-gate counts every request
+ * per IP). Navigations, API calls and unhashed files always go to the server.
+ */
+export async function routeQaContext(context, baseUrl) {
+  await context.route("**/*", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.origin !== baseUrl) return route.abort();
+    if (request.method() !== "GET" || url.search || !HASHED_ASSET.test(url.pathname)) return route.continue();
+    const cached = assetCache.get(url.pathname);
+    if (cached) return route.fulfill(cached);
+    const response = await route.fetch();
+    if (response.status() === 200) {
+      const headers = response.headers();
+      assetCache.set(url.pathname, { status: 200, headers: { "content-type": headers["content-type"] ?? "application/octet-stream" }, body: await response.body() });
+    }
+    return route.fulfill({ response });
+  });
+}
+
 /** Thrown when the QA instance answered 429: a shared-IP throttle, not a page defect. */
 export class QaRateLimitedError extends Error {
   constructor(retryAfterSeconds) {

@@ -33,4 +33,6 @@ several tRPC calls). If the instance answers 429, the runners wait for `Retry-Af
 scenario once in a fresh context. A second 429 is reported as `rate limited … (not a page result)` and counted
 separately in the summary; it is never a pass or a page defect. On a disposable QA instance an administrator can raise
 the `api` and `standard_browsing` budgets within their safe bounds in Console → Protection → Rate limits, then
-restore the defaults afterwards.
+restore the defaults afterwards. The process-local edge pre-gate (120 requests per 10 s per IP, static files
+included) is not configurable, so the runners serve content-hashed `/assets` files from an in-process memory cache after
+the first fetch (`routeQaContext`); navigations and API calls always reach the server.

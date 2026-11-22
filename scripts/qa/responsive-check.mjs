@@ -6,7 +6,7 @@
 // Requires QA_BASE_URL (disposable QA origin). Optional: QA_CHROMIUM_PATH, QA_ROUTE_FIXTURES, QA_ROUTE_FILTER,
 // QA_WIDTHS (comma list, partial run). Never prints raw Playwright errors (they may include tokens).
 import { launchQaBrowser } from "./lib/browser.mjs";
-import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
+import { openQaRoute, qaRouteScenarios, QaRateLimitedError, routeQaContext, withQaRateLimitRetry } from "./lib/routes.mjs";
 
 const ALL_WIDTHS = [240, 320, 390, 768, 1024, 1440, 1920, 2560];
 const MIN_TARGET = 24;
@@ -100,7 +100,7 @@ async function main() {
                 colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
                 acceptDownloads: false, serviceWorkers: "block", hasTouch: width < 1024, isMobile: false,
               });
-              await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+              await routeQaContext(context, baseUrl);
               page = await context.newPage();
               await openQaRoute(page, baseUrl, scenario, theme);
             }, (line) => console.log(line));
