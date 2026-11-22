@@ -34,9 +34,10 @@ export default function SignInPage() {
       setPassword("");
       await proceed(result.nextStep);
     } catch (err) {
-      const code: string | undefined = safeError(err)?.domainCode;
+      const safe = safeError(err);
+      const code = safe?.domainCode;
       // Uniform, non-enumerating message for credential failures; pass through rate-limit/maintenance messages.
-      setError(code === "RATE_LIMITED" || code === "MAINTENANCE" || code === "CUSTOMER_MAINTENANCE" || code === "UNAVAILABLE" ? errorMessage(err) : SIGN_IN_FAILED);
+      setError(code === "RATE_LIMITED" || code === "MAINTENANCE" || safe?.reasonCode === "CUSTOMER_MAINTENANCE" || code === "UNAVAILABLE" ? errorMessage(err) : SIGN_IN_FAILED);
     } finally {
       setBusy(false);
     }
