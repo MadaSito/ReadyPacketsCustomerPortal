@@ -47,6 +47,11 @@ function throwStepUpRequired(capability: Capability): never {
   );
 }
 
+export type AutomationsCheckedCapability =
+  | "automations.read"
+  | "automations.manage"
+  | "orders.automations.run";
+
 export async function recordAutomationsDenied(
   deps: ModuleDeps,
   principal: SessionPrincipal,
@@ -58,7 +63,12 @@ export async function recordAutomationsDenied(
     {
       category: "security",
       eventName: "authz.automations.denied",
-      action: capability === "automations.manage" ? "manage" : "read",
+      action:
+        capability === "automations.manage"
+          ? "manage"
+          : capability === "orders.automations.run"
+            ? "execute"
+            : "read",
       outcome: "denied",
       severity: "WARN",
       reasonCode,
@@ -73,7 +83,7 @@ export async function recordAutomationsDenied(
 export async function assertAutomationsCapabilityPreflight(
   deps: ModuleDeps,
   principal: SessionPrincipal,
-  capability: "automations.read" | "automations.manage",
+  capability: AutomationsCheckedCapability,
 ): Promise<void> {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
     await recordAutomationsDenied(deps, principal, capability, "ACCOUNT_STEP_PENDING");
@@ -119,7 +129,7 @@ export async function assertAutomationsActorInTx(
   deps: ModuleDeps,
   principal: SessionPrincipal,
   tx: Tx,
-  capability: "automations.read" | "automations.manage",
+  capability: AutomationsCheckedCapability,
   extraLockUserIds: readonly number[] = [],
 ): Promise<Map<number, LockedActorSummary>> {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {

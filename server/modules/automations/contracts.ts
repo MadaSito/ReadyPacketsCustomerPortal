@@ -474,6 +474,12 @@ export interface AutomationRunStepView {
   durationMs: number | null;
 }
 
+export interface OrderStageRunActorView {
+  publicId: string;
+  displayName: string;
+  role: "admin" | "staff" | "customer";
+}
+
 export interface AutomationRunView {
   publicId: string;
   automationPublicId: string;
@@ -482,6 +488,9 @@ export interface AutomationRunView {
   triggerMode: AutomationTriggerMode;
   triggerKey: string | null;
   triggerEventId: string | null;
+  orderPublicId: string | null;
+  stageStepKey: string | null;
+  triggeredBy: OrderStageRunActorView | null;
   correlationId: string;
   isTest: boolean;
   state: AutomationRunState;
@@ -493,6 +502,55 @@ export interface AutomationRunView {
   startedAt: Date | null;
   finishedAt: Date | null;
   durationMs: number | null;
+}
+
+export interface OrderStageBoundAutomationView {
+  publicId: string;
+  name: string;
+  description: string | null;
+  version: number;
+  triggerKey: string;
+  actionCount: number;
+  actionLabels: readonly string[];
+}
+
+export interface OrderStageStepView {
+  stepKey: string;
+  label: string;
+  customerLabel: string;
+  kind: "initial" | "active" | "terminal";
+  tone: "neutral" | "info" | "success" | "warning" | "danger";
+  phaseKey: string | null;
+  isCurrentOrderStep: boolean;
+  configuredAutomationCount: number;
+  configuredActionCount: number;
+  automations: readonly OrderStageBoundAutomationView[];
+}
+
+export interface OrderStageActionsView {
+  orderPublicId: string;
+  orderReference: string;
+  currentStatusKey: string;
+  workflowKey: string;
+  workflowVersionNumber: number;
+  engineEnabled: boolean;
+  engineDisabledReason: string | null;
+  settingsPath: "/admin/automations";
+  canManageAutomations: boolean;
+  steps: readonly OrderStageStepView[];
+  recentRuns: readonly AutomationRunView[];
+}
+
+export interface OrderStageActionsRunResult {
+  orderPublicId: string;
+  stepKey: string;
+  queuedRuns: readonly {
+    runPublicId: string;
+    automationPublicId: string;
+    automationName: string;
+    jobId: string;
+    deduplicated: boolean;
+  }[];
 }
 
 export interface AutomationStarterRecipe {
@@ -706,6 +764,7 @@ export interface AutomationsModule extends ModuleLifecycle {
     principal: SessionPrincipal,
     input: {
       automationPublicId?: string;
+      orderPublicId?: string;
       state?: AutomationRunState;
       cursor?: string;
       limit?: number;
@@ -713,6 +772,36 @@ export interface AutomationsModule extends ModuleLifecycle {
   ): Promise<{ items: AutomationRunView[]; nextCursor: string | null }>;
 
   getRun(principal: SessionPrincipal, input: { runPublicId: string }): Promise<AutomationRunView>;
+
+  /**
+   * Increment 04 Part B (Package T2 — B4 "Workflow stage actions"):
+   * Lists the steps of the order's pinned workflow version with enabled automations bound to each step,
+   * engine readiness state, and recent order-scoped automation runs. Requires `orders.automations.run`.
+   */
+  getOrderStageActions(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; runLimit?: number },
+  ): Promise<OrderStageActionsView>;
+
+  /**
+   * Increment 04 Part B (Package T2): paginated automation run history scoped to one order.
+   * Requires `orders.automations.run`.
+   */
+  listOrderStageRuns(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; cursor?: string; limit?: number },
+  ): Promise<{ items: AutomationRunView[]; nextCursor: string | null }>;
+
+  /**
+   * Increment 04 Part B (Package T2 — B4 "Workflow stage actions"):
+   * Queues and runs the enabled automations bound to `stepKey` on `orderPublicId` through the
+   * automations engine with per-run idempotency, rate limits, run-history tagging, and `order.stage_actions.run` audit.
+   * Requires `orders.automations.run`.
+   */
+  runForOrder(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stepKey: string; idempotencyKey: string },
+  ): Promise<OrderStageActionsRunResult>;
 }
 
 /* ------------------------------------------------------------------ shared static registry backing */
@@ -730,16 +819,23 @@ export function assertValidTriggerKey(key: string): void {
   }
 }
 
+export function isProhibitedActionKey(key: string): boolean {
+  for (const forbidden of PROHIBITED_ACTION_PREFIXES) {
+    if (key === forbidden || key.startsWith(forbidden)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function assertAllowedActionKey(key: string): void {
   if (!ACTION_KEY_RE.test(key) || key.length > 80) {
     throw new TypeError(`Invalid automation action key: ${key}`);
   }
-  for (const forbidden of PROHIBITED_ACTION_PREFIXES) {
-    if (key === forbidden || key.startsWith(forbidden)) {
-      throw new TypeError(
-        `Automation action key "${key}" is prohibited: actions may never mutate order status, permissions, credentials, or settings`,
-      );
-    }
+  if (isProhibitedActionKey(key)) {
+    throw new TypeError(
+      `Automation action key "${key}" is prohibited: actions may never mutate order status, permissions, credentials, or settings`,
+    );
   }
 }
 

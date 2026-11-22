@@ -107,7 +107,7 @@ export const engagementFeature: FeatureRoutes = {
       label: "Messages",
       component: OrderMessagesTab,
       access: "customer",
-      order: 20,
+      order: 40,
       badge: OrderMessagesUnreadBadge,
     },
   ],

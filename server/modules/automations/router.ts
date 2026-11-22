@@ -4,7 +4,7 @@
  */
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
-import { adminProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { adminProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { conditionTreeSchema } from "./conditions.js";
 import {
   AUTOMATION_MAX_ACTIONS,
@@ -19,6 +19,17 @@ import {
 
 const readProc = adminProcedure.use(requireCapability("automations.read"));
 const manageProc = adminProcedure.use(requireCapability("automations.manage"));
+const stageActionsProc = staffProcedure.use(requireCapability("orders.automations.run"));
+
+const stageStepKeySchema = z
+  .string()
+  .trim()
+  .regex(/^[a-z][a-z0-9_]{1,47}$/, "Invalid workflow step key.");
+
+const stageIdempotencyKeySchema = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9:_-]{8,64}$/, "Invalid idempotency key.");
 
 const ulidSchema = z
   .string()
@@ -248,6 +259,7 @@ export const automationsRouter = router({
         z
           .strictObject({
             automationPublicId: ulidSchema.optional(),
+            orderPublicId: ulidSchema.optional(),
             state: z.enum(AUTOMATION_RUN_STATES).optional(),
             cursor: cursorSchema,
             limit: z.number().int().min(1).max(100).optional(),
@@ -257,6 +269,7 @@ export const automationsRouter = router({
       .query(async ({ ctx, input }) => {
         return ctx.services.automations.listRuns(ctx.session, {
           ...(input?.automationPublicId ? { automationPublicId: input.automationPublicId } : {}),
+          ...(input?.orderPublicId ? { orderPublicId: input.orderPublicId } : {}),
           ...(input?.state ? { state: input.state } : {}),
           ...(input?.cursor ? { cursor: input.cursor } : {}),
           ...(input?.limit !== undefined ? { limit: input.limit } : {}),
@@ -267,6 +280,50 @@ export const automationsRouter = router({
       .input(z.strictObject({ runPublicId: ulidSchema }))
       .query(async ({ ctx, input }) => {
         return ctx.services.automations.getRun(ctx.session, input);
+      }),
+  }),
+
+  orderStageActions: router({
+    get: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          runLimit: z.number().int().min(1).max(50).optional(),
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.automations.getOrderStageActions(ctx.session, {
+          orderPublicId: input.orderPublicId,
+          ...(input.runLimit !== undefined ? { runLimit: input.runLimit } : {}),
+        });
+      }),
+
+    listRuns: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          cursor: cursorSchema,
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.automations.listOrderStageRuns(ctx.session, {
+          orderPublicId: input.orderPublicId,
+          ...(input.cursor ? { cursor: input.cursor } : {}),
+          ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        });
+      }),
+
+    runForOrder: stageActionsProc
+      .input(
+        z.strictObject({
+          orderPublicId: ulidSchema,
+          stepKey: stageStepKeySchema,
+          idempotencyKey: stageIdempotencyKeySchema,
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        return ctx.services.automations.runForOrder(ctx.session, input);
       }),
   }),
 });

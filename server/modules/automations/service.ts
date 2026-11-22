@@ -2,7 +2,9 @@
  * Automations module — core service, registry runtime, audit tap, and worker execution engine.
  * Owner: Package J server (`server/modules/automations/**`).
  */
+import { createHash } from "node:crypto";
 import { and, asc, count, desc, eq, gte, inArray, isNotNull, lt, lte } from "drizzle-orm";
+import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, conflict, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
@@ -47,6 +49,7 @@ import {
   EMPTY_CONDITION_TREE,
   OPERATORS_BY_FIELD_TYPE,
   conditionTreeSchema,
+  evaluateConditionLeaf,
   evaluateConditionTree,
   validateConditionTreeForFields,
 } from "./conditions.js";
@@ -60,6 +63,7 @@ import {
   assertAllowedActionKey,
   assertValidTriggerKey,
   getStaticAutomationRegistrations,
+  isProhibitedActionKey,
   type AutomationActionRegistration,
   type AutomationActionRunContext,
   type AutomationActionRunResult,
@@ -81,6 +85,11 @@ import {
   type AutomationTriggerRegistration,
   type AutomationVersionView,
   type AutomationsModule,
+  type OrderStageActionsRunResult,
+  type OrderStageActionsView,
+  type OrderStageBoundAutomationView,
+  type OrderStageRunActorView,
+  type OrderStageStepView,
 } from "./contracts.js";
 import {
   automationRunSteps,
@@ -100,6 +109,44 @@ export const JOB_PURGE_RUNS = "automations.purge_runs";
 const MAX_STEP_ATTEMPTS = 4;
 const MAX_LIVE_TEST_RUNS_PER_HOUR = 10;
 const STEP_KEY_RE = /^[A-Za-z0-9_-]{1,32}$/;
+const STAGE_STEP_KEY_RE = /^[a-z][a-z0-9_]{1,47}$/;
+const STAGE_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9:_-]{8,64}$/;
+const UNMATCHED_STEP_SENTINEL = "__rp_unmatched_step_sentinel__";
+const ENGINE_DISABLED_STAGE_MESSAGE =
+  "Automations engine is turned off. Enable it in Automations settings before running stage actions.";
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function canConditionTreeMatchStatus(
+  tree: AutomationConditionTree,
+  candidateStatus: string,
+): boolean {
+  if (tree.groups.length === 0) return true;
+  const groupMatches = tree.groups.map((group) => {
+    const leafMatches = group.conditions.map((leaf) => {
+      if (leaf.field !== "to_status") return true;
+      return evaluateConditionLeaf(leaf, candidateStatus);
+    });
+    return group.match === "all"
+      ? leafMatches.every(Boolean)
+      : leafMatches.some(Boolean);
+  });
+  return tree.match === "all"
+    ? groupMatches.every(Boolean)
+    : groupMatches.some(Boolean);
+}
+
+function conditionsBindSpecificallyToStep(
+  tree: AutomationConditionTree,
+  stepKey: string,
+): boolean {
+  return (
+    canConditionTreeMatchStatus(tree, stepKey) &&
+    !canConditionTreeMatchStatus(tree, UNMATCHED_STEP_SENTINEL)
+  );
+}
 
 interface PersistedActionStep {
   stepKey: string;
@@ -121,6 +168,7 @@ interface TransientRunSnapshot {
   parentCorrelationId?: string | null;
   orderPublicId?: string | null;
   filePublicId?: string | null;
+  actorUserId?: number | null;
   sampleFields?: Record<string, AutomationScalarValue> | null;
 }
 
@@ -871,18 +919,37 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       }
     }
 
-    if (orderPublicId && ULID_PATTERN.test(orderPublicId) && !fields.order_reference) {
+    if (input.snapshot.actorUserId && !recipients.actor) {
+      recipients.actor = [input.snapshot.actorUserId];
+    }
+
+    if (
+      orderPublicId &&
+      ULID_PATTERN.test(orderPublicId) &&
+      (!fields.order_reference || (!staffOnlyTrigger && !recipients.order_owner))
+    ) {
       const orderRef = await deps.services.orders?.getOrderRefByPublicId?.(orderPublicId, db);
       if (orderRef) {
-        fields.order_public_id = orderRef.publicId;
-        fields.order_reference = orderRef.reference;
-        fields.order_status_label = orderRef.statusKey;
-        fields.order_link = new URL(
-          `/orders/${orderRef.publicId}`,
-          deps.config.canonicalOrigin,
-        ).href;
+        if (fields.order_public_id === undefined) {
+          fields.order_public_id = orderRef.publicId;
+        }
+        if (fields.order_reference === undefined) {
+          fields.order_reference = orderRef.reference;
+        }
+        if (fields.order_status_label === undefined) {
+          fields.order_status_label = orderRef.statusKey;
+        }
+        if (fields.order_link === undefined) {
+          fields.order_link = new URL(
+            `/orders/${orderRef.publicId}`,
+            deps.config.canonicalOrigin,
+          ).href;
+        }
         if (!staffOnlyTrigger && !recipients.order_owner) {
           recipients.order_owner = [orderRef.ownerUserId];
+        }
+        if (!recipients.order_assignee) {
+          recipients.order_assignee = [];
         }
       }
     }
@@ -934,6 +1001,9 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       triggerMode: AutomationTriggerMode;
       triggerKey: string | null;
       triggerEventId: string | null;
+      orderPublicId?: string | null;
+      stageStepKey?: string | null;
+      triggeredByUserId?: number | null;
       dedupKey: string;
       isTest: boolean;
       snapshot: TransientRunSnapshot;
@@ -966,6 +1036,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       [],
     );
 
+    const resolvedOrderPublicId =
+      params.orderPublicId !== undefined
+        ? params.orderPublicId
+        : params.snapshot.orderPublicId && ULID_PATTERN.test(params.snapshot.orderPublicId)
+          ? params.snapshot.orderPublicId
+          : null;
+
     let runId: number;
     try {
       const [ins] = await tx.insert(automationRuns).values({
@@ -977,6 +1054,9 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         triggerMode: params.triggerMode,
         triggerKey: params.triggerKey,
         triggerEventId: params.triggerEventId,
+        orderPublicId: resolvedOrderPublicId,
+        stageStepKey: params.stageStepKey ?? null,
+        triggeredByUserId: params.triggeredByUserId ?? null,
         dedupKey: params.dedupKey,
         correlationId,
         isTest: params.isTest,
@@ -1471,6 +1551,46 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           }
 
           const persistedStep = persistedByStepKey.get(stepRow.stepKey);
+          if (
+            isProhibitedActionKey(stepRow.actionKey) ||
+            (persistedStep ? isProhibitedActionKey(persistedStep.actionKey) : false)
+          ) {
+            await db.transaction(async (tx) => {
+              await job.assertStillOwned(tx);
+              const now = clock.now();
+              await tx
+                .update(automationRunSteps)
+                .set({
+                  state: "failed",
+                  reasonCode: "ACTION_PROHIBITED",
+                  safeSummary:
+                    "Prohibited action blocked: automations cannot change order status or permissions.",
+                  finishedAt: now,
+                  updatedAt: now,
+                })
+                .where(eq(automationRunSteps.id, stepRow.id));
+              await tx
+                .update(automationRunSteps)
+                .set({ state: "skipped", reasonCode: "PRIOR_STEP_FAILED", updatedAt: now })
+                .where(
+                  and(
+                    eq(automationRunSteps.runId, runRow.id),
+                    eq(automationRunSteps.state, "pending"),
+                  ),
+                );
+              await finalizeRunInTx(
+                tx,
+                autoRow,
+                runRow,
+                "failed",
+                "ACTION_PROHIBITED",
+                evaluatedFieldsJson,
+                snapshot.parentCorrelationId,
+              );
+            });
+            return { outcome: "completed" };
+          }
+
           const actionDef = actionMap.get(stepRow.actionKey);
           if (!persistedStep || !actionDef) {
             await db.transaction(async (tx) => {
@@ -2932,10 +3052,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         triggerMode: "manual",
         triggerKey: null,
         triggerEventId: null,
+        orderPublicId: input.orderPublicId ?? null,
+        triggeredByUserId: principal.userId,
         dedupKey: manualDedup,
         isTest: false,
         snapshot: {
           orderPublicId: input.orderPublicId ?? null,
+          actorUserId: principal.userId,
           sampleFields: input.sampleFields ?? null,
         },
       });
@@ -2948,8 +3071,12 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
           outcome: "completed",
           actor: { userId: principal.userId, role: principal.role },
           resource: { type: "automation", publicId: autoRow.publicId },
+          ...(input.orderPublicId ? { orderPublicId: input.orderPublicId } : {}),
           correlationId: automationCorrelationId(queued.runPublicId),
-          attributes: { run_public_id: queued.runPublicId },
+          attributes: {
+            run_public_id: queued.runPublicId,
+            ...(input.orderPublicId ? { order_public_id: input.orderPublicId } : {}),
+          },
         },
         tx,
       );
@@ -3147,10 +3274,13 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
         triggerMode: existingAuto.triggerMode,
         triggerKey: existingAuto.triggerKey,
         triggerEventId: null,
+        orderPublicId: input.orderPublicId ?? null,
+        triggeredByUserId: principal.userId,
         dedupKey: `test:${ulid(clock.now().getTime())}`,
         isTest: true,
         snapshot: {
           orderPublicId: input.orderPublicId ?? null,
+          actorUserId: principal.userId,
           sampleFields: input.sampleFields ?? null,
         },
       });
@@ -3213,6 +3343,39 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       stepsByRunId.set(s.runId, arr);
     }
 
+    const actorIds = [
+      ...new Set(
+        runRows
+          .map((r) => r.triggeredByUserId)
+          .filter((uid): uid is number => typeof uid === "number" && uid > 0),
+      ),
+    ];
+    const actorById = new Map<number, OrderStageRunActorView>();
+    if (actorIds.length > 0) {
+      const actorRows = await db
+        .select({
+          id: users.id,
+          publicId: users.publicId,
+          nameEnc: users.nameEnc,
+          role: users.role,
+        })
+        .from(users)
+        .where(inArray(users.id, actorIds));
+      for (const a of actorRows) {
+        let displayName: string = a.role;
+        try {
+          displayName = crypto.decrypt(a.nameEnc, `users.name:${a.publicId}`);
+        } catch {
+          // Keep role fallback if decryption fails in synthetic rows.
+        }
+        actorById.set(a.id, {
+          publicId: a.publicId,
+          displayName,
+          role: a.role,
+        });
+      }
+    }
+
     return runRows.map((r) => ({
       publicId: r.publicId,
       automationPublicId: r.automationPublicId,
@@ -3221,6 +3384,9 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       triggerMode: r.triggerMode,
       triggerKey: r.triggerKey,
       triggerEventId: r.triggerEventId,
+      orderPublicId: r.orderPublicId ?? null,
+      stageStepKey: r.stageStepKey ?? null,
+      triggeredBy: r.triggeredByUserId ? (actorById.get(r.triggeredByUserId) ?? null) : null,
       correlationId: r.correlationId,
       isTest: r.isTest,
       state: r.state,
@@ -3241,6 +3407,7 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     principal: SessionPrincipal,
     input: {
       automationPublicId?: string;
+      orderPublicId?: string;
       state?: AutomationRunState;
       cursor?: string;
       limit?: number;
@@ -3249,6 +3416,10 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     await assertAutomationsCapabilityPreflight(deps, principal, "automations.read");
     const limit = Math.min(Math.max(input.limit ?? 25, 1), 100);
     const beforeId = decodeIdCursor(input.cursor);
+
+    if (input.orderPublicId && !ULID_PATTERN.test(input.orderPublicId)) {
+      return { items: [], nextCursor: null };
+    }
 
     let filterAutoId: number | undefined;
     if (input.automationPublicId) {
@@ -3270,6 +3441,9 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
       .where(
         and(
           filterAutoId !== undefined ? eq(automationRuns.automationId, filterAutoId) : undefined,
+          input.orderPublicId !== undefined
+            ? eq(automationRuns.orderPublicId, input.orderPublicId)
+            : undefined,
           input.state !== undefined ? eq(automationRuns.state, input.state) : undefined,
           beforeId !== undefined ? lt(automationRuns.id, beforeId) : undefined,
         ),
@@ -3299,6 +3473,358 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     if (!row) throw notFound("AUTOMATION_RUN_NOT_FOUND");
     const [hydrated] = await hydrateRunViews([row]);
     return hydrated!;
+  }
+
+  /* --------------------------------------------------- Order stage actions (Part B T2) */
+
+  function requireOrdersService() {
+    const ordersSvc = deps.services.orders;
+    if (!ordersSvc) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "ORDERS_UNAVAILABLE",
+        "Order service is temporarily unavailable.",
+      );
+    }
+    return ordersSvc;
+  }
+
+  function automationBindsToWorkflowStep(
+    autoRow: typeof automations.$inferSelect,
+    versionRow: typeof automationVersions.$inferSelect,
+    step: { key: string; kind: "initial" | "active" | "terminal" },
+  ): boolean {
+    if (!autoRow.enabled || autoRow.triggerMode !== "event") {
+      return false;
+    }
+    if (autoRow.triggerKey === "order.created") {
+      return step.kind === "initial";
+    }
+    if (autoRow.triggerKey === "order.status_changed") {
+      const conditionsTree = parseJsonSafe<AutomationConditionTree>(
+        versionRow.conditionsJson,
+        EMPTY_CONDITION_TREE,
+      );
+      return conditionsBindSpecificallyToStep(conditionsTree, step.key);
+    }
+    return false;
+  }
+
+  function toBoundAutomationView(
+    autoRow: typeof automations.$inferSelect,
+    versionRow: typeof automationVersions.$inferSelect,
+  ): OrderStageBoundAutomationView {
+    const persistedActions = parseJsonSafe<PersistedActionStep[]>(versionRow.actionsJson, []);
+    const actionLabels = persistedActions.map((step) => {
+      if (step.label && step.label.trim().length > 0) return step.label.trim();
+      const registered = actionMap.get(step.actionKey);
+      return registered?.label ?? step.actionKey;
+    });
+    return {
+      publicId: autoRow.publicId,
+      name: autoRow.name,
+      description: autoRow.description ?? null,
+      version: versionRow.version,
+      triggerKey: autoRow.triggerKey ?? "order.status_changed",
+      actionCount: persistedActions.length,
+      actionLabels,
+    };
+  }
+
+  async function loadLatestVersionsByAutomationId(
+    dbOrTx: typeof db | Tx,
+    autoRows: ReadonlyArray<typeof automations.$inferSelect>,
+  ): Promise<Map<number, typeof automationVersions.$inferSelect>> {
+    const byAutoId = new Map<number, typeof automationVersions.$inferSelect>();
+    if (autoRows.length === 0) return byAutoId;
+    const autoIds = autoRows.map((r) => r.id);
+    const verRows = await dbOrTx
+      .select()
+      .from(automationVersions)
+      .where(inArray(automationVersions.automationId, autoIds));
+    const targetVersionByAutoId = new Map(autoRows.map((r) => [r.id, r.version]));
+    for (const v of verRows) {
+      if (targetVersionByAutoId.get(v.automationId) === v.version) {
+        byAutoId.set(v.automationId, v);
+      }
+    }
+    return byAutoId;
+  }
+
+  async function getOrderStageActions(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; runLimit?: number },
+  ): Promise<OrderStageActionsView> {
+    await assertAutomationsCapabilityPreflight(deps, principal, "orders.automations.run");
+    if (!ULID_PATTERN.test(input.orderPublicId)) {
+      throw validation("INVALID_ORDER_ID", "Order identifier is invalid.");
+    }
+    syncStaticRegistrations();
+
+    const ordersSvc = requireOrdersService();
+    const access = await ordersSvc.assertCanReadOrder(principal, input.orderPublicId);
+    const bound = await ordersSvc.workflows.byVersionId(db, access.workflowVersionId);
+    const cfg = await readSetting(settings, AUTOMATIONS_CONFIG);
+
+    const candidateAutos = await db
+      .select()
+      .from(automations)
+      .where(
+        and(
+          eq(automations.enabled, true),
+          eq(automations.triggerMode, "event"),
+          inArray(automations.triggerKey, ["order.created", "order.status_changed"]),
+        ),
+      )
+      .orderBy(asc(automations.id));
+
+    const verByAutoId = await loadLatestVersionsByAutomationId(db, candidateAutos);
+
+    const steps: OrderStageStepView[] = bound.definition.states.map((state) => {
+      const boundViews: OrderStageBoundAutomationView[] = [];
+      let configuredActionCount = 0;
+      for (const autoRow of candidateAutos) {
+        const verRow = verByAutoId.get(autoRow.id);
+        if (!verRow) continue;
+        if (automationBindsToWorkflowStep(autoRow, verRow, state)) {
+          const view = toBoundAutomationView(autoRow, verRow);
+          boundViews.push(view);
+          configuredActionCount += view.actionCount;
+        }
+      }
+      return {
+        stepKey: state.key,
+        label: state.label,
+        customerLabel: state.customerLabel,
+        kind: state.kind,
+        tone: state.tone,
+        phaseKey: state.phase ?? null,
+        isCurrentOrderStep: access.statusKey === state.key,
+        configuredAutomationCount: boundViews.length,
+        configuredActionCount,
+        automations: boundViews,
+      };
+    });
+
+    const runLimit = Math.min(Math.max(input.runLimit ?? 20, 1), 50);
+    const runRows = await db
+      .select()
+      .from(automationRuns)
+      .where(eq(automationRuns.orderPublicId, access.publicId))
+      .orderBy(desc(automationRuns.id))
+      .limit(runLimit);
+    const recentRuns = await hydrateRunViews(runRows);
+
+    return {
+      orderPublicId: access.publicId,
+      orderReference: access.reference,
+      currentStatusKey: access.statusKey,
+      workflowKey: bound.workflowKey,
+      workflowVersionNumber: bound.versionNumber,
+      engineEnabled: cfg.enabled,
+      engineDisabledReason: cfg.enabled ? null : ENGINE_DISABLED_STAGE_MESSAGE,
+      settingsPath: "/admin/automations",
+      canManageAutomations: roleHasCapability(principal.role, "automations.manage"),
+      steps,
+      recentRuns,
+    };
+  }
+
+  async function listOrderStageRuns(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; cursor?: string; limit?: number },
+  ): Promise<{ items: AutomationRunView[]; nextCursor: string | null }> {
+    await assertAutomationsCapabilityPreflight(deps, principal, "orders.automations.run");
+    if (!ULID_PATTERN.test(input.orderPublicId)) {
+      throw validation("INVALID_ORDER_ID", "Order identifier is invalid.");
+    }
+    const ordersSvc = requireOrdersService();
+    const access = await ordersSvc.assertCanReadOrder(principal, input.orderPublicId);
+
+    const limit = Math.min(Math.max(input.limit ?? 20, 1), 50);
+    const beforeId = decodeIdCursor(input.cursor);
+
+    const rows = await db
+      .select()
+      .from(automationRuns)
+      .where(
+        and(
+          eq(automationRuns.orderPublicId, access.publicId),
+          beforeId !== undefined ? lt(automationRuns.id, beforeId) : undefined,
+        ),
+      )
+      .orderBy(desc(automationRuns.id))
+      .limit(limit + 1);
+
+    const slice = rows.slice(0, limit);
+    const nextCursor = rows.length > limit ? encodeIdCursor(slice[slice.length - 1]!.id) : null;
+    const items = await hydrateRunViews(slice);
+    return { items, nextCursor };
+  }
+
+  async function runForOrder(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string; stepKey: string; idempotencyKey: string },
+  ): Promise<OrderStageActionsRunResult> {
+    await assertAutomationsCapabilityPreflight(deps, principal, "orders.automations.run");
+    if (!ULID_PATTERN.test(input.orderPublicId)) {
+      throw validation("INVALID_ORDER_ID", "Order identifier is invalid.");
+    }
+    const stepKey = input.stepKey.trim();
+    if (!STAGE_STEP_KEY_RE.test(stepKey)) {
+      throw validation("INVALID_STEP_KEY", "Workflow step key is invalid.");
+    }
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (!STAGE_IDEMPOTENCY_KEY_RE.test(idempotencyKey)) {
+      throw validation(
+        "INVALID_IDEMPOTENCY_KEY",
+        "Idempotency key must be 8–64 URL-safe characters.",
+      );
+    }
+
+    syncStaticRegistrations();
+    const ordersSvc = requireOrdersService();
+    const orderSummary = await ordersSvc.getOrderSummary(principal, input.orderPublicId);
+
+    return db.transaction(async (tx) => {
+      await assertAutomationsActorInTx(deps, principal, tx, "orders.automations.run");
+
+      const cfg = await readSetting(settings, AUTOMATIONS_CONFIG, tx);
+      if (!cfg.enabled) {
+        throw new DomainError(
+          "NOT_CONFIGURED",
+          "AUTOMATIONS_DISABLED",
+          ENGINE_DISABLED_STAGE_MESSAGE,
+        );
+      }
+
+      const access = await ordersSvc.assertCanReadOrder(principal, input.orderPublicId, { tx });
+      const bound = await ordersSvc.workflows.byVersionId(tx, access.workflowVersionId);
+      const step = bound.definition.states.find((s) => s.key === stepKey);
+      if (!step) {
+        throw notFound("WORKFLOW_STEP_NOT_FOUND");
+      }
+
+      const candidateAutos = await tx
+        .select()
+        .from(automations)
+        .where(
+          and(
+            eq(automations.enabled, true),
+            eq(automations.triggerMode, "event"),
+            inArray(automations.triggerKey, ["order.created", "order.status_changed"]),
+          ),
+        )
+        .orderBy(asc(automations.id))
+        .for("update");
+
+      const verByAutoId = await loadLatestVersionsByAutomationId(tx, candidateAutos);
+      const boundAutos: Array<{
+        autoRow: typeof automations.$inferSelect;
+        verRow: typeof automationVersions.$inferSelect;
+      }> = [];
+      for (const autoRow of candidateAutos) {
+        const verRow = verByAutoId.get(autoRow.id);
+        if (!verRow) continue;
+        if (automationBindsToWorkflowStep(autoRow, verRow, step)) {
+          boundAutos.push({ autoRow, verRow });
+        }
+      }
+
+      if (boundAutos.length === 0) {
+        throw validation(
+          "NO_STAGE_ACTIONS_CONFIGURED",
+          `No enabled automations are bound to workflow step "${step.label}".`,
+        );
+      }
+
+      const orderLink = new URL(`/orders/${access.publicId}`, deps.config.canonicalOrigin).href;
+      const sampleFields: Record<string, AutomationScalarValue> = {
+        order_public_id: access.publicId,
+        order_reference: access.reference,
+        order_status_label: step.customerLabel,
+        order_link: orderLink,
+        currency: orderSummary.currency,
+        total_minor: orderSummary.totalMinor,
+        on_behalf: false,
+        from_status: access.statusKey,
+        to_status: step.key,
+        actor_role: principal.role,
+      };
+
+      const queuedRuns: {
+        runPublicId: string;
+        automationPublicId: string;
+        automationName: string;
+        jobId: string;
+        deduplicated: boolean;
+      }[] = [];
+      let newlyCreatedCount = 0;
+
+      for (const { autoRow, verRow } of boundAutos) {
+        const dedupKey = `stage:${sha256Hex(
+          `${access.publicId}:${step.key}:${autoRow.publicId}:${idempotencyKey}`,
+        )}`;
+        const queued = await createQueuedRunInTx(tx, {
+          automationRow: autoRow,
+          versionRow: verRow,
+          triggerMode: "manual",
+          triggerKey: autoRow.triggerKey,
+          triggerEventId: null,
+          orderPublicId: access.publicId,
+          stageStepKey: step.key,
+          triggeredByUserId: principal.userId,
+          dedupKey,
+          isTest: false,
+          snapshot: {
+            orderPublicId: access.publicId,
+            actorUserId: principal.userId,
+            sampleFields,
+          },
+        });
+        if (queued.created) {
+          newlyCreatedCount += 1;
+        }
+        queuedRuns.push({
+          runPublicId: queued.runPublicId,
+          automationPublicId: autoRow.publicId,
+          automationName: autoRow.name,
+          jobId: queued.jobId,
+          deduplicated: !queued.created,
+        });
+      }
+
+      if (newlyCreatedCount > 0) {
+        const firstNewRun = queuedRuns.find((r) => !r.deduplicated) ?? queuedRuns[0]!;
+        await audit.record(
+          {
+            category: "admin",
+            eventName: "order.stage_actions.run",
+            action: "execute",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "order", publicId: access.publicId },
+            orderPublicId: access.publicId,
+            correlationId: automationCorrelationId(firstNewRun.runPublicId),
+            safeCounts: {
+              queued_runs: newlyCreatedCount,
+              bound_automations: boundAutos.length,
+            },
+            attributes: {
+              order_public_id: access.publicId,
+              step_key: step.key,
+            },
+          },
+          tx,
+        );
+      }
+
+      return {
+        orderPublicId: access.publicId,
+        stepKey: step.key,
+        queuedRuns,
+      };
+    });
   }
 
   /* --------------------------------------------------- Module lifecycle */
@@ -3384,6 +3910,9 @@ export function createAutomationsService(deps: ModuleDeps): AutomationsModule {
     testRun,
     listRuns,
     getRun,
+    getOrderStageActions,
+    listOrderStageRuns,
+    runForOrder,
 
     init() {
       syncStaticRegistrations();
