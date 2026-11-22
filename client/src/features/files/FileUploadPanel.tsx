@@ -23,6 +23,7 @@ const uploadRefusals = new Map([
   ["UPLOAD_REQUEST_TOO_LARGE", "The total upload exceeds the request limit. Choose fewer or smaller files."],
   ["TOO_MANY_FILES", "This batch exceeds the file count limit."],
   ["ORDER_LOCKED", "This order is locked for file changes."],
+  ["ORDER_ACCEPTANCE_REQUIRED", "Accept the order's required policy before uploading files or saving a recording."],
   ["PHASE_LOCKED", "This phase is locked for file changes."],
   ["UPLOAD_SLOT_STATUS_CHANGED", "The order status changed. Reload to see the current upload slots."],
   ["UPLOAD_SLOT_UNAVAILABLE", "This upload slot is no longer available to you."],
@@ -60,6 +61,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const [category, setCategory] = useState<FileCategory>(replace?.category ?? "supporting");
   const [visibility, setVisibility] = useState<FileVisibility>(replace?.visibility ?? "customer_visible");
   const [selection, setSelection] = useState<File[]>([]);
+  const [recording, setRecording] = useState(false);
   const [results, setResults] = useState<UploadOutcome[]>([]);
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -73,10 +75,11 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     /^(?:audio\/)|\.(?:wav|ogg|webm|m4a)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
   const categories = (Object.keys(categoryLabels) as FileCategory[]).filter((key) => staff || key !== "deliverable");
 
-  function choose(files: File[]) {
+  function choose(files: File[], isRecording = false) {
     setMessage(null);
     setResults([]);
     setTranscript("");
+    setRecording(isRecording);
     if (files.length > maxFiles) {
       setSelection([]);
       setMessage(`Choose at most ${maxFiles} ${maxFiles === 1 ? "file" : "files"} per upload.`);
@@ -96,6 +99,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     setMessage(null);
     setResults([]);
     const query = new URLSearchParams({ category, visibility: slot ? "customer_visible" : visibility });
+    if (recording) query.set("source", "recording");
     if (slot) {
       query.set("slotKey", slot.key);
       query.set("statusKey", slot.statusKey);
@@ -151,7 +155,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       {audio?.enabled && !running && !selection.length && slot?.kind !== "document" ?
         <AudioRecorder extensions={extensions} maxSeconds={audio.maxMinutes * 60}
           maxBytes={Math.min(policy.maxFileBytes, policy.maxRequestBytes - 1024)}
-          onChoose={(file) => { choose([file]); window.requestAnimationFrame(() => transcriptInput.current?.focus()); }} /> : null}
+          onChoose={(file) => { choose([file], true); window.requestAnimationFrame(() => transcriptInput.current?.focus()); }} /> : null}
       {message ? <Callout tone="warning" title="Upload notice" live="polite">{message}</Callout> : null}
       {selection.length ? <>
         <ul className="grid min-w-0 divide-y divide-line rounded-[var(--radius-card)] border border-line bg-surface px-3" aria-label="Selected files and upload results">

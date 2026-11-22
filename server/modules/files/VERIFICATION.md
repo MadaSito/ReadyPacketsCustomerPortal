@@ -4,6 +4,8 @@ Use `source scripts/dev/env.sh` to select the project Node toolchain and local t
 
 ## Evidence and scope
 
+- Part B MySQL tests exercise the configured scanner before a clean PDF is staged for copy, prove a saved audio original and its real FFmpeg WebM derivative each stage their own copy with the original order status and slot, and assert bounded per-order transfer metadata before and after local deletion. Policy-gate tests verify a refusal before staging, a second refusal if the gate changes during transfer, and staff exemption. These tests use a fake Storage enqueue port and do not contact a cloud destination.
+
 - Increment 04 integration coverage includes slot admission, current owner, actor, phase changes at publication, counted versions, capacity and staff restore; the public API provider checks service scope, page bounds, current ownership, visibility, and its DTO. The worker tests use a synthetic waveform and real local FFmpeg to test conversion, lease loss, audit rollback, idempotent publication, and original retention, and a deliberately missing executable to test degraded health and original availability.
 - Local microphone permission, cancellation, keyboard pause/resume, review, object-URL disposal, and light/dark axe checks are exercised with mock browser APIs in jsdom. Device recording/playback, real browser layout and contrast, and assistive-technology acceptance remain staging checks.
 

@@ -18,6 +18,7 @@ const options = z.strictObject({
   versionOf: z.string().length(26).regex(ULID_PATTERN).optional(),
   slotKey: slotKeySchema.optional(),
   statusKey: slotKeySchema.optional(),
+  source: z.literal("recording").optional(),
 });
 const downloadBody = z.strictObject({ ticket: z.string().length(43).regex(/^[a-zA-Z0-9_-]{43}$/) });
 const multipartInvalid = () => validation("INVALID_MULTIPART", "Send one or more files using the multipart file fields.");

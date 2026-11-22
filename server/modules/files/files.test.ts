@@ -42,6 +42,8 @@ let persistedAdminStepUp: Date | null | undefined;
 let holdAtPurgeLock: boolean;
 let slotEnabled: boolean;
 let phaseLocked: boolean;
+let acceptanceRequired: boolean;
+let gateActions: { action: string; statusKey: string | null }[];
 
 beforeAll(async () => {
   t = await createTestDb({ schema: { orderFiles, fileDownloadTickets, fileAccessLog } });
@@ -66,6 +68,8 @@ beforeEach(async () => {
   holdAtPurgeLock = false;
   slotEnabled = false;
   phaseLocked = false;
+  acceptanceRequired = false;
+  gateActions = [];
   const read = async (principal: SessionPrincipal, id: number | string) => {
     if (id !== orderPublicId && id !== orderId) throw notFound("ORDER_NOT_FOUND");
     const accessRole = principal.role !== "customer" ? principal.role
@@ -86,14 +90,20 @@ beforeEach(async () => {
   };
   h.services.orders = {
     assertCanReadOrder: read, assertCanWriteOrder: write, assertCanReadOrderById: read, assertCanWriteOrderById: write,
+    gates: {
+      async assertCustomerMayWork({ action, statusKey }: { action: string; statusKey: string | null }) {
+        gateActions.push({ action, statusKey });
+        if (acceptanceRequired) throw new DomainError("CONFLICT", "ORDER_ACCEPTANCE_REQUIRED", "Accept the required order policy.");
+      },
+    },
     async getOrderRefByPublicId(id: string) {
       if (id !== orderPublicId) return null;
-      return { id: orderId, publicId: id, reference: "RP-TEST", ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
+      return { id: orderId, publicId: id, name: "Synthetic order", reference: "RP-TEST", ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
     },
     async getOrderRefById(id: number, tx?: Tx, options?: { forUpdate?: boolean }) {
       if (id !== orderId) return null;
       if (tx && options?.forUpdate && holdAtPurgeLock) locked = "legal_hold";
-      return { id, publicId: orderPublicId, ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
+      return { id, publicId: orderPublicId, name: "Synthetic order", reference: "RP-TEST", ownerUserId: orderOwner.userId, lockState: locked, statusKey: orderStage, workflowVersionId: 1 };
     },
     async getFileUploadSlots(principal: SessionPrincipal, id: string) {
       await write(principal, id);
@@ -107,7 +117,8 @@ beforeEach(async () => {
     async getFileSlotForCustody() { return slotEnabled ? voiceSlot : null; },
   } as unknown as TestHarness["services"]["orders"];
   h.services.identity = {
-    async getUser(userId: number) { return userId === orderOwner.userId ? { status: "active" } : null; },
+    async getUser(userId: number) { return userId === orderOwner.userId ?
+      { id: userId, publicId: orderOwner.userPublicId, name: "Synthetic customer", customerRef: "SAMPLE", status: "active" } : null; },
     sessions: {
       async assertCurrent(principal: SessionPrincipal) {
         if (principal.sessionId === revokedSession) throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Please sign in again.");
@@ -212,9 +223,21 @@ describe("private file admission and authorization", () => {
       await expect(files.setAudioRules(admin, rules)).resolves.toEqual(rules);
       expect(h.audit.named("file.audio.rules.changed")).toHaveLength(1);
       slotEnabled = true;
-      const result = await request(appFor(owner)).post(`/api/files/upload/${orderPublicId}?statusKey=intake&slotKey=voice_evidence`)
+      const stageOrderFile = vi.fn(async (publicId: string, tx: Tx, scope: { orderPublicId: string }) => {
+        expect(scope).toEqual({ orderPublicId });
+        await expect(files.getOrderFileCopySource(publicId, tx)).resolves.toMatchObject({
+          filePublicId: publicId, orderName: "Synthetic order", orderPublicId, statusKey: "intake", slotKey: "voice_evidence", createdAt: expect.any(Date),
+        });
+      });
+      h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
+      const result = await request(appFor(owner)).post(`/api/files/upload/${orderPublicId}?statusKey=intake&slotKey=voice_evidence&source=recording`)
         .field("transcript", "Synthetic audio transcript").attach("files", exampleWav(8000), "source.wav").expect(200);
       const id = result.body.results[0].file.publicId as string;
+      expect(stageOrderFile).toHaveBeenCalledExactlyOnceWith(id, expect.anything(), { orderPublicId });
+      expect(gateActions).toEqual([{ action: "record", statusKey: "intake" }, { action: "record", statusKey: "intake" }]);
+      expect(h.audit.named("file.uploaded")).toContainEqual(expect.objectContaining({
+        orderPublicId, attributes: expect.objectContaining({ file_source: "recording", file_visibility: "customer_visible" }),
+      }));
       expect(result.body.results[0]).toMatchObject({ outcome: "completed", file: { conversionState: "converting" } });
       await expect(files.readTranscript(stranger, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
       await expect(files.readTranscript(owner, id)).resolves.toEqual({ transcript: "Synthetic audio transcript" });
@@ -244,6 +267,7 @@ describe("private file admission and authorization", () => {
       const found = await files.list(owner, orderPublicId, {});
       const derived = found.items.find((item) => item.derivedFromPublicId === id)!;
       expect(derived).toMatchObject({ contentType: "audio/webm", extension: "webm", slotKey: "voice_evidence" });
+      expect(stageOrderFile.mock.calls.map(([publicId]) => publicId).filter((publicId) => publicId === derived.publicId)).toHaveLength(1);
       expect(found.items.find((item) => item.publicId === id)).toMatchObject({ extension: "wav", conversionState: "converted" });
       await expect(files.countFilesInSlot(orderId, "voice_evidence")).resolves.toBe(1);
       await expect(files.remove(staff, derived.publicId)).rejects.toMatchObject({ reasonCode: "AUDIO_DERIVATIVE_READ_ONLY" });
@@ -251,6 +275,9 @@ describe("private file admission and authorization", () => {
       await expect(files.assertCanReadFile(owner, derived.publicId)).rejects.toMatchObject({ code: "NOT_FOUND" });
       await expect(files.readTranscript(owner, id)).rejects.toMatchObject({ code: "NOT_FOUND" });
       expect(h.audit.named("file.audio.conversion").map((event) => event.outcome)).toEqual(["attempted", "attempted", "attempted", "completed"]);
+      expect(h.audit.named("file.audio.conversion").at(-1)).toMatchObject({
+        orderPublicId, attributes: { file_visibility: "customer_visible" },
+      });
     } finally { await rm(root, { force: true, recursive: true }); }
   });
 
@@ -302,6 +329,57 @@ describe("private file admission and authorization", () => {
     expect(stageOrderFile).toHaveBeenCalledOnce();
     expect(await t.db.select().from(orderFiles)).toEqual([]);
     expect(h.storage.objects.size).toBe(0);
+  });
+
+  it("stages a clean scanned document with its order and original status, and reports bounded metadata", async () => {
+    const scan = vi.fn(async ({ stream }: { stream: Readable }) => {
+      await buffer(stream);
+      return "clean" as const;
+    });
+    files = createFilesModule(h.deps, { scanner: { scan, health: async () => "ok" } });
+    const stageOrderFile = vi.fn(async (publicId: string, tx: Tx, scope: { orderPublicId: string }) => {
+      expect(scan).toHaveBeenCalledOnce();
+      expect(scope).toEqual({ orderPublicId });
+      await expect(files.getOrderFileCopySource(publicId, tx)).resolves.toMatchObject({
+        orderPublicId, orderName: "Synthetic order", filePublicId: publicId, displayName: "clean.pdf", statusKey: "intake", slotKey: null,
+      });
+    });
+    h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
+    const plan = await files.beginUpload(owner, orderPublicId, upload);
+    const staged = await files.stageUpload("clean.pdf", Readable.from([examplePdf()]), plan.rules);
+    const accepted = await files.commitUpload(owner, plan, staged);
+    expect(stageOrderFile).toHaveBeenCalledExactlyOnceWith(accepted.publicId, expect.anything(), { orderPublicId });
+    orderStage = "production";
+    await t.db.transaction(async (tx) => {
+      await expect(files.listOrderFileCopyMetadata(orderPublicId, [accepted.publicId], tx)).resolves.toEqual([{
+        filePublicId: accepted.publicId, displayName: "clean.pdf", statusKey: "intake", slotKey: null, sourceAvailable: true,
+      }]);
+      await expect(files.listOrderFileCopyMetadata(userPublicId, [accepted.publicId], tx)).resolves.toEqual([]);
+    });
+    await files.remove(staff, accepted.publicId);
+    await t.db.transaction(async (tx) => {
+      await expect(files.listOrderFileCopyMetadata(orderPublicId, [accepted.publicId], tx)).resolves.toEqual([
+        expect.objectContaining({ sourceAvailable: false }),
+      ]);
+    });
+  });
+
+  it("refuses customer upload before staging and rechecks acceptance after bytes have been staged", async () => {
+    acceptanceRequired = true;
+    await expect(files.list(owner, orderPublicId, {})).resolves.toMatchObject({ canUpload: false, items: [], audio: null });
+    await expect(files.beginUpload(owner, orderPublicId, upload)).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ORDER_ACCEPTANCE_REQUIRED" });
+    expect(h.storage.objects.size).toBe(0);
+    acceptanceRequired = false;
+    const plan = await files.beginUpload(owner, orderPublicId, upload);
+    const staged = await files.stageUpload("clean.pdf", Readable.from([examplePdf()]), plan.rules);
+    acceptanceRequired = true;
+    try {
+      await expect(files.commitUpload(owner, plan, staged)).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ORDER_ACCEPTANCE_REQUIRED" });
+    } finally { await files.cleanUpload(staged); }
+    expect(await t.db.select().from(orderFiles)).toEqual([]);
+    expect(h.storage.objects.size).toBe(0);
+    await expect(add(staff)).resolves.toMatchObject({ orderPublicId });
+    expect(gateActions).toEqual(Array.from({ length: 4 }, () => ({ action: "upload", statusKey: null })));
   });
 
   it("binds owner and current order stage before and after a streamed upload", async () => {
