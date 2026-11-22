@@ -27,6 +27,17 @@ The owner asks for a log centre that tracks each customer's acceptance of a poli
 ## Assumptions to confirm with the owner
 - Staff, not only administrators, can read the acceptance log and the customer's Policies tab.
 
+## As implemented
+
+Package D2, as reported by the owner, with no differences from the decision above:
+
+- **Routes:**
+  - `/admin/policy-acceptances`, with `/coverage`, `/updates` and `/versions/:versionId`;
+  - the customer profile tab "policies" (order 40) on `/admin/customers/:customerId`.
+- **Navigation:** Billing & compliance → Policy acceptances.
+- **Procedures:** `compliance.policies.admin.acceptanceLog.{filterOptions,list,detail,coverage,updates,forCustomer,versionText,export}`.
+- **CSV export:** limited to 5,000 rows.
+
 ## Consequences
 - The centre shows what was recorded. It does not prove a customer read the policy, and it is not legal advice.
 - Acceptances recorded before increment 04 have no order-gate fields. They appear with the source they were recorded with.

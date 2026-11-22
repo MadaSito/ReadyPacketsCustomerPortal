@@ -21,6 +21,23 @@ The owner asks for upsell in the cart (increment 05, decision D2). The cart (ADR
 - **Administration.** The admin page "Cart suggestions" needs `carts.upsells.manage` (administrators). It lists, creates, edits, activates, deactivates and deletes offers, and shows how often each was shown, accepted and dismissed.
 - **Audit events:** `cart.upsell_offer.created|updated|activated|deactivated|deleted` and `cart.upsell.accepted`.
 
+## As implemented
+
+Package B, as reported by the owner:
+
+- **Pages:**
+  - `/admin/carts/suggestions` (Operations → Cart suggestions, `carts.upsells.manage`);
+  - `/admin/carts` (Open carts, `carts.read_all`);
+  - for customers, the suggestions section on `/cart`.
+- **Settings:**
+  - `feature.cart.upsell` (default off), which needs `feature.cart`;
+  - `cart.abandoned_ttl_hours` (1–2160, default 72), applied by the hourly job `cart.abandoned.expire`.
+- **Procedures:**
+  - `cart.upsell.{accept,dismiss}`;
+  - `cart.admin.upsells.{list,create,update,setActive,delete}`.
+- **Bundle completion:** automatic suggestions use priority 50.
+- **Offer copy:** plain text of at most 200 characters.
+
 ## Consequences
 - Suggestions follow the same pricing and packet rules as the cart, so an accepted offer can never produce a price the customer did not see.
 - The counters are operational figures, not analytics, and need no consent beyond the existing session.
