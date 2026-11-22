@@ -83,6 +83,11 @@ export const CAPABILITIES = [
   "payments.manage",
   "carts.read_all",
   "storage.copies.read",
+  // increment 04, part B: console order workspace (rename, refunds, pipeline redelivery, stage actions)
+  "orders.rename",
+  "orders.production.redeliver",
+  "orders.automations.run",
+  "payments.refund",
   // portable / backup
   "portable.export",
   "portable.import",
@@ -118,6 +123,8 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "community.moderate",
   "referrals.read_all",
   "carts.read_all",
+  "orders.rename",
+  "orders.automations.run",
 ];
 
 /** Default role grants. Staff least-privilege by assignment is a recorded ADR target, not yet implemented. */
@@ -164,6 +171,8 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "webhooks.manage",
   "privacy.consent.manage",
   "payments.manage",
+  "orders.production.redeliver",
+  "payments.refund",
   "portable.export",
   "portable.import",
   "backup.run",
