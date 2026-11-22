@@ -8,7 +8,7 @@ You can use a discount code in your cart or in the last step of **Create an orde
 
 ## Enter a code
 
-- **In the cart:** under **Discount code**, type the code and select **Apply**.
+- **In the cart:** in **Cart** (`/cart`) or **Checkout** (`/cart/checkout`), type the code under **Discount code** and select **Apply**. Select **Remove** to take it off.
 - **When creating an order:** in **Review**, type the code in **Discount code** and select **Apply**.
 
 When the code applies, you see its name and the amount saved, and the new total is announced to screen readers. The code itself is not shown on your order or invoice; its name is shown instead. When you submit, the discount is fixed on your order.
@@ -28,7 +28,8 @@ Closing the tab forgets the code. You can also select **Forget the saved code** 
 - If a code cannot be used, you see "This code cannot be applied." For your security, we do not say why. Check the code, or contact us.
 - If a code needs a minimum amount or applies only to some items, and it is valid for your account, you are told what is missing.
 - If you change your items and the code no longer applies, it is removed and you are told.
-- If a code expires or runs out just before you submit, the order is not placed. Review the new total and submit again.
+- If a code expires or runs out just before you submit, the order is not placed. Checkout shows **Order not placed — confirm new total**; review it and submit again if you wish.
+- If the bundle discount also applies, you get whichever saves you more, unless the code allows both. The total discount on an order is capped by your portal (50% of the subtotal by default).
 - After several unsuccessful tries, code entry pauses for 15 minutes.
-- If an order is cancelled before any payment was started, the code may become available again. A refund does not make a code available again.
+- If an order is cancelled before any payment was started, the code may become available again. Once an online payment has been started, the code stays used, even if you choose **Restore items to cart** or receive a refund.
 - When our team creates an order for you, they can apply a code that is valid for your account.

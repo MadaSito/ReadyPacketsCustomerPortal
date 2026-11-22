@@ -37,6 +37,9 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Feature status summary](#feature-status-summary)
 - [Increment 04 operating guides](#increment-04-operating-guides)
 - [Working on an order](#working-on-an-order)
+- [Cart suggestions](#cart-suggestions)
+- [Discount codes](#discount-codes)
+- [Policy acceptances](#policy-acceptances)
 
 ## Increment 04 operating guides
 
@@ -45,7 +48,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
-- [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
+- [Cart suggestions](#cart-suggestions), [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
 - [Workflow export and import](./WORKFLOW_TRANSFER.md) (increment 05): move workflows between portals as drafts; enable `orders.workflow_transfer.enabled` first.
 - [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md): configure order phases, requirements and staff actions.
 - [Cart and checkout](./CART_AND_CHECKOUT.md): configure checkout, fulfillment requirements and cart operations.
@@ -155,6 +158,43 @@ When a workflow has a policy gate, the customer, and everyone with access to the
 The **Acceptances (n)** tab lists each record, for example "Signed by <name> using typed signature", with the time, policy and version. The source address is shown only to users with `sessions.read_all`, and viewing it is audited. Each record keeps a fingerprint (SHA-256) of the exact policy text that was shown, so you can prove which version was accepted. Open a record to print its receipt.
 
 You add gates in the workflow designer: choose the policy, the gate point, the signature mode (checkbox or typed full name) and whether to ask again when the policy gets a new version. If it asks again, customers must accept the new text. No acceptance e-mail is sent.
+
+## Cart suggestions
+
+Open **Operations → Cart suggestions** (`/admin/carts/suggestions`). You need `carts.upsells.manage` (administrators). The design is set out in [ADR 0043](../adr/0043-cart-upsell.md). Full module notes are in the [cart administrator notes](../../server/modules/cart/ADMIN_GUIDE.md), and customer help is in [Suggestions in your cart](./CART_SUGGESTIONS_HELP.md).
+
+### Switching it on
+
+- **`feature.cart.upsell`** is off by default and needs **`feature.cart`**. Switch both in **Platform → Feature flags**; this needs step-up and is audited.
+- While suggestions are off, customers never see them, but you can prepare offers in advance.
+- **`cart.abandoned_ttl_hours`** (1–2160, default 72) sets when an inactive open cart expires. The hourly job `cart.abandoned.expire` marks those carts expired and records `cart.expired`.
+
+### Offers
+
+You can create, edit, activate, deactivate and delete two kinds of offer:
+
+- **Add-on product**: an active catalogue product not yet in the cart.
+- **Packet tier upgrade**: a higher-priced tier of a packet already in the cart. The customer sees the exact price difference.
+
+For each offer, set:
+
+- the trigger: **Any non-empty cart**, or **When specific products are in the cart**;
+- an optional start and end;
+- a priority from 1 to 1000, where lower numbers are shown first.
+
+Up to 3 suggestions show per cart. When a cart is 1 or 2 packets short of the bundle rule (`orders.bundle_rule`), ReadyPackets also adds a bundle-completion suggestion at priority 50.
+
+### Copy rules
+
+The copy is plain text of at most 200 characters. HTML, countdown timers, pre-ticked boxes and confirm-shaming labels are not offered. Prices and eligibility are worked out on the server from the live catalogue, so withdrawn or repriced products drop out without breaking carts.
+
+### Reporting
+
+The page shows **Shown**, **Accepted** and **Dismissed** counts for each offer. An offer counts as shown at most once per cart.
+
+### Open carts
+
+**Operations → Open carts** (`/admin/carts`, `carts.read_all`) is read-only. Cart notes, billing details and applied codes are encrypted and never shown there.
 
 ## Discount codes
 
