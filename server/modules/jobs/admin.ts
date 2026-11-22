@@ -174,6 +174,12 @@ export function createJobsAdmin(deps: ModuleDeps) {
 
   return {
     isDraining,
+    // Always acquire this lock before locking the caller's outbox row. Never settle or mutate the prior job here.
+    async canReplaceFailedOutboxJob(jobPublicId: string, expectedJobType: string, tx: Tx): Promise<boolean> {
+      const row = await lockJob(tx, jobPublicId);
+      return row?.type === expectedJobType && row.state === "failed" && !row.allowRetry && !row.interruptionPending
+        && row.scheduleName === null;
+    },
     async reconcileOutboxJob(jobPublicId: string, tx: Tx, options?: { cancelQueued?: boolean }): Promise<OutboxJobDisposition> {
       const row = await lockJob(tx, jobPublicId);
       if (!row) return { state: "missing" };

@@ -57,6 +57,51 @@ function fixture(profile: Parameters<typeof createTestDeps>[0] = {}, useDurableA
   return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent, durableAudit };
 }
 
+describe("Outbox generation replacement", () => {
+  const type = "storage.copy_order_file";
+  const safeReason = "STORAGE_PROVIDER_RETRY";
+
+  it("permits only a matching terminal failure inaccessible to generic Jobs retry", async () => {
+    const f = fixture();
+    f.jobs.register(type, async () => ({ outcome: "failed", reasonCode: safeReason, retryable: false }));
+    const { jobId } = await f.jobs.enqueue(type, {});
+    const canReplace = (expected = type) => t.db.transaction((tx) => f.admin.canReplaceFailedOutboxJob(jobId, expected, tx));
+    expect(await canReplace()).toBe(false);
+    const claim = (await f.engine.claim())!;
+    expect(await canReplace()).toBe(false);
+    await f.engine.execute(claim);
+    expect(await canReplace("storage.copy_backup")).toBe(false);
+    expect(await canReplace()).toBe(true);
+    await expect(f.admin.retry(f.operator, jobId)).rejects.toMatchObject({ reasonCode: "JOB_RETRY_UNSAFE" });
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({ state: "failed", allowRetry: false });
+  });
+
+  it("refuses automatic retries, generically retryable failures and an expired or unknown claim without rewriting them", async () => {
+    const f = fixture();
+    f.jobs.register<{ ambiguous?: boolean }>(type, async ({ payload }) => payload.ambiguous
+      ? { outcome: "unknown", reasonCode: "STORAGE_COPY_UNCERTAIN" }
+      : { outcome: "failed", reasonCode: safeReason, retryable: true });
+    const first = await f.jobs.enqueue(type, {}, { maxAttempts: 2 });
+    const canReplace = (jobId: string) => t.db.transaction((tx) => f.admin.canReplaceFailedOutboxJob(jobId, type, tx));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(first.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "queued" });
+    f.h.clock.advance(2_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(first.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "failed", allowRetry: true });
+    const second = await f.jobs.enqueue(type, { ambiguous: true });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(second.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, second.jobId)).toMatchObject({ state: "unknown" });
+    const third = await f.jobs.enqueue(type, {});
+    await f.engine.claim();
+    await expireLease(third.jobId);
+    expect(await canReplace(third.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, third.jobId)).toMatchObject({ state: "running" });
+  });
+});
+
 describe("Customer maintenance policy", () => {
   const immediate = { enabled: true, message: "", startsAt: null, endsAt: null, expectedVersion: 0 } as const;
 
