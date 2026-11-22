@@ -140,7 +140,7 @@ it("never restores on return or on opening confirmation; restores once after exp
   expect(mocks.restore).not.toHaveBeenCalled();
   await user.click(restore);
   expect(mocks.restore).not.toHaveBeenCalled();
-  await user.click(screen.getByRole("button", { name: "Restore items", exact: true }));
+  await user.click(screen.getByRole("button", { name: "Restore items" }));
   expect(await screen.findByRole("link", { name: "Open restored cart" })).toHaveAttribute("href", "/cart");
   expect(mocks.restore).toHaveBeenCalledExactlyOnceWith({ attemptPublicId: attemptId });
 });
