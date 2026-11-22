@@ -1,6 +1,6 @@
 import { AlertTriangle, CheckCircle2, Info, PowerOff, SearchX, Sparkles, XCircle, type LucideIcon } from "lucide-react";
 import { QueryClientContext } from "@tanstack/react-query";
-import { useContext, useState, type ReactNode } from "react";
+import { useContext, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button } from "./Button";
 import { cn } from "./cn";
@@ -200,17 +200,42 @@ export interface LoadMoreProps {
   summary?: ReactNode;
   label?: string;
 }
-/** Cursor-pagination control (no infinite scroll — keyboard and AT friendly). */
+/**
+ * Cursor-pagination control (no infinite scroll — keyboard and AT friendly). When the last page loads, the button
+ * disappears; if it was the focused control, focus moves to the summary (or the control's region) instead of being
+ * dropped on <body>.
+ */
 export function LoadMore({ hasMore, loading, onLoadMore, summary, label = "Load more" }: LoadMoreProps) {
+  const regionRef = useRef<HTMLDivElement>(null);
+  const summaryRef = useRef<HTMLParagraphElement>(null);
+  const ownedFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (hasMore || !ownedFocus.current) return;
+    ownedFocus.current = false;
+    const active = document.activeElement;
+    if (active && active !== document.body && document.contains(active)) return;
+    (summaryRef.current ?? regionRef.current)?.focus();
+  }, [hasMore]);
   return (
-    <div className="flex flex-col items-center gap-2 py-4">
+    <div ref={regionRef} tabIndex={-1} className="flex flex-col items-center gap-2 py-4 outline-none">
       {summary ? (
-        <p role="status" className="text-sm text-muted">
+        <p ref={summaryRef} tabIndex={-1} role="status" className="text-sm text-muted outline-none">
           {summary}
         </p>
       ) : null}
       {hasMore ? (
-        <Button variant="secondary" onClick={onLoadMore} loading={loading}>
+        <Button
+          variant="secondary"
+          onClick={onLoadMore}
+          loading={loading}
+          onFocus={() => {
+            ownedFocus.current = true;
+          }}
+          onBlur={(event) => {
+            // Keep ownership only while focus is being lost to the unmount (relatedTarget null and still pending).
+            if (event.relatedTarget) ownedFocus.current = false;
+          }}
+        >
           {label}
         </Button>
       ) : null}

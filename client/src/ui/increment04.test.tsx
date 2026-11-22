@@ -6,6 +6,7 @@ import { Package } from "lucide-react";
 import {
   Checklist,
   FilterBar,
+  LoadMore,
   checklistSummary,
   CodeSamples,
   CopyField,
@@ -173,5 +174,19 @@ describe("Inputs", () => {
   it("labels the FilterBar search landmark so it stays unique beside the shell search", () => {
     renderUi(<FilterBar search="" onSearchChange={() => {}} searchLabel="Search orders" />);
     expect(screen.getByRole("search", { name: "Search orders" })).toBeInTheDocument();
+  });
+
+  it("LoadMore moves focus to its summary when the final page removes the focused button", async () => {
+    const user = userEvent.setup();
+    function Pager() {
+      const [pages, setPages] = useState(1);
+      return <LoadMore hasMore={pages < 2} onLoadMore={() => setPages(2)} summary={`Showing ${pages * 25} records`} />;
+    }
+    renderUi(<Pager />);
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Load more" })).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+    expect(screen.getByText("Showing 50 records")).toHaveFocus();
   });
 });
