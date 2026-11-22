@@ -35,7 +35,7 @@ export default function InvoicesAdminPage() {
     <>
       <PageHeader
         title="Invoices"
-        description="Create and issue invoices for orders, record payments received outside the portal, and issue refunds. Online card payments are not available in this release."
+        description="Create and issue invoices for orders and record payments received outside the portal. Online payments and refunds are handled from the order's Refund tab and Payments settings."
         actions={
           canManage ? (
             <Button leadingIcon={<Plus aria-hidden />} onClick={() => setCreating(true)}>
@@ -101,7 +101,13 @@ export default function InvoicesAdminPage() {
               headingLevel={3}
               title={filtered ? "No invoices match these filters" : "No invoices yet"}
               description={filtered ? "Try another status or clear the filters." : "Create a draft invoice for an order, then issue it to the customer."}
-              action={!filtered && canManage ? <Button onClick={() => setCreating(true)}>Create the first invoice</Button> : undefined}
+              action={
+                !filtered && canManage ? (
+                  <Button onClick={() => setCreating(true)}>Create the first invoice</Button>
+                ) : orderId && !status && canManage ? (
+                  <Button onClick={() => setCreating(true)}>New invoice for this order</Button>
+                ) : undefined
+              }
             />
           }
         />

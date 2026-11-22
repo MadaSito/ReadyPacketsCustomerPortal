@@ -1,10 +1,11 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { Download, ReceiptText } from "lucide-react";
-import { useState } from "react";
+import { Download, Plus, ReceiptText } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { Link, useParams } from "wouter";
 import type { InvoiceDetailView, InvoicePaymentView, InvoiceSummaryView } from "@server/modules/compliance/invoicesService";
 import { useTRPC } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton } from "@/ui";
+import { useCan } from "../admin/common";
 import { downloadInvoicePdf, InvoiceStatusBadge } from "../shared";
 
 function Amount({ minor, currency }: { minor: number; currency: string }) {
@@ -15,13 +16,29 @@ function DueDate({ date }: { date: Date | null }) {
   return date ? <DateTime value={date} format="date" /> : <>No due date set</>;
 }
 
-function InvoiceList({ items, showOrder }: { items: readonly InvoiceSummaryView[]; showOrder: boolean }) {
-  if (!items.length) return <EmptyState icon={ReceiptText} title="No invoices yet" description="Issued invoices will appear here." />;
+function InvoiceList({
+  items,
+  showOrder,
+  area = "customer",
+  emptyDescription = "Issued invoices will appear here.",
+  emptyAction,
+}: {
+  items: readonly InvoiceSummaryView[];
+  showOrder: boolean;
+  area?: "customer" | "console";
+  emptyDescription?: string;
+  emptyAction?: ReactNode;
+}) {
+  if (!items.length) {
+    return <EmptyState icon={ReceiptText} title="No invoices yet" description={emptyDescription} action={emptyAction} />;
+  }
+  const baseHref = area === "console" ? "/admin/invoices" : "/invoices";
+  const fallbackLabel = area === "console" ? "Draft invoice" : "View invoice";
   return <ul className="grid gap-3">
     {items.map((invoice) => (
       <li key={invoice.invoicePublicId}>
-        <Card title={<Link href={`/invoices/${encodeURIComponent(invoice.invoicePublicId)}`} className="text-action underline underline-offset-2">
-          {invoice.invoiceNumber ?? "View invoice"}
+        <Card title={<Link href={`${baseHref}/${encodeURIComponent(invoice.invoicePublicId)}`} className="text-action underline underline-offset-2">
+          {invoice.invoiceNumber ?? fallbackLabel}
         </Link>} actions={<InvoiceStatusBadge status={invoice.status} />}>
           <KeyValueList columns={3} items={[
             ...(showOrder ? [{ label: "Order", value: invoice.orderReference }] : []),
@@ -55,7 +72,46 @@ export function InvoicesPage() {
   );
 }
 
-export function OrderInvoicesTab({ orderId }: { orderId: string; area: "customer" | "console" }) {
+function ConsoleOrderInvoicesTab({ orderId }: { orderId: string }) {
+  const trpc = useTRPC();
+  const canManage = useCan("invoices.manage");
+  const invoices = useQuery(trpc.compliance.invoices.listForOrder.queryOptions({ orderPublicId: orderId }));
+  if (invoices.isPending) return <Skeleton lines={4} />;
+  if (invoices.isError) return <ErrorState title="We couldn't load the order's invoices" onRetry={() => void invoices.refetch()} />;
+  const items = invoices.data.items;
+  const newInvoiceHref = `/admin/invoices?order=${encodeURIComponent(orderId)}`;
+  return (
+    <div className="space-y-4">
+      {items.length > 0 && canManage ? (
+        <div className="flex justify-end">
+          <Button asChild variant="secondary" leadingIcon={<Plus aria-hidden="true" />}>
+            <Link href={newInvoiceHref}>New invoice for this order</Link>
+          </Button>
+        </div>
+      ) : null}
+      <InvoiceList
+        items={items}
+        showOrder={false}
+        area="console"
+        emptyDescription={canManage ? "Create a draft invoice for this order, then issue it to the customer." : "Invoices for this order will appear here."}
+        emptyAction={
+          canManage ? (
+            <Button asChild leadingIcon={<Plus aria-hidden="true" />}>
+              <Link href={newInvoiceHref}>New invoice for this order</Link>
+            </Button>
+          ) : undefined
+        }
+      />
+    </div>
+  );
+}
+
+export function OrderInvoicesTab({ orderId, area }: { orderId: string; area: "customer" | "console" }) {
+  if (area === "console") return <ConsoleOrderInvoicesTab orderId={orderId} />;
+  return <CustomerOrderInvoicesTab orderId={orderId} />;
+}
+
+function CustomerOrderInvoicesTab({ orderId }: { orderId: string }) {
   const trpc = useTRPC();
   const invoices = useQuery(trpc.compliance.invoices.listForOrder.queryOptions({ orderPublicId: orderId }));
   if (invoices.isPending) return <Skeleton lines={4} />;

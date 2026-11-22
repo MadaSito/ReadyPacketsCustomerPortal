@@ -269,7 +269,8 @@ describe("customer invoices", () => {
     await expectNoAxeViolations(list.container);
     list.unmount();
     renderUi(<OrderInvoicesTab orderId={orderId} area="customer" />);
-    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    expect(screen.queryByRole("link", { name: "New invoice for this order" })).not.toBeInTheDocument();
     expect(screen.queryByText("Unissued sample")).not.toBeInTheDocument();
     expect(mocks.orderInvoices).toHaveBeenCalledWith({ orderPublicId: orderId });
   });

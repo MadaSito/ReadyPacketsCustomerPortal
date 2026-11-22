@@ -85,8 +85,12 @@ export default function InvoiceDetailPage() {
         const m = (minor: number) => <Money value={money(minor, invoice.currency)} />;
         return (
           <div className="flex flex-col gap-6">
-            <Callout tone="warning" title="Online payments (Stripe)">
-              Not available in this release. Record payments received by bank transfer, wire, ACH, check or other methods manually.
+            <Callout tone="info" title="Payments and refunds">
+              Record offline payments received by bank transfer, wire, ACH, check, or other manual methods here. For refunds of online payments, open the{" "}
+              <Link href={`/admin/orders/${encodeURIComponent(invoice.orderPublicId)}/refund`} className="font-semibold text-action underline underline-offset-2">
+                order&apos;s Refund tab
+              </Link>
+              .
             </Callout>
             {invoice.status === "void" ? (
               <Callout tone="info" title="This invoice is void">
