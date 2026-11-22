@@ -325,6 +325,7 @@ In `compliance.init()`, the module also registers the `invoices` resource provid
 
 - Category `admin` / `business` (in-tx on completion):
   - `policy.document.created`, `policy.document.updated`, `policy.version.draft_saved`, `policy.version.draft_deleted`, `policy.version.published` (`admin`)
+  - `policy.acceptance_log.exported` (`admin`, attributes: `row_count`, `truncated`, `max_rows`, `scan_capped`, `filters`)
   - `policy.accepted` (`business`, attributes: `document_public_id`, `version_public_id`, `content_hash`, `method`, `has_order_binding`)
   - `intake.questionnaire.created`, `intake.questionnaire.updated`, `intake.version.draft_saved`, `intake.version.published` (`admin`)
   - `intake.submission.draft_saved`, `intake.submission.submitted`, `intake.submission.reviewed` (`business`)
@@ -599,13 +600,20 @@ export interface AcceptanceLogExportResult {
 | `policies.admin.acceptanceLog.versionText` | `policies.acceptances.read` | `{ versionPublicId: string }` -> `PolicyVersionReadView` |
 | `policies.admin.acceptanceLog.export` | `policies.acceptances.export` (admin + step-up) | `AcceptanceLogFilterInput` -> `AcceptanceLogExportResult` |
 
+- **Live session & signer-name confidentiality**:
+  - Every `acceptanceLog.*` read verifies a populated live session bound to `(userId, userPublicId, role, authMethod)` alongside live active-user + capability re-validation (`NOT_FOUND` for customers, `FORBIDDEN` + `authz.compliance.denied` for unauthorized staff).
+  - Raw `list`, `forCustomer`, and `export` payloads never carry or decrypt `typedSignerName`. On `detail`, `typedSignerName` is decrypted only inside a transaction that calls `identity.sessions.assertCurrent(tx, principal)` and verifies live `policies.manage`.
+- **Bounded unified scan & lock-free CSV export**:
+  - `list`, `forCustomer`, and `export` bound unified stream refinement to `MAX_UNIFIED_SCAN_ROWS = 10_000` raw evidence rows and `MAX_UNIFIED_SCAN_MS = 3_000` ms per call. When sparse post-refinement filters hit the scan/time budget before filling `limit`, `list`/`forCustomer` emit a frontier continuation `nextCursor` (including 0-item intermediate pages when more raw rows exist) and `export` marks `truncated: true` (`scan_capped: true` in `policy.acceptance_log.exported`).
+  - `export` preflights live authorization (`READ`), executes the bounded unified scan outside any `FOR UPDATE` row lock, and re-acquires `FOR UPDATE` + `sessions.assertCurrent(tx, principal)` + fresh step-up inside the final transaction that records `policy.acceptance_log.exported`.
+
 ### 9.2 Order Payment Exposure Port (`compliance.orderPaymentExposureInTx` — G-C3-02)
 
 - `compliance.orderPaymentExposureInTx(tx: Tx, orderPublicId: string): Promise<{ grossPaidMinor: number; payableInvoiceOpen: boolean; providerCapturePending: boolean; providerAttemptEver: boolean }>`
-- Acquires the order row lock (`FOR UPDATE` via `orders.getOrderRefByPublicId`), then performs non-blocking current reads (`FOR SHARE NOWAIT`) on `compliance_invoices`, `compliance_invoice_payments`, `compliance_invoice_refunds`, and `payment_attempts`, failing closed (redemption stays used) on any lock contention or missing `payments` evidence port.
+- Acquires the order row lock (`FOR UPDATE` via `orders.getOrderRefByPublicId`), then performs sequential non-blocking current reads (`FOR SHARE NOWAIT`) on `compliance_invoices`, `compliance_invoice_payments`, `compliance_invoice_refunds`, and `payment_attempts`, failing closed (redemption stays used) on any lock contention or missing `payments` evidence port without poisoning the caller's outer MariaDB transaction.
 - `grossPaidMinor`: sum of `amountMinor` across `succeeded` payment rows across all invoices of the order (partial payments and later-refunded payments keep `grossPaidMinor > 0`).
 - `payableInvoiceOpen`: `true` if any non-voided, issued invoice on the order has `balanceDueMinor > 0`. (Zero-total `$0.00` issued invoices derive `status = "paid"`, `balanceDueMinor = 0`, so `payableInvoiceOpen = false`.)
-- `providerAttemptEver`: strictly conservative per `/root` G-C3-02 ruling — `true` if **any** `payment_attempts` row has **ever** been created for the order or its invoices, regardless of status (`created`, `redirected`, `paid`, `failed`, `cancelled`, `expired`), or if the `payments` port is unavailable when invoices exist.
+- `providerAttemptEver`: strictly conservative per `/root` G-C3-02 ruling — `true` if **any** `payment_attempts` row has **ever** been created for the order or its invoices, regardless of status (`created`, `redirected`, `paid`, `failed`, `cancelled`, `expired`), or if the `payments` evidence port is unavailable (even when the order has zero invoices) or any lock contention/query error occurs.
 - `providerCapturePending`: `true` if any `payment_attempts` row is in `created`, `redirected`, `cancelled`, `paid` (unbooked), or `failed` (with verified webhook), or on lock contention / missing port. `invoices.admin.{create,issue}`, `issueCheckoutInvoiceInTx`, and `payments.startCheckout` also resolve workflow cancel states (`kind === "terminal" && /cancel/.test(key)`) directly from the `FOR UPDATE`-locked `(workflowVersionId, statusKey)` without non-locking re-reads.
 
 ### 9.3 Invoice Promo Discount Breakdown (Package C4)

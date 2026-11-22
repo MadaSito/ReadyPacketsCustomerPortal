@@ -31,12 +31,13 @@ import {
   or,
   type SQL,
 } from "drizzle-orm";
-import { roleHasCapability } from "../../../shared/capabilities.js";
+import { performance } from "node:perf_hooks";
+import { roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
-import { hasFreshStepUp } from "../../trpc/trpc.js";
+import { hasFreshStepUp, STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { users, type UserStatus } from "../identity/schema.js";
 import type { UserView } from "../identity/index.js";
 import { orders } from "../orders/schema.js";
@@ -266,6 +267,10 @@ export interface AcceptanceLogExportResult {
 /* ------------------------------------------------------------------ constants & pure helpers */
 
 export const MAX_ACCEPTANCE_EXPORT_ROWS = 5_000;
+/** Hard scan ceiling per unified stream call so sparse post-refinement filters stay bounded. */
+export const MAX_UNIFIED_SCAN_ROWS = 10_000;
+/** Hard monotonic elapsed-time ceiling (ms) per unified stream call. */
+export const MAX_UNIFIED_SCAN_MS = 3_000;
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 100;
 const DEFAULT_FOR_CUSTOMER_LIMIT = 25;
@@ -416,7 +421,21 @@ function mapAccountMethod(
 
 /* ------------------------------------------------------------------ service factory */
 
-export function createAcceptanceLogService(deps: ModuleDeps) {
+export interface AcceptanceLogScanOptions {
+  maxScannedRows?: number | undefined;
+  maxScanMs?: number | undefined;
+}
+
+export function createAcceptanceLogService(
+  deps: ModuleDeps,
+  scanOptions: AcceptanceLogScanOptions = {},
+) {
+  const maxScannedRowsBound = Math.max(
+    1,
+    Math.trunc(scanOptions.maxScannedRows ?? MAX_UNIFIED_SCAN_ROWS),
+  );
+  const maxScanMsBound = Math.max(1, Math.trunc(scanOptions.maxScanMs ?? MAX_UNIFIED_SCAN_MS));
+
   function identityPort() {
     return (deps.services as Partial<typeof deps.services>).identity;
   }
@@ -453,15 +472,17 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
 
   /**
    * Enforces Increment 05 §4 authorization for read procedures:
-   *   - Re-checks live user status & session currency.
+   *   - Requires a populated live session bound to `principal.userId`, `principal.userPublicId`,
+   *     `principal.authMethod`, and persisted `users.role` (never skips session verification).
    *   - `customer` receives `NOT_FOUND` (no admin surface existence oracle).
-   *   - `staff`/`admin` without `policies.acceptances.read` receives `FORBIDDEN`.
+   *   - `staff`/`admin` without `requiredCapability` receives `FORBIDDEN`.
    */
   async function authorizeRead(
     principal: SessionPrincipal,
     procedure: string,
     resourcePublicId?: string,
-  ): Promise<{ userId: number; role: "staff" | "admin" }> {
+    requiredCapability: Capability = "policies.acceptances.read",
+  ): Promise<{ userId: number; role: "staff" | "admin"; stepUpAt: Date | null }> {
     if (principal.state !== "full" || principal.pendingSteps.length > 0) {
       throw new DomainError(
         "REMEDIATION_REQUIRED",
@@ -471,24 +492,7 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
     }
 
     const identity = identityPort();
-    if (identity?.sessions?.getState) {
-      const sessionState = await identity.sessions.getState(principal.sessionId);
-      if (!sessionState || !sessionState.live) {
-        throw new DomainError(
-          "UNAUTHENTICATED",
-          "SESSION_NOT_CURRENT",
-          "Your session is no longer active. Please sign in again.",
-        );
-      }
-    }
-
-    const [liveUser] = await deps.db
-      .select({ id: users.id, role: users.role, status: users.status })
-      .from(users)
-      .where(eq(users.id, principal.userId))
-      .limit(1);
-
-    if (!liveUser || liveUser.status !== "active") {
+    if (!identity?.sessions?.getState) {
       throw new DomainError(
         "UNAUTHENTICATED",
         "SESSION_NOT_CURRENT",
@@ -496,17 +500,96 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
       );
     }
 
-    if (liveUser.role === "customer" || principal.role === "customer") {
+    const [sessionState, [liveUser]] = await Promise.all([
+      identity.sessions.getState(principal.sessionId),
+      deps.db
+        .select({
+          id: users.id,
+          publicId: users.publicId,
+          role: users.role,
+          status: users.status,
+        })
+        .from(users)
+        .where(eq(users.id, principal.userId))
+        .limit(1),
+    ]);
+
+    if (
+      !liveUser ||
+      liveUser.status !== "active" ||
+      liveUser.publicId !== principal.userPublicId ||
+      !sessionState ||
+      !sessionState.live ||
+      sessionState.userId !== principal.userId ||
+      sessionState.userPublicId !== principal.userPublicId ||
+      sessionState.userStatus !== "active" ||
+      sessionState.authMethod !== principal.authMethod
+    ) {
+      throw new DomainError(
+        "UNAUTHENTICATED",
+        "SESSION_NOT_CURRENT",
+        "Your session is no longer active. Please sign in again.",
+      );
+    }
+
+    if (
+      liveUser.role === "customer" ||
+      principal.role === "customer" ||
+      sessionState.role === "customer"
+    ) {
       await recordAuthzDenial(principal, "ADMIN_SURFACE_HIDDEN", procedure, resourcePublicId);
       throw notFound("NOT_FOUND");
     }
 
-    if (!roleHasCapability(liveUser.role, "policies.acceptances.read")) {
+    if (liveUser.role !== principal.role || sessionState.role !== liveUser.role) {
+      throw new DomainError(
+        "UNAUTHENTICATED",
+        "SESSION_NOT_CURRENT",
+        "Your session is no longer active. Please sign in again.",
+      );
+    }
+
+    if (!roleHasCapability(liveUser.role, requiredCapability)) {
       await recordAuthzDenial(principal, "CAPABILITY_NOT_GRANTED", procedure, resourcePublicId);
       throw forbidden("CAPABILITY_NOT_GRANTED");
     }
 
-    return { userId: liveUser.id, role: liveUser.role };
+    return {
+      userId: liveUser.id,
+      role: liveUser.role,
+      stepUpAt: sessionState.stepUpAt,
+    };
+  }
+
+  /**
+   * Re-verifies the persisted user + session currency (`identity.sessions.assertCurrent` under lock)
+   * and `policies.manage` capability right before decrypting `typedSignerName`.
+   */
+  async function assertLiveSignerDecryptAccess(principal: SessionPrincipal): Promise<void> {
+    const identity = identityPort();
+    if (!identity?.sessions?.assertCurrent) {
+      throw new DomainError(
+        "UNAUTHENTICATED",
+        "SESSION_NOT_CURRENT",
+        "Your session is no longer active. Please sign in again.",
+      );
+    }
+    await deps.db.transaction(async (tx) => {
+      const current = await identity.sessions.assertCurrent(principal, tx);
+      if (current.pendingSteps.length > 0) {
+        throw new DomainError(
+          "REMEDIATION_REQUIRED",
+          "ACCOUNT_STEP_PENDING",
+          "Please finish securing your account to continue.",
+        );
+      }
+      if (current.role === "customer") {
+        throw notFound("NOT_FOUND");
+      }
+      if (!roleHasCapability(current.role, "policies.manage")) {
+        throw forbidden("CAPABILITY_NOT_GRANTED");
+      }
+    });
   }
 
   async function loadCatalog(dbOrTx: DbOrTx, now: Date): Promise<PolicyCatalogSnapshot> {
@@ -1346,7 +1429,8 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
 
   /**
    * Collects up to `targetCount` unified `AcceptanceLogItem`s newest-first across both evidence tables,
-   * advancing the shared keyset cursor cleanly across batches when post-refinement filters skip legacy rows.
+   * advancing the shared keyset cursor cleanly across batches when post-refinement filters skip legacy rows,
+   * while enforcing explicit scanned-row (`maxScannedRowsBound`) and monotonic time (`maxScanMsBound`) ceilings.
    */
   async function queryUnifiedStream(
     dbOrTx: DbOrTx,
@@ -1354,21 +1438,30 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
     filter: AcceptanceLogFilterInput,
     initialCursor: KeysetCursor | undefined,
     targetCount: number,
-  ): Promise<{ items: AcceptanceLogItem[]; hasMore: boolean }> {
+  ): Promise<{
+    items: AcceptanceLogItem[];
+    hasMore: boolean;
+    scanCapped: boolean;
+    continuationCursor: KeysetCursor | undefined;
+  }> {
     const now = deps.clock.now();
     const catalog = await loadCatalog(dbOrTx, now);
     const resolved = await resolveStreamFilters(dbOrTx, principal, catalog, filter);
     if (resolved.impossible) {
-      return { items: [], hasMore: false };
+      return { items: [], hasMore: false, scanCapped: false, continuationCursor: undefined };
     }
 
     const collected: AcceptanceLogItem[] = [];
     let cursor = initialCursor;
+    let lastFrontierCursor: KeysetCursor | undefined = initialCursor;
     let exhausted = false;
+    let scannedRows = 0;
+    let scanCapped = false;
+    const startedAtMs = performance.now();
 
     while (collected.length <= targetCount && !exhausted) {
       const remaining = targetCount + 1 - collected.length;
-      const batchSize = Math.min(Math.max(remaining, 50), EVIDENCE_MAX_LIMIT - 1);
+      const batchSize = Math.min(Math.max(remaining, 50), EVIDENCE_MAX_LIMIT - 1, maxScannedRowsBound);
 
       const [acctBatch, gateBatch] = await Promise.all([
         fetchAccountCandidatesBatch(dbOrTx, resolved, cursor, batchSize),
@@ -1406,29 +1499,71 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
 
       // Guarantee forward progress even if every row in one batch was older than the other stream's horizon.
       const windowToProcess = safeWindow.length > 0 ? safeWindow : merged.slice(0, 1);
+      // Bound window evaluation to remaining scan budget when post-refinement filters are sparse.
+      const remainingScanBudget = Math.max(1, maxScannedRowsBound - scannedRows);
+      const boundedWindow =
+        windowToProcess.length > remainingScanBudget
+          ? windowToProcess.slice(0, remainingScanBudget)
+          : windowToProcess;
+
       const hydrated = await hydrateAndFilterCandidates(
         dbOrTx,
         catalog,
         resolved,
-        windowToProcess,
+        boundedWindow,
       );
       collected.push(...hydrated);
+      scannedRows += boundedWindow.length;
 
-      if (!acctBatch.hasMore && !gateBatch.hasMore && windowToProcess.length === merged.length) {
+      const fullyConsumedMerged =
+        !acctBatch.hasMore && !gateBatch.hasMore && boundedWindow.length === merged.length;
+      if (fullyConsumedMerged) {
         exhausted = true;
       } else {
-        const lastProcessed = windowToProcess[windowToProcess.length - 1]!;
+        const lastProcessed = boundedWindow[boundedWindow.length - 1]!;
         cursor = {
           acceptedAt: lastProcessed.acceptedAt,
           publicId: lastProcessed.publicId,
         };
+        lastFrontierCursor = cursor;
+
+        if (
+          collected.length <= targetCount &&
+          (scannedRows >= maxScannedRowsBound || performance.now() - startedAtMs >= maxScanMsBound)
+        ) {
+          scanCapped = true;
+          break;
+        }
       }
     }
 
-    const hasMore = collected.length > targetCount;
+    if (collected.length > targetCount) {
+      const pageItems = collected.slice(0, targetCount);
+      const lastItem = pageItems[pageItems.length - 1];
+      return {
+        items: pageItems,
+        hasMore: true,
+        scanCapped: false,
+        continuationCursor: lastItem
+          ? { acceptedAt: lastItem.acceptedAt, publicId: lastItem.publicId }
+          : lastFrontierCursor,
+      };
+    }
+
+    if (scanCapped) {
+      return {
+        items: collected,
+        hasMore: true,
+        scanCapped: true,
+        continuationCursor: lastFrontierCursor,
+      };
+    }
+
     return {
-      items: collected.slice(0, targetCount),
-      hasMore,
+      items: collected,
+      hasMore: false,
+      scanCapped: false,
+      continuationCursor: undefined,
     };
   }
 
@@ -1480,20 +1615,17 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
     const limit = Math.min(Math.max(Math.trunc(input.limit ?? DEFAULT_LIST_LIMIT), 1), MAX_LIST_LIMIT);
     const cursor = decodeAcceptanceLogCursor(input.cursor);
 
-    const { items, hasMore } = await queryUnifiedStream(
+    const { items, hasMore, continuationCursor } = await queryUnifiedStream(
       deps.db,
       principal,
       input,
       cursor,
       limit,
     );
-    const last = items[items.length - 1];
     return {
       items,
       nextCursor:
-        hasMore && last
-          ? encodeAcceptanceLogCursor({ acceptedAt: last.acceptedAt, publicId: last.publicId })
-          : null,
+        hasMore && continuationCursor ? encodeAcceptanceLogCursor(continuationCursor) : null,
     };
   }
 
@@ -1567,6 +1699,7 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
       let signerNameRedacted = false;
       if (hasSig) {
         if (canViewSignerName) {
+          await assertLiveSignerDecryptAccess(principal);
           typedSignerName = deps.crypto.decrypt(
             acctRow.signerNameEnc!,
             signerNameAad(acctRow.publicId),
@@ -1669,6 +1802,7 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
     let signerNameRedacted = false;
     if (hasSig) {
       if (canViewSignerName) {
+        await assertLiveSignerDecryptAccess(principal);
         typedSignerName = deps.crypto.decrypt(gateItem.signerNameEnc!, gateItem.signerNameAad!);
         signerNameRedacted = false;
       } else {
@@ -2262,35 +2396,20 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
     principal: SessionPrincipal,
     input: AcceptanceLogFilterInput = {},
   ): Promise<AcceptanceLogExportResult> {
-    if (principal.state !== "full" || principal.pendingSteps.length > 0) {
-      throw new DomainError(
-        "REMEDIATION_REQUIRED",
-        "ACCOUNT_STEP_PENDING",
-        "Please finish securing your account to continue.",
-      );
-    }
-
-    // Customer gets NOT_FOUND on admin procedures (§4).
-    if (principal.role === "customer") {
-      await recordAuthzDenial(
-        principal,
-        "ADMIN_SURFACE_HIDDEN",
-        "compliance.policies.admin.acceptanceLog.export",
-      );
-      throw notFound("NOT_FOUND");
-    }
-
-    if (!roleHasCapability(principal.role, "policies.acceptances.export")) {
-      await recordAuthzDenial(
-        principal,
-        "CAPABILITY_NOT_GRANTED",
-        "compliance.policies.admin.acceptanceLog.export",
-      );
-      throw forbidden("CAPABILITY_NOT_GRANTED");
-    }
+    // 1. Preflight live session + role + capability BEFORE scanning (never hold FOR UPDATE auth locks across stream reads).
+    const preAuth = await authorizeRead(
+      principal,
+      "compliance.policies.admin.acceptanceLog.export",
+      undefined,
+      "policies.acceptances.export",
+    );
 
     const now = deps.clock.now();
-    if (!hasFreshStepUp(principal, now)) {
+    const liveStepUpFresh =
+      hasFreshStepUp(principal, now) &&
+      preAuth.stepUpAt !== null &&
+      now.getTime() - preAuth.stepUpAt.getTime() <= STEP_UP_MAX_AGE_MS;
+    if (!liveStepUpFresh) {
       deps.audit.note({
         category: "security",
         eventName: "authz.step_up.required",
@@ -2313,11 +2432,63 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
       );
     }
 
+    // 2. Bounded stream scan + CSV assembly outside any FOR UPDATE actor/session lock.
+    const {
+      items,
+      hasMore: truncated,
+      scanCapped,
+    } = await queryUnifiedStream(
+      deps.db,
+      principal,
+      input,
+      undefined,
+      MAX_ACCEPTANCE_EXPORT_ROWS,
+    );
+
+    const headerLine = `${ACCEPTANCE_CSV_COLUMNS.join(",")}\r\n`;
+    const dataLines = items.map((item) => {
+      // IMPORTANT: typedSignerName is NEVER included in CSV exports (Decision D4).
+      const cells = [
+        escapeAcceptanceCsvCell(item.publicId),
+        escapeAcceptanceCsvCell(item.acceptedAt.toISOString()),
+        escapeAcceptanceCsvCell(item.customer?.userPublicId ?? ""),
+        escapeAcceptanceCsvCell(item.customer?.customerRef ?? ""),
+        escapeAcceptanceCsvCell(item.customer?.name ?? ""),
+        escapeAcceptanceCsvCell(item.customer?.email ?? ""),
+        escapeAcceptanceCsvCell(item.policySlug),
+        escapeAcceptanceCsvCell(item.policyTitle),
+        escapeAcceptanceCsvCell(item.versionNumber),
+        escapeAcceptanceCsvCell(item.versionLabel),
+        escapeAcceptanceCsvCell(item.contentHash),
+        escapeAcceptanceCsvCell(item.freshness),
+        escapeAcceptanceCsvCell(item.source),
+        escapeAcceptanceCsvCell(item.method),
+        escapeAcceptanceCsvCell(item.orderReference ?? ""),
+        escapeAcceptanceCsvCell(item.correlationId ?? ""),
+      ];
+      return `${cells.join(",")}\r\n`;
+    });
+    const csv = `${headerLine}${dataLines.join("")}`;
+
+    const dateStamp = now.toISOString().slice(0, 10);
+    const filename = `policy-acceptances-${dateStamp}.csv`;
+    const filterSummary = summarizeFilterKeys(input);
+
+    // 3. Short transactional live-actor + live-session + live-step-up lock + durable audit BEFORE returning CSV bytes.
     return runComplianceTx(
       deps,
       principal,
       { type: "policy_acceptance_log" },
       async (tx: Tx) => {
+        const identity = identityPort();
+        if (!identity?.sessions?.assertCurrent) {
+          throw new DomainError(
+            "UNAUTHENTICATED",
+            "SESSION_NOT_CURRENT",
+            "Your session is no longer active. Please sign in again.",
+          );
+        }
+
         // Re-check live role first so a demoted-to-customer session still receives NOT_FOUND.
         const [liveRoleRow] = await tx
           .select({ role: users.role })
@@ -2335,43 +2506,6 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
           "policies.acceptances.export",
         );
 
-        const { items, hasMore: truncated } = await queryUnifiedStream(
-          tx,
-          principal,
-          input,
-          undefined,
-          MAX_ACCEPTANCE_EXPORT_ROWS,
-        );
-
-        const headerLine = `${ACCEPTANCE_CSV_COLUMNS.join(",")}\r\n`;
-        const dataLines = items.map((item) => {
-          // IMPORTANT: typedSignerName is NEVER included in CSV exports (Decision D4).
-          const cells = [
-            escapeAcceptanceCsvCell(item.publicId),
-            escapeAcceptanceCsvCell(item.acceptedAt.toISOString()),
-            escapeAcceptanceCsvCell(item.customer?.userPublicId ?? ""),
-            escapeAcceptanceCsvCell(item.customer?.customerRef ?? ""),
-            escapeAcceptanceCsvCell(item.customer?.name ?? ""),
-            escapeAcceptanceCsvCell(item.customer?.email ?? ""),
-            escapeAcceptanceCsvCell(item.policySlug),
-            escapeAcceptanceCsvCell(item.policyTitle),
-            escapeAcceptanceCsvCell(item.versionNumber),
-            escapeAcceptanceCsvCell(item.versionLabel),
-            escapeAcceptanceCsvCell(item.contentHash),
-            escapeAcceptanceCsvCell(item.freshness),
-            escapeAcceptanceCsvCell(item.source),
-            escapeAcceptanceCsvCell(item.method),
-            escapeAcceptanceCsvCell(item.orderReference ?? ""),
-            escapeAcceptanceCsvCell(item.correlationId ?? ""),
-          ];
-          return `${cells.join(",")}\r\n`;
-        });
-        const csv = `${headerLine}${dataLines.join("")}`;
-
-        const dateStamp = now.toISOString().slice(0, 10);
-        const filename = `policy-acceptances-${dateStamp}.csv`;
-        const filterSummary = summarizeFilterKeys(input);
-
         await deps.audit.record(
           {
             category: "admin",
@@ -2385,7 +2519,9 @@ export function createAcceptanceLogService(deps: ModuleDeps) {
               filter_summary: filterSummary,
               row_count: items.length,
               truncated,
+              scan_capped: scanCapped,
               max_rows: MAX_ACCEPTANCE_EXPORT_ROWS,
+              max_scanned_rows: maxScannedRowsBound,
               ...(input.policyDocumentPublicId
                 ? { policy_document_public_id: input.policyDocumentPublicId }
                 : {}),

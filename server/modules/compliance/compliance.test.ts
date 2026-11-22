@@ -13,7 +13,9 @@ import type { OrderAccessRole, OrderAccessView, OrderLockState, OrdersModule } f
 import { createTestDeps, fakePrincipal } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { computeInvoiceTotals, validateIntakeAnswers } from "./domain.js";
+import { createAcceptanceLogService } from "./acceptanceLogService.js";
 import { createComplianceModule } from "./index.js";
+import { complianceRouter } from "./router.js";
 import * as complianceSchema from "./schema.js";
 
 interface FakeOrderRecord {
@@ -26,6 +28,12 @@ interface FakeOrderRecord {
   origin: "portal" | "import";
   productPublicIds: string[];
   workflowKey?: string;
+  statusKey?: string;
+  discountMinor?: number;
+  discountLabel?: string | null;
+  promoDiscountMinor?: number;
+  promoLabel?: string | null;
+  bundleDiscountMinor?: number;
   grants: Map<number, "contributor" | "viewer">;
 }
 
@@ -50,7 +58,7 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
       reference: order.reference,
       ownerUserId: order.ownerUserId,
       ownerPublicId: order.ownerPublicId,
-      statusKey: "in_progress",
+      statusKey: order.statusKey ?? "in_progress",
       lockState: order.lockState,
       locked: order.lockState !== "none",
       readOnlyImported: order.origin === "import" || order.lockState === "imported_read_only",
@@ -59,6 +67,15 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
       origin: order.origin,
       version: 1,
       workflowVersionId: 1,
+      ...(order.discountMinor !== undefined ? { discountMinor: order.discountMinor } : {}),
+      ...(order.discountLabel !== undefined ? { discountLabel: order.discountLabel } : {}),
+      ...(order.promoDiscountMinor !== undefined
+        ? { promoDiscountMinor: order.promoDiscountMinor }
+        : {}),
+      ...(order.promoLabel !== undefined ? { promoLabel: order.promoLabel } : {}),
+      ...(order.bundleDiscountMinor !== undefined
+        ? { bundleDiscountMinor: order.bundleDiscountMinor }
+        : {}),
     };
   }
 
@@ -124,10 +141,57 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
         id: o.id,
         publicId: o.publicId,
         reference: o.reference,
+        name: o.reference,
         ownerUserId: o.ownerUserId,
         lockState: o.lockState,
-        statusKey: "in_progress",
+        statusKey: o.statusKey ?? "in_progress",
+        workflowVersionId: 1,
       };
+    },
+    async getOrderRefByPublicId(orderPublicId: string, _tx?: DbOrTx) {
+      const o = ordersByPubId.get(orderPublicId);
+      if (!o) return null;
+      return {
+        id: o.id,
+        publicId: o.publicId,
+        reference: o.reference,
+        name: o.reference,
+        ownerUserId: o.ownerUserId,
+        lockState: o.lockState,
+        statusKey: o.statusKey ?? "in_progress",
+        workflowVersionId: 1,
+      };
+    },
+    async searchOrders(_principal: SessionPrincipal, query: string, limit = 20) {
+      const q = query.trim().toUpperCase();
+      return Array.from(ordersByPubId.values())
+        .filter((o) => o.publicId === query.trim() || o.reference.toUpperCase().startsWith(q))
+        .slice(0, limit)
+        .map((o) => ({
+          publicId: o.publicId,
+          reference: o.reference,
+          projectName: o.reference,
+          statusLabel: o.statusKey ?? "in_progress",
+          updatedAt: new Date("2026-11-20T12:00:00.000Z"),
+        }));
+    },
+    workflows: {
+      async byVersionId() {
+        return {
+          id: 1,
+          workflowId: 1,
+          workflowKey: "standard",
+          versionNumber: 1,
+          definition: {
+            initialStateKey: "in_progress",
+            states: [
+              { key: "in_progress", label: "In Progress", kind: "active", tone: "info" },
+              { key: "cancelled", label: "Cancelled", kind: "terminal", tone: "danger" },
+            ],
+            transitions: [],
+          },
+        };
+      },
     },
     async portableOrders(_tx: DbOrTx, sel: { limit: number; orderIds?: number[] }) {
       const targetIds = sel.orderIds ? new Set(sel.orderIds) : null;
@@ -1661,5 +1725,1153 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     const inv4 = (await compliance.invoices.listForOrder(customerBPrincipal, payOrder.publicId)).items[0];
     expect(inv4?.paymentState).toBe("refunded");
     expect(inv4?.refundedMinor).toBe(10_000);
+  });
+
+  it("Increment 05 (C4 + G-C3-02): renders separate bundle and promo discount lines, derives paid for 100% zero-total invoices, and enforces conservative orderPaymentExposureInTx + cancelled-order refusal", async () => {
+    const h = createTestDeps({ db: tdb.db as unknown as Db });
+    const now = new Date("2026-11-22T15:00:00.000Z");
+    h.clock.set(now);
+    const localAdmin = fakePrincipal({
+      ...adminPrincipal,
+      stepUpAt: now,
+    });
+
+    const localOrders = new Map<string, FakeOrderRecord>();
+    const promoOrder: FakeOrderRecord = {
+      id: 701,
+      publicId: ulid(now.getTime() + 701),
+      reference: "RP-2026-0701",
+      ownerUserId: customerAPrincipal.userId,
+      ownerPublicId: customerAPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      discountMinor: 3_500,
+      discountLabel: "Bundle save + SPRING15 (15% off)",
+      promoDiscountMinor: 1_500,
+      promoLabel: "SPRING15 (15% off)",
+      bundleDiscountMinor: 2_000,
+      grants: new Map(),
+    };
+    const zeroOrder: FakeOrderRecord = {
+      id: 702,
+      publicId: ulid(now.getTime() + 702),
+      reference: "RP-2026-0702",
+      ownerUserId: customerAPrincipal.userId,
+      ownerPublicId: customerAPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      discountMinor: 5_000,
+      discountLabel: "VIP100 (100% off)",
+      promoDiscountMinor: 5_000,
+      promoLabel: "VIP100 (100% off)",
+      bundleDiscountMinor: 0,
+      grants: new Map(),
+    };
+    const exposureOrder: FakeOrderRecord = {
+      id: 703,
+      publicId: ulid(now.getTime() + 703),
+      reference: "RP-2026-0703",
+      ownerUserId: customerBPrincipal.userId,
+      ownerPublicId: customerBPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    const cancelledOrder: FakeOrderRecord = {
+      id: 704,
+      publicId: ulid(now.getTime() + 704),
+      reference: "RP-2026-0704",
+      ownerUserId: customerBPrincipal.userId,
+      ownerPublicId: customerBPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      statusKey: "cancelled",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    for (const o of [promoOrder, zeroOrder, exposureOrder, cancelledOrder]) {
+      localOrders.set(o.publicId, o);
+    }
+
+    let simulatedAttemptState = { providerCapturePending: false, providerAttemptEver: false };
+    h.services.orders = buildFakeOrdersModule(localOrders);
+    (h.services as unknown as Record<string, unknown>).payments = {
+      async getAttemptExposureForOrderInTx() {
+        return simulatedAttemptState;
+      },
+    };
+    const compliance = createComplianceModule(h.deps);
+    h.services.compliance = compliance;
+
+    // 1. C4: Separate bundle + promo discount lines on invoice view & PDF
+    const promoIssued = await tdb.db.transaction((tx) =>
+      compliance.issueCheckoutInvoiceInTx(
+        {
+          principal: customerAPrincipal,
+          orderId: promoOrder.id,
+          orderPublicId: promoOrder.publicId,
+          currency: "USD",
+          lines: [{ description: "Packet 1 + Packet 2", quantity: 1, unitAmountMinor: 10_000 }],
+          discountMinor: 3_500,
+        },
+        tx,
+      ),
+    );
+    expect(promoIssued.totalMinor).toBe(6_500);
+
+    const promoDetail = await compliance.invoices.get(customerAPrincipal, promoIssued.invoicePublicId);
+    expect(promoDetail.discountMinor).toBe(3_500);
+    expect(promoDetail.bundleDiscountMinor).toBe(2_000);
+    expect(promoDetail.promoDiscountMinor).toBe(1_500);
+    expect(promoDetail.promoLabel).toBe("SPRING15 (15% off)");
+
+    const pdf = await compliance.invoices.downloadPdf(customerAPrincipal, promoIssued.invoicePublicId);
+    const pdfText = pdf.buffer.toString("latin1");
+    expect(pdfText).toContain("Bundle discount");
+    expect(pdfText).toContain("-USD 20.00");
+    expect(pdfText).toContain("Discount \\(SPRING15 \\(15% off\\)\\)");
+    expect(pdfText).toContain("-USD 15.00");
+
+    // If an admin issues a supplemental invoice with a different custom discount, order promo breakdown is not misattributed
+    const customDraft = await compliance.invoices.admin.createDraft(localAdmin, {
+      orderPublicId: promoOrder.publicId,
+      currency: "USD",
+      lines: [{ description: "Add-on consultation", quantity: 1, unitAmountMinor: 4_000 }],
+      discountMinor: 500,
+      taxMinor: 0,
+    });
+    const customDetail = await compliance.invoices.get(localAdmin, customDraft.invoicePublicId);
+    expect(customDetail.promoDiscountMinor).toBe(0);
+    expect(customDetail.promoLabel).toBeNull();
+    expect(customDetail.bundleDiscountMinor).toBe(500);
+    expect(customDetail.discountLabel).toBeNull();
+
+    // 2. C4: 100% discount ($0.00 total) invoice derives `paid`, balanceDue = 0, and no open payable exposure
+    const zeroIssued = await tdb.db.transaction((tx) =>
+      compliance.issueCheckoutInvoiceInTx(
+        {
+          principal: customerAPrincipal,
+          orderId: zeroOrder.id,
+          orderPublicId: zeroOrder.publicId,
+          currency: "USD",
+          lines: [{ description: "Packet 1 Basic", quantity: 1, unitAmountMinor: 5_000 }],
+          discountMinor: 5_000,
+        },
+        tx,
+      ),
+    );
+    expect(zeroIssued.totalMinor).toBe(0);
+    const zeroDetail = await compliance.invoices.get(customerAPrincipal, zeroIssued.invoicePublicId);
+    expect(zeroDetail.status).toBe("paid");
+    expect(zeroDetail.paymentState).toBe("paid");
+    expect(zeroDetail.balanceDueMinor).toBe(0);
+    expect(zeroDetail.canRecordPayment).toBe(false);
+    expect(zeroDetail.promoDiscountMinor).toBe(5_000);
+    expect(zeroDetail.promoLabel).toBe("VIP100 (100% off)");
+    expect(zeroDetail.bundleDiscountMinor).toBe(0);
+
+    const zeroSummary = (await compliance.invoices.getOrderPaymentSummaries([zeroOrder.publicId])).get(
+      zeroOrder.publicId,
+    );
+    expect(zeroSummary?.state).toBe("paid");
+
+    const zeroExposure = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, zeroOrder.publicId),
+    );
+    expect(zeroExposure).toEqual({
+      grossPaidMinor: 0,
+      payableInvoiceOpen: false,
+      providerCapturePending: false,
+      providerAttemptEver: false,
+    });
+
+    // 3. G-C3-02: Conservative `orderPaymentExposureInTx` transitions
+    const expInitial = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, exposureOrder.publicId),
+    );
+    expect(expInitial).toEqual({
+      grossPaidMinor: 0,
+      payableInvoiceOpen: false,
+      providerCapturePending: false,
+      providerAttemptEver: false,
+    });
+
+    // Any provider attempt ever created (even failed/expired) -> providerAttemptEver: true
+    simulatedAttemptState = { providerCapturePending: false, providerAttemptEver: true };
+    const expAfterFailedAttempt = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, exposureOrder.publicId),
+    );
+    expect(expAfterFailedAttempt.providerAttemptEver).toBe(true);
+    simulatedAttemptState = { providerCapturePending: false, providerAttemptEver: false };
+
+    // Issued open invoice -> payableInvoiceOpen: true
+    const expDraft = await compliance.invoices.admin.createDraft(localAdmin, {
+      orderPublicId: exposureOrder.publicId,
+      currency: "USD",
+      lines: [{ description: "Standard Packet", quantity: 1, unitAmountMinor: 8_000 }],
+      discountMinor: 0,
+      taxMinor: 0,
+    });
+    await compliance.invoices.admin.issue(localAdmin, { invoicePublicId: expDraft.invoicePublicId });
+    const expIssued = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, exposureOrder.publicId),
+    );
+    expect(expIssued).toEqual({
+      grossPaidMinor: 0,
+      payableInvoiceOpen: true,
+      providerCapturePending: false,
+      providerAttemptEver: false,
+    });
+
+    // Partial payment -> grossPaidMinor = 3_000, payableInvoiceOpen = true
+    const partialPmt = await compliance.invoices.admin.recordManualPayment(localAdmin, {
+      invoicePublicId: expDraft.invoicePublicId,
+      method: "wire",
+      amountMinor: 3_000,
+      currency: "USD",
+      reference: "WIRE-703-PART",
+      idempotencyKey: "idem-703-part",
+    });
+    const expPartial = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, exposureOrder.publicId),
+    );
+    expect(expPartial.grossPaidMinor).toBe(3_000);
+    expect(expPartial.payableInvoiceOpen).toBe(true);
+
+    // Refunded payment still keeps grossPaidMinor > 0 so redemption is never released after refund
+    await compliance.invoices.admin.recordRefund(localAdmin, {
+      invoicePublicId: expDraft.invoicePublicId,
+      paymentPublicId: partialPmt.paymentPublicId,
+      amountMinor: 3_000,
+      currency: "USD",
+      reasonCode: "CUSTOMER_REQUEST",
+      reference: "RFD-703-PART",
+      confirmationPhrase: "REFUND ORDER",
+      idempotencyKey: "idem-703-rfd",
+    });
+    const expAfterRefund = await tdb.db.transaction((tx) =>
+      compliance.orderPaymentExposureInTx(tx, exposureOrder.publicId),
+    );
+    expect(expAfterRefund.grossPaidMinor).toBe(3_000);
+
+    // 4. G-C3-02: Absent payments port with ZERO invoices still fails closed (`providerAttemptEver: true`)
+    const savedPayments = h.services.payments;
+    delete (h.services as Partial<typeof h.services>).payments;
+    try {
+      const noPortZeroInvoicesOrder: FakeOrderRecord = {
+        id: 705,
+        publicId: ulid(now.getTime() + 705),
+        reference: "RP-2026-0705",
+        ownerUserId: customerAPrincipal.userId,
+        ownerPublicId: customerAPrincipal.userPublicId,
+        lockState: "none",
+        origin: "portal",
+        productPublicIds: [],
+        grants: new Map(),
+      };
+      localOrders.set(noPortZeroInvoicesOrder.publicId, noPortZeroInvoicesOrder);
+      const absentPortExposure = await tdb.db.transaction((tx) =>
+        compliance.orderPaymentExposureInTx(tx, noPortZeroInvoicesOrder.publicId),
+      );
+      expect(absentPortExposure).toEqual({
+        grossPaidMinor: 0,
+        payableInvoiceOpen: false,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      });
+    } finally {
+      h.services.payments = savedPayments;
+    }
+
+    // 5. G-C3-02: Real 2-connection MariaDB/InnoDB `FOR SHARE NOWAIT` contention test:
+    //    when another connection holds `FOR UPDATE` on an invoice row, `orderPaymentExposureInTx`
+    //    fails closed immediately (`providerAttemptEver: true`) AND the outer cancellation tx STILL COMMITS!
+    const lockPool = mysql.createPool({
+      uri: tdb.url,
+      connectionLimit: 2,
+      timezone: "Z",
+      supportBigNumbers: true,
+      charset: "utf8mb4",
+    });
+    const blockerConn = await lockPool.getConnection();
+    try {
+      await blockerConn.beginTransaction();
+      await blockerConn.query(
+        "SELECT id FROM compliance_invoices WHERE public_id = ? FOR UPDATE",
+        [promoIssued.invoicePublicId],
+      );
+
+      const markerDocPubId = ulid(now.getTime() + 706);
+      const contendedExposure = await tdb.db.transaction(async (tx) => {
+        const exp = await compliance.orderPaymentExposureInTx(tx, promoOrder.publicId);
+        // Prove the outer transaction remains healthy and committable after NOWAIT lock refusal!
+        await tx.insert(complianceSchema.policyDocuments).values({
+          publicId: markerDocPubId,
+          slug: `nowait-tx-commit-${markerDocPubId.toLowerCase()}`,
+          title: "NOWAIT Commit Proof",
+          audience: "staff",
+          active: false,
+          requiresAcceptance: false,
+          requiresTypedSignature: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+        return exp;
+      });
+
+      expect(contendedExposure).toEqual({
+        grossPaidMinor: 1,
+        payableInvoiceOpen: true,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      });
+
+      const [committedMarker] = await tdb.db
+        .select({ publicId: complianceSchema.policyDocuments.publicId })
+        .from(complianceSchema.policyDocuments)
+        .where(eq(complianceSchema.policyDocuments.publicId, markerDocPubId));
+      expect(committedMarker?.publicId).toBe(markerDocPubId);
+    } finally {
+      await blockerConn.rollback();
+      blockerConn.release();
+      await lockPool.end();
+    }
+
+    // 6. G-C3-02: Cancelled orders refuse new invoice drafts and checkout invoice issuance
+    await expect(
+      compliance.invoices.admin.createDraft(localAdmin, {
+        orderPublicId: cancelledOrder.publicId,
+        currency: "USD",
+        lines: [{ description: "Blocked on cancelled order", quantity: 1, unitAmountMinor: 2_000 }],
+        discountMinor: 0,
+        taxMinor: 0,
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ORDER_CANCELLED" });
+
+    await expect(
+      tdb.db.transaction((tx) =>
+        compliance.issueCheckoutInvoiceInTx(
+          {
+            principal: customerBPrincipal,
+            orderId: cancelledOrder.id,
+            orderPublicId: cancelledOrder.publicId,
+            currency: "USD",
+            lines: [{ description: "Blocked checkout invoice", quantity: 1, unitAmountMinor: 2_000 }],
+            discountMinor: 0,
+          },
+          tx,
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ORDER_CANCELLED" });
+  });
+
+  it("Increment 05 (D1): Policy Acceptance Log Centre unifies account + order-gate evidence, enforces §4 authz & signer-name privacy, tracks coverage/updates/customer profile, and exports formula-safe CSV", async () => {
+    const h = createTestDeps({ db: tdb.db as unknown as Db });
+    const baseTime = new Date("2026-11-22T16:00:00.000Z");
+    h.clock.set(baseTime);
+
+    // Seed dedicated active customers with real AES-256-GCM envelopes (required by `compliance.acceptance.accept`)
+    const d1CustAPubId = ulid(baseTime.getTime() + 11);
+    const [insD1CustA] = await tdb.db.insert(users).values({
+      publicId: d1CustAPubId,
+      emailEnc: h.deps.crypto.encrypt("d1.clara@example.test", `users.email:${d1CustAPubId}`),
+      emailIndex: "1".padStart(64, "c"),
+      nameEnc: h.deps.crypto.encrypt("Clara Signer", `users.name:${d1CustAPubId}`),
+      customerRef: "CUST-8801",
+      role: "customer",
+      status: "active",
+      emailVerifiedAt: baseTime,
+      createdAt: baseTime,
+      updatedAt: baseTime,
+    });
+    const d1CustAPrincipal = fakePrincipal({
+      userId: insD1CustA.insertId,
+      userPublicId: d1CustAPubId,
+      role: "customer",
+    });
+
+    const d1CustBPubId = ulid(baseTime.getTime() + 12);
+    const [insD1CustB] = await tdb.db.insert(users).values({
+      publicId: d1CustBPubId,
+      emailEnc: h.deps.crypto.encrypt("d1.bob@example.test", `users.email:${d1CustBPubId}`),
+      emailIndex: "2".padStart(64, "c"),
+      nameEnc: h.deps.crypto.encrypt("Bob Prior", `users.name:${d1CustBPubId}`),
+      customerRef: "CUST-8802",
+      role: "customer",
+      status: "active",
+      emailVerifiedAt: baseTime,
+      createdAt: baseTime,
+      updatedAt: baseTime,
+    });
+    const d1CustBPrincipal = fakePrincipal({
+      userId: insD1CustB.insertId,
+      userPublicId: d1CustBPubId,
+      role: "customer",
+    });
+
+    const formulaCustomerPubId = ulid(baseTime.getTime() + 13);
+    const [insFormula] = await tdb.db.insert(users).values({
+      publicId: formulaCustomerPubId,
+      emailEnc: h.deps.crypto.encrypt("formula@example.test", `users.email:${formulaCustomerPubId}`),
+      emailIndex: "f".padStart(64, "9"),
+      nameEnc: h.deps.crypto.encrypt("=CMD|' /C calc'!A0", `users.name:${formulaCustomerPubId}`),
+      customerRef: "CUST-9901",
+      role: "customer",
+      status: "active",
+      emailVerifiedAt: baseTime,
+      createdAt: baseTime,
+      updatedAt: baseTime,
+    });
+    const formulaCustomerPrincipal = fakePrincipal({
+      userId: insFormula.insertId,
+      userPublicId: formulaCustomerPubId,
+      role: "customer",
+    });
+
+    const localAdminFresh = fakePrincipal({
+      ...adminPrincipal,
+      sessionId: ulid(baseTime.getTime() + 901),
+      stepUpAt: baseTime,
+    });
+    const localAdminStaleStepUp = fakePrincipal({
+      ...adminPrincipal,
+      sessionId: ulid(baseTime.getTime() + 902),
+      stepUpAt: new Date(baseTime.getTime() - 2 * 60 * 60_000),
+    });
+    const localStaff = fakePrincipal({
+      ...staffPrincipal,
+      sessionId: ulid(baseTime.getTime() + 903),
+      stepUpAt: baseTime,
+    });
+
+    // Live session registry for `identity.sessions.{getState,assertCurrent}` + user lookups
+    interface MockSessionRecord {
+      sessionId: string;
+      userId: number;
+      userPublicId: string;
+      role: "customer" | "staff" | "admin";
+      userStatus: "active" | "suspended" | "deactivated";
+      live: boolean;
+      stepUpAt: Date | null;
+      mfaVerifiedAt: Date | null;
+      authMethod: "local";
+      assertCurrentError?: Error;
+    }
+    const sessionRegistry = new Map<string, MockSessionRecord>();
+    const registerSessionFor = (p: SessionPrincipal) => {
+      sessionRegistry.set(p.sessionId, {
+        sessionId: p.sessionId,
+        userId: p.userId,
+        userPublicId: p.userPublicId,
+        role: p.role,
+        userStatus: "active",
+        live: true,
+        stepUpAt: p.stepUpAt,
+        mfaVerifiedAt: p.mfaVerifiedAt,
+        authMethod: "local",
+      });
+    };
+    for (const p of [
+      localAdminFresh,
+      localAdminStaleStepUp,
+      localStaff,
+      d1CustAPrincipal,
+      d1CustBPrincipal,
+      formulaCustomerPrincipal,
+      viewerPrincipal,
+    ]) {
+      registerSessionFor(p);
+    }
+
+    const userBook = new Map<
+      number,
+      { id: number; publicId: string; customerRef: string | null; email: string; name: string; role: "customer" | "staff" | "admin" }
+    >([
+      [
+        d1CustAPrincipal.userId,
+        {
+          id: d1CustAPrincipal.userId,
+          publicId: d1CustAPubId,
+          customerRef: "CUST-8801",
+          email: "d1.clara@example.test",
+          name: "Clara Signer",
+          role: "customer",
+        },
+      ],
+      [
+        d1CustBPrincipal.userId,
+        {
+          id: d1CustBPrincipal.userId,
+          publicId: d1CustBPubId,
+          customerRef: "CUST-8802",
+          email: "d1.bob@example.test",
+          name: "Bob Prior",
+          role: "customer",
+        },
+      ],
+      [
+        formulaCustomerPrincipal.userId,
+        {
+          id: formulaCustomerPrincipal.userId,
+          publicId: formulaCustomerPubId,
+          customerRef: "CUST-9901",
+          email: "formula@example.test",
+          name: "=CMD|' /C calc'!A0",
+          role: "customer",
+        },
+      ],
+      [
+        viewerPrincipal.userId,
+        {
+          id: viewerPrincipal.userId,
+          publicId: viewerPrincipal.userPublicId,
+          customerRef: "CUST-7700",
+          email: "viewer@example.test",
+          name: "Vera Viewer",
+          role: "customer",
+        },
+      ],
+      [
+        customerAPrincipal.userId,
+        {
+          id: customerAPrincipal.userId,
+          publicId: customerAPrincipal.userPublicId,
+          customerRef: "CUST-7701",
+          email: "custa@example.test",
+          name: "Clara Customer",
+          role: "customer",
+        },
+      ],
+      [
+        customerBPrincipal.userId,
+        {
+          id: customerBPrincipal.userId,
+          publicId: customerBPrincipal.userPublicId,
+          customerRef: "CUST-7702",
+          email: "custb@example.test",
+          name: "Bob Other",
+          role: "customer",
+        },
+      ],
+    ]);
+
+    h.services.identity = {
+      sessions: {
+        async getState(sessionId: string) {
+          const s = sessionRegistry.get(sessionId);
+          if (!s) return null;
+          return {
+            sessionId: s.sessionId,
+            userId: s.userId,
+            userPublicId: s.userPublicId,
+            role: s.role,
+            userStatus: s.userStatus,
+            live: s.live,
+            revokedAt: s.live ? null : h.clock.now(),
+            mfaVerifiedAt: s.mfaVerifiedAt,
+            stepUpAt: s.stepUpAt,
+            absoluteExpiresAt: new Date(h.clock.now().getTime() + 3_600_000),
+            authMethod: s.authMethod,
+          };
+        },
+        async assertCurrent(principal: SessionPrincipal) {
+          const s = sessionRegistry.get(principal.sessionId);
+          if (!s || !s.live || s.userId !== principal.userId || s.role !== principal.role) {
+            throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Session not current.");
+          }
+          if (s.assertCurrentError) throw s.assertCurrentError;
+          return {
+            pendingSteps: [],
+            role: s.role,
+            stepUpAt: s.stepUpAt,
+            mfaVerifiedAt: s.mfaVerifiedAt,
+          };
+        },
+      },
+      async getUsersByIds(ids: readonly number[]) {
+        const map = new Map();
+        for (const id of ids) {
+          const u = userBook.get(id);
+          if (u) {
+            map.set(id, {
+              id: u.id,
+              publicId: u.publicId,
+              customerRef: u.customerRef,
+              email: u.email,
+              name: u.name,
+              role: u.role,
+              status: "active",
+              emailVerified: true,
+              mfaEnabled: false,
+              lastSignedInAt: null,
+              createdAt: baseTime,
+            });
+          }
+        }
+        return map;
+      },
+      async findCustomerIds(q: string) {
+        const needle = q.trim().toLowerCase();
+        const matches: number[] = [];
+        for (const u of userBook.values()) {
+          if (
+            u.publicId.toLowerCase() === needle ||
+            (u.customerRef && u.customerRef.toLowerCase().includes(needle)) ||
+            u.email.toLowerCase().includes(needle) ||
+            u.name.toLowerCase().includes(needle)
+          ) {
+            matches.push(u.id);
+          }
+        }
+        return matches;
+      },
+    } as unknown as typeof h.services.identity;
+
+    const gateOrder: FakeOrderRecord = {
+      id: 801,
+      publicId: ulid(baseTime.getTime() + 801),
+      reference: "RP-2026-0801",
+      ownerUserId: d1CustAPrincipal.userId,
+      ownerPublicId: d1CustAPubId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    const checkoutOrder: FakeOrderRecord = {
+      id: 802,
+      publicId: ulid(baseTime.getTime() + 802),
+      reference: "RP-2026-0802",
+      ownerUserId: formulaCustomerPrincipal.userId,
+      ownerPublicId: formulaCustomerPubId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    const localOrders = new Map<string, FakeOrderRecord>([
+      [gateOrder.publicId, gateOrder],
+      [checkoutOrder.publicId, checkoutOrder],
+    ]);
+
+    const fakeOrders = buildFakeOrdersModule(localOrders);
+    // Attach `gates.context` so `compliance.acceptance.accept` records a real `order_policy_acceptances` row!
+    let gatedPolicyPubId = "";
+    (fakeOrders.gates as unknown as Record<string, unknown>).context = async (
+      orderPublicId: string,
+      actor: SessionPrincipal,
+    ) => {
+      const o = localOrders.get(orderPublicId);
+      if (!o || o.ownerUserId !== actor.userId) return null;
+      return {
+        orderId: o.id,
+        orderPublicId: o.publicId,
+        reference: o.reference,
+        name: o.reference,
+        customerUserId: o.ownerUserId,
+        workflowVersionId: 1,
+        currentStatusKey: "in_progress",
+        gates: [
+          {
+            key: "order_start",
+            policyPublicId: gatedPolicyPubId,
+            point: "order_start" as const,
+            signatureMode: "typed_name" as const,
+            askAgainOnNewVersion: true,
+          },
+        ],
+        actorAccess: "owner" as const,
+      };
+    };
+    (fakeOrders.gates as unknown as Record<string, unknown>).registerProvider = () => {};
+
+    h.services.orders = fakeOrders;
+    const compliance = createComplianceModule(h.deps);
+    h.services.compliance = compliance;
+    await compliance.init?.();
+
+    // 1. Create and publish v1.0 of a required typed-signature customer policy, then accept across sources
+    const createdDoc = await compliance.policies.admin.createDocument(localAdminFresh, {
+      slug: "d1-master-terms",
+      title: "D1 Master Service Terms",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: true,
+      versionLabel: "1.0",
+      contentFormat: "safe_markdown",
+      bodyText: "## Master Terms v1.0\n\nCustomer agrees to the version 1.0 service terms.",
+      changeSummary: "Initial publication",
+    });
+    gatedPolicyPubId = createdDoc.documentPublicId;
+    await compliance.policies.admin.publishVersion(localAdminFresh, {
+      versionPublicId: createdDoc.draftVersionPublicId,
+      effectiveAt: baseTime,
+    });
+
+    // Optional informational policy (`requiresAcceptance: false`) to test `not_required` state in `forCustomer`
+    const optionalDoc = await compliance.policies.admin.createDocument(localAdminFresh, {
+      slug: "d1-privacy-notice",
+      title: "D1 Privacy Notice",
+      audience: "customer",
+      requiresAcceptance: false,
+      requiresTypedSignature: false,
+      versionLabel: "2026.1",
+      contentFormat: "plain_text",
+      bodyText: "Informational privacy notice that does not require active acceptance.",
+    });
+    await compliance.policies.admin.publishVersion(localAdminFresh, {
+      versionPublicId: optionalDoc.draftVersionPublicId,
+      effectiveAt: baseTime,
+    });
+
+    // a) Registration acceptance for d1CustB on v1.0 (eventually superseded when v2.0 is published)
+    h.clock.advance(1_000);
+    await runWithRequestContext(
+      Object.assign(newRequestContext("http"), { ipAddress: "198.51.100.10" }),
+      () =>
+        compliance.recordRegistrationAcceptances({
+          userId: d1CustBPrincipal.userId,
+          items: [
+            {
+              versionPublicId: createdDoc.draftVersionPublicId,
+              contentHash: createdDoc.contentHash,
+              signerName: "Bob Prior",
+            },
+          ],
+        }),
+    );
+
+    // b) Portal acceptance for d1CustA on v1.0 (typed signature)
+    h.clock.advance(1_000);
+    const v1PortalAcc = await runWithRequestContext(
+      Object.assign(newRequestContext("http"), { ipAddress: "198.51.100.11" }),
+      () =>
+        compliance.policies.accept(d1CustAPrincipal, {
+          versionPublicId: createdDoc.draftVersionPublicId,
+          contentHash: createdDoc.contentHash,
+          signerName: "Clara Signer",
+        }),
+    );
+
+    // Publish v2.0 so v1.0 becomes `superseded` and v2.0 becomes `current`!
+    h.clock.advance(2_000);
+    const v2Now = h.clock.now();
+    localAdminFresh.stepUpAt = v2Now;
+    sessionRegistry.get(localAdminFresh.sessionId)!.stepUpAt = v2Now;
+    const draftV2 = await compliance.policies.admin.createDraftVersion(localAdminFresh, {
+      documentPublicId: createdDoc.documentPublicId,
+      versionLabel: "2.0",
+      contentFormat: "safe_markdown",
+      bodyText: "## Master Terms v2.0\n\nUpdated terms requiring customer re-acceptance.",
+      changeSummary: "Added SLA schedule",
+    });
+    await compliance.policies.admin.publishVersion(localAdminFresh, {
+      versionPublicId: draftV2.versionPublicId,
+      effectiveAt: v2Now,
+    });
+
+    // Draft v3.0 (unpublished) — must NOT appear in `updates`, `filterOptions`, or `versionText`!
+    const draftV3 = await compliance.policies.admin.createDraftVersion(localAdminFresh, {
+      documentPublicId: createdDoc.documentPublicId,
+      versionLabel: "3.0-draft",
+      contentFormat: "plain_text",
+      bodyText: "Unpublished draft version 3.0 text that should never appear in versionText.",
+    });
+
+    // c) Portal re-acceptance by d1CustA on v2.0 (`portal_reacceptance`)
+    h.clock.advance(1_000);
+    const v2Reaccept = await runWithRequestContext(
+      Object.assign(newRequestContext("http"), { ipAddress: "198.51.100.11" }),
+      () =>
+        compliance.policies.accept(d1CustAPrincipal, {
+          versionPublicId: draftV2.versionPublicId,
+          contentHash: draftV2.contentHash,
+          signerName: "Clara Signer",
+        }),
+    );
+
+    // d) Checkout acceptance by formulaCustomer on v2.0 (`checkout`)
+    h.clock.advance(1_000);
+    await tdb.db.transaction((tx) =>
+      compliance.recordCheckoutAcceptances(
+        {
+          principal: formulaCustomerPrincipal,
+          orderId: checkoutOrder.id,
+          orderPublicId: checkoutOrder.publicId,
+          items: [
+            {
+              versionPublicId: draftV2.versionPublicId,
+              contentHash: draftV2.contentHash,
+              signerName: "=CMD|' /C calc'!A0",
+            },
+          ],
+        },
+        tx,
+      ),
+    );
+
+    // e) Order-gate acceptance by d1CustA on v2.0 (`order_gate` in `order_policy_acceptances` with typed signature)
+    h.clock.advance(1_000);
+    const gateReceipt = await runWithRequestContext(
+      Object.assign(newRequestContext("http"), { ipAddress: "198.51.100.11" }),
+      () =>
+        compliance.acceptance.accept(d1CustAPrincipal, {
+          orderId: gateOrder.publicId,
+          gateKey: "order_start",
+          policyVersionId: draftV2.versionPublicId,
+          textSha256: draftV2.contentHash,
+          typedName: "Clara Signer",
+        }),
+    );
+
+    const log = compliance.policies.admin.acceptanceLog;
+
+    // 2. §4 Authorization invariants: customer gets NOT_FOUND on EVERY admin procedure; staff gets FORBIDDEN on export
+    await expect(log.filterOptions(d1CustAPrincipal)).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(log.list(d1CustAPrincipal, {})).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      log.detail(d1CustAPrincipal, { publicId: v2Reaccept.acceptancePublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(log.coverage(d1CustAPrincipal, {})).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(log.updates(d1CustAPrincipal, {})).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      log.forCustomer(d1CustAPrincipal, { customerPublicId: d1CustAPubId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      log.versionText(d1CustAPrincipal, { versionPublicId: draftV2.versionPublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(log.export(d1CustAPrincipal, {})).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // Staff has `policies.acceptances.read` -> can read, but gets FORBIDDEN on `export`
+    await expect(log.export(localStaff, {})).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      reasonCode: "CAPABILITY_NOT_GRANTED",
+    });
+
+    // Admin with stale step-up gets STEP_UP_REQUIRED on `export`
+    await expect(log.export(localAdminStaleStepUp, {})).rejects.toMatchObject({
+      code: "STEP_UP_REQUIRED",
+      reasonCode: "STEP_UP_REQUIRED",
+    });
+
+    // 2b. Session-binding hardening: missing session port, userId mismatch, role mismatch, and `assertCurrent` revocation before signer decrypt
+    const hijackedSessionPrincipal = fakePrincipal({
+      ...localStaff,
+      sessionId: d1CustAPrincipal.sessionId, // belongs to a different userId!
+    });
+    await expect(log.list(hijackedSessionPrincipal, {})).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+      reasonCode: "SESSION_NOT_CURRENT",
+    });
+
+    const roleMismatchSessionId = ulid(baseTime.getTime() + 950);
+    sessionRegistry.set(roleMismatchSessionId, {
+      sessionId: roleMismatchSessionId,
+      userId: localStaff.userId,
+      userPublicId: localStaff.userPublicId,
+      role: "admin", // mismatches persisted `staff` role!
+      userStatus: "active",
+      live: true,
+      stepUpAt: baseTime,
+      mfaVerifiedAt: baseTime,
+      authMethod: "local",
+    });
+    await expect(
+      log.list(fakePrincipal({ ...localStaff, sessionId: roleMismatchSessionId }), {}),
+    ).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+      reasonCode: "SESSION_NOT_CURRENT",
+    });
+
+    const savedIdentity = h.services.identity;
+    h.services.identity = {} as unknown as typeof h.services.identity;
+    try {
+      await expect(log.list(localStaff, {})).rejects.toMatchObject({
+        code: "UNAUTHENTICATED",
+        reasonCode: "SESSION_NOT_CURRENT",
+      });
+    } finally {
+      h.services.identity = savedIdentity;
+    }
+
+    // `detail` with `policies.manage` calls `sessions.assertCurrent` BEFORE decrypting `typedSignerName`
+    const adminRec = sessionRegistry.get(localAdminFresh.sessionId)!;
+    adminRec.assertCurrentError = new DomainError(
+      "UNAUTHENTICATED",
+      "SESSION_NOT_CURRENT",
+      "Revoked right before signer decrypt.",
+    );
+    try {
+      await expect(
+        log.detail(localAdminFresh, { publicId: v1PortalAcc.acceptancePublicId }),
+      ).rejects.toMatchObject({
+        code: "UNAUTHENTICATED",
+        reasonCode: "SESSION_NOT_CURRENT",
+      });
+    } finally {
+      delete adminRec.assertCurrentError;
+    }
+
+    // 3. `filterOptions` & `versionText`
+    const opts = await log.filterOptions(localStaff);
+    const masterOpt = opts.policies.find((p) => p.documentPublicId === createdDoc.documentPublicId);
+    expect(masterOpt).toBeDefined();
+    expect(masterOpt?.versions.map((v) => v.versionLabel)).toEqual(["2.0", "1.0"]);
+    expect(masterOpt?.versions[0]?.isCurrent).toBe(true);
+    expect(masterOpt?.versions[1]?.isCurrent).toBe(false);
+
+    const v2Text = await log.versionText(localStaff, { versionPublicId: draftV2.versionPublicId });
+    expect(v2Text.versionLabel).toBe("2.0");
+    expect(v2Text.isCurrent).toBe(true);
+    expect(v2Text.bodyText).toContain("Master Terms v2.0");
+    await expect(
+      log.versionText(localStaff, { versionPublicId: draftV3.versionPublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // 4. Unified `list`: merges `order_gate` + `checkout` + `portal_reacceptance` + `portal_acceptance` + `registration`
+    //    newest-first, paginates cleanly with cursor, and omits `typedSignerName` from raw objects!
+    const page1 = await log.list(localStaff, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      limit: 2,
+    });
+    expect(page1.items).toHaveLength(2);
+    expect(page1.items[0]?.source).toBe("order_gate");
+    expect(page1.items[0]?.evidenceKind).toBe("order_gate");
+    expect(page1.items[0]?.orderReference).toBe("RP-2026-0801");
+    expect(page1.items[0]?.freshness).toBe("current");
+    expect(page1.items[1]?.source).toBe("checkout");
+    expect(page1.items[1]?.orderReference).toBe("RP-2026-0802");
+    expect(page1.nextCursor).toBeTruthy();
+
+    const page2 = await log.list(localStaff, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      cursor: page1.nextCursor!,
+      limit: 10,
+    });
+    expect(page2.items.map((i) => i.source)).toEqual([
+      "portal_reacceptance",
+      "portal_acceptance",
+      "registration",
+    ]);
+    expect(page2.items[0]?.freshness).toBe("current");
+    expect(page2.items[1]?.freshness).toBe("superseded");
+    expect(page2.items[1]?.supersededByVersionPublicId).toBe(draftV2.versionPublicId);
+    expect(page2.items[1]?.supersededByVersionLabel).toBe("2.0");
+    expect(page2.nextCursor).toBeNull();
+
+    // Signer name MUST be completely absent (not even null/masked) from raw list payloads
+    for (const item of [...page1.items, ...page2.items]) {
+      expect("typedSignerName" in item).toBe(false);
+      expect("signerNameEnc" in item).toBe(false);
+      expect("signerNameRedacted" in item).toBe(false);
+    }
+
+    // Filter checks: source, freshness, orderReference, customerQuery
+    const onlyGate = await log.list(localStaff, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      source: "order_gate",
+    });
+    expect(onlyGate.items).toHaveLength(1);
+    expect(onlyGate.items[0]?.publicId).toBe(gateReceipt.receipt.receiptId);
+
+    const onlySuperseded = await log.list(localStaff, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      freshness: "superseded",
+    });
+    expect(onlySuperseded.items).toHaveLength(2);
+    expect(onlySuperseded.items.every((i) => i.versionLabel === "1.0")).toBe(true);
+
+    const byOrderRef = await log.list(localStaff, { orderReference: "RP-2026-0802" });
+    expect(byOrderRef.items).toHaveLength(1);
+    expect(byOrderRef.items[0]?.source).toBe("checkout");
+
+    const byCustRef = await log.list(localStaff, { customerQuery: "CUST-9901" });
+    expect(byCustRef.items).toHaveLength(1);
+    expect(byCustRef.items[0]?.customer?.userPublicId).toBe(formulaCustomerPubId);
+
+    // Same IP address produces identical HMAC pseudonym across `policy_acceptances` and `order_policy_acceptances`
+    expect(page1.items[0]?.addressPseudonym).toBeTruthy();
+    expect(page1.items[0]?.addressPseudonym).toBe(page2.items[0]?.addressPseudonym);
+
+    // 4b. Bounded scan ceiling (`maxScannedRows: 1`): sparse post-refinement filter (`portal_acceptance`,
+    //     where newest `context='portal'` row is `portal_reacceptance` and gets dropped!)
+    //     caps page 1 at 0 items with a valid frontier `nextCursor`, recovers `v1PortalAcc` on page 2,
+    //     and sets `truncated: true` + `scan_capped: true` on `export`!
+    const boundedLog = createAcceptanceLogService(h.deps, { maxScannedRows: 1 });
+    const walkedIds: string[] = [];
+    let walkCursor: string | undefined;
+    let walkLoops = 0;
+    do {
+      const step = await boundedLog.list(localStaff, {
+        policyDocumentPublicId: createdDoc.documentPublicId,
+        source: "portal_acceptance",
+        limit: 10,
+        ...(walkCursor ? { cursor: walkCursor } : {}),
+      });
+      if (walkLoops === 0) {
+        // Page 1 scanned 1 row (`v2Reaccept`, dropped by refinement) -> 0 items + non-null frontier cursor!
+        expect(step.items).toHaveLength(0);
+        expect(step.nextCursor).toBeTruthy();
+      }
+      walkedIds.push(...step.items.map((i) => i.publicId));
+      walkCursor = step.nextCursor ?? undefined;
+      walkLoops += 1;
+      expect(walkLoops).toBeLessThanOrEqual(5);
+    } while (walkCursor);
+    expect(walkLoops).toBe(2);
+    expect(walkedIds).toEqual([v1PortalAcc.acceptancePublicId]);
+
+    h.audit.clear();
+    const nowBeforeCapExport = h.clock.now();
+    localAdminFresh.stepUpAt = nowBeforeCapExport;
+    sessionRegistry.get(localAdminFresh.sessionId)!.stepUpAt = nowBeforeCapExport;
+    const cappedExport = await boundedLog.export(localAdminFresh, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      source: "portal_acceptance",
+    });
+    expect(cappedExport.rowCount).toBe(0);
+    expect(cappedExport.truncated).toBe(true);
+    expect(h.audit.named("policy.acceptance_log.exported")[0]?.attributes).toMatchObject({
+      truncated: true,
+      scan_capped: true,
+      max_scanned_rows: 1,
+    });
+
+    // 5. Signer-name privacy on `detail` (staff redacted vs admin decrypted, for BOTH account & order_gate rows)
+    const staffAcctDetail = await log.detail(localStaff, { publicId: v1PortalAcc.acceptancePublicId });
+    expect(staffAcctDetail.hasTypedSignature).toBe(true);
+    expect(staffAcctDetail.typedSignerName).toBeNull();
+    expect(staffAcctDetail.signerNameRedacted).toBe(true);
+
+    const adminAcctDetail = await log.detail(localAdminFresh, {
+      publicId: v1PortalAcc.acceptancePublicId,
+    });
+    expect(adminAcctDetail.typedSignerName).toBe("Clara Signer");
+    expect(adminAcctDetail.signerNameRedacted).toBe(false);
+
+    const staffGateDetail = await log.detail(localStaff, { publicId: gateReceipt.receipt.receiptId });
+    expect(staffGateDetail.typedSignerName).toBeNull();
+    expect(staffGateDetail.signerNameRedacted).toBe(true);
+
+    const adminGateDetail = await log.detail(localAdminFresh, { publicId: gateReceipt.receipt.receiptId });
+    expect(adminGateDetail.typedSignerName).toBe("Clara Signer");
+    expect(adminGateDetail.signerNameRedacted).toBe(false);
+
+    // 6. `coverage`: d1CustA & formulaCustomer accepted v2.0; d1CustB accepted v1.0 (outstanding with prior v1.0); viewer never accepted
+    const cov = await log.coverage(localStaff, {
+      documentPublicId: createdDoc.documentPublicId,
+    });
+    const docCov = cov.policies[0]!;
+    expect(docCov.currentVersionLabel).toBe("2.0");
+    expect(docCov.acceptedCurrentCount).toBe(2);
+    expect(docCov.outstandingCount).toBe(docCov.activeCustomerCount - 2);
+    const bobOut = docCov.outstandingCustomers.find(
+      (c) => c.customer.userPublicId === d1CustBPubId,
+    );
+    expect(bobOut?.lastAcceptedVersionLabel).toBe("1.0");
+    const veraOut = docCov.outstandingCustomers.find(
+      (c) => c.customer.userPublicId === viewerPrincipal.userPublicId,
+    );
+    expect(veraOut?.lastAcceptedVersionPublicId).toBeNull();
+
+    const covTrunc = await log.coverage(localStaff, {
+      documentPublicId: createdDoc.documentPublicId,
+      outstandingLimit: 1,
+    });
+    expect(covTrunc.policies[0]?.outstandingCustomers).toHaveLength(1);
+    expect(covTrunc.policies[0]?.outstandingTruncated).toBe(true);
+
+    // 7. `updates`: published versions newest-first with distinct customer counts
+    const upd = await log.updates(localStaff, {
+      documentPublicId: createdDoc.documentPublicId,
+    });
+    expect(upd.items.map((u) => u.versionLabel)).toEqual(["2.0", "1.0"]);
+    expect(upd.items[0]?.isCurrent).toBe(true);
+    expect(upd.items[0]?.acceptedCustomerCount).toBe(2);
+    expect(upd.items[1]?.isCurrent).toBe(false);
+    expect(upd.items[1]?.acceptedCustomerCount).toBe(2);
+
+    // 8. `forCustomer`: current status across required & optional policies + unified history (no signer name!)
+    const bobProfile = await log.forCustomer(localStaff, {
+      customerPublicId: d1CustBPubId,
+    });
+    const bobMaster = bobProfile.policies.find(
+      (p) => p.documentPublicId === createdDoc.documentPublicId,
+    );
+    expect(bobMaster?.state).toBe("update_pending");
+    expect(bobMaster?.acceptedVersionLabel).toBe("1.0");
+    const bobOptional = bobProfile.policies.find(
+      (p) => p.documentPublicId === optionalDoc.documentPublicId,
+    );
+    expect(bobOptional?.state).toBe("not_required");
+    for (const hItem of bobProfile.history) {
+      expect("typedSignerName" in hItem).toBe(false);
+    }
+    // Non-customer (staff/admin) publicId -> NOT_FOUND (no role existence oracle)
+    await expect(
+      log.forCustomer(localStaff, { customerPublicId: localStaff.userPublicId }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // 9. `export`: formula neutralization, no signer name column/value, transactional audit `policy.acceptance_log.exported`
+    h.audit.clear();
+    const exportNow = h.clock.now();
+    localAdminFresh.stepUpAt = exportNow;
+    sessionRegistry.get(localAdminFresh.sessionId)!.stepUpAt = exportNow;
+    const exported = await log.export(localAdminFresh, {
+      policyDocumentPublicId: createdDoc.documentPublicId,
+    });
+    expect(exported.contentType).toBe("text/csv; charset=utf-8");
+    expect(exported.rowCount).toBe(5);
+    expect(exported.truncated).toBe(false);
+    const csvLines = exported.csv.trim().split("\r\n");
+    expect(csvLines[0]).toBe(
+      "evidence_public_id,accepted_at_utc,customer_public_id,customer_reference,customer_name,customer_email,policy_slug,policy_title,version_number,version_label,content_sha256,freshness,source,method,order_reference,correlation_id",
+    );
+    expect(csvLines[0]).not.toContain("signer");
+    // Formula payload `=CMD|' /C calc'!A0` is neutralized with a leading single quote `'`!
+    expect(exported.csv).toContain("'=CMD|' /C calc'!A0");
+    expect(exported.csv).not.toContain(",=CMD|");
+    // Plaintext signer names for non-formula customers must not appear as a signer column
+    expect(csvLines.every((line) => line.split(",").length >= 16)).toBe(true);
+
+    const exportAudits = h.audit.named("policy.acceptance_log.exported");
+    expect(exportAudits).toHaveLength(1);
+    expect(exportAudits[0]?.attributes).toMatchObject({
+      filter_summary: "policy",
+      row_count: 5,
+      truncated: false,
+      scan_capped: false,
+      policy_document_public_id: createdDoc.documentPublicId,
+    });
+    const exportAuditIdx = h.audit.events.findIndex(
+      (e) => e.eventName === "policy.acceptance_log.exported",
+    );
+    expect(h.audit.recordedInTx[exportAuditIdx]).toBe(true);
+
+    // 10. End-to-end tRPC router check (`compliance.policies.admin.acceptanceLog.*`)
+    const makeTrpcCtx = (principal: SessionPrincipal) => ({
+      services: h.services,
+      session: principal,
+      request: newRequestContext("http"),
+      transport: "cookie" as const,
+    });
+    const customerCaller = complianceRouter.createCaller(makeTrpcCtx(d1CustAPrincipal) as never);
+    await expect(
+      customerCaller.policies.admin.acceptanceLog.list({}),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const staffCaller = complianceRouter.createCaller(makeTrpcCtx(localStaff) as never);
+    const routerList = await staffCaller.policies.admin.acceptanceLog.list({
+      policyDocumentPublicId: createdDoc.documentPublicId,
+      limit: 5,
+    });
+    expect(routerList.items).toHaveLength(5);
+    expect(routerList.items.every((it) => !("typedSignerName" in it))).toBe(true);
+    await expect(
+      staffCaller.policies.admin.acceptanceLog.export({}),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });

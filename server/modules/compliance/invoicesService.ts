@@ -3329,10 +3329,14 @@ export function createInvoicesService(deps: ModuleDeps) {
     const paymentsSvc = (deps.services as Partial<typeof deps.services>).payments;
 
     if (invoices.length === 0) {
-      const attemptExp =
-        paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function"
-          ? await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, [])
-          : { providerCapturePending: false, providerAttemptEver: false };
+      let attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+      if (paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function") {
+        try {
+          attemptExp = await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, []);
+        } catch {
+          attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+        }
+      }
       return {
         grossPaidMinor: 0,
         payableInvoiceOpen: false,
@@ -3345,22 +3349,20 @@ export function createInvoicesService(deps: ModuleDeps) {
     let paymentRows;
     let refundRows;
     try {
-      [paymentRows, refundRows] = await Promise.all([
-        tx
-          .select()
-          .from(complianceInvoicePayments)
-          .where(inArray(complianceInvoicePayments.invoiceId, invoiceIds))
-          .orderBy(asc(complianceInvoicePayments.id))
-          .for("share", { noWait: true }),
-        tx
-          .select({
-            invoiceId: complianceInvoiceRefunds.invoiceId,
-            amountMinor: complianceInvoiceRefunds.amountMinor,
-          })
-          .from(complianceInvoiceRefunds)
-          .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds))
-          .for("share", { noWait: true }),
-      ]);
+      paymentRows = await tx
+        .select()
+        .from(complianceInvoicePayments)
+        .where(inArray(complianceInvoicePayments.invoiceId, invoiceIds))
+        .orderBy(asc(complianceInvoicePayments.id))
+        .for("share", { noWait: true });
+      refundRows = await tx
+        .select({
+          invoiceId: complianceInvoiceRefunds.invoiceId,
+          amountMinor: complianceInvoiceRefunds.amountMinor,
+        })
+        .from(complianceInvoiceRefunds)
+        .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds))
+        .for("share", { noWait: true });
     } catch {
       return {
         grossPaidMinor: 1,
@@ -3394,12 +3396,16 @@ export function createInvoicesService(deps: ModuleDeps) {
       return inv.totalMinor - invNetPaid > 0;
     });
 
-    // Fail closed if existing invoices are present and the payments evidence port is unavailable,
-    // or if ANY payment_attempts row has EVER been created for this order/invoices (regardless of status).
-    const attemptExp =
-      paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function"
-        ? await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, invoiceIds)
-        : { providerCapturePending: true, providerAttemptEver: true };
+    // Fail closed if the payments evidence port is unavailable, throws, or if ANY payment_attempts
+    // row has EVER been created for this order/invoices (regardless of status).
+    let attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+    if (paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function") {
+      try {
+        attemptExp = await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, invoiceIds);
+      } catch {
+        attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+      }
+    }
 
     return {
       grossPaidMinor,
