@@ -190,6 +190,16 @@ describe("workflow designer", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Notices and notes" })).toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: /Require a note/ }));
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    // Increment 04: phases and requirements step (optional; edits here are undone so the publish payload is unchanged).
+    expect(await screen.findByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add phase" }));
+    expect(screen.getByLabelText(/Phase 1 name/)).toHaveValue("Phase 1");
+    await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
+    expect(screen.getAllByLabelText(/Upload name/)[0]).toHaveValue("Documents");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getAllByRole("button", { name: /^Remove upload / })[0]!);
+    await user.click(screen.getByRole("button", { name: /^Remove phase / }));
+    await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(await screen.findByRole("heading", { level: 2, name: "Review and publish" })).toBeInTheDocument();
     expect(screen.getByText("The draft has no problems and is ready to publish.")).toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: /Use for new orders/ }));
