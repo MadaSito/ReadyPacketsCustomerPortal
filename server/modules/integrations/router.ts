@@ -168,6 +168,12 @@ const redeliverProductionDispatchSchema = z.strictObject({
   dispatchPublicId: ulidParamSchema,
   reason: z.string().max(500),
   confirmation: z.string().max(64),
+  idempotencyKey: z
+    .string()
+    .trim()
+    .min(8)
+    .max(64)
+    .regex(/^[A-Za-z0-9:_-]+$/),
 });
 
 const resendProductionSchema = z.strictObject({

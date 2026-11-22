@@ -268,6 +268,7 @@ export interface RedeliverProductionDispatchInput {
   dispatchPublicId: string;
   reason: string;
   confirmation: string;
+  idempotencyKey: string;
 }
 
 export interface ResendProductionInput {
@@ -1182,6 +1183,7 @@ export function createProductionWebhookService(
       resendReasonCode: ControlledResendReason | null;
       retryOfPublicId?: string | null;
       redeliveryOfPublicId?: string | null;
+      idempotencyKeyOverride?: string;
       dispatchKind?: DispatchActionKind;
       reasonLength?: number;
       phase1ArtifactsConfirmed: boolean;
@@ -1189,7 +1191,8 @@ export function createProductionWebhookService(
   ): Promise<ProductionDispatchItem> {
     const now = deps.clock.now();
     const publicId = ulid();
-    const idempotencyKey = `rp-prod:${params.phase.toLowerCase()}:${publicId}`;
+    const idempotencyKey =
+      params.idempotencyKeyOverride ?? `rp-prod:${params.phase.toLowerCase()}:${publicId}`;
     const payloadJson = JSON.stringify(params.payloadObject);
     const payloadSha256 = sha256Hex(payloadJson);
     const payloadEnc = deps.crypto.encrypt(payloadJson, dispatchPayloadAad(publicId));
@@ -2503,6 +2506,372 @@ export function createProductionWebhookService(
     };
   }
 
+  /**
+   * Reconstructs the exact original payload for `retry` / `redeliver` of a selected `targetRow`,
+   * enforcing cryptographic byte-identity (`sha256Hex(JSON.stringify(payload)) === targetRow.payloadSha256`)
+   * and refusing fail-closed if live order scope or verifiable payload inputs drifted.
+   */
+  async function reconstructExactDispatchPayloadInTx(
+    tx: Tx,
+    params: {
+      orderId: number;
+      orderPublicId: string;
+      targetRow: DispatchRow;
+      existingRows: DispatchRow[];
+      action: "retry" | "redeliver";
+    },
+  ): Promise<{ ok: true; prepared: PreparedPhaseDispatch } | { ok: false; error: DomainError }> {
+    const orders = requireOrders();
+    const identity = requireIdentity();
+    const { orderId, orderPublicId, targetRow, existingRows, action } = params;
+    const phase = targetRow.phase as ProductionPhase;
+    const label = phaseDisplayLabel(phase);
+
+    const [scope, prodState] = await Promise.all([
+      orders.getProductionScope(orderId, { tx }),
+      readProductionState(tx),
+    ]);
+    if (!scope) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
+    const targetSecret = targetSecretForPhase(prodState, phase);
+    if ((phase === "P301" || phase === "P401") && (!targetSecret || !isValidProductionWebhookUrl(targetSecret))) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+          `${label} (${phase}) HTTPS destination URL is not configured.`,
+        ),
+      };
+    }
+
+    if (!prodState.enabled || !prodState.configured || !targetSecret || !isValidProductionWebhookUrl(targetSecret)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          "Production webhooks are disabled or incomplete.",
+        ),
+      };
+    }
+
+    if (isOrderLockedForProduction(scope.lockState)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_LOCKED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_LOCKED", "This order is locked and cannot dispatch production webhooks."),
+      };
+    }
+
+    if (isOrderCanceledStatus(scope.statusKey)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_CANCELED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_CANCELED", "Canceled orders cannot dispatch production webhooks."),
+      };
+    }
+
+    if (scope.ownerUserId !== targetRow.expectedOwnerUserId) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_OWNER_CHANGED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORDER_OWNER_CHANGED",
+          "The order owner changed since the selected dispatch was created; replay is refused.",
+        ),
+      };
+    }
+
+    const owner = await identity.getUser(scope.ownerUserId, { tx });
+    if (!owner || owner.status !== "active") {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_OWNER_INACTIVE",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: validation(
+          "ORDER_OWNER_INACTIVE",
+          "The order owner account must be active to dispatch production webhooks.",
+        ),
+      };
+    }
+
+    // Verify order reference & packet scope parity against `targetRow` before reconstructing payload bytes.
+    const scopeProbe = buildP101Payload({
+      customerRef: "CUST-SCOPE-PROBE",
+      orderReference: scope.reference,
+      canonVersion: "canon-scope-probe",
+      runMode: "production",
+      clientName: "Scope Probe",
+      clientEmail: "scope-probe@example.test",
+      releaseStatus: "",
+      packets: scope.packets,
+      otherItemCount: scope.otherItemCount,
+    });
+    const orderReferenceMatches =
+      scope.reference === targetRow.orderReference &&
+      (phase !== "P101" || scope.reference === targetRow.sentOrderId);
+    const packetScopeMatches =
+      targetRow.bundleScopeManifest === null
+        ? true
+        : scopeProbe.ok &&
+          scopeProbe.payload !== null &&
+          scopeProbe.payload.packet === targetRow.packet &&
+          scopeProbe.payload.tier === targetRow.tier &&
+          scopeProbe.payload.bundle_scope_manifest === targetRow.bundleScopeManifest;
+
+    if (!orderReferenceMatches || !packetScopeMatches) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_SCOPE_CHANGED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORDER_SCOPE_CHANGED",
+          "The order reference or packet scope changed since the selected dispatch was created; replay is refused.",
+        ),
+      };
+    }
+
+    const authHeaderValue =
+      prodState.cfg.authHeaderName !== ""
+        ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
+        : null;
+    const destinationFingerprint = computeDestinationFingerprint(phase, {
+      targetUrl: targetSecret,
+      authHeaderName: prodState.cfg.authHeaderName,
+      authHeaderValue,
+      canonVersion: prodState.cfg.canonVersion,
+      runMode: prodState.cfg.runMode,
+    });
+
+    if (phase === "P101") {
+      const liveP101 = buildP101Payload({
+        customerRef: owner.customerRef ?? null,
+        orderReference: scope.reference,
+        canonVersion: prodState.cfg.canonVersion,
+        runMode: prodState.cfg.runMode,
+        clientName: owner.name,
+        clientEmail: owner.email,
+        releaseStatus: targetRow.releaseStatus ?? "",
+        packets: scope.packets,
+        otherItemCount: scope.otherItemCount,
+      });
+      if (
+        !liveP101.ok ||
+        !liveP101.payload ||
+        liveP101.payload.customer_id !== targetRow.sentCustomerId ||
+        liveP101.payload.order_id !== targetRow.sentOrderId ||
+        liveP101.payload.run_mode !== targetRow.sentRunMode ||
+        sha256Hex(JSON.stringify(liveP101.payload)) !== targetRow.payloadSha256
+      ) {
+        await recordRefusedAuditInTx(tx, {
+          phase: "P101",
+          orderPublicId,
+          reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+          packet: targetRow.packet ?? null,
+          tier: targetRow.tier ?? null,
+          bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+            "Original Phase I (P101) payload bytes no longer match current customer or pipeline metadata; start a new order workflow or restore the original values.",
+          ),
+        };
+      }
+
+      const p = liveP101.payload;
+      return {
+        ok: true,
+        prepared: {
+          orderReference: targetRow.orderReference,
+          expectedOwnerUserId: targetRow.expectedOwnerUserId,
+          destinationFingerprint,
+          payloadObject: p,
+          sentCustomerId: p.customer_id,
+          sentOrderId: p.order_id,
+          sentRunMode: p.run_mode,
+          packet: p.packet,
+          tier: p.tier,
+          bundleScopeManifest: p.bundle_scope_manifest,
+          releaseStatus: p.release_status,
+          phase1ArtifactsConfirmed: false,
+        },
+      };
+    }
+
+    const deliveredP101 = existingRows.find((r) => r.phase === "P101" && r.state === "delivered");
+    if (!deliveredP101) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_P101_NOT_DELIVERED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "PRODUCTION_P101_NOT_DELIVERED",
+          `${label} (${phase}) cannot run until Phase I (P101) has been delivered for this order.`,
+        ),
+      };
+    }
+
+    if (phase === "P301" || phase === "P401") {
+      const deliveredP201 = existingRows.find((r) => r.phase === "P201" && r.state === "delivered");
+      if (!deliveredP201) {
+        await recordRefusedAuditInTx(tx, {
+          phase,
+          orderPublicId,
+          reasonCode: "PRODUCTION_P201_NOT_DELIVERED",
+          packet: targetRow.packet ?? null,
+          tier: targetRow.tier ?? null,
+          bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "PRODUCTION_P201_NOT_DELIVERED",
+            `${label} (${phase}) cannot run until Phase II (P201) has been delivered for this order.`,
+          ),
+        };
+      }
+      if (phase === "P401" && prodState.p301UrlConfigured) {
+        const deliveredP301 = existingRows.find((r) => r.phase === "P301" && r.state === "delivered");
+        if (!deliveredP301) {
+          await recordRefusedAuditInTx(tx, {
+            phase: "P401",
+            orderPublicId,
+            reasonCode: "PRODUCTION_P301_NOT_DELIVERED",
+            packet: targetRow.packet ?? null,
+            tier: targetRow.tier ?? null,
+            bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+            action,
+          });
+          return {
+            ok: false,
+            error: conflict(
+              "PRODUCTION_P301_NOT_DELIVERED",
+              "Phase IV (P401) cannot run until configured Phase III (P301) has been delivered for this order.",
+            ),
+          };
+        }
+      }
+    }
+
+    // Reconstruct directly from the selected `targetRow` (never from `newestDeliveredP101` or mutated settings/customer fields)
+    // and enforce exact SHA-256 byte-identity against `targetRow.payloadSha256`.
+    const payloadCheck = buildLaterPhaseFromDeliveredP101(phase, {
+      customerId: targetRow.sentCustomerId,
+      orderId: targetRow.sentOrderId,
+      runMode: targetRow.sentRunMode,
+    });
+    if (
+      !payloadCheck.ok ||
+      sha256Hex(JSON.stringify(payloadCheck.payload)) !== targetRow.payloadSha256
+    ) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+          `Original ${label} (${phase}) payload bytes could not be verified against the stored SHA-256 digest; replay is refused.`,
+        ),
+      };
+    }
+
+    return {
+      ok: true,
+      prepared: {
+        orderReference: targetRow.orderReference,
+        expectedOwnerUserId: targetRow.expectedOwnerUserId,
+        destinationFingerprint,
+        payloadObject: payloadCheck.payload,
+        sentCustomerId: payloadCheck.payload.customer_id,
+        sentOrderId: payloadCheck.payload.order_id,
+        sentRunMode: payloadCheck.payload.run_mode,
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        releaseStatus: targetRow.releaseStatus ?? null,
+        phase1ArtifactsConfirmed:
+          phase === "P201" ? true : Boolean(targetRow.phase1ArtifactsConfirmed),
+      },
+    };
+  }
+
   async function requestOptionalLaterPhase(
     principal: SessionPrincipal,
     orderPublicId: string,
@@ -3531,14 +3900,11 @@ export function createProductionWebhookService(
             );
           }
 
-          const prep = await preparePhasePayloadInTx(tx, {
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
             orderId: access.id,
             orderPublicId: access.publicId,
-            phase,
+            targetRow,
             existingRows,
-            releaseStatusOverride: targetRow.releaseStatus ?? "",
-            requireExplicitP201Confirm: false,
-            phase1ArtifactsConfirmed: Boolean(targetRow.phase1ArtifactsConfirmed),
             action: "retry",
           });
           if (!prep.ok) {
@@ -3598,6 +3964,17 @@ export function createProductionWebhookService(
           "Enter an audit reason between 3 and 280 printable characters.",
         );
       }
+      const operatorIdempotencyKey = input.idempotencyKey.trim();
+      if (
+        operatorIdempotencyKey.length < 8 ||
+        operatorIdempotencyKey.length > 64 ||
+        !/^[A-Za-z0-9:_-]+$/.test(operatorIdempotencyKey)
+      ) {
+        throw validation(
+          "REDELIVER_IDEMPOTENCY_KEY_REQUIRED",
+          "Provide a valid idempotencyKey between 8 and 64 URL-safe characters.",
+        );
+      }
 
       const orders = requireOrders();
       await reconcileStaleDispatches({
@@ -3625,6 +4002,28 @@ export function createProductionWebhookService(
           if (!targetRow) {
             throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
           }
+
+          // Durable operator-intent idempotency: a replay of the same confirmed mutation (even after
+          // delivery completes) returns the existing redelivery row without enqueuing another run.
+          const intentDigest = deps.crypto
+            .blindIndex(
+              `${access.id}:${operatorIdempotencyKey}`,
+              "integration_production_dispatches.redeliver_intent_v1",
+            )
+            .slice(0, 40);
+          const intentSuffix = `:rdlv:${intentDigest}`;
+          const existingForIntent =
+            existingRows.find((r) => r.idempotencyKey.endsWith(intentSuffix)) ?? null;
+          if (existingForIntent) {
+            if (existingForIntent.redeliveryOfPublicId !== targetRow.publicId) {
+              throw conflict(
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "This idempotencyKey was already used for a different dispatch on this order.",
+              );
+            }
+            return { ok: true, item: toDispatchItem(existingForIntent) };
+          }
+
           if (targetRow.state !== "delivered") {
             throw conflict(
               "PRODUCTION_DISPATCH_NOT_DELIVERED",
@@ -3640,15 +4039,21 @@ export function createProductionWebhookService(
               `Cannot re-deliver ${phase} while a dispatch is queued or sending.`,
             );
           }
+          if (
+            phaseRows[0]?.state === "unknown" ||
+            phaseRows.some((r) => r.redeliveryOfPublicId !== null && r.state === "unknown")
+          ) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_UNCERTAIN",
+              `Cannot re-deliver ${phase} while a prior delivery outcome is uncertain; verify downstream state first.`,
+            );
+          }
 
-          const prep = await preparePhasePayloadInTx(tx, {
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
             orderId: access.id,
             orderPublicId: access.publicId,
-            phase,
+            targetRow,
             existingRows,
-            releaseStatusOverride: targetRow.releaseStatus ?? "",
-            requireExplicitP201Confirm: false,
-            phase1ArtifactsConfirmed: phase === "P201" ? true : Boolean(targetRow.phase1ArtifactsConfirmed),
             action: "redeliver",
           });
           if (!prep.ok) {
@@ -3675,6 +4080,7 @@ export function createProductionWebhookService(
             resendReasonCode: "OPERATOR_REPLAY_DELIVERED",
             retryOfPublicId: null,
             redeliveryOfPublicId: targetRow.publicId,
+            idempotencyKeyOverride: `rp-prod:${phase.toLowerCase()}${intentSuffix}`,
             dispatchKind: "redeliver",
             reasonLength: reason.length,
             phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
@@ -3733,6 +4139,12 @@ export function createProductionWebhookService(
             throw conflict(
               "PRODUCTION_DISPATCH_IN_PROGRESS",
               `Cannot re-send ${input.phase} while a dispatch is queued or sending.`,
+            );
+          }
+          if (phaseRows.some((r) => r.state === "delivered")) {
+            throw conflict(
+              "PRODUCTION_ALREADY_DELIVERED",
+              `${input.phase} has already been delivered for this order; use production.order.redeliver with step-up confirmation instead.`,
             );
           }
 
