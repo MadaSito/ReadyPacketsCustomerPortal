@@ -71,6 +71,28 @@ export function compliancePort(services: Services): CompliancePort | null {
   return fn ? { assertRequiredPoliciesAccepted: fn } : null;
 }
 
+/**
+ * Increment 05 (C3, /root decision G-C3-02): authoritative payment exposure of one order from compliance (billing),
+ * read in the cancelling transaction with the order's invoices locked. Not the display summary. Partial payments
+ * count in grossPaidMinor. Absent ⇒ null ⇒ orders never releases a redemption automatically (fail closed).
+ */
+export interface OrderPaymentExposure {
+  grossPaidMinor: number;
+  payableInvoiceOpen: boolean;
+  providerCapturePending: boolean;
+}
+export type OrderPaymentExposurePort = (tx: Tx, orderPublicId: string) => Promise<OrderPaymentExposure>;
+export function paymentExposurePort(services: Services): OrderPaymentExposurePort | null {
+  return method<OrderPaymentExposurePort>((services as Partial<Services>).compliance, "orderPaymentExposureInTx");
+}
+
+/** True only for a well-formed answer proving nothing was paid and nothing can still be captured. */
+export function releaseIsSafe(exposure: unknown): boolean {
+  if (!exposure || typeof exposure !== "object") return false;
+  const e = exposure as Partial<OrderPaymentExposure>;
+  return e.grossPaidMinor === 0 && e.payableInvoiceOpen === false && e.providerCapturePending === false;
+}
+
 /* ---------------- Increment 05 (C3): promotions port, binding signatures from INCREMENT_05_CONTRACT §3 ---------------- */
 
 export interface PromotionLine {

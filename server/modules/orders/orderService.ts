@@ -14,7 +14,7 @@ import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
 import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
-import { compliancePort, engagementPort, filesPort, identityPort, promoNotApplicable, promotionsPort, requirePromotions, type PromotionContext, type PromotionOutcome } from "./ports.js";
+import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, type PromotionContext, type PromotionOutcome } from "./ports.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
@@ -240,15 +240,15 @@ export function createOrderService(deps: OrderServiceDeps) {
     if (!row || (row.promoLabel === null && row.promoDiscountMinor === 0)) return;
     const port = promotionsPort(deps.services);
     if (!port) return;
-    // Fail closed: release only on a DEFINITIVE unpaid/void answer read in this transaction. No provider, no row
-    // for the order, or a read error ⇒ the redemption stays used (an administrator can release it in promotions).
-    const provider = deps.paymentSummary();
-    if (!provider) return;
+    // Fail closed (/root G-C3-02): release only on compliance's authoritative exposure read in THIS transaction:
+    // nothing ever paid (partial payments count), no open payable invoice, no pending provider capture. Port
+    // absent, error or any exposure ⇒ the redemption stays used; the cancellation itself still succeeds.
+    const exposure = paymentExposurePort(deps.services);
+    if (!exposure) return;
     try {
-      const state = (await provider([row.publicId], tx)).get(row.publicId)?.state;
-      if (state !== "unpaid" && state !== "void") return;
+      if (!releaseIsSafe(await exposure(tx, row.publicId))) return;
     } catch {
-      deps.logger.warn("order payment state unavailable; promotion kept", { orderPublicId: row.publicId });
+      deps.logger.warn("order payment exposure unavailable; promotion kept", { orderPublicId: row.publicId });
       return;
     }
     await port.releaseForOrderInTx(tx, { orderPublicId: row.publicId, reason: "order_cancelled" });

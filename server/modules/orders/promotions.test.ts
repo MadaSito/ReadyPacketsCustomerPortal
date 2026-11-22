@@ -14,7 +14,6 @@ import { createTestDeps, type TestHarness } from "../../../tests/helpers/fakes.j
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { ordersRouter } from "./router.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
-import type { OrderPaymentState } from "./orderService.js";
 import type { PromotionContext, PromotionOutcome } from "./ports.js";
 import { orders } from "./schema.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, idemKey, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
@@ -80,7 +79,7 @@ class FakePromotions {
 }
 
 let promos: FakePromotions;
-let payment: Map<string, OrderPaymentState>;
+
 const items = () => [{ productPublicId: productId, quantity: 1 }];
 const rowOf = async (publicId: string) => (await t.db.select().from(orders).where(eq(orders.publicId, publicId)))[0]!;
 
@@ -108,14 +107,11 @@ beforeAll(async () => {
     features: [],
   });
   productId = product.publicId;
-  payment = new Map();
-  mod.registerPaymentSummaryProvider(async (ids) => new Map(ids.filter((id) => payment.has(id)).map((id) => [id, { state: payment.get(id)!, totalMinor: 0, currency: "USD" }])));
 });
 afterAll(() => t.cleanup());
 beforeEach(() => {
   promos = new FakePromotions(() => alice.id);
   (h.services as unknown as Record<string, unknown>).promotions = promos;
-  payment.clear();
 });
 
 describe("promotion codes on orders (C3)", () => {
@@ -180,23 +176,45 @@ describe("promotion codes on orders (C3)", () => {
     expect(result).toMatchObject({ created: true, discountMinor: 1000, totalMinor: 9000, promoDiscountMinor: 1000, promoLabel: "Synthetic 10 % off" });
   });
 
-  it("cancelling before payment releases the redemption; a paid order keeps it; an order without a code calls nothing", async () => {
-    promos.remaining = 5;
-    // No payment row for the order ⇒ not definitively unpaid ⇒ kept (fail closed).
-    const unknown = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
-    await mod.orders.transition(alice.principal, { orderId: unknown.publicId, expectedVersion: (await rowOf(unknown.publicId)).version, toStatus: "canceled" });
+  it("cancelling releases the redemption only on authoritative zero exposure; otherwise it stays used and the cancel succeeds", async () => {
+    promos.remaining = 10;
+    const services = h.services as unknown as Record<string, unknown>;
+    // Without compliance's authoritative exposure port the redemption is never released (fail closed).
+    delete services.compliance;
+    const noGuard = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+    await mod.orders.transition(alice.principal, { orderId: noGuard.publicId, expectedVersion: (await rowOf(noGuard.publicId)).version, toStatus: "canceled" });
     expect(promos.released).toEqual([]);
-    const unpaid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
-    payment.set(unpaid.publicId, "unpaid");
-    await mod.orders.transition(alice.principal, { orderId: unpaid.publicId, expectedVersion: (await rowOf(unpaid.publicId)).version, toStatus: "canceled" });
-    expect(promos.released).toEqual([unpaid.publicId]);
-    const paid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
-    payment.set(paid.publicId, "paid");
-    await mod.orders.transition(staff.principal, { orderId: paid.publicId, expectedVersion: (await rowOf(paid.publicId)).version, toStatus: "canceled" });
-    expect(promos.released).toEqual([unpaid.publicId]);
-    const plain = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey() });
-    await mod.orders.transition(alice.principal, { orderId: plain.publicId, expectedVersion: (await rowOf(plain.publicId)).version, toStatus: "canceled" });
-    expect(promos.released).toEqual([unpaid.publicId]);
+    // Exposure proves nothing paid and nothing capturable ⇒ released; any exposure, malformed answer or error ⇒ kept.
+    const exposureOf = new Map<string, unknown>();
+    const asked: string[] = [];
+    services.compliance = {
+      orderPaymentExposureInTx: async (_tx: Tx, publicId: string) => {
+        asked.push(publicId);
+        const value = exposureOf.get(publicId);
+        if (value === "throw") throw new Error("synthetic");
+        return value;
+      },
+    };
+    const none = { grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false };
+    try {
+      const unpaid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+      exposureOf.set(unpaid.publicId, none);
+      await mod.orders.transition(alice.principal, { orderId: unpaid.publicId, expectedVersion: (await rowOf(unpaid.publicId)).version, toStatus: "canceled" });
+      expect(promos.released).toEqual([unpaid.publicId]);
+      for (const exposure of [{ ...none, grossPaidMinor: 1 }, { ...none, payableInvoiceOpen: true }, { ...none, providerCapturePending: true }, "throw", { grossPaidMinor: 0 }]) {
+        const kept = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+        exposureOf.set(kept.publicId, exposure);
+        await mod.orders.transition(alice.principal, { orderId: kept.publicId, expectedVersion: (await rowOf(kept.publicId)).version, toStatus: "canceled" });
+        expect((await rowOf(kept.publicId)).statusKey).toBe("canceled");
+      }
+      expect(promos.released).toEqual([unpaid.publicId]);
+      const plain = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey() });
+      await mod.orders.transition(alice.principal, { orderId: plain.publicId, expectedVersion: (await rowOf(plain.publicId)).version, toStatus: "canceled" });
+      expect(promos.released).toEqual([unpaid.publicId]);
+      expect(asked).not.toContain(plain.publicId);
+    } finally {
+      delete services.compliance;
+    }
   });
 
   it("a code never travels in a URL: quote (GET) refuses it, quoteWithPromo is a POST mutation", () => {
