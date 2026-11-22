@@ -231,7 +231,7 @@ export default function DiscountCodesPage() {
               ]}
               rowActions={canManage ? (r) => <div className="flex flex-wrap gap-2"><StatusActionButtons promotion={r} onAction={(a) => actions.ask(r, a)} /></div> : undefined}
             />
-            <LoadMore hasMore={!!list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={rows ? `Showing ${rows.length} discount codes` : undefined} />
+            <LoadMore hasMore={!!list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={rows ? `Showing ${rows.length} discount ${rows.length === 1 ? "code" : "codes"}` : undefined} />
           </div>
         </section>
         <SettingsCard />

@@ -367,8 +367,8 @@ export function AdminCartUpsellsPage() {
                 .join(", ");
         return (
           <div className="flex min-w-0 flex-col gap-1 text-sm">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="font-medium break-words text-ink">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="min-w-0 font-medium break-words text-ink">
                 {row.targetProductName ?? row.targetProductPublicId}
               </span>
               {row.targetProductPriceMinor !== null && row.targetProductCurrency ? (
@@ -392,11 +392,12 @@ export function AdminCartUpsellsPage() {
     },
     {
       key: "counters",
-      header: "Shown / Accepted / Dismissed",
+      // A short header keeps the label column of the stacked mobile card narrow (320 px reflow, WCAG 1.4.10).
+      header: "Activity",
       align: "end",
       cell: (row) => (
-        <span className="font-mono text-xs whitespace-nowrap text-body">
-          {row.shownCount} / {row.acceptedCount} / {row.dismissedCount}
+        <span className="text-xs break-words text-body">
+          {row.shownCount} shown · {row.acceptedCount} accepted · {row.dismissedCount} dismissed
         </span>
       ),
     },

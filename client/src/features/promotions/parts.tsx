@@ -148,7 +148,7 @@ export function RedemptionsSection({ promotionPublicId }: { promotionPublicId?: 
           <Button size="sm" variant="ghost" onClick={() => setReleasing(r)} aria-label={`Release the redemption on ${r.orderNumber ?? "this order"}`}>Release</Button>
         ) : null : undefined}
       />
-      <LoadMore hasMore={!!list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={rows ? `Showing ${rows.length} redemptions` : undefined} />
+      <LoadMore hasMore={!!list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={rows ? `Showing ${rows.length} ${rows.length === 1 ? "redemption" : "redemptions"}` : undefined} />
       <ReleaseDialog redemption={releasing} onClose={() => setReleasing(null)} onReleased={async () => {
         await qc.invalidateQueries(api.redemptions.pathFilter());
         await qc.invalidateQueries(api.stats.pathFilter());
