@@ -61,7 +61,7 @@ import {
   type WizardStepId,
   type WorkflowIssue,
 } from "./model";
-import { PhasesEditor, StateRulesFields } from "./rulesFields";
+import { AcceptanceGatesEditor, PhasesEditor, StateRulesFields, StorageFolderEditor } from "./rulesFields";
 
 export default function WorkflowDesignerPage() {
   const { draftId = "" } = useParams<{ draftId: string }>();
@@ -410,6 +410,8 @@ function StepBody(props: StepBodyProps) {
       {step === "rules" ? (
         <>
           <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
           <ol className="flex flex-col gap-4">
             {definition.states.map((state, index) => (
               <li key={index}>
@@ -593,6 +595,12 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
         ) : null}
         <Card title="Phases" headingLevel={2}>
           <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+        </Card>
+        <Card title="Acceptance and storage" headingLevel={2}>
+          <div className="flex flex-col gap-4">
+            <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
+            <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
+          </div>
         </Card>
         <Card title="Add" headingLevel={2}>
           <div className="flex flex-col gap-4">

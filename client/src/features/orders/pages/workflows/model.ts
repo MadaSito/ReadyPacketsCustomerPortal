@@ -4,6 +4,7 @@
  */
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
+import { DEFAULT_ORDER_FILE_FOLDER_TEMPLATE, isOrderFileFolderTemplate, resolveOrderFileFolder, type OrderFileFolderToken } from "@shared/orderFileFolder";
 
 type Out = inferRouterOutputs<AppRouter>["orders"]["admin"]["workflows"];
 export type WorkflowListRow = Out["list"][number];
@@ -100,6 +101,14 @@ const STEP_OF_CODE: Record<string, WizardStepId> = {
   ACK_BODY_REQUIRED: "rules",
   ACK_MARKUP: "rules",
   TERMINAL_REQUIREMENTS: "rules",
+  UPLOAD_FOLDER_INVALID: "rules",
+  WORKFLOW_FOLDER_INVALID: "rules",
+  GATE_KEY_FORMAT: "rules",
+  GATE_KEY_DUPLICATE: "rules",
+  GATE_POLICY_REQUIRED: "rules",
+  GATE_STEP_REQUIRED: "rules",
+  GATE_STEP_UNKNOWN: "rules",
+  GATE_STEP_TERMINAL: "rules",
 };
 export const stepOfIssue = (issue: WorkflowIssue): WizardStepId => STEP_OF_CODE[issue.code] ?? "review";
 export const errorsOf = (issues: readonly WorkflowIssue[]) => issues.filter((issue) => issue.severity === "error");
@@ -282,3 +291,51 @@ export function setPosition(layout: Layout, key: string, x: number, y: number): 
 export const nodeId = (index: number) => `s${index}`;
 export const edgeId = (index: number) => `t${index}`;
 export const indexOfId = (id: string) => Number(id.slice(1));
+
+/* ------------------------------------------------------------------ part B: acceptance gates + storage folders */
+
+export type DraftGate = NonNullable<DraftDefinition["acceptanceGates"]>[number];
+export const MAX_GATES = 10;
+export const SIGNATURE_MODE_OPTIONS = [
+  { value: "checkbox", label: "Tick a box" },
+  { value: "typed_name", label: "Type their full name" },
+] as const;
+
+export function newGate(definition: DraftDefinition): DraftGate {
+  const taken = new Set((definition.acceptanceGates ?? []).map((gate) => gate.key));
+  return { key: keyFromLabel("terms", taken), policyPublicId: "", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true };
+}
+export function updateGate(definition: DraftDefinition, index: number, patch: Partial<DraftGate>): DraftDefinition {
+  return { ...definition, acceptanceGates: (definition.acceptanceGates ?? []).map((gate, i) => (i === index ? { ...gate, ...patch } : gate)) };
+}
+export function removeGate(definition: DraftDefinition, index: number): DraftDefinition {
+  const next = (definition.acceptanceGates ?? []).filter((_, i) => i !== index);
+  return { ...definition, acceptanceGates: next.length ? next : undefined };
+}
+/** Select value for a gate point: "order_start" or "step:<key>". */
+export const gatePointValue = (point: DraftGate["point"]) => (point === "order_start" ? "order_start" : `step:${point.stepKey}`);
+export const gatePointFrom = (value: string): DraftGate["point"] => (value.startsWith("step:") ? { stepKey: value.slice(5) } : "order_start");
+
+/** Synthetic values for the live example path (never real customer data). */
+export const FOLDER_EXAMPLE_VALUES: Record<OrderFileFolderToken, string> = {
+  customer_ref: "CUST-0042",
+  order_ref: "RP-2026-000123",
+  order_name: "Example project",
+  phase: "Intake",
+  slot: "Signed contract",
+  yyyy: "2026",
+  mm: "11",
+};
+/**
+ * Example path for a folder template with the precedence the copy worker uses (slot → workflow → default).
+ * Returns null when the effective template is not valid (the server reports the error on save).
+ */
+export function folderExample(templates: (string | undefined)[], values: Partial<Record<OrderFileFolderToken, string>> = {}): string | null {
+  const template = templates.map((value) => value?.trim()).find((value) => value) ?? DEFAULT_ORDER_FILE_FOLDER_TEMPLATE;
+  if (!isOrderFileFolderTemplate(template)) return null;
+  try {
+    return resolveOrderFileFolder(template, { ...FOLDER_EXAMPLE_VALUES, ...values }).join("/");
+  } catch {
+    return null;
+  }
+}

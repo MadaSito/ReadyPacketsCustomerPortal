@@ -3,12 +3,144 @@
  * (upload slots and acknowledgements). Shared by the wizard "Phases and requirements" step and the canvas
  * side panel. The server validates everything; these fields only edit the draft and show its issues.
  */
+import { useQuery } from "@tanstack/react-query";
 import { Plus, Trash2 } from "lucide-react";
+import { DEFAULT_ORDER_FILE_FOLDER_TEMPLATE, ORDER_FILE_FOLDER_TOKENS } from "@shared/orderFileFolder";
+import { useTRPC } from "@/lib/trpc";
 import { Button, Checkbox, Field, Input, Select, Textarea } from "@/ui";
 import {
-  ACK_SIDE_OPTIONS, ACTORS, addPhase, fieldError, newAcknowledgement, newUpload, parseTypes, removePhase, toggleActor, updatePhase, UPLOAD_KIND_OPTIONS, withRequirements,
-  type DraftAcknowledgement, type DraftDefinition, type DraftState, type DraftUpload, type WorkflowIssue,
+  ACK_SIDE_OPTIONS, ACTORS, addPhase, fieldError, folderExample, gatePointFrom, gatePointValue, MAX_GATES, newAcknowledgement, newGate, newUpload, parseTypes, removeGate, removePhase,
+  SIGNATURE_MODE_OPTIONS, toggleActor, updateGate, updatePhase, UPLOAD_KIND_OPTIONS, withRequirements,
+  type DraftAcknowledgement, type DraftDefinition, type DraftGate, type DraftState, type DraftUpload, type WorkflowIssue,
 } from "./model";
+
+const TOKEN_LIST = ORDER_FILE_FOLDER_TOKENS.map((token) => `{${token}}`).join(", ");
+const FOLDER_HINT = `Folder path inside the storage location, with / between folders. You can use ${TOKEN_LIST}.`;
+
+/** Live example of where files land (synthetic values). Announced politely as the template changes. */
+function FolderExample({ templates, phase, slot }: { templates: (string | undefined)[]; phase?: string; slot?: string }) {
+  const example = folderExample(templates, { ...(phase ? { phase } : {}), ...(slot ? { slot } : {}) });
+  return (
+    <p className="text-sm text-muted" aria-live="polite">
+      {example ? (
+        <>
+          Example: <span className="font-mono break-all text-body">{example}</span>
+        </>
+      ) : (
+        "No example yet: the folder path is not valid."
+      )}
+    </p>
+  );
+}
+
+/** Part B (B7): the workflow's default storage folder (slot folders override it). */
+export function StorageFolderEditor({ definition, issues, onChange }: { definition: DraftDefinition; issues: readonly WorkflowIssue[]; onChange: (definition: DraftDefinition) => void }) {
+  return (
+    <fieldset className="flex min-w-0 flex-col gap-3 rounded-[var(--radius-card)] border border-line p-4">
+      <legend className="px-1 text-sm font-semibold text-ink">Storage folder</legend>
+      <Field label="Default storage folder (optional)" hint={`${FOLDER_HINT} Empty uses ${DEFAULT_ORDER_FILE_FOLDER_TEMPLATE}.`} error={fieldError(issues, "storageFolder")}>
+        <Input
+          value={definition.storageFolder ?? ""}
+          maxLength={400}
+          spellCheck={false}
+          autoCapitalize="none"
+          className="font-mono"
+          placeholder={DEFAULT_ORDER_FILE_FOLDER_TEMPLATE}
+          onChange={(event) => onChange({ ...definition, storageFolder: event.target.value || undefined })}
+        />
+      </Field>
+      <FolderExample templates={[definition.storageFolder]} />
+    </fieldset>
+  );
+}
+
+/**
+ * Part B (B6): acceptance gates. A gate asks the customer to accept a published policy before working on the
+ * order (order start) or before submitting from one status. The server enforces it; this only edits the draft.
+ */
+export function AcceptanceGatesEditor({ definition, issues, onChange }: { definition: DraftDefinition; issues: readonly WorkflowIssue[]; onChange: (definition: DraftDefinition) => void }) {
+  const trpc = useTRPC();
+  const policies = useQuery(trpc.compliance.policies.admin.listDocuments.queryOptions());
+  const gates = definition.acceptanceGates ?? [];
+  const published = (policies.data ?? []).filter((doc) => doc.active && doc.currentPublishedVersion);
+  const policyOptions = (gate: DraftGate) => {
+    const options = published.map((doc) => ({ value: doc.documentPublicId, label: doc.title }));
+    if (gate.policyPublicId && !options.some((option) => option.value === gate.policyPublicId))
+      options.unshift({ value: gate.policyPublicId, label: "Policy not available (unpublished or removed)" });
+    return options;
+  };
+  const pointOptions = [
+    { value: "order_start", label: "Before any work on the order" },
+    ...definition.states
+      .filter((state) => state.kind !== "terminal" && state.key)
+      .map((state) => ({ value: `step:${state.key}`, label: `Before submitting from “${state.label.trim() || state.key}”` })),
+  ];
+  return (
+    <fieldset className="flex min-w-0 flex-col gap-3 rounded-[var(--radius-card)] border border-line p-4">
+      <legend className="px-1 text-sm font-semibold text-ink">Acceptance gates</legend>
+      <p className="text-sm text-body">
+        Optional. Ask the customer to accept a published policy before they can upload, record, answer intake questions or submit. Staff are never blocked, and cancelling is always possible.
+        Publishing gates needs workflow rules to be turned on in settings.
+      </p>
+      {policies.isError ? (
+        <p className="text-sm text-danger" role="alert">
+          The policy list could not be loaded. You can still edit the other fields.
+        </p>
+      ) : null}
+      {gates.length === 0 ? <p className="text-sm text-muted">No gates.</p> : null}
+      <ol className="flex flex-col gap-4">
+        {gates.map((gate, index) => {
+          const path = `acceptanceGates.${index}`;
+          const name = `Gate ${index + 1}`;
+          return (
+            <li key={index} className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line p-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field label={`${name} policy`} required error={fieldError(issues, `${path}.policyPublicId`)}>
+                  <Select
+                    value={gate.policyPublicId}
+                    placeholder={policies.isPending ? "Loading policies…" : "Choose a policy"}
+                    options={policyOptions(gate)}
+                    onChange={(event) => onChange(updateGate(definition, index, { policyPublicId: event.target.value }))}
+                  />
+                </Field>
+                <Field label={`${name} applies`} required error={fieldError(issues, `${path}.point`)}>
+                  <Select value={gatePointValue(gate.point)} options={pointOptions} onChange={(event) => onChange(updateGate(definition, index, { point: gatePointFrom(event.target.value) }))} />
+                </Field>
+                <Field label={`${name} signature`}>
+                  <Select
+                    value={gate.signatureMode}
+                    options={SIGNATURE_MODE_OPTIONS}
+                    onChange={(event) => onChange(updateGate(definition, index, { signatureMode: event.target.value as DraftGate["signatureMode"] }))}
+                  />
+                </Field>
+                <Field label={`${name} key`} required hint="Lowercase letters, digits and underscores." error={fieldError(issues, `${path}.key`)}>
+                  <Input value={gate.key} maxLength={48} spellCheck={false} autoCapitalize="none" className="font-mono" onChange={(event) => onChange(updateGate(definition, index, { key: event.target.value }))} />
+                </Field>
+              </div>
+              <Checkbox
+                label="Ask again when the policy has a new version"
+                checked={gate.askAgainOnNewVersion}
+                onCheckedChange={(on) => onChange(updateGate(definition, index, { askAgainOnNewVersion: on === true }))}
+              />
+              <div>
+                <Button size="sm" variant="ghost" aria-label={`Remove gate ${index + 1}`} onClick={() => onChange(removeGate(definition, index))}>
+                  <Trash2 aria-hidden="true" className="size-4" />
+                  Remove
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+      <div>
+        <Button variant="secondary" size="sm" disabled={gates.length >= MAX_GATES} onClick={() => onChange({ ...definition, acceptanceGates: [...gates, newGate(definition)] })}>
+          <Plus aria-hidden="true" className="size-4" />
+          Add acceptance gate
+        </Button>
+      </div>
+    </fieldset>
+  );
+}
 
 const MAX_PHASES = 12;
 const MAX_UPLOADS = 10;
@@ -120,6 +252,21 @@ export function StateRulesFields({ definition, state, index, issues, onChange }:
               <Field label="Hint (optional)" hint="Plain text, up to 200 characters." error={at("hint")}>
                 <Input value={upload.hint ?? ""} maxLength={200} onChange={(event) => setUpload(i, { hint: event.target.value || undefined })} />
               </Field>
+              <Field label="Storage folder (optional)" hint={`${FOLDER_HINT} Empty uses the workflow's default folder.`} error={at("storageFolder")}>
+                <Input
+                  value={upload.storageFolder ?? ""}
+                  maxLength={400}
+                  spellCheck={false}
+                  autoCapitalize="none"
+                  className="font-mono"
+                  onChange={(event) => setUpload(i, { storageFolder: event.target.value || undefined })}
+                />
+              </Field>
+              <FolderExample
+                templates={[upload.storageFolder, definition.storageFolder]}
+                phase={definition.phases?.find((phase) => phase.key === state.phase)?.label}
+                slot={upload.label}
+              />
               <fieldset>
                 <legend className="mb-1 text-sm font-medium text-ink">Who may upload {slot}</legend>
                 <div className="flex flex-wrap gap-x-6 gap-y-1">
