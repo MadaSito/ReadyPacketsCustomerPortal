@@ -37,6 +37,7 @@ export interface ProductionRedeliverInput {
   dispatchPublicId: string;
   reason: string;
   confirmation: string;
+  idempotencyKey: string;
 }
 
 export interface ProductionTRPCProxy {

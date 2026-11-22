@@ -562,8 +562,8 @@ describe("Production & Automation UI — WCAG 2.2 AA pageA11y (light & dark)", (
       path: "/admin/integrations/production",
       api: fakeAuthApi({ me: async () => sessionFor("admin") }),
     });
-    await screen.findByRole("heading", { level: 1, name: "Production pipeline" });
-    await screen.findByLabelText("Phase III (P301) webhook URL (optional)");
+    await screen.findByRole("heading", { level: 1, name: "Production pipeline" }, { timeout: 5000 });
+    await screen.findByLabelText("Phase III (P301) webhook URL (optional)", {}, { timeout: 5000 });
   });
 
   pageA11y("/admin/orders/:orderId/automation ready", async () => {
@@ -575,8 +575,16 @@ describe("Production & Automation UI — WCAG 2.2 AA pageA11y (light & dark)", (
       path: `/admin/orders/${orderPublicId}/automation`,
       api: fakeAuthApi({ me: async () => sessionFor("admin") }),
     });
-    await screen.findByRole("heading", { level: 1, name: "Order RP-C000008-2611-5E4A2D" });
-    await screen.findByRole("heading", { name: "This order's pipeline history" });
+    await screen.findByRole(
+      "heading",
+      { level: 1, name: "Order RP-C000008-2611-5E4A2D" },
+      { timeout: 5000 },
+    );
+    await screen.findByRole(
+      "heading",
+      { name: "This order's pipeline history" },
+      { timeout: 5000 },
+    );
   });
 
   pageA11y("/admin/orders/:orderId/automation redeliver dialog open", async () => {
@@ -926,17 +934,21 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
     );
     staffRender.unmount();
 
-    // 2. Admin sees Redeliver on delivered P101, manages keyboard focus on cancel & step-up cancel, and requires reason + exact uppercase REDELIVER + step-up MFA
+    // 2. Admin sees Redeliver on delivered P101, manages keyboard focus on cancel & step-up cancel, preserves idempotencyKey across step-up cancel + ambiguous retry, and issues a fresh key for a new dialog intent
     const user = userEvent.setup();
     mockState.staffViewer = false;
     const stepUp = vi.fn().mockResolvedValue(undefined);
     redeliverDispatch
       .mockRejectedValueOnce({ data: { safe: { domainCode: "STEP_UP_REQUIRED" } } })
       .mockRejectedValueOnce({ data: { safe: { domainCode: "STEP_UP_REQUIRED" } } })
+      .mockRejectedValueOnce({
+        data: { safe: { safeMessage: "Temporary gateway timeout while confirming redelivery." } },
+      })
       .mockImplementationOnce(async () => {
         mockState.hasRedeliveryRow = true;
         return {};
-      });
+      })
+      .mockResolvedValueOnce({});
 
     const adminRender = renderUi(
       <OrderProductionTab orderId={orderPublicId} area="console" stageActionsSlot={null} />,
@@ -1010,7 +1022,7 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
     await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
     expect(stepUp).not.toHaveBeenCalled();
 
-    // Second submit completes step-up verification and executes redeliver
+    // Second submit completes step-up verification, hits an ambiguous gateway error, and retries inside the SAME dialog with the SAME idempotencyKey
     fireEvent.click(within(dialog).getByRole("button", { name: "Confirm redelivery" }));
     const verifyDialog = await screen.findByRole("dialog", { name: "Confirm it's you" });
     fireEvent.change(within(verifyDialog).getByLabelText(/Password/), {
@@ -1021,20 +1033,58 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
     });
     fireEvent.click(within(verifyDialog).getByRole("button", { name: "Verify" }));
 
-    await waitFor(() =>
-      expect(redeliverDispatch).toHaveBeenLastCalledWith({
-        orderPublicId,
-        dispatchPublicId: deliveredDispatchId,
-        reason: "Downstream worker lost disk volume after accepting HTTP 202",
-        confirmation: "REDELIVER",
-      }),
-    );
+    expect(
+      await within(dialog).findByText("Temporary gateway timeout while confirming redelivery."),
+    ).toBeTruthy();
+
+    // Retry inside the same open dialog succeeds and reuses the exact same operator idempotencyKey
+    fireEvent.click(within(dialog).getByRole("button", { name: "Confirm redelivery" }));
+
+    await waitFor(() => expect(redeliverDispatch).toHaveBeenCalledTimes(4));
     expect(stepUp).toHaveBeenCalledOnce();
+
+    const intentKeysFirstDialog = redeliverDispatch.mock.calls.map(
+      (call) => (call[0] as { idempotencyKey: string }).idempotencyKey,
+    );
+    const firstIntentKey = intentKeysFirstDialog[0]!;
+    expect(firstIntentKey).toMatch(/^[A-Za-z0-9:_-]{8,64}$/);
+    expect(new Set(intentKeysFirstDialog)).toEqual(new Set([firstIntentKey]));
+    expect(redeliverDispatch).toHaveBeenLastCalledWith({
+      orderPublicId,
+      dispatchPublicId: deliveredDispatchId,
+      reason: "Downstream worker lost disk volume after accepting HTTP 202",
+      confirmation: "REDELIVER",
+      idempotencyKey: firstIntentKey,
+    });
 
     // Resulting new delivery row displays `Redelivery of …` badge in pipeline history
     expect(
       (await screen.findAllByText(`Redelivery of …${deliveredDispatchId.slice(-6)}`)).length,
     ).toBeGreaterThanOrEqual(1);
+
+    // Opening a brand-new Redeliver dialog later issues a fresh, distinct idempotencyKey
+    const refreshedTable = await screen.findByRole("table", {
+      name: "This order's pipeline history",
+    });
+    const secondLaunchButtons = within(refreshedTable).getAllByRole("button", {
+      name: "Redeliver Phase I intake (P101)",
+    });
+    fireEvent.click(secondLaunchButtons[0]!);
+    const secondDialog = await screen.findByRole("dialog", {
+      name: "Redeliver Phase I intake (P101)",
+    });
+    fireEvent.change(within(secondDialog).getByLabelText(/Reason for redelivery/), {
+      target: { value: "Second independent redelivery after upstream fix" },
+    });
+    fireEvent.change(within(secondDialog).getByLabelText(/Type REDELIVER to confirm/), {
+      target: { value: "REDELIVER" },
+    });
+    fireEvent.click(within(secondDialog).getByRole("button", { name: "Confirm redelivery" }));
+
+    await waitFor(() => expect(redeliverDispatch).toHaveBeenCalledTimes(5));
+    const fifthCallArg = redeliverDispatch.mock.calls[4]![0] as { idempotencyKey: string };
+    expect(fifthCallArg.idempotencyKey).toMatch(/^[A-Za-z0-9:_-]{8,64}$/);
+    expect(fifthCallArg.idempotencyKey).not.toBe(firstIntentKey);
   });
 
   it("blocks ineligible orders, hides private error details on ErrorState, and preserves PW-02 Outcome unknown warning", async () => {

@@ -83,6 +83,25 @@ class OptionalSlotBoundary extends Component<{ children: ReactNode }, { failed: 
   }
 }
 
+function createRedeliverIntentKey(): string {
+  if (
+    typeof globalThis.crypto !== "undefined" &&
+    typeof globalThis.crypto.randomUUID === "function"
+  ) {
+    return `redeliver:${globalThis.crypto.randomUUID()}`;
+  }
+  const bytes = new Uint8Array(16);
+  if (
+    typeof globalThis.crypto !== "undefined" &&
+    typeof globalThis.crypto.getRandomValues === "function"
+  ) {
+    globalThis.crypto.getRandomValues(bytes);
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `redeliver:${hex}`;
+  }
+  return `redeliver:${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+}
+
 export interface OrderProductionTabProps {
   orderId: string;
   area: "customer" | "console";
@@ -226,6 +245,7 @@ function ConsoleOrderAutomationPanel({
   const [redeliverError, setRedeliverError] = useState<string>();
   const [redelivering, setRedelivering] = useState(false);
   const redeliverReasonRef = useRef<HTMLTextAreaElement | null>(null);
+  const redeliverIntentKeyRef = useRef<string>("");
 
   // Admin Re-send dialog state (preserved for `unknown` recovery -> orders.production.trigger)
   const [resendPhase, setResendPhase] = useState<"P101" | "P201" | null>(null);
@@ -570,10 +590,16 @@ function ConsoleOrderAutomationPanel({
   };
 
   const openRedeliverDialog = (row: ProductionDispatchItem) => {
+    redeliverIntentKeyRef.current = createRedeliverIntentKey();
     setRedeliverTarget(row);
     setRedeliverReason("");
     setRedeliverConfirmation("");
     setRedeliverError(undefined);
+  };
+
+  const closeRedeliverDialog = () => {
+    redeliverIntentKeyRef.current = "";
+    setRedeliverTarget(null);
   };
 
   const cleanedRedeliverReason = redeliverReason.trim();
@@ -596,6 +622,9 @@ function ConsoleOrderAutomationPanel({
       return;
     }
 
+    const intentKey =
+      redeliverIntentKeyRef.current || (redeliverIntentKeyRef.current = createRedeliverIntentKey());
+
     setRedelivering(true);
     setRedeliverError(undefined);
     try {
@@ -606,6 +635,7 @@ function ConsoleOrderAutomationPanel({
             dispatchPublicId: redeliverTarget.publicId,
             reason: cleanedRedeliverReason,
             confirmation: REDELIVER_CONFIRM_PHRASE,
+            idempotencyKey: intentKey,
           }),
         {
           reason:
@@ -617,7 +647,7 @@ function ConsoleOrderAutomationPanel({
         title: `${PHASE_LABELS[redeliverTarget.phase]} redelivery queued`,
         description: "Created a new delivery record linked to the original dispatch.",
       });
-      setRedeliverTarget(null);
+      closeRedeliverDialog();
       await refreshOrderProduction();
     } catch (err) {
       if (err instanceof StepUpCancelledError) {
@@ -1178,7 +1208,7 @@ function ConsoleOrderAutomationPanel({
       <Dialog
         open={redeliverTarget !== null}
         onOpenChange={(open) => {
-          if (!open && !redelivering) setRedeliverTarget(null);
+          if (!open && !redelivering) closeRedeliverDialog();
         }}
         dismissible={!redelivering}
         initialFocusRef={redeliverReasonRef}
@@ -1239,7 +1269,7 @@ function ConsoleOrderAutomationPanel({
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
             <Button
               variant="secondary"
-              onClick={() => setRedeliverTarget(null)}
+              onClick={closeRedeliverDialog}
               disabled={redelivering}
             >
               Cancel

@@ -34,6 +34,6 @@ Spread into `integrationsFeature` via `client/src/features/integrations/routes.t
 - `order.history` (`orders.production.trigger`, `{ orderPublicId }`) -> `{ items: ProductionDispatchItem[] }` (includes `retryOf` and `redeliveryOf`).
 - `order.requestP101`, `order.requestP201`, `order.requestP301`, `order.requestP401` (`orders.production.trigger`).
 - `order.retry` (`orders.production.trigger`, `{ orderPublicId, dispatchPublicId }`) — retries latest `failed` / `dead` dispatch for a phase when no dispatch for that phase is `queued`, `sending`, `unknown`, or `delivered`.
-- `order.redeliver` (`orders.production.redeliver` admin step-up, `{ orderPublicId, dispatchPublicId, reason, confirmation: "REDELIVER" }`) — creates a new delivery record linked via `redeliveryOf`.
+- `order.redeliver` (`orders.production.redeliver` admin step-up, `{ orderPublicId, dispatchPublicId, reason, confirmation: "REDELIVER", idempotencyKey }`) — creates a new delivery record linked via `redeliveryOf`, using one per-dialog-intent `idempotencyKey` (`^[A-Za-z0-9:_-]{8,64}$`) held stable across canceled step-up or ambiguous retries.
 - `order.resend` (`orders.production.trigger` admin step-up) — preserved for `unknown` delivery outcome recovery (`PW-02`).
 - `admin.listDispatches` (`adminProcedure`, `{ phase?, state?, orderReference?, fromDate?, toDate?, limit? }`) -> `{ items: ProductionDispatchItem[] }`.
