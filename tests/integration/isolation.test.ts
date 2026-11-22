@@ -104,7 +104,10 @@ function probes(): Record<string, Probe> {
       kind: "mutation", input: () => ({ orderPublicId: o.orderId, dispatchPublicId: o.dispatchId }), denial: consoleOnly,
     },
     [`${productionOrder}.redeliver`]: {
-      kind: "mutation", input: () => ({ orderPublicId: o.orderId, dispatchPublicId: o.dispatchId, reason: "Synthetic test", confirmation: "REDELIVER" }),
+      kind: "mutation", input: () => ({
+        orderPublicId: o.orderId, dispatchPublicId: o.dispatchId,
+        reason: "Synthetic test", confirmation: "REDELIVER", idempotencyKey: key("redeliver"),
+      }),
       denial: consoleOnly,
     },
     [`${productionOrder}.resend`]: {
