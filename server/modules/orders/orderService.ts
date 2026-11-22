@@ -1078,6 +1078,11 @@ export function createOrderService(deps: OrderServiceDeps) {
           origin: row.origin,
           version: row.version,
           workflowVersionId: row.workflowVersionId,
+          discountMinor: row.discountMinor,
+          discountLabel: row.discountLabel,
+          promoDiscountMinor: row.promoDiscountMinor,
+          promoLabel: row.promoLabel,
+          bundleDiscountMinor: Math.max(0, row.discountMinor - row.promoDiscountMinor),
         };
         await deps.requirements.onTransition(tx, null, view, bound, transition.to);
         const now = deps.clock.now();

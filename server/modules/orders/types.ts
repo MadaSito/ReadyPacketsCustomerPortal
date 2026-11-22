@@ -30,6 +30,14 @@ export interface OrderAccessView {
   origin: "portal" | "import";
   version: number;
   workflowVersionId: number;
+  /** Increment 05 (C4 invoices): stored totals, always set by orders (optional only for peer test fakes). `discountLabel` is the COMBINED label when a code applied. */
+  discountMinor?: number;
+  discountLabel?: string | null;
+  /** The part of discountMinor due to the discount code (0 without a code). */
+  promoDiscountMinor?: number;
+  promoLabel?: string | null;
+  /** discountMinor − promoDiscountMinor (bundle part; may be 0 when the code replaced the bundle discount). */
+  bundleDiscountMinor?: number;
 }
 
 export interface AccessOptions {
