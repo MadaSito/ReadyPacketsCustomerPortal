@@ -317,7 +317,7 @@ All procedures are admin only. Customers and staff get `FORBIDDEN`, the existing
 | Procedure | Capability | Input ⇒ output |
 | --- | --- | --- |
 | `status` (query) | `workflows.manage` | ⇒ `{ enabled, canExport, canImport, maxBytes: 2097152, maxWorkflows: 50 }` |
-| `export` (mutation) | `workflows.export` | `{ selection: { all: true } \| { workflowKeys: string[1..50] } }` ⇒ `{ fileName, packageText, digest, … }`; unknown key ⇒ `NOT_FOUND` |
+| `export` (mutation) | `workflows.export` | `{ selection: { all: true } \| { workflowKeys: string[1..50] } }` ⇒ `{ fileName, packageText }` (the digest is inside the package); unknown key ⇒ `NOT_FOUND` |
 | `preview` (mutation, `form_submission`) | `workflows.import` + step-up | `{ packageText ≤ 2 MiB }` ⇒ `TransferPreview` |
 | `applyImport` (mutation, `form_submission`) | `workflows.import` + step-up (re-checked in the tx) | `TransferApplyInput` ⇒ `TransferApplyResult`. Named `applyImport` because `apply` is reserved by tRPC |
 

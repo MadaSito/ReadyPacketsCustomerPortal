@@ -100,15 +100,23 @@ export default function NewOrderPage() {
   // One always-mounted polite region for discount-code changes (the step-1 estimate has its own live line).
   const [promoMessage, setPromoMessage] = useState("");
   const [promoNotice, setPromoNotice] = useState<string | null>(null);
+  // Identity of the selection + code currently on screen: a superseded (older) quote's refusal must not clear a
+  // newer code or selection.
+  const promoIdentity = JSON.stringify([promoInput.items, promoCode]);
+  const promoIdentityRef = useRef(promoIdentity);
+  useEffect(() => {
+    promoIdentityRef.current = promoIdentity;
+  }, [promoIdentity]);
   const promoQuery = useQuery({
     queryKey: ["orders", "quoteWithPromo", promoInput.items, promoCode],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
+      const identity = promoIdentity;
       try {
         return await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: promoCode ?? "" });
       } catch (err) {
         // A selection change made the code inapplicable: remove it for good (never re-applied silently, never
-        // sent on create) and say so; the plain quote is shown again.
-        if (safeError(err)?.reasonCode === "PROMO_NOT_APPLICABLE") {
+        // sent on create) and say so; the plain quote is shown again. Only for the quote still on screen.
+        if (!signal.aborted && identity === promoIdentityRef.current && safeError(err)?.reasonCode === "PROMO_NOT_APPLICABLE") {
           const notice = "The discount code does not apply to this selection and was removed.";
           setPromoCode(null);
           setPromoNotice(notice);

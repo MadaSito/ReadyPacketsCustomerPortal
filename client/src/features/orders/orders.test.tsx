@@ -336,8 +336,8 @@ describe("new order wizard", () => {
     handlers.set("orders.catalog.list", () => catalog);
     handlers.set("platform.bootstrap", () => ({ features: { promotions: true }, consent: { enabled: false, policyVersion: 1, renewMonths: 12 } }));
     handlers.set("orders.quoteWithPromo", (input) => {
-      const { items } = input as { items: { quantity: number }[] };
-      if (items[0]?.quantity !== 2) throw Object.assign(new Error("promo"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "PROMO_NOT_APPLICABLE", safeMessage: "This code cannot be applied.", requestId: "r1" } } });
+      const { items, promoCode } = input as { items: { quantity: number }[]; promoCode: string };
+      if (items[0]?.quantity !== 2 || promoCode !== "SAVE10") throw Object.assign(new Error("promo"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "PROMO_NOT_APPLICABLE", safeMessage: "This code cannot be applied.", requestId: "r1" } } });
       const base = fakeQuote(input);
       return { ...base, discountMinor: 100, discountLabel: "Synthetic promo", totalMinor: base.totalMinor - 100, promo: { label: "Synthetic promo", promoDiscountMinor: 100 } };
     });
@@ -356,13 +356,20 @@ describe("new order wizard", () => {
     await user.click(screen.getByRole("button", { name: "Back" }));
     await user.clear(screen.getByLabelText("Quantity of Synthetic A"));
     await user.type(screen.getByLabelText("Quantity of Synthetic A"), "3");
-    expect(await screen.findByText("The discount code does not apply to this selection and was removed.")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getAllByRole("status").some((region) => region.textContent === "The discount code does not apply to this selection and was removed.")).toBe(true),
+    );
     await user.clear(screen.getByLabelText("Quantity of Synthetic A"));
     await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
     // Not re-applied: the field offers entry again and create carries no code.
     expect(await screen.findByLabelText("Discount code")).toBeInTheDocument();
+    // A later field error replaces the notice in the shared status region.
+    await user.type(screen.getByLabelText("Discount code"), "WRONG1{Enter}");
+    await waitFor(() => expect(screen.getAllByRole("status").some((region) => region.textContent === "This code cannot be applied.")).toBe(true));
+    expect(screen.queryByText("The discount code does not apply to this selection and was removed.")).toBeNull();
+    expect(calls.filter((c) => c.path === "orders.create")).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Submit order" }));
     await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
     const create = calls.filter((c) => c.path === "orders.create");
