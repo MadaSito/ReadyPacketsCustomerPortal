@@ -95,14 +95,19 @@ describe("graph drive adapter (against the local Graph fake)", () => {
     expect(writes).toBe(4);
   });
 
-  it("re-running an identical put returns the existing item; a different object under the same name conflicts", async () => {
-    const { adapter } = setup();
+  it("re-running an identical put returns the existing item; a different object under the same name gets a suffix", async () => {
+    const { adapter, graph } = setup();
     const bytes = randomBytes(2048);
     const first = await adapter.put(putInput(bytes));
     const again = await adapter.put(putInput(bytes));
     expect(again.remoteId).toBe(first.remoteId);
-    await rejectsWith(adapter.put(putInput(randomBytes(2048))), "DESTINATION_CONFLICT");
-    await rejectsWith(adapter.put(putInput(randomBytes(10))), "DESTINATION_CONFLICT");
+    expect(first.targetPath).toEqual(["AvExample_CUST-1", "RP-1 Demo", "file.pdf"]);
+    expect(again.targetPath).toEqual(first.targetPath);
+    // Different content under the same name: never overwritten, stored as the next free variant.
+    const sameSize = await adapter.put(putInput(randomBytes(2048)));
+    const smaller = await adapter.put(putInput(randomBytes(10)));
+    expect([sameSize.targetPath, smaller.targetPath]).toEqual([["AvExample_CUST-1", "RP-1 Demo", "file (1).pdf"], ["AvExample_CUST-1", "RP-1 Demo", "file (2).pdf"]]);
+    expect(graph.findByPath(graph.libraryDrive, ["Portal", "Orders", "AvExample_CUST-1", "RP-1 Demo", "file.pdf"])?.content?.equals(bytes)).toBe(true);
   });
 
   it("uses a chunked upload session for large files without forwarding the bearer token", async () => {
@@ -205,7 +210,7 @@ describe("graph drive adapter (against the local Graph fake)", () => {
 
   it("refuses unsafe names and paths", async () => {
     const { adapter, graph } = setup();
-    for (const [path, name] of [[[".."], "x"], [["a/b"], "x"], [["ok"], "../x"], [["ok"], "a:b"], [["ok"], ""], [["ok"], "x\u202e"]] as const) {
+    for (const [path, name] of [[[".."], "x"], [["a/b"], "x"], [["a\\b"], "x"], [["ok"], "../x"], [["ok"], ""], [["ok"], " "], [["."], "x"], [["ok"], ".."]] as const) {
       await rejectsWith(adapter.put(putInput(Buffer.from("x"), name, [...path])), "INVALID_INPUT");
     }
     expect(graph.calls).toHaveLength(0);

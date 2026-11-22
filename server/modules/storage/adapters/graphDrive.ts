@@ -6,10 +6,13 @@
  * `write` grant on the one site (SharePoint), or `Files.ReadWrite.All` restricted by policy (OneDrive).
  *
  * put():
- *  - Folders are created one segment at a time with conflictBehavior "fail" (an existing folder is reused).
- *  - Files are never overwritten and never auto-renamed. If the name already exists with the same size and
- *    QuickXorHash the existing item is returned (idempotent re-run after a lost acknowledgement);
- *    otherwise DESTINATION_CONFLICT.
+ *  - Names are mapped to SharePoint/OneDrive-safe names (graphDriveNames.ts) and the full decoded path,
+ *    including the library path, is checked against the 400-character limit BEFORE any folder or write call.
+ *  - Folders are created one segment at a time with conflictBehavior "fail"; an existing folder (or one a
+ *    concurrent worker just created) is reused, keeping the drive's casing.
+ *  - Files are never overwritten. A same-name file with the same size and QuickXorHash is reused (idempotent
+ *    re-run after a lost acknowledgement); otherwise the next free "name (n).ext" is used. Large uploads
+ *    compare the hash before committing the final chunk. `targetPath` is the real final path.
  *  - ≤ SIMPLE_UPLOAD_MAX bytes: one PUT …:/content. Larger: an upload session; chunks are multiples of
  *    320 KiB; the session URL is checked against the tenant host lineage, receives no bearer token, is never
  *    logged, and is cancelled on failure.
@@ -25,18 +28,20 @@ import { QuickXorHash } from "./graphDriveQuickXor.js";
 import {
   checkUploadUrl,
   encodeDrivePath,
-  isValidSegment,
   parseSiteUrl,
   sharePointTenantOf,
   siteLookupPath,
   splitRootFolderPath,
 } from "./graphDriveUrls.js";
+import { MAX_DECODED_PATH, MAX_SUFFIX, conflictVariant, decodedLength, fitFileName, safeDriveName } from "./graphDriveNames.js";
 
 export const SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024;
 /** 32 × 320 KiB = 10 MiB (Graph requires multiples of 320 KiB). */
 export const UPLOAD_CHUNK = 32 * 320 * 1024;
 export const MAX_FILE_BYTES = 16 * 1024 * 1024 * 1024;
 const CHUNK_ATTEMPTS = 3;
+/** Caller path segments below the configured root (the folder resolver allows 8). */
+const MAX_PATH_SEGMENTS = 12;
 
 /* ------------------------------------------------------------------ config */
 
@@ -150,17 +155,22 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
     return expectOk(res, 200);
   };
 
-  /** Returns the item id of the folder at root + segments, creating missing folders. */
-  const ensureFolderId = async (segments: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<string> => {
+  /** Returns the folder item id at root + segments (creating missing folders) and the REAL segment names. */
+  const ensureFolderId = async (segments: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<{ id: string; names: string[] }> => {
     const full = [...root, ...segments];
     const rootItem = await itemByPath([], signal);
     let parentId = str(rootItem?.id);
     if (!parentId) throw new StorageAdapterError("DESTINATION_NOT_FOUND", false);
+    // Real names (drive casing wins: "Customers" is reused for "customers"), so later lookups and the
+    // recorded target path match what exists remotely.
+    const real: string[] = [];
     for (let i = 0; i < full.length; i++) {
-      const existing = await itemByPath(full.slice(0, i + 1), signal);
+      const lookup = [...real, full[i]!];
+      const existing = await itemByPath(lookup, signal);
+      let folder: Record<string, unknown>;
       if (existing) {
         if (!existing.folder) throw new StorageAdapterError("DESTINATION_CONFLICT", false);
-        parentId = str(existing.id);
+        folder = existing;
       } else {
         await beforeWrite?.();
         const res = await call({
@@ -171,31 +181,75 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
           ...(beforeWrite ? { beforeSend: beforeWrite } : {}),
         });
         if (res.status === 409) {
-          const raced = await itemByPath(full.slice(0, i + 1), signal);
-          if (!raced?.folder) throw new StorageAdapterError("DESTINATION_CONFLICT", false);
-          parentId = str(raced.id);
+          // A concurrent worker created it first: reuse it. Not visible yet → retry later, never duplicate.
+          const raced = await itemByPath(lookup, signal);
+          if (!raced) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
+          if (!raced.folder) throw new StorageAdapterError("DESTINATION_CONFLICT", false);
+          folder = raced;
         } else {
-          parentId = str(expectOk(res, 200, 201).id);
+          folder = expectOk(res, 200, 201);
         }
       }
+      parentId = str(folder.id);
       if (!parentId) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
+      const name = str(folder.name);
+      real.push(name && name.toLowerCase() === full[i]!.toLowerCase() ? name : full[i]!);
     }
-    return parentId;
+    return { id: parentId, names: real.slice(root.length) };
   };
 
-  const validateSegments = (path: readonly string[], name?: string) => {
-    if (path.length > 20 || !path.every(isValidSegment) || (name !== undefined && !isValidSegment(name))) {
+  /** Library server-relative path ("sites/Orders/Shared Documents"), counted in the 400-character limit. */
+  let driveInfo: { tenant: string | null; prefix: string } | null = null;
+  const describeDrive = async (signal?: AbortSignal) => {
+    if (driveInfo) return driveInfo;
+    const body = expectOk(await call({ method: "GET", path: drive, query: { $select: "id,webUrl" }, signal }), 200);
+    const url = (() => {
+      try {
+        return new URL(str(body.webUrl) ?? "");
+      } catch {
+        return null;
+      }
+    })();
+    const prefix = (() => {
+      if (!url) return "";
+      try {
+        return decodeURIComponent(url.pathname).replace(/^\/+|\/+$/gu, "");
+      } catch {
+        return url.pathname.replace(/^\/+|\/+$/gu, "");
+      }
+    })();
+    driveInfo = { tenant: url ? sharePointTenantOf(url.hostname) : null, prefix };
+    return driveInfo;
+  };
+
+  /**
+   * Validates the caller's segments and maps them to safe drive names, before any folder or write call.
+   * Traversal (`.`, `..`, `/`, `\\`) and empty segments are refused, never mapped; other provider rules are mapped.
+   */
+  const prepare = async (path: readonly string[], rawName: string | undefined, signal?: AbortSignal) => {
+    const bad = (v: unknown) => typeof v !== "string" || v.trim() === "" || v === "." || v === ".." || /[\\/]/u.test(v) || v.length > 1024;
+    if (path.length > MAX_PATH_SEGMENTS || path.some(bad) || (rawName !== undefined && bad(rawName))) {
       throw new StorageAdapterError("INVALID_INPUT", false);
     }
+    const folders = path.map((seg, i) => safeDriveName(seg, { file: false, topLevel: root.length === 0 && i === 0 }));
+    const { prefix } = await describeDrive(signal);
+    const prefixSegs = [...(prefix ? [prefix] : []), ...root, ...folders];
+    const folderLength = decodedLength(prefixSegs);
+    if (folderLength > MAX_DECODED_PATH) throw new StorageAdapterError("INVALID_INPUT", false);
+    if (rawName === undefined) return { folders, name: null };
+    const name = fitFileName(folderLength, safeDriveName(rawName, { file: true }), rawName);
+    if (!name) throw new StorageAdapterError("INVALID_INPUT", false);
+    return { folders, name };
   };
+
+  const hashOf = (it: Record<string, unknown>) => str(asRecord(asRecord(asRecord(it.file).hashes)).quickXorHash);
 
   const verify = async (item: Record<string, unknown>, size: number, quickXor: string, signal?: AbortSignal): Promise<StoragePutResult> => {
     let observed = item;
-    const hashOf = (it: Record<string, unknown>) => str(asRecord(asRecord(asRecord(it.file).hashes)).quickXorHash);
     const itemId = str(item.id);
     if (!itemId) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", false);
     if (typeof observed.size !== "number" || !hashOf(observed)) {
-      const res = await call({ method: "GET", path: `${drive}/items/${encodeURIComponent(itemId)}`, query: { $select: "id,size,file" }, signal });
+      const res = await call({ method: "GET", path: `${drive}/items/${encodeURIComponent(itemId)}`, query: { $select: "id,name,size,file" }, signal });
       observed = expectOk(res, 200);
     }
     if (str(observed.id) !== itemId || observed.size !== size || hashOf(observed) !== quickXor) {
@@ -204,35 +258,31 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
     return { remoteId: itemId, size: observed.size, verifiedTransportDigest: "quickxor" };
   };
 
-  const driveTenant = async (signal?: AbortSignal): Promise<string> => {
-    const res = await call({ method: "GET", path: drive, query: { $select: "id,webUrl" }, signal });
-    const body = expectOk(res, 200);
-    let host: string;
-    try {
-      host = new URL(str(body.webUrl) ?? "").hostname;
-    } catch {
-      host = "";
-    }
-    const tenant = sharePointTenantOf(host);
-    if (!tenant) throw new StorageAdapterError("DESTINATION_DENIED", false);
-    return tenant;
-  };
+  type LargeOutcome = { kind: "uploaded"; item: Record<string, unknown>; quickXor: string } | { kind: "conflict" } | { kind: "identical"; item: Record<string, unknown>; quickXor: string };
 
-  const uploadLarge = async (parentId: string, input: StoragePutInput): Promise<{ item: Record<string, unknown>; quickXor: string }> => {
-    const tenant = await driveTenant(input.signal);
+  /**
+   * Upload session into `parentId/name`. `identicalTo` is consulted with the full QuickXorHash BEFORE the
+   * final chunk is sent: a match cancels the session (nothing committed) and reuses that item.
+   */
+  const uploadLarge = async (parentId: string, name: string, input: StoragePutInput, identicalTo: (quickXor: string) => Record<string, unknown> | null): Promise<LargeOutcome> => {
+    const { tenant } = await describeDrive(input.signal);
+    if (!tenant) throw new StorageAdapterError("DESTINATION_DENIED", false);
     await input.beforeWrite?.();
     const res = await call({
       method: "POST",
-      path: `${drive}/items/${encodeURIComponent(parentId)}:/${encodeURIComponent(input.name)}:/createUploadSession`,
+      path: `${drive}/items/${encodeURIComponent(parentId)}:/${encodeURIComponent(name)}:/createUploadSession`,
       body: { item: { "@microsoft.graph.conflictBehavior": "fail" } },
       signal: input.signal,
       ...(input.beforeWrite ? { beforeSend: input.beforeWrite } : {}),
     });
+    if (res.status === 409) return { kind: "conflict" };
     const url = checkUploadUrl(expectOk(res, 200).uploadUrl, tenant);
     if (!url) throw new StorageAdapterError("DESTINATION_DENIED", false);
     const hash = new QuickXorHash();
     let offset = 0;
     let finalItem: Record<string, unknown> | null = null;
+    let identical: { item: Record<string, unknown>; quickXor: string } | null = null;
+    const stopIdentical = new Error("identical");
     // A lost fence must reach the job layer unchanged (never re-labelled as a retryable provider error).
     let fenceError: { error: unknown } | null = null;
     const fence = async () => {
@@ -250,6 +300,14 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
         async (chunk) => {
           hash.update(chunk);
           const end = offset + chunk.length - 1;
+          if (end === input.size - 1) {
+            const quickXor = hash.digestBase64();
+            const match = identicalTo(quickXor);
+            if (match) {
+              identical = { item: match, quickXor };
+              throw stopIdentical;
+            }
+          }
           for (let attempt = 1; ; attempt++) {
             let r: GraphResponse | null = null;
             await fence();
@@ -263,6 +321,8 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
               break;
             }
             if (r && r.status === 202) break;
+            // Name taken at commit by a concurrent writer: nothing of ours was committed; a retry picks the next name.
+            if (r && r.status === 409) throw new StorageAdapterError("DESTINATION_CONFLICT", true);
             if (r && !(r.status >= 500 || r.status === 429)) throw fromStatus(r.status);
             if (attempt >= CHUNK_ATTEMPTS) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
             // Resume only if the server still expects exactly this chunk.
@@ -281,13 +341,17 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
       // Best-effort cancel, but never after a lost write fence; a valid cancel is itself fenced.
       if (!fenceError) await graph.uploadSessionControl({ url, method: "DELETE", beforeSend: fence }).catch(() => undefined);
       if (fenceError) throw (fenceError as { error: unknown }).error;
+      if (error === stopIdentical && identical) return { kind: "identical", ...(identical as { item: Record<string, unknown>; quickXor: string }) };
       throw toAdapterError(error);
     }
     if (!finalItem) throw new StorageAdapterError("PROVIDER_UNAVAILABLE", true);
-    return { item: finalItem, quickXor: hash.digestBase64() };
+    return { kind: "uploaded", item: finalItem, quickXor: hash.digestBase64() };
   };
 
   return {
+    // put() validates names and the full path first, then creates its folders behind beforeWrite.
+    putCreatesFolders: true,
+
     async test(signal?: AbortSignal): Promise<StorageTestResult> {
       try {
         if (!creds || !config.driveId || splitRootFolderPath(config.rootFolderPath) === null) return { ok: false, code: "NOT_CONFIGURED" };
@@ -307,49 +371,79 @@ export function createGraphDriveAdapter(graph: GraphHttpPort, config: DriveConfi
     },
 
     async ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void> {
-      validateSegments(path);
-      await ensureFolderId(path, signal, beforeWrite);
+      const { folders } = await prepare(path, undefined, signal);
+      await ensureFolderId(folders, signal, beforeWrite);
     },
 
     async put(input: StoragePutInput): Promise<StoragePutResult> {
-      validateSegments(input.path, input.name);
       if (!Number.isSafeInteger(input.size) || input.size < 0) throw new StorageAdapterError("INVALID_INPUT", false);
       if (input.size > MAX_FILE_BYTES) throw new StorageAdapterError("TOO_LARGE", false);
-      const parentId = await ensureFolderId(input.path, input.signal, input.beforeWrite);
-      const existing = await itemByPath([...root, ...input.path, input.name], input.signal);
-      if (existing) {
-        // Idempotent re-run: only an identical object counts as "already copied". Hash the source to compare.
-        if (!existing.file || existing.size !== input.size) throw new StorageAdapterError("DESTINATION_CONFLICT", false);
-        const hash = new QuickXorHash();
-        await readExactly(input.body, input.size, async (c) => void hash.update(c), UPLOAD_CHUNK);
-        try {
-          return await verify(existing, input.size, hash.digestBase64(), input.signal);
-        } catch (error) {
-          if (error instanceof StorageAdapterError && error.code === "INTEGRITY_MISMATCH") throw new StorageAdapterError("DESTINATION_CONFLICT", false);
-          throw error;
-        }
-      }
+      const { folders, name } = await prepare(input.path, input.name, input.signal);
+      if (!name) throw new StorageAdapterError("INVALID_INPUT", false);
       // Simple PUT needs a raw-bytes request; transports without it use a (single-chunk) upload session.
       if (input.size === 0 && graph.supportsRawBody === false) throw new StorageAdapterError("INVALID_INPUT", false);
-      if (input.size <= SIMPLE_UPLOAD_MAX && graph.supportsRawBody !== false) {
+      const simple = input.size <= SIMPLE_UPLOAD_MAX && graph.supportsRawBody !== false;
+      const parent = await ensureFolderId(folders, input.signal, input.beforeWrite);
+      const folderPath = [...root, ...parent.names];
+
+      let bytes: Buffer | null = null;
+      let quickXor: string | null = null;
+      if (simple) {
         const parts: Buffer[] = [];
         await readExactly(input.body, input.size, async (c) => void parts.push(Buffer.from(c)), SIMPLE_UPLOAD_MAX + 1);
-        const bytes = Buffer.concat(parts);
-        const quickXor = new QuickXorHash().update(bytes).digestBase64();
-        await input.beforeWrite?.();
-        const res = await call({
-          method: "PUT",
-          path: `${drive}/items/${encodeURIComponent(parentId)}:/${encodeURIComponent(input.name)}:/content`,
-          query: { "@microsoft.graph.conflictBehavior": "fail" },
-          rawBody: bytes,
-          headers: { "content-type": "application/octet-stream" },
-          signal: input.signal,
-          ...(input.beforeWrite ? { beforeSend: input.beforeWrite } : {}),
-        });
-        return verify(expectOk(res, 200, 201), input.size, quickXor, input.signal);
+        bytes = Buffer.concat(parts);
+        quickXor = new QuickXorHash().update(bytes).digestBase64();
       }
-      const { item, quickXor } = await uploadLarge(parentId, input);
-      return verify(item, input.size, quickXor, input.signal);
+
+      // Same-name files are never overwritten: an identical file (size + QuickXorHash) is reused, otherwise
+      // the next free "name (n).ext" is used. Every create uses conflictBehavior "fail", so concurrent
+      // writers can never replace each other; a lost race moves on to the next variant.
+      const sameSize: Record<string, unknown>[] = [];
+      const identicalTo = (hash: string) => sameSize.find((item) => hashOf(item) === hash) ?? null;
+      const done = async (item: Record<string, unknown>, hash: string, candidate: string) => {
+        const result = await verify(item, input.size, hash, input.signal);
+        // The real final path below the configured root: drive casing for folders, the committed file name.
+        return { ...result, targetPath: [...parent.names, str(item.name) ?? candidate] };
+      };
+      for (let n = 0; n <= MAX_SUFFIX; n++) {
+        const candidate = conflictVariant(name, n);
+        const existing = await itemByPath([...folderPath, candidate], input.signal);
+        if (existing) {
+          if (existing.file && existing.size === input.size) sameSize.push(existing);
+          continue;
+        }
+        if (simple && bytes && quickXor) {
+          const match = identicalTo(quickXor);
+          if (match) return done(match, quickXor, candidate);
+          await input.beforeWrite?.();
+          const res = await call({
+            method: "PUT",
+            path: `${drive}/items/${encodeURIComponent(parent.id)}:/${encodeURIComponent(candidate)}:/content`,
+            query: { "@microsoft.graph.conflictBehavior": "fail" },
+            rawBody: bytes,
+            headers: { "content-type": "application/octet-stream" },
+            signal: input.signal,
+            ...(input.beforeWrite ? { beforeSend: input.beforeWrite } : {}),
+          });
+          if (res.status === 409) {
+            const raced = await itemByPath([...folderPath, candidate], input.signal);
+            if (raced?.file && raced.size === input.size) sameSize.push(raced);
+            const again = identicalTo(quickXor);
+            if (again) return done(again, quickXor, candidate);
+            continue;
+          }
+          return done(expectOk(res, 200, 201), quickXor, candidate);
+        }
+        const outcome = await uploadLarge(parent.id, candidate, input, identicalTo);
+        if (outcome.kind === "conflict") {
+          const raced = await itemByPath([...folderPath, candidate], input.signal);
+          if (raced?.file && raced.size === input.size) sameSize.push(raced);
+          continue;
+        }
+        if (outcome.kind === "identical") return done(outcome.item, outcome.quickXor, candidate);
+        return done(outcome.item, outcome.quickXor, candidate);
+      }
+      throw new StorageAdapterError("DESTINATION_CONFLICT", false);
     },
 
     async remove(remoteId: string, signal?: AbortSignal): Promise<void> {
