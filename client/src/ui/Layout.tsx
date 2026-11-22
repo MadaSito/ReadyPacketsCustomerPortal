@@ -24,7 +24,7 @@ export function Card({ title, description, actions, footer, headingLevel = 2, fl
             {title ? <H className="text-base font-semibold text-ink">{title}</H> : null}
             {description ? <p className="mt-0.5 text-sm text-muted">{description}</p> : null}
           </div>
-          {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
+          {actions ? <div className="flex max-w-full shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
         </div>
       ) : null}
       <div className={cn(!flush && "p-4 sm:p-5")}>{children}</div>
@@ -58,7 +58,7 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta, cla
           </div>
           {description ? <p className="mt-1 max-w-[70ch] text-[0.9375rem] text-body">{description}</p> : null}
         </div>
-        {actions ? <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
+        {actions ? <div className="flex max-w-full shrink-0 flex-wrap items-center gap-2">{actions}</div> : null}
       </div>
     </header>
   );
