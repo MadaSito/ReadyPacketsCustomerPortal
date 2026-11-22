@@ -3,15 +3,15 @@
  * Owner: orders_engineer. The server decides visibility (customer view never contains internal notes).
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Suspense, useState, type FormEvent } from "react";
-import { useLocation, useParams } from "wouter";
+import { Suspense, useState, type FormEvent, type ReactNode } from "react";
+import { useParams } from "wouter";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { FEATURES, ORDER_TABS } from "@/app/registry";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
-  Skeleton, Spinner, Tabs, Textarea, formatDateTime, useToast, type Tone,
+  RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
@@ -25,7 +25,6 @@ const ORDER_BANNERS = FEATURES.flatMap((feature) => feature.orderBanners ?? []).
 
 export function OrderDetailView({ area }: { area: Area }) {
   const { orderId = "", tab } = useParams<{ orderId: string; tab?: string }>();
-  const [, navigate] = useLocation();
   const trpc = useTRPC();
   const consoleArea = area === "console";
   const base = consoleArea ? "/admin/orders" : "/orders";
@@ -103,12 +102,20 @@ export function OrderDetailView({ area }: { area: Area }) {
           </Suspense>
         );
       })}
-      <Tabs
+      <RouteTabs
+        idBase="order-tabs"
         label="Order sections"
         value={active}
-        onValueChange={(value) => navigate(value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${value}`, { replace: true })}
-        items={tabs}
+        items={tabs.map((item) => ({
+          value: item.value,
+          label: item.label,
+          href: item.value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${item.value}`,
+          labelContent: item.labelContent,
+        }))}
       />
+      <RouteTabPanel idBase="order-tabs" value={active} className="mt-4">
+        {tabs.find((item) => item.value === active)?.content}
+      </RouteTabPanel>
     </>
   );
 }
@@ -139,10 +146,18 @@ const PAYMENT_TONES: Record<PaymentState, Tone> = {
  */
 export const BUILT_IN_TAB_ORDER = { overview: 0, phases: 10, notes: 105, sharing: 110 } as const;
 
-function orderTabItems(order: OrderDetail, area: Area) {
+interface TabEntry {
+  order: number;
+  value: string;
+  label: string;
+  labelContent?: ReactNode;
+  content: ReactNode;
+}
+
+function orderTabItems(order: OrderDetail, area: Area): TabEntry[] {
   const consoleArea = area === "console";
   const lockState = order.lockState as LockState;
-  const builtIn = [
+  const builtIn: TabEntry[] = [
     { order: BUILT_IN_TAB_ORDER.overview, value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
     ...(consoleArea
       ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <WorkflowRulesPanel orderId={order.publicId} area={area} /> }]
@@ -155,21 +170,33 @@ function orderTabItems(order: OrderDetail, area: Area) {
       content: <SharingPanel orderId={order.publicId} canShare={order.canShare} locked={lockState !== "none"} />,
     },
   ];
-  const contributed = ORDER_TABS.filter((t) => t.access === "customer" || consoleArea).map((t) => {
+  const contributed: TabEntry[] = ORDER_TABS.filter((t) => t.access === "customer" || consoleArea).map((t) => {
     const Component = t.component;
     const Badge = t.badge;
     const Label = t.labelComponent;
+    // RouteTabs: the strip shows `labelContent` (live label + optional badge); the narrow-screen select keeps `label`.
+    const labelContent =
+      Label || Badge ? (
+        <span className="inline-flex items-center gap-1.5">
+          {Label ? (
+            <Suspense fallback={t.label}>
+              <Label orderId={order.publicId} area={area} />
+            </Suspense>
+          ) : (
+            t.label
+          )}
+          {Badge ? (
+            <Suspense fallback={null}>
+              <Badge orderId={order.publicId} area={area} />
+            </Suspense>
+          ) : null}
+        </span>
+      ) : undefined;
     return {
       order: t.order,
       value: t.key,
-      label: Label ? (
-        <Suspense fallback={t.label}>
-          <Label orderId={order.publicId} area={area} />
-        </Suspense>
-      ) : (
-        t.label
-      ),
-      badge: Badge ? <Badge orderId={order.publicId} area={area} /> : undefined,
+      label: t.label,
+      labelContent,
       content: (
         <Suspense fallback={<Spinner label={`Loading ${t.label}`} />}>
           <Component orderId={order.publicId} area={area} />

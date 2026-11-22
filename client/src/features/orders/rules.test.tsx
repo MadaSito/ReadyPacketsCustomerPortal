@@ -47,7 +47,7 @@ function proxy(path: string[]): unknown {
 vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
 vi.mock("@/lib/features", async (original) => ({ ...(await original<typeof featuresModule>()), useFeatureEnabled: (flag: string) => flags.has(flag) }));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
-vi.mock("@/app/registry", () => ({ ORDER_TABS: [] }));
+vi.mock("@/app/registry", () => ({ ORDER_TABS: [], FEATURES: [] }));
 
 const ORDER_ID = "01JTESTORDER0000000000000A";
 const CUSTOMER_ID = "01JTESTUSER00000000000000B";
@@ -129,6 +129,14 @@ describe("order page rules", () => {
     await expectNoAxeViolations(container);
   });
 
+  it("a slot hint ending in punctuation is not doubled when joined (no \"..\")", async () => {
+    const base = rules();
+    handlers.set("orders.requirements.forOrder", () => rules({ uploads: [{ ...base.uploads[0]!, hint: "Upload the signed files." }] }));
+    renderCustomerOrder();
+    const text = await screen.findByText(/^Upload the signed files\. /);
+    expect(text.textContent).not.toContain("..");
+  });
+
   it("renders nothing for a workflow without phases or requirements", async () => {
     handlers.set("orders.requirements.forOrder", () => rules({ phases: [], uploads: [], acknowledgements: [], unmet: 0 }));
     renderCustomerOrder();
@@ -185,11 +193,12 @@ describe("order page rules", () => {
     );
     handlers.set("orders.phases.unlock", () => ({ ok: true }));
     const user = userEvent.setup();
+    // Part B: in the console the rules panel lives on the Phases tab.
     renderUi(
-      <Route path="/admin/orders/:orderId">
+      <Route path="/admin/orders/:orderId/:tab">
         <AdminOrderDetailPage />
       </Route>,
-      { path: `/admin/orders/${ORDER_ID}` },
+      { path: `/admin/orders/${ORDER_ID}/phases` },
     );
     expect(await screen.findByText("Locked")).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "Unlock a phase" }));

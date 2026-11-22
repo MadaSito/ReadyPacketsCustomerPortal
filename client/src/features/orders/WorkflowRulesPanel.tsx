@@ -29,8 +29,9 @@ export function WorkflowRulesPanel({ orderId, area }: { orderId: string; area: "
     ...data.uploads.map((slot) => ({
       key: `upload:${slot.key}`,
       label: slot.label,
+      // Parts are joined with ". ", so a hint's own closing punctuation is dropped (no "files.. 0 files").
       description: [
-        slot.hint,
+        slot.hint ? slot.hint.trim().replace(/[.!?]+$/, "") : null,
         uploadSummary(slot),
         slot.allowedTypes.length ? `Accepted: ${slot.allowedTypes.map((type) => type.toUpperCase()).join(", ")}` : null,
       ]
