@@ -12,7 +12,7 @@ import type { AuditEmitter, Clock, Db, DbOrTx, FieldCrypto, Logger, Mailer, Sess
 import type { Services } from "../../container.js";
 import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
-import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderReferences, orders, orderStatusHistory } from "./schema.js";
+import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { compliancePort, engagementPort, filesPort, identityPort } from "./ports.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
@@ -73,6 +73,16 @@ export function decodeCursor(cursor: string | undefined | null): number | null {
   const match = /^o:(\d{1,15})$/.exec(raw);
   if (!match) throw validation("INVALID_CURSOR", "The list position is not valid. Reload the list.");
   return Number(match[1]);
+}
+
+function encodeNameCursor(at: Date, id: number): string {
+  return Buffer.from(`n:${at.getTime()}:${id}`, "utf8").toString("base64url");
+}
+function decodeNameCursor(cursor: string | undefined | null): { at: Date; id: number } | null {
+  if (!cursor) return null;
+  const match = /^n:(\d{1,15}):(\d{1,15})$/.exec(Buffer.from(cursor, "base64url").toString("utf8"));
+  if (!match) throw validation("INVALID_CURSOR", "The list position is not valid. Reload the list.");
+  return { at: new Date(Number(match[1])), id: Number(match[2]) };
 }
 
 /** Escapes LIKE wildcards so user input is always a literal prefix/substring. */
@@ -702,7 +712,7 @@ export function createOrderService(deps: OrderServiceDeps) {
 
     /**
      * Part B (B2): console rename. Capability orders.rename (router + in-tx re-check), optimistic version,
-     * reference untouched, audit `order.renamed` with old and new name, change event for the SharePoint row.
+     * reference untouched, audit `order.renamed` (renamed flag + old/new length; names are not copied into audit), change event for the SharePoint row.
      */
     async rename(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; name: string }) {
       const name = normalizeOrderName(input.name);
@@ -719,6 +729,14 @@ export function createOrderService(deps: OrderServiceDeps) {
           .set({ projectName: name, version: view.version + 1, updatedAt: deps.clock.now() })
           .where(and(eq(orders.id, view.id), eq(orders.version, view.version)));
         if (affectedRows(result) !== 1) throw staleVersion();
+        await tx.insert(orderNameHistory).values({
+          orderId: view.id,
+          oldName,
+          newName: name,
+          actorUserId: principal.userId,
+          actorRole: principal.role,
+          createdAt: deps.clock.now(),
+        });
         await deps.audit.record(
           {
             category: "business",
@@ -727,7 +745,9 @@ export function createOrderService(deps: OrderServiceDeps) {
             outcome: "completed",
             actor: actorOf(principal),
             resource: { type: "order", publicId: view.publicId },
-            attributes: { old_name: oldName, new_name: name },
+            // The audit envelope drops `*name*` keys as personal data, so the event records that the
+            // name changed and the lengths only; the current name lives on the order row (data minimising).
+            attributes: { order_public_id: view.publicId, renamed: true, old_length: oldName.length, new_length: name.length },
           },
           tx,
         );
@@ -779,6 +799,48 @@ export function createOrderService(deps: OrderServiceDeps) {
           };
         }),
         nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null,
+      };
+    },
+
+    /**
+     * Part B (B2 port for the Order history tab, trusted — caller ran assertCanReadOrder): renames newest first,
+     * ordered by (created_at DESC, id DESC) with a keyset cursor on the same pair (stable across timestamp ties,
+     * index order_name_history_order_idx). `customerView` returns a generic entry only: no old/new name (an
+     * earlier name may be a former owner's text after reassignment) and no actor id.
+     */
+    async listNameHistory(orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean; tx?: DbOrTx }) {
+      const db = opts.tx ?? deps.db;
+      const limit = Math.min(Math.max(Math.trunc(opts.limit) || 1, 1), MAX_PAGE);
+      const before = decodeNameCursor(opts.cursor);
+      const scope = eq(orderNameHistory.orderId, orderId);
+      const rows = await db
+        .select()
+        .from(orderNameHistory)
+        .where(
+          before === null
+            ? scope
+            : and(
+                scope,
+                or(
+                  lt(orderNameHistory.createdAt, before.at),
+                  and(eq(orderNameHistory.createdAt, before.at), lt(orderNameHistory.id, before.id)),
+                ),
+              ),
+        )
+        .orderBy(desc(orderNameHistory.createdAt), desc(orderNameHistory.id))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const roleOf = (role: string): "customer" | "staff" | "admin" | "system" => (role === "admin" || role === "staff" || role === "system" ? role : "customer");
+      const last = page[page.length - 1];
+      return {
+        items: page.map((entry) => ({
+          at: entry.createdAt,
+          oldName: opts.customerView ? null : entry.oldName,
+          newName: opts.customerView ? null : entry.newName,
+          actorUserId: opts.customerView ? null : entry.actorUserId,
+          actorRole: roleOf(entry.actorRole),
+        })),
+        nextCursor: rows.length > limit && last ? encodeNameCursor(last.createdAt, last.id) : null,
       };
     },
 

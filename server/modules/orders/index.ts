@@ -95,6 +95,8 @@ export interface OrdersModule extends ModuleLifecycle {
   getOrderFileFolderRouting(input: { orderPublicId: string; statusKey: string; slotKey: string | null }, tx: Tx): Promise<OrderFileFolderRouting | null>;
   /** Part B (S2, trusted — caller authorised first): status transitions newest first. */
   listStatusTransitions: OrderService["listStatusTransitions"];
+  /** Part B (B2): renames for the Order history tab (trusted; caller authorizes; customerView hides staff ids). */
+  listNameHistory: OrderService["listNameHistory"];
   /** Part B (B1): compliance registers the console payment badge source at init. */
   registerPaymentSummaryProvider(provider: OrderPaymentSummaryProvider): void;
 
@@ -163,6 +165,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     gates,
     getOrderFileFolderRouting,
     listStatusTransitions: orders.listStatusTransitions,
+    listNameHistory: orders.listNameHistory,
     registerPaymentSummaryProvider(provider) {
       if (typeof provider !== "function") throw new Error("invalid payment summary provider");
       paymentProvider = provider;
