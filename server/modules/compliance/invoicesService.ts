@@ -1593,6 +1593,15 @@ export function createInvoicesService(deps: ModuleDeps) {
     );
   }
 
+  function containsRefundPanDigits(value: string): boolean {
+    const matches = value.match(/\d[\d -]{11,22}\d/gu);
+    if (!matches) return false;
+    return matches.some((m) => {
+      const digits = m.replace(/\D/gu, "");
+      return digits.length >= 13 && digits.length <= 19;
+    });
+  }
+
   async function adminRecordRefund(
     principal: SessionPrincipal,
     input: {
@@ -1604,6 +1613,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       reference: string;
       notes?: string | undefined;
       refundedAt?: Date | undefined;
+      confirmationPhrase: string;
       idempotencyKey: string;
     },
   ): Promise<{
@@ -1618,12 +1628,22 @@ export function createInvoicesService(deps: ModuleDeps) {
     if (!input.idempotencyKey || input.idempotencyKey.trim().length < 8) {
       throw validation("INVALID_IDEMPOTENCY_KEY", "An idempotency key of at least 8 characters is required.");
     }
+    if (input.confirmationPhrase.trim() !== "REFUND ORDER") {
+      throw validation("INVALID_REFUND_CONFIRMATION", "Type REFUND ORDER to confirm.");
+    }
+    if (
+      containsRefundPanDigits(input.reference) ||
+      (input.notes !== undefined && containsRefundPanDigits(input.notes))
+    ) {
+      throw validation("CARD_DATA_FORBIDDEN", "Card numbers must never be entered in refund references or notes.");
+    }
 
     const REFUND_REFUSAL_REASONS = new Set([
       "IMPORTED_INVOICE_READ_ONLY",
       "PAYMENT_NOT_FOUND",
       "CURRENCY_MISMATCH",
       "REFUND_EXCEEDS_PAYMENT",
+      "PROVIDER_PAYMENT_USE_ORDER_REFUNDS",
       "ORDER_LOCKED",
     ]);
 
@@ -1632,7 +1652,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       principal,
       { type: "invoice", publicId: input.invoicePublicId },
       async (tx) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.refund");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
       const [inv] = await tx
@@ -1697,6 +1717,12 @@ export function createInvoicesService(deps: ModuleDeps) {
       if (!pmt || pmt.status !== "succeeded") {
         throw notFound("PAYMENT_NOT_FOUND");
       }
+      if (pmt.method === "provider_online" || pmt.provider !== null) {
+        throw conflict(
+          "PROVIDER_PAYMENT_USE_ORDER_REFUNDS",
+          "Online provider payments must be refunded from the order Refunds workspace so provider state and reservations stay synchronized.",
+        );
+      }
       if (currency !== inv.currency) {
         throw validation("CURRENCY_MISMATCH", `Refund currency (${currency}) must match invoice currency (${inv.currency}).`);
       }
@@ -1711,7 +1737,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         throw validation(
           "REFUND_EXCEEDS_PAYMENT",
           "Refund amount exceeds the remaining refundable amount on that payment.",
-          { maxRefundableMinor: pmt.amountMinor - alreadyRefunded },
+          { maxRefundableMinor: Math.max(0, pmt.amountMinor - alreadyRefunded) },
         );
       }
 

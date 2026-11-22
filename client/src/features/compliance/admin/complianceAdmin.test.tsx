@@ -431,14 +431,23 @@ describe("invoices", () => {
     await user.type(within(dialog).getByLabelText(/^Amount/), "60");
     await user.selectOptions(within(dialog).getByLabelText(/^Reason/), "OVERPAYMENT");
     await user.type(within(dialog).getByLabelText(/^Reference/), "RF-1");
-    await user.type(within(dialog).getByLabelText(/to confirm/), "INV-2026-0001");
+    await user.type(within(dialog).getByLabelText(/to confirm/), "REFUND ORDER");
     await user.click(within(dialog).getByRole("button", { name: "Record refund" }));
     expect(await within(dialog).findByText(/from 0.01 to 50.00/)).toBeInTheDocument();
     expect(callsTo("compliance.invoices.admin.recordRefund")).toHaveLength(0);
     await user.clear(within(dialog).getByLabelText(/^Amount/));
     await user.type(within(dialog).getByLabelText(/^Amount/), "20");
     await user.click(within(dialog).getByRole("button", { name: "Record refund" }));
-    await waitFor(() => expect(callsTo("compliance.invoices.admin.recordRefund")[0]?.input).toMatchObject({ paymentPublicId: PAY, amountMinor: 2000, reasonCode: "OVERPAYMENT", reference: "RF-1", currency: "USD" }));
+    await waitFor(() =>
+      expect(callsTo("compliance.invoices.admin.recordRefund")[0]?.input).toMatchObject({
+        paymentPublicId: PAY,
+        amountMinor: 2000,
+        reasonCode: "OVERPAYMENT",
+        reference: "RF-1",
+        currency: "USD",
+        confirmationPhrase: "REFUND ORDER",
+      }),
+    );
     expect((callsTo("compliance.invoices.admin.recordRefund")[0]?.input as { idempotencyKey: string }).idempotencyKey.length).toBeGreaterThanOrEqual(8);
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 

@@ -34,6 +34,7 @@ const policiesManageProc = protectedProcedure.use(requireCapability("policies.ma
 const intakeManageProc = protectedProcedure.use(requireCapability("intake.manage"));
 const intakeReviewProc = staffProcedure.use(requireCapability("intake.review"));
 const invoicesManageProc = staffProcedure.use(requireCapability("invoices.manage"));
+const paymentsRefundProc = staffProcedure.use(requireCapability("payments.refund"));
 
 export const complianceRouter = router({
   /** Order policy acceptance gateway (package V). */
@@ -349,7 +350,7 @@ export const complianceRouter = router({
           return ctx.services.compliance.invoices.admin.recordManualPayment(ctx.session, input);
         }),
 
-      recordRefund: invoicesManageProc
+      recordRefund: paymentsRefundProc
         .meta({ rateLimit: "form_submission" })
         .input(recordRefundSchema)
         .mutation(async ({ ctx, input }) => {

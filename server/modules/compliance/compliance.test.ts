@@ -871,27 +871,57 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
       }),
     ).rejects.toMatchObject({ reasonCode: "INVOICE_HAS_UNREFUNDED_PAYMENTS" });
 
-    // Refund exceeding payment amount is refused!
+    // Staff (who holds `invoices.manage` with step-up, not `payments.refund`) cannot record refunds
     await expect(
       compliance.invoices.admin.recordRefund(staffPrincipal, {
+        invoicePublicId: draftInv.invoicePublicId,
+        paymentPublicId: pmt1.paymentPublicId,
+        amountMinor: 10_000,
+        currency: "USD",
+        reasonCode: "SCOPE_REDUCTION",
+        reference: "RFD-STAFF-DENY",
+        confirmationPhrase: "REFUND ORDER",
+        idempotencyKey: "idem-rfd-staff-deny",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    // Admin without exact `REFUND ORDER` phrase is refused
+    await expect(
+      compliance.invoices.admin.recordRefund(adminPrincipal, {
+        invoicePublicId: draftInv.invoicePublicId,
+        paymentPublicId: pmt1.paymentPublicId,
+        amountMinor: 10_000,
+        currency: "USD",
+        reasonCode: "SCOPE_REDUCTION",
+        reference: "RFD-WRONG-PHRASE",
+        confirmationPhrase: "RP-INV-2026-000001",
+        idempotencyKey: "idem-rfd-wrong-phrase",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "INVALID_REFUND_CONFIRMATION" });
+
+    // Refund exceeding payment amount is refused!
+    await expect(
+      compliance.invoices.admin.recordRefund(adminPrincipal, {
         invoicePublicId: draftInv.invoicePublicId,
         paymentPublicId: pmt1.paymentPublicId,
         amountMinor: 105_001,
         currency: "USD",
         reasonCode: "OVER_REFUND",
         reference: "RFD-BAD",
+        confirmationPhrase: "REFUND ORDER",
         idempotencyKey: "idem-rfd-bad",
       }),
     ).rejects.toMatchObject({ reasonCode: "REFUND_EXCEEDS_PAYMENT" });
 
     // Partial refund of 50_000 re-derives invoice status back to `issued` with balanceDue = 50_000!
-    const rfd1 = await compliance.invoices.admin.recordRefund(staffPrincipal, {
+    const rfd1 = await compliance.invoices.admin.recordRefund(adminPrincipal, {
       invoicePublicId: draftInv.invoicePublicId,
       paymentPublicId: pmt1.paymentPublicId,
       amountMinor: 50_000,
       currency: "USD",
       reasonCode: "SCOPE_REDUCTION",
       reference: "RFD-5001",
+      confirmationPhrase: "REFUND ORDER",
       idempotencyKey: "idem-rfd-5001",
     });
     expect(rfd1.invoiceStatus).toBe("issued");
@@ -1604,8 +1634,9 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
       paymentPublicId: pmt.paymentPublicId,
       amountMinor: 3_500,
       currency: "USD",
-      reasonCode: "customer_request",
+      reasonCode: "CUSTOMER_REQUEST",
       reference: "RFD-601-PART",
+      confirmationPhrase: "REFUND ORDER",
       idempotencyKey: "idem-601-rfd-1",
     });
     const s3 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);
@@ -1620,8 +1651,9 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
       paymentPublicId: pmt.paymentPublicId,
       amountMinor: 6_500,
       currency: "USD",
-      reasonCode: "customer_request",
+      reasonCode: "CUSTOMER_REQUEST",
       reference: "RFD-601-FULL",
+      confirmationPhrase: "REFUND ORDER",
       idempotencyKey: "idem-601-rfd-2",
     });
     const s4 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);

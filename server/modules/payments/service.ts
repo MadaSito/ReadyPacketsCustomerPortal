@@ -2498,25 +2498,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       if (byRef) return byRef;
     }
 
-    if (verified.providerPaymentRef) {
-      const candidates = await tx
-        .select()
-        .from(paymentRefunds)
-        .where(
-          and(
-            eq(paymentRefunds.provider, provider),
-            eq(paymentRefunds.environment, environment),
-            eq(paymentRefunds.providerPaymentRef, verified.providerPaymentRef),
-          ),
-        )
-        .orderBy(desc(paymentRefunds.id))
-        .limit(5);
-      const nonTerminal = candidates.filter((c) => c.status === "pending" || c.status === "unknown");
-      if (nonTerminal.length === 1) {
-        return nonTerminal[0] ?? null;
-      }
-    }
-
     return null;
   }
 
@@ -2619,6 +2600,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  const DETERMINISTIC_REFUND_MISMATCH_CODES = new Set([
+    "STRIPE_REFUND_METADATA_MISMATCH",
+    "STRIPE_REFUND_PAYMENT_MISMATCH",
+    "STRIPE_REFUND_CHARGE_MISMATCH",
+    "STRIPE_REFUND_AMOUNT_OR_CURRENCY_MISMATCH",
+    "STRIPE_REFUND_ID_MISMATCH",
+    "STRIPE_INVALID_PAYMENT_REF",
+    "SQUARE_REFUND_LOOKUP_MISMATCH",
+    "SQUARE_REFUND_LOOKUP_INVALID",
+  ]);
+
   async function verifyAndApplyRefundWebhook(args: {
     provider: ActivePaymentProvider;
     credentials: ProviderCredentials;
@@ -2629,6 +2621,29 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     duplicate: boolean;
     now: Date;
   }): Promise<PaymentWebhookResult> {
+    if (
+      args.refundRow.providerRefundRef &&
+      args.providerRefundRefHint &&
+      args.refundRow.providerRefundRef !== args.providerRefundRefHint
+    ) {
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          status: "verification_mismatch",
+          reasonCode: "REFUND_PROVIDER_REF_CONFLICT",
+          processedAt: args.now,
+        })
+        .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+      return {
+        httpStatus: 200,
+        accepted: false,
+        duplicate: args.duplicate,
+        booked: false,
+        reasonCode: "REFUND_PROVIDER_REF_CONFLICT",
+      };
+    }
+
+    const expectedDirectRef = args.refundRow.providerRefundRef ?? args.providerRefundRefHint;
     const refundAdapter = refundAdapters[args.provider];
     const lookup = await refundAdapter.lookupRefund({
       credentials: args.credentials,
@@ -2636,10 +2651,33 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       providerIdempotencyKey: args.refundRow.providerIdempotencyKey,
       refundMarker: `ReadyPackets refund ${args.refundRow.publicId}`,
       providerPaymentRef: args.refundRow.providerPaymentRef,
-      providerRefundRef: args.providerRefundRefHint ?? args.refundRow.providerRefundRef,
+      providerRefundRef: expectedDirectRef,
       amountMinor: args.refundRow.amountMinor,
       currency: args.refundRow.currency,
     });
+
+    if (
+      lookup.status === "unknown" &&
+      lookup.failureReasonCode &&
+      DETERMINISTIC_REFUND_MISMATCH_CODES.has(lookup.failureReasonCode)
+    ) {
+      const code = lookup.failureReasonCode.slice(0, 64);
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          status: "verification_mismatch",
+          reasonCode: code,
+          processedAt: args.now,
+        })
+        .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+      return {
+        httpStatus: 200,
+        accepted: false,
+        duplicate: args.duplicate,
+        booked: false,
+        reasonCode: code,
+      };
+    }
 
     if (lookup.status === "unknown" || lookup.status === "absent") {
       await deps.db
@@ -2655,6 +2693,24 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         duplicate: args.duplicate,
         booked: false,
         reasonCode: lookup.failureReasonCode ?? "REFUND_VERIFICATION_UNCONFIRMED",
+      };
+    }
+
+    if (!lookup.providerRefundRef || (expectedDirectRef && lookup.providerRefundRef !== expectedDirectRef)) {
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          status: "verification_mismatch",
+          reasonCode: "REFUND_ID_VERIFICATION_MISMATCH",
+          processedAt: args.now,
+        })
+        .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+      return {
+        httpStatus: 200,
+        accepted: false,
+        duplicate: args.duplicate,
+        booked: false,
+        reasonCode: "REFUND_ID_VERIFICATION_MISMATCH",
       };
     }
 
@@ -2679,8 +2735,25 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         };
       }
 
-      const resolvedProviderRef =
-        lookup.providerRefundRef ?? args.providerRefundRefHint ?? locked.providerRefundRef;
+      if (locked.providerRefundRef && locked.providerRefundRef !== lookup.providerRefundRef) {
+        await tx
+          .update(paymentWebhookEvents)
+          .set({
+            status: "verification_mismatch",
+            reasonCode: "REFUND_PROVIDER_REF_CONFLICT",
+            processedAt: args.now,
+          })
+          .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+        return {
+          httpStatus: 200 as const,
+          accepted: false,
+          duplicate: args.duplicate,
+          booked: false,
+          reasonCode: "REFUND_PROVIDER_REF_CONFLICT",
+        };
+      }
+
+      const resolvedProviderRef = lookup.providerRefundRef;
 
       if (lookup.status === "succeeded" && resolvedProviderRef) {
         if (locked.status !== "succeeded") {
@@ -3653,13 +3726,20 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       const now = deps.clock.now();
+      if (
+        locked.providerRefundRef &&
+        lookup.providerRefundRef &&
+        locked.providerRefundRef !== lookup.providerRefundRef
+      ) {
+        return "pending";
+      }
       const resolvedRef = lookup.providerRefundRef ?? locked.providerRefundRef;
 
-      if (lookup.status === "succeeded" && resolvedRef) {
+      if (lookup.status === "succeeded" && lookup.providerRefundRef) {
         await settleProviderRefundSucceededInTx(
           tx,
           locked,
-          resolvedRef,
+          lookup.providerRefundRef,
           lookup.settledAt ?? now,
           null,
         );

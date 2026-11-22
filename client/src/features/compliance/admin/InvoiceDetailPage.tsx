@@ -3,6 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { useState } from "react";
 import { Link, useParams } from "wouter";
+import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Badge, Breadcrumbs, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Field, Input, KeyValueList, Money, PageHeader, Select, Textarea, useToast } from "@/ui";
 import { InvoiceStatusBadge, downloadInvoicePdf, newIdempotencyKey, parseDecimalToMinor } from "../shared";
@@ -19,6 +20,7 @@ export function refundableMinor(invoice: InvoiceDetail, payment: InvoicePayment)
 
 export default function InvoiceDetailPage() {
   const { invoiceId = "" } = useParams<{ invoiceId: string }>();
+  const session = useSession();
   const trpc = useTRPC();
   const toast = useToast();
   const valid = ULID.test(invoiceId);
@@ -26,6 +28,7 @@ export default function InvoiceDetailPage() {
   const [action, setAction] = useState<Action>(null);
   const [downloading, setDownloading] = useState(false);
   const inv = detail.data;
+  const canRefundManual = Boolean(inv?.canManage && session.view.status === "full" && session.view.role === "admin");
   const title = inv ? (inv.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : "Draft invoice") : "Invoice";
   const download = async () => {
     if (!inv) return;
@@ -151,7 +154,7 @@ export default function InvoiceDetailPage() {
                   { key: "status", header: "Status", cell: (p) => <Badge tone={p.status === "succeeded" ? "success" : "danger"}>{p.status === "succeeded" ? "Received" : "Failed"}</Badge> },
                 ]}
                 rowActions={(p) =>
-                  invoice.canManage && refundableMinor(invoice, p) > 0 ? (
+                  canRefundManual && p.method !== "provider_online" && refundableMinor(invoice, p) > 0 ? (
                     <Button size="sm" variant="secondary" onClick={() => setAction({ kind: "refund", payment: p })}>
                       Refund{" "}<span className="sr-only">payment {p.reference}</span>
                     </Button>
@@ -308,9 +311,9 @@ function RefundDialog({ invoice, payment, onClose }: { invoice: InvoiceDetail; p
       destructive
       onOpenChange={(open) => (open ? undefined : onClose())}
       title="Record a refund"
-      description={`Against payment ${payment.reference}. Up to ${(max / 100).toFixed(2)} ${payment.currency} can be refunded. Return the money through your bank first; this records it.`}
+      description={`Against payment ${payment.reference}. Up to ${(max / 100).toFixed(2)} ${payment.currency} can be refunded. Recorded only — no money is moved by the portal.`}
       confirmLabel="Record refund"
-      confirmText={confirmToken(invoice)}
+      confirmText="REFUND ORDER"
       onConfirm={async () => {
         const amountMinor = parseDecimalToMinor(values.amount, false);
         if (amountMinor === null || amountMinor > max) fail(`Enter an amount from 0.01 to ${(max / 100).toFixed(2)}.`);
@@ -326,6 +329,7 @@ function RefundDialog({ invoice, payment, onClose }: { invoice: InvoiceDetail; p
               reasonCode: values.reasonCode,
               reference: values.reference.trim(),
               notes: values.notes.trim() || undefined,
+              confirmationPhrase: "REFUND ORDER",
               idempotencyKey,
             }),
           { reason: "Recording a refund needs verification.", success: "Refund recorded" },

@@ -313,7 +313,7 @@ In `compliance.init()`, the module also registers the `invoices` resource provid
 | `invoices.admin.issue` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, dueAt? }` -> `{ invoicePublicId, invoiceNumber, status, issuedAt }` |
 | `invoices.admin.void` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, reason }` -> `{ invoicePublicId, status: "void", voidedAt }` |
 | `invoices.admin.recordManualPayment` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, method, amountMinor, currency, reference, notes?, receivedAt?, idempotencyKey }` -> `{ paymentPublicId, invoiceStatus, balanceDueMinor, duplicate }` |
-| `invoices.admin.recordRefund` | `staffProcedure` + `invoices.manage` (step-up) | `{ invoicePublicId, paymentPublicId, amountMinor, currency, reasonCode, reference, notes?, refundedAt?, idempotencyKey }` -> `{ refundPublicId, invoiceStatus, balanceDueMinor, duplicate }` |
+| `invoices.admin.recordRefund` | `staffProcedure` + `payments.refund` (admin + step-up) | `{ invoicePublicId, paymentPublicId, amountMinor, currency, reasonCode, reference, notes?, refundedAt?, confirmationPhrase: "REFUND ORDER", idempotencyKey }` -> `{ refundPublicId, invoiceStatus, balanceDueMinor, duplicate }` (manual payments only; `provider_online` payments refused with `CONFLICT:PROVIDER_PAYMENT_USE_ORDER_REFUNDS`; serializes against `compliance_invoice_payments` `FOR UPDATE`) |
 
 ## 5. Raw HTTP routes (`/api/compliance/...`)
 

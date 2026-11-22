@@ -557,6 +557,7 @@ export const recordRefundSchema = z.strictObject({
   reference: nfcTrimmedString(1, 128),
   notes: nfcTrimmedString(0, 500).optional(),
   refundedAt: z.coerce.date().optional(),
+  confirmationPhrase: z.string().trim().min(1).max(32),
   idempotencyKey: z.string().trim().min(8).max(128),
 });
 

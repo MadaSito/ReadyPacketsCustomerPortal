@@ -22,6 +22,7 @@ import {
   paymentWebhookEvents,
   REFUND_CONFIRMATION_PHRASE,
 } from "./index.js";
+import { createStripeRefundProvider } from "./providers/stripe.js";
 import * as paymentsSchema from "./schema.js";
 
 interface FakeOrderRecord {
@@ -1277,5 +1278,421 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
       code: "NOT_FOUND",
       reasonCode: "PAYMENT_ATTEMPT_NOT_FOUND",
     });
+  });
+
+  it("refuses signed same-amount sibling Stripe Dashboard webhooks, missing payment/charge binding, and direct-GET ID mismatches before settling the genuine portal refund", async () => {
+    const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
+    const webhookSecret = "whsec_test_sibling_guard_07";
+    await payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_sibling_guard_07",
+      stripeWebhookSecret: webhookSecret,
+    });
+
+    const order = seedOrder(customerAPrincipal);
+    const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 25_000);
+    const started = await payments.startCheckout(invoicePublicId, undefined, {
+      principal: customerAPrincipal,
+      idempotencyKey: "idem-sibling-checkout-1",
+    });
+    if (started.mode !== "redirect") throw new Error("expected redirect");
+
+    const sessionEntry = [...protocol.stripeSessions.values()][0]!;
+    protocol.markStripeSessionPaid(sessionEntry.id);
+    const tsSec = Math.floor(h.clock.now().getTime() / 1000);
+    const paidBody = Buffer.from(
+      JSON.stringify({
+        id: "evt_sibling_paid_07",
+        type: "checkout.session.completed",
+        livemode: false,
+        created: tsSec,
+        data: { object: { id: sessionEntry.id, metadata: sessionEntry.metadata } },
+      }),
+      "utf8",
+    );
+    const paidWh = await payments.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: paidBody,
+      headers: { "stripe-signature": signStripeWebhook(paidBody, webhookSecret, tsSec) },
+      notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+    });
+    expect(paidWh.booked).toBe(true);
+
+    const wsBefore = await callerFor(adminPrincipal).refunds.forOrder({ orderPublicId: order.publicId });
+    const paymentPubId = wsBefore.payments[0]!.paymentPublicId;
+    const piId = sessionEntry.payment_intent.id;
+
+    // Create a $100.00 portal refund whose POST drops after Stripe accepted it -> status `unknown`, providerRefundRef `null`
+    protocol.setNextStripeRefundPostBehavior("network_drop_after_stripe_accepted");
+    const portalRefund = await callerFor(adminPrincipal).refunds.create({
+      orderPublicId: order.publicId,
+      paymentPublicId: paymentPubId,
+      amountMinor: 10_000,
+      currency: "USD",
+      reason: "Partial service adjustment",
+      sendCustomerNotice: false,
+      confirmationPhrase: REFUND_CONFIRMATION_PHRASE,
+      idempotencyKey: "idem-portal-rfd-sibling-10000",
+    });
+    expect(portalRefund.status).toBe("unknown");
+    expect(portalRefund.providerRefundRef).toBeNull();
+
+    const genuineStripeRefund = [...protocol.stripeRefunds.values()].find(
+      (r) => r.metadata.refund_public_id === portalRefund.refundPublicId,
+    )!;
+    expect(genuineStripeRefund).toBeDefined();
+
+    // Separate legitimate Stripe Dashboard refund on the SAME payment_intent, SAME amount (10_000), SAME currency ("usd"), NO portal metadata!
+    const dashboardRefundId = "re_dashboard_sibling_10000";
+    protocol.stripeRefunds.set(dashboardRefundId, {
+      id: dashboardRefundId,
+      object: "refund",
+      amount: 10_000,
+      currency: "usd",
+      payment_intent: piId,
+      status: "succeeded",
+      created: tsSec + 5,
+      metadata: {},
+    });
+
+    // 1. Signed `refund.created` & `refund.updated` & `charge.refunded` webhooks for the Dashboard sibling refund MUST NOT book or settle the portal refund!
+    for (const [idx, evtType] of (["refund.created", "refund.updated"] as const).entries()) {
+      const siblingBody = Buffer.from(
+        JSON.stringify({
+          id: `evt_sibling_dash_${idx}`,
+          type: evtType,
+          livemode: false,
+          created: tsSec + 10 + idx,
+          data: {
+            object: {
+              id: dashboardRefundId,
+              object: "refund",
+              amount: 10_000,
+              currency: "usd",
+              payment_intent: piId,
+              status: "succeeded",
+              metadata: {},
+            },
+          },
+        }),
+        "utf8",
+      );
+      const res = await payments.handleSignedWebhook({
+        provider: "stripe",
+        rawBody: siblingBody,
+        headers: { "stripe-signature": signStripeWebhook(siblingBody, webhookSecret, tsSec + 10 + idx) },
+        notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+      });
+      expect(res.httpStatus).toBe(200);
+      expect(res.booked).toBe(false);
+      expect(res.reasonCode).toBe("IGNORED");
+    }
+
+    // Even if a webhook envelope spoofs `metadata.refund_public_id` pointing at `dashboardRefundId`,
+    // authoritative direct GET /v1/refunds/re_dashboard_sibling_10000 sees missing metadata and rejects as verification_mismatch!
+    const spoofedHintBody = Buffer.from(
+      JSON.stringify({
+        id: "evt_sibling_spoofed_hint_07",
+        type: "refund.updated",
+        livemode: false,
+        created: tsSec + 20,
+        data: {
+          object: {
+            id: dashboardRefundId,
+            object: "refund",
+            amount: 10_000,
+            currency: "usd",
+            payment_intent: piId,
+            status: "succeeded",
+            metadata: { refund_public_id: portalRefund.refundPublicId },
+          },
+        },
+      }),
+      "utf8",
+    );
+    const spoofedRes = await payments.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: spoofedHintBody,
+      headers: { "stripe-signature": signStripeWebhook(spoofedHintBody, webhookSecret, tsSec + 20) },
+      notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+    });
+    expect(spoofedRes.httpStatus).toBe(200);
+    expect(spoofedRes.accepted).toBe(false);
+    expect(spoofedRes.booked).toBe(false);
+    expect(spoofedRes.reasonCode).toBe("STRIPE_REFUND_METADATA_MISMATCH");
+
+    // Verify portal refund row is STILL `unknown` with `providerRefundRef = null` and order is STILL `paid`!
+    const [rowStillUnknown] = await tdb.db
+      .select()
+      .from(paymentRefunds)
+      .where(eq(paymentRefunds.publicId, portalRefund.refundPublicId));
+    expect(rowStillUnknown?.status).toBe("unknown");
+    expect(rowStillUnknown?.providerRefundRef).toBeNull();
+    const wsAfterSibling = await callerFor(adminPrincipal).refunds.forOrder({ orderPublicId: order.publicId });
+    expect(wsAfterSibling.orderPaymentState).toBe("paid");
+    expect(wsAfterSibling.payments[0]?.refundedMinor).toBe(0);
+    expect(wsAfterSibling.payments[0]?.reservedPendingOrUnknownMinor).toBe(10_000);
+
+    // 2. Direct adapter lookup checks: missing metadata, missing payment_intent, missing charge, and requested-vs-returned ID mismatch
+    const directAdapter = createStripeRefundProvider(() => ({
+      fetchPinned: async (url) => {
+        const u = typeof url === "string" ? new URL(url) : url;
+        const requestedId = decodeURIComponent(u.pathname.slice("/v1/refunds/".length));
+        if (requestedId === "re_no_meta_01") {
+          return {
+            status: 200,
+            headers: {},
+            body: Buffer.from(
+              JSON.stringify({
+                id: "re_no_meta_01",
+                amount: 10_000,
+                currency: "usd",
+                payment_intent: piId,
+                status: "succeeded",
+                metadata: {},
+              }),
+              "utf8",
+            ),
+          };
+        }
+        if (requestedId === "re_missing_pi_01") {
+          return {
+            status: 200,
+            headers: {},
+            body: Buffer.from(
+              JSON.stringify({
+                id: "re_missing_pi_01",
+                amount: 10_000,
+                currency: "usd",
+                status: "succeeded",
+                metadata: { refund_public_id: portalRefund.refundPublicId },
+              }),
+              "utf8",
+            ),
+          };
+        }
+        if (requestedId === "re_missing_ch_01") {
+          return {
+            status: 200,
+            headers: {},
+            body: Buffer.from(
+              JSON.stringify({
+                id: "re_missing_ch_01",
+                amount: 10_000,
+                currency: "usd",
+                payment_intent: piId,
+                status: "succeeded",
+                metadata: { refund_public_id: portalRefund.refundPublicId },
+              }),
+              "utf8",
+            ),
+          };
+        }
+        return {
+          status: 200,
+          headers: {},
+          body: Buffer.from(
+            JSON.stringify({
+              id: "re_completely_other_id",
+              amount: 10_000,
+              currency: "usd",
+              payment_intent: piId,
+              status: "succeeded",
+              metadata: { refund_public_id: portalRefund.refundPublicId },
+            }),
+            "utf8",
+          ),
+        };
+      },
+    }));
+
+    const baseLookup = {
+      credentials: { secretKey: "sk_test_sibling_guard_07", mode: "test" as const },
+      refundPublicId: portalRefund.refundPublicId,
+      providerIdempotencyKey: `rp-refund-${portalRefund.refundPublicId}`,
+      refundMarker: `ReadyPackets refund ${portalRefund.refundPublicId}`,
+      providerPaymentRef: piId,
+      amountMinor: 10_000,
+      currency: "USD",
+    };
+
+    expect(await directAdapter.lookupRefund({ ...baseLookup, providerRefundRef: "re_no_meta_01" })).toMatchObject({
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_REFUND_METADATA_MISMATCH",
+    });
+    expect(await directAdapter.lookupRefund({ ...baseLookup, providerRefundRef: "re_missing_pi_01" })).toMatchObject({
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_REFUND_PAYMENT_MISMATCH",
+    });
+    expect(
+      await directAdapter.lookupRefund({
+        ...baseLookup,
+        providerPaymentRef: "ch_expected_charge_01",
+        providerRefundRef: "re_missing_ch_01",
+      }),
+    ).toMatchObject({
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_REFUND_CHARGE_MISMATCH",
+    });
+    expect(await directAdapter.lookupRefund({ ...baseLookup, providerRefundRef: "re_requested_id_01" })).toMatchObject({
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_REFUND_ID_MISMATCH",
+    });
+
+    // 3. Genuine signed webhook for `genuineStripeRefund` (exact portal metadata + payment_intent + amount + currency + ID) settles cleanly!
+    const genuineBody = Buffer.from(
+      JSON.stringify({
+        id: "evt_genuine_portal_refund_07",
+        type: "refund.updated",
+        livemode: false,
+        created: tsSec + 30,
+        data: { object: genuineStripeRefund },
+      }),
+      "utf8",
+    );
+    const genuineWh = await payments.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: genuineBody,
+      headers: { "stripe-signature": signStripeWebhook(genuineBody, webhookSecret, tsSec + 30) },
+      notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+    });
+    expect(genuineWh.httpStatus).toBe(200);
+    expect(genuineWh.booked).toBe(true);
+
+    const wsSettled = await callerFor(adminPrincipal).refunds.forOrder({ orderPublicId: order.publicId });
+    expect(wsSettled.orderPaymentState).toBe("partially_refunded");
+    expect(wsSettled.payments[0]?.refundedMinor).toBe(10_000);
+    expect(wsSettled.payments[0]?.reservedPendingOrUnknownMinor).toBe(0);
+    expect(wsSettled.payments[0]?.refundableMinor).toBe(15_000);
+  });
+
+  it("enforces payments.refund + REFUND ORDER on legacy compliance.invoices.admin.recordRefund, blocks provider_online bypass while a reservation is pending, and coordinates manual reservations", async () => {
+    const { h, protocol, compliance, payments, seedOrder, callerFor } = createHarness();
+    const webhookSecret = "whsec_test_legacy_guard_08";
+    await payments.admin.updateSettings(adminPrincipal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_legacy_guard_08",
+      stripeWebhookSecret: webhookSecret,
+    });
+
+    const order = seedOrder(customerAPrincipal);
+    const invoicePublicId = await issueOrderInvoice(compliance, order.publicId, 20_000);
+    const started = await payments.startCheckout(invoicePublicId, undefined, {
+      principal: customerAPrincipal,
+      idempotencyKey: "idem-legacy-guard-checkout-1",
+    });
+    if (started.mode !== "redirect") throw new Error("expected redirect");
+
+    const sessionEntry = [...protocol.stripeSessions.values()][0]!;
+    protocol.markStripeSessionPaid(sessionEntry.id);
+    const tsSec = Math.floor(h.clock.now().getTime() / 1000);
+    const paidBody = Buffer.from(
+      JSON.stringify({
+        id: "evt_legacy_guard_paid_08",
+        type: "checkout.session.completed",
+        livemode: false,
+        created: tsSec,
+        data: { object: { id: sessionEntry.id, metadata: sessionEntry.metadata } },
+      }),
+      "utf8",
+    );
+    await payments.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: paidBody,
+      headers: { "stripe-signature": signStripeWebhook(paidBody, webhookSecret, tsSec) },
+      notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+    });
+
+    const wsInitial = await callerFor(adminPrincipal).refunds.forOrder({ orderPublicId: order.publicId });
+    const onlinePaymentPubId = wsInitial.payments[0]!.paymentPublicId;
+
+    // Open a $120.00 `pending` Stripe refund reservation (leaving $80.00 refundable, $0 settled in compliance_invoice_refunds)
+    protocol.setNextStripeRefundPostBehavior("pending");
+    const pendingRefund = await callerFor(adminPrincipal).refunds.create({
+      orderPublicId: order.publicId,
+      paymentPublicId: onlinePaymentPubId,
+      amountMinor: 12_000,
+      currency: "USD",
+      reason: "Pending Stripe refund reservation",
+      sendCustomerNotice: false,
+      confirmationPhrase: REFUND_CONFIRMATION_PHRASE,
+      idempotencyKey: "idem-legacy-pending-12000",
+    });
+    expect(pendingRefund.status).toBe("pending");
+
+    // 1. Staff with `invoices.manage` + fresh step-up is denied (`FORBIDDEN`) on legacy `recordRefund`
+    await expect(
+      compliance.invoices.admin.recordRefund(staffPrincipal, {
+        invoicePublicId,
+        paymentPublicId: onlinePaymentPubId,
+        amountMinor: 5_000,
+        currency: "USD",
+        reasonCode: "OVERPAYMENT",
+        reference: "RFD-STAFF-BYPASS",
+        confirmationPhrase: REFUND_CONFIRMATION_PHRASE,
+        idempotencyKey: "idem-legacy-staff-bypass",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    // 2. Admin without `REFUND ORDER` phrase is denied (`INVALID_REFUND_CONFIRMATION`)
+    await expect(
+      compliance.invoices.admin.recordRefund(adminPrincipal, {
+        invoicePublicId,
+        paymentPublicId: onlinePaymentPubId,
+        amountMinor: 5_000,
+        currency: "USD",
+        reasonCode: "OVERPAYMENT",
+        reference: "RFD-BAD-PHRASE",
+        confirmationPhrase: "CONFIRM",
+        idempotencyKey: "idem-legacy-bad-phrase",
+      }),
+    ).rejects.toMatchObject({ code: "VALIDATION", reasonCode: "INVALID_REFUND_CONFIRMATION" });
+
+    // 3. Admin WITH `REFUND ORDER` attempting legacy `recordRefund` on `provider_online` payment (for $150.00, which would overdraw the $120.00 pending reservation!) is refused (`PROVIDER_PAYMENT_USE_ORDER_REFUNDS`)
+    await expect(
+      compliance.invoices.admin.recordRefund(adminPrincipal, {
+        invoicePublicId,
+        paymentPublicId: onlinePaymentPubId,
+        amountMinor: 15_000,
+        currency: "USD",
+        reasonCode: "OVERPAYMENT",
+        reference: "RFD-ONLINE-BYPASS",
+        confirmationPhrase: REFUND_CONFIRMATION_PHRASE,
+        idempotencyKey: "idem-legacy-online-bypass",
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "PROVIDER_PAYMENT_USE_ORDER_REFUNDS" });
+
+    // 4. When the pending Stripe refund subsequently succeeds, settlement completes cleanly without an overdrawn local ledger!
+    const storedPending = protocol.stripeRefunds.get(pendingRefund.providerRefundRef!)!;
+    storedPending.status = "succeeded";
+    const settledBody = Buffer.from(
+      JSON.stringify({
+        id: "evt_legacy_guard_settled_08",
+        type: "refund.updated",
+        livemode: false,
+        created: tsSec + 15,
+        data: { object: storedPending },
+      }),
+      "utf8",
+    );
+    const settledWh = await payments.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: settledBody,
+      headers: { "stripe-signature": signStripeWebhook(settledBody, webhookSecret, tsSec + 15) },
+      notificationUrl: "https://portal.example.test/api/payments/webhook/stripe",
+    });
+    expect(settledWh.booked).toBe(true);
+
+    const wsAfterSettle = await callerFor(adminPrincipal).refunds.forOrder({ orderPublicId: order.publicId });
+    expect(wsAfterSettle.payments[0]?.refundedMinor).toBe(12_000);
+    expect(wsAfterSettle.payments[0]?.refundableMinor).toBe(8_000);
   });
 });

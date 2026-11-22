@@ -330,7 +330,12 @@ export function createStripeProvider(
         providerPaymentRef = paymentIntentId ?? objectId;
         const refundsList = asRecord(dataObj?.refunds)?.data;
         if (Array.isArray(refundsList) && refundsList.length > 0) {
-          const latestRefund = asRecord(refundsList[0]);
+          const portalRefundCandidate = refundsList.find((entry) => {
+            const meta = asRecord(asRecord(entry)?.metadata);
+            const pubId = typeof meta?.refund_public_id === "string" ? meta.refund_public_id.trim() : "";
+            return /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(pubId);
+          });
+          const latestRefund = asRecord(portalRefundCandidate ?? refundsList[0]);
           const rId = typeof latestRefund?.id === "string" ? latestRefund.id.trim() : null;
           const rMeta = asRecord(latestRefund?.metadata);
           const rPubId =
@@ -485,7 +490,8 @@ function parseStripeRefundObject(
     providerPaymentRef: string;
     amountMinor: number;
     currency: string;
-    requireMetadataMatch: boolean;
+    expectedRefundId?: string | null;
+    mode: "direct" | "list_filter";
   },
 ): {
   status: "succeeded" | "pending" | "failed" | "unknown";
@@ -497,17 +503,68 @@ function parseStripeRefundObject(
   const refundId = typeof rawObj.id === "string" ? rawObj.id.trim() : "";
   if (!/^re_[A-Za-z0-9_]{6,120}$/u.test(refundId)) return null;
 
+  if (expected.expectedRefundId && refundId !== expected.expectedRefundId) {
+    return {
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_REFUND_ID_MISMATCH",
+      settledAt: null,
+    };
+  }
+
   const metadata = asRecord(rawObj.metadata);
   const metaRefundPubId =
     typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : null;
-  if (expected.requireMetadataMatch && metaRefundPubId !== expected.refundPublicId) {
-    return null;
-  }
-  if (metaRefundPubId && metaRefundPubId !== expected.refundPublicId) {
+  if (metaRefundPubId !== expected.refundPublicId) {
+    if (expected.mode === "list_filter") {
+      return null;
+    }
     return {
       status: "unknown",
-      providerRefundRef: refundId,
+      providerRefundRef: null,
       failureReasonCode: "STRIPE_REFUND_METADATA_MISMATCH",
+      settledAt: null,
+    };
+  }
+
+  const piRaw = rawObj.payment_intent;
+  const piId =
+    typeof piRaw === "string"
+      ? piRaw.trim()
+      : typeof asRecord(piRaw)?.id === "string"
+        ? (asRecord(piRaw)!.id as string).trim()
+        : null;
+  const chRaw = rawObj.charge;
+  const chId =
+    typeof chRaw === "string"
+      ? chRaw.trim()
+      : typeof asRecord(chRaw)?.id === "string"
+        ? (asRecord(chRaw)!.id as string).trim()
+        : null;
+
+  if (expected.providerPaymentRef.startsWith("pi_")) {
+    if (!piId || piId !== expected.providerPaymentRef) {
+      return {
+        status: "unknown",
+        providerRefundRef: null,
+        failureReasonCode: "STRIPE_REFUND_PAYMENT_MISMATCH",
+        settledAt: null,
+      };
+    }
+  } else if (expected.providerPaymentRef.startsWith("ch_")) {
+    if (!chId || chId !== expected.providerPaymentRef) {
+      return {
+        status: "unknown",
+        providerRefundRef: null,
+        failureReasonCode: "STRIPE_REFUND_CHARGE_MISMATCH",
+        settledAt: null,
+      };
+    }
+  } else {
+    return {
+      status: "unknown",
+      providerRefundRef: null,
+      failureReasonCode: "STRIPE_INVALID_PAYMENT_REF",
       settledAt: null,
     };
   }
@@ -517,40 +574,8 @@ function parseStripeRefundObject(
   if (amount !== expected.amountMinor || currency !== expected.currency.toUpperCase()) {
     return {
       status: "unknown",
-      providerRefundRef: refundId,
+      providerRefundRef: null,
       failureReasonCode: "STRIPE_REFUND_AMOUNT_OR_CURRENCY_MISMATCH",
-      settledAt: null,
-    };
-  }
-
-  const piRaw = rawObj.payment_intent;
-  const piId =
-    typeof piRaw === "string"
-      ? piRaw
-      : typeof asRecord(piRaw)?.id === "string"
-        ? (asRecord(piRaw)!.id as string)
-        : null;
-  const chRaw = rawObj.charge;
-  const chId =
-    typeof chRaw === "string"
-      ? chRaw
-      : typeof asRecord(chRaw)?.id === "string"
-        ? (asRecord(chRaw)!.id as string)
-        : null;
-
-  if (expected.providerPaymentRef.startsWith("pi_") && piId && piId !== expected.providerPaymentRef) {
-    return {
-      status: "unknown",
-      providerRefundRef: refundId,
-      failureReasonCode: "STRIPE_REFUND_PAYMENT_MISMATCH",
-      settledAt: null,
-    };
-  }
-  if (expected.providerPaymentRef.startsWith("ch_") && chId && chId !== expected.providerPaymentRef) {
-    return {
-      status: "unknown",
-      providerRefundRef: refundId,
-      failureReasonCode: "STRIPE_REFUND_CHARGE_MISMATCH",
       settledAt: null,
     };
   }
@@ -691,7 +716,7 @@ export function createStripeRefundProvider(
         providerPaymentRef: input.providerPaymentRef,
         amountMinor: input.amountMinor,
         currency: input.currency,
-        requireMetadataMatch: false,
+        mode: "direct",
       });
       if (!mapped || mapped.status === "unknown") {
         return {
@@ -778,13 +803,22 @@ export function createStripeRefundProvider(
             providerPaymentRef: input.providerPaymentRef,
             amountMinor: input.amountMinor,
             currency: input.currency,
-            requireMetadataMatch: false,
+            expectedRefundId: input.providerRefundRef,
+            mode: "direct",
           });
           if (!mapped) {
             return {
               status: "unknown",
-              providerRefundRef: input.providerRefundRef,
+              providerRefundRef: null,
               failureReasonCode: "STRIPE_LOOKUP_INVALID_PAYLOAD",
+              settledAt: null,
+            };
+          }
+          if (mapped.status !== "unknown" && mapped.providerRefundRef !== input.providerRefundRef) {
+            return {
+              status: "unknown",
+              providerRefundRef: null,
+              failureReasonCode: "STRIPE_REFUND_ID_MISMATCH",
               settledAt: null,
             };
           }
@@ -861,7 +895,7 @@ export function createStripeRefundProvider(
             providerPaymentRef: input.providerPaymentRef,
             amountMinor: input.amountMinor,
             currency: input.currency,
-            requireMetadataMatch: true,
+            mode: "list_filter",
           });
           if (!row) continue;
           if (matched) {
