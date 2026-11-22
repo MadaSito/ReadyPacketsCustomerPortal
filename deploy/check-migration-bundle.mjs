@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -8,8 +8,17 @@ const requiredTag = "0005_increment_05";
 // the journal would otherwise be silently skipped by Drizzle.
 export function checkMigrationBundle(dir) {
   const journal = join(dir, "meta", "_journal.json");
-  if (!lstatSync(journal).isFile()) throw new Error("invalid migration journal file");
-  const { entries } = JSON.parse(readFileSync(journal, "utf8"));
+  // Check and read through one descriptor (no symlink is followed), so the file that was checked is the
+  // file that is read.
+  const fd = openSync(journal, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let text;
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("invalid migration journal file");
+    text = readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+  const { entries } = JSON.parse(text);
   if (!Array.isArray(entries)) throw new Error("invalid migration journal");
   const seen = new Set();
   for (const [idx, entry] of entries.entries()) {
