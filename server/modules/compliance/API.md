@@ -354,3 +354,14 @@ In `compliance.init()`, the module also registers the `invoices` resource provid
   - `compliance.policies`: `ok` / `not_configured`
   - `compliance.intake`: `ok` / `not_configured`
   - `compliance.invoices`: `ok` (`issuedUnpaidInvoices` count)
+
+## 8. Increment 04 Part B Ports (`policies`, `intake`, `invoices`)
+
+- **Package V — Order Policy Acceptance Gate Port (`server/modules/compliance/policiesService.ts`)**:
+  - `compliance.policies.versionForGate(policyPublicId: string, tx?: DbOrTx): Promise<PolicyForGateView | null>` — returns the policy document metadata and its current published effective version (`id`, `publicId`, `versionNumber`, `versionLabel`, `contentFormat`, `bodyText`, `contentHash`, `effectiveAt`, `publishedAt`), or `currentVersion: null` when draft-only or archived (`active === false`).
+  - `compliance.policies.versionById(versionId: number, tx?: DbOrTx): Promise<PolicyForGateView | null>` — resolves any historical `policy_versions` row by numeric FK id even after the parent document is archived so signed order-acceptance evidence remains inspectable.
+  - `compliance.intake.saveDraft` & `compliance.intake.submit` invoke `deps.services.orders.gates.assertCustomerMayWork({ tx, orderId, actor, action: "intake", statusKey })` fail-closed inside `tx` whenever the caller is a customer.
+- **Package U — Order Payment State & Refund Ledger Ports (`server/modules/compliance/invoicesService.ts`)**:
+  - `InvoiceSummaryView.paymentState`: `"draft" | "unpaid" | "partially_paid" | "paid" | "partially_refunded" | "refunded" | "void"` alongside `refundedMinor` and `grossPaidMinor`.
+  - `compliance.invoices.getOrderPaymentSummaries(orderPublicIds: readonly string[], tx?: DbOrTx)` — batched read port returning `Map<string, { state: "unpaid" | "paid" | "partially_refunded" | "refunded", totalMinor: number, currency: string }>` for `orders` console headers/lists.
+  - `compliance.invoices.listOrderPaymentsAndRefunds`, `lockOrderPaymentForRefundInTx`, and `bookSettledRefundInTx` — internal transactional ports consumed by `payments.refunds` to lock captured payments `FOR UPDATE`, book settled provider/manual refunds idempotently, and fire `deps.services.referrals.onInvoiceRefunded(event, { tx })` when an invoice becomes fully refunded.

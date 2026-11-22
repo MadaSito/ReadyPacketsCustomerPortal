@@ -52,3 +52,14 @@
   6. Portable v3 `READ ONLY` repeatable-read export (`RECORD_SCHEMAS` + `referencesOf` closure + secret/IP scan) and inert import (`origin = "import"` does not satisfy live `requiredAcceptancesFor`).
   7. Live actor `FOR UPDATE` re-validation on mid-session role demotion, durable audit fail-closed rollback, and 1-connection pool (`connectionLimit: 1`) non-deadlock verification.
   8. Reviewer & audit regression suite: public `listPublished` excludes `staff` audience, server-derived acceptance method & `effectiveAt`/supersession enforcement, `tx`-scoped `catalog_item` + `workflow` intake applicability, cursor-paginated `getSubmission` revisions, and `authz.compliance.denied` / `invoice.payment.refused` post-rollback audits with `snake_case` attributes.
+
+## 4. Increment 04 Part B — Packages U & V Verification
+
+- `scripts/dev/test.sh server/modules/compliance/compliance.test.ts` — **11/11 passed** (added 3 Part B integration tests):
+  9. `policies.versionForGate` & `policies.versionById`: verifies exact published text & SHA-256 hash, `currentVersion: null` for draft-only or archived policies, and historical `versionById` resolution after archive.
+  10. `intake.saveDraft` & `intake.submit`: verifies fail-closed `orders.gates.assertCustomerMayWork` (`CONFLICT:ACCEPTANCE_REQUIRED`) inside `tx` for customers while permitting staff writes.
+  11. `invoices.getOrderPaymentSummaries` & `InvoiceSummaryView.paymentState`: verifies `unpaid` -> `paid` -> `partially_refunded` -> `refunded` transitions.
+- `scripts/dev/test.sh client/src/features/compliance/customer/complianceCustomer.test.tsx` — **11/11 passed** (designed and tested against WCAG 2.2 AA via `axe-core`).
+- `scripts/dev/test.sh client/src/features/compliance/admin/complianceAdmin.test.tsx` — **15/15 passed**.
+- `scripts/dev/tc.sh` — **0 diagnostics**.
+- `./node_modules/.bin/eslint` on owned `compliance` paths — **0 errors, 0 warnings**.

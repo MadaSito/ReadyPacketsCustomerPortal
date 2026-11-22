@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import mysql from "mysql2/promise";
 import { drizzle } from "drizzle-orm/mysql2";
@@ -1391,5 +1392,242 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     expect(refusedEvt?.outcome).toBe("refused");
     expect(refusedEvt?.reasonCode).toBe("PAYMENT_EXCEEDS_BALANCE_DUE");
     expect(Object.keys(refusedEvt?.attributes ?? {}).every((k) => /^[a-z0-9_]+$/.test(k))).toBe(true);
+  });
+
+  it("policies.versionForGate & versionById: returns current published version with exact text & SHA-256 hash, currentVersion: null for unpublished/archived, and historical versionById after archive", async () => {
+    const { h, compliance } = makeHarness();
+
+    // Unknown policyPublicId / versionId -> null
+    expect(await compliance.policies.versionForGate(ulid(h.clock.now().getTime() + 77_777))).toBeNull();
+    expect(await compliance.policies.versionById(999_999)).toBeNull();
+
+    // Draft-only policy -> versionForGate returns currentVersion: null
+    const exactBody = "# Service Engagement Terms\n\nCustomer agrees to scope, timeline, and delivery rules.";
+    const created = await compliance.policies.admin.createDocument(adminPrincipal, {
+      slug: "order-service-terms-b6",
+      title: "Order Service Engagement Terms",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: true,
+      versionLabel: "2.1",
+      contentFormat: "safe_markdown",
+      bodyText: exactBody,
+    });
+    const draftGate = await compliance.policies.versionForGate(created.documentPublicId);
+    expect(draftGate?.active).toBe(true);
+    expect(draftGate?.currentVersion).toBeNull();
+
+    // Publish -> versionForGate returns exact text, version number, version label, title, and SHA-256 hex
+    const published = await compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: created.draftVersionPublicId,
+    });
+    const gateView = await compliance.policies.versionForGate(created.documentPublicId);
+    expect(gateView).not.toBeNull();
+    expect(gateView?.documentPublicId).toBe(created.documentPublicId);
+    expect(gateView?.slug).toBe("order-service-terms-b6");
+    expect(gateView?.title).toBe("Order Service Engagement Terms");
+    expect(gateView?.active).toBe(true);
+    expect(gateView?.currentVersion?.publicId).toBe(published.versionPublicId);
+    expect(gateView?.currentVersion?.versionNumber).toBe(1);
+    expect(gateView?.currentVersion?.versionLabel).toBe("2.1");
+    expect(gateView?.currentVersion?.bodyText).toBe(exactBody);
+    expect(gateView?.currentVersion?.contentHash).toBe(
+      createHash("sha256").update(exactBody, "utf8").digest("hex"),
+    );
+
+    // Deactivate/archive policy -> versionForGate returns active: false & currentVersion: null,
+    // while versionById still resolves the historical published version for signed evidence display!
+    const docDetail = await compliance.policies.admin.getDocument(adminPrincipal, created.documentPublicId);
+    await compliance.policies.admin.updateDocument(adminPrincipal, {
+      documentPublicId: created.documentPublicId,
+      expectedVersion: docDetail.document.version,
+      title: docDetail.document.title,
+      audience: docDetail.document.audience,
+      requiresAcceptance: docDetail.document.requiresAcceptance,
+      requiresTypedSignature: docDetail.document.requiresTypedSignature,
+      active: false,
+    });
+    const archivedGate = await compliance.policies.versionForGate(created.documentPublicId);
+    expect(archivedGate?.active).toBe(false);
+    expect(archivedGate?.currentVersion).toBeNull();
+
+    const historical = await compliance.policies.versionById(gateView!.currentVersion!.id);
+    expect(historical).not.toBeNull();
+    expect(historical?.active).toBe(false);
+    expect(historical?.currentVersion?.publicId).toBe(published.versionPublicId);
+    expect(historical?.currentVersion?.contentHash).toBe(gateView?.currentVersion?.contentHash);
+    expect(historical?.currentVersion?.bodyText).toBe(exactBody);
+  });
+
+  it("intake.saveDraft & submit: enforces fail-closed orders.gates.assertCustomerMayWork for customers while allowing staff writes", async () => {
+    const { h, compliance } = makeHarness();
+    const now = h.clock.now();
+    const gatedOrder: FakeOrderRecord = {
+      id: 599,
+      publicId: ulid(now.getTime() + 59_900),
+      reference: "RP-2026-000599",
+      ownerUserId: customerAPrincipal.userId,
+      ownerPublicId: customerAPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    ordersMap.set(gatedOrder.publicId, gatedOrder);
+
+    let gateBlocked = true;
+    const gateCalls: Array<{ role: string; orderId: number; action: string; hasTx: boolean }> = [];
+    (h.services.orders as unknown as Record<string, unknown>).gates = {
+      async assertCustomerMayWork(input: {
+        tx: DbOrTx;
+        orderId: number;
+        actor: SessionPrincipal;
+        action: string;
+        statusKey: string | null;
+      }) {
+        gateCalls.push({
+          role: input.actor.role,
+          orderId: input.orderId,
+          action: input.action,
+          hasTx: input.tx !== undefined,
+        });
+        if (gateBlocked) {
+          throw new DomainError(
+            "CONFLICT",
+            "ACCEPTANCE_REQUIRED",
+            "Order policy acceptance is required before working on this order.",
+          );
+        }
+      },
+    };
+
+    const q = await compliance.intake.admin.createQuestionnaire(adminPrincipal, {
+      slug: "gated-order-questionnaire",
+      title: "Gated Order Questionnaire",
+      scopeKind: "default",
+      fields: [
+        { key: "legal_entity", label: "Legal Entity", type: "short_text", required: true, sensitive: false, minLength: 2, maxLength: 100 },
+      ],
+    });
+    await compliance.intake.admin.publishVersion(adminPrincipal, q.draftVersionPublicId);
+
+    // Customer saveDraft and submit fail closed when acceptance gate rejects
+    await expect(
+      compliance.intake.saveDraft(customerAPrincipal, {
+        orderPublicId: gatedOrder.publicId,
+        questionnairePublicId: q.questionnairePublicId,
+        answers: { legal_entity: "Acme Holdings LLC" },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ACCEPTANCE_REQUIRED" });
+
+    await expect(
+      compliance.intake.submit(customerAPrincipal, {
+        orderPublicId: gatedOrder.publicId,
+        questionnairePublicId: q.questionnairePublicId,
+        answers: { legal_entity: "Acme Holdings LLC" },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT", reasonCode: "ACCEPTANCE_REQUIRED" });
+
+    expect(gateCalls).toHaveLength(2);
+    expect(gateCalls.every((c) => c.hasTx)).toBe(true);
+
+    // Staff can still save intake notes/drafts on the order while customer acceptance is pending
+    const staffSaved = await compliance.intake.saveDraft(staffPrincipal, {
+      orderPublicId: gatedOrder.publicId,
+      questionnairePublicId: q.questionnairePublicId,
+      answers: { legal_entity: "Acme Holdings LLC" },
+    });
+    expect(staffSaved.status).toBe("draft");
+    expect(gateCalls).toHaveLength(2); // Not invoked for staff
+
+    // Once customer completes acceptance gate, customer submit succeeds
+    gateBlocked = false;
+    const customerSubmitted = await compliance.intake.submit(customerAPrincipal, {
+      orderPublicId: gatedOrder.publicId,
+      questionnairePublicId: q.questionnairePublicId,
+      answers: { legal_entity: "Acme Holdings LLC" },
+    });
+    expect(customerSubmitted.status).toBe("submitted");
+    expect(gateCalls).toHaveLength(3);
+  });
+
+  it("invoices.getOrderPaymentSummaries & paymentState: transitions unpaid -> paid -> partially_refunded -> refunded", async () => {
+    const { h, compliance } = makeHarness();
+    const now = h.clock.now();
+    const payOrder: FakeOrderRecord = {
+      id: 601,
+      publicId: ulid(now.getTime() + 60_100),
+      reference: "RP-2026-000601",
+      ownerUserId: customerBPrincipal.userId,
+      ownerPublicId: customerBPrincipal.userPublicId,
+      lockState: "none",
+      origin: "portal",
+      productPublicIds: [],
+      grants: new Map(),
+    };
+    ordersMap.set(payOrder.publicId, payOrder);
+
+    const draft = await compliance.invoices.admin.createDraft(adminPrincipal, {
+      orderPublicId: payOrder.publicId,
+      currency: "USD",
+      lines: [{ description: "Compliance Review Package", quantity: 1, unitAmountMinor: 10_000 }],
+      discountMinor: 0,
+      taxMinor: 0,
+    });
+    await compliance.invoices.admin.issue(adminPrincipal, { invoicePublicId: draft.invoicePublicId });
+
+    // 1. Issued, unpaid -> `unpaid`
+    const s1 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);
+    expect(s1?.state).toBe("unpaid");
+    expect(s1?.totalMinor).toBe(10_000);
+    const list1 = await compliance.invoices.listForOrder(customerBPrincipal, payOrder.publicId);
+    expect(list1.items[0]?.paymentState).toBe("unpaid");
+
+    // 2. Paid in full -> `paid`
+    const pmt = await compliance.invoices.admin.recordManualPayment(adminPrincipal, {
+      invoicePublicId: draft.invoicePublicId,
+      method: "wire",
+      amountMinor: 10_000,
+      currency: "USD",
+      reference: "WIRE-601",
+      idempotencyKey: "idem-601-pay",
+    });
+    const s2 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);
+    expect(s2?.state).toBe("paid");
+    expect((await compliance.invoices.listForOrder(customerBPrincipal, payOrder.publicId)).items[0]?.paymentState).toBe(
+      "paid",
+    );
+
+    // 3. Partial refund ($35.00 of $100.00) -> `partially_refunded`
+    await compliance.invoices.admin.recordRefund(adminPrincipal, {
+      invoicePublicId: draft.invoicePublicId,
+      paymentPublicId: pmt.paymentPublicId,
+      amountMinor: 3_500,
+      currency: "USD",
+      reasonCode: "customer_request",
+      reference: "RFD-601-PART",
+      idempotencyKey: "idem-601-rfd-1",
+    });
+    const s3 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);
+    expect(s3?.state).toBe("partially_refunded");
+    const inv3 = (await compliance.invoices.listForOrder(customerBPrincipal, payOrder.publicId)).items[0];
+    expect(inv3?.paymentState).toBe("partially_refunded");
+    expect(inv3?.refundedMinor).toBe(3_500);
+
+    // 4. Remaining refund ($65.00) -> `refunded`
+    await compliance.invoices.admin.recordRefund(adminPrincipal, {
+      invoicePublicId: draft.invoicePublicId,
+      paymentPublicId: pmt.paymentPublicId,
+      amountMinor: 6_500,
+      currency: "USD",
+      reasonCode: "customer_request",
+      reference: "RFD-601-FULL",
+      idempotencyKey: "idem-601-rfd-2",
+    });
+    const s4 = (await compliance.invoices.getOrderPaymentSummaries([payOrder.publicId])).get(payOrder.publicId);
+    expect(s4?.state).toBe("refunded");
+    const inv4 = (await compliance.invoices.listForOrder(customerBPrincipal, payOrder.publicId)).items[0];
+    expect(inv4?.paymentState).toBe("refunded");
+    expect(inv4?.refundedMinor).toBe(10_000);
   });
 });

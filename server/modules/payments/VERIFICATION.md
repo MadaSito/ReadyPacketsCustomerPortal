@@ -29,3 +29,20 @@
 - `scripts/dev/test.sh server/modules/payments/providers/square.test.ts` — 4/4 passed (`files_engineer`)
 - `scripts/dev/test.sh client/src/features/payments/payments.test.tsx` — passed (`files_engineer`)
 - `scripts/dev/test.sh client/src/features/auth/legal.test.tsx` — passed (including `axe-core` accessibility verification)
+
+## 3. Increment 04 Part B — Package U (`payments.refunds`) Verification
+
+1. **RBAC, Step-Up, Confirmation Phrase & PAN Rejection**:
+   - `payments.refunds.forOrder` enforces `staffProcedure` + `invoices.read_all`, re-validates order read scope (`NOT_FOUND` on restricted orders), and redacts decrypted `reason` (`null`) when the caller lacks `payments.refund`.
+   - `payments.refunds.create` enforces `staffProcedure` + `payments.refund` + fresh step-up (`<= 10 min`), live-actor re-validation inside `tx`, exact `"REFUND ORDER"` server check, PAN-like digit-sequence rejection on `reason`, and `amountMinor <= refundableMinor` computed under `SELECT ... FOR UPDATE` across `compliance_invoices`, `compliance_invoice_payments`, and `payment_refunds`.
+   - Cross-customer `getCheckoutStatus({ attemptPublicId })` and `cancelAttemptIfUnpaid({ attemptPublicId })` normalize to `NOT_FOUND:PAYMENT_ATTEMPT_NOT_FOUND`.
+2. **Manual `"recorded_only"` vs Provider Refunds (`Stripe` & `Square`)**:
+   - Manual payments book synchronously in `tx` (`executionKind = "recorded_only"`) with zero outbound calls, optional customer notice email (`compliance.refund_notice` inside `tx`), customer-safe `payment.refund.succeeded` audit attributes (`{ order_public_id, invoice_public_id, provider, execution_kind }`), and transactional `services.referrals.onInvoiceRefunded(event, { tx })` when an invoice becomes fully refunded.
+   - Provider refunds commit `payment_refunds` (`status: "pending"`, `providerIdempotencyKey: "rp-refund-" + refundPublicId`) + enqueue `compliance.refund.reconcile` before calling `createRefund` over pinned egress outside `tx`.
+   - `unknown` transport/5xx/409/429 outcomes never re-POST, hold `reservedPendingOrUnknownMinor`, block concurrent refunds on that payment (`CONFLICT:REFUND_OUTCOME_UNKNOWN_PENDING`), and settle exclusively via read-only `GET` reconciliation (`lookupRefund`, fenced by `context.assertStillOwned(tx)` before `FOR UPDATE`) or double-verified `refund.created` / `refund.updated` webhooks.
+3. **Part B Test Results**:
+   - `scripts/dev/test.sh server/modules/payments/refunds.test.ts` — 6/6 passed (real MySQL)
+   - `scripts/dev/test.sh server/modules/payments/payments.test.ts` — 6/6 passed (real MySQL)
+   - `scripts/dev/tc.sh` — 0 diagnostics
+   - `./node_modules/.bin/eslint` on owned `payments` paths — 0 errors, 0 warnings
+   - **Not verified in this sandbox**: live external network calls to Stripe or Square production/sandbox endpoints; full Vite production bundle or live browser session (verified via jsdom + `axe-core` tests per build contract).

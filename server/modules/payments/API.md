@@ -255,16 +255,27 @@ Mounted by `http_security_engineer` (`server/http/API.md` slots `K webhook` and 
 | `payments.admin.getAttempt` | `payments.manage` | Detailed attempt view + linked verified webhook receipts |
 | `payments.admin.listWebhooks` | `payments.manage` | Cursor-paginated `payment_webhook_events` (`provider?`, `status?`, `cursor?`, `limit?`) |
 | `payments.admin.reconcileNow` | `payments.manage` (step-up) | Triggers an audited immediate reconciliation pass (`ReconcilePaymentsResult`) |
+| `payments.refunds.forOrder` | `staffProcedure` + `invoices.read_all` | `{ orderPublicId }` -> `OrderRefundWorkspaceView` (per-payment captured, refunded, reserved, refundable balances & refund history; reason redacted when caller lacks `payments.refund`) |
+| `payments.refunds.create` | `staffProcedure` + `payments.refund` (step-up) | `{ orderPublicId, paymentPublicId, amountMinor, currency, reason, sendCustomerNotice, confirmationPhrase: "REFUND ORDER", idempotencyKey }` -> `CreateOrderRefundResult` |
 
 ---
 
 ## 6. Capabilities, Jobs & Exports for `/root`
 
-- Capability: `payments.manage` (`admin`, in `STEP_UP_CAPABILITIES`).
-- Background job: `payments.reconcile_redirected` (registered on `deps.jobs` in `payments.init()`).
+- Capabilities:
+  - `payments.manage` (`admin`, in `STEP_UP_CAPABILITIES`)
+  - `payments.refund` (`admin`, in `STEP_UP_CAPABILITIES`)
+- Background jobs:
+  - `payments.reconcile_redirected` (registered on `deps.jobs` in `payments.init()`)
+  - `compliance.refund.reconcile` (registered via `registerRefundReconciliation` in `payments.init()`; performs read-only `GET` lookup on `pending` / `unknown` provider refunds and never re-POSTs)
+- Increment 04 Part B refund architecture (`server/modules/payments/service.ts`, `providers/stripe.ts`, `providers/square-refund.ts`):
+  - `payment_refunds` stores encrypted `reasonEnc` (never PAN), `providerIdempotencyKey = "rp-refund-" + refundPublicId`, `status` (`pending` | `succeeded` | `failed` | `unknown`), and `complianceRefundPublicId`.
+  - Intent is committed as `pending` under `FOR UPDATE` locks before outbound provider egress; `unknown` transport/5xx/409/429 outcomes reserve refundable balance and never resend `POST`.
+  - Verified `refund.created` / `refund.updated` webhooks re-query the provider via `lookupRefund` before settling.
+  - Manual payments execute synchronously inside `tx` with `executionKind = "recorded_only"` and zero external calls.
 - Server exports (for `/root` container & tRPC wiring):
   - `createPaymentsModule`, `type PaymentsModule` from `server/modules/payments/index.ts`
   - `paymentsRouter` from `server/modules/payments/router.ts`
-  - Drizzle tables `paymentAttempts`, `paymentWebhookEvents` from `server/modules/payments/schema.ts`
+  - Drizzle tables `paymentAttempts`, `paymentWebhookEvents`, `paymentRefunds` from `server/modules/payments/schema.ts`
 - Client export (for `/root` `client/src/app/registry.ts`):
-  - `paymentsFeature` from `client/src/features/payments/routes.tsx` (`/admin/payments`, Console group `"Billing & compliance"`, `order: 41`, `capability: "payments.manage"`).
+  - `paymentsFeature` from `client/src/features/payments/routes.tsx` (`/admin/payments`, Console group `"Billing & compliance"`, `order: 41`, `capability: "payments.manage"`, plus Console order workspace Refunds tab).
