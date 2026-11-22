@@ -52,6 +52,8 @@ export default function NewOrderPage() {
   // Increment 05 (C3): discount codes on the direct order path (with the cart on, the cart owns codes).
   const promotionsEnabled = useFeatureEnabled("promotions");
   const [promoCode, setPromoCode] = useState<string | null>(null);
+  const [promoRevision, setPromoRevision] = useState(0);
+  const promoScope = useId();
   const [step, setStep] = useState(0);
   const [quantities, setQuantities] = useState<Record<string, string>>({});
   const [selection, setSelection] = useState<Record<number, string | null>>({});
@@ -102,13 +104,15 @@ export default function NewOrderPage() {
   const [promoNotice, setPromoNotice] = useState<string | null>(null);
   // Identity of the selection + code currently on screen: a superseded (older) quote's refusal must not clear a
   // newer code or selection.
-  const promoIdentity = JSON.stringify([promoInput.items, promoCode]);
+  const promoIdentity = JSON.stringify([promoInput.items, promoRevision]);
   const promoIdentityRef = useRef(promoIdentity);
   useEffect(() => {
     promoIdentityRef.current = promoIdentity;
   }, [promoIdentity]);
   const promoQuery = useQuery({
-    queryKey: ["orders", "quoteWithPromo", promoInput.items, promoCode],
+    // The code itself is never part of a cache key: an opaque per-component revision identifies it instead, and
+    // gcTime 0 drops the entry as soon as nothing shows it.
+    queryKey: ["orders", "quoteWithPromo", promoScope, promoRevision, promoInput.items],
     queryFn: async ({ signal }) => {
       const identity = promoIdentity;
       try {
@@ -119,6 +123,7 @@ export default function NewOrderPage() {
         if (!signal.aborted && identity === promoIdentityRef.current && safeError(err)?.reasonCode === "PROMO_NOT_APPLICABLE") {
           const notice = "The discount code does not apply to this selection and was removed.";
           setPromoCode(null);
+          setPromoRevision((current) => current + 1);
           setPromoNotice(notice);
           setPromoMessage(notice);
         }
@@ -140,7 +145,9 @@ export default function NewOrderPage() {
     setPromoNotice(null);
     // Rethrows the server's uniform refusal for the field to show.
     const result = await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: code });
-    queryClient.setQueryData(["orders", "quoteWithPromo", promoInput.items, code], result);
+    const revision = promoRevision + 1;
+    queryClient.setQueryData(["orders", "quoteWithPromo", promoScope, revision, promoInput.items], result);
+    setPromoRevision(revision);
     setPromoCode(code);
   };
   const promoTotalText =
@@ -159,6 +166,8 @@ export default function NewOrderPage() {
   };
   const removePromo = async () => {
     setPromoCode(null);
+    setPromoRevision((current) => current + 1);
+    queryClient.removeQueries({ queryKey: ["orders", "quoteWithPromo", promoScope] });
   };
   const quoteReason = quote.error ? safeError(quote.error)?.reasonCode : undefined;
   const quoteProblem = quote.error ? (quoteReason && REASON_MESSAGES[quoteReason]) || "The total could not be calculated. Please try again." : null;

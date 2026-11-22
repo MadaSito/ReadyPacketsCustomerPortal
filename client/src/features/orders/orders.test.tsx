@@ -302,7 +302,7 @@ describe("new order wizard", () => {
     });
     handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));
     const user = userEvent.setup();
-    const { container, location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    const { container, location, queryClient } = renderUi(<NewOrderPage />, { path: "/orders/new" });
     await screen.findByText("Synthetic A");
     await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
     await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -324,6 +324,8 @@ describe("new order wizard", () => {
     await waitFor(() => expect(screen.getByText(/Discount Synthetic promo applied\. New total/)).toBeInTheDocument());
     expect(calls.filter((c) => c.path === "orders.create")).toHaveLength(0);
     expect(location.history?.at(-1)).toBe("/orders/new");
+    // The code is never part of a cache key.
+    expect(JSON.stringify(queryClient.getQueryCache().getAll().map((query) => query.queryKey))).not.toContain("SAVE10");
     await expectNoAxeViolations(container);
     await user.click(screen.getByRole("button", { name: "Submit order" }));
     await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
