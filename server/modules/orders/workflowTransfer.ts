@@ -158,11 +158,17 @@ function walkKeys(value: unknown): void {
     const current = stack.pop();
     nodes += 1;
     if (nodes > TRANSFER_MAX_NODES) throw refuse("PACKAGE_TOO_LARGE", "The file has too many entries to import.");
-    if (Array.isArray(current)) stack.push(...current);
+    // Children are counted BEFORE they are enqueued (one at a time, never spread), so a very wide array or object
+    // ends in PACKAGE_TOO_LARGE instead of a RangeError from a huge argument list.
+    const enqueue = (child: unknown) => {
+      if (nodes + stack.length + 1 > TRANSFER_MAX_NODES) throw refuse("PACKAGE_TOO_LARGE", "The file has too many entries to import.");
+      stack.push(child);
+    };
+    if (Array.isArray(current)) for (const child of current) enqueue(child);
     else if (current !== null && typeof current === "object") {
       for (const key of Object.keys(current)) {
         if (FORBIDDEN_KEYS.has(key)) throw refuse("PACKAGE_FORBIDDEN_KEY", "The file contains a field name that is not allowed. Export the workflows again from the source installation.");
-        stack.push((current as Record<string, unknown>)[key]);
+        enqueue((current as Record<string, unknown>)[key]);
       }
     }
   }

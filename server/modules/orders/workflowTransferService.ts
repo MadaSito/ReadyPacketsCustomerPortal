@@ -129,7 +129,12 @@ function isDuplicateEntry(error: unknown): boolean {
 }
 
 export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
-  /** Published policies that gates may use (audience all/customer). Compliance absent ⇒ none (references stay unresolved). */
+  /**
+   * Published policies that gates may use (audience all/customer). Compliance absent ⇒ none (references stay unresolved).
+   * Called BEFORE the orders transaction opens: `listPublishedPolicies` uses its own connection, and calling it while
+   * holding a tx connection could self-deadlock a small pool. Gates on a draft are re-validated against published
+   * policies when the draft is published, so a policy withdrawn in between cannot reach a published workflow.
+   */
   async function localPolicies(): Promise<LocalPolicy[]> {
     const compliance = (deps.services as Partial<Services>).compliance as { listPublishedPolicies?: () => Promise<LocalPolicy[]> } | undefined;
     if (typeof compliance?.listPublishedPolicies !== "function") return [];
@@ -188,10 +193,10 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
     return matches;
   }
 
-  async function buildPreview(parsed: ParsedPackage, db: DbOrTx, tx: Tx): Promise<TransferPreview> {
+  async function buildPreview(parsed: ParsedPackage, local: LocalPolicy[], db: DbOrTx, tx: Tx): Promise<TransferPreview> {
     const { pkg } = parsed;
     const analysis = analysePackage(parsed);
-    const [local, rulesEnabled] = await Promise.all([localPolicies(), deps.rulesEnabled(tx)]);
+    const rulesEnabled = await deps.rulesEnabled(tx);
     const matches = matchReferences(pkg.references.policies, local);
     const resolution: GateResolution = new Map([...matches].map(([ref, policy]) => [ref, { localPolicyPublicId: policy.documentPublicId }]));
     const keys = analysis.keys.slice(0, TRANSFER_MAX_WORKFLOWS);
@@ -267,6 +272,7 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
     },
 
     async exportPackage(principal: SessionPrincipal, input: { selection: TransferSelection }): Promise<{ fileName: string; packageText: string }> {
+      const publishedPolicies = await localPolicies(); // outside the tx (see localPolicies)
       return deps.db.transaction(async (tx) => {
         await guard(principal, tx, "workflows.export");
         const wanted = "all" in input.selection ? null : [...new Set(input.selection.workflowKeys)];
@@ -303,7 +309,7 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
 
         // Local policy ids → portable references (slug, title, audience). Unknown ids still get a reference with an
         // empty slug, so the importing administrator must map them or remove the gate explicitly.
-        const local = new Map((await localPolicies()).map((policy) => [policy.documentPublicId, policy]));
+        const local = new Map(publishedPolicies.map((policy) => [policy.documentPublicId, policy]));
         const refOf = new Map<string, string>();
         const policies: PackagePolicy[] = [];
         const workflows = [...sources.values()]
@@ -361,10 +367,11 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
     },
 
     async preview(principal: SessionPrincipal, input: { packageText: string }): Promise<TransferPreview> {
+      const publishedPolicies = await localPolicies(); // outside the tx (see localPolicies)
       return deps.db.transaction(async (tx) => {
         await guard(principal, tx, "workflows.import");
         const parsed = parsePackage(input.packageText);
-        const preview = await buildPreview(parsed, tx, tx);
+        const preview = await buildPreview(parsed, publishedPolicies, tx, tx);
         await deps.audit.record(
           {
             category: "admin",
@@ -392,12 +399,15 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
     async applyImport(principal: SessionPrincipal, input: TransferApplyInput): Promise<TransferApplyResult> {
       const parsed = parsePackage(input.packageText);
       const hash = requestHash(parsed.digest, input);
+      const publishedPolicies = await localPolicies(); // outside the tx (see localPolicies)
       try {
         return await deps.db.transaction(async (tx) => {
           await guard(principal, tx, "workflows.import");
+          // A wrong digest is always blocking, even for a replay of an earlier successful request.
+          if (!parsed.digestMatches) throw validation("PACKAGE_BLOCKED", "The file was changed after it was exported. Export it again from the source installation.", { blockingCodes: ["DIGEST_MISMATCH"] });
           const replay = await replayOf(tx, principal, input.idempotencyKey, hash);
           if (replay) return replay;
-          const preview = await buildPreview(parsed, tx, tx);
+          const preview = await buildPreview(parsed, publishedPolicies, tx, tx);
           if (preview.blocking.length) throw validation("PACKAGE_BLOCKED", preview.blocking[0]!.message, { blockingCodes: preview.blocking.map((entry) => entry.code) });
 
           // Decisions: exactly one per workflow in the file.
@@ -416,7 +426,7 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
           // References: matched by slug unless mapped; every unresolved reference used by an applied workflow must be
           // mapped to a published all/customer policy, or its gates removed explicitly.
           const refs = new Map(preview.references.policies.map((policy) => [policy.ref, policy]));
-          const local = new Map((await localPolicies()).map((policy) => [policy.documentPublicId, policy]));
+          const local = new Map(publishedPolicies.map((policy) => [policy.documentPublicId, policy]));
           const resolution = new Map<string, { localPolicyPublicId: string } | { removeGates: true }>();
           for (const policy of preview.references.policies) if (policy.resolution.status === "matched") resolution.set(policy.ref, { localPolicyPublicId: policy.resolution.localPolicyPublicId });
           const mappedRefs = new Set<string>();
