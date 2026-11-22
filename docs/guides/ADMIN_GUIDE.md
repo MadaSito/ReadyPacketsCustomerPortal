@@ -36,6 +36,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Search engines](#search-engines)
 - [Feature status summary](#feature-status-summary)
 - [Increment 04 operating guides](#increment-04-operating-guides)
+- [Working on an order](#working-on-an-order)
 
 ## Increment 04 operating guides
 
@@ -53,10 +54,75 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Jobs and schedules](../../server/modules/jobs/ADMIN_GUIDE.md): inspect job attempts and manage schedules.
 - [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
 - [Webhooks console](./WEBHOOKS_CONSOLE.md): configure subscriptions and inbound endpoints, inspect deliveries, and rerun eligible failures.
+- [Webhooks administration](../integrations/WEBHOOKS_ADMIN_GUIDE.md): security defaults, signing, the redacted delivery log and step-up redelivery and reprocessing, in operator detail.
 - [Public API (inbound): keys, request log and replay](../../server/modules/publicApi/ADMIN_GUIDE.md): manage API access and scoped keys, inspect requests, and replay eligible operations.
 - [Application Protection](../../server/modules/protection/ADMIN_GUIDE.md): manage protection policy, offline country lookups and recovery.
 - [Sessions, sign-in log and access restrictions](../../server/modules/identity/ADMIN_GUIDE_SESSIONS.md): review sign-ins, manage sessions and configure access restrictions.
 - [Cookies and consent](../../server/modules/platform/ADMIN_GUIDE_CONSENT.md): configure the cookie banner, manage consent categories, and review the consent ledger.
+
+## Working on an order
+
+Open **Orders** and select an order (`/admin/orders/:orderId`). The header shows the order name, then the reference, the customer and the date it was placed, followed by badges for status, payment state and total. The actions are **Rename order**, **Change reference**, **Reassign customer**, **Invoice** and **Refund**, followed by the status actions. Each tab has its own address, so you can bookmark or share a link to it. On narrow screens the tab strip scrolls, and the remaining tabs move into a **More** menu.
+
+### Rename an order
+
+**Rename order** changes the order's display name (1–120 characters) and never its reference. Staff and administrators with `orders.rename` can use it. If someone else changed the order first, the rename is refused; reload the order and try again. Every rename is audited as `order.renamed` with the old and new name and appears in **Order history**.
+
+### Order history
+
+**Order history** replaces Activity. The left column lists every status transition (from → to, note, time and who made it). The right column lists the order's audited activity, such as renames, reference changes, reassignment, access grants, phase reviews, acceptances, file uploads and storage copies, production dispatches, stage-action runs and refunds. Filter by category and page through older entries. Customers see only their own subset, with staff shown as "ReadyPackets staff" and no IP addresses.
+
+### Automation
+
+On the **Automation** tab (`/admin/orders/:orderId/automation`), staff and administrators with `orders.production.trigger` can:
+
+- Preview the payload and start Phase I (`P101`) or Phase II (`P201`).
+- Start Phase III (`P301`) or Phase IV (`P401`), but only when their HTTPS URLs are configured under **Integrations → Production pipeline** (`/admin/integrations/production`). These later phases use the same `{customer_id, order_id, run_mode}` sent in `P101`.
+
+When a Start button is disabled, the card explains why: the pipeline is switched off, an endpoint URL is missing, `canon_version` is incomplete, or an earlier phase has not been delivered. Administrators also get a link to the pipeline settings.
+
+**This order's pipeline history** lists every dispatch with its phase, state, attempt count, last HTTP status, times and correlation ID.
+
+- **Retry** queues a fresh attempt for a failed or dead-lettered dispatch.
+- **Redeliver** re-sends a dispatch that was already delivered. It needs an administrator with `orders.production.redeliver`, fresh step-up, a reason and the typed word `REDELIVER`. It creates a new delivery marked as a redelivery, because the receiver may start a second production run.
+
+**Workflow stage actions** lists, for each step of the order's workflow, the enabled automations bound to it. Staff and administrators with `orders.automations.run` can select **Run actions** to run them for this order now. Every run appears in the run history. The automations engine must be switched on, and automations can never change an order's status or permissions.
+
+The **Webhook rules** note reminds you of three rules:
+
+- `P201` must carry the same `customer_id`, `order_id` and `run_mode` as `P101`.
+- The bundle scope manifest is a JSON string.
+- `P201` should not start before the Phase I artifacts exist.
+
+### SharePoint sync
+
+Open the **SharePoint sync** tab to inspect outbound copies of the order's uploads, saved recordings and converted audio. It is called **File sync** when no SharePoint or OneDrive connection is assigned to order files.
+
+- **Who can see it:** staff and administrators with `orders.read_all`. Customers never see this tab.
+- **What it shows:** totals for total, synced, in-progress and failed transfers. For each file, it shows the workflow phase, status, destination connection, target folder path and last update.
+- **Retry:** staff and administrators with `files.manage` can retry a failed transfer while its local source file still exists. No extra step-up is needed. Uncertain outcomes are never resent blindly.
+- **Copy log:** administrators with `storage.copies.read` can select **Open Copy log** to view `/admin/storage/copies?orderPublicId=<orderId>`. If no order-file destination is assigned yet, they can open **Storage connections** (`/admin/storage`) instead.
+
+You choose the destination folder in the workflow designer (**Storage folder**), either per upload or recording slot or as a workflow default. Otherwise the connection's assignment default applies. The available placeholders are `{customer_ref}`, `{order_ref}`, `{order_name}`, `{phase}`, `{slot}`, `{yyyy}` and `{mm}`. The designer shows an example path and refuses unsafe paths. Local storage remains the system of record, so a failed remote copy never blocks the customer.
+
+### Refunds
+
+The **Refund** tab shows each captured payment, its provider (Stripe, Square or manual), the amount already refunded or reserved, and the amount still available to refund. Staff without `payments.refund` can review this but cannot submit refunds.
+
+To issue a refund, you need an administrator account with `payments.refund` and fresh step-up verification. You also enter a written reason and an amount within the refundable balance, choose whether to notify the customer, and type `REFUND ORDER`.
+
+- **Stripe and Square:** ReadyPackets saves the refund before it contacts the provider. If the result cannot be confirmed, the refund shows as **unknown**. ReadyPackets then checks the provider again in the background and never sends the refund a second time. An unknown result does not mean the refund failed. Do not issue another refund for that payment, in the portal or in the provider's dashboard, while it is unresolved.
+- **Manual payments:** use **Record refund** only after you have refunded the customer outside ReadyPackets. Recording a refund does not move money.
+- **Customer notice:** if you chose to notify the customer, the notice is queued only after the provider confirms the refund or a manual refund is recorded. Mail delivery status is tracked separately from refund status.
+- **Referral rewards:** when an order's first paid invoice is refunded in full, any referral reward tied to it is flagged for manual review.
+
+### Acceptances
+
+When a workflow has a policy gate, the customer, and everyone with access to the order, must accept the policy. The gate applies either before they can work on the order or before a named phase can be submitted. Until then they can read the order but cannot upload, record, answer intake or submit. The server enforces this, not the page. Staff are not gated.
+
+The **Acceptances (n)** tab lists each record, for example "Signed by <name> using typed signature", with the time, policy and version. The source address is shown only to users with `sessions.read_all`. Each record keeps a fingerprint (SHA-256) of the exact policy text that was shown, so you can prove which version was accepted. Open a record to print its receipt.
+
+You add gates in the workflow designer: choose the policy, the gate point, the signature mode (checkbox or typed full name) and whether to ask again when the policy gets a new version.
 
 ## Storage copy log
 
