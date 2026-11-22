@@ -12,6 +12,7 @@ import {
   protectedProcedure,
   requireCapability,
   router,
+  staffProcedure,
 } from "../../trpc/trpc.js";
 import type { PaymentsModule } from "./index.js";
 import {
@@ -41,6 +42,27 @@ function requirePaymentsModule(services: Services): PaymentsModule {
 }
 
 const paymentsManageProc = adminProcedure.use(requireCapability("payments.manage"));
+const paymentsRefundProc = adminProcedure.use(requireCapability("payments.refund"));
+
+export const createOrderRefundInputSchema = z.strictObject({
+  orderPublicId: publicIdSchema,
+  paymentPublicId: publicIdSchema,
+  amountMinor: z.number().int().positive().max(1_000_000_000),
+  currency: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{3}$/u, "Currency must be a 3-letter ISO code."),
+  reason: z.string().min(1).max(1000),
+  reasonCode: z
+    .string()
+    .trim()
+    .regex(/^[A-Z][A-Z0-9_]{1,63}$/u, "Invalid refund reason code.")
+    .optional(),
+  sendCustomerNotice: z.boolean().default(false),
+  confirmationPhrase: z.string().max(64),
+  idempotencyKey: z.string().trim().min(8).max(128),
+});
 
 export const updatePaymentsSettingsInputSchema = z.strictObject({
   provider: z.enum(PAYMENT_PROVIDER_CHOICES),
@@ -186,6 +208,23 @@ export const paymentsRouter = router({
       )
       .mutation(({ ctx, input }) =>
         requirePaymentsModule(ctx.services).admin.reconcileNow(ctx.session, input),
+      ),
+  }),
+
+  /** Console Order Workspace — Refunds tab (`payments.refunds.{forOrder,create}`). */
+  refunds: router({
+    forOrder: staffProcedure
+      .meta({ rateLimit: "standard_browsing" })
+      .input(z.strictObject({ orderPublicId: publicIdSchema }))
+      .query(({ ctx, input }) =>
+        requirePaymentsModule(ctx.services).refunds.forOrder(ctx.session, input),
+      ),
+
+    create: paymentsRefundProc
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(createOrderRefundInputSchema)
+      .mutation(({ ctx, input }) =>
+        requirePaymentsModule(ctx.services).refunds.create(ctx.session, input),
       ),
   }),
 });

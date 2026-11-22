@@ -16,11 +16,16 @@ import type { ModuleDeps } from "../../../container.js";
 import { DomainError, validation } from "../../../core/errors.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import type {
+  CreateProviderRefundInput,
+  LookupProviderRefundInput,
   PaymentProviderAdapter,
+  PaymentRefundAdapter,
   ProviderCreateCheckoutInput,
   ProviderCreateCheckoutOutput,
   ProviderFetchedPayment,
   ProviderFetchPaymentInput,
+  ProviderRefundExecutionOutcome,
+  ProviderRefundLookupResult,
   ProviderVerifyWebhookInput,
   ProviderVerifyWebhookOutput,
 } from "./types.js";
@@ -258,11 +263,30 @@ export function createStripeProvider(
           : typeof asRecord(paymentIntentRaw)?.id === "string"
             ? (asRecord(paymentIntentRaw)!.id as string)
             : null;
+      const chargeRaw = dataObj?.charge;
+      const chargeId =
+        typeof chargeRaw === "string"
+          ? chargeRaw
+          : typeof asRecord(chargeRaw)?.id === "string"
+            ? (asRecord(chargeRaw)!.id as string)
+            : null;
 
-      let outcomeHint: "paid" | "failed" | "expired" | "ignored" = "ignored";
+      let outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "ignored" = "ignored";
       let providerRef: string | null = null;
       let providerOrderRef: string | null = paymentIntentId;
       let providerPaymentRef: string | null = paymentIntentId;
+      let providerRefundRef: string | null = null;
+      let refundPublicIdHint: string | null = null;
+      let refundStatusHint: "pending" | "succeeded" | "failed" | null = null;
+      let refundAmountMinorHint: number | null = null;
+      let refundCurrencyHint: string | null = null;
+
+      const parseRefundStatusHint = (raw: unknown): "pending" | "succeeded" | "failed" | null => {
+        if (raw === "succeeded") return "succeeded";
+        if (raw === "pending" || raw === "requires_action") return "pending";
+        if (raw === "failed" || raw === "canceled") return "failed";
+        return null;
+      };
 
       if (
         eventType === "checkout.session.completed" ||
@@ -280,6 +304,52 @@ export function createStripeProvider(
         outcomeHint = "failed";
         providerOrderRef = objectId;
         providerPaymentRef = objectId;
+      } else if (
+        eventType === "refund.created" ||
+        eventType === "refund.updated" ||
+        eventType === "charge.refund.updated"
+      ) {
+        outcomeHint = "refund_updated";
+        providerRefundRef = objectId && /^re_[A-Za-z0-9_]{6,120}$/u.test(objectId) ? objectId : null;
+        providerPaymentRef = paymentIntentId ?? chargeId;
+        const metaRefundId =
+          typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : null;
+        refundPublicIdHint =
+          metaRefundId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(metaRefundId) ? metaRefundId : null;
+        refundStatusHint = parseRefundStatusHint(dataObj?.status);
+        refundAmountMinorHint =
+          typeof dataObj?.amount === "number" && Number.isSafeInteger(dataObj.amount) && dataObj.amount > 0
+            ? dataObj.amount
+            : null;
+        refundCurrencyHint =
+          typeof dataObj?.currency === "string" && /^[a-zA-Z]{3}$/u.test(dataObj.currency)
+            ? dataObj.currency.toUpperCase()
+            : null;
+      } else if (eventType === "charge.refunded") {
+        outcomeHint = "refund_updated";
+        providerPaymentRef = paymentIntentId ?? objectId;
+        const refundsList = asRecord(dataObj?.refunds)?.data;
+        if (Array.isArray(refundsList) && refundsList.length > 0) {
+          const latestRefund = asRecord(refundsList[0]);
+          const rId = typeof latestRefund?.id === "string" ? latestRefund.id.trim() : null;
+          const rMeta = asRecord(latestRefund?.metadata);
+          const rPubId =
+            typeof rMeta?.refund_public_id === "string" ? rMeta.refund_public_id.trim() : null;
+          providerRefundRef = rId && /^re_[A-Za-z0-9_]{6,120}$/u.test(rId) ? rId : null;
+          refundPublicIdHint =
+            rPubId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(rPubId) ? rPubId : null;
+          refundStatusHint = parseRefundStatusHint(latestRefund?.status);
+          refundAmountMinorHint =
+            typeof latestRefund?.amount === "number" &&
+            Number.isSafeInteger(latestRefund.amount) &&
+            latestRefund.amount > 0
+              ? latestRefund.amount
+              : null;
+          refundCurrencyHint =
+            typeof latestRefund?.currency === "string" && /^[a-zA-Z]{3}$/u.test(latestRefund.currency)
+              ? latestRefund.currency.toUpperCase()
+              : null;
+        }
       }
 
       return {
@@ -293,6 +363,11 @@ export function createStripeProvider(
         providerRef,
         providerOrderRef,
         providerPaymentRef,
+        providerRefundRef,
+        refundPublicIdHint,
+        refundStatusHint,
+        refundAmountMinorHint,
+        refundCurrencyHint,
         outcomeHint,
       };
     },
@@ -395,6 +470,431 @@ export function createStripeProvider(
 
 export function createStripeProviderAdapter(deps: ModuleDeps): PaymentProviderAdapter {
   return createStripeProvider(() => {
+    const egress = (deps.services as Partial<typeof deps.services>).integrations?.egress;
+    if (!egress) {
+      throw new DomainError("UNAVAILABLE", "EGRESS_UNAVAILABLE", "Outbound egress policy is unavailable.");
+    }
+    return egress;
+  });
+}
+
+function parseStripeRefundObject(
+  rawObj: Record<string, unknown> | null,
+  expected: {
+    refundPublicId: string;
+    providerPaymentRef: string;
+    amountMinor: number;
+    currency: string;
+    requireMetadataMatch: boolean;
+  },
+): {
+  status: "succeeded" | "pending" | "failed" | "unknown";
+  providerRefundRef: string | null;
+  failureReasonCode: string | null;
+  settledAt: Date | null;
+} | null {
+  if (!rawObj) return null;
+  const refundId = typeof rawObj.id === "string" ? rawObj.id.trim() : "";
+  if (!/^re_[A-Za-z0-9_]{6,120}$/u.test(refundId)) return null;
+
+  const amount = typeof rawObj.amount === "number" ? rawObj.amount : -1;
+  const currency = typeof rawObj.currency === "string" ? rawObj.currency.toUpperCase() : "";
+  if (amount !== expected.amountMinor || currency !== expected.currency.toUpperCase()) {
+    return {
+      status: "unknown",
+      providerRefundRef: refundId,
+      failureReasonCode: "STRIPE_REFUND_AMOUNT_OR_CURRENCY_MISMATCH",
+      settledAt: null,
+    };
+  }
+
+  const piRaw = rawObj.payment_intent;
+  const piId =
+    typeof piRaw === "string"
+      ? piRaw
+      : typeof asRecord(piRaw)?.id === "string"
+        ? (asRecord(piRaw)!.id as string)
+        : null;
+  const chRaw = rawObj.charge;
+  const chId =
+    typeof chRaw === "string"
+      ? chRaw
+      : typeof asRecord(chRaw)?.id === "string"
+        ? (asRecord(chRaw)!.id as string)
+        : null;
+
+  if (expected.providerPaymentRef.startsWith("pi_") && piId && piId !== expected.providerPaymentRef) {
+    return {
+      status: "unknown",
+      providerRefundRef: refundId,
+      failureReasonCode: "STRIPE_REFUND_PAYMENT_MISMATCH",
+      settledAt: null,
+    };
+  }
+  if (expected.providerPaymentRef.startsWith("ch_") && chId && chId !== expected.providerPaymentRef) {
+    return {
+      status: "unknown",
+      providerRefundRef: refundId,
+      failureReasonCode: "STRIPE_REFUND_CHARGE_MISMATCH",
+      settledAt: null,
+    };
+  }
+
+  const metadata = asRecord(rawObj.metadata);
+  const metaRefundPubId =
+    typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : null;
+  if (expected.requireMetadataMatch && metaRefundPubId !== expected.refundPublicId) {
+    return null;
+  }
+  if (metaRefundPubId && metaRefundPubId !== expected.refundPublicId) {
+    return {
+      status: "unknown",
+      providerRefundRef: refundId,
+      failureReasonCode: "STRIPE_REFUND_METADATA_MISMATCH",
+      settledAt: null,
+    };
+  }
+
+  const rawStatus = typeof rawObj.status === "string" ? rawObj.status : "";
+  const createdSec = typeof rawObj.created === "number" ? rawObj.created : null;
+  const createdAt = createdSec && Number.isSafeInteger(createdSec) && createdSec > 0 ? new Date(createdSec * 1000) : null;
+  const failureReasonRaw =
+    typeof rawObj.failure_reason === "string" && /^[a-z0-9_]{2,64}$/iu.test(rawObj.failure_reason)
+      ? rawObj.failure_reason.toUpperCase()
+      : "STRIPE_REFUND_FAILED";
+
+  if (rawStatus === "succeeded") {
+    return {
+      status: "succeeded",
+      providerRefundRef: refundId,
+      failureReasonCode: null,
+      settledAt: createdAt,
+    };
+  }
+  if (rawStatus === "pending" || rawStatus === "requires_action") {
+    return {
+      status: "pending",
+      providerRefundRef: refundId,
+      failureReasonCode: null,
+      settledAt: null,
+    };
+  }
+  if (rawStatus === "failed" || rawStatus === "canceled") {
+    return {
+      status: "failed",
+      providerRefundRef: refundId,
+      failureReasonCode: failureReasonRaw,
+      settledAt: createdAt,
+    };
+  }
+  return {
+    status: "unknown",
+    providerRefundRef: refundId,
+    failureReasonCode: "STRIPE_REFUND_UNEXPECTED_STATUS",
+    settledAt: null,
+  };
+}
+
+export function createStripeRefundProvider(
+  getEgress: () => Pick<EgressPolicy, "fetchPinned">,
+): PaymentRefundAdapter<"stripe"> {
+  return {
+    provider: "stripe",
+
+    async createRefund(input: CreateProviderRefundInput): Promise<ProviderRefundExecutionOutcome> {
+      try {
+        assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      } catch {
+        return { outcome: "failed", failureReasonCode: "STRIPE_KEY_MODE_MISMATCH" };
+      }
+      if (
+        !/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(input.refundPublicId) ||
+        input.providerIdempotencyKey !== `rp-refund-${input.refundPublicId}` ||
+        !/^(pi|ch)_[A-Za-z0-9_]{6,120}$/u.test(input.providerPaymentRef) ||
+        !Number.isSafeInteger(input.amountMinor) ||
+        input.amountMinor <= 0 ||
+        !/^[A-Z]{3}$/u.test(input.currency)
+      ) {
+        return { outcome: "failed", failureReasonCode: "STRIPE_REFUND_INVALID_REQUEST" };
+      }
+
+      const params = new URLSearchParams();
+      if (input.providerPaymentRef.startsWith("pi_")) {
+        params.set("payment_intent", input.providerPaymentRef);
+      } else {
+        params.set("charge", input.providerPaymentRef);
+      }
+      params.set("amount", String(input.amountMinor));
+      params.set("reason", "requested_by_customer");
+      params.set("metadata[refund_public_id]", input.refundPublicId);
+      params.set("metadata[order_public_id]", input.orderPublicId);
+      params.set("metadata[invoice_public_id]", input.invoicePublicId);
+
+      let response;
+      try {
+        const egress = getEgress();
+        response = await egress.fetchPinned(new URL("/v1/refunds", STRIPE_API_ORIGIN), "stripe", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${input.credentials.secretKey}`,
+            "content-type": "application/x-www-form-urlencoded",
+            "idempotency-key": input.providerIdempotencyKey,
+            "stripe-version": STRIPE_API_VERSION,
+          },
+          body: params.toString(),
+          timeoutMs: STRIPE_TIMEOUT_MS,
+          maxRequestBytes: 8 * 1024,
+          maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+          requireAllowlistRule: true,
+          publicAddressesOnly: true,
+          expectedHostSuffixes: [STRIPE_API_HOST],
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
+        });
+      } catch {
+        // Network interruption, timeout, or egress failure after intent commit -> NEVER resend POST!
+        return { outcome: "unknown", failureReasonCode: "STRIPE_REFUND_TRANSPORT_UNKNOWN" };
+      }
+
+      if (
+        response.status === 408 ||
+        response.status === 409 ||
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        return { outcome: "unknown", failureReasonCode: "STRIPE_REFUND_UPSTREAM_UNKNOWN" };
+      }
+
+      let parsed: Record<string, unknown> | null;
+      try {
+        parsed = asRecord(JSON.parse(response.body.toString("utf8")));
+      } catch {
+        return { outcome: "unknown", failureReasonCode: "STRIPE_REFUND_INVALID_JSON" };
+      }
+
+      if (response.status >= 400 && response.status < 500) {
+        const errObj = asRecord(parsed?.error);
+        const errType = typeof errObj?.type === "string" ? errObj.type : "";
+        const errCode = typeof errObj?.code === "string" ? errObj.code : "";
+        if (errType === "idempotency_error" || errCode === "lock_timeout") {
+          return { outcome: "unknown", failureReasonCode: "STRIPE_REFUND_IDEMPOTENCY_IN_FLIGHT" };
+        }
+        const safeCode =
+          errCode && /^[a-z0-9_]{2,56}$/iu.test(errCode)
+            ? `STRIPE_${errCode.toUpperCase()}`
+            : "STRIPE_REFUND_REFUSED";
+        return { outcome: "failed", failureReasonCode: safeCode.slice(0, 64) };
+      }
+
+      const mapped = parseStripeRefundObject(parsed, {
+        refundPublicId: input.refundPublicId,
+        providerPaymentRef: input.providerPaymentRef,
+        amountMinor: input.amountMinor,
+        currency: input.currency,
+        requireMetadataMatch: false,
+      });
+      if (!mapped || mapped.status === "unknown") {
+        return {
+          outcome: "unknown",
+          failureReasonCode: mapped?.failureReasonCode ?? "STRIPE_REFUND_UNCONFIRMED",
+        };
+      }
+      if (mapped.status === "failed") {
+        return {
+          outcome: "failed",
+          failureReasonCode: mapped.failureReasonCode ?? "STRIPE_REFUND_FAILED",
+        };
+      }
+      return {
+        outcome: mapped.status,
+        providerRefundRef: mapped.providerRefundRef!,
+        settledAt: mapped.settledAt,
+      };
+    },
+
+    async lookupRefund(input: LookupProviderRefundInput): Promise<ProviderRefundLookupResult> {
+      try {
+        assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      } catch {
+        return {
+          status: "unknown",
+          providerRefundRef: input.providerRefundRef,
+          failureReasonCode: "STRIPE_KEY_MODE_MISMATCH",
+          settledAt: null,
+        };
+      }
+
+      let egress: Pick<EgressPolicy, "fetchPinned">;
+      try {
+        egress = getEgress();
+      } catch {
+        return {
+          status: "unknown",
+          providerRefundRef: input.providerRefundRef,
+          failureReasonCode: "EGRESS_UNAVAILABLE",
+          settledAt: null,
+        };
+      }
+
+      if (input.providerRefundRef && /^re_[A-Za-z0-9_]{6,120}$/u.test(input.providerRefundRef)) {
+        try {
+          const response = await egress.fetchPinned(
+            new URL(`/v1/refunds/${encodeURIComponent(input.providerRefundRef)}`, STRIPE_API_ORIGIN),
+            "stripe",
+            {
+              method: "GET",
+              headers: {
+                authorization: `Bearer ${input.credentials.secretKey}`,
+                "stripe-version": STRIPE_API_VERSION,
+              },
+              timeoutMs: STRIPE_TIMEOUT_MS,
+              maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+              requireAllowlistRule: true,
+              publicAddressesOnly: true,
+              expectedHostSuffixes: [STRIPE_API_HOST],
+              ...(input.signal ? { signal: input.signal } : {}),
+              ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
+            },
+          );
+          if (response.status === 404) {
+            return {
+              status: "absent",
+              providerRefundRef: null,
+              failureReasonCode: "STRIPE_REFUND_NOT_FOUND",
+              settledAt: null,
+            };
+          }
+          if (response.status < 200 || response.status >= 300) {
+            return {
+              status: "unknown",
+              providerRefundRef: input.providerRefundRef,
+              failureReasonCode: "STRIPE_LOOKUP_UPSTREAM_UNKNOWN",
+              settledAt: null,
+            };
+          }
+          const parsed = asRecord(JSON.parse(response.body.toString("utf8")));
+          const mapped = parseStripeRefundObject(parsed, {
+            refundPublicId: input.refundPublicId,
+            providerPaymentRef: input.providerPaymentRef,
+            amountMinor: input.amountMinor,
+            currency: input.currency,
+            requireMetadataMatch: false,
+          });
+          if (!mapped) {
+            return {
+              status: "unknown",
+              providerRefundRef: input.providerRefundRef,
+              failureReasonCode: "STRIPE_LOOKUP_INVALID_PAYLOAD",
+              settledAt: null,
+            };
+          }
+          return mapped;
+        } catch {
+          return {
+            status: "unknown",
+            providerRefundRef: input.providerRefundRef,
+            failureReasonCode: "STRIPE_LOOKUP_TRANSPORT_UNKNOWN",
+            settledAt: null,
+          };
+        }
+      }
+
+      if (!/^(pi|ch)_[A-Za-z0-9_]{6,120}$/u.test(input.providerPaymentRef)) {
+        return {
+          status: "unknown",
+          providerRefundRef: null,
+          failureReasonCode: "STRIPE_INVALID_PAYMENT_REF",
+          settledAt: null,
+        };
+      }
+
+      const queryKey = input.providerPaymentRef.startsWith("pi_") ? "payment_intent" : "charge";
+      try {
+        const listUrl = new URL(
+          `/v1/refunds?${queryKey}=${encodeURIComponent(input.providerPaymentRef)}&limit=25`,
+          STRIPE_API_ORIGIN,
+        );
+        const response = await egress.fetchPinned(listUrl, "stripe", {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${input.credentials.secretKey}`,
+            "stripe-version": STRIPE_API_VERSION,
+          },
+          timeoutMs: STRIPE_TIMEOUT_MS,
+          maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+          requireAllowlistRule: true,
+          publicAddressesOnly: true,
+          expectedHostSuffixes: [STRIPE_API_HOST],
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
+        });
+        if (response.status === 404) {
+          return {
+            status: "absent",
+            providerRefundRef: null,
+            failureReasonCode: "STRIPE_PAYMENT_NOT_FOUND",
+            settledAt: null,
+          };
+        }
+        if (response.status < 200 || response.status >= 300) {
+          return {
+            status: "unknown",
+            providerRefundRef: null,
+            failureReasonCode: "STRIPE_LOOKUP_LIST_UNKNOWN",
+            settledAt: null,
+          };
+        }
+        const parsed = asRecord(JSON.parse(response.body.toString("utf8")));
+        const list = parsed?.data;
+        if (!Array.isArray(list)) {
+          return {
+            status: "unknown",
+            providerRefundRef: null,
+            failureReasonCode: "STRIPE_LOOKUP_INVALID_LIST",
+            settledAt: null,
+          };
+        }
+        let matched: ProviderRefundLookupResult | null = null;
+        for (const item of list) {
+          const row = parseStripeRefundObject(asRecord(item), {
+            refundPublicId: input.refundPublicId,
+            providerPaymentRef: input.providerPaymentRef,
+            amountMinor: input.amountMinor,
+            currency: input.currency,
+            requireMetadataMatch: true,
+          });
+          if (!row) continue;
+          if (matched) {
+            return {
+              status: "unknown",
+              providerRefundRef: null,
+              failureReasonCode: "STRIPE_LOOKUP_AMBIGUOUS_MATCH",
+              settledAt: null,
+            };
+          }
+          matched = row;
+        }
+        if (matched) return matched;
+        return {
+          status: "absent",
+          providerRefundRef: null,
+          failureReasonCode: null,
+          settledAt: null,
+        };
+      } catch {
+        return {
+          status: "unknown",
+          providerRefundRef: null,
+          failureReasonCode: "STRIPE_LOOKUP_TRANSPORT_UNKNOWN",
+          settledAt: null,
+        };
+      }
+    },
+  };
+}
+
+export function createStripeRefundAdapter(deps: ModuleDeps): PaymentRefundAdapter<"stripe"> {
+  return createStripeRefundProvider(() => {
     const egress = (deps.services as Partial<typeof deps.services>).integrations?.egress;
     if (!egress) {
       throw new DomainError("UNAVAILABLE", "EGRESS_UNAVAILABLE", "Outbound egress policy is unavailable.");

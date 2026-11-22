@@ -2792,18 +2792,16 @@ export function createInvoicesService(deps: ModuleDeps) {
       });
     }
 
-    const [sumsMap, ledgerRefundRows] = await Promise.all([
-      computeLedgerSums(tx, [inv.id]),
-      tx
-        .select({
-          refundPublicId: complianceInvoiceRefunds.publicId,
-          amountMinor: complianceInvoiceRefunds.amountMinor,
-          idempotencyKey: complianceInvoiceRefunds.idempotencyKey,
-          providerEventId: complianceInvoiceRefunds.providerEventId,
-        })
-        .from(complianceInvoiceRefunds)
-        .where(eq(complianceInvoiceRefunds.paymentId, pmt.id)),
-    ]);
+    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const ledgerRefundRows = await tx
+      .select({
+        refundPublicId: complianceInvoiceRefunds.publicId,
+        amountMinor: complianceInvoiceRefunds.amountMinor,
+        idempotencyKey: complianceInvoiceRefunds.idempotencyKey,
+        providerEventId: complianceInvoiceRefunds.providerEventId,
+      })
+      .from(complianceInvoiceRefunds)
+      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
     const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
 
     return {
@@ -2890,10 +2888,8 @@ export function createInvoicesService(deps: ModuleDeps) {
       .limit(1);
 
     if (existingIdem) {
-      const [sumsMap, orderState] = await Promise.all([
-        computeLedgerSums(tx, [inv.id]),
-        computeOrderWorkspacePaymentState(tx, inv.orderPublicId),
-      ]);
+      const sumsMap = await computeLedgerSums(tx, [inv.id]);
+      const orderState = await computeOrderWorkspacePaymentState(tx, inv.orderPublicId);
       const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
       const invoiceStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,

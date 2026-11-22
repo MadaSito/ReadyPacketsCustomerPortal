@@ -6,32 +6,55 @@
 import "./settings.js";
 import type { ModuleDeps } from "../../container.js";
 import type { ModuleHealth, ModuleLifecycle } from "../../core/types.js";
+import { registerRefundReconciliation } from "../jobs/refundSupport.js";
 import { createPaymentReturnHttpRouter, createPaymentWebhooksHttpRouter } from "./http.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
-import { createStripeProvider, createStripeProviderAdapter, isAllowedStripeHostedUrl } from "./providers/stripe.js";
+import { createSquareRefundAdapter } from "./providers/square-refund.js";
+import {
+  createStripeProvider,
+  createStripeProviderAdapter,
+  createStripeRefundAdapter,
+  createStripeRefundProvider,
+  isAllowedStripeHostedUrl,
+} from "./providers/stripe.js";
 import type {
+  CreateProviderRefundInput,
+  LookupProviderRefundInput,
   PaymentProviderAdapter,
+  PaymentProviderAdapterDeps,
+  PaymentRefundAdapter,
   ProviderCreateCheckoutInput,
   ProviderCreateCheckoutOutput,
   ProviderCredentials,
   ProviderFetchedPayment,
   ProviderFetchPaymentInput,
+  ProviderRefundExecutionOutcome,
+  ProviderRefundLookupResult,
   ProviderVerifyWebhookInput,
   ProviderVerifyWebhookOutput,
 } from "./providers/types.js";
-import { paymentsRouter, type PaymentsRouter, updatePaymentsSettingsInputSchema } from "./router.js";
+import {
+  createOrderRefundInputSchema,
+  paymentsRouter,
+  type PaymentsRouter,
+  updatePaymentsSettingsInputSchema,
+} from "./router.js";
 import {
   ACTIVE_PAYMENT_PROVIDERS,
   type ActivePaymentProvider,
   PAYMENT_ATTEMPT_STATUSES,
   PAYMENT_ENVIRONMENT_MODES,
   PAYMENT_PROVIDER_CHOICES,
+  PAYMENT_REFUND_STATUSES,
   PAYMENT_WEBHOOK_STATUSES,
   type PaymentAttemptRow,
   paymentAttempts,
   type PaymentAttemptStatus,
   type PaymentEnvironmentMode,
   type PaymentProviderChoice,
+  type PaymentRefundRow,
+  paymentRefunds,
+  type PaymentRefundStatus,
   type PaymentWebhookEventRow,
   paymentWebhookEvents,
   type PaymentWebhookStatus,
@@ -43,13 +66,22 @@ import {
   type CancelAttemptResult,
   type CheckoutReturnPaths,
   type CheckoutStatusView,
+  type CreateOrderRefundInput,
+  type CreateOrderRefundResultView,
   createPaymentsService,
+  type OrderPaymentProviderKind,
+  type OrderPaymentRefundItemView,
+  type OrderRefundablePaymentView,
+  type OrderRefundWorkspaceView,
   type PaymentsAdminSettingsView,
   type PaymentsPublicConfigView,
   type PaymentsService,
   type PaymentsServiceOptions,
   type PaymentWebhookResult,
   type ReconcilePaymentsResult,
+  REFUND_CONFIRMATION_PHRASE,
+  type RefundExecutionKind,
+  type RefundExecutionLabel,
   type StartCheckoutOptions,
   type StartCheckoutResult,
   type UpdatePaymentsSettingsInput,
@@ -75,7 +107,22 @@ export function createPaymentsModule(
   deps: ModuleDeps,
   options?: PaymentsServiceOptions,
 ): PaymentsModule {
-  const service = createPaymentsService(deps, options);
+  const serviceRef: { current?: PaymentsService } = {};
+  const enqueueRefundReconciliation = registerRefundReconciliation(
+    deps.jobs,
+    (refundPublicId, context) => {
+      if (!serviceRef.current) {
+        return Promise.resolve("pending");
+      }
+      return serviceRef.current.reconcileProviderRefund(refundPublicId, context);
+    },
+  );
+  const service = createPaymentsService(deps, {
+    ...options,
+    enqueueRefundReconciliation:
+      options?.enqueueRefundReconciliation ?? enqueueRefundReconciliation,
+  });
+  serviceRef.current = service;
 
   deps.jobs.register(
     RECONCILE_PAYMENTS_JOB_TYPE,
@@ -145,20 +192,26 @@ export function createPaymentsModule(
 
 export {
   ACTIVE_PAYMENT_PROVIDERS,
+  createOrderRefundInputSchema,
   createPaymentReturnHttpRouter,
   createPaymentsService,
   createPaymentWebhooksHttpRouter,
   createSquareProviderAdapter,
+  createSquareRefundAdapter,
   createStripeProvider,
   createStripeProviderAdapter,
+  createStripeRefundAdapter,
+  createStripeRefundProvider,
   isAllowedStripeHostedUrl,
   isSafePortalReturnPath,
   maskLast4,
   PAYMENT_ATTEMPT_STATUSES,
   PAYMENT_ENVIRONMENT_MODES,
   PAYMENT_PROVIDER_CHOICES,
+  PAYMENT_REFUND_STATUSES,
   PAYMENT_WEBHOOK_STATUSES,
   paymentAttempts,
+  paymentRefunds,
   PAYMENTS_CONFIG_SETTING,
   PAYMENTS_SQUARE_ACCESS_TOKEN,
   PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY,
@@ -166,6 +219,7 @@ export {
   PAYMENTS_STRIPE_WEBHOOK_SECRET,
   paymentsRouter,
   paymentWebhookEvents,
+  REFUND_CONFIRMATION_PHRASE,
   updatePaymentsSettingsInputSchema,
 };
 
@@ -177,11 +231,23 @@ export type {
   CancelAttemptResult,
   CheckoutReturnPaths,
   CheckoutStatusView,
+  CreateOrderRefundInput,
+  CreateOrderRefundResultView,
+  CreateProviderRefundInput,
+  LookupProviderRefundInput,
+  OrderPaymentProviderKind,
+  OrderPaymentRefundItemView,
+  OrderRefundablePaymentView,
+  OrderRefundWorkspaceView,
   PaymentAttemptRow,
   PaymentAttemptStatus,
   PaymentEnvironmentMode,
   PaymentProviderAdapter,
+  PaymentProviderAdapterDeps,
   PaymentProviderChoice,
+  PaymentRefundAdapter,
+  PaymentRefundRow,
+  PaymentRefundStatus,
   PaymentsAdminSettingsView,
   PaymentsConfigValue,
   PaymentsPublicConfigView,
@@ -196,9 +262,13 @@ export type {
   ProviderCredentials,
   ProviderFetchedPayment,
   ProviderFetchPaymentInput,
+  ProviderRefundExecutionOutcome,
+  ProviderRefundLookupResult,
   ProviderVerifyWebhookInput,
   ProviderVerifyWebhookOutput,
   ReconcilePaymentsResult,
+  RefundExecutionKind,
+  RefundExecutionLabel,
   StartCheckoutOptions,
   StartCheckoutResult,
   UpdatePaymentsSettingsInput,

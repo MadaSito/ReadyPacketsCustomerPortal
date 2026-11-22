@@ -14,18 +14,31 @@
  *    hardcoded reviewed same-origin paths.
  */
 import { createHash } from "node:crypto";
-import { and, count, desc, eq, lt, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, lt, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
-import { ulid } from "../../core/ids.js";
-import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { getRequestContext } from "../../core/requestContext.js";
+import { ULID_PATTERN, ulid } from "../../core/ids.js";
+import type { DbOrTx, EnqueueOptions, SessionPrincipal, Tx } from "../../core/types.js";
 import { assertLiveActorInTx, runComplianceTx } from "../compliance/actorAuth.js";
-import { decodeIdCursor, encodeIdCursor } from "../compliance/domain.js";
+import { decodeIdCursor, encodeIdCursor, type InvoicePaymentState } from "../compliance/domain.js";
+import {
+  REFUND_NOTICE_TEMPLATE_KEY,
+  REFUND_RECONCILE_JOB,
+  type RefundReconcileContext,
+} from "../jobs/refundSupport.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { createSquareProviderAdapter } from "./providers/square.js";
-import { createStripeProviderAdapter } from "./providers/stripe.js";
-import type { PaymentProviderAdapter, ProviderCredentials, ProviderFetchedPayment } from "./providers/types.js";
+import { createSquareRefundAdapter } from "./providers/square-refund.js";
+import { createStripeProviderAdapter, createStripeRefundAdapter } from "./providers/stripe.js";
+import type {
+  PaymentProviderAdapter,
+  PaymentRefundAdapter,
+  ProviderCredentials,
+  ProviderFetchedPayment,
+  ProviderVerifyWebhookOutput,
+} from "./providers/types.js";
 import {
   type ActivePaymentProvider,
   paymentAttempts,
@@ -33,6 +46,9 @@ import {
   type PaymentAttemptStatus,
   type PaymentEnvironmentMode,
   type PaymentProviderChoice,
+  paymentRefunds,
+  type PaymentRefundRow,
+  type PaymentRefundStatus,
   paymentWebhookEvents,
   type PaymentWebhookEventRow,
   type PaymentWebhookStatus,
@@ -225,12 +241,136 @@ export interface AdminPaymentAttemptDetail {
   webhooks: AdminPaymentWebhookSummary[];
 }
 
+export type OrderPaymentProviderKind = "stripe" | "square" | "manual";
+export type RefundExecutionKind = "provider_refund" | "recorded_only";
+export type RefundExecutionLabel =
+  | "Stripe refund"
+  | "Square refund"
+  | "recorded only — no money is moved by the portal";
+export const REFUND_CONFIRMATION_PHRASE = "REFUND ORDER" as const;
+
+export interface OrderPaymentRefundItemView {
+  refundPublicId: string;
+  paymentPublicId: string;
+  provider: OrderPaymentProviderKind;
+  executionKind: RefundExecutionKind;
+  executionLabel: RefundExecutionLabel;
+  status: PaymentRefundStatus;
+  amountMinor: number;
+  currency: string;
+  reasonCode: string;
+  reason: string | null;
+  providerRefundRef: string | null;
+  sendCustomerNotice: boolean;
+  customerNoticeSentAt: string | null;
+  failureReasonCode: string | null;
+  createdAt: string;
+  settledAt: string | null;
+}
+
+export interface OrderRefundablePaymentView {
+  paymentPublicId: string;
+  invoicePublicId: string;
+  invoiceNumber: string;
+  invoiceStatus: "draft" | "issued" | "paid" | "void";
+  invoicePaymentState: InvoicePaymentState;
+  provider: OrderPaymentProviderKind;
+  executionKind: RefundExecutionKind;
+  executionLabel: RefundExecutionLabel;
+  providerPaymentRef: string | null;
+  capturedMinor: number;
+  refundedMinor: number;
+  reservedPendingOrUnknownMinor: number;
+  refundableMinor: number;
+  currency: string;
+  paidAt: string;
+  refunds: OrderPaymentRefundItemView[];
+}
+
+export interface OrderRefundWorkspaceView {
+  orderPublicId: string;
+  orderPaymentState: InvoicePaymentState | "none";
+  confirmationPhrase: "REFUND ORDER";
+  canIssueRefund: boolean;
+  payments: OrderRefundablePaymentView[];
+}
+
+export interface CreateOrderRefundInput {
+  orderPublicId: string;
+  paymentPublicId: string;
+  amountMinor: number;
+  currency: string;
+  reason: string;
+  reasonCode?: string | undefined;
+  sendCustomerNotice: boolean;
+  confirmationPhrase: string;
+  idempotencyKey: string;
+}
+
+export interface CreateOrderRefundResultView {
+  refundPublicId: string;
+  executionKind: RefundExecutionKind;
+  executionLabel: RefundExecutionLabel;
+  status: PaymentRefundStatus;
+  amountMinor: number;
+  currency: string;
+  provider: OrderPaymentProviderKind;
+  providerRefundRef: string | null;
+  failureReasonCode: string | null;
+  invoicePaymentState: InvoicePaymentState;
+  orderPaymentState: InvoicePaymentState | "none";
+  replayed: boolean;
+}
+
+export type EnqueueRefundReconciliationFn = (
+  refundPublicId: string,
+  tx: Tx,
+  options?: Pick<EnqueueOptions, "runAt" | "correlationId">,
+) => Promise<{ jobId: string }>;
+
 export interface PaymentsServiceOptions {
   stripeAdapter?: PaymentProviderAdapter;
   squareAdapter?: PaymentProviderAdapter;
+  stripeRefundAdapter?: PaymentRefundAdapter<"stripe">;
+  squareRefundAdapter?: PaymentRefundAdapter<"square">;
+  enqueueRefundReconciliation?: EnqueueRefundReconciliationFn;
 }
 
 const DEFAULT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
+const REFUND_RECONCILE_INITIAL_DELAY_MS = 2 * 60 * 1000;
+const CARD_PAN_LIKE_PATTERN = /\b(?:\d[ -]*?){13,19}\b/u;
+
+function formatRefundNoticeAmount(amountMinor: number, currency: string): string {
+  const code = currency.toUpperCase();
+  try {
+    const decimals = new Intl.NumberFormat("en-US", { style: "currency", currency: code }).resolvedOptions()
+      .maximumFractionDigits ?? 2;
+    const major = amountMinor / 10 ** decimals;
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: code,
+      currencyDisplay: "code",
+    }).format(major);
+  } catch {
+    return `${code} ${(amountMinor / 100).toFixed(2)}`;
+  }
+}
+
+function executionMetaForProvider(provider: OrderPaymentProviderKind): {
+  executionKind: RefundExecutionKind;
+  executionLabel: RefundExecutionLabel;
+} {
+  if (provider === "stripe") {
+    return { executionKind: "provider_refund", executionLabel: "Stripe refund" };
+  }
+  if (provider === "square") {
+    return { executionKind: "provider_refund", executionLabel: "Square refund" };
+  }
+  return {
+    executionKind: "recorded_only",
+    executionLabel: "recorded only — no money is moved by the portal",
+  };
+}
 
 function toAdminAttemptSummary(row: PaymentAttemptRow): AdminPaymentAttemptSummary {
   return {
@@ -287,12 +427,48 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     square: options?.squareAdapter ?? createSquareProviderAdapter(deps),
   };
 
+  const refundAdapters: Record<ActivePaymentProvider, PaymentRefundAdapter> = {
+    stripe: options?.stripeRefundAdapter ?? createStripeRefundAdapter(deps),
+    square:
+      options?.squareRefundAdapter ??
+      createSquareRefundAdapter({
+        egress: {
+          fetchPinned: (url, purpose, fetchOpts) =>
+            deps.services.integrations.egress.fetchPinned(url, purpose, fetchOpts),
+        },
+        clock: deps.clock,
+      }),
+  };
+
+  const enqueueRefundReconciliation: EnqueueRefundReconciliationFn =
+    options?.enqueueRefundReconciliation ??
+    ((refundPublicId, tx, enqueueOpts = {}) =>
+      deps.jobs.enqueue(
+        REFUND_RECONCILE_JOB,
+        { refundPublicId },
+        {
+          runAt: enqueueOpts.runAt,
+          correlationId: enqueueOpts.correlationId,
+          idempotencyKey: `refund-reconcile:${refundPublicId}`,
+          maxAttempts: 8,
+        },
+        tx,
+      ));
+
   function requireComplianceService() {
     const complianceSvc = (deps.services as Partial<typeof deps.services>).compliance;
     if (!complianceSvc) {
       throw new DomainError("UNAVAILABLE", "COMPLIANCE_UNAVAILABLE", "Invoice service is temporarily unavailable.");
     }
     return complianceSvc;
+  }
+
+  function requireOrdersService() {
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (!ordersSvc) {
+      throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order service is temporarily unavailable.");
+    }
+    return ordersSvc;
   }
 
   async function assertAdminPaymentsRead(principal: SessionPrincipal): Promise<void> {
@@ -732,7 +908,15 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
 
     // Enforces resource-level read authorization (throws NOT_FOUND for other customers; no existence oracle).
-    const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { principal });
+    let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
+    try {
+      invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { principal });
+    } catch (err) {
+      if (query.attemptPublicId && !query.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
+        throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+      throw err;
+    }
 
     let attemptRow: PaymentAttemptRow | null;
     if (query.attemptPublicId) {
@@ -823,10 +1007,18 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         targetInvoicePublicId = attRef.invoicePublicId;
       }
 
-      const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, {
-        principal: livePrincipal,
-        tx,
-      });
+      let invoice: Awaited<ReturnType<typeof complianceSvc.getInvoiceForCheckout>>;
+      try {
+        invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, {
+          principal: livePrincipal,
+          tx,
+        });
+      } catch (err) {
+        if (target.attemptPublicId && !target.invoicePublicId && err instanceof DomainError && err.code === "NOT_FOUND") {
+          throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        }
+        throw err;
+      }
       if (livePrincipal.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
@@ -1298,9 +1490,87 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         if (existing.status !== "retry_pending") {
           return {
             kind: "duplicate_done" as const,
-            booked: existing.status === "processed" && existing.reasonCode === "BOOKED",
+            booked:
+              existing.status === "processed" &&
+              (existing.reasonCode === "BOOKED" || existing.reasonCode === "REFUND_SUCCEEDED"),
           };
         }
+      }
+
+      const webhookPublicId = existing?.publicId ?? ulid(now.getTime());
+
+      if (verified.outcomeHint === "refund_updated") {
+        const refundRow = await findRefundForWebhookInTx(tx, input.provider, eventEnv, verified);
+        if (!refundRow) {
+          if (existing) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "ignored",
+                reasonCode: "REFUND_NOT_FOUND",
+                providerRefundRef: verified.providerRefundRef ?? existing.providerRefundRef,
+                processedAt: now,
+              })
+              .where(eq(paymentWebhookEvents.id, existing.id));
+          } else {
+            await tx.insert(paymentWebhookEvents).values({
+              publicId: webhookPublicId,
+              provider: input.provider,
+              environment: eventEnv,
+              externalEventId: verified.externalEventId,
+              eventType: verified.eventType,
+              payloadSha256,
+              attemptId: null,
+              attemptPublicId: verified.attemptPublicId,
+              refundId: null,
+              refundPublicId: verified.refundPublicIdHint ?? null,
+              providerRef: verified.providerRef,
+              providerOrderRef: verified.providerOrderRef,
+              providerPaymentRef: verified.providerPaymentRef,
+              providerRefundRef: verified.providerRefundRef ?? null,
+              status: "ignored",
+              reasonCode: "REFUND_NOT_FOUND",
+              occurredAt: verified.occurredAt,
+              receivedAt: now,
+              processedAt: now,
+            });
+          }
+          return { kind: "ignored" as const };
+        }
+
+        let webhookRowId: number;
+        if (existing) {
+          webhookRowId = existing.id;
+        } else {
+          const [ins] = await tx.insert(paymentWebhookEvents).values({
+            publicId: webhookPublicId,
+            provider: input.provider,
+            environment: eventEnv,
+            externalEventId: verified.externalEventId,
+            eventType: verified.eventType,
+            payloadSha256,
+            attemptId: refundRow.attemptId,
+            attemptPublicId: null,
+            refundId: refundRow.id,
+            refundPublicId: refundRow.publicId,
+            providerRef: verified.providerRef,
+            providerOrderRef: verified.providerOrderRef,
+            providerPaymentRef: refundRow.providerPaymentRef,
+            providerRefundRef: verified.providerRefundRef ?? refundRow.providerRefundRef,
+            status: "retry_pending",
+            reasonCode: "AWAITING_REFUND_VERIFICATION",
+            occurredAt: verified.occurredAt,
+            receivedAt: now,
+          });
+          webhookRowId = ins.insertId;
+        }
+
+        return {
+          kind: "verify_refund" as const,
+          webhookRowId,
+          refundRow,
+          duplicate: Boolean(existing),
+        };
       }
 
       const attempt = await findAttemptForWebhookInTx(tx, input.provider, config.mode, {
@@ -1308,8 +1578,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         providerRef: verified.providerRef,
         providerOrderRef: verified.providerOrderRef,
       });
-
-      const webhookPublicId = existing?.publicId ?? ulid(now.getTime());
 
       if (!attempt || verified.outcomeHint === "ignored") {
         if (existing) {
@@ -1496,6 +1764,19 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         booked: false,
         reasonCode: staged.status.toUpperCase(),
       };
+    }
+
+    if (staged.kind === "verify_refund") {
+      return verifyAndApplyRefundWebhook({
+        provider: input.provider,
+        credentials,
+        refundRow: staged.refundRow,
+        webhookRowId: staged.webhookRowId,
+        externalEventId: verified.externalEventId,
+        providerRefundRefHint: verified.providerRefundRef ?? null,
+        duplicate: staged.duplicate,
+        now,
+      });
     }
 
     const { attempt, webhookRowId } = staged;
@@ -2143,6 +2424,1299 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     return result;
   }
 
+  async function loadProviderRefundCredentials(
+    provider: ActivePaymentProvider,
+    environment: PaymentEnvironmentMode,
+    tx?: Tx,
+  ): Promise<ProviderCredentials> {
+    const config = await loadConfig(tx);
+    if (config.mode !== environment) {
+      throw conflict(
+        "REFUND_ENVIRONMENT_MISMATCH",
+        `Payment was captured in ${environment} mode while payments are currently configured in ${config.mode} mode.`,
+      );
+    }
+    if (provider === "stripe") {
+      const secretKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+      if (!secretKey) {
+        throw new DomainError(
+          "UNAVAILABLE",
+          "PAYMENT_PROVIDER_NOT_CONFIGURED",
+          "Stripe credentials are not configured.",
+        );
+      }
+      return { mode: environment, secretKey };
+    }
+    const accessToken = await readSecret(deps.settings, PAYMENTS_SQUARE_ACCESS_TOKEN, tx);
+    if (!accessToken) {
+      throw new DomainError(
+        "UNAVAILABLE",
+        "PAYMENT_PROVIDER_NOT_CONFIGURED",
+        "Square credentials are not configured.",
+      );
+    }
+    return {
+      mode: environment,
+      secretKey: accessToken,
+      ...(config.squareLocationId ? { squareLocationId: config.squareLocationId } : {}),
+    };
+  }
+
+  async function findRefundForWebhookInTx(
+    tx: Tx,
+    provider: ActivePaymentProvider,
+    environment: PaymentEnvironmentMode,
+    verified: Extract<ProviderVerifyWebhookOutput, { ok: true }>,
+  ): Promise<PaymentRefundRow | null> {
+    if (verified.refundPublicIdHint) {
+      const [byHint] = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(
+          and(
+            eq(paymentRefunds.provider, provider),
+            eq(paymentRefunds.environment, environment),
+            eq(paymentRefunds.publicId, verified.refundPublicIdHint),
+          ),
+        )
+        .limit(1);
+      if (byHint) return byHint;
+    }
+
+    if (verified.providerRefundRef) {
+      const [byRef] = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(
+          and(
+            eq(paymentRefunds.provider, provider),
+            eq(paymentRefunds.environment, environment),
+            eq(paymentRefunds.providerRefundRef, verified.providerRefundRef),
+          ),
+        )
+        .limit(1);
+      if (byRef) return byRef;
+    }
+
+    if (verified.providerPaymentRef) {
+      const candidates = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(
+          and(
+            eq(paymentRefunds.provider, provider),
+            eq(paymentRefunds.environment, environment),
+            eq(paymentRefunds.providerPaymentRef, verified.providerPaymentRef),
+          ),
+        )
+        .orderBy(desc(paymentRefunds.id))
+        .limit(5);
+      const nonTerminal = candidates.filter((c) => c.status === "pending" || c.status === "unknown");
+      if (nonTerminal.length === 1) {
+        return nonTerminal[0] ?? null;
+      }
+    }
+
+    return null;
+  }
+
+  async function settleProviderRefundSucceededInTx(
+    tx: Tx,
+    row: PaymentRefundRow,
+    providerRefundRef: string,
+    settledAt: Date,
+    verifiedWebhookEventId: string | null,
+  ): Promise<{
+    complianceRefundPublicId: string;
+    invoicePaymentState: InvoicePaymentState;
+    orderPaymentState: InvoicePaymentState | "none";
+  }> {
+    const now = deps.clock.now();
+    const complianceSvc = requireComplianceService();
+    const ordersSvc = requireOrdersService();
+    const decryptedReason = deps.crypto.decrypt(row.reasonEnc, `payment_refunds.reason:${row.publicId}`);
+
+    const booked = await complianceSvc.invoices.bookSettledRefundInTx(tx, {
+      invoiceId: row.invoiceId,
+      paymentId: row.compliancePaymentId,
+      amountMinor: row.amountMinor,
+      currency: row.currency,
+      reasonCode: row.reasonCode,
+      reference: providerRefundRef,
+      notes: decryptedReason,
+      refundedAt: settledAt,
+      recordedByUserId: row.requestedByUserId,
+      idempotencyKey: row.providerIdempotencyKey,
+      provider: row.provider,
+      providerEventId: row.publicId,
+    });
+
+    let noticeSentAt = row.customerNoticeSentAt;
+    if (row.sendCustomerNotice && !noticeSentAt) {
+      const orderRef =
+        typeof ordersSvc.getOrderRefById === "function"
+          ? await ordersSvc.getOrderRefById(row.orderId, tx)
+          : null;
+      if (orderRef) {
+        await deps.mailer.enqueue(
+          {
+            template: REFUND_NOTICE_TEMPLATE_KEY,
+            to: { userId: orderRef.ownerUserId },
+            vars: {
+              orderReference: orderRef.reference,
+              refundAmount: formatRefundNoticeAmount(row.amountMinor, row.currency),
+              refundReference: row.publicId,
+            },
+            idempotencyKey: `refund-notice:${row.publicId}`,
+          },
+          tx,
+        );
+        noticeSentAt = now;
+      }
+    }
+
+    await tx
+      .update(paymentRefunds)
+      .set({
+        status: "succeeded",
+        providerRefundRef,
+        complianceRefundPublicId: booked.complianceRefundPublicId,
+        verifiedWebhookEventId: verifiedWebhookEventId ?? row.verifiedWebhookEventId,
+        failureReasonCode: null,
+        customerNoticeSentAt: noticeSentAt,
+        settledAt: row.settledAt ?? settledAt,
+        lastReconciledAt: now,
+        version: row.version + 1,
+        updatedAt: now,
+      })
+      .where(eq(paymentRefunds.id, row.id));
+
+    if (!booked.duplicate) {
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "payment.refund.succeeded",
+          action: "create",
+          outcome: "completed",
+          actor: { role: "system" },
+          resource: { type: "payment_refund", publicId: row.publicId },
+          orderPublicId: row.orderPublicId,
+          attributes: {
+            order_public_id: row.orderPublicId,
+            invoice_public_id: row.invoicePublicId,
+            provider: row.provider,
+            execution_kind: "provider_refund",
+          },
+        },
+        tx,
+      );
+    }
+
+    return {
+      complianceRefundPublicId: booked.complianceRefundPublicId,
+      invoicePaymentState: booked.invoicePaymentState,
+      orderPaymentState: booked.orderPaymentState,
+    };
+  }
+
+  async function verifyAndApplyRefundWebhook(args: {
+    provider: ActivePaymentProvider;
+    credentials: ProviderCredentials;
+    refundRow: PaymentRefundRow;
+    webhookRowId: number;
+    externalEventId: string;
+    providerRefundRefHint: string | null;
+    duplicate: boolean;
+    now: Date;
+  }): Promise<PaymentWebhookResult> {
+    const refundAdapter = refundAdapters[args.provider];
+    const lookup = await refundAdapter.lookupRefund({
+      credentials: args.credentials,
+      refundPublicId: args.refundRow.publicId,
+      providerIdempotencyKey: args.refundRow.providerIdempotencyKey,
+      refundMarker: `ReadyPackets refund ${args.refundRow.publicId}`,
+      providerPaymentRef: args.refundRow.providerPaymentRef,
+      providerRefundRef: args.providerRefundRefHint ?? args.refundRow.providerRefundRef,
+      amountMinor: args.refundRow.amountMinor,
+      currency: args.refundRow.currency,
+    });
+
+    if (lookup.status === "unknown" || lookup.status === "absent") {
+      await deps.db
+        .update(paymentWebhookEvents)
+        .set({
+          status: "retry_pending",
+          reasonCode: (lookup.failureReasonCode ?? "REFUND_VERIFICATION_UNCONFIRMED").slice(0, 64),
+        })
+        .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+      return {
+        httpStatus: 503,
+        accepted: false,
+        duplicate: args.duplicate,
+        booked: false,
+        reasonCode: lookup.failureReasonCode ?? "REFUND_VERIFICATION_UNCONFIRMED",
+      };
+    }
+
+    return deps.db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(eq(paymentRefunds.id, args.refundRow.id))
+        .for("update")
+        .limit(1);
+      if (!locked) {
+        await tx
+          .update(paymentWebhookEvents)
+          .set({ status: "ignored", reasonCode: "REFUND_NOT_FOUND", processedAt: args.now })
+          .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+        return {
+          httpStatus: 200 as const,
+          accepted: true,
+          duplicate: args.duplicate,
+          booked: false,
+          reasonCode: "REFUND_NOT_FOUND",
+        };
+      }
+
+      const resolvedProviderRef =
+        lookup.providerRefundRef ?? args.providerRefundRefHint ?? locked.providerRefundRef;
+
+      if (lookup.status === "succeeded" && resolvedProviderRef) {
+        if (locked.status !== "succeeded") {
+          await settleProviderRefundSucceededInTx(
+            tx,
+            locked,
+            resolvedProviderRef,
+            lookup.settledAt ?? args.now,
+            args.externalEventId,
+          );
+        }
+        await tx
+          .update(paymentWebhookEvents)
+          .set({
+            status: "processed",
+            reasonCode: "REFUND_SUCCEEDED",
+            providerRefundRef: resolvedProviderRef,
+            processedAt: args.now,
+          })
+          .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+        return {
+          httpStatus: 200 as const,
+          accepted: true,
+          duplicate: args.duplicate,
+          booked: true,
+          reasonCode: "REFUND_SUCCEEDED",
+        };
+      }
+
+      if (lookup.status === "failed") {
+        const failureCode = (lookup.failureReasonCode ?? "PROVIDER_REFUND_FAILED").slice(0, 64);
+        if (locked.status !== "succeeded" && locked.status !== "failed") {
+          await tx
+            .update(paymentRefunds)
+            .set({
+              status: "failed",
+              providerRefundRef: resolvedProviderRef,
+              verifiedWebhookEventId: args.externalEventId,
+              failureReasonCode: failureCode,
+              settledAt: args.now,
+              lastReconciledAt: args.now,
+              version: locked.version + 1,
+              updatedAt: args.now,
+            })
+            .where(eq(paymentRefunds.id, locked.id));
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "payment.refund.failed",
+              action: "create",
+              outcome: "failed",
+              severity: "WARN",
+              reasonCode: failureCode,
+              actor: { role: "system" },
+              resource: { type: "payment_refund", publicId: locked.publicId },
+              orderPublicId: locked.orderPublicId,
+              attributes: {
+                order_public_id: locked.orderPublicId,
+                invoice_public_id: locked.invoicePublicId,
+                provider: locked.provider,
+              },
+            },
+            tx,
+          );
+        }
+        await tx
+          .update(paymentWebhookEvents)
+          .set({
+            status: "processed",
+            reasonCode: "REFUND_FAILED",
+            providerRefundRef: resolvedProviderRef,
+            processedAt: args.now,
+          })
+          .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+        return {
+          httpStatus: 200 as const,
+          accepted: true,
+          duplicate: args.duplicate,
+          booked: false,
+          reasonCode: "REFUND_FAILED",
+        };
+      }
+
+      // lookup.status === "pending"
+      if (locked.status === "pending" || locked.status === "unknown") {
+        await tx
+          .update(paymentRefunds)
+          .set({
+            status: "pending",
+            providerRefundRef: resolvedProviderRef,
+            verifiedWebhookEventId: args.externalEventId,
+            lastReconciledAt: args.now,
+            version: locked.version + 1,
+            updatedAt: args.now,
+          })
+          .where(eq(paymentRefunds.id, locked.id));
+      }
+      await tx
+        .update(paymentWebhookEvents)
+        .set({
+          status: "processed",
+          reasonCode: "REFUND_PENDING",
+          providerRefundRef: resolvedProviderRef,
+          processedAt: args.now,
+        })
+        .where(eq(paymentWebhookEvents.id, args.webhookRowId));
+      return {
+        httpStatus: 200 as const,
+        accepted: true,
+        duplicate: args.duplicate,
+        booked: false,
+        reasonCode: "REFUND_PENDING",
+      };
+    });
+  }
+
+  async function forOrderRefunds(
+    principal: SessionPrincipal,
+    input: { orderPublicId: string },
+  ): Promise<OrderRefundWorkspaceView> {
+    if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+      await deps.audit.record({
+        category: "security",
+        eventName: "authz.payments.denied",
+        action: "authorize",
+        outcome: "denied",
+        severity: "WARN",
+        reasonCode: "REMEDIATION_SESSION",
+        actor: { userId: principal.userId, role: principal.role },
+        resource: { type: "order_refunds", publicId: input.orderPublicId },
+      });
+      throw forbidden("REMEDIATION_SESSION");
+    }
+    if (principal.role !== "staff" && principal.role !== "admin") {
+      await deps.audit.record({
+        category: "security",
+        eventName: "authz.payments.denied",
+        action: "authorize",
+        outcome: "denied",
+        severity: "WARN",
+        reasonCode: "STAFF_REQUIRED",
+        actor: { userId: principal.userId, role: principal.role },
+        resource: { type: "order_refunds", publicId: input.orderPublicId },
+      });
+      throw forbidden("STAFF_REQUIRED");
+    }
+    if (!ULID_PATTERN.test(input.orderPublicId)) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
+    const ordersSvc = requireOrdersService();
+    // Enforces resource-level order scope; returns NOT_FOUND with zero existence oracle on unauthorized/missing orders.
+    await ordersSvc.assertCanReadOrder(principal, input.orderPublicId);
+
+    const canIssueRefund = roleHasCapability(principal.role, "payments.refund");
+    const complianceSvc = requireComplianceService();
+
+    const [ledgerSnapshot, providerRefundRows] = await Promise.all([
+      complianceSvc.invoices.listOrderPaymentsAndRefunds(input.orderPublicId, undefined, {
+        includeNotes: canIssueRefund,
+      }),
+      deps.db
+        .select()
+        .from(paymentRefunds)
+        .where(eq(paymentRefunds.orderPublicId, input.orderPublicId))
+        .orderBy(desc(paymentRefunds.createdAt), desc(paymentRefunds.id)),
+    ]);
+
+    const providerRefundsByPaymentId = new Map<number, PaymentRefundRow[]>();
+    for (const r of providerRefundRows) {
+      const list = providerRefundsByPaymentId.get(r.compliancePaymentId) ?? [];
+      list.push(r);
+      providerRefundsByPaymentId.set(r.compliancePaymentId, list);
+    }
+
+    const payments: OrderRefundablePaymentView[] = ledgerSnapshot.payments.map((pmt) => {
+      const providerKind: OrderPaymentProviderKind =
+        pmt.method === "provider_online" && (pmt.provider === "stripe" || pmt.provider === "square")
+          ? pmt.provider
+          : "manual";
+      const execMeta = executionMetaForProvider(providerKind);
+      const pRefundRows = providerRefundsByPaymentId.get(pmt.paymentId) ?? [];
+
+      const linkedComplianceRefundPublicIds = new Set<string>();
+      const providerRefundPublicIds = new Set<string>();
+      for (const r of pRefundRows) {
+        providerRefundPublicIds.add(r.publicId);
+        if (r.complianceRefundPublicId) {
+          linkedComplianceRefundPublicIds.add(r.complianceRefundPublicId);
+        }
+      }
+
+      const unlinkedLedgerRefunds = pmt.ledgerRefunds.filter(
+        (lr) =>
+          !linkedComplianceRefundPublicIds.has(lr.refundPublicId) &&
+          (!lr.providerEventId || !providerRefundPublicIds.has(lr.providerEventId)),
+      );
+
+      const unlinkedLedgerMinor = unlinkedLedgerRefunds.reduce((sum, lr) => sum + lr.amountMinor, 0);
+      const succeededProviderMinor = pRefundRows
+        .filter((r) => r.status === "succeeded")
+        .reduce((sum, r) => sum + r.amountMinor, 0);
+      const reservedPendingOrUnknownMinor = pRefundRows
+        .filter((r) => r.status === "pending" || r.status === "unknown")
+        .reduce((sum, r) => sum + r.amountMinor, 0);
+
+      const refundedMinor = unlinkedLedgerMinor + succeededProviderMinor;
+      const refundableMinor = Math.max(
+        0,
+        pmt.capturedMinor - refundedMinor - reservedPendingOrUnknownMinor,
+      );
+
+      const refundItems: OrderPaymentRefundItemView[] = [
+        ...pRefundRows.map((r): OrderPaymentRefundItemView => {
+          const itemMeta = executionMetaForProvider(r.provider);
+          return {
+            refundPublicId: r.publicId,
+            paymentPublicId: pmt.paymentPublicId,
+            provider: r.provider,
+            executionKind: itemMeta.executionKind,
+            executionLabel: itemMeta.executionLabel,
+            status: r.status,
+            amountMinor: r.amountMinor,
+            currency: r.currency,
+            reasonCode: r.reasonCode,
+            reason: canIssueRefund
+              ? deps.crypto.decrypt(r.reasonEnc, `payment_refunds.reason:${r.publicId}`)
+              : null,
+            providerRefundRef: r.providerRefundRef,
+            sendCustomerNotice: r.sendCustomerNotice,
+            customerNoticeSentAt: r.customerNoticeSentAt ? r.customerNoticeSentAt.toISOString() : null,
+            failureReasonCode: r.failureReasonCode,
+            createdAt: r.createdAt.toISOString(),
+            settledAt: r.settledAt ? r.settledAt.toISOString() : null,
+          };
+        }),
+        ...unlinkedLedgerRefunds.map((lr): OrderPaymentRefundItemView => {
+          const lrProvider: OrderPaymentProviderKind =
+            lr.provider === "stripe" || lr.provider === "square" ? lr.provider : "manual";
+          const lrMeta = executionMetaForProvider(lrProvider);
+          return {
+            refundPublicId: lr.refundPublicId,
+            paymentPublicId: pmt.paymentPublicId,
+            provider: lrProvider,
+            executionKind: lrMeta.executionKind,
+            executionLabel: lrMeta.executionLabel,
+            status: "succeeded",
+            amountMinor: lr.amountMinor,
+            currency: lr.currency,
+            reasonCode: lr.reasonCode,
+            reason: canIssueRefund ? lr.notes : null,
+            providerRefundRef: lrProvider === "manual" ? null : lr.reference,
+            sendCustomerNotice: false,
+            customerNoticeSentAt: null,
+            failureReasonCode: null,
+            createdAt: lr.refundedAt.toISOString(),
+            settledAt: lr.refundedAt.toISOString(),
+          };
+        }),
+      ].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+      return {
+        paymentPublicId: pmt.paymentPublicId,
+        invoicePublicId: pmt.invoicePublicId,
+        invoiceNumber: pmt.invoiceNumber,
+        invoiceStatus: pmt.invoiceStatus,
+        invoicePaymentState: pmt.invoicePaymentState,
+        provider: providerKind,
+        executionKind: execMeta.executionKind,
+        executionLabel: execMeta.executionLabel,
+        providerPaymentRef: providerKind === "manual" ? null : pmt.reference,
+        capturedMinor: pmt.capturedMinor,
+        refundedMinor,
+        reservedPendingOrUnknownMinor,
+        refundableMinor,
+        currency: pmt.currency,
+        paidAt: pmt.receivedAt.toISOString(),
+        refunds: refundItems,
+      };
+    });
+
+    return {
+      orderPublicId: input.orderPublicId,
+      orderPaymentState: ledgerSnapshot.orderPaymentState,
+      confirmationPhrase: REFUND_CONFIRMATION_PHRASE,
+      canIssueRefund,
+      payments,
+    };
+  }
+
+  async function createOrderRefund(
+    principal: SessionPrincipal,
+    input: CreateOrderRefundInput,
+  ): Promise<CreateOrderRefundResultView> {
+    if (input.confirmationPhrase !== REFUND_CONFIRMATION_PHRASE) {
+      throw validation(
+        "CONFIRMATION_PHRASE_MISMATCH",
+        `Type "${REFUND_CONFIRMATION_PHRASE}" exactly to confirm this refund.`,
+      );
+    }
+    const trimmedReason = input.reason.trim();
+    if (trimmedReason.length < 1 || trimmedReason.length > 1000) {
+      throw validation("REFUND_REASON_REQUIRED", "Enter a refund reason between 1 and 1,000 characters.");
+    }
+    for (let i = 0; i < trimmedReason.length; i += 1) {
+      const code = trimmedReason.charCodeAt(i);
+      if ((code >= 0 && code <= 8) || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) {
+        throw validation("INVALID_REFUND_REASON", "Refund reason contains unsupported control characters.");
+      }
+    }
+    if (CARD_PAN_LIKE_PATTERN.test(trimmedReason)) {
+      throw validation("CARD_DATA_FORBIDDEN", "Do not include payment card numbers in the refund reason.");
+    }
+    if (!Number.isSafeInteger(input.amountMinor) || input.amountMinor <= 0) {
+      throw validation("INVALID_REFUND_AMOUNT", "Refund amount must be a positive integer in minor units.");
+    }
+    const currency = input.currency.trim().toUpperCase();
+    if (!/^[A-Z]{3}$/u.test(currency)) {
+      throw validation("INVALID_CURRENCY", "Currency must be a 3-letter ISO code.");
+    }
+    const idempotencyKey = input.idempotencyKey.trim();
+    if (idempotencyKey.length < 8 || idempotencyKey.length > 128) {
+      throw validation("INVALID_IDEMPOTENCY_KEY", "Idempotency key must be between 8 and 128 characters.");
+    }
+    const reasonCode =
+      input.reasonCode && /^[A-Z][A-Z0-9_]{1,63}$/u.test(input.reasonCode)
+        ? input.reasonCode
+        : "ORDER_REFUND";
+
+    const complianceSvc = requireComplianceService();
+    const ordersSvc = requireOrdersService();
+    const correlationId = getRequestContext()?.correlationId;
+
+    const prepared = await runComplianceTx(
+      deps,
+      principal,
+      { type: "order_refund", publicId: input.orderPublicId },
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.refund");
+        const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+        const now = deps.clock.now();
+
+        await ordersSvc.assertCanWriteOrder(livePrincipal, input.orderPublicId, {
+          kind: "invoice",
+          tx,
+          forUpdate: true,
+        });
+
+        const locked = await complianceSvc.invoices.lockOrderPaymentForRefundInTx(tx, {
+          orderPublicId: input.orderPublicId,
+          paymentPublicId: input.paymentPublicId,
+        });
+
+        if (currency !== locked.currency) {
+          throw validation(
+            "CURRENCY_MISMATCH",
+            `Refund currency (${currency}) must match payment currency (${locked.currency}).`,
+          );
+        }
+
+        const providerKind: OrderPaymentProviderKind =
+          locked.method === "provider_online" &&
+          (locked.provider === "stripe" || locked.provider === "square")
+            ? locked.provider
+            : "manual";
+
+        if (providerKind === "manual") {
+          const manualIdemKey = `manual-refund:${locked.paymentId}:${idempotencyKey}`.slice(0, 128);
+          const alreadyManualRefunded = locked.ledgerRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
+          const existingManual = locked.ledgerRefunds.find((r) => r.idempotencyKey === manualIdemKey);
+
+          if (!existingManual && alreadyManualRefunded + input.amountMinor > locked.capturedMinor) {
+            throw conflict(
+              "REFUND_EXCEEDS_REFUNDABLE",
+              "Refund amount exceeds the remaining refundable balance on this payment.",
+            );
+          }
+
+          const booked = await complianceSvc.invoices.bookSettledRefundInTx(tx, {
+            invoiceId: locked.invoiceId,
+            paymentId: locked.paymentId,
+            amountMinor: input.amountMinor,
+            currency,
+            reasonCode,
+            reference: "RECORDED-ONLY",
+            notes: trimmedReason,
+            refundedAt: now,
+            recordedByUserId: liveActor.userId,
+            idempotencyKey: manualIdemKey,
+            provider: null,
+            providerEventId: null,
+          });
+
+          if (!booked.duplicate) {
+            await deps.audit.record(
+              {
+                category: "business",
+                eventName: "payment.refund.prepared",
+                action: "create",
+                outcome: "completed",
+                actor: { userId: liveActor.userId, role: liveActor.role },
+                resource: { type: "payment_refund", publicId: booked.complianceRefundPublicId },
+                orderPublicId: locked.orderPublicId,
+                attributes: {
+                  order_public_id: locked.orderPublicId,
+                  invoice_public_id: locked.invoicePublicId,
+                  provider: "manual",
+                  execution_kind: "recorded_only",
+                },
+              },
+              tx,
+            );
+
+            await deps.audit.record(
+              {
+                category: "business",
+                eventName: "payment.refund.succeeded",
+                action: "create",
+                outcome: "completed",
+                actor: { userId: liveActor.userId, role: liveActor.role },
+                resource: { type: "payment_refund", publicId: booked.complianceRefundPublicId },
+                orderPublicId: locked.orderPublicId,
+                attributes: {
+                  order_public_id: locked.orderPublicId,
+                  invoice_public_id: locked.invoicePublicId,
+                  provider: "manual",
+                  execution_kind: "recorded_only",
+                },
+              },
+              tx,
+            );
+
+            if (input.sendCustomerNotice) {
+              await deps.mailer.enqueue(
+                {
+                  template: REFUND_NOTICE_TEMPLATE_KEY,
+                  to: { userId: locked.ownerUserId },
+                  vars: {
+                    orderReference: locked.orderReference,
+                    refundAmount: formatRefundNoticeAmount(input.amountMinor, currency),
+                    refundReference: booked.complianceRefundPublicId,
+                  },
+                  idempotencyKey: `refund-notice:${booked.complianceRefundPublicId}`,
+                },
+                tx,
+              );
+            }
+          }
+
+          const manualMeta = executionMetaForProvider("manual");
+          return {
+            kind: "immediate" as const,
+            result: {
+              refundPublicId: booked.complianceRefundPublicId,
+              executionKind: manualMeta.executionKind,
+              executionLabel: manualMeta.executionLabel,
+              status: "succeeded" as const,
+              amountMinor: input.amountMinor,
+              currency,
+              provider: "manual" as const,
+              providerRefundRef: null,
+              failureReasonCode: null,
+              invoicePaymentState: booked.invoicePaymentState,
+              orderPaymentState: booked.orderPaymentState,
+              replayed: booked.duplicate,
+            },
+          };
+        }
+
+        // Provider refund branch ("stripe" | "square"): lock existing payment_refunds rows FOR UPDATE.
+        const existingProviderRefunds = await tx
+          .select()
+          .from(paymentRefunds)
+          .where(eq(paymentRefunds.compliancePaymentId, locked.paymentId))
+          .orderBy(asc(paymentRefunds.id))
+          .for("update");
+
+        const duplicateRow = existingProviderRefunds.find((r) => r.idempotencyKey === idempotencyKey);
+        if (duplicateRow) {
+          const dupMeta = executionMetaForProvider(duplicateRow.provider);
+          const ledgerSnap = await complianceSvc.invoices.listOrderPaymentsAndRefunds(
+            locked.orderPublicId,
+            tx,
+            { includeNotes: false },
+          );
+          const pmtSnap = ledgerSnap.payments.find((p) => p.paymentId === locked.paymentId);
+          return {
+            kind: "immediate" as const,
+            result: {
+              refundPublicId: duplicateRow.publicId,
+              executionKind: dupMeta.executionKind,
+              executionLabel: dupMeta.executionLabel,
+              status: duplicateRow.status,
+              amountMinor: duplicateRow.amountMinor,
+              currency: duplicateRow.currency,
+              provider: duplicateRow.provider,
+              providerRefundRef: duplicateRow.providerRefundRef,
+              failureReasonCode: duplicateRow.failureReasonCode,
+              invoicePaymentState: pmtSnap?.invoicePaymentState ?? locked.invoicePaymentState,
+              orderPaymentState: ledgerSnap.orderPaymentState,
+              replayed: true,
+            },
+          };
+        }
+
+        if (existingProviderRefunds.some((r) => r.status === "unknown")) {
+          throw conflict(
+            "REFUND_OUTCOME_UNKNOWN_PENDING",
+            "A previous refund on this payment has an unconfirmed provider outcome. Confirm or reconcile it before submitting another refund.",
+          );
+        }
+
+        const linkedIds = new Set(
+          existingProviderRefunds
+            .filter((r) => r.status === "succeeded" && r.complianceRefundPublicId !== null)
+            .map((r) => r.complianceRefundPublicId!),
+        );
+        const providerRowPubIds = new Set(existingProviderRefunds.map((r) => r.publicId));
+        const unlinkedLedgerMinor = locked.ledgerRefunds
+          .filter(
+            (lr) =>
+              !linkedIds.has(lr.refundPublicId) &&
+              (!lr.providerEventId || !providerRowPubIds.has(lr.providerEventId)),
+          )
+          .reduce((sum, lr) => sum + lr.amountMinor, 0);
+
+        const activeProviderMinor = existingProviderRefunds
+          .filter((r) => r.status === "pending" || r.status === "succeeded" || r.status === "unknown")
+          .reduce((sum, r) => sum + r.amountMinor, 0);
+
+        const refundableMinor = Math.max(
+          0,
+          locked.capturedMinor - unlinkedLedgerMinor - activeProviderMinor,
+        );
+        if (input.amountMinor > refundableMinor) {
+          throw conflict(
+            "REFUND_EXCEEDS_REFUNDABLE",
+            "Refund amount exceeds the remaining refundable balance on this payment.",
+          );
+        }
+
+        let matchedAttempt: PaymentAttemptRow | undefined;
+        if (locked.providerEventId && ULID_PATTERN.test(locked.providerEventId)) {
+          const [att] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(
+              or(
+                eq(paymentAttempts.compliancePaymentPublicId, locked.paymentPublicId),
+                eq(paymentAttempts.publicId, locked.providerEventId),
+              ),
+            )
+            .limit(1);
+          matchedAttempt = att;
+        } else {
+          const [att] = await tx
+            .select()
+            .from(paymentAttempts)
+            .where(eq(paymentAttempts.compliancePaymentPublicId, locked.paymentPublicId))
+            .limit(1);
+          matchedAttempt = att;
+        }
+
+        const config = await loadConfig(tx);
+        const environment: PaymentEnvironmentMode = matchedAttempt?.environment ?? config.mode;
+        const credentials = await loadProviderRefundCredentials(providerKind, environment, tx);
+        const providerPaymentRef = matchedAttempt?.providerPaymentRef ?? locked.providerReference;
+
+        const refundPublicId = ulid(now.getTime());
+        const providerIdempotencyKey = `rp-refund-${refundPublicId}`;
+        const refundMarker = `ReadyPackets refund ${refundPublicId}`;
+        const reasonEnc = deps.crypto.encrypt(trimmedReason, `payment_refunds.reason:${refundPublicId}`);
+
+        const enqueued = await enqueueRefundReconciliation(refundPublicId, tx, {
+          runAt: new Date(now.getTime() + REFUND_RECONCILE_INITIAL_DELAY_MS),
+          ...(correlationId ? { correlationId } : {}),
+        });
+
+        const [ins] = await tx.insert(paymentRefunds).values({
+          publicId: refundPublicId,
+          orderId: locked.orderId,
+          orderPublicId: locked.orderPublicId,
+          invoiceId: locked.invoiceId,
+          invoicePublicId: locked.invoicePublicId,
+          compliancePaymentId: locked.paymentId,
+          compliancePaymentPublicId: locked.paymentPublicId,
+          attemptId: matchedAttempt?.id ?? null,
+          provider: providerKind,
+          environment,
+          status: "pending",
+          amountMinor: input.amountMinor,
+          currency,
+          reasonCode,
+          reasonEnc,
+          requestedByUserId: liveActor.userId,
+          idempotencyKey,
+          providerIdempotencyKey,
+          providerPaymentRef,
+          providerRefundRef: null,
+          complianceRefundPublicId: null,
+          sendCustomerNotice: input.sendCustomerNotice,
+          customerNoticeSentAt: null,
+          reconcileJobId: enqueued.jobId,
+          verifiedWebhookEventId: null,
+          failureReasonCode: null,
+          version: 1,
+          settledAt: null,
+          lastReconciledAt: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payment.refund.prepared",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: liveActor.userId, role: liveActor.role },
+            resource: { type: "payment_refund", publicId: refundPublicId },
+            orderPublicId: locked.orderPublicId,
+            attributes: {
+              order_public_id: locked.orderPublicId,
+              invoice_public_id: locked.invoicePublicId,
+              provider: providerKind,
+              execution_kind: "provider_refund",
+            },
+          },
+          tx,
+        );
+
+        return {
+          kind: "execute_provider" as const,
+          refundRowId: ins.insertId,
+          refundPublicId,
+          provider: providerKind,
+          credentials,
+          providerIdempotencyKey,
+          refundMarker,
+          providerPaymentRef,
+          orderPublicId: locked.orderPublicId,
+          invoicePublicId: locked.invoicePublicId,
+          invoiceNumber: locked.invoiceNumber,
+          amountMinor: input.amountMinor,
+          currency,
+          actorUserId: liveActor.userId,
+          actorRole: liveActor.role,
+        };
+      },
+    );
+
+    if (prepared.kind === "immediate") {
+      return prepared.result;
+    }
+
+    // Phase 2: Execute provider refund OUTSIDE any database transaction.
+    // On ambiguous / network error ("unknown"), NEVER resend POST automatically!
+    const refundAdapter = refundAdapters[prepared.provider];
+    const execOutcome = await refundAdapter.createRefund({
+      credentials: prepared.credentials,
+      refundPublicId: prepared.refundPublicId,
+      providerIdempotencyKey: prepared.providerIdempotencyKey,
+      refundMarker: prepared.refundMarker,
+      orderPublicId: prepared.orderPublicId,
+      invoicePublicId: prepared.invoicePublicId,
+      invoiceNumber: prepared.invoiceNumber,
+      providerPaymentRef: prepared.providerPaymentRef,
+      amountMinor: prepared.amountMinor,
+      currency: prepared.currency,
+    });
+
+    // Phase 3: Persist provider execution outcome in a short transaction.
+    return deps.db.transaction(async (tx) => {
+      const now = deps.clock.now();
+      const [lockedRow] = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(eq(paymentRefunds.id, prepared.refundRowId))
+        .for("update")
+        .limit(1);
+      if (!lockedRow) {
+        throw notFound("REFUND_NOT_FOUND");
+      }
+
+      const execMeta = executionMetaForProvider(lockedRow.provider);
+
+      // If a concurrent verified webhook already settled this refund while the HTTP call was returning, preserve it!
+      if (lockedRow.status === "succeeded" || lockedRow.status === "failed") {
+        const ledgerSnap = await complianceSvc.invoices.listOrderPaymentsAndRefunds(
+          lockedRow.orderPublicId,
+          tx,
+          { includeNotes: false },
+        );
+        const pmtSnap = ledgerSnap.payments.find((p) => p.paymentId === lockedRow.compliancePaymentId);
+        return {
+          refundPublicId: lockedRow.publicId,
+          executionKind: execMeta.executionKind,
+          executionLabel: execMeta.executionLabel,
+          status: lockedRow.status,
+          amountMinor: lockedRow.amountMinor,
+          currency: lockedRow.currency,
+          provider: lockedRow.provider,
+          providerRefundRef: lockedRow.providerRefundRef,
+          failureReasonCode: lockedRow.failureReasonCode,
+          invoicePaymentState: pmtSnap?.invoicePaymentState ?? "paid",
+          orderPaymentState: ledgerSnap.orderPaymentState,
+          replayed: false,
+        };
+      }
+
+      if (execOutcome.outcome === "succeeded") {
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payment.refund.sent",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: prepared.actorUserId, role: prepared.actorRole },
+            resource: { type: "payment_refund", publicId: lockedRow.publicId },
+            orderPublicId: lockedRow.orderPublicId,
+            attributes: {
+              order_public_id: lockedRow.orderPublicId,
+              invoice_public_id: lockedRow.invoicePublicId,
+              provider: lockedRow.provider,
+            },
+          },
+          tx,
+        );
+
+        const settled = await settleProviderRefundSucceededInTx(
+          tx,
+          lockedRow,
+          execOutcome.providerRefundRef,
+          execOutcome.settledAt ?? now,
+          null,
+        );
+
+        return {
+          refundPublicId: lockedRow.publicId,
+          executionKind: execMeta.executionKind,
+          executionLabel: execMeta.executionLabel,
+          status: "succeeded" as const,
+          amountMinor: lockedRow.amountMinor,
+          currency: lockedRow.currency,
+          provider: lockedRow.provider,
+          providerRefundRef: execOutcome.providerRefundRef,
+          failureReasonCode: null,
+          invoicePaymentState: settled.invoicePaymentState,
+          orderPaymentState: settled.orderPaymentState,
+          replayed: false,
+        };
+      }
+
+      if (execOutcome.outcome === "pending") {
+        await tx
+          .update(paymentRefunds)
+          .set({
+            status: "pending",
+            providerRefundRef: execOutcome.providerRefundRef,
+            version: lockedRow.version + 1,
+            updatedAt: now,
+          })
+          .where(eq(paymentRefunds.id, lockedRow.id));
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payment.refund.sent",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: prepared.actorUserId, role: prepared.actorRole },
+            resource: { type: "payment_refund", publicId: lockedRow.publicId },
+            orderPublicId: lockedRow.orderPublicId,
+            attributes: {
+              order_public_id: lockedRow.orderPublicId,
+              invoice_public_id: lockedRow.invoicePublicId,
+              provider: lockedRow.provider,
+            },
+          },
+          tx,
+        );
+
+        const ledgerSnap = await complianceSvc.invoices.listOrderPaymentsAndRefunds(
+          lockedRow.orderPublicId,
+          tx,
+          { includeNotes: false },
+        );
+        const pmtSnap = ledgerSnap.payments.find((p) => p.paymentId === lockedRow.compliancePaymentId);
+        return {
+          refundPublicId: lockedRow.publicId,
+          executionKind: execMeta.executionKind,
+          executionLabel: execMeta.executionLabel,
+          status: "pending" as const,
+          amountMinor: lockedRow.amountMinor,
+          currency: lockedRow.currency,
+          provider: lockedRow.provider,
+          providerRefundRef: execOutcome.providerRefundRef,
+          failureReasonCode: null,
+          invoicePaymentState: pmtSnap?.invoicePaymentState ?? "paid",
+          orderPaymentState: ledgerSnap.orderPaymentState,
+          replayed: false,
+        };
+      }
+
+      if (execOutcome.outcome === "failed") {
+        const failCode = execOutcome.failureReasonCode.slice(0, 64);
+        await tx
+          .update(paymentRefunds)
+          .set({
+            status: "failed",
+            failureReasonCode: failCode,
+            settledAt: now,
+            version: lockedRow.version + 1,
+            updatedAt: now,
+          })
+          .where(eq(paymentRefunds.id, lockedRow.id));
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payment.refund.failed",
+            action: "create",
+            outcome: "failed",
+            severity: "WARN",
+            reasonCode: failCode,
+            actor: { userId: prepared.actorUserId, role: prepared.actorRole },
+            resource: { type: "payment_refund", publicId: lockedRow.publicId },
+            orderPublicId: lockedRow.orderPublicId,
+            attributes: {
+              order_public_id: lockedRow.orderPublicId,
+              invoice_public_id: lockedRow.invoicePublicId,
+              provider: lockedRow.provider,
+            },
+          },
+          tx,
+        );
+
+        const ledgerSnap = await complianceSvc.invoices.listOrderPaymentsAndRefunds(
+          lockedRow.orderPublicId,
+          tx,
+          { includeNotes: false },
+        );
+        const pmtSnap = ledgerSnap.payments.find((p) => p.paymentId === lockedRow.compliancePaymentId);
+        return {
+          refundPublicId: lockedRow.publicId,
+          executionKind: execMeta.executionKind,
+          executionLabel: execMeta.executionLabel,
+          status: "failed" as const,
+          amountMinor: lockedRow.amountMinor,
+          currency: lockedRow.currency,
+          provider: lockedRow.provider,
+          providerRefundRef: null,
+          failureReasonCode: failCode,
+          invoicePaymentState: pmtSnap?.invoicePaymentState ?? "paid",
+          orderPaymentState: ledgerSnap.orderPaymentState,
+          replayed: false,
+        };
+      }
+
+      // execOutcome.outcome === "unknown": NEVER resend POST automatically; leave reserved for reconciliation.
+      const unknownCode = (
+        execOutcome.outcome === "unknown" ? execOutcome.failureReasonCode : "REFUND_OUTCOME_UNKNOWN"
+      ).slice(0, 64);
+      await tx
+        .update(paymentRefunds)
+        .set({
+          status: "unknown",
+          failureReasonCode: unknownCode,
+          version: lockedRow.version + 1,
+          updatedAt: now,
+        })
+        .where(eq(paymentRefunds.id, lockedRow.id));
+
+      await deps.audit.record(
+        {
+          category: "integration",
+          eventName: "payment.refund.unknown",
+          action: "create",
+          outcome: "unknown",
+          severity: "WARN",
+          reasonCode: unknownCode,
+          actor: { userId: prepared.actorUserId, role: prepared.actorRole },
+          resource: { type: "payment_refund", publicId: lockedRow.publicId },
+          orderPublicId: lockedRow.orderPublicId,
+          attributes: {
+            order_public_id: lockedRow.orderPublicId,
+            invoice_public_id: lockedRow.invoicePublicId,
+            provider: lockedRow.provider,
+          },
+        },
+        tx,
+      );
+
+      const ledgerSnap = await complianceSvc.invoices.listOrderPaymentsAndRefunds(
+        lockedRow.orderPublicId,
+        tx,
+        { includeNotes: false },
+      );
+      const pmtSnap = ledgerSnap.payments.find((p) => p.paymentId === lockedRow.compliancePaymentId);
+      return {
+        refundPublicId: lockedRow.publicId,
+        executionKind: execMeta.executionKind,
+        executionLabel: execMeta.executionLabel,
+        status: "unknown" as const,
+        amountMinor: lockedRow.amountMinor,
+        currency: lockedRow.currency,
+        provider: lockedRow.provider,
+        providerRefundRef: null,
+        failureReasonCode: unknownCode,
+        invoicePaymentState: pmtSnap?.invoicePaymentState ?? "paid",
+        orderPaymentState: ledgerSnap.orderPaymentState,
+        replayed: false,
+      };
+    });
+  }
+
+  /**
+   * Durable job handler (`compliance.refund.reconcile`) registered via `registerRefundReconciliation`.
+   * Performs ONLY read-only `lookupRefund` queries against the provider (NEVER submits a POST refund),
+   * and fences finalization with `context.assertStillOwned(tx)` BEFORE locking `payment_refunds`.
+   */
+  async function reconcileProviderRefund(
+    refundPublicId: string,
+    context: RefundReconcileContext,
+  ): Promise<"settled" | "pending"> {
+    const [initialRow] = await deps.db
+      .select()
+      .from(paymentRefunds)
+      .where(eq(paymentRefunds.publicId, refundPublicId))
+      .limit(1);
+
+    if (!initialRow || initialRow.status === "succeeded" || initialRow.status === "failed") {
+      return "settled";
+    }
+
+    let credentials: ProviderCredentials;
+    try {
+      credentials = await loadProviderRefundCredentials(initialRow.provider, initialRow.environment);
+    } catch {
+      return "pending";
+    }
+
+    const refundAdapter = refundAdapters[initialRow.provider];
+    const lookup = await refundAdapter.lookupRefund({
+      credentials,
+      refundPublicId: initialRow.publicId,
+      providerIdempotencyKey: initialRow.providerIdempotencyKey,
+      refundMarker: `ReadyPackets refund ${initialRow.publicId}`,
+      providerPaymentRef: initialRow.providerPaymentRef,
+      providerRefundRef: initialRow.providerRefundRef,
+      amountMinor: initialRow.amountMinor,
+      currency: initialRow.currency,
+      signal: context.signal,
+      beforeSend: () => context.assertStillOwned(),
+    });
+
+    return deps.db.transaction(async (tx) => {
+      await context.assertStillOwned(tx);
+
+      const [locked] = await tx
+        .select()
+        .from(paymentRefunds)
+        .where(eq(paymentRefunds.id, initialRow.id))
+        .for("update")
+        .limit(1);
+
+      if (!locked || locked.status === "succeeded" || locked.status === "failed") {
+        return "settled";
+      }
+
+      const now = deps.clock.now();
+      const resolvedRef = lookup.providerRefundRef ?? locked.providerRefundRef;
+
+      if (lookup.status === "succeeded" && resolvedRef) {
+        await settleProviderRefundSucceededInTx(
+          tx,
+          locked,
+          resolvedRef,
+          lookup.settledAt ?? now,
+          null,
+        );
+        return "settled";
+      }
+
+      if (lookup.status === "failed") {
+        const failCode = (lookup.failureReasonCode ?? "PROVIDER_REFUND_FAILED").slice(0, 64);
+        await tx
+          .update(paymentRefunds)
+          .set({
+            status: "failed",
+            providerRefundRef: resolvedRef,
+            failureReasonCode: failCode,
+            settledAt: now,
+            lastReconciledAt: now,
+            version: locked.version + 1,
+            updatedAt: now,
+          })
+          .where(eq(paymentRefunds.id, locked.id));
+
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payment.refund.failed",
+            action: "create",
+            outcome: "failed",
+            severity: "WARN",
+            reasonCode: failCode,
+            actor: { role: "system" },
+            resource: { type: "payment_refund", publicId: locked.publicId },
+            orderPublicId: locked.orderPublicId,
+            attributes: {
+              order_public_id: locked.orderPublicId,
+              invoice_public_id: locked.invoicePublicId,
+              provider: locked.provider,
+            },
+          },
+          tx,
+        );
+        return "settled";
+      }
+
+      // lookup.status is "pending", "unknown", or "absent": never classify unconfirmed/not-yet-visible as failed.
+      await tx
+        .update(paymentRefunds)
+        .set({
+          providerRefundRef: resolvedRef,
+          lastReconciledAt: now,
+          updatedAt: now,
+        })
+        .where(eq(paymentRefunds.id, locked.id));
+
+      return "pending";
+    });
+  }
+
   async function healthCounts(): Promise<{
     provider: PaymentProviderChoice;
     onlineEnabled: boolean;
@@ -2178,6 +3752,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     cancelAttemptIfUnpaid,
     handleSignedWebhook,
     reconcilePendingAttempts,
+    reconcileProviderRefund,
+    refunds: {
+      forOrder: forOrderRefunds,
+      create: createOrderRefund,
+    },
     admin: {
       getSettings: adminGetSettings,
       updateSettings: adminUpdateSettings,
