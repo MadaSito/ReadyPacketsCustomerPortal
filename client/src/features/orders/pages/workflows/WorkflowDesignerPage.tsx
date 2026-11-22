@@ -61,7 +61,7 @@ import {
   type WizardStepId,
   type WorkflowIssue,
 } from "./model";
-import { AcceptanceGatesEditor, PhasesEditor, StateRulesFields, StorageFolderEditor } from "./rulesFields";
+import { AcceptanceGatesEditor, PhasesEditor, RulesReviewSummary, StateRulesFields, StorageFolderEditor } from "./rulesFields";
 
 export default function WorkflowDesignerPage() {
   const { draftId = "" } = useParams<{ draftId: string }>();
@@ -438,6 +438,7 @@ function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, set
       {publishable ? <Callout tone="success">The draft has no problems and is ready to publish.</Callout> : null}
       {dirty ? <Callout tone="info">You have unsaved changes. Publishing saves them first.</Callout> : null}
       <DefinitionTables definition={definition} />
+      <RulesReviewSummary definition={definition} />
       <Checkbox label="Use for new orders (default workflow)" description="If you leave this off, new orders keep using the current default." checked={makeDefault} onCheckedChange={setMakeDefault} />
       <Field label="Change note (optional)" hint="Shown in the version list, for example why the change was made.">
         <Textarea value={changeNote} maxLength={500} rows={3} onChange={(event) => setChangeNote(event.target.value)} />

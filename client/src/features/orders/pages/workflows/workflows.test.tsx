@@ -351,6 +351,41 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
   });
 });
 
+describe("workflow designer — review summary", () => {
+  it("Review and publish summarises phases, requirement counts, gates and the files folder", async () => {
+    const reviewStates = [
+      { ...states[0]!, phase: "intake", requirements: { uploads: [{ key: "brief", label: "Brief", kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"], storageFolder: "Briefs/{order_ref}" }], acknowledgements: [{ key: "terms", title: "Terms", body: "Synthetic.", acceptedBy: "customer", requireTypedName: false }] } },
+      { ...states[1]!, phase: "delivery" },
+    ];
+    const definition = {
+      phases: [{ key: "intake", label: "Intake" }, { key: "delivery", label: "Delivery" }],
+      states: reviewStates,
+      transitions: [transition],
+      storageFolder: "Orders/{order_ref}",
+      acceptanceGates: [{ key: "terms", policyPublicId: POLICY_A, point: { stepKey: "submitted" }, signatureMode: "typed_name", askAgainOnNewVersion: true }],
+    };
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    const { container } = designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements", "Review and publish"]) {
+      await user.click(screen.getByRole("button", { name: "Save and continue" }));
+      expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
+    }
+    const summary = screen.getByRole("region", { name: "Phases, requirements, acceptance and storage" });
+    expect(summary).toHaveTextContent("Each phase locks when the order moves on");
+    expect(summary).toHaveTextContent("Intake: 1 status; requirements: 1 upload, 1 acknowledgement");
+    expect(summary).toHaveTextContent("Delivery: 1 status; requirements: None");
+    expect(await within(summary).findByText("Synthetic order terms")).toBeInTheDocument();
+    expect(summary).toHaveTextContent("before submitting from “Submitted”; type their full name; asked again for a new policy version");
+    expect(summary).toHaveTextContent("Orders/{order_ref}; 1 upload slot uses its own folder");
+    expect(summary).toHaveTextContent("Example: Orders/RP-2026-000123");
+    await expectNoAxeViolations(container);
+  });
+});
+
 describe("designer part B page accessibility", () => {
   // The rules step with a gate and the folder fields (with the live example), checked as a page in light and dark.
   const prepare = async () => {

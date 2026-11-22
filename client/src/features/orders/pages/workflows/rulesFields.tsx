@@ -367,3 +367,81 @@ export function StateRulesFields({ definition, state, index, issues, onChange }:
     </div>
   );
 }
+
+/**
+ * Review step summary of the increment-04 rules: phases (with lock behaviour), requirement counts per phase,
+ * acceptance gates and the order-files folder. Read-only; stacks to one column below 640 px.
+ */
+export function RulesReviewSummary({ definition }: { definition: DraftDefinition }) {
+  const trpc = useTRPC();
+  const policies = useQuery(trpc.compliance.policies.listPublished.queryOptions());
+  const phases = definition.phases ?? [];
+  const gates = definition.acceptanceGates ?? [];
+  const countsOf = (states: readonly DraftState[]) => ({
+    statuses: states.length,
+    uploads: states.reduce((sum, state) => sum + (state.requirements?.uploads.length ?? 0), 0),
+    acknowledgements: states.reduce((sum, state) => sum + (state.requirements?.acknowledgements.length ?? 0), 0),
+  });
+  const phaseRows = phases.map((phase) => ({ key: phase.key, label: phase.label.trim() || phase.key, ...countsOf(definition.states.filter((state) => state.phase === phase.key)) }));
+  const unphased = countsOf(definition.states.filter((state) => !state.phase || !phases.some((phase) => phase.key === state.phase)));
+  const stateLabel = (key: string) => definition.states.find((state) => state.key === key)?.label.trim() || key;
+  const policyTitle = (id: string) => policies.data?.find((doc) => doc.documentPublicId === id)?.title ?? (id ? (policies.isPending ? "Loading…" : "Policy not available") : "No policy chosen");
+  const workflowFolder = definition.storageFolder?.trim() || "";
+  const slotOverrides = definition.states.reduce((sum, state) => sum + (state.requirements?.uploads.filter((slot) => slot.storageFolder?.trim()).length ?? 0), 0);
+  const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+  const reqText = (row: { uploads: number; acknowledgements: number }) =>
+    row.uploads + row.acknowledgements === 0 ? "None" : `${plural(row.uploads, "upload", "uploads")}, ${plural(row.acknowledgements, "acknowledgement", "acknowledgements")}`;
+  return (
+    <section aria-labelledby="review-rules-heading" className="flex min-w-0 flex-col gap-4">
+      <h3 id="review-rules-heading" className="text-base font-semibold text-ink">
+        Phases, requirements, acceptance and storage
+      </h3>
+      <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+        <div className="min-w-0 rounded-[var(--radius-card)] border border-line p-4">
+          <h4 className="text-sm font-semibold text-ink">Phases</h4>
+          {phaseRows.length === 0 ? (
+            <p className="mt-1 text-sm text-muted">No phases. Orders show statuses only.</p>
+          ) : (
+            <>
+              <p className="mt-1 text-sm text-muted">Each phase locks when the order moves on; staff can unlock it with a reason.</p>
+              <ul className="mt-2 flex flex-col gap-2 text-sm text-body">
+                {phaseRows.map((row) => (
+                  <li key={row.key} className="min-w-0 break-words">
+                    <span className="font-medium text-ink">{row.label}</span>: {plural(row.statuses, "status", "statuses")}; requirements: {reqText(row)}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {unphased.uploads + unphased.acknowledgements > 0 ? <p className="mt-2 text-sm text-body">Statuses without a phase: requirements: {reqText(unphased)}</p> : null}
+        </div>
+        <div className="min-w-0 rounded-[var(--radius-card)] border border-line p-4">
+          <h4 className="text-sm font-semibold text-ink">Acceptance gates</h4>
+          {gates.length === 0 ? (
+            <p className="mt-1 text-sm text-muted">No gates.</p>
+          ) : (
+            <ul className="mt-2 flex flex-col gap-2 text-sm text-body">
+              {gates.map((gate, index) => (
+                <li key={`${gate.key}-${index}`} className="min-w-0 break-words">
+                  <span className="font-medium text-ink">{policyTitle(gate.policyPublicId)}</span>:{" "}
+                  {gate.point === "order_start" ? "before any work on the order" : `before submitting from “${stateLabel(gate.point.stepKey)}”`};{" "}
+                  {(SIGNATURE_MODE_OPTIONS.find((option) => option.value === gate.signatureMode)?.label ?? gate.signatureMode).toLowerCase()}
+                  {gate.askAgainOnNewVersion ? "; asked again for a new policy version" : ""}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="min-w-0 rounded-[var(--radius-card)] border border-line p-4 sm:col-span-2">
+          <h4 className="text-sm font-semibold text-ink">Order files folder</h4>
+          <p className="mt-1 text-sm text-body">
+            <span className="font-mono break-all">{workflowFolder || DEFAULT_ORDER_FILE_FOLDER_TEMPLATE}</span>
+            {workflowFolder ? null : " (default)"}
+            {slotOverrides > 0 ? `; ${plural(slotOverrides, "upload slot uses", "upload slots use")} its own folder` : ""}
+          </p>
+          <FolderExample templates={[workflowFolder]} />
+        </div>
+      </div>
+    </section>
+  );
+}
