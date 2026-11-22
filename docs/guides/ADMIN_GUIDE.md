@@ -47,6 +47,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Jobs and schedules](../../server/modules/jobs/ADMIN_GUIDE.md): inspect job attempts and manage schedules.
 - [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
 - [Webhooks console](./WEBHOOKS_CONSOLE.md): configure subscriptions and inbound endpoints, inspect deliveries, and rerun eligible failures.
+- [Public API (inbound): keys, request log and replay](../../server/modules/publicApi/ADMIN_GUIDE.md): manage API access and scoped keys, inspect requests, and replay eligible operations.
 - [Application Protection](../../server/modules/protection/ADMIN_GUIDE.md): manage protection policy, offline country lookups and recovery.
 - [Cookies and consent](../../server/modules/platform/ADMIN_GUIDE_CONSENT.md): configure the cookie banner, manage consent categories, and review the consent ledger.
 
