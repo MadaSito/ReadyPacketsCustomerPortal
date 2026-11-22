@@ -45,8 +45,9 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0038 | Refunds through the Stripe or Square refund API; recorded refunds for manual payments (supersedes "refunds are manual" in 0035) | Accepted (owner confirmation requested) |
 | 0039 | Policy acceptance gateway on workflows, enforced by the server with append-only evidence | Accepted (owner confirmation requested) |
 | 0040 | Order files copied to assigned storage with folder templates and a per-order sync view (extends 0027) | Accepted (owner confirmation requested) |
-| 0041 | Order Automation tab: pipeline history, guarded redelivery, optional Phase III / IV, workflow stage actions | Accepted (owner confirmation requested for Phase III / IV) |
+| 0041 | Order Automation tab: pipeline history, guarded redelivery, optional Phase III / IV, workflow stage actions | Accepted (confirmed by the owner 2026-11-22) |
 | 0042 | Workflow export and import between portals as an integrity-checked JSON package; imports are drafts only | Accepted (owner confirmation requested) |
 | 0043 | Cart upsell: server-priced suggestions the customer must choose, never pre-selected | Accepted (owner confirmation requested) |
 | 0044 | Discount codes and links with atomic redemption, a global discount guard and uniform refusals | Accepted (owner confirmation requested) |
 | 0045 | Policy acceptance log centre: a read-only view over the existing append-only evidence | Accepted (owner confirmation requested) |
+| 0046 | Authenticator setup: a newer sign-in replaces an abandoned setup instead of being refused for ten minutes | Accepted |

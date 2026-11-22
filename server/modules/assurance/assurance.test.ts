@@ -287,12 +287,48 @@ describe("assurance: isolated transactional model", () => {
     });
     const { secret } = await caller(account).beginTotpEnrollment();
     const secondSession = caller({ ...account, sessionId: nextSessionId });
-    await expect(secondSession.beginTotpEnrollment()).rejects.toMatchObject({ code: "CONFLICT" });
     await expect(secondSession.confirmTotpEnrollment({ code: totp(secret).generate({ timestamp: +h.clock.now() }) }))
-      .rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      .rejects.toMatchObject({ code: "CONFLICT", cause: { reasonCode: "TOTP_SETUP_REPLACED" } });
     h.clock.advance(10 * 60_000);
     await expect(caller(account).confirmTotpEnrollment({ code: totp(secret).generate({ timestamp: +h.clock.now() }) }))
-      .rejects.toMatchObject({ code: "UNAUTHORIZED" });
+      .rejects.toMatchObject({ code: "CONFLICT", cause: { reasonCode: "TOTP_SETUP_EXPIRED" } });
+    const [row] = await db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, account.userId));
+    expect(row?.totpSecretEnc).toBeNull();
+    const refusals = h.audit.named("auth.totp.enrollment_denied");
+    expect(refusals.map((event) => event.reasonCode)).toEqual(["TOTP_SETUP_REPLACED", "TOTP_SETUP_EXPIRED"]);
+    expect(refusals.every((event) => event.outcome === "denied")).toBe(true);
+  });
+
+  it("lets a new sign-in replace an abandoned authenticator setup with a new secret", async () => {
+    const account = await fixture({ state: "remediation", pendingSteps: ["enroll_mfa"] });
+    const nextSessionId = ulid(+h.clock.now());
+    const [oldSession] = await db.db.select().from(userSessions).where(eq(userSessions.publicId, account.sessionId));
+    await db.db.insert(userSessions).values({
+      userId: account.userId, publicId: nextSessionId, tokenHash: randomBytes(32).toString("hex"),
+      csrfSecretEnc: oldSession!.csrfSecretEnc, authenticatedAt: h.clock.now(), lastSeenAt: h.clock.now(), absoluteExpiresAt: oldSession!.absoluteExpiresAt,
+    });
+    const abandoned = await caller(account).beginTotpEnrollment();
+    // The same session resumes its own setup and sees the same key.
+    await expect(caller(account).beginTotpEnrollment()).resolves.toMatchObject({ secret: abandoned.secret });
+    h.clock.advance(60_000);
+    const next = { ...account, sessionId: nextSessionId };
+    const replacement = await caller(next).beginTotpEnrollment();
+    expect(replacement.secret).not.toBe(abandoned.secret);
+    expect(h.audit.named("auth.totp.enrollment_superseded")).toMatchObject([
+      { outcome: "completed", reasonCode: "TOTP_SETUP_SUPERSEDED", severity: "WARN" },
+    ]);
+    expect(h.audit.named("auth.totp.enrollment_started")).toHaveLength(2);
+    // The abandoned key no longer works anywhere, and the earlier session is told to start again.
+    const oldCode = totp(abandoned.secret).generate({ timestamp: +h.clock.now() });
+    await expect(caller(account).confirmTotpEnrollment({ code: oldCode }))
+      .rejects.toMatchObject({ code: "CONFLICT", cause: { reasonCode: "TOTP_SETUP_REPLACED" } });
+    await expect(caller(next).confirmTotpEnrollment({ code: oldCode })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    h.clock.advance(30_000);
+    const recovery = await caller(next).confirmTotpEnrollment({ code: totp(replacement.secret).generate({ timestamp: +h.clock.now() }) });
+    expect(recovery.recoveryCodes).toHaveLength(10);
+    const [row] = await db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, account.userId));
+    expect(row).toMatchObject({ pendingTotpSecretEnc: null, pendingTotpSessionId: null });
+    expect(row?.totpSecretEnc).not.toBeNull();
   });
 
   it("rejects enrollment-code replay, serializes fresh code replay, and throttles per account", async () => {
@@ -440,6 +476,9 @@ describe("assurance: isolated transactional model", () => {
     const [row] = await db.db.select().from(assuranceAccounts).where(eq(assuranceAccounts.userId, actor.userId));
     expect(row?.pendingTotpSecretEnc).toBeNull();
     await expect(db.db.select().from(assuranceChallenges).where(eq(assuranceChallenges.userId, actor.userId))).resolves.toEqual([]);
+    // Once the clean-up has removed the setup, the page is still told to show a new QR code.
+    await expect(caller(actor).confirmTotpEnrollment({ code: "000000" }))
+      .rejects.toMatchObject({ code: "CONFLICT", cause: { reasonCode: "TOTP_SETUP_EXPIRED" } });
   });
 
   it("rotates a successful sign-in challenge and step-up, and rejects password failures without consuming the factor", async () => {

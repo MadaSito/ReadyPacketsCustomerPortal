@@ -81,7 +81,7 @@ with your password and a second factor.
 1. Open your authenticator app, such as Microsoft Authenticator, Google Authenticator, 1Password or Authy.
 2. Scan the QR code, or choose **Copy setup key** and enter the key manually.
 3. Enter the 6-digit code shown by the app.
-4. The setup expires after 10 minutes and is tied to the current session. If it expires, start again.
+4. The QR code and setup key work for 10 minutes and are tied to the current sign-in. If they expire, or if you sign in again and start over, the page shows a new QR code. Remove the earlier ReadyPackets entry from your authenticator app and scan the new one.
 
 On **Account security** you can also remove the authenticator app. This is allowed only if you have at least one
 passkey, so you never lose all strong sign-in methods.
