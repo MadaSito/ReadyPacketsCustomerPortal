@@ -7,7 +7,7 @@ export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger" | "link
 export type ButtonSize = "sm" | "md" | "lg";
 
 const base =
-  "inline-flex items-center justify-center gap-2 rounded-[var(--radius-control)] font-semibold whitespace-nowrap select-none transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-60 aria-disabled:cursor-not-allowed aria-disabled:opacity-60 [&_svg]:size-4 [&_svg]:shrink-0";
+  "inline-flex items-center justify-center gap-2 rounded-[var(--radius-control)] max-w-full font-semibold whitespace-nowrap select-none max-[359px]:whitespace-normal max-[359px]:text-center max-[359px]:break-words transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-60 aria-disabled:cursor-not-allowed aria-disabled:opacity-60 [&_svg]:size-4 [&_svg]:shrink-0";
 const variants: Record<ButtonVariant, string> = {
   primary: "bg-action text-on-action hover:bg-action-hover shadow-[var(--shadow-card)]",
   secondary: "bg-surface text-ink border border-control-border hover:bg-surface-sunken",

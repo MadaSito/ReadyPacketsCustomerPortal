@@ -8,6 +8,7 @@ const ITEMS = [
   { href: "/admin/settings/presentation", label: "Sign-in page" },
   { href: "/admin/settings/transfer", label: "Export and import" },
   { href: "/admin/health", label: "Health" },
+  { href: "/admin/privacy", label: "Cookies and consent" },
 ] as const;
 
 /** Sub-navigation shared by every platform console page. */

@@ -14,6 +14,8 @@ export const SSO_REFUSAL_MESSAGES: Record<string, { title: string; body: string 
   SSO_SESSION_CHANGED: { title: "Your session changed", body: "This attempt belongs to a different session. Sign in again and retry from the same browser tab." },
   SSO_MFA_REQUIRED: { title: "Multi-factor verification is required", body: "Microsoft did not confirm multi-factor verification. Verify with your portal authenticator instead." },
   SSO_WRONG_ACCOUNT: { title: "A different Microsoft account was used", body: "Sign in to Microsoft with the account linked to this portal account." },
+  SSO_MAINTENANCE: { title: "Customer sign-in is paused for maintenance", body: "We are carrying out planned maintenance. Please try again later." },
+  SSO_RESTRICTED: { title: "Sign-in is not allowed from here", body: "Your organization limits where you can sign in from. Contact your administrator if you need access." },
   SSO_IDENTITY_IN_USE: { title: "This Microsoft account is linked elsewhere", body: "It is already linked to a different portal account." },
 };
 

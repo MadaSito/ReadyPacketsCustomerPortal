@@ -1,6 +1,7 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MeResult } from "@/lib/authApi";
+import { __setConsentForTests } from "@/lib/consent";
 import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { AppRoutes } from "@/app/AppRouter";
@@ -14,7 +15,15 @@ import { authFeature } from "./routes";
 import { MARKETING_POLICY_URLS } from "./legal/LegalLayout";
 import PrivacyPage from "./pages/PrivacyPage";
 
-vi.mock("@/app/slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
+vi.mock("@/app/slots", () => ({
+  NotificationSlot: () => null,
+  GlobalSearchSlot: () => null,
+  AnalyticsConsentSlot: () => null,
+  CookieConsentSlot: () => null,
+  CustomerMaintenanceSlot: () => null,
+  CartBadgeSlot: () => null,
+  SsoSignInSlot: () => null,
+}));
 vi.mock("@/lib/trpc", async (original) => ({
   ...(await original<typeof trpcModule>()),
   useTRPC: () => ({
@@ -96,6 +105,9 @@ describe("public legal pages", () => {
     expect(
       screen.getByText(/does not automatically delete copies already written to configured cloud storage destinations/i),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Stripe Checkout/)).toBeInTheDocument();
+    expect(screen.getByText(/Square Payment Links/)).toBeInTheDocument();
+    expect(screen.getByText(/redirects your browser to the provider's hosted payment page/i)).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
 });
@@ -119,7 +131,7 @@ describe("consent-gated analytics on the legal pages", () => {
     expect(isEligibleAnalyticsPath("/sign-in")).toBe(false);
   });
 
-  it("an anonymous visitor on /privacy gets a reachable consent control; allowing sends only a credential-less pageview", async () => {
+  it("never renders an independent opt-in banner or sends a pageview until shared @/lib/consent grants analytics", async () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     const { container } = renderUi(
@@ -131,24 +143,23 @@ describe("consent-gated analytics on the legal pages", () => {
       </>,
       { path: "/privacy", api: fakeAuthApi({ me: unauth }) },
     );
-    const panel = await screen.findByRole("region", { name: "Optional public-page analytics" });
-    expect(panel).toBeInTheDocument();
-    const allow = screen.getByRole("button", { name: "Allow for session" });
-    const decline = screen.getByRole("button", { name: "Decline" });
-    for (const button of [allow, decline]) {
-      button.focus();
-      expect(button).toHaveFocus();
-    }
-    expect(fetchMock).not.toHaveBeenCalled(); // nothing before consent
+    await screen.findByRole("heading", { level: 1, name: "Portal privacy notice" });
+    expect(screen.queryByRole("region", { name: "Optional public-page analytics" })).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled(); // nothing when privacy.consent is off / undecided
     await expectNoAxeViolations(container);
 
-    fireEvent.click(allow);
+    act(() => {
+      __setConsentForTests({
+        enabled: true,
+        policyVersion: 1,
+        choices: { preferences: false, analytics: true, session_replay: false },
+      });
+    });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://eu.i.posthog.com/capture/");
     expect(init.credentials).toBe("omit");
     expect(JSON.parse(String(init.body)).properties.$pathname).toBe("/privacy");
-    expect(await screen.findByRole("button", { name: "Withdraw consent" })).toBeInTheDocument();
   });
 
   it("stays silent for a signed-in user on the same page", async () => {

@@ -2,10 +2,11 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 import { clearRecoveryBatch, useRecoveryBatch } from "@/lib/recoveryBatch";
+import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import type { StepUpApi } from "@/ui";
 import { CredentialAdmin, type CredentialsActions } from "./pages/CredentialsTab";
-import { SecuritySettings, type SecurityActions } from "./pages/SecurityPage";
+import { SecurityCardSlot, SecuritySettings, type SecurityActions } from "./pages/SecurityPage";
 
 const runDirectly: StepUpApi = { run: (action) => action(), request: async () => true };
 const defaultState = {
@@ -33,6 +34,23 @@ function HandoffProbe() {
 }
 
 describe("account security settings", () => {
+  it("places customer cards around two-factor and hides contributions above the session role", () => {
+    const Password = () => <section aria-label="Change password">Password</section>;
+    const Sessions = () => <section aria-label="Active sessions">Sessions</section>;
+    const Staff = () => <section aria-label="Staff card">Staff</section>;
+    const cards = [
+      { key: "password", access: "customer", order: 10, component: Password },
+      { key: "staff", access: "staff", order: 30, component: Staff },
+      { key: "sessions", access: "customer", order: 40, component: Sessions },
+    ] as const;
+    renderUi(<main>
+      <SecurityCardSlot position="before" viewerRole="customer" cards={cards} />
+      <section aria-label="Two-factor">Two-factor</section>
+      <SecurityCardSlot position="after" viewerRole="customer" cards={cards} />
+    </main>);
+    expect(screen.getAllByRole("region").map((element) => element.getAttribute("aria-label"))).toEqual(["Change password", "Two-factor", "Active sessions"]);
+  });
+
   it("exposes passkey availability and number of recovery codes without color alone", async () => {
     security();
     expect(screen.getByRole("heading", { name: "Account security", level: 1 })).toBeVisible();
@@ -89,7 +107,35 @@ describe("account security settings", () => {
   });
 });
 
+pageA11y("/account/security two-factor ready", async () => {
+  security();
+  document.title = "Account security · ReadyPackets";
+  await screen.findByRole("heading", { name: "Authenticator app" });
+});
+
+pageA11y("/account/security recovery confirmation", async () => {
+  security();
+  document.title = "Account security · ReadyPackets";
+  fireEvent.click(await screen.findByRole("button", { name: "Generate new recovery codes" }));
+  await screen.findByRole("alertdialog", { name: "Replace your recovery codes?" });
+});
+
 describe("credentials administration widget", () => {
+  it("allows the reset MFA action label to wrap and still requires confirmation", async () => {
+    const actions: CredentialsActions = {
+      setCredential: missing, resetMfa: vi.fn(async () => ({ ok: true as const })),
+    };
+    renderUi(<CredentialAdmin customerId={target} actions={actions} stepUp={runDirectly} email={{ state: "ready" }} />, { wrapper: withCustomer });
+    const trigger = screen.getByRole("button", { name: "Reset multi-factor authentication" });
+    expect(trigger).toHaveClass("whitespace-normal", "max-w-full");
+    expect(trigger).not.toHaveClass("whitespace-nowrap");
+    fireEvent.click(trigger);
+    const confirm = await screen.findByRole("alertdialog", { name: "Reset multi-factor authentication?" });
+    expect(actions.resetMfa).not.toHaveBeenCalled();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Reset MFA" }));
+    await waitFor(() => expect(actions.resetMfa).toHaveBeenCalledExactlyOnceWith(target));
+  });
+
   it("disables email when the provider is unavailable, and reveals then discards the generated password", async () => {
     const temporaryPassword = "synthetic only generated value";
     const actions: CredentialsActions = {

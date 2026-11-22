@@ -24,6 +24,7 @@ export const GROUP_LABELS: Record<string, string> = {
   engagement: "Messages and support",
   compliance: "Compliance",
   portable: "Portable transfer",
+  privacy: "Privacy and cookies",
   analytics: "Analytics",
   features: "Features",
 };

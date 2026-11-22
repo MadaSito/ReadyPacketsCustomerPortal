@@ -20,6 +20,11 @@ interface IntegrationsProductionModule {
   integrationsProductionOrderTabs?: readonly OrderTab[];
 }
 
+interface IntegrationsWebhooksModule {
+  webhookRoutes?: readonly RouteDef[];
+  webhookNav?: readonly NavItem[];
+}
+
 const adminModules = import.meta.glob<IntegrationsAdminModule>("./admin/index.{ts,tsx}", {
   eager: true,
 });
@@ -30,14 +35,21 @@ const productionModules = import.meta.glob<IntegrationsProductionModule>("./prod
 });
 const loadedProduction = Object.values(productionModules)[0];
 
+const webhookModules = import.meta.glob<IntegrationsWebhooksModule>("./webhooks/index.{ts,tsx}", {
+  eager: true,
+});
+const loadedWebhooks = Object.values(webhookModules)[0];
+
 export const integrationsFeature: FeatureRoutes = {
   routes: [
     ...(loadedAdmin?.integrationsAdminRoutes ?? []),
     ...(loadedProduction?.productionAdminRoutes ?? loadedProduction?.integrationsProductionRoutes ?? []),
+    ...(loadedWebhooks?.webhookRoutes ?? []),
   ],
   nav: [
     ...(loadedAdmin?.integrationsAdminNav ?? []),
     ...(loadedProduction?.productionAdminNav ?? loadedProduction?.integrationsProductionNav ?? []),
+    ...(loadedWebhooks?.webhookNav ?? []),
   ],
   orderTabs: [
     ...(loadedProduction?.productionOrderTabs ?? loadedProduction?.integrationsProductionOrderTabs ?? []),

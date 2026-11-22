@@ -45,6 +45,7 @@
 		header_up X-Forwarded-Host {$RP_DOMAIN}
 		header_up X-Forwarded-Port 443
 		header_up -Forwarded
+		header_up -X-ReadyPackets-Country
 		header_up -traceparent
 		header_up -tracestate
 		transport http {
@@ -107,8 +108,8 @@
 	}
 }
 
-# Plain HTTP for RP_DOMAIN redirects to HTTPS except OAuth/OIDC callback paths, which are refused with 404
-# and no Location header so authorization codes/state are never echoed into a redirect. Caddy's built-in ACME
+# Plain HTTP for RP_DOMAIN redirects to HTTPS except sensitive callbacks, which are refused with 404
+# and no Location header so callback queries are never echoed into a redirect. Caddy's built-in ACME
 # HTTP-01 solver still intercepts /.well-known/acme-challenge/* ahead of these handlers.
 http://{$RP_DOMAIN} {
 	header {
@@ -124,8 +125,8 @@ http://{$RP_DOMAIN} {
 		respond 421
 	}
 
-	@oauth_callback path_regexp (?i)^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$))
-	handle @oauth_callback {
+	@canonical_callback path_regexp (?i)^/(?:api/identity/sso/callback/?$|api/storage/oauth/callback(?:/|$)|api/(?:webhooks/inbound|payments/(?:webhooks|return))(?:/|$))
+	handle @canonical_callback {
 		respond 404
 	}
 

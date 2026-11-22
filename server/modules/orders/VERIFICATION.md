@@ -89,3 +89,45 @@ Server tests use a test database with fake identity, audit, files and engagement
 | Wizard + canvas + publish (new version; existing orders keep theirs) in a real browser | manual check by the lead on the preview build | — |
 
 Not verified here: the real identity module's step-up and actor re-validation (integration suite); assistive-technology use and 320–1920 px layouts beyond the lead's browser check; drag interactions on the canvas (jsdom tests use keyboard/form alternatives); behaviour under real concurrent connections (tests are sequential).
+
+## Increment 04 — workflow rules, phase locks, console order actions (package A + item 13)
+
+Run by orders_engineer one file at a time on `feat/increment-04`. The server suites use the test database with migration 0003 (provisional, 4961345). Identity, audit, files and notifications are fake adapters, not the real modules. The client suites use jsdom with a fake tRPC proxy and axe-core. Colour contrast is not checked in jsdom.
+
+| Requirement | Evidence | Where |
+| --- | --- | --- |
+| Definition extension (phases, uploads, acknowledgements, `api` actor) validated with precise codes and paths; feature off by default refuses publishing, on publishes | automated-test | server/modules/orders/requirements.test.ts (18 tests) › "accepts a sound rules definition", "reports precise codes…", "refuses while off…" |
+| Requirements block leaving a status (`REQUIREMENTS_UNMET`), cancel exempt, fail closed without Files | automated-test | requirements.test.ts › "shows the checklist and refuses…", "does not block cancellation", "allows the transition once uploads are counted…" |
+| Authorisation matrix for read/acknowledge (anonymous, customer, other customer, viewer, contributor, staff, admin) | automated-test | requirements.test.ts › "authorisation matrix…" |
+| Acknowledgement of the exact text (hash), once, typed name encrypted, wrong side / changed text refused | automated-test | requirements.test.ts › "records an acknowledgement of the exact text, once" |
+| Phase lock on leaving, enforcement, staff unlock with reason (internal note), re-lock at next change, reopen on re-entry; audit events | automated-test | requirements.test.ts › "locks the phase being left…", "re-locks at the next status change…" |
+| Files ports (writable slots per side, status writable, custody slot) | automated-test | requirements.test.ts › "files ports expose writable slots per actor side" |
+| Console access grants: off by default, admin + step-up, uniform refusal for unknown/ineligible/owner, order and customer-wide scope, future orders, revoke together, both notified, viewers read-only | automated-test | requirements.test.ts › five "access" tests |
+| Customer lookup staff-only with masked e-mail | automated-test | requirements.test.ts › "customer lookup is staff-only and masks e-mail" |
+| Checkout creates the order in the caller's tx, idempotent, customers only | automated-test | requirements.test.ts › "creates inside the caller's transaction…" |
+| Public API provider: list/get/create as system; transitions only where the workflow lists `api` | automated-test | requirements.test.ts › "lists, gets, creates as system…" |
+| Existing order and designer behaviour unchanged | automated-test | orders.test.ts (35), workflowDesigner.test.ts (16): last run at 83728a7 / a7049a1; server code unchanged since |
+| Order page: phase rail, checklist (upload link, read-and-accept), nothing shown without rules; acknowledgement dialog (scrollable focusable full text, explicit checkbox, typed name, sends the shown hash, server refusal shown); staff unlock dialog (reason ≥ 10, notify switch) | automated-test | client/src/features/orders/rules.test.tsx (19 tests) |
+| Console: new order for a customer (picker, quantities, one idempotent submit); access dialog (list, grant, revoke for admin; view-only for staff); customer tab lists that customer's orders; reassign uses the customer picker (no raw id) | automated-test | rules.test.tsx; orders.test.tsx (29 tests) |
+| Nav "My orders" (10) and "Create an order" (12); `/orders/new` adds to the cart when the `cart` flag is on, otherwise creates the order | automated-test | rules.test.tsx › "navigation and new-order cart handoff" |
+| Designer: "Phases and requirements" wizard step, canvas side panel, API integration actor, helper edits keep phases | automated-test | workflows.test.tsx (8 tests), rules.test.tsx › "designer rule helpers" |
+| WCAG 2.2 AA page checks in light and dark: order page with rules, acknowledgement dialog open, console customer orders tab (axe, single h1/main, theme applied) | automated-test (`pageA11y`) | rules.test.tsx › "increment 04 page accessibility" (6 cases) |
+
+Not checked here: the real identity step-up and session re-validation (integration suite); the real Files slot counting (fake adapter); real notification delivery; colour contrast, 320 px layout, 400 % zoom and screen-reader use in a real browser (those are for the lead's browser pass); behaviour under truly concurrent connections. The `/cart` page that the wizard hands off to belongs to the cart package and is not tested here.
+
+
+## Increment 04 part B (S1) — console order workspace
+
+| Requirement | Method | Evidence |
+| --- | --- | --- |
+| Rename: NFC, version bump, reference unchanged, history row, name-free audit in the tx; no-op, stale, invalid names, customers refused; audit failure rolls back | automated-test | consoleOrder.test.ts › "orders.console.rename (B2)" (3 tests) |
+| Name history: staff old → new across pages, stable order, customer view generic, bad cursor refused | automated-test | consoleOrder.test.ts › "listNameHistory…" |
+| Status transitions port, customer view notes | automated-test | consoleOrder.test.ts › "listStatusTransitions (S2 port)" |
+| Gates: no provider → UNAVAILABLE; customer blocked with CONFLICT ORDER_ACCEPTANCE_REQUIRED until accepted; staff pass; cancel never gated; step gates at the FROM status; API checked against the owner; context scoped; invalid provider refused | automated-test | consoleOrder.test.ts › "orders.gates (B6)" (6 tests) |
+| Folder routing port | automated-test | consoleOrder.test.ts › "getOrderFileFolderRouting" |
+| Designer validation of gates and folders (including traversal, absolute, backslash, unknown token, control characters, reserved names); gates need workflow rules on | automated-test | workflowDesigner.test.ts (20 tests) |
+| Console header (reference · customer · placed, badges), B1 action row order, tab order, `/activity` → Notes, banners per area, Rename dialog (keyboard open, Escape returns focus, validation, success keeps reference), staff vs admin actions, page axe light and dark incl. dialog open | automated-test | client/src/features/orders/orders.test.tsx (39 tests) |
+| Rules panel in the console Phases tab; hint punctuation not doubled | automated-test | rules.test.tsx (20 tests) |
+| Designer gate editor (published policies only, final steps not offered, server issue at field, payload), storage folder fields with live example (invalid shows a message), slot override, policy list failure | automated-test | workflows.test.tsx (12 tests, incl. pageA11y light and dark of the rules step) |
+
+Not checked here: a real browser (RouteTabs overflow and select below 480 px, focus, contrast, 320 px, zoom); the real acceptance provider (compliance), tested only with a fake provider; the real payment-summary provider; real SharePoint copies using the folder templates; behaviour under truly concurrent connections.

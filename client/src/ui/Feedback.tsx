@@ -1,6 +1,6 @@
-import { AlertTriangle, CheckCircle2, Info, XCircle, type LucideIcon } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, PowerOff, SearchX, Sparkles, XCircle, type LucideIcon } from "lucide-react";
 import { QueryClientContext } from "@tanstack/react-query";
-import { useContext, useState, type ReactNode } from "react";
+import { useContext, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button } from "./Button";
 import { cn } from "./cn";
@@ -61,6 +61,16 @@ export function Skeleton({ className, lines }: SkeletonProps) {
   return <div aria-hidden="true" className={cn("h-4 animate-pulse rounded bg-surface-sunken", className)} />;
 }
 
+export type EmptyStateVariant = "default" | "first-use" | "no-results" | "filtered" | "disabled" | "error";
+const EMPTY_ICONS: Record<EmptyStateVariant, LucideIcon | undefined> = {
+  default: undefined,
+  "first-use": Sparkles,
+  "no-results": SearchX,
+  filtered: SearchX,
+  disabled: PowerOff,
+  error: AlertTriangle,
+};
+
 export interface EmptyStateProps {
   icon?: LucideIcon;
   title: ReactNode;
@@ -69,19 +79,41 @@ export interface EmptyStateProps {
   action?: ReactNode;
   className?: string;
   headingLevel?: 2 | 3;
+  /** Chooses the default icon; `filtered` with `onClearFilters` adds a "Clear filters" button. */
+  variant?: EmptyStateVariant;
+  size?: "sm" | "md";
+  onClearFilters?: () => void;
 }
-export function EmptyState({ icon: Icon, title, description, action, className, headingLevel = 2 }: EmptyStateProps) {
+export function EmptyState({ icon, title, description, action, className, headingLevel = 2, variant = "default", size = "md", onClearFilters }: EmptyStateProps) {
   const H = `h${headingLevel}` as const;
+  const Icon = icon ?? EMPTY_ICONS[variant];
+  const clear =
+    variant === "filtered" && onClearFilters ? (
+      <button type="button" onClick={onClearFilters} className="inline-flex min-h-11 items-center rounded-[var(--radius-control)] border border-control-border px-4 text-sm font-medium text-ink hover:bg-surface-sunken">
+        Clear filters
+      </button>
+    ) : null;
   return (
-    <div className={cn("flex flex-col items-center justify-center gap-3 rounded-[var(--radius-card)] border border-dashed border-control-border bg-surface px-6 py-10 text-center", className)}>
+    <div
+      className={cn(
+        "flex min-w-0 flex-col items-center justify-center gap-3 rounded-[var(--radius-card)] border border-dashed border-control-border bg-surface text-center",
+        size === "sm" ? "px-4 py-6" : "px-6 py-10",
+        className,
+      )}
+    >
       {Icon ? (
-        <span className="inline-flex size-12 items-center justify-center rounded-full bg-action-soft text-action">
-          <Icon aria-hidden="true" className="size-6" />
+        <span className={cn("inline-flex items-center justify-center rounded-full bg-action-soft text-action", size === "sm" ? "size-10" : "size-12")}>
+          <Icon aria-hidden="true" className={size === "sm" ? "size-5" : "size-6"} />
         </span>
       ) : null}
-      <H className="text-base font-semibold text-ink">{title}</H>
-      {description ? <p className="max-w-md text-sm text-body">{description}</p> : null}
-      {action ? <div className="mt-1 flex flex-wrap justify-center gap-2">{action}</div> : null}
+      <H className="text-base font-semibold break-words text-ink">{title}</H>
+      {description ? <p className="max-w-md text-sm break-words text-body">{description}</p> : null}
+      {action || clear ? (
+        <div className="mt-1 flex flex-wrap justify-center gap-2">
+          {clear}
+          {action}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -168,17 +200,42 @@ export interface LoadMoreProps {
   summary?: ReactNode;
   label?: string;
 }
-/** Cursor-pagination control (no infinite scroll — keyboard and AT friendly). */
+/**
+ * Cursor-pagination control (no infinite scroll — keyboard and AT friendly). When the last page loads, the button
+ * disappears; if it was the focused control, focus moves to the summary (or the control's region) instead of being
+ * dropped on <body>.
+ */
 export function LoadMore({ hasMore, loading, onLoadMore, summary, label = "Load more" }: LoadMoreProps) {
+  const regionRef = useRef<HTMLDivElement>(null);
+  const summaryRef = useRef<HTMLParagraphElement>(null);
+  const ownedFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (hasMore || !ownedFocus.current) return;
+    ownedFocus.current = false;
+    const active = document.activeElement;
+    if (active && active !== document.body && document.contains(active)) return;
+    (summaryRef.current ?? regionRef.current)?.focus();
+  }, [hasMore]);
   return (
-    <div className="flex flex-col items-center gap-2 py-4">
+    <div ref={regionRef} tabIndex={-1} className="flex flex-col items-center gap-2 py-4 outline-none">
       {summary ? (
-        <p role="status" className="text-sm text-muted">
+        <p ref={summaryRef} tabIndex={-1} role="status" className="text-sm text-muted outline-none">
           {summary}
         </p>
       ) : null}
       {hasMore ? (
-        <Button variant="secondary" onClick={onLoadMore} loading={loading}>
+        <Button
+          variant="secondary"
+          onClick={onLoadMore}
+          loading={loading}
+          onFocus={() => {
+            ownedFocus.current = true;
+          }}
+          onBlur={(event) => {
+            // Keep ownership only while focus is being lost to the unmount (relatedTarget null and still pending).
+            if (event.relatedTarget) ownedFocus.current = false;
+          }}
+        >
           {label}
         </Button>
       ) : null}

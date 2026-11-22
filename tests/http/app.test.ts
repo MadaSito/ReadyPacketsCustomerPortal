@@ -1,5 +1,8 @@
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Router } from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
@@ -9,7 +12,7 @@ import { getRequestContext } from "../../server/core/requestContext.js";
 import type { RateLimiter } from "../../server/core/types.js";
 import { createApp, type AppOptions } from "../../server/http/app.js";
 import { sendPrivateDownload } from "../../server/http/downloads.js";
-import { EDGE_REQUESTS_PER_WINDOW } from "../../server/http/edgeAdmission.js";
+import { EDGE_REQUESTS_PER_WINDOW, EDGE_STATIC_PER_WINDOW, edgeAdmissionBucket } from "../../server/http/edgeAdmission.js";
 import { getHttpState } from "../../server/http/requestState.js";
 import { ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken } from "../../server/security/csrf.js";
 import { protectedProcedure, publicProcedure, router } from "../../server/trpc/trpc.js";
@@ -124,6 +127,7 @@ describe("HTTP edge: authority, headers, proxy and probes", () => {
     const csp = res.headers["content-security-policy"];
     expect(csp).toMatch(/default-src 'none'; script-src 'self' 'nonce-[A-Za-z0-9_-]{24}'/);
     expect(csp).toContain("style-src 'self'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'");
+    expect(csp).toContain("; media-src 'self' blob:;");
     expect(csp).toContain("frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'");
     expect(csp).not.toMatch(/unsafe-inline|unsafe-eval/);
     expect(second.headers["content-security-policy"]).not.toBe(csp);
@@ -138,6 +142,7 @@ describe("HTTP edge: authority, headers, proxy and probes", () => {
       "cache-control": "no-store",
     });
     expect(res.headers["permissions-policy"]).toContain("camera=()");
+    expect(String(res.headers["permissions-policy"]).split(/,\s*/u)).toContain("microphone=(self)");
     expect(res.headers["x-powered-by"]).toBeUndefined();
   });
 
@@ -241,6 +246,58 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     expect(consume).toHaveBeenCalledWith("api", "ip:2001:db8:1234:5678::/64", 1);
   });
 
+  it("gives three 60-asset cold loads from one address separate bounded capacity without raising API admission", async () => {
+    const staticDir = await mkdtemp(join(tmpdir(), "readypackets-edge-"));
+    try {
+      const assets = Array.from({ length: 60 }, (_, i) => `chunk-${i.toString(16).padStart(8, "0")}.js`);
+      await mkdir(join(staticDir, "assets"));
+      await Promise.all(assets.map((asset) => writeFile(join(staticDir, "assets", asset), "export {};")));
+      const h = harness({ staticDir }, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
+      const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+      type Protection = NonNullable<typeof h.services.protection>;
+      const recordRateLimit = vi.fn<Protection["recordRateLimit"]>(async () => {});
+      h.services.rateLimiter = { consume };
+      const protectionStub: Pick<Protection, "inspect" | "recordRateLimit"> = {
+        inspect: async () => ({ action: "allow" }), recordRateLimit,
+      };
+      h.services.protection = protectionStub as Protection;
+      const get = (path: string, client = 0) => h.http.get(path).set("Host", HOST)
+        .set("X-Forwarded-For", "198.51.100.45").set("User-Agent", `test-client/${client}`);
+      for (const asset of assets) {
+        for (let client = 0; client < 3; client++) await get(`/assets/${asset}`, client).expect(200);
+      }
+      expect(consume).not.toHaveBeenCalled();
+      for (let i = 0; i < EDGE_REQUESTS_PER_WINDOW - 1; i++) await get("/api/check").expect(200);
+      for (let i = 180; i < EDGE_STATIC_PER_WINDOW; i++) await get(`/assets/${assets[0]}`).expect(200);
+      const staticDenial = await get(`/assets/${assets[0]}`).expect(429).expect("Retry-After", "10");
+      await get("/api/check").expect(200);
+      const apiDenial = await get("/api/check").expect(429).expect("Retry-After", "10");
+      expect(consume).toHaveBeenCalledTimes(120);
+      for (const [bucket, response] of [["edge_static", staticDenial], ["edge_requests", apiDenial]] as const) {
+        expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({
+          status: 429, rateLimitBucket: bucket, requestId: response.headers["x-request-id"],
+        }));
+        expect(recordRateLimit).toHaveBeenCalledWith(expect.anything(), expect.any(String), bucket);
+      }
+      h.clock.advance(10_000);
+      await get(`/assets/${assets[0]}`).expect(200);
+      await get("/api/check").expect(200);
+    } finally {
+      await rm(staticDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("classifies only canonical static GET/HEAD paths into the higher admission bucket", () => {
+    expect(edgeAdmissionBucket("GET", "/assets/adminKnowledge.test-BR1MlJtE.js")).toBe("edge_static");
+    expect(edgeAdmissionBucket("HEAD", "/fonts/inter-400.woff2")).toBe("edge_static");
+    expect(edgeAdmissionBucket("GET", "/brand/banner.png")).toBe("edge_static");
+    for (const path of ["/assets/plain.js", "/assets/../chunk-12345678.js", "/assets/%2echunk-12345678.js",
+      "/assets/chunk-12345678.html", "/api/trpc/identity.signIn", "/sign-in", "/brand/license.txt"]) {
+      expect(edgeAdmissionBucket("GET", path)).toBe("edge_requests");
+    }
+    expect(edgeAdmissionBucket("POST", "/assets/chunk-12345678.js")).toBe("edge_requests");
+  });
+
   it("maps trusted forwarded IPv4-mapped forms to the same durable subject as IPv4", async () => {
     const h = harness({}, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
     const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
@@ -296,6 +353,7 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     expect(result.headers["retry-after"]).toBe("24");
     expect(result.body).toHaveLength(2);
     expect(consume).toHaveBeenCalledWith("auth_high_risk", expect.stringMatching(/^edge:ip:/), 2);
+    expect(h.access).toHaveBeenCalledWith("http request", expect.objectContaining({ status: 429, rateLimitBucket: "auth_high_risk" }));
     expect(h.sessionResolver).not.toHaveBeenCalled();
     const big = await h.http.get(`/api/trpc/${Array(9).fill("open").join(",")}?batch=1`).set("Host", HOST).expect(400);
     expect(big.body.error.json.data.safe.reasonCode).toBe("BATCH_TOO_LARGE");
@@ -317,7 +375,7 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     }
     expect(h.audit.events).toHaveLength(0);
     expect(h.audit.notes).toEqual([expect.objectContaining({
-      eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: "scarce" },
+      eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: "scarce", rateLimitBucket: "auth_high_risk" },
     })]);
   });
 });
@@ -376,6 +434,116 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
+  it("isolates increment 04 routers, preserves signed bytes and refuses alias, preview and alternate methods", async () => {
+    const inbound = vi.fn();
+    const returns = vi.fn();
+    const publicApi = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/orders", (req, res) => {
+        expect(Buffer.isBuffer(req.body)).toBe(true);
+        expect(getRequestContext()?.actor).toBeUndefined();
+        res.json({ raw: req.body.toString("utf8"), path: req.path, requestId: getRequestContext()?.requestId });
+      });
+      return r;
+    };
+    const inboundWebhooks = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/hook", (req, res) => { inbound(req.body); res.status(204).end(); });
+      return r;
+    };
+    const paymentReturn = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.get("/example", (_req, res) => { returns(); res.status(204).end(); });
+      return r;
+    };
+    const raw = "{\n  \"status\" : \"synthetic\"\n}";
+    const h = harness({ isolatedRouters: { publicApi, inboundWebhooks, paymentReturn } }, { aliasHosts: ["portal.readypackets.test"] });
+    const api = await h.http.post("/api/v1/orders").set("Host", HOST).set("X-RP-CSRF", "synthetic")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("json").send(raw).expect(200);
+    expect(api.body).toEqual({ raw, path: "/orders", requestId: api.headers["x-request-id"] });
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("json").send(raw).expect(204);
+    expect(inbound).toHaveBeenCalledWith(Buffer.from(raw));
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("text").send(raw).expect(400);
+    await h.http.post("/api/webhooks/inbound/hook").set("Host", HOST).type("json").send({ huge: "a".repeat(270_000) }).expect(413);
+    await h.http.get("/api/webhooks/inbound/hook").set("Host", HOST).expect(404);
+    const missing = await h.http.post("/api/v1/missing").set("Host", HOST).type("json").send(raw)
+      .expect("Content-Type", /application\/problem\+json/u).expect(404);
+    expect(missing.body).toMatchObject({ status: 404, request_id: missing.headers["x-request-id"] });
+    await h.http.post("/API/V1/orders").set("Host", HOST).type("json").send(raw).expect(404);
+    await h.http.get("/api/payments/return/example").set("Host", HOST).expect(204);
+    const alias = await h.http.get("/Api/Payments/Return/example?state=synthetic-query").set("Host", "portal.readypackets.test").expect(404);
+    expect(alias.headers.location).toBeUndefined();
+    expect(JSON.stringify(h.access.mock.calls)).not.toContain("synthetic-query");
+    expect(returns).toHaveBeenCalledTimes(1);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    const preview = harness({ isolatedRouters: { publicApi } }, { deploymentProfile: "preview" });
+    await preview.http.post("/api/v1/orders").set("Host", HOST).type("json").send(raw).expect(404);
+  });
+
+  it("mounts the default Public API adapter without resolving browser cookies", async () => {
+    const h = harness();
+    const handle = vi.fn(async () => ({
+      status: 200, headers: { "content-type": "application/json" }, body: '{"openapi":"3.1.0"}',
+    }));
+    h.services.publicApi = { handle } as unknown as typeof h.services.publicApi;
+    const response = await h.http.get("/api/v1/openapi.json").set("Host", HOST)
+      .set("X-Request-Id", "untrusted-api-id").set("Cookie", requestCookies(h.config, TOKEN_A))
+      .expect(200, { openapi: "3.1.0" });
+    expect(handle).toHaveBeenCalledWith(expect.objectContaining({
+      method: "GET", target: "/openapi.json", body: Buffer.alloc(0), requestId: response.headers["x-request-id"],
+    }));
+    expect(response.headers["x-request-id"]).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("passes exact JSON bytes to the default inbound webhook adapter without resolving cookies", async () => {
+    const h = harness();
+    const receiveInboundHttp = vi.fn(async () => ({ httpStatus: 200, body: { ok: true } }));
+    h.services.integrations = { webhooks: { receiveInboundHttp } } as unknown as typeof h.services.integrations;
+    const endpointPublicId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const body = '{\n "event":"synthetic"\n}';
+    const response = await h.http.post(`/api/webhooks/inbound/${endpointPublicId}`).set("Host", HOST)
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("json").send(body).expect(200, { ok: true });
+    expect(receiveInboundHttp).toHaveBeenCalledWith(expect.objectContaining({
+      endpointPublicId, rawBody: Buffer.from(body), correlationId: response.headers["x-correlation-id"],
+    }));
+    expect(response.headers["x-correlation-id"]).toBe(response.headers["x-request-id"]);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("mounts the default payment adapters with a fixed return and canonical notification target", async () => {
+    const h = harness();
+    const handleSignedWebhook = vi.fn(async () => ({
+      httpStatus: 200, accepted: true, duplicate: false, booked: false, reasonCode: "SYNTHETIC",
+    }));
+    Object.assign(h.services, { payments: { handleSignedWebhook } });
+    const attempt = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const body = '{\n "id":"synthetic"\n}';
+    await h.http.post("/api/payments/webhooks/square").set("Host", HOST).type("json")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).send(body).expect(200);
+    expect(handleSignedWebhook).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "square", rawBody: Buffer.from(body), notificationUrl: `${ORIGIN}/api/payments/webhooks/square`,
+    }));
+    await h.http.get(`/api/payments/return/stripe/${attempt}?flow=checkout&next=https://other.example.test`).set("Host", HOST)
+      .expect(303).expect("Location", `/checkout/return?attempt=${attempt}`);
+    expect(handleSignedWebhook).toHaveBeenCalledTimes(1);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("does not log the payment receiver's exception message", async () => {
+    const h = harness();
+    const error = vi.fn();
+    h.services.logger.error = error;
+    Object.assign(h.services, { payments: { handleSignedWebhook: async () => { throw new Error("synthetic-sensitive-provider-detail"); } } });
+    await h.http.post("/api/payments/webhooks/stripe").set("Host", HOST)
+      .type("json").send({ id: "synthetic" }).expect(500)
+      .expect({ ok: false, reasonCode: "INTERNAL_WEBHOOK_ERROR" });
+    expect(error).toHaveBeenCalledWith("Unhandled error in payment webhook receiver", expect.objectContaining({
+      provider: "stripe", reasonCode: "UNHANDLED_EXCEPTION", errorName: "Error",
+    }));
+    expect(JSON.stringify(error.mock.calls)).not.toContain("synthetic-sensitive-provider-detail");
+  });
+
   it("passes only narrow webhook bytes ahead of JSON parsing and enforces request body limits", async () => {
     const signedWebhookRouter = Router();
     signedWebhookRouter.post("/synthetic", (req, res) => {

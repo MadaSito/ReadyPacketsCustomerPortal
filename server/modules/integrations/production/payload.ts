@@ -60,6 +60,9 @@ export interface P201Payload {
   run_mode: string;
 }
 
+export type P301Payload = P201Payload;
+export type P401Payload = P201Payload;
+
 export interface ProductionIdentityTriple {
   customerId: string;
   orderId: string;
@@ -537,6 +540,132 @@ export function validateP201(
   }
 
   return { ok: true, payload: raw, errors: [] };
+}
+
+export type LaterProductionPhase = "P201" | "P301" | "P401";
+
+/**
+ * Validates a Phase II/III/IV (`P201` | `P301` | `P401`) `{ customer_id, order_id, run_mode }` payload
+ * and (when provided) enforces exact identity-triple parity with the delivered P101 record for the order.
+ * Delegates `P201` directly to `validateP201` so existing `P201_*` error codes remain byte-identical.
+ */
+export function validateLaterPhasePayload(
+  phase: LaterProductionPhase,
+  candidate: unknown,
+  expectedFromDeliveredP101?: ProductionIdentityTriple,
+): PayloadValidationResult<P201Payload> {
+  if (phase === "P201") {
+    return validateP201(candidate, expectedFromDeliveredP101);
+  }
+
+  const errors: PayloadValidationIssue[] = [];
+
+  if (!isPlainRecord(candidate)) {
+    return {
+      ok: false,
+      payload: null,
+      errors: [{ code: `${phase}_NOT_OBJECT`, message: `${phase} payload must be a JSON object.` }],
+    };
+  }
+
+  if ("order_scope_mode" in candidate) {
+    errors.push({
+      code: `${phase}_ORDER_SCOPE_MODE_FORBIDDEN`,
+      message: `order_scope_mode must never be included in ${phase} payloads.`,
+    });
+  }
+
+  for (const key of Object.keys(candidate)) {
+    if (key !== "order_scope_mode" && !P201_KEY_SET.has(key)) {
+      errors.push({
+        code: `${phase}_UNEXPECTED_FIELD`,
+        message: `Unexpected ${phase} field: ${key}.`,
+      });
+    }
+  }
+
+  for (const requiredKey of P201_EXACT_KEYS) {
+    const val = candidate[requiredKey];
+    if (typeof val !== "string") {
+      errors.push({
+        code: `${phase}_${requiredKey.toUpperCase()}_NOT_STRING`,
+        message: `${requiredKey} must be a string value.`,
+      });
+    } else if (hasControlChars(val)) {
+      errors.push({
+        code: `${phase}_${requiredKey.toUpperCase()}_CONTROL_CHARS`,
+        message: `${requiredKey} must not contain control characters.`,
+      });
+    }
+  }
+
+  if (errors.length > 0) {
+    return { ok: false, payload: null, errors };
+  }
+
+  const raw = candidate as unknown as P201Payload;
+
+  if (raw.customer_id.trim().length === 0 || raw.customer_id.length > 120) {
+    errors.push({
+      code: `${phase}_CUSTOMER_ID_INVALID`,
+      message: "customer_id must be a non-empty customer reference.",
+    });
+  }
+  if (raw.order_id.trim().length === 0 || raw.order_id.length > 120) {
+    errors.push({
+      code: `${phase}_ORDER_ID_INVALID`,
+      message: "order_id must be a non-empty order reference.",
+    });
+  }
+  if (!RUN_MODE_PATTERN.test(raw.run_mode)) {
+    errors.push({
+      code: `${phase}_RUN_MODE_INVALID`,
+      message: "run_mode must match ^[a-z][a-z0-9_]{0,31}$.",
+    });
+  }
+
+  if (expectedFromDeliveredP101) {
+    if (raw.customer_id !== expectedFromDeliveredP101.customerId) {
+      errors.push({
+        code: `${phase}_CUSTOMER_ID_MISMATCH`,
+        message: `${phase} customer_id must match the delivered P101 customer_id verbatim.`,
+      });
+    }
+    if (raw.order_id !== expectedFromDeliveredP101.orderId) {
+      errors.push({
+        code: `${phase}_ORDER_ID_MISMATCH`,
+        message: `${phase} order_id must match the delivered P101 order_id verbatim.`,
+      });
+    }
+    if (raw.run_mode !== expectedFromDeliveredP101.runMode) {
+      errors.push({
+        code: `${phase}_RUN_MODE_MISMATCH`,
+        message: `${phase} run_mode must match the delivered P101 run_mode verbatim.`,
+      });
+    }
+  }
+
+  if (errors.length > 0) {
+    return { ok: false, payload: null, errors };
+  }
+
+  return { ok: true, payload: raw, errors: [] };
+}
+
+/**
+ * Constructs a later-phase (`P201` | `P301` | `P401`) `{ customer_id, order_id, run_mode }` payload
+ * solely from the stored, delivered P101 identity triple (never recomputed from mutable customer/order rows).
+ */
+export function buildLaterPhaseFromDeliveredP101(
+  phase: LaterProductionPhase,
+  deliveredP101: ProductionIdentityTriple,
+): PayloadValidationResult<P201Payload> {
+  const candidate: P201Payload = {
+    customer_id: deliveredP101.customerId,
+    order_id: deliveredP101.orderId,
+    run_mode: deliveredP101.runMode,
+  };
+  return validateLaterPhasePayload(phase, candidate, deliveredP101);
 }
 
 /**

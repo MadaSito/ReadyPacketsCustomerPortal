@@ -1,7 +1,7 @@
 /**
  * Platform module — Drizzle MySQL tables. Owner: platform module engineer.
  */
-import { bigint, char, index, int, json, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
+import { bigint, boolean, char, index, int, json, mysqlTable, text, uniqueIndex, varchar } from "drizzle-orm/mysql-core";
 import { createdAtColumn, idColumn, publicIdColumn, refColumn, updatedAtColumn, utcDateTime, versionColumn } from "../../db/columns.js";
 
 /**
@@ -66,4 +66,33 @@ export const platformReencryptCheckpoints = mysqlTable(
     updatedAt: updatedAtColumn(),
   },
   (t) => [uniqueIndex("platform_reencrypt_target_uq").on(t.target, t.targetKeyId)],
+);
+
+/**
+ * Cookie-consent ledger (increment 04, package J). Append-only: one row per decision. No IP in clear (keyed
+ * HMAC only), no user agent. `consent_id` is the random anonymous id the browser keeps with its choice;
+ * `user_public_id` is set when the decision was made in a full session.
+ */
+export const platformConsentRecords = mysqlTable(
+  "platform_consent_records",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    consentId: char("consent_id", { length: 22 }).notNull(),
+    userPublicId: varchar("user_public_id", { length: 32 }),
+    policyVersion: int("policy_version", { unsigned: true }).notNull(),
+    preferences: boolean("preferences").notNull(),
+    analytics: boolean("analytics").notNull(),
+    sessionReplay: boolean("session_replay").notNull(),
+    action: varchar("action", { length: 12, enum: ["accept_all", "reject_all", "save", "withdraw"] }).notNull(),
+    source: varchar("source", { length: 12, enum: ["banner", "preferences", "account", "gpc"] }).notNull(),
+    gpc: boolean("gpc").notNull(),
+    ipIndex: char("ip_index", { length: 64 }),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    index("platform_consent_records_consent_idx").on(t.consentId, t.createdAt),
+    index("platform_consent_records_user_idx").on(t.userPublicId, t.createdAt),
+    index("platform_consent_records_created_idx").on(t.createdAt),
+  ],
 );

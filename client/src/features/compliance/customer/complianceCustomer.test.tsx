@@ -1,5 +1,6 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { lazy, Suspense, type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InvoiceDetailView } from "@server/modules/compliance/invoicesService";
 import type { OrderIntakeItemView } from "@server/modules/compliance/intakeService";
@@ -76,7 +77,7 @@ const intake: OrderIntakeItemView = {
 };
 const invoice: InvoiceDetailView = {
   invoicePublicId: publicId("6"), orderPublicId: orderId, orderReference: "RP-123", invoiceNumber: "RP-INV-123",
-  status: "issued", currency: "USD", subtotalMinor: 10000, discountMinor: 0, taxMinor: 0, totalMinor: 10000,
+  status: "issued", paymentState: "partially_refunded", currency: "USD", subtotalMinor: 10000, discountMinor: 0, taxMinor: 0, totalMinor: 10000,
   grossPaidMinor: 4000, refundedMinor: 1000, netPaidMinor: 3000, balanceDueMinor: 7000, issuedAt: date,
   dueAt: date, voidedAt: null, origin: "portal", version: 1, createdAt: date, issuerName: "ReadyPackets",
   issuerAddress: "", memo: null, voidReason: null, paymentInstructions: "", onlinePaymentConfigured: false,
@@ -181,6 +182,34 @@ describe("customer policy review", () => {
     expect(await screen.findByRole("textbox", { name: "Project draft" })).toHaveValue("My project");
   });
 
+  it("keeps an h1 heading visible inside a local Suspense boundary while a lazy child page loads after policy check", async () => {
+    mocks.policyStatus.mockResolvedValue({ pendingRequired: [], published: [document], acceptances: [] });
+    let resolveLazy!: (mod: { default: () => ReactElement }) => void;
+    const LazyChild = lazy(
+      () =>
+        new Promise<{ default: () => ReactElement }>((resolve) => {
+          resolveLazy = resolve;
+        }),
+    );
+    const { container } = renderUi(
+      <Suspense fallback={<p>Outer route loading without heading</p>}>
+        <RequiredPolicyGate>
+          <LazyChild />
+        </RequiredPolicyGate>
+      </Suspense>,
+    );
+    await waitFor(() => expect(resolveLazy).toBeTypeOf("function"));
+    expect(screen.getByRole("heading", { level: 1, name: "New order" })).toBeVisible();
+    expect(screen.queryByText("Outer route loading without heading")).not.toBeInTheDocument();
+    await expectNoAxeViolations(container);
+
+    await act(async () => {
+      resolveLazy({ default: () => <h1>New order wizard loaded</h1> });
+    });
+    expect(await screen.findByRole("heading", { level: 1, name: "New order wizard loaded" })).toBeVisible();
+    await expectNoAxeViolations(container);
+  });
+
   it("renders legal markup as safe text and shows only server-returned acceptance history", async () => {
     const legal = renderUi(<LegalPage />);
     expect(await screen.findByText("<img src=x onerror=alert(1)>")).toBeVisible();
@@ -261,7 +290,9 @@ describe("customer invoices", () => {
     mocks.invoiceList.mockResolvedValue({ items: [invoice, draft], nextCursor: null });
     mocks.orderInvoices.mockResolvedValue({ items: [invoice, draft] });
     const list = renderUi(<InvoicesPage />);
-    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    const invoiceLink = await screen.findByRole("link", { name: "RP-INV-123" });
+    expect(invoiceLink).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    expect(invoiceLink).toHaveClass("inline-flex", "min-h-6", "items-center");
     expect(screen.getByText("Issued")).toBeVisible();
     expect(screen.getByText("Due date")).toBeVisible();
     expect(screen.getByText("$70.00")).toBeVisible();
@@ -269,7 +300,8 @@ describe("customer invoices", () => {
     await expectNoAxeViolations(list.container);
     list.unmount();
     renderUi(<OrderInvoicesTab orderId={orderId} area="customer" />);
-    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toHaveAttribute("href", `/invoices/${invoice.invoicePublicId}`);
+    expect(screen.queryByRole("link", { name: "New invoice for this order" })).not.toBeInTheDocument();
     expect(screen.queryByText("Unissued sample")).not.toBeInTheDocument();
     expect(mocks.orderInvoices).toHaveBeenCalledWith({ orderPublicId: orderId });
   });

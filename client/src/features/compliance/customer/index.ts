@@ -17,7 +17,7 @@ export const complianceCustomerNav: NavItem[] = [
 
 export const complianceOrderTabs: OrderTab[] = [
   { key: "intake", label: "Intake", access: "customer", order: 20, component: lazy(() => import("./OrderIntakeTab")) },
-  { key: "invoices", label: "Invoices", access: "customer", order: 40, component: lazy(() => import("./InvoicePages").then((m) => ({ default: m.OrderInvoicesTab }))) },
+  { key: "invoices", label: "Invoices", access: "customer", order: 70, component: lazy(() => import("./InvoicePages").then((m) => ({ default: m.OrderInvoicesTab }))) },
 ];
 
 export const complianceWidgets: DashboardWidget[] = [

@@ -57,9 +57,13 @@ export interface OrderRef {
   id: number;
   publicId: string;
   reference: string;
+  /** Part B: the order name (projectName), for storage folder tokens and copy sources. */
+  name: string;
   ownerUserId: number;
   lockState: OrderLockState;
   statusKey: string;
+  /** Increment 04: pinned workflow version (for phase checks via isStatusPhaseLocked). */
+  workflowVersionId: number;
 }
 
 export type AccessibleOrderIds = { all: true } | { all: false; orderIds: number[]; truncated: boolean };

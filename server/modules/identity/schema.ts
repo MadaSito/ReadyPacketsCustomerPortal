@@ -84,11 +84,16 @@ export const userSessions = mysqlTable(
     revokeReason: varchar("revoke_reason", { length: 40 }),
     /** Coarse "Browser on OS" summary derived server-side; no raw user agent, no IP. */
     deviceSummary: varchar("device_summary", { length: 80 }),
+    /** Increment 04: client address at sign-in, encrypted (aad `user_sessions.ip:<publicId>`). Admin session centre only. */
+    ipAddressEnc: text("ip_address_enc"),
+    /** Increment 04: ISO 3166-1 alpha-2 at sign-in (protection.clientCountry), null = unknown. */
+    country: char("country", { length: 2 }),
     createdAt: createdAtColumn(),
   },
   (table) => [
     uniqueIndex("user_sessions_token_hash_uq").on(table.tokenHash),
     index("user_sessions_user_idx").on(table.userId, table.revokedAt),
+    index("user_sessions_live_idx").on(table.revokedAt, table.lastSeenAt),
   ],
 );
 export type UserSessionRow = typeof userSessions.$inferSelect;
@@ -264,3 +269,68 @@ export const ssoAuthRequests = mysqlTable(
   ],
 );
 export type SsoAuthRequestRow = typeof ssoAuthRequests.$inferSelect;
+
+/* ------------------------------------------------------------------ increment 04: session centre (package D) */
+
+export const SIGN_IN_EVENT_KINDS = ["success", "failure", "lock", "sign_out", "forced_end", "expiry", "refused"] as const;
+export type SignInEventKind = (typeof SIGN_IN_EVENT_KINDS)[number];
+
+/**
+ * Sign-in / session log. Never holds the typed e-mail, a password, a token or a raw user agent. The IP is
+ * encrypted (aad `identity_sign_in_events.ip:<publicId>`) with a blind index for exact-match filtering.
+ */
+export const signInEvents = mysqlTable(
+  "identity_sign_in_events",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    occurredAt: utcDateTime("occurred_at").notNull(),
+    kind: mysqlEnum("kind", SIGN_IN_EVENT_KINDS).notNull(),
+    reasonCode: varchar("reason_code", { length: 40 }),
+    userId: refColumn("user_id").references(() => users.id),
+    role: mysqlEnum("role", USER_ROLES),
+    authMethod: mysqlEnum("auth_method", AUTH_METHODS),
+    sessionPublicId: char("session_public_id", { length: 26 }),
+    ipAddressEnc: text("ip_address_enc"),
+    ipIndex: char("ip_index", { length: 64 }),
+    country: char("country", { length: 2 }),
+    deviceSummary: varchar("device_summary", { length: 80 }),
+    /** Administrator who forced the end (forced_end only). */
+    actorUserId: refColumn("actor_user_id").references(() => users.id),
+    requestId: char("request_id", { length: 26 }),
+  },
+  (table) => [
+    index("identity_sign_in_events_time_idx").on(table.occurredAt),
+    index("identity_sign_in_events_user_idx").on(table.userId, table.occurredAt),
+    index("identity_sign_in_events_kind_idx").on(table.kind, table.occurredAt),
+    index("identity_sign_in_events_ip_idx").on(table.ipIndex, table.occurredAt),
+  ],
+);
+export type SignInEventRow = typeof signInEvents.$inferSelect;
+
+export const COUNTRY_RULE_MODES = ["off", "allow", "deny"] as const;
+export const RESTRICTION_SCOPES = ["all", "customers", "console"] as const;
+
+/** Single row (id = 1). Ships disabled. Per-role lifetimes null = use the global identity settings. */
+export const sessionRestrictions = mysqlTable("identity_session_restrictions", {
+  id: int("id").primaryKey(),
+  enabled: boolean("enabled").notNull().default(false),
+  maxConcurrentPerUser: int("max_concurrent_per_user"),
+  idleMinutesCustomer: int("idle_minutes_customer"),
+  idleMinutesStaff: int("idle_minutes_staff"),
+  idleMinutesAdmin: int("idle_minutes_admin"),
+  absoluteHoursCustomer: int("absolute_hours_customer"),
+  absoluteHoursStaff: int("absolute_hours_staff"),
+  absoluteHoursAdmin: int("absolute_hours_admin"),
+  /** JSON array of normalised CIDR strings (≤ 100). Empty = no console IP restriction. */
+  consoleIpAllowList: text("console_ip_allow_list"),
+  countryMode: mysqlEnum("country_mode", COUNTRY_RULE_MODES).notNull().default("off"),
+  countryScope: mysqlEnum("country_scope", RESTRICTION_SCOPES).notNull().default("all"),
+  /** Comma-separated ISO alpha-2 codes (≤ 250). */
+  countries: varchar("countries", { length: 750 }),
+  allowUnknownCountry: boolean("allow_unknown_country").notNull().default(true),
+  version: versionColumn(),
+  updatedBy: refColumn("updated_by").references(() => users.id),
+  updatedAt: updatedAtColumn(),
+});
+export type SessionRestrictionsRow = typeof sessionRestrictions.$inferSelect;

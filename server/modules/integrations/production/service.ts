@@ -33,6 +33,8 @@ import { flagKey } from "../../platform/settingsRegistry.js";
 import {
   assertIntegrationsManageInTx,
   assertIntegrationsManagePreflight,
+  assertProductionRedeliverInTx,
+  assertProductionRedeliverPreflight,
   assertProductionResendInTx,
   assertProductionResendPreflight,
   assertProductionTriggerInTx,
@@ -48,20 +50,23 @@ import {
   INTEGRATIONS_PRODUCTION_FLAG,
   INTEGRATIONS_PRODUCTION_P101_URL,
   INTEGRATIONS_PRODUCTION_P201_URL,
+  INTEGRATIONS_PRODUCTION_P301_URL,
+  INTEGRATIONS_PRODUCTION_P401_URL,
   isValidProductionAuthHeaderName,
   isValidProductionWebhookUrl,
   readIntegrationFlag,
 } from "../settings.js";
 import type { ProviderState } from "../smtp.js";
 import {
+  buildLaterPhaseFromDeliveredP101,
   buildP101Payload,
   buildP201FromDeliveredP101,
   CANON_VERSION_PATTERN,
   maskP101PayloadForRole,
   maskSecretWebhookUrl,
   RUN_MODE_PATTERN,
+  validateLaterPhasePayload,
   validateP101,
-  validateP201,
   type P101Payload,
   type P201Payload,
   type PayloadValidationIssue,
@@ -80,7 +85,9 @@ export const PRODUCTION_DISPATCH_MAX_TTL_MS = 86_400_000 as const;
 const RECONCILE_BATCH_SIZE = 100;
 const MAX_RECONCILE_BATCHES = 10;
 
-export type ProductionPhase = "P101" | "P201";
+export const PRODUCTION_SETTINGS_HREF = "/admin/integrations/production" as const;
+export const PRODUCTION_PHASES = ["P101", "P201", "P301", "P401"] as const;
+export type ProductionPhase = (typeof PRODUCTION_PHASES)[number];
 export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
 export type ProductionValidationIssue = PayloadValidationIssue;
 export type ControlledResendReason =
@@ -88,6 +95,35 @@ export type ControlledResendReason =
   | "OPERATOR_RETRY_AFTER_DEAD_LETTER"
   | "OPERATOR_RETRY_AFTER_FAILURE"
   | "OPERATOR_REPLAY_DELIVERED";
+
+export type ProductionDisabledReasonCategory =
+  | "pipeline_off"
+  | "endpoint_missing"
+  | "config_incomplete"
+  | "in_progress"
+  | "already_delivered"
+  | "retry_or_resend_required"
+  | "precondition";
+
+export interface ProductionDisabledReason {
+  code: string;
+  category: ProductionDisabledReasonCategory;
+  message: string;
+  /** True when an administrator can resolve this reason in `/admin/integrations/production`. */
+  settingsActionable: boolean;
+}
+
+export interface ProductionLaterPhasePreview {
+  configured: boolean;
+  eligible: boolean;
+  p101Delivered: boolean;
+  prerequisiteDelivered: boolean;
+  alreadyDelivered: boolean;
+  activeState: ProductionDispatchState | null;
+  validationErrors: ProductionValidationIssue[];
+  disabledReasons: ProductionDisabledReason[];
+  payload: P201Payload | null;
+}
 
 export interface MaskedWebhookUrlView {
   host: string;
@@ -103,6 +139,10 @@ export interface ProductionSettingsView {
   p101UrlMask: MaskedWebhookUrlView | null;
   p201UrlConfigured: boolean;
   p201UrlMask: MaskedWebhookUrlView | null;
+  p301UrlConfigured: boolean;
+  p301UrlMask: MaskedWebhookUrlView | null;
+  p401UrlConfigured: boolean;
+  p401UrlMask: MaskedWebhookUrlView | null;
   authHeaderName: string;
   authHeaderValueConfigured: boolean;
   canonVersion: string;
@@ -116,6 +156,10 @@ export interface UpdateProductionSettingsInput {
   p101Url?: string | null;
   /** Omit/`undefined` to keep existing secret, `null` to clear, HTTPS URL string to replace. */
   p201Url?: string | null;
+  /** Optional Phase III (`P301`) HTTPS URL: omit/`undefined` to keep existing secret, `null` to clear, HTTPS URL string to replace. */
+  p301Url?: string | null;
+  /** Optional Phase IV (`P401`) HTTPS URL: omit/`undefined` to keep existing secret, `null` to clear, HTTPS URL string to replace. */
+  p401Url?: string | null;
   authHeaderName?: string;
   /** Omit/`undefined` to keep existing secret, `null` to clear, string to replace. */
   authHeaderValue?: string | null;
@@ -138,22 +182,29 @@ export interface ProductionDryRunResult {
 export interface ProductionOrderPreview {
   featureEnabled: boolean;
   featureConfigured: boolean;
+  settingsHref: string;
   p101: {
+    configured: boolean;
     eligible: boolean;
     alreadyDelivered: boolean;
     activeState: ProductionDispatchState | null;
     validationErrors: ProductionValidationIssue[];
+    disabledReasons: ProductionDisabledReason[];
     payload: P101Payload | null;
     maskedForViewer: boolean;
   };
   p201: {
+    configured: boolean;
     eligible: boolean;
     p101Delivered: boolean;
     alreadyDelivered: boolean;
     activeState: ProductionDispatchState | null;
     validationErrors: ProductionValidationIssue[];
+    disabledReasons: ProductionDisabledReason[];
     payload: P201Payload | null;
   };
+  p301: ProductionLaterPhasePreview;
+  p401: ProductionLaterPhasePreview;
 }
 
 export interface ProductionDispatchItem {
@@ -181,6 +232,10 @@ export interface ProductionDispatchItem {
   lastReasonCode: string | null;
   /** Controlled server-classified code ONLY — never reflects raw operator prose. */
   resendReason: string | null;
+  /** Public ULID of the failed/dead dispatch this attempt retried, or `null`. */
+  retryOf: string | null;
+  /** Public ULID of the already-delivered dispatch this attempt re-delivered, or `null`. */
+  redeliveryOf: string | null;
   requestedByPublicId: string | null;
   correlationId: string;
   createdAt: Date;
@@ -197,6 +252,23 @@ export interface RequestP101Input {
 export interface RequestP201Input {
   orderPublicId: string;
   phase1ArtifactsConfirmed: boolean;
+}
+
+export interface RequestLaterPhaseInput {
+  orderPublicId: string;
+}
+
+export interface RetryProductionDispatchInput {
+  orderPublicId: string;
+  dispatchPublicId: string;
+}
+
+export interface RedeliverProductionDispatchInput {
+  orderPublicId: string;
+  dispatchPublicId: string;
+  reason: string;
+  confirmation: string;
+  idempotencyKey: string;
 }
 
 export interface ResendProductionInput {
@@ -226,6 +298,10 @@ export interface ProductionWebhookService {
   ): Promise<ProductionOrderPreview>;
   requestP101(principal: SessionPrincipal, input: RequestP101Input): Promise<ProductionDispatchItem>;
   requestP201(principal: SessionPrincipal, input: RequestP201Input): Promise<ProductionDispatchItem>;
+  requestP301(principal: SessionPrincipal, input: RequestLaterPhaseInput): Promise<ProductionDispatchItem>;
+  requestP401(principal: SessionPrincipal, input: RequestLaterPhaseInput): Promise<ProductionDispatchItem>;
+  retry(principal: SessionPrincipal, input: RetryProductionDispatchInput): Promise<ProductionDispatchItem>;
+  redeliver(principal: SessionPrincipal, input: RedeliverProductionDispatchInput): Promise<ProductionDispatchItem>;
   resend(principal: SessionPrincipal, input: ResendProductionInput): Promise<ProductionDispatchItem>;
   orderHistory(principal: SessionPrincipal, input: { orderPublicId: string }): Promise<{ items: ProductionDispatchItem[] }>;
   listDispatches(
@@ -362,6 +438,31 @@ class CandidateMovedRollback extends Error {
   }
 }
 
+const RETRY_STORAGE_SUFFIX_RE = /:r:[0-9A-HJKMNP-TV-Z]{26}$/;
+
+function toWireIdempotencyKey(storedKey: string): string {
+  return storedKey.replace(RETRY_STORAGE_SUFFIX_RE, "");
+}
+
+function resolveRetryRootRow(targetRow: DispatchRow, existingRows: readonly DispatchRow[]): DispatchRow {
+  const byPublicId = new Map(existingRows.map((r) => [r.publicId, r]));
+  const visited = new Set<string>();
+  let current: DispatchRow = targetRow;
+  while (current.retryOfPublicId && !visited.has(current.publicId)) {
+    visited.add(current.publicId);
+    const parent = byPublicId.get(current.retryOfPublicId);
+    if (!parent) {
+      break;
+    }
+    current = parent;
+  }
+  return current;
+}
+
+function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: readonly DispatchRow[]): string {
+  return toWireIdempotencyKey(resolveRetryRootRow(targetRow, existingRows).idempotencyKey);
+}
+
 function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
   return {
     publicId: row.publicId,
@@ -371,7 +472,7 @@ function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
     state: row.state as ProductionDispatchState,
     attemptCount: row.attemptCount,
     maxAttempts: PRODUCTION_MAX_ATTEMPTS,
-    idempotencyKey: row.idempotencyKey,
+    idempotencyKey: toWireIdempotencyKey(row.idempotencyKey),
     payloadSha256: row.payloadSha256,
     identityTriple: {
       customerId: row.sentCustomerId,
@@ -386,6 +487,8 @@ function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
     responseSummary: row.responseSummary ?? null,
     lastReasonCode: row.lastReasonCode ?? null,
     resendReason: row.resendReason ?? null,
+    retryOf: row.retryOfPublicId ?? null,
+    redeliveryOf: row.redeliveryOfPublicId ?? null,
     requestedByPublicId: row.requestedByPublicId ?? null,
     correlationId: row.correlationId,
     createdAt: row.createdAt,
@@ -406,6 +509,8 @@ function buildSafeDispatchAuditAttributes(
     | "httpStatus"
     | "attemptCount"
     | "idempotencyKey"
+    | "retryOfPublicId"
+    | "redeliveryOfPublicId"
   >,
   extra?: Record<string, string | number | boolean | null>,
 ): Record<string, SafeAttributeValue> {
@@ -417,9 +522,24 @@ function buildSafeDispatchAuditAttributes(
     bundle_scope_manifest: row.bundleScopeManifest ?? null,
     http_status: row.httpStatus ?? null,
     attempt_count: row.attemptCount,
-    idempotency_key: row.idempotencyKey,
+    idempotency_key: toWireIdempotencyKey(row.idempotencyKey),
+    retry_of_public_id: row.retryOfPublicId ?? null,
+    redelivery_of_public_id: row.redeliveryOfPublicId ?? null,
     ...extra,
   };
+}
+
+function phaseDisplayLabel(phase: ProductionPhase): string {
+  switch (phase) {
+    case "P101":
+      return "Phase I";
+    case "P201":
+      return "Phase II";
+    case "P301":
+      return "Phase III";
+    case "P401":
+      return "Phase IV";
+  }
 }
 
 const JOB_AUDIT_ACTOR = { userId: null, role: "system" as const };
@@ -484,16 +604,20 @@ export function createProductionWebhookService(
   }
 
   async function readProductionState(tx?: Tx) {
-    const [enabled, cfg, p101Secret, p201Secret, authValueConfigured] = await Promise.all([
+    const [enabled, cfg, p101Secret, p201Secret, p301Secret, p401Secret, authValueConfigured] = await Promise.all([
       readIntegrationFlag(deps.settings, INTEGRATIONS_PRODUCTION_FLAG, tx),
       readSetting(deps.settings, INTEGRATIONS_PRODUCTION_CONFIG, tx),
       readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P101_URL, tx),
       readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P201_URL, tx),
+      readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P301_URL, tx),
+      readSecret(deps.settings, INTEGRATIONS_PRODUCTION_P401_URL, tx),
       isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx),
     ]);
 
     const p101UrlConfigured = Boolean(p101Secret && isValidProductionWebhookUrl(p101Secret));
     const p201UrlConfigured = Boolean(p201Secret && isValidProductionWebhookUrl(p201Secret));
+    const p301UrlConfigured = Boolean(p301Secret && isValidProductionWebhookUrl(p301Secret));
+    const p401UrlConfigured = Boolean(p401Secret && isValidProductionWebhookUrl(p401Secret));
     const authHeaderValid = isValidProductionAuthHeaderName(cfg.authHeaderName);
     const authConsistent = authHeaderValid && (cfg.authHeaderName === "" || authValueConfigured);
     const canonTrimmed = cfg.canonVersion.trim();
@@ -507,11 +631,64 @@ export function createProductionWebhookService(
       cfg,
       p101Secret,
       p201Secret,
+      p301Secret,
+      p401Secret,
       p101UrlConfigured,
       p201UrlConfigured,
+      p301UrlConfigured,
+      p401UrlConfigured,
+      authHeaderValid,
+      authConsistent,
+      canonValid,
+      runModeValid,
       authValueConfigured,
       configured,
     };
+  }
+
+  function targetSecretForPhase(
+    prodState: Awaited<ReturnType<typeof readProductionState>>,
+    phase: ProductionPhase,
+  ): string | null {
+    switch (phase) {
+      case "P101":
+        return prodState.p101Secret;
+      case "P201":
+        return prodState.p201Secret;
+      case "P301":
+        return prodState.p301Secret;
+      case "P401":
+        return prodState.p401Secret;
+    }
+  }
+
+  function phaseUrlConfigured(
+    prodState: Awaited<ReturnType<typeof readProductionState>>,
+    phase: ProductionPhase,
+  ): boolean {
+    switch (phase) {
+      case "P101":
+        return prodState.p101UrlConfigured;
+      case "P201":
+        return prodState.p201UrlConfigured;
+      case "P301":
+        return prodState.p301UrlConfigured;
+      case "P401":
+        return prodState.p401UrlConfigured;
+    }
+  }
+
+  function secretDefForPhase(phase: ProductionPhase) {
+    switch (phase) {
+      case "P101":
+        return INTEGRATIONS_PRODUCTION_P101_URL;
+      case "P201":
+        return INTEGRATIONS_PRODUCTION_P201_URL;
+      case "P301":
+        return INTEGRATIONS_PRODUCTION_P301_URL;
+      case "P401":
+        return INTEGRATIONS_PRODUCTION_P401_URL;
+    }
   }
 
   type ReconcileCandidate = Pick<
@@ -602,6 +779,7 @@ export function createProductionWebhookService(
             reasonCode,
             correlationId: correlationIdOverride ?? locked.correlationId,
             actor: JOB_AUDIT_ACTOR,
+            orderPublicId: locked.orderPublicId,
             resource: { type: "integration_production_dispatch", publicId: locked.publicId },
             attributes: buildSafeDispatchAuditAttributes(locked, {
               retryable: false,
@@ -843,8 +1021,12 @@ export function createProductionWebhookService(
       cfg,
       p101Secret,
       p201Secret,
+      p301Secret,
+      p401Secret,
       p101UrlConfigured,
       p201UrlConfigured,
+      p301UrlConfigured,
+      p401UrlConfigured,
       authValueConfigured,
       configured,
     } = stateSnapshot;
@@ -879,6 +1061,10 @@ export function createProductionWebhookService(
       p101UrlMask: maskSecretWebhookUrl(p101Secret),
       p201UrlConfigured,
       p201UrlMask: maskSecretWebhookUrl(p201Secret),
+      p301UrlConfigured,
+      p301UrlMask: maskSecretWebhookUrl(p301Secret),
+      p401UrlConfigured,
+      p401UrlMask: maskSecretWebhookUrl(p401Secret),
       authHeaderName: cfg.authHeaderName,
       authHeaderValueConfigured: authValueConfigured,
       canonVersion: cfg.canonVersion,
@@ -960,6 +1146,8 @@ export function createProductionWebhookService(
     };
   }
 
+  type DispatchActionKind = "request" | "retry" | "redeliver" | "resend";
+
   async function recordRefusedAuditInTx(
     tx: Tx,
     input: {
@@ -970,17 +1158,21 @@ export function createProductionWebhookService(
       tier?: string | null;
       bundleScopeManifest?: string | null;
       isResend?: boolean;
+      action?: DispatchActionKind;
+      extraAttrs?: Record<string, SafeAttributeValue>;
     },
   ): Promise<void> {
+    const action = input.action ?? (input.isResend ? "resend" : "request");
     await deps.audit.record(
       {
         category: "integration",
         eventName: "integration.production.dispatch.refused",
-        action: input.isResend ? "resend" : "request",
+        action,
         outcome: "denied",
         severity: "WARN",
         provider: "production_webhook",
         reasonCode: input.reasonCode,
+        orderPublicId: input.orderPublicId,
         resource: { type: "order", publicId: input.orderPublicId },
         attributes: {
           phase: input.phase,
@@ -989,6 +1181,7 @@ export function createProductionWebhookService(
           tier: input.tier ?? null,
           bundle_scope_manifest: input.bundleScopeManifest ?? null,
           http_status: null,
+          ...input.extraAttrs,
         },
       },
       tx,
@@ -1015,17 +1208,33 @@ export function createProductionWebhookService(
       releaseStatus: string | null;
       isResend: boolean;
       resendReasonCode: ControlledResendReason | null;
+      retryOfPublicId?: string | null;
+      redeliveryOfPublicId?: string | null;
+      idempotencyKeyOverride?: string;
+      retryRootWireKey?: string;
+      destinationChanged?: boolean;
+      dispatchKind?: DispatchActionKind;
+      reasonLength?: number;
       phase1ArtifactsConfirmed: boolean;
     },
   ): Promise<ProductionDispatchItem> {
     const now = deps.clock.now();
     const publicId = ulid();
-    const idempotencyKey = `rp-prod:${params.phase.toLowerCase()}:${publicId}`;
+    // Retry rows carry the root delivery's wire `Idempotency-Key` upstream (so receiver dedupe protects
+    // operator retries after 5xx exhaustion to `dead`) while appending `:r:<publicId>` (`<= 87 <= 96`)
+    // in `integration_production_dispatches.idempotency_key` to satisfy `uq_prod_dispatch_idempotency`.
+    const storedIdempotencyKey = params.retryRootWireKey
+      ? `${params.retryRootWireKey}:r:${publicId}`
+      : (params.idempotencyKeyOverride ?? `rp-prod:${params.phase.toLowerCase()}:${publicId}`);
+    const wireIdempotencyKey = toWireIdempotencyKey(storedIdempotencyKey);
     const payloadJson = JSON.stringify(params.payloadObject);
     const payloadSha256 = sha256Hex(payloadJson);
     const payloadEnc = deps.crypto.encrypt(payloadJson, dispatchPayloadAad(publicId));
     const correlationId = getRequestContext()?.correlationId ?? ulid();
     const expiresAt = new Date(now.getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS);
+    const retryOfPublicId = params.retryOfPublicId ?? null;
+    const redeliveryOfPublicId = params.redeliveryOfPublicId ?? null;
+    const dispatchKind: DispatchActionKind = params.dispatchKind ?? (params.isResend ? "resend" : "request");
 
     const { jobId } = await deps.jobs.enqueue(
       PRODUCTION_DELIVERY_JOB,
@@ -1051,7 +1260,7 @@ export function createProductionWebhookService(
       phase: params.phase,
       state: "queued",
       attemptCount: 0,
-      idempotencyKey,
+      idempotencyKey: storedIdempotencyKey,
       payloadSha256,
       payloadEnc,
       sentCustomerId: params.sentCustomerId,
@@ -1066,6 +1275,8 @@ export function createProductionWebhookService(
       lastReasonCode: null,
       isResend: params.isResend,
       resendReason: params.resendReasonCode,
+      retryOfPublicId,
+      redeliveryOfPublicId,
       phase1ArtifactsConfirmed: params.phase1ArtifactsConfirmed,
       requestedByUserId: params.principal.userId,
       requestedByPublicId: params.principal.userPublicId,
@@ -1084,24 +1295,38 @@ export function createProductionWebhookService(
       tier: params.tier,
       bundle_scope_manifest: params.bundleScopeManifest,
       http_status: null,
-      idempotency_key: idempotencyKey,
+      idempotency_key: wireIdempotencyKey,
+      retry_of_public_id: retryOfPublicId,
+      redelivery_of_public_id: redeliveryOfPublicId,
     };
     if (params.isResend && params.resendReasonCode) {
       reqAttrs.resend_reason_code = params.resendReasonCode;
     }
+    if (typeof params.destinationChanged === "boolean") {
+      reqAttrs.destination_changed = params.destinationChanged;
+    }
+
+    const auditEventName =
+      dispatchKind === "redeliver"
+        ? "integration.production.dispatch.redelivered"
+        : dispatchKind === "retry"
+          ? "integration.production.dispatch.retried"
+          : dispatchKind === "resend"
+            ? "integration.production.dispatch.resent"
+            : "integration.production.dispatch.requested";
 
     await deps.audit.record(
       {
         category: "integration",
-        eventName: params.isResend
-          ? "integration.production.dispatch.resent"
-          : "integration.production.dispatch.requested",
-        action: params.isResend ? "resend" : "request",
+        eventName: auditEventName,
+        action: dispatchKind,
         outcome: "completed",
-        severity: params.isResend ? "WARN" : "INFO",
+        severity: dispatchKind === "redeliver" || dispatchKind === "resend" ? "WARN" : "INFO",
         provider: "production_webhook",
+        orderPublicId: params.orderPublicId,
         resource: { type: "integration_production_dispatch", publicId },
         attributes: reqAttrs,
+        ...(typeof params.reasonLength === "number" ? { safeCounts: { reason_length: params.reasonLength } } : {}),
       },
       tx,
     );
@@ -1160,6 +1385,7 @@ export function createProductionWebhookService(
         reasonCode,
         correlationId,
         actor: JOB_AUDIT_ACTOR,
+        orderPublicId: row.orderPublicId,
         resource: { type: "integration_production_dispatch", publicId: row.publicId },
         attributes: buildSafeDispatchAuditAttributes(row, {
           retryable: false,
@@ -1276,7 +1502,7 @@ export function createProductionWebhookService(
 
       const prodState = await readProductionState(tx);
       const phase = row.phase as ProductionPhase;
-      const targetUrl = phase === "P101" ? prodState.p101Secret : prodState.p201Secret;
+      const targetUrl = targetSecretForPhase(prodState, phase);
       const authHeaderValue =
         prodState.cfg.authHeaderName !== ""
           ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
@@ -1391,7 +1617,7 @@ export function createProductionWebhookService(
           schemaOk =
             phase === "P101"
               ? validateP101(parsed).ok
-              : validateP201(parsed, {
+              : validateLaterPhasePayload(phase, parsed, {
                   customerId: row.sentCustomerId,
                   orderId: row.sentOrderId,
                   runMode: row.sentRunMode,
@@ -1477,10 +1703,13 @@ export function createProductionWebhookService(
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      "Idempotency-Key": decision.row.idempotencyKey,
+      "Idempotency-Key": toWireIdempotencyKey(decision.row.idempotencyKey),
       "X-ReadyPackets-Delivery": decision.row.publicId,
       "X-Correlation-Id": job.correlationId,
     };
+    if (decision.row.redeliveryOfPublicId) {
+      headers["X-ReadyPackets-Redelivery-Of"] = decision.row.redeliveryOfPublicId;
+    }
     if (decision.authHeaderName && decision.authHeaderValue) {
       headers[decision.authHeaderName] = decision.authHeaderValue;
     }
@@ -1622,6 +1851,7 @@ export function createProductionWebhookService(
             provider: "production_webhook",
             correlationId: job.correlationId,
             actor: JOB_AUDIT_ACTOR,
+            orderPublicId: locked.orderPublicId,
             resource: { type: "integration_production_dispatch", publicId: locked.publicId },
             attributes: buildSafeDispatchAuditAttributes({
               ...locked,
@@ -1663,6 +1893,7 @@ export function createProductionWebhookService(
             reasonCode: attemptOutcome.reasonCode,
             correlationId: job.correlationId,
             actor: JOB_AUDIT_ACTOR,
+            orderPublicId: locked.orderPublicId,
             resource: { type: "integration_production_dispatch", publicId: locked.publicId },
             attributes: buildSafeDispatchAuditAttributes(
               {
@@ -1711,6 +1942,7 @@ export function createProductionWebhookService(
               reasonCode,
               correlationId: job.correlationId,
               actor: JOB_AUDIT_ACTOR,
+              orderPublicId: locked.orderPublicId,
               resource: { type: "integration_production_dispatch", publicId: locked.publicId },
               attributes: buildSafeDispatchAuditAttributes(
                 {
@@ -1752,6 +1984,7 @@ export function createProductionWebhookService(
             reasonCode: attemptOutcome.reasonCode,
             correlationId: job.correlationId,
             actor: JOB_AUDIT_ACTOR,
+            orderPublicId: locked.orderPublicId,
             resource: { type: "integration_production_dispatch", publicId: locked.publicId },
             attributes: buildSafeDispatchAuditAttributes(
               {
@@ -1795,6 +2028,7 @@ export function createProductionWebhookService(
           reasonCode: attemptOutcome.reasonCode,
           correlationId: job.correlationId,
           actor: JOB_AUDIT_ACTOR,
+          orderPublicId: locked.orderPublicId,
           resource: { type: "integration_production_dispatch", publicId: locked.publicId },
           attributes: buildSafeDispatchAuditAttributes(
             {
@@ -1861,10 +2095,911 @@ export function createProductionWebhookService(
     });
   }
 
+  async function verifyOrderRedeliverCaller(principal: SessionPrincipal, orderPublicId: string): Promise<void> {
+    const orders = requireOrders();
+    await deps.db.transaction(async (tx) => {
+      await orders.assertCanReadOrder(principal, orderPublicId, { tx });
+      await assertProductionRedeliverInTx(deps, principal, tx);
+    });
+  }
+
+  function buildPhaseDisabledReasons(params: {
+    phase: ProductionPhase;
+    prodState: Awaited<ReturnType<typeof readProductionState>>;
+    phaseRows: DispatchRow[];
+    validationErrors: ProductionValidationIssue[];
+  }): ProductionDisabledReason[] {
+    const reasons: ProductionDisabledReason[] = [];
+    const { phase, prodState, phaseRows, validationErrors } = params;
+    const thisEndpointConfigured = phaseUrlConfigured(prodState, phase);
+    const label = phaseDisplayLabel(phase);
+
+    if (!prodState.enabled) {
+      reasons.push({
+        code: "PIPELINE_DISABLED",
+        category: "pipeline_off",
+        message: "Production webhook pipeline is disabled in Integrations -> Production.",
+        settingsActionable: true,
+      });
+    }
+    if (!thisEndpointConfigured) {
+      reasons.push({
+        code: `${phase}_ENDPOINT_NOT_CONFIGURED`,
+        category: "endpoint_missing",
+        message: `No ${label} (${phase}) HTTPS destination URL is configured.`,
+        settingsActionable: true,
+      });
+    }
+    if (
+      (phase !== "P101" && !prodState.p101UrlConfigured) ||
+      (phase !== "P201" && !prodState.p201UrlConfigured)
+    ) {
+      reasons.push({
+        code: "CORE_PIPELINE_URLS_INCOMPLETE",
+        category: "config_incomplete",
+        message: "Both Phase I (P101) and Phase II (P201) HTTPS URLs must be saved to run the production pipeline.",
+        settingsActionable: true,
+      });
+    }
+    if (!prodState.canonValid) {
+      reasons.push({
+        code: "CANON_VERSION_NOT_CONFIGURED",
+        category: "config_incomplete",
+        message: "Production canon_version is not configured in Integrations -> Production.",
+        settingsActionable: true,
+      });
+    }
+    if (!prodState.runModeValid) {
+      reasons.push({
+        code: "RUN_MODE_INVALID",
+        category: "config_incomplete",
+        message: "Production run_mode is invalid in Integrations -> Production.",
+        settingsActionable: true,
+      });
+    }
+    if (!prodState.authConsistent) {
+      reasons.push({
+        code: "AUTH_HEADER_VALUE_MISSING",
+        category: "config_incomplete",
+        message: "Custom authentication header name is set without a saved header secret.",
+        settingsActionable: true,
+      });
+    }
+
+    const inProgress = phaseRows.some((r) => r.state === "queued" || r.state === "sending");
+    const delivered = phaseRows.some((r) => r.state === "delivered");
+    const latest = phaseRows[0] ?? null;
+
+    if (inProgress) {
+      reasons.push({
+        code: "DISPATCH_IN_PROGRESS",
+        category: "in_progress",
+        message: `A ${label} (${phase}) dispatch is currently queued or sending for this order.`,
+        settingsActionable: false,
+      });
+    } else if (delivered) {
+      reasons.push({
+        code: `${phase}_ALREADY_DELIVERED`,
+        category: "already_delivered",
+        message: `${label} (${phase}) has already been delivered; use Re-deliver in pipeline history if another run is required.`,
+        settingsActionable: false,
+      });
+    } else if (latest !== null) {
+      if (latest.state === "unknown") {
+        reasons.push({
+          code: "PRIOR_ATTEMPT_UNCERTAIN",
+          category: "retry_or_resend_required",
+          message: `A prior ${label} (${phase}) attempt ended with an uncertain outcome; verify downstream state before re-sending.`,
+          settingsActionable: false,
+        });
+      } else {
+        reasons.push({
+          code: "PRIOR_ATTEMPT_FAILED_RETRY_AVAILABLE",
+          category: "retry_or_resend_required",
+          message: `A prior ${label} (${phase}) attempt ended in ${latest.state}; use Retry in pipeline history to try again.`,
+          settingsActionable: false,
+        });
+      }
+    }
+
+    for (const issue of validationErrors) {
+      if (issue.code === "CANON_VERSION_REQUIRED" && !prodState.canonValid) {
+        continue;
+      }
+      reasons.push({
+        code: issue.code,
+        category: issue.code === "CANON_VERSION_REQUIRED" ? "config_incomplete" : "precondition",
+        message: issue.message,
+        settingsActionable: issue.code === "CANON_VERSION_REQUIRED",
+      });
+    }
+
+    return reasons;
+  }
+
   async function verifyAdminCaller(principal: SessionPrincipal): Promise<void> {
     await deps.db.transaction(async (tx) => {
       await assertProductionTriggerInTx(deps, principal, tx);
     });
+  }
+
+  interface PreparedPhaseDispatch {
+    orderReference: string;
+    expectedOwnerUserId: number;
+    destinationFingerprint: string;
+    payloadObject: P101Payload | P201Payload;
+    sentCustomerId: string;
+    sentOrderId: string;
+    sentRunMode: string;
+    packet: string | null;
+    tier: string | null;
+    bundleScopeManifest: string | null;
+    releaseStatus: string | null;
+    phase1ArtifactsConfirmed: boolean;
+  }
+
+  async function preparePhasePayloadInTx(
+    tx: Tx,
+    params: {
+      orderId: number;
+      orderPublicId: string;
+      phase: ProductionPhase;
+      existingRows: DispatchRow[];
+      releaseStatusOverride?: string;
+      requireExplicitP201Confirm: boolean;
+      phase1ArtifactsConfirmed: boolean;
+      action: DispatchActionKind;
+    },
+  ): Promise<{ ok: true; prepared: PreparedPhaseDispatch } | { ok: false; error: DomainError }> {
+    const orders = requireOrders();
+    const identity = requireIdentity();
+    const { orderId, orderPublicId, phase, existingRows, action } = params;
+
+    if (phase === "P101") {
+      const candidate = await evaluateP101CandidateInTx(tx, orderId, params.releaseStatusOverride);
+      if (!candidate.featureEnabled || !candidate.featureConfigured || !candidate.prodState.p101Secret) {
+        await recordRefusedAuditInTx(tx, {
+          phase: "P101",
+          orderPublicId,
+          reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          packet: candidate.payload?.packet ?? null,
+          tier: candidate.payload?.tier ?? null,
+          bundleScopeManifest: candidate.payload?.bundle_scope_manifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error: new DomainError(
+            "NOT_CONFIGURED",
+            "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+            "Production webhooks are disabled or incomplete.",
+          ),
+        };
+      }
+      if (candidate.validationErrors.length > 0 || !candidate.payload) {
+        const first = candidate.validationErrors[0] ?? {
+          code: "INVALID_P101_PAYLOAD",
+          message: "Order failed Phase I (P101) validation.",
+        };
+        await recordRefusedAuditInTx(tx, {
+          phase: "P101",
+          orderPublicId,
+          reasonCode: first.code,
+          packet: candidate.payload?.packet ?? null,
+          tier: candidate.payload?.tier ?? null,
+          bundleScopeManifest: candidate.payload?.bundle_scope_manifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error:
+            first.code === "ORDER_LOCKED" || first.code === "ORDER_CANCELED"
+              ? conflict(first.code, first.message)
+              : validation(first.code, first.message, {
+                  error_codes: candidate.validationErrors.map((e) => e.code),
+                }),
+        };
+      }
+
+      const authHeaderValue =
+        candidate.prodState.cfg.authHeaderName !== ""
+          ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
+          : null;
+      const destinationFingerprint = computeDestinationFingerprint("P101", {
+        targetUrl: candidate.prodState.p101Secret,
+        authHeaderName: candidate.prodState.cfg.authHeaderName,
+        authHeaderValue,
+        canonVersion: candidate.prodState.cfg.canonVersion,
+        runMode: candidate.prodState.cfg.runMode,
+      });
+
+      const p = candidate.payload;
+      return {
+        ok: true,
+        prepared: {
+          orderReference: candidate.scope.reference,
+          expectedOwnerUserId: candidate.scope.ownerUserId,
+          destinationFingerprint,
+          payloadObject: p,
+          sentCustomerId: p.customer_id,
+          sentOrderId: p.order_id,
+          sentRunMode: p.run_mode,
+          packet: p.packet,
+          tier: p.tier,
+          bundleScopeManifest: p.bundle_scope_manifest,
+          releaseStatus: p.release_status,
+          phase1ArtifactsConfirmed: false,
+        },
+      };
+    }
+
+    const [scope, prodState] = await Promise.all([
+      orders.getProductionScope(orderId, { tx }),
+      readProductionState(tx),
+    ]);
+    if (!scope) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
+    const targetSecret = targetSecretForPhase(prodState, phase);
+    const label = phaseDisplayLabel(phase);
+
+    if ((phase === "P301" || phase === "P401") && (!targetSecret || !isValidProductionWebhookUrl(targetSecret))) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+          `${label} (${phase}) HTTPS destination URL is not configured.`,
+        ),
+      };
+    }
+
+    if (isOrderLockedForProduction(scope.lockState)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_LOCKED",
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_LOCKED", "This order is locked and cannot dispatch production webhooks."),
+      };
+    }
+
+    if (isOrderCanceledStatus(scope.statusKey)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_CANCELED",
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_CANCELED", "Canceled orders cannot dispatch production webhooks."),
+      };
+    }
+
+    const owner = await identity.getUser(scope.ownerUserId, { tx });
+    if (!owner || owner.status !== "active") {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_OWNER_INACTIVE",
+        action,
+      });
+      return {
+        ok: false,
+        error: validation(
+          "ORDER_OWNER_INACTIVE",
+          "The order owner account must be active to dispatch production webhooks.",
+        ),
+      };
+    }
+
+    if (params.requireExplicitP201Confirm && phase === "P201" && params.phase1ArtifactsConfirmed !== true) {
+      await recordRefusedAuditInTx(tx, {
+        phase: "P201",
+        orderPublicId,
+        reasonCode: "PHASE1_ARTIFACTS_CONFIRMATION_REQUIRED",
+        action,
+      });
+      return {
+        ok: false,
+        error: validation(
+          "PHASE1_ARTIFACTS_CONFIRMATION_REQUIRED",
+          "Confirm that the Phase I final artifacts exist before sending Phase II (P201).",
+        ),
+      };
+    }
+
+    if (!prodState.enabled || !prodState.configured || !targetSecret) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          "Production webhooks are disabled or incomplete.",
+        ),
+      };
+    }
+
+    const deliveredP101 = existingRows.find((r) => r.phase === "P101" && r.state === "delivered");
+    if (!deliveredP101) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_P101_NOT_DELIVERED",
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "PRODUCTION_P101_NOT_DELIVERED",
+          `${label} (${phase}) cannot run until Phase I (P101) has been delivered for this order.`,
+        ),
+      };
+    }
+
+    if (phase === "P301" || phase === "P401") {
+      const deliveredP201 = existingRows.find((r) => r.phase === "P201" && r.state === "delivered");
+      if (!deliveredP201) {
+        await recordRefusedAuditInTx(tx, {
+          phase,
+          orderPublicId,
+          reasonCode: "PRODUCTION_P201_NOT_DELIVERED",
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "PRODUCTION_P201_NOT_DELIVERED",
+            `${label} (${phase}) cannot run until Phase II (P201) has been delivered for this order.`,
+          ),
+        };
+      }
+      if (phase === "P401" && prodState.p301UrlConfigured) {
+        const deliveredP301 = existingRows.find((r) => r.phase === "P301" && r.state === "delivered");
+        if (!deliveredP301) {
+          await recordRefusedAuditInTx(tx, {
+            phase: "P401",
+            orderPublicId,
+            reasonCode: "PRODUCTION_P301_NOT_DELIVERED",
+            action,
+          });
+          return {
+            ok: false,
+            error: conflict(
+              "PRODUCTION_P301_NOT_DELIVERED",
+              "Phase IV (P401) cannot run until configured Phase III (P301) has been delivered for this order.",
+            ),
+          };
+        }
+      }
+    }
+
+    const payloadCheck = buildLaterPhaseFromDeliveredP101(phase, {
+      customerId: deliveredP101.sentCustomerId,
+      orderId: deliveredP101.sentOrderId,
+      runMode: deliveredP101.sentRunMode,
+    });
+    if (!payloadCheck.ok) {
+      const first = payloadCheck.errors[0]!;
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: first.code,
+        action,
+      });
+      return {
+        ok: false,
+        error: validation(first.code, first.message, {
+          error_codes: payloadCheck.errors.map((e) => e.code),
+        }),
+      };
+    }
+
+    const authHeaderValue =
+      prodState.cfg.authHeaderName !== ""
+        ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
+        : null;
+    const destinationFingerprint = computeDestinationFingerprint(phase, {
+      targetUrl: targetSecret,
+      authHeaderName: prodState.cfg.authHeaderName,
+      authHeaderValue,
+      canonVersion: prodState.cfg.canonVersion,
+      runMode: prodState.cfg.runMode,
+    });
+
+    return {
+      ok: true,
+      prepared: {
+        orderReference: deliveredP101.orderReference,
+        expectedOwnerUserId: scope.ownerUserId,
+        destinationFingerprint,
+        payloadObject: payloadCheck.payload,
+        sentCustomerId: payloadCheck.payload.customer_id,
+        sentOrderId: payloadCheck.payload.order_id,
+        sentRunMode: payloadCheck.payload.run_mode,
+        packet: deliveredP101.packet ?? null,
+        tier: deliveredP101.tier ?? null,
+        bundleScopeManifest: deliveredP101.bundleScopeManifest ?? null,
+        releaseStatus: null,
+        phase1ArtifactsConfirmed: phase === "P201" ? params.phase1ArtifactsConfirmed : false,
+      },
+    };
+  }
+
+  /**
+   * Reconstructs the exact original payload for `retry` / `redeliver` of a selected `targetRow`,
+   * enforcing cryptographic byte-identity (`sha256Hex(JSON.stringify(payload)) === targetRow.payloadSha256`)
+   * and refusing fail-closed if live order scope or verifiable payload inputs drifted.
+   */
+  async function reconstructExactDispatchPayloadInTx(
+    tx: Tx,
+    params: {
+      orderId: number;
+      orderPublicId: string;
+      targetRow: DispatchRow;
+      existingRows: DispatchRow[];
+      action: "retry" | "redeliver" | "resend";
+    },
+  ): Promise<{ ok: true; prepared: PreparedPhaseDispatch } | { ok: false; error: DomainError }> {
+    const orders = requireOrders();
+    const identity = requireIdentity();
+    const { orderId, orderPublicId, targetRow, existingRows, action } = params;
+    const phase = targetRow.phase as ProductionPhase;
+    const label = phaseDisplayLabel(phase);
+
+    const [scope, prodState] = await Promise.all([
+      orders.getProductionScope(orderId, { tx }),
+      readProductionState(tx),
+    ]);
+    if (!scope) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
+    const targetSecret = targetSecretForPhase(prodState, phase);
+    if ((phase === "P301" || phase === "P401") && (!targetSecret || !isValidProductionWebhookUrl(targetSecret))) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+          `${label} (${phase}) HTTPS destination URL is not configured.`,
+        ),
+      };
+    }
+
+    if (!prodState.enabled || !prodState.configured || !targetSecret || !isValidProductionWebhookUrl(targetSecret)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: new DomainError(
+          "NOT_CONFIGURED",
+          "PRODUCTION_WEBHOOKS_NOT_ENABLED",
+          "Production webhooks are disabled or incomplete.",
+        ),
+      };
+    }
+
+    if (isOrderLockedForProduction(scope.lockState)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_LOCKED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_LOCKED", "This order is locked and cannot dispatch production webhooks."),
+      };
+    }
+
+    if (isOrderCanceledStatus(scope.statusKey)) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_CANCELED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict("ORDER_CANCELED", "Canceled orders cannot dispatch production webhooks."),
+      };
+    }
+
+    if (scope.ownerUserId !== targetRow.expectedOwnerUserId) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_OWNER_CHANGED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORDER_OWNER_CHANGED",
+          "The order owner changed since the selected dispatch was created; replay is refused.",
+        ),
+      };
+    }
+
+    const owner = await identity.getUser(scope.ownerUserId, { tx });
+    if (!owner || owner.status !== "active") {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_OWNER_INACTIVE",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: validation(
+          "ORDER_OWNER_INACTIVE",
+          "The order owner account must be active to dispatch production webhooks.",
+        ),
+      };
+    }
+
+    // Verify order reference & packet scope parity against `targetRow` before reconstructing payload bytes.
+    const scopeProbe = buildP101Payload({
+      customerRef: "CUST-SCOPE-PROBE",
+      orderReference: scope.reference,
+      canonVersion: "canon-scope-probe",
+      runMode: "production",
+      clientName: "Scope Probe",
+      clientEmail: "scope-probe@example.test",
+      releaseStatus: "",
+      packets: scope.packets,
+      otherItemCount: scope.otherItemCount,
+    });
+    const orderReferenceMatches =
+      scope.reference === targetRow.orderReference &&
+      (phase !== "P101" || scope.reference === targetRow.sentOrderId);
+    const packetScopeMatches =
+      targetRow.bundleScopeManifest === null
+        ? true
+        : scopeProbe.ok &&
+          scopeProbe.payload !== null &&
+          scopeProbe.payload.packet === targetRow.packet &&
+          scopeProbe.payload.tier === targetRow.tier &&
+          scopeProbe.payload.bundle_scope_manifest === targetRow.bundleScopeManifest;
+
+    if (!orderReferenceMatches || !packetScopeMatches) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORDER_SCOPE_CHANGED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORDER_SCOPE_CHANGED",
+          "The order reference or packet scope changed since the selected dispatch was created; replay is refused.",
+        ),
+      };
+    }
+
+    const authHeaderValue =
+      prodState.cfg.authHeaderName !== ""
+        ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
+        : null;
+    const destinationFingerprint = computeDestinationFingerprint(phase, {
+      targetUrl: targetSecret,
+      authHeaderName: prodState.cfg.authHeaderName,
+      authHeaderValue,
+      canonVersion: prodState.cfg.canonVersion,
+      runMode: prodState.cfg.runMode,
+    });
+
+    if (phase === "P101") {
+      const liveP101 = buildP101Payload({
+        customerRef: owner.customerRef ?? null,
+        orderReference: scope.reference,
+        canonVersion: prodState.cfg.canonVersion,
+        runMode: prodState.cfg.runMode,
+        clientName: owner.name,
+        clientEmail: owner.email,
+        releaseStatus: targetRow.releaseStatus ?? "",
+        packets: scope.packets,
+        otherItemCount: scope.otherItemCount,
+      });
+      if (
+        !liveP101.ok ||
+        !liveP101.payload ||
+        liveP101.payload.customer_id !== targetRow.sentCustomerId ||
+        liveP101.payload.order_id !== targetRow.sentOrderId ||
+        liveP101.payload.run_mode !== targetRow.sentRunMode ||
+        sha256Hex(JSON.stringify(liveP101.payload)) !== targetRow.payloadSha256
+      ) {
+        await recordRefusedAuditInTx(tx, {
+          phase: "P101",
+          orderPublicId,
+          reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+          packet: targetRow.packet ?? null,
+          tier: targetRow.tier ?? null,
+          bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+            "Original Phase I (P101) payload bytes no longer match current customer or pipeline metadata; start a new order workflow or restore the original values.",
+          ),
+        };
+      }
+
+      const p = liveP101.payload;
+      return {
+        ok: true,
+        prepared: {
+          orderReference: targetRow.orderReference,
+          expectedOwnerUserId: targetRow.expectedOwnerUserId,
+          destinationFingerprint,
+          payloadObject: p,
+          sentCustomerId: p.customer_id,
+          sentOrderId: p.order_id,
+          sentRunMode: p.run_mode,
+          packet: p.packet,
+          tier: p.tier,
+          bundleScopeManifest: p.bundle_scope_manifest,
+          releaseStatus: p.release_status,
+          phase1ArtifactsConfirmed: false,
+        },
+      };
+    }
+
+    const deliveredP101 = existingRows.find((r) => r.phase === "P101" && r.state === "delivered");
+    if (!deliveredP101) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "PRODUCTION_P101_NOT_DELIVERED",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "PRODUCTION_P101_NOT_DELIVERED",
+          `${label} (${phase}) cannot run until Phase I (P101) has been delivered for this order.`,
+        ),
+      };
+    }
+
+    if (phase === "P301" || phase === "P401") {
+      const deliveredP201 = existingRows.find((r) => r.phase === "P201" && r.state === "delivered");
+      if (!deliveredP201) {
+        await recordRefusedAuditInTx(tx, {
+          phase,
+          orderPublicId,
+          reasonCode: "PRODUCTION_P201_NOT_DELIVERED",
+          packet: targetRow.packet ?? null,
+          tier: targetRow.tier ?? null,
+          bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+          action,
+        });
+        return {
+          ok: false,
+          error: conflict(
+            "PRODUCTION_P201_NOT_DELIVERED",
+            `${label} (${phase}) cannot run until Phase II (P201) has been delivered for this order.`,
+          ),
+        };
+      }
+      if (phase === "P401" && prodState.p301UrlConfigured) {
+        const deliveredP301 = existingRows.find((r) => r.phase === "P301" && r.state === "delivered");
+        if (!deliveredP301) {
+          await recordRefusedAuditInTx(tx, {
+            phase: "P401",
+            orderPublicId,
+            reasonCode: "PRODUCTION_P301_NOT_DELIVERED",
+            packet: targetRow.packet ?? null,
+            tier: targetRow.tier ?? null,
+            bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+            action,
+          });
+          return {
+            ok: false,
+            error: conflict(
+              "PRODUCTION_P301_NOT_DELIVERED",
+              "Phase IV (P401) cannot run until configured Phase III (P301) has been delivered for this order.",
+            ),
+          };
+        }
+      }
+    }
+
+    // Reconstruct directly from the selected `targetRow` (never from `newestDeliveredP101` or mutated settings/customer fields)
+    // and enforce exact SHA-256 byte-identity against `targetRow.payloadSha256`.
+    const payloadCheck = buildLaterPhaseFromDeliveredP101(phase, {
+      customerId: targetRow.sentCustomerId,
+      orderId: targetRow.sentOrderId,
+      runMode: targetRow.sentRunMode,
+    });
+    if (
+      !payloadCheck.ok ||
+      sha256Hex(JSON.stringify(payloadCheck.payload)) !== targetRow.payloadSha256
+    ) {
+      await recordRefusedAuditInTx(tx, {
+        phase,
+        orderPublicId,
+        reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        action,
+      });
+      return {
+        ok: false,
+        error: conflict(
+          "ORIGINAL_PAYLOAD_UNVERIFIABLE",
+          `Original ${label} (${phase}) payload bytes could not be verified against the stored SHA-256 digest; replay is refused.`,
+        ),
+      };
+    }
+
+    return {
+      ok: true,
+      prepared: {
+        orderReference: targetRow.orderReference,
+        expectedOwnerUserId: targetRow.expectedOwnerUserId,
+        destinationFingerprint,
+        payloadObject: payloadCheck.payload,
+        sentCustomerId: payloadCheck.payload.customer_id,
+        sentOrderId: payloadCheck.payload.order_id,
+        sentRunMode: payloadCheck.payload.run_mode,
+        packet: targetRow.packet ?? null,
+        tier: targetRow.tier ?? null,
+        bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+        releaseStatus: targetRow.releaseStatus ?? null,
+        phase1ArtifactsConfirmed:
+          phase === "P201" ? true : Boolean(targetRow.phase1ArtifactsConfirmed),
+      },
+    };
+  }
+
+  async function requestOptionalLaterPhase(
+    principal: SessionPrincipal,
+    orderPublicId: string,
+    phase: "P301" | "P401",
+  ): Promise<ProductionDispatchItem> {
+    assertProductionTriggerPreflight(principal);
+    const orders = requireOrders();
+    await reconcileStaleDispatches({
+      orderPublicId,
+      verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, orderPublicId),
+    });
+
+    const label = phaseDisplayLabel(phase);
+    const outcome = await deps.db.transaction(
+      async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
+        // PW-05: Lock order row FOR UPDATE FIRST, then lock/revalidate Identity actor SECOND.
+        const access = await orders.assertCanReadOrder(principal, orderPublicId, {
+          tx,
+          forUpdate: true,
+        });
+        await assertProductionTriggerInTx(deps, principal, tx);
+
+        const existingRows = await tx
+          .select()
+          .from(integrationProductionDispatches)
+          .where(eq(integrationProductionDispatches.orderId, access.id))
+          .for("update")
+          .orderBy(desc(integrationProductionDispatches.id));
+
+        const prep = await preparePhasePayloadInTx(tx, {
+          orderId: access.id,
+          orderPublicId: access.publicId,
+          phase,
+          existingRows,
+          requireExplicitP201Confirm: false,
+          phase1ArtifactsConfirmed: false,
+          action: "request",
+        });
+        if (!prep.ok) {
+          return prep;
+        }
+
+        const existingPhase = existingRows.filter((r) => r.phase === phase);
+        if (existingPhase.some((r) => r.state === "queued" || r.state === "sending")) {
+          throw conflict(
+            "PRODUCTION_DISPATCH_IN_PROGRESS",
+            `A ${label} (${phase}) dispatch is already queued or sending for this order.`,
+          );
+        }
+        if (existingPhase.some((r) => r.state === "delivered")) {
+          throw conflict(
+            `PRODUCTION_${phase}_ALREADY_DELIVERED`,
+            `${label} (${phase}) has already been delivered for this order. Re-delivering requires an administrator with step-up authentication, a reason, and REDELIVER confirmation.`,
+          );
+        }
+        if (existingPhase.length > 0) {
+          throw conflict(
+            "PRODUCTION_RESEND_REQUIRED",
+            `A prior ${label} (${phase}) attempt already ran for this order; use Retry in pipeline history.`,
+          );
+        }
+
+        const item = await enqueueDispatchInTx(tx, {
+          principal,
+          orderId: access.id,
+          orderPublicId: access.publicId,
+          orderReference: prep.prepared.orderReference,
+          expectedOwnerUserId: prep.prepared.expectedOwnerUserId,
+          destinationFingerprint: prep.prepared.destinationFingerprint,
+          phase,
+          payloadObject: prep.prepared.payloadObject,
+          sentCustomerId: prep.prepared.sentCustomerId,
+          sentOrderId: prep.prepared.sentOrderId,
+          sentRunMode: prep.prepared.sentRunMode,
+          packet: prep.prepared.packet,
+          tier: prep.prepared.tier,
+          bundleScopeManifest: prep.prepared.bundleScopeManifest,
+          releaseStatus: prep.prepared.releaseStatus,
+          isResend: false,
+          resendReasonCode: null,
+          dispatchKind: "request",
+          phase1ArtifactsConfirmed: false,
+        });
+        return { ok: true, item };
+      },
+    );
+
+    if (!outcome.ok) {
+      throw outcome.error;
+    }
+    return outcome.item;
   }
 
   return {
@@ -1919,6 +3054,18 @@ export function createProductionWebhookService(
           "Phase II (P201) URL must be a valid HTTPS URL without embedded credentials.",
         );
       }
+      if (typeof input.p301Url === "string" && !isValidProductionWebhookUrl(input.p301Url.trim())) {
+        throw validation(
+          "INVALID_P301_URL",
+          "Phase III (P301) URL must be a valid HTTPS URL without embedded credentials.",
+        );
+      }
+      if (typeof input.p401Url === "string" && !isValidProductionWebhookUrl(input.p401Url.trim())) {
+        throw validation(
+          "INVALID_P401_URL",
+          "Phase IV (P401) URL must be a valid HTTPS URL without embedded credentials.",
+        );
+      }
       if (typeof input.authHeaderValue === "string") {
         if (
           input.authHeaderValue.length === 0 ||
@@ -1935,14 +3082,18 @@ export function createProductionWebhookService(
       await deps.db.transaction(async (tx) => {
         await assertIntegrationsManageInTx(deps, principal, tx);
 
-        const [existingP101, existingP201, existingAuthVal] = await Promise.all([
+        const [existingP101, existingP201, existingP301, existingP401, existingAuthVal] = await Promise.all([
           isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P101_URL, tx),
           isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P201_URL, tx),
+          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P301_URL, tx),
+          isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_P401_URL, tx),
           isSecretConfigured(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx),
         ]);
 
         const nextP101Configured = input.p101Url === undefined ? existingP101 : input.p101Url !== null;
         const nextP201Configured = input.p201Url === undefined ? existingP201 : input.p201Url !== null;
+        const nextP301Configured = input.p301Url === undefined ? existingP301 : input.p301Url !== null;
+        const nextP401Configured = input.p401Url === undefined ? existingP401 : input.p401Url !== null;
         const nextAuthValConfigured =
           input.authHeaderValue === undefined ? existingAuthVal : input.authHeaderValue !== null;
 
@@ -1975,6 +3126,20 @@ export function createProductionWebhookService(
             tx,
           );
         }
+        if (input.p301Url !== undefined) {
+          await deps.settings.setSecret(
+            INTEGRATIONS_PRODUCTION_P301_URL.key,
+            input.p301Url === null ? null : input.p301Url.trim(),
+            tx,
+          );
+        }
+        if (input.p401Url !== undefined) {
+          await deps.settings.setSecret(
+            INTEGRATIONS_PRODUCTION_P401_URL.key,
+            input.p401Url === null ? null : input.p401Url.trim(),
+            tx,
+          );
+        }
         if (input.authHeaderValue !== undefined) {
           await deps.settings.setSecret(
             INTEGRATIONS_PRODUCTION_AUTH_VALUE.key,
@@ -1991,7 +3156,12 @@ export function createProductionWebhookService(
         );
         await deps.settings.set(flagKey(INTEGRATIONS_PRODUCTION_FLAG.flag), input.enabled, tx);
 
-        if (input.p101Url !== undefined || input.p201Url !== undefined) {
+        if (
+          input.p101Url !== undefined ||
+          input.p201Url !== undefined ||
+          input.p301Url !== undefined ||
+          input.p401Url !== undefined
+        ) {
           await checks.clearVerification("production", tx);
         }
 
@@ -2012,6 +3182,8 @@ export function createProductionWebhookService(
               timeout_ms: timeoutMs,
               p101_url_configured: nextP101Configured,
               p201_url_configured: nextP201Configured,
+              p301_url_configured: nextP301Configured,
+              p401_url_configured: nextP401Configured,
               auth_header_configured: authHeaderName !== "",
               auth_header_value_configured: nextAuthValConfigured,
             },
@@ -2032,8 +3204,7 @@ export function createProductionWebhookService(
         await assertIntegrationsManageInTx(deps, principal, tx);
       });
 
-      const secretDef =
-        input.phase === "P101" ? INTEGRATIONS_PRODUCTION_P101_URL : INTEGRATIONS_PRODUCTION_P201_URL;
+      const secretDef = secretDefForPhase(input.phase);
       const targetUrl = await readSecret(deps.settings, secretDef);
 
       if (!targetUrl) {
@@ -2124,11 +3295,17 @@ export function createProductionWebhookService(
 
         const p101Rows = existingRows.filter((r) => r.phase === "P101");
         const p201Rows = existingRows.filter((r) => r.phase === "P201");
+        const p301Rows = existingRows.filter((r) => r.phase === "P301");
+        const p401Rows = existingRows.filter((r) => r.phase === "P401");
 
         const deliveredP101 = p101Rows.find((r) => r.state === "delivered") ?? null;
         const latestP101 = p101Rows[0] ?? null;
         const deliveredP201 = p201Rows.find((r) => r.state === "delivered") ?? null;
         const latestP201 = p201Rows[0] ?? null;
+        const deliveredP301 = p301Rows.find((r) => r.state === "delivered") ?? null;
+        const latestP301 = p301Rows[0] ?? null;
+        const deliveredP401 = p401Rows.find((r) => r.state === "delivered") ?? null;
+        const latestP401 = p401Rows[0] ?? null;
 
         let previewP101Payload: P101Payload | null = null;
         let maskedForViewer = principal.role !== "admin";
@@ -2143,21 +3320,35 @@ export function createProductionWebhookService(
           candidate.featureConfigured &&
           candidate.validationErrors.length === 0 &&
           latestP101 === null;
+        const p101DisabledReasons = p101Eligible
+          ? []
+          : buildPhaseDisabledReasons({
+              phase: "P101",
+              prodState: candidate.prodState,
+              phaseRows: p101Rows,
+              validationErrors: candidate.validationErrors,
+            });
 
-        const p201Errors: ProductionValidationIssue[] = [];
-        let previewP201Payload: P201Payload | null = null;
+        const baseOrderErrors: ProductionValidationIssue[] = [];
         if (isOrderLockedForProduction(candidate.scope.lockState)) {
-          p201Errors.push({
+          baseOrderErrors.push({
             code: "ORDER_LOCKED",
             message: "This order is locked and cannot dispatch production webhooks.",
           });
         }
         if (isOrderCanceledStatus(candidate.scope.statusKey)) {
-          p201Errors.push({
+          baseOrderErrors.push({
             code: "ORDER_CANCELED",
             message: "Canceled orders cannot dispatch production webhooks.",
           });
         }
+        const ownerInactiveIssue = candidate.validationErrors.find((e) => e.code === "ORDER_OWNER_INACTIVE");
+        if (ownerInactiveIssue) {
+          baseOrderErrors.push(ownerInactiveIssue);
+        }
+
+        const p201Errors: ProductionValidationIssue[] = [...baseOrderErrors];
+        let previewP201Payload: P201Payload | null = null;
         if (!deliveredP101) {
           p201Errors.push({
             code: "P101_NOT_DELIVERED",
@@ -2182,25 +3373,153 @@ export function createProductionWebhookService(
           Boolean(deliveredP101) &&
           p201Errors.length === 0 &&
           latestP201 === null;
+        const p201DisabledReasons = p201Eligible
+          ? []
+          : buildPhaseDisabledReasons({
+              phase: "P201",
+              prodState: candidate.prodState,
+              phaseRows: p201Rows,
+              validationErrors: p201Errors,
+            });
+
+        const p301Errors: ProductionValidationIssue[] = [...baseOrderErrors];
+        let previewP301Payload: P201Payload | null = null;
+        if (!deliveredP101) {
+          p301Errors.push({
+            code: "P101_NOT_DELIVERED",
+            message: "Phase I (P101) must be delivered for this order before Phase III (P301) can start.",
+          });
+        } else {
+          const p301Check = buildLaterPhaseFromDeliveredP101("P301", {
+            customerId: deliveredP101.sentCustomerId,
+            orderId: deliveredP101.sentOrderId,
+            runMode: deliveredP101.sentRunMode,
+          });
+          if (p301Check.ok) {
+            previewP301Payload = p301Check.payload;
+          } else {
+            p301Errors.push(...p301Check.errors);
+          }
+          if (!deliveredP201) {
+            p301Errors.push({
+              code: "P201_NOT_DELIVERED",
+              message: "Phase II (P201) must be delivered for this order before Phase III (P301) can start.",
+            });
+          }
+        }
+
+        const p301Eligible =
+          candidate.featureEnabled &&
+          candidate.featureConfigured &&
+          candidate.prodState.p301UrlConfigured &&
+          Boolean(deliveredP101 && deliveredP201) &&
+          p301Errors.length === 0 &&
+          latestP301 === null;
+        const p301DisabledReasons = p301Eligible
+          ? []
+          : buildPhaseDisabledReasons({
+              phase: "P301",
+              prodState: candidate.prodState,
+              phaseRows: p301Rows,
+              validationErrors: p301Errors,
+            });
+
+        const p401Errors: ProductionValidationIssue[] = [...baseOrderErrors];
+        let previewP401Payload: P201Payload | null = null;
+        if (!deliveredP101) {
+          p401Errors.push({
+            code: "P101_NOT_DELIVERED",
+            message: "Phase I (P101) must be delivered for this order before Phase IV (P401) can start.",
+          });
+        } else {
+          const p401Check = buildLaterPhaseFromDeliveredP101("P401", {
+            customerId: deliveredP101.sentCustomerId,
+            orderId: deliveredP101.sentOrderId,
+            runMode: deliveredP101.sentRunMode,
+          });
+          if (p401Check.ok) {
+            previewP401Payload = p401Check.payload;
+          } else {
+            p401Errors.push(...p401Check.errors);
+          }
+          if (!deliveredP201) {
+            p401Errors.push({
+              code: "P201_NOT_DELIVERED",
+              message: "Phase II (P201) must be delivered for this order before Phase IV (P401) can start.",
+            });
+          } else if (candidate.prodState.p301UrlConfigured && !deliveredP301) {
+            p401Errors.push({
+              code: "P301_NOT_DELIVERED",
+              message:
+                "Phase III (P301) is configured and must be delivered for this order before Phase IV (P401) can start.",
+            });
+          }
+        }
+
+        const p401PrereqDelivered = Boolean(
+          deliveredP101 && deliveredP201 && (!candidate.prodState.p301UrlConfigured || deliveredP301),
+        );
+        const p401Eligible =
+          candidate.featureEnabled &&
+          candidate.featureConfigured &&
+          candidate.prodState.p401UrlConfigured &&
+          p401PrereqDelivered &&
+          p401Errors.length === 0 &&
+          latestP401 === null;
+        const p401DisabledReasons = p401Eligible
+          ? []
+          : buildPhaseDisabledReasons({
+              phase: "P401",
+              prodState: candidate.prodState,
+              phaseRows: p401Rows,
+              validationErrors: p401Errors,
+            });
 
         return {
           featureEnabled: candidate.featureEnabled,
           featureConfigured: candidate.featureConfigured,
+          settingsHref: PRODUCTION_SETTINGS_HREF,
           p101: {
+            configured: candidate.prodState.p101UrlConfigured,
             eligible: p101Eligible,
             alreadyDelivered: Boolean(deliveredP101),
             activeState: latestP101 ? (latestP101.state as ProductionDispatchState) : null,
             validationErrors: candidate.validationErrors,
+            disabledReasons: p101DisabledReasons,
             payload: previewP101Payload,
             maskedForViewer,
           },
           p201: {
+            configured: candidate.prodState.p201UrlConfigured,
             eligible: p201Eligible,
             p101Delivered: Boolean(deliveredP101),
             alreadyDelivered: Boolean(deliveredP201),
             activeState: latestP201 ? (latestP201.state as ProductionDispatchState) : null,
             validationErrors: p201Errors,
+            disabledReasons: p201DisabledReasons,
             payload: previewP201Payload,
+          },
+          p301: {
+            configured: candidate.prodState.p301UrlConfigured,
+            eligible: p301Eligible,
+            p101Delivered: Boolean(deliveredP101),
+            prerequisiteDelivered: Boolean(deliveredP101 && deliveredP201),
+            alreadyDelivered: Boolean(deliveredP301),
+            activeState: latestP301 ? (latestP301.state as ProductionDispatchState) : null,
+            validationErrors: p301Errors,
+            disabledReasons: p301DisabledReasons,
+            payload: previewP301Payload,
+          },
+          p401: {
+            configured: candidate.prodState.p401UrlConfigured,
+            eligible: p401Eligible,
+            p101Delivered: Boolean(deliveredP101),
+            prerequisiteDelivered: p401PrereqDelivered,
+            alreadyDelivered: Boolean(deliveredP401),
+            activeState: latestP401 ? (latestP401.state as ProductionDispatchState) : null,
+            validationErrors: p401Errors,
+            disabledReasons: p401DisabledReasons,
+            payload: previewP401Payload,
           },
         };
       });
@@ -2545,6 +3864,353 @@ export function createProductionWebhookService(
       return outcome.item;
     },
 
+    async requestP301(principal, input): Promise<ProductionDispatchItem> {
+      return requestOptionalLaterPhase(principal, input.orderPublicId, "P301");
+    },
+
+    async requestP401(principal, input): Promise<ProductionDispatchItem> {
+      return requestOptionalLaterPhase(principal, input.orderPublicId, "P401");
+    },
+
+    async retry(principal, input): Promise<ProductionDispatchItem> {
+      assertProductionTriggerPreflight(principal);
+      const orders = requireOrders();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderTriggerCaller(principal, input.orderPublicId),
+      });
+
+      const outcome = await deps.db.transaction(
+        async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
+          // PW-05: Lock order row FOR UPDATE FIRST, then lock/revalidate Identity actor SECOND.
+          const access = await orders.assertCanReadOrder(principal, input.orderPublicId, {
+            tx,
+            forUpdate: true,
+          });
+          await assertProductionTriggerInTx(deps, principal, tx);
+
+          const existingRows = await tx
+            .select()
+            .from(integrationProductionDispatches)
+            .where(eq(integrationProductionDispatches.orderId, access.id))
+            .for("update")
+            .orderBy(desc(integrationProductionDispatches.id));
+
+          const targetRow = existingRows.find((r) => r.publicId === input.dispatchPublicId) ?? null;
+          if (!targetRow) {
+            throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
+          }
+
+          const phase = targetRow.phase as ProductionPhase;
+          const phaseRows = existingRows.filter((r) => r.phase === phase);
+
+          if (phaseRows.some((r) => r.state === "queued" || r.state === "sending")) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_IN_PROGRESS",
+              `Cannot retry ${phase} while a dispatch is queued or sending.`,
+            );
+          }
+
+          const rootRow = resolveRetryRootRow(targetRow, phaseRows);
+          // Abuse guard: once an intent chain has been delivered (or an initial undelivered chain is superseded by a
+          // delivered phase row), `retry` is refused; retrying an undelivered `dead`/`failed` redelivery row (`rootRow`
+          // has `redeliveryOfPublicId !== null` and zero delivered rows in its `retryOf` chain) is permitted and
+          // preserves that redelivery's wire `Idempotency-Key`.
+          const intentChainDelivered = phaseRows.some(
+            (r) =>
+              r.state === "delivered" &&
+              resolveRetryRootRow(r, phaseRows).publicId === rootRow.publicId,
+          );
+          const initialPhaseAlreadyDelivered =
+            rootRow.redeliveryOfPublicId === null &&
+            phaseRows.some((r) => r.state === "delivered");
+          if (intentChainDelivered || initialPhaseAlreadyDelivered) {
+            throw conflict(
+              "PRODUCTION_ALREADY_DELIVERED",
+              `${phaseDisplayLabel(phase)} (${phase}) has already been delivered; re-sending requires an administrator with step-up authentication and REDELIVER confirmation.`,
+            );
+          }
+          if (
+            targetRow.state === "unknown" ||
+            phaseRows.some(
+              (r) =>
+                r.state === "unknown" &&
+                (rootRow.redeliveryOfPublicId === null ||
+                  resolveRetryRootRow(r, phaseRows).publicId === rootRow.publicId),
+            )
+          ) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_UNCERTAIN",
+              `A ${phase} attempt ended with an uncertain outcome; verify downstream state before re-sending.`,
+            );
+          }
+          if (targetRow.state !== "failed" && targetRow.state !== "dead") {
+            throw conflict(
+              "PRODUCTION_DISPATCH_NOT_FAILED",
+              "Only failed or dead-lettered dispatches can be retried.",
+            );
+          }
+          if (phaseRows[0]?.publicId !== targetRow.publicId) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_SUPERSEDED",
+              "A newer dispatch already exists for this phase; retry the latest failed attempt.",
+            );
+          }
+
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
+            orderId: access.id,
+            orderPublicId: access.publicId,
+            targetRow,
+            existingRows,
+            action: "retry",
+          });
+          if (!prep.ok) {
+            return prep;
+          }
+
+          if (
+            prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint ||
+            prep.prepared.destinationFingerprint !== targetRow.destinationFingerprint
+          ) {
+            await recordRefusedAuditInTx(tx, {
+              phase,
+              orderPublicId: access.publicId,
+              reasonCode: "PRODUCTION_DESTINATION_CHANGED",
+              packet: targetRow.packet ?? null,
+              tier: targetRow.tier ?? null,
+              bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+              action: "retry",
+              extraAttrs: {
+                target_dispatch_public_id: targetRow.publicId,
+                destination_changed: true,
+              },
+            });
+            return {
+              ok: false,
+              error: conflict(
+                "PRODUCTION_DESTINATION_CHANGED",
+                "Webhook destination or authentication changed since the original dispatch; an administrator with step-up verification must use Re-send.",
+              ),
+            };
+          }
+
+          const resendReasonCode: ControlledResendReason =
+            targetRow.state === "dead" ? "OPERATOR_RETRY_AFTER_DEAD_LETTER" : "OPERATOR_RETRY_AFTER_FAILURE";
+          const retryRootWireKey = resolveRetryRootWireKey(targetRow, phaseRows);
+
+          const item = await enqueueDispatchInTx(tx, {
+            principal,
+            orderId: access.id,
+            orderPublicId: access.publicId,
+            orderReference: prep.prepared.orderReference,
+            expectedOwnerUserId: prep.prepared.expectedOwnerUserId,
+            destinationFingerprint: prep.prepared.destinationFingerprint,
+            phase,
+            payloadObject: prep.prepared.payloadObject,
+            sentCustomerId: prep.prepared.sentCustomerId,
+            sentOrderId: prep.prepared.sentOrderId,
+            sentRunMode: prep.prepared.sentRunMode,
+            packet: prep.prepared.packet,
+            tier: prep.prepared.tier,
+            bundleScopeManifest: prep.prepared.bundleScopeManifest,
+            releaseStatus: prep.prepared.releaseStatus,
+            isResend: true,
+            resendReasonCode,
+            retryOfPublicId: targetRow.publicId,
+            redeliveryOfPublicId: rootRow.redeliveryOfPublicId ?? null,
+            retryRootWireKey,
+            dispatchKind: "retry",
+            phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
+          });
+          return { ok: true, item };
+        },
+      );
+
+      if (!outcome.ok) {
+        throw outcome.error;
+      }
+      return outcome.item;
+    },
+
+    async redeliver(principal, input): Promise<ProductionDispatchItem> {
+      const now = deps.clock.now();
+      assertProductionRedeliverPreflight(principal, now);
+
+      if (input.confirmation !== "REDELIVER") {
+        throw validation(
+          "REDELIVER_CONFIRMATION_REQUIRED",
+          "Type REDELIVER in uppercase to confirm re-delivery of an already-delivered production webhook.",
+        );
+      }
+      const reason = input.reason.trim();
+      if (reason.length < 3 || reason.length > 280 || !hasNoHeaderInjection(reason)) {
+        throw validation(
+          "REDELIVER_REASON_REQUIRED",
+          "Enter an audit reason between 3 and 280 printable characters.",
+        );
+      }
+      const operatorIdempotencyKey = input.idempotencyKey.trim();
+      if (
+        operatorIdempotencyKey.length < 8 ||
+        operatorIdempotencyKey.length > 64 ||
+        !/^[A-Za-z0-9:_-]+$/.test(operatorIdempotencyKey)
+      ) {
+        throw validation(
+          "REDELIVER_IDEMPOTENCY_KEY_REQUIRED",
+          "Provide a valid idempotencyKey between 8 and 64 URL-safe characters.",
+        );
+      }
+
+      const orders = requireOrders();
+      await reconcileStaleDispatches({
+        orderPublicId: input.orderPublicId,
+        verifyCallerBeforeMutate: () => verifyOrderRedeliverCaller(principal, input.orderPublicId),
+      });
+
+      const outcome = await deps.db.transaction(
+        async (tx): Promise<{ ok: true; item: ProductionDispatchItem } | { ok: false; error: DomainError }> => {
+          // PW-05: Lock order row FOR UPDATE FIRST, then lock/revalidate Identity actor + post-lock step-up SECOND.
+          const access = await orders.assertCanReadOrder(principal, input.orderPublicId, {
+            tx,
+            forUpdate: true,
+          });
+          await assertProductionRedeliverInTx(deps, principal, tx);
+
+          const existingRows = await tx
+            .select()
+            .from(integrationProductionDispatches)
+            .where(eq(integrationProductionDispatches.orderId, access.id))
+            .for("update")
+            .orderBy(desc(integrationProductionDispatches.id));
+
+          const targetRow = existingRows.find((r) => r.publicId === input.dispatchPublicId) ?? null;
+          if (!targetRow) {
+            throw notFound("PRODUCTION_DISPATCH_NOT_FOUND");
+          }
+
+          // Durable operator-intent idempotency: a replay of the same confirmed mutation (even after
+          // delivery completes) returns the existing redelivery row without enqueuing another run.
+          const phase = targetRow.phase as ProductionPhase;
+          const intentDigest = deps.crypto
+            .blindIndex(
+              `${access.id}:${operatorIdempotencyKey}`,
+              "integration_production_dispatches.redeliver_intent_v1",
+            )
+            .slice(0, 40);
+          const intentSuffix = `:rdlv:${intentDigest}`;
+          const expectedRedeliverKey = `rp-prod:${phase.toLowerCase()}${intentSuffix}`;
+          const existingForIntent =
+            existingRows.find(
+              (r) => r.redeliveryOfPublicId !== null && r.idempotencyKey.endsWith(intentSuffix),
+            ) ?? null;
+          if (existingForIntent) {
+            if (existingForIntent.redeliveryOfPublicId !== targetRow.publicId) {
+              throw conflict(
+                "IDEMPOTENCY_KEY_CONFLICT",
+                "This idempotencyKey was already used for a different dispatch on this order.",
+              );
+            }
+            const latestInIntentChain =
+              existingRows.find(
+                (r) => toWireIdempotencyKey(r.idempotencyKey) === expectedRedeliverKey,
+              ) ?? existingForIntent;
+            return { ok: true, item: toDispatchItem(latestInIntentChain) };
+          }
+
+          if (targetRow.state !== "delivered") {
+            throw conflict(
+              "PRODUCTION_DISPATCH_NOT_DELIVERED",
+              "Only already-delivered dispatches can be re-delivered; use Retry for failed dispatches.",
+            );
+          }
+
+          const phaseRows = existingRows.filter((r) => r.phase === phase);
+          if (phaseRows.some((r) => r.state === "queued" || r.state === "sending")) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_IN_PROGRESS",
+              `Cannot re-deliver ${phase} while a dispatch is queued or sending.`,
+            );
+          }
+
+          const latestRedeliveryRow =
+            phaseRows.find((r) => resolveRetryRootRow(r, phaseRows).redeliveryOfPublicId !== null) ?? null;
+          const latestRedeliveryRoot = latestRedeliveryRow
+            ? resolveRetryRootRow(latestRedeliveryRow, phaseRows)
+            : null;
+          const latestRedeliveryChain = latestRedeliveryRoot
+            ? phaseRows.filter(
+                (r) => resolveRetryRootRow(r, phaseRows).publicId === latestRedeliveryRoot.publicId,
+              )
+            : [];
+          const latestRedeliveryDelivered = latestRedeliveryChain.some((r) => r.state === "delivered");
+
+          if (
+            phaseRows[0]?.state === "unknown" ||
+            latestRedeliveryRow?.state === "unknown" ||
+            (!latestRedeliveryDelivered && latestRedeliveryChain.some((r) => r.state === "unknown"))
+          ) {
+            throw conflict(
+              "PRODUCTION_DISPATCH_UNCERTAIN",
+              `Cannot start a new ${phase} redelivery while the latest redelivery outcome is unknown; verify downstream state and retry or resolve the prior attempt first.`,
+            );
+          }
+          if (
+            !latestRedeliveryDelivered &&
+            (latestRedeliveryRow?.state === "dead" ||
+              latestRedeliveryChain.some((r) => r.state === "dead"))
+          ) {
+            throw conflict(
+              "PRODUCTION_REDELIVERY_RETRY_REQUIRED",
+              `The latest ${phase} redelivery ended in dead-letter state; retry that redelivery row (${latestRedeliveryRow!.publicId}) so its original Idempotency-Key is preserved.`,
+            );
+          }
+
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
+            orderId: access.id,
+            orderPublicId: access.publicId,
+            targetRow,
+            existingRows,
+            action: "redeliver",
+          });
+          if (!prep.ok) {
+            return prep;
+          }
+
+          const item = await enqueueDispatchInTx(tx, {
+            principal,
+            orderId: access.id,
+            orderPublicId: access.publicId,
+            orderReference: prep.prepared.orderReference,
+            expectedOwnerUserId: prep.prepared.expectedOwnerUserId,
+            destinationFingerprint: prep.prepared.destinationFingerprint,
+            phase,
+            payloadObject: prep.prepared.payloadObject,
+            sentCustomerId: prep.prepared.sentCustomerId,
+            sentOrderId: prep.prepared.sentOrderId,
+            sentRunMode: prep.prepared.sentRunMode,
+            packet: prep.prepared.packet,
+            tier: prep.prepared.tier,
+            bundleScopeManifest: prep.prepared.bundleScopeManifest,
+            releaseStatus: prep.prepared.releaseStatus,
+            isResend: true,
+            resendReasonCode: "OPERATOR_REPLAY_DELIVERED",
+            retryOfPublicId: null,
+            redeliveryOfPublicId: targetRow.publicId,
+            idempotencyKeyOverride: `rp-prod:${phase.toLowerCase()}${intentSuffix}`,
+            dispatchKind: "redeliver",
+            reasonLength: reason.length,
+            phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
+          });
+          return { ok: true, item };
+        },
+      );
+
+      if (!outcome.ok) {
+        throw outcome.error;
+      }
+      return outcome.item;
+    },
+
     async resend(principal, input): Promise<ProductionDispatchItem> {
       const now = deps.clock.now();
       assertProductionResendPreflight(principal, now);
@@ -2555,7 +4221,6 @@ export function createProductionWebhookService(
       }
 
       const orders = requireOrders();
-      const identity = requireIdentity();
       // PW-02: Reconcile any stale/expired `sending`/`queued` rows via job-fenced reconciliation before opening
       // the order transaction so interrupted attempts never permanently block administrative re-send.
       await reconcileStaleDispatches({
@@ -2592,242 +4257,100 @@ export function createProductionWebhookService(
               `Cannot re-send ${input.phase} while a dispatch is queued or sending.`,
             );
           }
+          if (phaseRows.some((r) => r.state === "delivered")) {
+            throw conflict(
+              "PRODUCTION_ALREADY_DELIVERED",
+              `${input.phase} has already been delivered for this order; use production.order.redeliver with step-up confirmation instead.`,
+            );
+          }
 
           // PW-07: Classify into controlled server code; NEVER store or audit raw `input.reason` prose.
-          const resendReasonCode = classifyResendReasonCode(phaseRows[0]!);
+          const latestRow = phaseRows[0]!;
+          const rootRow = phaseRows[phaseRows.length - 1]!;
+          const resendReasonCode = classifyResendReasonCode(latestRow);
 
-          if (input.phase === "P101") {
-            const candidate = await evaluateP101CandidateInTx(tx, access.id, input.releaseStatus);
-            if (!candidate.featureEnabled || !candidate.featureConfigured || !candidate.prodState.p101Secret) {
-              await recordRefusedAuditInTx(tx, {
-                phase: "P101",
-                orderPublicId: access.publicId,
-                reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
-                isResend: true,
-              });
-              return {
-                ok: false,
-                error: new DomainError(
-                  "NOT_CONFIGURED",
-                  "PRODUCTION_WEBHOOKS_NOT_ENABLED",
-                  "Production webhooks are disabled or incomplete.",
-                ),
-              };
-            }
-            if (candidate.validationErrors.length > 0 || !candidate.payload) {
-              const first = candidate.validationErrors[0] ?? {
-                code: "INVALID_P101_PAYLOAD",
-                message: "Order failed Phase I (P101) validation.",
-              };
-              await recordRefusedAuditInTx(tx, {
-                phase: "P101",
-                orderPublicId: access.publicId,
-                reasonCode: first.code,
-                packet: candidate.payload?.packet ?? null,
-                tier: candidate.payload?.tier ?? null,
-                bundleScopeManifest: candidate.payload?.bundle_scope_manifest ?? null,
-                isResend: true,
-              });
-              return {
-                ok: false,
-                error:
-                  first.code === "ORDER_LOCKED" || first.code === "ORDER_CANCELED"
-                    ? conflict(first.code, first.message)
-                    : validation(first.code, first.message, {
-                        error_codes: candidate.validationErrors.map((e) => e.code),
-                      }),
-              };
-            }
-
-            const authHeaderValue =
-              candidate.prodState.cfg.authHeaderName !== ""
-                ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
-                : null;
-            const destinationFingerprint = computeDestinationFingerprint("P101", {
-              targetUrl: candidate.prodState.p101Secret,
-              authHeaderName: candidate.prodState.cfg.authHeaderName,
-              authHeaderValue,
-              canonVersion: candidate.prodState.cfg.canonVersion,
-              runMode: candidate.prodState.cfg.runMode,
-            });
-
-            const p = candidate.payload;
-            const item = await enqueueDispatchInTx(tx, {
-              principal,
-              orderId: access.id,
+          if (input.phase === "P201" && input.phase1ArtifactsConfirmed !== true) {
+            await recordRefusedAuditInTx(tx, {
+              phase: "P201",
               orderPublicId: access.publicId,
-              orderReference: candidate.scope.reference,
-              expectedOwnerUserId: candidate.scope.ownerUserId,
-              destinationFingerprint,
+              reasonCode: "PHASE1_ARTIFACTS_UNCONFIRMED",
+              packet: rootRow.packet ?? null,
+              tier: rootRow.tier ?? null,
+              bundleScopeManifest: rootRow.bundleScopeManifest ?? null,
+              isResend: true,
+              action: "resend",
+            });
+            return {
+              ok: false,
+              error: validation(
+                "PHASE1_ARTIFACTS_UNCONFIRMED",
+                "Confirm Phase I SharePoint output artifacts before re-sending Phase II (P201).",
+              ),
+            };
+          }
+
+          if (
+            input.phase === "P101" &&
+            input.releaseStatus !== undefined &&
+            input.releaseStatus.trim() !== (rootRow.releaseStatus ?? "")
+          ) {
+            await recordRefusedAuditInTx(tx, {
               phase: "P101",
-              payloadObject: p,
-              sentCustomerId: p.customer_id,
-              sentOrderId: p.order_id,
-              sentRunMode: p.run_mode,
-              packet: p.packet,
-              tier: p.tier,
-              bundleScopeManifest: p.bundle_scope_manifest,
-              releaseStatus: p.release_status,
-              isResend: true,
-              resendReasonCode,
-              phase1ArtifactsConfirmed: false,
-            });
-            return { ok: true, item };
-          }
-
-          // P201 re-send
-          const [scope, prodState] = await Promise.all([
-            orders.getProductionScope(access.id, { tx }),
-            readProductionState(tx),
-          ]);
-          if (!scope) {
-            throw notFound("ORDER_NOT_FOUND");
-          }
-
-          if (isOrderLockedForProduction(scope.lockState)) {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
               orderPublicId: access.publicId,
-              reasonCode: "ORDER_LOCKED",
+              reasonCode: "ORDER_SCOPE_CHANGED",
+              packet: rootRow.packet ?? null,
+              tier: rootRow.tier ?? null,
+              bundleScopeManifest: rootRow.bundleScopeManifest ?? null,
               isResend: true,
-            });
-            return {
-              ok: false,
-              error: conflict("ORDER_LOCKED", "This order is locked and cannot dispatch production webhooks."),
-            };
-          }
-          if (isOrderCanceledStatus(scope.statusKey)) {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: "ORDER_CANCELED",
-              isResend: true,
-            });
-            return {
-              ok: false,
-              error: conflict("ORDER_CANCELED", "Canceled orders cannot dispatch production webhooks."),
-            };
-          }
-
-          const owner = await identity.getUser(scope.ownerUserId, { tx });
-          if (!owner || owner.status !== "active") {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: "ORDER_OWNER_INACTIVE",
-              isResend: true,
-            });
-            return {
-              ok: false,
-              error: validation(
-                "ORDER_OWNER_INACTIVE",
-                "The order owner account must be active to dispatch production webhooks.",
-              ),
-            };
-          }
-
-          if (input.phase1ArtifactsConfirmed !== true) {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: "PHASE1_ARTIFACTS_CONFIRMATION_REQUIRED",
-              isResend: true,
-            });
-            return {
-              ok: false,
-              error: validation(
-                "PHASE1_ARTIFACTS_CONFIRMATION_REQUIRED",
-                "Confirm that the Phase I final artifacts exist before re-sending Phase II (P201).",
-              ),
-            };
-          }
-
-          if (!prodState.enabled || !prodState.configured || !prodState.p201Secret) {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: "PRODUCTION_WEBHOOKS_NOT_ENABLED",
-              isResend: true,
-            });
-            return {
-              ok: false,
-              error: new DomainError(
-                "NOT_CONFIGURED",
-                "PRODUCTION_WEBHOOKS_NOT_ENABLED",
-                "Production webhooks are disabled or incomplete.",
-              ),
-            };
-          }
-
-          const deliveredP101 = existingRows.find((r) => r.phase === "P101" && r.state === "delivered");
-          if (!deliveredP101) {
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: "PRODUCTION_P101_NOT_DELIVERED",
-              isResend: true,
+              action: "resend",
             });
             return {
               ok: false,
               error: conflict(
-                "PRODUCTION_P101_NOT_DELIVERED",
-                "Phase II (P201) cannot be re-sent until Phase I (P101) has been delivered for this order.",
+                "ORDER_SCOPE_CHANGED",
+                "Cannot change releaseStatus when re-sending an undelivered dispatch; payload bytes must match the original attempt.",
               ),
             };
           }
 
-          const p201Check = buildP201FromDeliveredP101({
-            customerId: deliveredP101.sentCustomerId,
-            orderId: deliveredP101.sentOrderId,
-            runMode: deliveredP101.sentRunMode,
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
+            orderId: access.id,
+            orderPublicId: access.publicId,
+            targetRow: rootRow,
+            existingRows,
+            action: "resend",
           });
-          if (!p201Check.ok) {
-            const first = p201Check.errors[0]!;
-            await recordRefusedAuditInTx(tx, {
-              phase: "P201",
-              orderPublicId: access.publicId,
-              reasonCode: first.code,
-              isResend: true,
-            });
-            return {
-              ok: false,
-              error: validation(first.code, first.message, {
-                error_codes: p201Check.errors.map((e) => e.code),
-              }),
-            };
+          if (!prep.ok) {
+            return prep;
           }
 
-          const authHeaderValue =
-            prodState.cfg.authHeaderName !== ""
-              ? await readSecret(deps.settings, INTEGRATIONS_PRODUCTION_AUTH_VALUE, tx)
-              : null;
-          const destinationFingerprint = computeDestinationFingerprint("P201", {
-            targetUrl: prodState.p201Secret,
-            authHeaderName: prodState.cfg.authHeaderName,
-            authHeaderValue,
-            canonVersion: prodState.cfg.canonVersion,
-            runMode: prodState.cfg.runMode,
-          });
+          const retryRootWireKey = toWireIdempotencyKey(rootRow.idempotencyKey);
+          const destinationChanged =
+            prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint;
 
           const item = await enqueueDispatchInTx(tx, {
             principal,
             orderId: access.id,
             orderPublicId: access.publicId,
-            orderReference: deliveredP101.orderReference,
-            expectedOwnerUserId: scope.ownerUserId,
-            destinationFingerprint,
-            phase: "P201",
-            payloadObject: p201Check.payload,
-            sentCustomerId: p201Check.payload.customer_id,
-            sentOrderId: p201Check.payload.order_id,
-            sentRunMode: p201Check.payload.run_mode,
-            packet: deliveredP101.packet ?? null,
-            tier: deliveredP101.tier ?? null,
-            bundleScopeManifest: deliveredP101.bundleScopeManifest ?? null,
-            releaseStatus: null,
+            orderReference: prep.prepared.orderReference,
+            expectedOwnerUserId: prep.prepared.expectedOwnerUserId,
+            destinationFingerprint: prep.prepared.destinationFingerprint,
+            phase: input.phase,
+            payloadObject: prep.prepared.payloadObject,
+            sentCustomerId: prep.prepared.sentCustomerId,
+            sentOrderId: prep.prepared.sentOrderId,
+            sentRunMode: prep.prepared.sentRunMode,
+            packet: prep.prepared.packet,
+            tier: prep.prepared.tier,
+            bundleScopeManifest: prep.prepared.bundleScopeManifest,
+            releaseStatus: prep.prepared.releaseStatus,
             isResend: true,
             resendReasonCode,
-            phase1ArtifactsConfirmed: true,
+            retryRootWireKey,
+            destinationChanged,
+            dispatchKind: "resend",
+            reasonLength: reason.length,
+            phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
           });
           return { ok: true, item };
         },

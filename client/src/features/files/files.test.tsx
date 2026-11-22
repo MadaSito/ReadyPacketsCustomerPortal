@@ -20,6 +20,7 @@ vi.mock("@/lib/trpc", async (original) => ({
   useTRPC: () => {
     const mutation = { mutationOptions: () => ({ mutationFn: async () => ({}) }) };
     return {
+      orders: { requirements: { forOrder: { queryKey: (input: { orderId: string }) => ["requirements", input.orderId] } } },
       files: {
         list: {
           infiniteQueryOptions: () => ({
@@ -42,6 +43,7 @@ const sample: FileRecord = {
   logicalPublicId: `01JTEST${"0".repeat(18)}1`,
   phasePublicId: null,
   statusKey: "intake",
+  slotKey: null, derivedFromPublicId: null, conversionState: null, conversionReason: null, durationSeconds: null,
   version: 1,
   visibility: "customer_visible",
   category: "supporting",
@@ -61,6 +63,21 @@ beforeEach(() => {
 });
 
 describe("file upload", () => {
+  it("binds the selected workflow status and slot and sends the optional transcript only on explicit upload", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff={false} policy={policy}
+      slot={{ key: "voice_evidence", statusKey: "intake", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"] }}
+      audio={{ enabled: true, maxMinutes: 5 }} onChanged={vi.fn()} />);
+    await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "evidence.wav", { type: "audio/wav" }));
+    await user.type(screen.getByLabelText("Audio transcript (optional)"), "Synthetic statement");
+    expect(fetchMock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toContain("slotKey=voice_evidence&statusKey=intake");
+    expect((init.body as FormData).get("transcript")).toBe("Synthetic statement");
+  });
   it("shows actual upload progress state and distinct server-confirmed outcomes", async () => {
     const changed = vi.fn();
     const user = userEvent.setup();
@@ -110,10 +127,11 @@ describe("file administration", () => {
   it("labels the rules, identifies unconfigured scanning, validates inputs, and sends bounded changes", async () => {
     const onSave = vi.fn(async () => {});
     const user = userEvent.setup();
-    const { container } = renderUi(<FilesAdminContent onSave={onSave} saving={false} overview={{
+    const { container } = renderUi(<FilesAdminContent onSave={onSave} saving={false} audioSaving={false} onSaveAudio={vi.fn()} overview={{
       rules: { ...policy, retentionDays: 30 },
       supported: { ...policy, maxFileBytes: 100 * 1024 * 1024, maxRequestBytes: 256 * 1024 * 1024, maxFiles: 12 },
       storedBytes: "1024", storedFiles: 4, retainedFiles: 2, antivirus: "not_configured",
+      audioRules: { enabled: false, maxMinutes: 5, bitrateKbps: 48, keepOriginal: true }, audioVersion: null,
     }} />);
     expect(screen.getByRole("heading", { level: 1, name: "File administration" })).toBeInTheDocument();
     expect(screen.getByText("Not configured")).toBeInTheDocument();

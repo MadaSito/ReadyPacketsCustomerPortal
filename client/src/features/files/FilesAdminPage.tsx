@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { FolderLock, ShieldAlert } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { FilesModule, UploadPolicy } from "@server/modules/files/index";
-import type { FileRules } from "@server/modules/files/settings";
+import type { AudioRules, FileRules } from "@server/modules/files/settings";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, Checkbox, ErrorState, Field, Input, KeyValueList, PageHeader,
@@ -96,8 +96,45 @@ export function FileRulesEditor({ initial, supported, onSave, busy }: {
   );
 }
 
-export function FilesAdminContent({ overview, saving, onSave }: {
+function AudioRulesEditor({ initial, busy, version, onSave }: {
+  initial: AudioRules; busy: boolean; version: string | null; onSave: (value: AudioRules) => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [minutes, setMinutes] = useState(String(initial.maxMinutes));
+  const [bitrate, setBitrate] = useState(String(initial.bitrateKbps));
+  const [notice, setNotice] = useState<string | null>(null);
+  const changed = enabled !== initial.enabled || Number(minutes) !== initial.maxMinutes || Number(bitrate) !== initial.bitrateKbps;
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setNotice(null);
+    const value = { enabled, maxMinutes: Number(minutes), bitrateKbps: Number(bitrate), keepOriginal: true as const };
+    if (!Number.isInteger(value.maxMinutes) || value.maxMinutes < 1 || value.maxMinutes > 20 ||
+      !Number.isInteger(value.bitrateKbps) || value.bitrateKbps < 24 || value.bitrateKbps > 128) {
+      setNotice("Enter whole numbers within the given duration and bitrate limits.");
+      return;
+    }
+    try { await onSave(value); }
+    catch (error) { if (!(error instanceof StepUpCancelledError)) setNotice(errorMessage(error, "Audio settings could not be saved.")); }
+  }
+  return <form className="grid min-w-0 gap-4" onSubmit={(event) => { void submit(event); }} noValidate>
+    <p className="text-sm text-body">{!initial.enabled ? "Recording and conversion are off. Ordinary file uploads remain available." :
+      version ? `FFmpeg ${version} is available.` : "Conversion not available. Original audio can still be uploaded."}</p>
+    <Checkbox label="Enable microphone recording and WebM conversion" checked={enabled} onCheckedChange={setEnabled} disabled={busy} />
+    <Field label="Maximum recording length (minutes)" hint="Between 1 and 20 minutes." required>
+      <Input type="number" min={1} max={20} step={1} value={minutes} onChange={(event) => setMinutes(event.target.value)} disabled={busy} />
+    </Field>
+    <Field label="WebM bitrate (kbps)" hint="Between 24 and 128 kbps." required>
+      <Input type="number" min={24} max={128} step={1} value={bitrate} onChange={(event) => setBitrate(event.target.value)} disabled={busy} />
+    </Field>
+    <p className="text-sm text-body">Keep original: always on. Conversion creates a separate copy; it never replaces the original.</p>
+    {notice ? <Callout tone="danger" live="assertive" title="Check audio settings">{notice}</Callout> : null}
+    <div><Button type="submit" disabled={!changed} loading={busy}>Save audio settings</Button></div>
+  </form>;
+}
+
+export function FilesAdminContent({ overview, saving, onSave, audioSaving, onSaveAudio }: {
   overview: Overview; saving: boolean; onSave: (rules: FileRules) => Promise<void>;
+  audioSaving: boolean; onSaveAudio: (rules: AudioRules) => Promise<void>;
 }) {
   return (
     <>
@@ -107,6 +144,10 @@ export function FilesAdminContent({ overview, saving, onSave }: {
           <FileRulesEditor key={JSON.stringify(overview.rules)} initial={overview.rules} supported={overview.supported} busy={saving} onSave={onSave} />
         </Card>
         <div className="grid min-w-0 gap-5">
+          <Card title="Audio recording and conversion" description="Control browser recording and the worker’s WebM/Opus output.">
+            <AudioRulesEditor initial={overview.audioRules} version={overview.audioVersion} key={JSON.stringify(overview.audioRules)}
+              busy={audioSaving} onSave={onSaveAudio} />
+          </Card>
           <Card title="Recorded storage usage" description="Includes active versions and files retained in trash. Staging and export artifacts are excluded.">
             <KeyValueList columns={1} items={[
               { label: "Stored file versions", value: overview.storedFiles.toLocaleString() },
@@ -134,6 +175,7 @@ export default function FilesAdminPage() {
   const stepUp = useStepUp();
   const overview = useQuery(trpc.files.admin.get.queryOptions());
   const save = useMutation(trpc.files.admin.setTypeRules.mutationOptions());
+  const saveAudio = useMutation(trpc.files.admin.setAudioRules.mutationOptions());
   const [verifying, setVerifying] = useState(false);
 
   async function change(rules: FileRules) {
@@ -146,6 +188,14 @@ export default function FilesAdminPage() {
       setVerifying(false);
     }
   }
+  async function changeAudio(rules: AudioRules) {
+    setVerifying(true);
+    try {
+      await stepUp.run(() => saveAudio.mutateAsync(rules), { reason: "Changing audio recording and conversion requires a fresh identity check." });
+      await queryClient.invalidateQueries({ queryKey: trpc.files.pathKey() });
+      toast.show({ tone: "success", title: "Audio settings saved" });
+    } finally { setVerifying(false); }
+  }
 
   if (!overview.data) {
     return <>
@@ -155,5 +205,6 @@ export default function FilesAdminPage() {
         <ErrorState title="File settings are unavailable" error={overview.error} onRetry={() => { void overview.refetch(); }} />}
     </>;
   }
-  return <FilesAdminContent overview={overview.data} onSave={change} saving={save.isPending || verifying} />;
+  return <FilesAdminContent overview={overview.data} onSave={change} saving={save.isPending || verifying}
+    onSaveAudio={changeAudio} audioSaving={saveAudio.isPending || verifying} />;
 }

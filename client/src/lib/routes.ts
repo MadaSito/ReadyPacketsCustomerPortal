@@ -36,8 +36,17 @@ export interface NavItem {
   /** lucide-react icon component. */
   icon: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
   area: "customer" | "console";
-  /** Console grouping heading, e.g. "Operations", "Security", "Platform". */
+  /**
+   * Console: grouping heading, e.g. "Operations", "Security", "Platform".
+   * Customer area: undefined = main section, "Support" or "Account" (entries placed in the account menu
+   * without a group count as "Account").
+   */
   group?: string;
+  /**
+   * Feature switch key (`features.enabled(key)`, platform port). The entry is shown only while the switch is
+   * on, and is hidden while loading or when the port is unavailable. Hiding is never authorisation.
+   */
+  enabledBy?: "cart" | "community" | "referrals" | "knowledge" | (string & {});
   access: RouteAccess;
   capability?: Capability;
   /** Sort order within the area/group (lower first). */
@@ -68,8 +77,26 @@ export interface DetailTab<Props> {
   order: number;
   /** Optional small component rendered next to the label (e.g. unread count). */
   badge?: ComponentType<Props>;
+  /**
+   * Optional dynamic label rendered IN PLACE OF `label` (text only, e.g. "SharePoint sync (2)"). `label` stays
+   * required: it is shown while the component loads and remains the fallback name. Count queries must be cheap
+   * and must not run for users who cannot see the tab (the host only mounts it for visible tabs).
+   */
+  labelComponent?: ComponentType<Props>;
 }
 export type OrderTab = DetailTab<{ orderId: string; area: "customer" | "console" }>;
+/**
+ * Full-width block a feature contributes to the order page, rendered between the header and the tab strip
+ * (host: orders feature; e.g. the acceptance gate). Rendered inside Suspense with no fallback; the component
+ * renders null when it has nothing to show. Server checks stay authoritative.
+ */
+export interface OrderBanner {
+  key: string;
+  /** Lower first. */
+  order: number;
+  area: "customer" | "console" | "both";
+  component: LazyExoticComponent<ComponentType<{ orderId: string; area: "customer" | "console" }>> | ComponentType<{ orderId: string; area: "customer" | "console" }>;
+}
 export type CustomerTab = DetailTab<{ customerId: string }>;
 /** Cards a feature contributes to the customer dashboard or console overview. */
 export interface DashboardWidget {
@@ -96,15 +123,28 @@ export interface RouteWrapper {
   order: number;
 }
 
+/** A card a feature contributes to the customer Security page (`/account/security`, host: assurance feature). */
+export interface SecurityCard {
+  key: string;
+  /** Lower first. Two-factor (host) sits at 20. */
+  order: number;
+  access: "customer" | "staff" | "admin";
+  component: LazyExoticComponent<ComponentType> | ComponentType;
+}
+
 export interface FeatureRoutes {
   routes: RouteDef[];
   nav?: NavItem[];
   /** Tabs contributed to the order detail page (host: orders feature). */
   orderTabs?: OrderTab[];
+  /** Full-width banners on the order page between header and tabs (host: orders feature). */
+  orderBanners?: OrderBanner[];
   /** Tabs contributed to the console customer detail page (host: identity feature). */
   customerTabs?: CustomerTab[];
   /** Cards contributed to the dashboards (host: dashboard feature). */
   widgets?: DashboardWidget[];
   /** Wrappers applied around routes owned by other features (see `RouteWrapper`). */
   routeWrappers?: RouteWrapper[];
+  /** Cards contributed to the customer Security page (host: assurance feature). */
+  securityCards?: SecurityCard[];
 }

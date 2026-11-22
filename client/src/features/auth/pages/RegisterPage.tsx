@@ -1,15 +1,49 @@
+import { useQuery } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { PASSWORD_POLICY, countCodePoints } from "@shared/domain";
 import { useAuthApi, type Accepted } from "@/lib/authApi";
+import { apiUrl } from "@/lib/runtime";
+import { sessionFetch } from "@/lib/sessionTransport";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Button, Callout, Checkbox, Field, Input } from "@/ui";
 import { usePreviewProfile } from "@/app/shell/common";
+import { CustomerMaintenanceSlot } from "@/app/slots";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, PasswordMeter, useFocusOnError } from "../components/bits";
 
+/** Referral code from `/register?ref=CODE` (decision 8); anything that isn't a well-formed code is dropped. */
+export function referralCodeFrom(search: string): string | undefined {
+  const raw = new URLSearchParams(search).get("ref")?.trim().toUpperCase();
+  return raw && /^[0-9A-Z]{10}$/.test(raw) ? raw : undefined;
+}
+
+const REFERRAL_HOLD = "/api/referrals/hold";
+
+/**
+ * The referral feature keeps a 30-day first-party hold (HttpOnly cookie, no Web Storage) set by its /register wrapper.
+ * When the URL has no ?ref=, ask the server for the held code. Any failure means "no code" (fail closed).
+ */
+export async function fetchHeldReferralCode(): Promise<string | null> {
+  try {
+    const response = await sessionFetch(apiUrl(REFERRAL_HOLD), { method: "GET", credentials: "include" });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { code?: unknown };
+    return typeof body.code === "string" ? (referralCodeFrom(`?ref=${encodeURIComponent(body.code)}`) ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearHeldReferralCode(): void {
+  void sessionFetch(apiUrl(REFERRAL_HOLD), { method: "DELETE", credentials: "include" }).catch(() => undefined);
+}
+
 export default function RegisterPage() {
   const api = useAuthApi();
+  const urlCode = referralCodeFrom(useSearch());
+  const held = useQuery({ queryKey: ["rp", "referrals", "hold"], queryFn: fetchHeldReferralCode, enabled: !urlCode, retry: false, staleTime: Infinity });
+  const referralCode = urlCode ?? held.data ?? undefined;
   const preview = usePreviewProfile();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -38,8 +72,9 @@ export default function RegisterPage() {
     setError(null);
     setBusy(true);
     try {
-      const result = await api.register({ name: name.trim(), email: email.trim(), password });
+      const result = await api.register({ name: name.trim(), email: email.trim(), password, ...(referralCode ? { referralCode } : {}) });
       setPassword("");
+      if (referralCode) clearHeldReferralCode();
       setDone(result);
     } catch (err) {
       const safe = safeError(err);
@@ -84,6 +119,7 @@ export default function RegisterPage() {
         </>
       }
     >
+      <CustomerMaintenanceSlot />
       <FormError message={error} focusRef={errorRef} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
         <Field label="Full name" error={errors.name} required>

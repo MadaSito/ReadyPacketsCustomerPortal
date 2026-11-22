@@ -15,12 +15,14 @@ export function RecommendedBackup({ archive }: { archive: Archive | null }) {
     return <Callout tone="warning" title="No verified backup available">Run and verify a backup before you need it. A restore should only start from a verified copy.</Callout>;
   }
   return (
-    <div className="flex flex-col gap-2 text-body sm:flex-row sm:flex-wrap sm:items-center">
+    <div className="flex min-w-0 flex-col gap-2 text-body sm:flex-row sm:flex-wrap sm:items-center">
       <span>Most recent verified backup:</span>
       <DateTime value={archive.createdAt} format="datetime" />
       <VerificationBadge status={archive.verificationStatus} />
-      <code className="text-xs break-all">{archive.publicId}</code>
-      <Button asChild size="sm" variant="secondary"><Link href={`${BASE}/${encodeURIComponent(archive.publicId)}`}>Open backup</Link></Button>
+      <code className="text-xs break-all [overflow-wrap:anywhere]">{archive.publicId}</code>
+      <Button asChild size="sm" variant="secondary" className="h-auto max-w-full py-1.5 text-center whitespace-normal">
+        <Link href={`${BASE}/${encodeURIComponent(archive.publicId)}`}>Open backup</Link>
+      </Button>
     </div>
   );
 }
@@ -37,7 +39,7 @@ export default function RestorePage() {
         breadcrumbs={<Breadcrumbs items={[{ label: "Backups", href: BASE }, { label: "Restore procedure" }]} />}
         description="Restores are run by an operator on the server, not from this console."
       />
-      <div className="space-y-8">
+      <div className="min-w-0 space-y-8">
         <Callout tone="info" title="Why restore is not a button here">
           A restore replaces business data and account security state. To keep that power away from a browser session, it runs only
           from the host command line, into a separately named isolated database, using credentials the operator supplies there — never
@@ -48,8 +50,15 @@ export default function RestorePage() {
           {list.isPending ? <Skeleton lines={1} /> : list.error ? <ErrorState error={list.error} onRetry={() => list.refetch()} /> : <RecommendedBackup archive={recommended} />}
         </Section>
 
-        <Section title="Operator procedure" description="Follow docs/operations/BACKUP_AND_RESTORE.md; it is the authoritative, current version of these steps.">
-          <ol className="list-decimal space-y-2 ps-5 text-body">
+        <Section
+          title="Operator procedure"
+          description={
+            <span className="break-words [overflow-wrap:anywhere]">
+              Follow docs/operations/BACKUP_AND_RESTORE.md; it is the authoritative, current version of these steps.
+            </span>
+          }
+        >
+          <ol className="list-decimal space-y-2 ps-5 text-body break-words [overflow-wrap:anywhere]">
             <li>Verify the backup from its page here, and confirm the backup encryption key is available on the host from its offline custody copy.</li>
             <li>Create a new, empty database and an empty storage folder for the restored copy, with their own credentials.</li>
             <li>On the server, run the restore command below. It asks for the exact typed confirmation and never accepts secrets as arguments.</li>
@@ -58,8 +67,22 @@ export default function RestorePage() {
           </ol>
         </Section>
 
-        <Section title="Command" description="Replace the values in angle brackets. When restoring straight from this server's storage, --backup-id <BACKUP_PUBLIC_ID> may be used instead of --archive-file. Exit code 0 means restored and verified; 1 means refused or integrity failed; 78 means configuration error.">
-          <CodeBlock label="Restore command for the operator" copyable>{restoreCommand(recommended?.publicId ?? null)}</CodeBlock>
+        <Section
+          title="Command"
+          description={
+            <span className="break-words [overflow-wrap:anywhere]">
+              Replace the values in angle brackets. When restoring straight from this server&apos;s storage, --backup-id &lt;BACKUP_PUBLIC_ID&gt; may be used instead of --archive-file. Exit code 0 means restored and verified; 1 means refused or integrity failed; 78 means configuration error.
+            </span>
+          }
+        >
+          <CodeBlock
+            label="Restore command for the operator"
+            copyable
+            wrap
+            className="max-w-full [&_code]:break-all [&_code]:[overflow-wrap:anywhere]"
+          >
+            {restoreCommand(recommended?.publicId ?? null)}
+          </CodeBlock>
         </Section>
 
         <Section title="Restore records">

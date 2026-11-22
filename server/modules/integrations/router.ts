@@ -4,10 +4,14 @@
 import { z } from "zod";
 import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { EGRESS_PRESET_KEYS, EGRESS_PROTOCOLS, EGRESS_PURPOSES } from "./egress.js";
+import { WEBHOOK_DELIVERY_STATUSES, WEBHOOK_DIRECTIONS, WEBHOOK_SUBSCRIPTION_STATUSES } from "./webhooks/index.js";
 
 const manageProcedure = adminProcedure.use(requireCapability("integrations.manage"));
+const webhooksManageProcedure = adminProcedure.use(requireCapability("webhooks.manage"));
+const apiReplayProcedure = adminProcedure.use(requireCapability("api.replay"));
 const productionTriggerProcedure = staffProcedure.use(requireCapability("orders.production.trigger"));
 const productionResendProcedure = adminProcedure.use(requireCapability("orders.production.trigger"));
+const productionRedeliverProcedure = staffProcedure.use(requireCapability("orders.production.redeliver"));
 
 const ulidParamSchema = z.string().trim().min(10).max(64);
 
@@ -115,13 +119,15 @@ const setEgressPresetSchema = z.strictObject({
     .optional(),
 });
 
-const productionPhaseSchema = z.enum(["P101", "P201"]);
+const productionPhaseSchema = z.enum(["P101", "P201", "P301", "P401"]);
 const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead", "unknown"]);
 
 const updateProductionSettingsSchema = z.strictObject({
   enabled: z.boolean(),
   p101Url: z.string().trim().max(2048).nullable().optional(),
   p201Url: z.string().trim().max(2048).nullable().optional(),
+  p301Url: z.string().trim().max(2048).nullable().optional(),
+  p401Url: z.string().trim().max(2048).nullable().optional(),
   authHeaderName: z.string().trim().max(64).optional(),
   authHeaderValue: z.string().max(1024).nullable().optional(),
   canonVersion: z.string().trim().max(64),
@@ -146,6 +152,28 @@ const requestP101Schema = z.strictObject({
 const requestP201Schema = z.strictObject({
   orderPublicId: ulidParamSchema,
   phase1ArtifactsConfirmed: z.boolean(),
+});
+
+const requestLaterPhaseSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+});
+
+const retryProductionDispatchSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  dispatchPublicId: ulidParamSchema,
+});
+
+const redeliverProductionDispatchSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  dispatchPublicId: ulidParamSchema,
+  reason: z.string().max(500),
+  confirmation: z.string().max(64),
+  idempotencyKey: z
+    .string()
+    .trim()
+    .min(8)
+    .max(64)
+    .regex(/^[A-Za-z0-9:_-]+$/),
 });
 
 const resendProductionSchema = z.strictObject({
@@ -253,6 +281,220 @@ export const integrationsRouter = router({
         .input(checkEgressTargetSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.egress.checkTarget(ctx.session, input)),
     }),
+
+    webhooks: router({
+      settings: router({
+        get: adminProcedure.query(({ ctx }) => ctx.services.integrations.webhooks.getSettings(ctx.session)),
+        update: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              enabled: z.boolean().optional(),
+              retentionDays: z.number().int().min(0).max(90).optional(),
+              autoDisableThreshold: z.number().int().min(3).max(50).optional(),
+              deliveryTimeoutMs: z.number().int().min(1_000).max(30_000).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.updateSettings(ctx.session, input)),
+      }),
+
+      catalogue: adminProcedure.query(({ ctx }) => ctx.services.integrations.webhooks.listCatalogueEvents(ctx.session)),
+
+      subscriptions: router({
+        list: adminProcedure
+          .input(
+            z
+              .strictObject({
+                status: z.enum(WEBHOOK_SUBSCRIPTION_STATUSES).optional(),
+                cursor: z.string().max(200).nullish(),
+                limit: z.number().int().min(1).max(100).optional(),
+              })
+              .default({}),
+          )
+          .query(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.listSubscriptions(ctx.session, {
+              status: input.status,
+              cursor: input.cursor ?? undefined,
+              limit: input.limit,
+            }),
+          ),
+        get: adminProcedure
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .query(({ ctx, input }) => ctx.services.integrations.webhooks.getSubscription(ctx.session, input.publicId)),
+        create: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              name: z.string().trim().min(1).max(120),
+              description: z.string().trim().max(280).nullable().optional(),
+              targetUrl: z.string().trim().min(10).max(2048),
+              events: z.array(z.string().trim().min(2).max(120)).min(1).max(200),
+              paused: z.boolean().optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.createSubscription(ctx.session, input)),
+        update: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              name: z.string().trim().min(1).max(120).optional(),
+              description: z.string().trim().max(280).nullable().optional(),
+              targetUrl: z.string().trim().min(10).max(2048).optional(),
+              events: z.array(z.string().trim().min(2).max(120)).min(1).max(200).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.updateSubscription(ctx.session, input)),
+        setPaused: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              paused: z.boolean(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.setSubscriptionPaused(ctx.session, input)),
+        rotateSecret: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              overlapMinutes: z.number().int().min(0).max(1440).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.rotateSubscriptionSecret(ctx.session, input)),
+        testDelivery: webhooksManageProcedure
+          .meta({ rateLimit: "expensive" })
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              eventKey: z.string().trim().min(2).max(120).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.testSubscriptionDelivery(ctx.session, input)),
+        remove: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.deleteSubscription(ctx.session, input)),
+      }),
+
+      inbound: router({
+        list: adminProcedure
+          .input(
+            z
+              .strictObject({
+                enabled: z.boolean().optional(),
+                cursor: z.string().max(200).nullish(),
+                limit: z.number().int().min(1).max(100).optional(),
+              })
+              .default({}),
+          )
+          .query(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.listInboundEndpoints(ctx.session, {
+              enabled: input.enabled,
+              cursor: input.cursor ?? undefined,
+              limit: input.limit,
+            }),
+          ),
+        get: adminProcedure
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .query(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.getInboundEndpoint(ctx.session, input.publicId),
+          ),
+        create: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              name: z.string().trim().min(1).max(120),
+              endpointKey: z.string().trim().min(3).max(64),
+              description: z.string().trim().max(280).nullable().optional(),
+              enabled: z.boolean().optional(),
+              toleranceSeconds: z.number().int().min(30).max(300).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.createInboundEndpoint(ctx.session, input)),
+        update: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              name: z.string().trim().min(1).max(120).optional(),
+              description: z.string().trim().max(280).nullable().optional(),
+              toleranceSeconds: z.number().int().min(30).max(300).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.updateInboundEndpoint(ctx.session, input)),
+        setEnabled: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              enabled: z.boolean(),
+            }),
+          )
+          .mutation(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.setInboundEndpointEnabled(ctx.session, input),
+          ),
+        rotateSecret: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+              overlapMinutes: z.number().int().min(0).max(1440).optional(),
+            }),
+          )
+          .mutation(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.rotateInboundEndpointSecret(ctx.session, input),
+          ),
+        remove: webhooksManageProcedure
+          .input(
+            z.strictObject({
+              publicId: ulidParamSchema,
+              expectedVersion: z.number().int().min(1),
+            }),
+          )
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.deleteInboundEndpoint(ctx.session, input)),
+      }),
+
+      deliveries: router({
+        list: adminProcedure
+          .input(
+            z
+              .strictObject({
+                direction: z.enum(WEBHOOK_DIRECTIONS).optional(),
+                subscriptionPublicId: ulidParamSchema.optional(),
+                inboundEndpointPublicId: ulidParamSchema.optional(),
+                eventKey: z.string().trim().max(120).optional(),
+                status: z.enum(WEBHOOK_DELIVERY_STATUSES).optional(),
+                from: z.date().optional(),
+                to: z.date().optional(),
+                correlationId: z.string().trim().max(64).optional(),
+                search: z.string().trim().max(120).optional(),
+                cursor: z.string().max(200).nullish(),
+                limit: z.number().int().min(1).max(100).optional(),
+              })
+              .default({}),
+          )
+          .query(({ ctx, input }) =>
+            ctx.services.integrations.webhooks.listDeliveries(ctx.session, {
+              ...input,
+              cursor: input.cursor ?? undefined,
+            }),
+          ),
+        get: adminProcedure
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .query(({ ctx, input }) => ctx.services.integrations.webhooks.getDelivery(ctx.session, input.publicId)),
+        redeliver: apiReplayProcedure
+          .meta({ rateLimit: "expensive" })
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.redeliver(ctx.session, input)),
+        reprocessInbound: apiReplayProcedure
+          .meta({ rateLimit: "expensive" })
+          .input(z.strictObject({ publicId: ulidParamSchema }))
+          .mutation(({ ctx, input }) => ctx.services.integrations.webhooks.reprocessInbound(ctx.session, input)),
+      }),
+    }),
   }),
 
   production: router({
@@ -277,6 +519,19 @@ export const integrationsRouter = router({
       requestP201: productionTriggerProcedure
         .input(requestP201Schema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP201(ctx.session, input)),
+      requestP301: productionTriggerProcedure
+        .input(requestLaterPhaseSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP301(ctx.session, input)),
+      requestP401: productionTriggerProcedure
+        .input(requestLaterPhaseSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP401(ctx.session, input)),
+      retry: productionTriggerProcedure
+        .input(retryProductionDispatchSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.retry(ctx.session, input)),
+      redeliver: productionRedeliverProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(redeliverProductionDispatchSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.redeliver(ctx.session, input)),
       resend: productionResendProcedure
         .input(resendProductionSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.resend(ctx.session, input)),

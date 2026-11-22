@@ -2,10 +2,12 @@ import type {
   DashboardWidget,
   FeatureRoutes,
   NavItem,
+  OrderBanner,
   OrderTab,
   RouteDef,
   RouteWrapper,
 } from "@/lib/routes";
+import { acceptanceOrderBanners, acceptanceOrderTabs, acceptanceRoutes } from "./acceptance";
 
 interface ComplianceCustomerModule {
   complianceCustomerRoutes?: RouteDef[];
@@ -35,16 +37,33 @@ const adminMod = Object.values(adminModules)[0];
 export const routes: RouteDef[] = [
   ...(customerMod?.complianceCustomerRoutes ?? []),
   ...(adminMod?.complianceAdminRoutes ?? []),
+  ...acceptanceRoutes,
 ];
 
+function normalizeCustomerNav(items: NavItem[]): NavItem[] {
+  return items.map((item) => {
+    if (item.href === "/invoices") {
+      const { group: _group, ...rest } = item;
+      return { ...rest, order: 40 };
+    }
+    if (item.href === "/policies") {
+      return { ...item, group: "Account", order: 230 };
+    }
+    return item;
+  });
+}
+
 export const nav: NavItem[] = [
-  ...(customerMod?.complianceCustomerNav ?? []),
+  ...normalizeCustomerNav(customerMod?.complianceCustomerNav ?? []),
   ...(adminMod?.complianceAdminNav ?? []),
 ];
 
 export const orderTabs: OrderTab[] = [
   ...(customerMod?.complianceOrderTabs ?? []),
+  ...acceptanceOrderTabs,
 ];
+
+export const orderBanners: OrderBanner[] = [...acceptanceOrderBanners];
 
 export const widgets: DashboardWidget[] = [
   ...(customerMod?.complianceWidgets ?? []),
@@ -58,6 +77,7 @@ export const complianceFeature: FeatureRoutes = {
   routes,
   nav,
   orderTabs,
+  orderBanners,
   widgets,
   routeWrappers,
 };

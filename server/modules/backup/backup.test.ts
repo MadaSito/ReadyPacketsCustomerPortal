@@ -69,7 +69,12 @@ import { z } from "zod";
 import { entriesForEvent } from "../audit/triggerCatalogue.js";
 import { getStaticAutomationRegistrations } from "../automations/contracts.js";
 import { createStorageModule } from "../storage/index.js";
-import { storageAssignments, storageConnections, storageFileCopies } from "../storage/schema.js";
+import {
+  storageAssignments,
+  storageConnections,
+  storageCopyAttempts,
+  storageFileCopies,
+} from "../storage/schema.js";
 import { BACKUP_JOB_REMOTE_COPY, BACKUP_JOB_REMOTE_SWEEP } from "./offsite.js";
 // Side-effect import ensures backup setting definitions are registered in the platform settings registry.
 import "./settings.js";
@@ -96,6 +101,7 @@ const TEST_SCHEMA = {
   auditTombstones,
   storageConnections,
   storageAssignments,
+  storageCopyAttempts,
   storageFileCopies,
   backupArchives,
   backupVerifications,
@@ -1809,16 +1815,53 @@ describe("backup module — encrypted backup, verify, isolated restore, continui
       }).map((e) => e.key),
     ).toContain("backup.policy_unmet");
 
-    // 6. Retry failed Azure destination via `copyOffsiteNow` -> reaches 3 verified copies across 3 systems -> 3-2-1 MET!
+    // 6. Retry failed Azure destination via guarded `expectedFailedJobId` + `mayRetryOffsiteCopy` -> reaches 3 verified copies across 3 systems -> 3-2-1 MET!
+    const [failedAzRow] = await tdb.db
+      .select()
+      .from(backupRemoteCopies)
+      .where(eq(backupRemoteCopies.connectionPublicId, azureConn.publicId));
+    const failedAzJobId = failedAzRow!.jobPublicId!;
+
+    await tdb.db.transaction(async (tx) => {
+      expect(
+        await mod.mayRetryOffsiteCopy(
+          { backupPublicId: createdArchive.publicId, connectionPublicId: azureConn.publicId, jobPublicId: "job_stale_00" },
+          tx,
+        ),
+      ).toBe(false);
+      expect(
+        await mod.mayRetryOffsiteCopy(
+          { backupPublicId: createdArchive.publicId, connectionPublicId: azureConn.publicId, jobPublicId: failedAzJobId },
+          tx,
+        ),
+      ).toBe(true);
+    });
+
+    await expect(
+      mod.copyOffsiteNow(admin, {
+        backupPublicId: createdArchive.publicId,
+        connectionPublicId: azureConn.publicId,
+        expectedFailedJobId: "job_stale_00",
+      }),
+    ).rejects.toMatchObject({ reasonCode: "COPY_RETRY_STALE" });
+
     const retryQueued = await mod.copyOffsiteNow(admin, {
       backupPublicId: createdArchive.publicId,
       connectionPublicId: azureConn.publicId,
+      expectedFailedJobId: failedAzJobId,
     });
     expect(retryQueued.queued).toHaveLength(1);
     expect(retryQueued.queued[0]?.state).toBe("queued");
 
     const [retryResult] = await harness.jobs.runAll(BACKUP_JOB_REMOTE_COPY);
     expect(retryResult?.outcome).toBe("completed");
+
+    const recordedAttempts = await tdb.db
+      .select()
+      .from(storageCopyAttempts)
+      .where(eq(storageCopyAttempts.sourcePublicId, createdArchive.publicId));
+    expect(recordedAttempts.filter((a) => a.state === "verified" && a.verification === "checksum")).toHaveLength(2);
+    expect(recordedAttempts.some((a) => a.state === "failed")).toBe(true);
 
     const afterRetry = await mod.getOffsiteConfig(admin);
     expect(afterRetry.status321.verifiedCopies).toBe(3);

@@ -1,6 +1,6 @@
 /**
- * /admin/integrations/production — Production pipeline (P101 / P201) admin configuration,
- * dry-run egress verification, and filterable dispatch log.
+ * /admin/integrations/production — Production pipeline (P101 / P201 / optional P301 & P401)
+ * admin configuration, dry-run egress verification, and filterable dispatch log.
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
@@ -47,7 +47,7 @@ import {
   type ProductionSettingsView,
 } from "./model";
 
-interface SettingsFormState {
+export interface SettingsFormState {
   enabled: boolean;
   canonVersion: string;
   runMode: string;
@@ -56,6 +56,10 @@ interface SettingsFormState {
   clearP101Url: boolean;
   p201Url: string;
   clearP201Url: boolean;
+  p301Url: string;
+  clearP301Url: boolean;
+  p401Url: string;
+  clearP401Url: boolean;
   authHeaderName: string;
   authHeaderValue: string;
   clearAuthHeaderValue: boolean;
@@ -73,6 +77,10 @@ function toInitialForm(view: ProductionSettingsView): SettingsFormState {
     clearP101Url: false,
     p201Url: "",
     clearP201Url: false,
+    p301Url: "",
+    clearP301Url: false,
+    p401Url: "",
+    clearP401Url: false,
     authHeaderName: view.authHeaderName,
     authHeaderValue: "",
     clearAuthHeaderValue: false,
@@ -95,6 +103,8 @@ export function validateSettingsForm(
   const errors: FormErrors = {};
   const p101Trimmed = form.p101Url.trim();
   const p201Trimmed = form.p201Url.trim();
+  const p301Trimmed = form.p301Url.trim();
+  const p401Trimmed = form.p401Url.trim();
   const canonTrimmed = form.canonVersion.trim();
   const runModeTrimmed = form.runMode.trim();
   const headerNameTrimmed = form.authHeaderName.trim();
@@ -104,6 +114,12 @@ export function validateSettingsForm(
   }
   if (p201Trimmed && !isHttpsUrl(p201Trimmed)) {
     errors.p201Url = "Enter a valid HTTPS webhook URL starting with https://.";
+  }
+  if (p301Trimmed && !isHttpsUrl(p301Trimmed)) {
+    errors.p301Url = "Enter a valid HTTPS webhook URL starting with https://.";
+  }
+  if (p401Trimmed && !isHttpsUrl(p401Trimmed)) {
+    errors.p401Url = "Enter a valid HTTPS webhook URL starting with https://.";
   }
 
   const willHaveP101 = p101Trimmed
@@ -156,6 +172,10 @@ function parseDateEnd(raw: string): Date | undefined {
   if (!raw) return undefined;
   const parsed = new Date(`${raw}T23:59:59.999Z`);
   return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+function shortPublicId(publicId: string): string {
+  return publicId.length > 10 ? `…${publicId.slice(-6)}` : publicId;
 }
 
 export default function ProductionPipelinePage() {
@@ -239,6 +259,16 @@ export default function ProductionPipelinePage() {
       : form.p201Url.trim()
         ? form.p201Url.trim()
         : undefined;
+    const p301Url = form.clearP301Url
+      ? null
+      : form.p301Url.trim()
+        ? form.p301Url.trim()
+        : undefined;
+    const p401Url = form.clearP401Url
+      ? null
+      : form.p401Url.trim()
+        ? form.p401Url.trim()
+        : undefined;
     const authHeaderValue = form.clearAuthHeaderValue
       ? null
       : form.authHeaderValue
@@ -257,6 +287,8 @@ export default function ProductionPipelinePage() {
             authHeaderName: form.authHeaderName.trim(),
             ...(p101Url !== undefined ? { p101Url } : {}),
             ...(p201Url !== undefined ? { p201Url } : {}),
+            ...(p301Url !== undefined ? { p301Url } : {}),
+            ...(p401Url !== undefined ? { p401Url } : {}),
             ...(authHeaderValue !== undefined ? { authHeaderValue } : {}),
           }),
         { reason: "Changing production pipeline settings requires verification." },
@@ -330,15 +362,15 @@ export default function ProductionPipelinePage() {
           </div>
         }
         title="Production pipeline"
-        description="Manual Phase I (P101) and Phase II (P201) webhook triggers. Webhook URLs and authorization headers are encrypted at rest, checked against the outbound allowlist, and never echoed."
+        description="Manual Phase I (P101), Phase II (P201), and optional Phase III (P301) / Phase IV (P401) webhook triggers. Webhook URLs and authorization headers are encrypted at rest, checked against the outbound allowlist, and never echoed."
         meta={stateMeta ? <Badge tone={stateMeta.tone}>{stateMeta.label}</Badge> : undefined}
       />
 
       <div className="flex min-w-0 flex-col gap-6">
         <Callout tone="info" title="What delivery status confirms">
           A delivered dispatch confirms HTTP acceptance by the configured webhook endpoint. The
-          portal receives no inbound callback from the pipeline and cannot verify downstream Phase I
-          or Phase II artifact completion.
+          portal receives no inbound callback from the pipeline and cannot verify downstream
+          artifact completion.
         </Callout>
 
         {settings.isError ? (
@@ -373,7 +405,7 @@ export default function ProductionPipelinePage() {
 
                 <Switch
                   label="Enable production pipeline webhooks"
-                  description="Off by default until both HTTPS webhook URLs and a canon version are configured."
+                  description="Off by default until Phase I (P101), Phase II (P201), and a canon version are configured. Phase III and Phase IV are optional."
                   checked={form.enabled}
                   onCheckedChange={(checked) => updateForm("enabled", checked)}
                 />
@@ -414,7 +446,7 @@ export default function ProductionPipelinePage() {
 
                 <Field
                   label="Run mode"
-                  hint="Sent as run_mode in P101 and locked into P201 for the same order."
+                  hint="Sent as run_mode in P101 and locked into P201, P301, and P401 for the same order."
                   error={errors.runMode}
                   required
                 >
@@ -472,6 +504,54 @@ export default function ProductionPipelinePage() {
                     label="Remove saved Phase II (P201) webhook URL"
                     checked={form.clearP201Url}
                     onCheckedChange={(checked) => updateForm("clearP201Url", checked)}
+                  />
+                ) : null}
+
+                <Field
+                  label="Phase III (P301) webhook URL (optional)"
+                  hint={`Saved endpoint: ${formatMaskedUrl(data.p301UrlMask)}. When configured, shows "Start Phase III" on the order Automation tab.`}
+                  error={errors.p301Url}
+                >
+                  <Input
+                    type="url"
+                    value={form.p301Url}
+                    onChange={(e) => updateForm("p301Url", e.target.value)}
+                    placeholder="https://…"
+                    maxLength={2048}
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={form.clearP301Url}
+                  />
+                </Field>
+                {data.p301UrlConfigured ? (
+                  <Checkbox
+                    label="Remove saved Phase III (P301) webhook URL"
+                    checked={form.clearP301Url}
+                    onCheckedChange={(checked) => updateForm("clearP301Url", checked)}
+                  />
+                ) : null}
+
+                <Field
+                  label="Phase IV (P401) webhook URL (optional)"
+                  hint={`Saved endpoint: ${formatMaskedUrl(data.p401UrlMask)}. When configured, shows "Start Phase IV" on the order Automation tab.`}
+                  error={errors.p401Url}
+                >
+                  <Input
+                    type="url"
+                    value={form.p401Url}
+                    onChange={(e) => updateForm("p401Url", e.target.value)}
+                    placeholder="https://…"
+                    maxLength={2048}
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={form.clearP401Url}
+                  />
+                </Field>
+                {data.p401UrlConfigured ? (
+                  <Checkbox
+                    label="Remove saved Phase IV (P401) webhook URL"
+                    checked={form.clearP401Url}
+                    onCheckedChange={(checked) => updateForm("clearP401Url", checked)}
                   />
                 ) : null}
 
@@ -568,6 +648,26 @@ export default function ProductionPipelinePage() {
                   Test Phase II (P201) destination
                 </Button>
 
+                <Button
+                  variant="secondary"
+                  block
+                  disabled={!data.p301UrlConfigured}
+                  loading={testingPhase === "P301"}
+                  onClick={() => void onTestDestination("P301")}
+                >
+                  Test Phase III (P301) destination
+                </Button>
+
+                <Button
+                  variant="secondary"
+                  block
+                  disabled={!data.p401UrlConfigured}
+                  loading={testingPhase === "P401"}
+                  onClick={() => void onTestDestination("P401")}
+                >
+                  Test Phase IV (P401) destination
+                </Button>
+
                 <Button asChild variant="ghost" size="sm">
                   <Link href="/admin/integrations/egress">Review outbound allowlist</Link>
                 </Button>
@@ -611,7 +711,7 @@ export default function ProductionPipelinePage() {
 
         <Section
           title="Production dispatches"
-          description="Every manual Phase I (P101) and Phase II (P201) webhook dispatch across orders."
+          description="Every manual Phase I (P101), Phase II (P201), Phase III (P301), and Phase IV (P401) webhook dispatch across orders."
         >
           <div className="space-y-4">
             <FilterBar
@@ -630,6 +730,8 @@ export default function ProductionPipelinePage() {
                     { value: "", label: "All phases" },
                     { value: "P101", label: PHASE_LABELS.P101 },
                     { value: "P201", label: PHASE_LABELS.P201 },
+                    { value: "P301", label: PHASE_LABELS.P301 },
+                    { value: "P401", label: PHASE_LABELS.P401 },
                   ]}
                 />
               </Field>
@@ -676,7 +778,7 @@ export default function ProductionPipelinePage() {
               empty={
                 <EmptyState
                   title="No production dispatches recorded"
-                  description="Manual Phase I (P101) and Phase II (P201) triggers started from an order's Production tab appear here."
+                  description="Manual pipeline triggers started from an order's Automation tab appear here."
                   headingLevel={3}
                 />
               }
@@ -688,7 +790,7 @@ export default function ProductionPipelinePage() {
                   cell: (row) => (
                     <div>
                       <Button asChild variant="link">
-                        <Link href={`/admin/orders/${row.orderPublicId}/production`}>
+                        <Link href={`/admin/orders/${row.orderPublicId}/automation`}>
                           {row.orderReference}
                         </Link>
                       </Button>
@@ -702,11 +804,23 @@ export default function ProductionPipelinePage() {
                   key: "phase",
                   header: "Phase",
                   cell: (row) => (
-                    <div>
+                    <div className="flex flex-col gap-1">
                       <span className="font-medium text-ink">{PHASE_LABELS[row.phase]}</span>
                       {row.packet && row.tier ? (
                         <div className="text-xs text-muted">
                           Packet {row.packet} · {row.tier}
+                        </div>
+                      ) : null}
+                      {row.redeliveryOf ? (
+                        <div>
+                          <Badge tone="info">
+                            Redelivery of {shortPublicId(row.redeliveryOf)}
+                          </Badge>
+                        </div>
+                      ) : null}
+                      {row.retryOf ? (
+                        <div>
+                          <Badge tone="neutral">Retry of {shortPublicId(row.retryOf)}</Badge>
                         </div>
                       ) : null}
                     </div>

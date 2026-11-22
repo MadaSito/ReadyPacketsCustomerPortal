@@ -10,8 +10,8 @@ import type { MeUser } from "@/lib/authApi";
 import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
-import { GlobalSearchSlot, NotificationSlot } from "../slots";
-import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, NotificationSlot } from "../slots";
+import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
   const groups = new Map<string, NavItem[]>();
@@ -23,7 +23,7 @@ function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> 
 }
 
 function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof groupNav>; collapsed?: boolean; onNavigate?: () => void }) {
-  const active = useActive();
+  const active = useCurrentNav(groups.flatMap((g) => g.items));
   return (
     <nav aria-label="Console" className="flex flex-col gap-5">
       {groups.map(({ group, items }) => (
@@ -58,68 +58,74 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
 }
 
 export function ConsoleShell({ user, children }: { user: MeUser; children: ReactNode }) {
-  const groups = groupNav(visibleNav(ALL_NAV, "console", user.role).filter((item) => navPlacement(item) !== "hidden"));
+  const groups = groupNav(useEnabledNav(visibleNav(ALL_NAV, "console", user.role)).filter((item) => navPlacement(item) !== "hidden"));
   const [collapsed, setCollapsed] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   return (
-    <div className="flex min-h-dvh bg-surface-soft">
+    <div className="flex min-h-dvh flex-col bg-surface-soft">
+      {/* The consent banner sits above the sidebar row, never as a flex sibling that squeezes the content column. */}
+      <CookieConsentSlot />
       <SkipLink />
-      {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
-      <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
-        <div className={cn("flex h-16 items-center px-4", collapsed && "justify-center px-2")}>
-          <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex rounded">
-            {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
-          </Link>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
-          <SideNav groups={groups} collapsed={collapsed} />
-        </div>
-        <div className="border-t border-navy-border p-3">
-          <button
-            type="button"
-            onClick={() => setCollapsed((c) => !c)}
-            aria-expanded={!collapsed}
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            className={cn("flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm text-on-navy-muted hover:bg-navy-elevated hover:text-on-navy", collapsed && "justify-center px-0")}
-          >
-            {collapsed ? <ChevronsRight aria-hidden="true" className="size-5" /> : <ChevronsLeft aria-hidden="true" className="size-5" />}
-            {collapsed ? null : "Collapse"}
-          </button>
-        </div>
-      </aside>
-
-      <div className="flex min-w-0 flex-1 flex-col">
-        <PreviewBanner />
-        <MaintenanceBanner />
-        <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
-          <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
-            <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
-            <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded lg:hidden">
-              <BrandLogo variant="icon" label="" className="h-9" />
+      <div className="flex min-h-0 flex-1">
+        {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
+        <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
+          <div className={cn("flex h-16 items-center px-4", collapsed && "justify-center px-2")}>
+            <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex rounded">
+              {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
             </Link>
-            {/* Inline search from md up (min width keeps the placeholder whole); a single icon link below md. */}
-            <div className="hidden min-w-[20rem] flex-1 px-1 md:block md:max-w-md" data-testid="console-search-inline">
-              <GlobalSearchSlot className="flex w-full items-center gap-2 [&>*:first-child]:min-w-0 [&>*:first-child]:flex-1" />
-            </div>
-            <Link
-              href="/admin/search"
-              aria-label="Search"
-              className="inline-flex size-11 shrink-0 items-center justify-center rounded-[var(--radius-control)] text-body hover:bg-surface-sunken hover:text-ink md:hidden"
-            >
-              <Search aria-hidden="true" className="size-5" />
-            </Link>
-            <div className="ml-auto flex shrink-0 items-center gap-1">
-              <NotificationSlot area="console" />
-              <ThemeToggle />
-              <AccountMenu user={user} area="console" />
-            </div>
           </div>
-        </header>
-        <main id="main" tabIndex={-1} className="w-full max-w-[100rem] min-w-0 flex-1 px-4 py-6 outline-none sm:px-6 lg:px-8 lg:py-8">
-          {children}
-        </main>
-        <Footer />
+          <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+            <SideNav groups={groups} collapsed={collapsed} />
+          </div>
+          <div className="border-t border-navy-border p-3">
+            <button
+              type="button"
+              onClick={() => setCollapsed((c) => !c)}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              className={cn("flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm text-on-navy-muted hover:bg-navy-elevated hover:text-on-navy", collapsed && "justify-center px-0")}
+            >
+              {collapsed ? <ChevronsRight aria-hidden="true" className="size-5" /> : <ChevronsLeft aria-hidden="true" className="size-5" />}
+              {collapsed ? null : "Collapse"}
+            </button>
+          </div>
+        </aside>
+
+        <div className="flex min-w-0 flex-1 flex-col">
+          <PreviewBanner />
+          <MaintenanceBanner />
+          <CustomerMaintenanceSlot />
+          <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
+            <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
+              <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
+              {/* Below 300 px the header logo yields its space so the actions fit (the menu still links home). */}
+              <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded max-[299px]:hidden lg:hidden">
+                <BrandLogo variant="icon" label="" className="h-9" />
+              </Link>
+              {/* Inline search from md up (min width keeps the placeholder whole); a single icon link below md. */}
+              <div className="hidden min-w-[20rem] flex-1 px-1 md:block md:max-w-md" data-testid="console-search-inline">
+                <GlobalSearchSlot className="flex w-full items-center gap-2 [&>*:first-child]:min-w-0 [&>*:first-child]:flex-1" />
+              </div>
+              <Link
+                href="/admin/search"
+                aria-label="Search"
+                className="inline-flex size-11 shrink-0 items-center justify-center rounded-[var(--radius-control)] text-body hover:bg-surface-sunken hover:text-ink md:hidden"
+              >
+                <Search aria-hidden="true" className="size-5" />
+              </Link>
+              <div className="ml-auto flex shrink-0 items-center gap-1">
+                <NotificationSlot area="console" />
+                <ThemeToggle />
+                <AccountMenu user={user} area="console" />
+              </div>
+            </div>
+          </header>
+          <main id="main" tabIndex={-1} className="w-full max-w-[100rem] min-w-0 flex-1 px-4 py-6 outline-none sm:px-6 lg:px-8 lg:py-8">
+            {children}
+          </main>
+          <Footer />
+        </div>
       </div>
 
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">

@@ -40,7 +40,7 @@ export interface TriggerCatalogueEntry {
   label: string;
   description: string;
   group: "Accounts" | "Orders" | "Files and messages" | "Support" | "Billing" | "Operations";
-  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup";
+  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup" | "integrations" | "community" | "payments" | "referrals" | "knowledge";
   eventName: string;
   outcomes: readonly AuditTapEvent["outcome"][];
   match?: Readonly<Record<string, string | boolean>>;
@@ -169,6 +169,22 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     recipients: [person("ticket_requester", "Ticket requester"), person("ticket_assignee", "Assigned staff member"), ACTOR],
   },
   {
+    key: "community.topic_created", label: "Community topic started", group: "Support", owner: "community", staffOnly: true,
+    description: "A member started a community topic (published or held for review). Fires only while the forum is switched on.",
+    eventName: "community.topic.created", outcomes: ["completed"], resourceType: "community_topic",
+    fields: [actorRole, f("post_state", "Opening post state", "enum", "event", { enumValues: ["published", "pending"] }),
+      f("held_reason", "Held for review because", "string"), f("topic_link", "Link to the topic", "string", "context")],
+    recipients: [STAFF, ADMINS],
+  },
+  {
+    key: "community.post_reported", label: "Community post reported", group: "Support", owner: "community", staffOnly: true,
+    description: "A member reported a community post. Hidden automatically when the report threshold is reached.",
+    eventName: "community.post.reported", outcomes: ["completed"], resourceType: "community_post",
+    fields: [f("report_reason", "Report reason", "enum", "event", { enumValues: ["spam", "abuse", "off_topic", "personal_info", "other"] }),
+      f("auto_hidden", "Hidden automatically", "boolean"), f("queue_link", "Link to the moderation queue", "string", "context")],
+    recipients: [STAFF, ADMINS],
+  },
+  {
     key: "invoice.issued", label: "Invoice issued", group: "Billing", owner: "compliance",
     description: "An invoice was issued to a customer.",
     eventName: "invoice.issued", outcomes: ["completed"], resourceType: "invoice",
@@ -191,6 +207,13 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     description: "An administrator switched maintenance mode on (background work pauses).",
     eventName: "job.maintenance.changed", outcomes: ["completed"], match: { reason_code: "MAINTENANCE_ENABLED" }, resourceType: "job_maintenance",
     fields: [], recipients: [ACTOR, ADMINS, STAFF],
+  },
+  {
+    key: "customer_maintenance.configured", label: "Customer maintenance scheduled or changed", group: "Operations", owner: "jobs",
+    description: "An administrator switched customer maintenance on, scheduled it or changed its window. Fires when the setting changes, not when the window starts.",
+    eventName: "job.customer_maintenance.changed", outcomes: ["completed"], match: { reason_code: "CUSTOMER_MAINTENANCE_CONFIGURED" }, resourceType: "customer_maintenance",
+    fields: [f("starts_at", "Starts", "datetime"), f("ends_at", "Expected end", "datetime"), f("enabled", "Switched on", "boolean")],
+    recipients: [ACTOR, ADMINS, STAFF],
   },
   {
     key: "backup.completed", label: "Backup completed", group: "Operations", owner: "backup",

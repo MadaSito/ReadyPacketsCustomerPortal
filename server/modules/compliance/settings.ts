@@ -44,3 +44,15 @@ export const INVOICE_PAYMENT_INSTRUCTIONS = defineSetting({
   default: "Contact ReadyPackets billing support through your order workspace for wire or ACH remittance instructions.",
   sensitivity: "internal",
 });
+
+export const INVOICE_DEFAULT_TAX_RATE_BPS = defineSetting({
+  key: "compliance.invoices.default_tax_rate_bps",
+  owner: "compliance",
+  group: "compliance",
+  label: "Default checkout tax rate (basis points)",
+  description: "Default integer tax rate in basis points (100 bps = 1.00%, 0 = tax-exempt) applied at checkout.",
+  schema: z.number().int().min(0).max(5000),
+  default: 0,
+  sensitivity: "internal",
+});
+

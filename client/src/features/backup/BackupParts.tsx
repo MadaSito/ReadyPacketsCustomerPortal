@@ -76,17 +76,19 @@ export function OffHostBadge({
 export function KeyCustodyNotice({ keyConfigured, warning }: { keyConfigured: boolean; warning: string | null }) {
   return (
     <Section title="Encryption key custody" description="Every backup is encrypted. The backup key is never shown in this console and cannot be downloaded from it.">
-      <div className="space-y-3">
+      <div className="min-w-0 space-y-3">
         {!keyConfigured ? (
           <Callout tone="danger" title="No backup key configured">
-            Backups are refused until an encryption key is configured on the host (RP_BACKUP_KEY_FILE, a 0600 file readable only by the service).
-            There is no unencrypted mode.
+            <span className="break-words [overflow-wrap:anywhere]">
+              Backups are refused until an encryption key is configured on the host (RP_BACKUP_KEY_FILE, a 0600 file readable only by the service).
+              There is no unencrypted mode.
+            </span>
           </Callout>
         ) : null}
-        {warning ? <Callout tone="warning" title="Key custody warning">{warning}</Callout> : null}
+        {warning ? <Callout tone="warning" title="Key custody warning"><span className="break-words [overflow-wrap:anywhere]">{warning}</span></Callout> : null}
         <Callout tone="info" title="Where the key must be kept">
-          <p className="mb-2">Keep a copy of the backup key outside this server — for example in an offline password vault or a sealed escrow envelope held by two named custodians.</p>
-          <p>A backup cannot be restored without the key that encrypted it. If the server is lost together with its only key copy, every backup is unrecoverable. See the key runbook in scripts/ops/keys/RUNBOOK.md.</p>
+          <p className="mb-2 break-words [overflow-wrap:anywhere]">Keep a copy of the backup key outside this server — for example in an offline password vault or a sealed escrow envelope held by two named custodians.</p>
+          <p className="break-words [overflow-wrap:anywhere]">A backup cannot be restored without the key that encrypted it. If the server is lost together with its only key copy, every backup is unrecoverable. See the key runbook in scripts/ops/keys/RUNBOOK.md.</p>
         </Callout>
       </div>
     </Section>

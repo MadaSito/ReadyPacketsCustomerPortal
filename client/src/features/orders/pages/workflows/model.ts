@@ -4,6 +4,7 @@
  */
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
+import { DEFAULT_ORDER_FILE_FOLDER_TEMPLATE, isOrderFileFolderTemplate, resolveOrderFileFolder, type OrderFileFolderToken } from "@shared/orderFileFolder";
 
 type Out = inferRouterOutputs<AppRouter>["orders"]["admin"]["workflows"];
 export type WorkflowListRow = Out["list"][number];
@@ -21,6 +22,7 @@ export const ACTORS = [
   { value: "customer", label: "Customer" },
   { value: "staff", label: "Staff" },
   { value: "admin", label: "Administrator" },
+  { value: "api", label: "API integration" },
 ] as const;
 export type Actor = (typeof ACTORS)[number]["value"];
 export const ACTOR_LABEL: Record<string, string> = Object.fromEntries(ACTORS.map((actor) => [actor.value, actor.label]));
@@ -44,6 +46,7 @@ export const WIZARD_STEPS = [
   { id: "transitions", label: "Transitions" },
   { id: "who", label: "Who may move" },
   { id: "notices", label: "Notices and notes" },
+  { id: "rules", label: "Phases and requirements" },
   { id: "review", label: "Review and publish" },
 ] as const;
 export type WizardStepId = (typeof WIZARD_STEPS)[number]["id"];
@@ -75,6 +78,37 @@ const STEP_OF_CODE: Record<string, WizardStepId> = {
   TRANSITION_ACTOR_DUPLICATE: "who",
   TRANSITION_ACTION_LABEL_EMPTY: "notices",
   NO_CUSTOMER_NOTICE: "notices",
+  PHASE_KEY_REQUIRED: "rules",
+  PHASE_KEY_FORMAT: "rules",
+  PHASE_KEY_DUPLICATE: "rules",
+  PHASE_LABEL_REQUIRED: "rules",
+  STATE_PHASE_UNKNOWN: "rules",
+  STATE_PHASE_MISSING: "rules",
+  PHASE_UNUSED: "rules",
+  UPLOAD_KEY_FORMAT: "rules",
+  UPLOAD_KEY_DUPLICATE: "rules",
+  UPLOAD_LABEL_REQUIRED: "rules",
+  UPLOAD_MAX_TOO_LOW: "rules",
+  UPLOAD_MIN_ABOVE_MAX: "rules",
+  UPLOAD_NOBODY: "rules",
+  UPLOAD_ACTOR_DUPLICATE: "rules",
+  UPLOAD_TYPE_FORMAT: "rules",
+  UPLOAD_TYPE_DUPLICATE: "rules",
+  UPLOAD_HINT_MARKUP: "rules",
+  ACK_KEY_FORMAT: "rules",
+  ACK_KEY_DUPLICATE: "rules",
+  ACK_TITLE_REQUIRED: "rules",
+  ACK_BODY_REQUIRED: "rules",
+  ACK_MARKUP: "rules",
+  TERMINAL_REQUIREMENTS: "rules",
+  UPLOAD_FOLDER_INVALID: "rules",
+  WORKFLOW_FOLDER_INVALID: "rules",
+  GATE_KEY_FORMAT: "rules",
+  GATE_KEY_DUPLICATE: "rules",
+  GATE_POLICY_REQUIRED: "rules",
+  GATE_STEP_REQUIRED: "rules",
+  GATE_STEP_UNKNOWN: "rules",
+  GATE_STEP_TERMINAL: "rules",
 };
 export const stepOfIssue = (issue: WorkflowIssue): WizardStepId => STEP_OF_CODE[issue.code] ?? "review";
 export const errorsOf = (issues: readonly WorkflowIssue[]) => issues.filter((issue) => issue.severity === "error");
@@ -118,7 +152,7 @@ export function updateState(definition: DraftDefinition, layout: Layout, index: 
     transitions = transitions.map((t) => ({ ...t, from: t.from === before.key ? after.key : t.from, to: t.to === before.key ? after.key : t.to }));
     nodes = nodes.map((node) => (node.key === before.key ? { ...node, key: after.key } : node));
   }
-  return { definition: { states, transitions }, layout: { nodes } };
+  return { definition: { ...definition, states, transitions }, layout: { nodes } };
 }
 
 export function addState(definition: DraftDefinition, layout: Layout, label = "New status"): { definition: DraftDefinition; layout: Layout; index: number } {
@@ -138,7 +172,7 @@ export function removeState(definition: DraftDefinition, layout: Layout, index: 
   const states = definition.states.filter((_, i) => i !== index);
   const stillUsed = states.some((state) => state.key === removed.key);
   return {
-    definition: { states, transitions: stillUsed ? definition.transitions : definition.transitions.filter((t) => t.from !== removed.key && t.to !== removed.key) },
+    definition: { ...definition, states, transitions: stillUsed ? definition.transitions : definition.transitions.filter((t) => t.from !== removed.key && t.to !== removed.key) },
     layout: { nodes: stillUsed ? layout.nodes : layout.nodes.filter((node) => node.key !== removed.key) },
   };
 }
@@ -167,6 +201,75 @@ export function toggleActor(list: readonly string[], actor: Actor, on: boolean):
   return ACTORS.map((a) => a.value).filter((value) => set.has(value));
 }
 
+/* ------------------------------------------------------------------ phases and requirements (increment 04) */
+
+export type DraftPhase = NonNullable<DraftDefinition["phases"]>[number];
+export type DraftRequirements = NonNullable<DraftState["requirements"]>;
+export type DraftUpload = DraftRequirements["uploads"][number];
+export type DraftAcknowledgement = DraftRequirements["acknowledgements"][number];
+export const UPLOAD_KIND_OPTIONS = [
+  { value: "document", label: "Document" },
+  { value: "audio", label: "Audio" },
+];
+export const ACK_SIDE_OPTIONS = [
+  { value: "customer", label: "The customer" },
+  { value: "staff", label: "Our staff" },
+];
+
+export function addPhase(definition: DraftDefinition): DraftDefinition {
+  const phases = definition.phases ?? [];
+  const key = keyFromLabel(`Phase ${phases.length + 1}`, new Set(phases.map((phase) => phase.key)));
+  return { ...definition, phases: [...phases, { key, label: `Phase ${phases.length + 1}` }] };
+}
+export function updatePhase(definition: DraftDefinition, index: number, patch: Partial<DraftPhase>): DraftDefinition {
+  const phases = definition.phases ?? [];
+  const before = phases[index];
+  if (!before) return definition;
+  const after = { ...before, ...patch };
+  const renamed = patch.key !== undefined && patch.key !== before.key;
+  return {
+    ...definition,
+    phases: phases.map((phase, i) => (i === index ? after : phase)),
+    // Renaming a phase key carries the statuses that belong to it.
+    states: renamed ? definition.states.map((state) => (state.phase === before.key ? { ...state, phase: after.key } : state)) : definition.states,
+  };
+}
+export function removePhase(definition: DraftDefinition, index: number): DraftDefinition {
+  const phases = definition.phases ?? [];
+  const removed = phases[index];
+  if (!removed) return definition;
+  const rest = phases.filter((_, i) => i !== index);
+  return {
+    ...definition,
+    phases: rest,
+    states: definition.states.map((state) => {
+      if (state.phase !== removed.key || rest.some((phase) => phase.key === removed.key)) return state;
+      const { phase: _phase, ...without } = state;
+      return without;
+    }),
+  };
+}
+
+const requirementsOf = (state: DraftState): DraftRequirements => state.requirements ?? { uploads: [], acknowledgements: [] };
+/** Patch for a state's requirements (drops the object when both lists are empty). */
+export function withRequirements(state: DraftState, next: (current: DraftRequirements) => DraftRequirements): Partial<DraftState> {
+  const requirements = next(requirementsOf(state));
+  return { requirements: requirements.uploads.length || requirements.acknowledgements.length ? requirements : undefined };
+}
+export function newUpload(state: DraftState): DraftUpload {
+  const taken = new Set(requirementsOf(state).uploads.map((upload) => upload.key));
+  return { key: keyFromLabel("documents", taken), label: "Documents", kind: "document", minCount: 1, maxCount: 5, allowedTypes: ["pdf"], uploadedBy: ["customer"] };
+}
+export function newAcknowledgement(state: DraftState): DraftAcknowledgement {
+  const taken = new Set(requirementsOf(state).acknowledgements.map((ack) => ack.key));
+  return { key: keyFromLabel("terms", taken), title: "", body: "", acceptedBy: "customer", requireTypedName: false };
+}
+export const parseTypes = (text: string): string[] =>
+  text
+    .split(/[\s,]+/)
+    .map((part) => part.trim().toLowerCase().replace(/^\./, ""))
+    .filter(Boolean);
+
 /* ------------------------------------------------------------------ canvas */
 
 // Steps are 208 px wide; the spacing leaves room for a transition label between neighbours.
@@ -188,3 +291,51 @@ export function setPosition(layout: Layout, key: string, x: number, y: number): 
 export const nodeId = (index: number) => `s${index}`;
 export const edgeId = (index: number) => `t${index}`;
 export const indexOfId = (id: string) => Number(id.slice(1));
+
+/* ------------------------------------------------------------------ part B: acceptance gates + storage folders */
+
+export type DraftGate = NonNullable<DraftDefinition["acceptanceGates"]>[number];
+export const MAX_GATES = 10;
+export const SIGNATURE_MODE_OPTIONS = [
+  { value: "checkbox", label: "Tick a box" },
+  { value: "typed_name", label: "Type their full name" },
+] as const;
+
+export function newGate(definition: DraftDefinition): DraftGate {
+  const taken = new Set((definition.acceptanceGates ?? []).map((gate) => gate.key));
+  return { key: keyFromLabel("terms", taken), policyPublicId: "", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true };
+}
+export function updateGate(definition: DraftDefinition, index: number, patch: Partial<DraftGate>): DraftDefinition {
+  return { ...definition, acceptanceGates: (definition.acceptanceGates ?? []).map((gate, i) => (i === index ? { ...gate, ...patch } : gate)) };
+}
+export function removeGate(definition: DraftDefinition, index: number): DraftDefinition {
+  const next = (definition.acceptanceGates ?? []).filter((_, i) => i !== index);
+  return { ...definition, acceptanceGates: next.length ? next : undefined };
+}
+/** Select value for a gate point: "order_start" or "step:<key>". */
+export const gatePointValue = (point: DraftGate["point"]) => (point === "order_start" ? "order_start" : `step:${point.stepKey}`);
+export const gatePointFrom = (value: string): DraftGate["point"] => (value.startsWith("step:") ? { stepKey: value.slice(5) } : "order_start");
+
+/** Synthetic values for the live example path (never real customer data). */
+export const FOLDER_EXAMPLE_VALUES: Record<OrderFileFolderToken, string> = {
+  customer_ref: "RPCUS-A1B2C3D4E",
+  order_ref: "RP-2026-000123",
+  order_name: "Example project",
+  phase: "Intake",
+  slot: "Signed contract",
+  yyyy: "2026",
+  mm: "11",
+};
+/**
+ * Example path for a folder template with the precedence the copy worker uses (slot → workflow → default).
+ * Returns null when the effective template is not valid (the server reports the error on save).
+ */
+export function folderExample(templates: (string | undefined)[], values: Partial<Record<OrderFileFolderToken, string>> = {}): string | null {
+  const template = templates.map((value) => value?.trim()).find((value) => value) ?? DEFAULT_ORDER_FILE_FOLDER_TEMPLATE;
+  if (!isOrderFileFolderTemplate(template)) return null;
+  try {
+    return resolveOrderFileFolder(template, { ...FOLDER_EXAMPLE_VALUES, ...values }).join("/");
+  } catch {
+    return null;
+  }
+}

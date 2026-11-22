@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useSearch } from "wouter";
 import { useAuthApi } from "@/lib/authApi";
 import { errorMessage, safeError } from "@/lib/trpc";
-import { SsoSignInSlot } from "@/app/slots";
+import { CustomerMaintenanceSlot, SsoSignInSlot } from "@/app/slots";
 import { Button, Callout, Field, Input } from "@/ui";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, useFocusOnError } from "../components/bits";
@@ -34,9 +34,10 @@ export default function SignInPage() {
       setPassword("");
       await proceed(result.nextStep);
     } catch (err) {
-      const code = safeError(err)?.domainCode;
+      const safe = safeError(err);
+      const code = safe?.domainCode;
       // Uniform, non-enumerating message for credential failures; pass through rate-limit/maintenance messages.
-      setError(code === "RATE_LIMITED" || code === "MAINTENANCE" || code === "UNAVAILABLE" ? errorMessage(err) : SIGN_IN_FAILED);
+      setError(code === "RATE_LIMITED" || code === "MAINTENANCE" || safe?.reasonCode === "CUSTOMER_MAINTENANCE" || code === "UNAVAILABLE" ? errorMessage(err) : SIGN_IN_FAILED);
     } finally {
       setBusy(false);
     }
@@ -61,6 +62,7 @@ export default function SignInPage() {
           You were signed out after a period of inactivity.
         </Callout>
       ) : null}
+      <CustomerMaintenanceSlot />
       <FormError message={error} focusRef={errorRef} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
         <Field label="Email">

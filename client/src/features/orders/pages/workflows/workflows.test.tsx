@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
+import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminWorkflowsPage from "../AdminWorkflowsPage";
 import WorkflowDesignerPage from "./WorkflowDesignerPage";
@@ -86,9 +87,14 @@ afterAll(() => {
   if (original.h) Object.defineProperty(HTMLElement.prototype, "offsetHeight", original.h);
 });
 
+const POLICY_A = "01JTESTPOL0000000000000000";
+// Shape of compliance.policies.listPublished (only currently published customer-audience policies are returned).
+const policyDocs = [{ documentPublicId: POLICY_A, slug: "order-terms", title: "Synthetic order terms", audience: "customer", requiresAcceptance: true, versionNumber: 1 }];
+
 beforeEach(() => {
   handlers.clear();
   calls.length = 0;
+  handlers.set("compliance.policies.listPublished", () => policyDocs);
 });
 
 const designer = () => renderUi(<Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route>, { path: `/admin/workflows/drafts/${DRAFT}` });
@@ -190,6 +196,16 @@ describe("workflow designer", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Notices and notes" })).toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: /Require a note/ }));
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    // Increment 04: phases and requirements step (optional; edits here are undone so the publish payload is unchanged).
+    expect(await screen.findByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add phase" }));
+    expect(screen.getByLabelText(/Phase 1 name/)).toHaveValue("Phase 1");
+    await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
+    expect(screen.getAllByLabelText(/Upload name/)[0]).toHaveValue("Documents");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getAllByRole("button", { name: /^Remove upload / })[0]!);
+    await user.click(screen.getByRole("button", { name: /^Remove phase / }));
+    await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(await screen.findByRole("heading", { level: 2, name: "Review and publish" })).toBeInTheDocument();
     expect(screen.getByText("The draft has no problems and is ready to publish.")).toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: /Use for new orders/ }));
@@ -246,6 +262,146 @@ describe("workflow designer", () => {
     expect(await screen.findByRole("heading", { level: 2, name: "Transitions" })).toBeInTheDocument();
     expect(screen.getByText("Transition 1: Submitted to Completed")).toBeInTheDocument();
   });
+});
+
+describe("workflow designer — acceptance gates and storage folders (part B)", () => {
+  it("edits a gate (policy, point, signature, ask again) and folders with a live example path; server issues show at the field", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
+    let saves = 0;
+    handlers.set("orders.admin.workflows.drafts.save", (input) => {
+      saves += 1;
+      const gates = (input as { definition: { acceptanceGates?: { policyPublicId: string }[] } }).definition.acceptanceGates ?? [];
+      const issues = gates.some((gate) => !gate.policyPublicId)
+        ? [{ severity: "error", code: "GATE_POLICY_REQUIRED", path: "acceptanceGates.0.policyPublicId", message: "Acceptance gate 1: choose a policy from the policy centre." }]
+        : [];
+      return { rowVersion: 1 + saves, issues, publishable: issues.length === 0 };
+    });
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    const { container } = designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements"]) {
+      await user.click(screen.getByRole("button", { name: "Save and continue" }));
+      expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
+    }
+    const gates = screen.getByRole("group", { name: "Acceptance gates" });
+    expect(within(gates).getByText("No gates.")).toBeInTheDocument();
+    await user.click(within(gates).getByRole("button", { name: "Add acceptance gate" }));
+    const policy = within(gates).getByLabelText(/Gate 1 policy/);
+    await waitFor(() => expect(within(policy).getByRole("option", { name: "Synthetic order terms" })).toBeInTheDocument());
+    // Options come from the public published list, without the admin policy list (no step-up for designers).
+    expect(calls.some((call) => call.path === "compliance.policies.admin.listDocuments")).toBe(false);
+    const applies = within(gates).getByLabelText(/Gate 1 applies/);
+    // Final statuses cannot be gated (nothing is submitted from them).
+    expect(within(applies).getAllByRole("option").map((o) => o.textContent)).toEqual(["Before any work on the order", "Before submitting from “Submitted”"]);
+
+    // Saving without a policy: the server's message appears at the field and the step is blocked.
+    await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    expect(await screen.findAllByText("Acceptance gate 1: choose a policy from the policy centre.")).not.toHaveLength(0);
+    expect(screen.getByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+
+    await user.selectOptions(policy, POLICY_A);
+    await user.selectOptions(applies, "step:submitted");
+    await user.selectOptions(within(gates).getByLabelText(/Gate 1 signature/), "typed_name");
+    await user.click(within(gates).getByRole("checkbox", { name: "Ask again when the policy has a new version" }));
+
+    const storage = screen.getByRole("group", { name: "Storage folder" });
+    expect(within(storage).getByText("customers/RPCUS-A1B2C3D4E/orders/RP-2026-000123/Intake")).toBeInTheDocument();
+    const folder = within(storage).getByLabelText(/Default storage folder/);
+    await user.type(folder, "../secret");
+    expect(within(storage).getByText("No example yet: the folder path is not valid.")).toBeInTheDocument();
+    await user.clear(folder);
+    await user.click(folder);
+    await user.paste("clients/{customer_ref}/{order_ref}");
+    expect(within(storage).getByText("clients/RPCUS-A1B2C3D4E/RP-2026-000123")).toBeInTheDocument();
+
+    // Per-slot folder overrides the workflow default in the example.
+    await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
+    const slotFolder = screen.getAllByLabelText(/^Storage folder \(optional\)/)[0]!;
+    await user.click(slotFolder);
+    await user.paste("uploads/{slot}");
+    expect(screen.getByText("uploads/Documents")).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+
+    await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review and publish" })).toBeInTheDocument();
+    const lastSave = calls.filter((c) => c.path === "orders.admin.workflows.drafts.save").at(-1)?.input as {
+      definition: { acceptanceGates: unknown[]; storageFolder: string; states: { requirements?: { uploads: { storageFolder?: string }[] } }[] };
+    };
+    expect(lastSave.definition.acceptanceGates).toEqual([{ key: "terms", policyPublicId: POLICY_A, point: { stepKey: "submitted" }, signatureMode: "typed_name", askAgainOnNewVersion: false }]);
+    expect(lastSave.definition.storageFolder).toBe("clients/{customer_ref}/{order_ref}");
+    expect(lastSave.definition.states[0]!.requirements!.uploads[0]!.storageFolder).toBe("uploads/{slot}");
+  });
+
+  it("a gate can be removed and the policy list failing still leaves the editor usable", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition: { states, transitions: [transition], acceptanceGates: [{ key: "terms", policyPublicId: "01JTESTPOL00000000000000ZZ", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true }] } }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("compliance.policies.listPublished", () => {
+      throw new Error("FORBIDDEN");
+    });
+    const user = userEvent.setup();
+    designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (let i = 0; i < 4; i += 1) await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    const gates = await screen.findByRole("group", { name: "Acceptance gates" });
+    expect(await within(gates).findByText(/The policy list could not be loaded/)).toBeInTheDocument();
+    expect(within(gates).getByRole("option", { name: "Policy not available (unpublished or removed)" })).toBeInTheDocument();
+    await user.click(within(gates).getByRole("button", { name: "Remove gate 1" }));
+    expect(within(gates).getByText("No gates.")).toBeInTheDocument();
+  });
+});
+
+describe("workflow designer — review summary", () => {
+  it("Review and publish summarises phases, requirement counts, gates and the files folder", async () => {
+    const reviewStates = [
+      { ...states[0]!, phase: "intake", requirements: { uploads: [{ key: "brief", label: "Brief", kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"], storageFolder: "Briefs/{order_ref}" }], acknowledgements: [{ key: "terms", title: "Terms", body: "Synthetic.", acceptedBy: "customer", requireTypedName: false }] } },
+      { ...states[1]!, phase: "delivery" },
+    ];
+    const definition = {
+      phases: [{ key: "intake", label: "Intake" }, { key: "delivery", label: "Delivery" }],
+      states: reviewStates,
+      transitions: [transition],
+      storageFolder: "Orders/{order_ref}",
+      acceptanceGates: [{ key: "terms", policyPublicId: POLICY_A, point: { stepKey: "submitted" }, signatureMode: "typed_name", askAgainOnNewVersion: true }],
+    };
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    const { container } = designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements", "Review and publish"]) {
+      await user.click(screen.getByRole("button", { name: "Save and continue" }));
+      expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
+    }
+    const summary = screen.getByRole("region", { name: "Phases, requirements, acceptance and storage" });
+    expect(summary).toHaveTextContent("Each phase locks when the order moves on");
+    expect(summary).toHaveTextContent("Intake: 1 status; requirements: 1 upload, 1 acknowledgement");
+    expect(summary).toHaveTextContent("Delivery: 1 status; requirements: None");
+    expect(await within(summary).findByText("Synthetic order terms")).toBeInTheDocument();
+    expect(summary).toHaveTextContent("before submitting from “Submitted”; type their full name; asked again for a new policy version");
+    expect(summary).toHaveTextContent("Orders/{order_ref}; 1 upload slot uses its own folder");
+    expect(summary).toHaveTextContent("Example: Orders/RP-2026-000123");
+    await expectNoAxeViolations(container);
+  });
+});
+
+describe("designer part B page accessibility", () => {
+  // The rules step with a gate and the folder fields (with the live example), checked as a page in light and dark.
+  const prepare = async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition: { states, transitions: [transition], acceptanceGates: [{ key: "terms", policyPublicId: "01JTESTPOL00000000000000ZZ", point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true }] } }));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    document.title = "Workflow draft · Console";
+    renderUi(<main><Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route></main>, { path: `/admin/workflows/drafts/${DRAFT}` });
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements"]) {
+      fireEvent.click(screen.getByRole("button", { name: "Save and continue" }));
+      await screen.findByRole("heading", { level: 2, name: next });
+    }
+    await screen.findByRole("group", { name: "Acceptance gates" });
+  };
+  pageA11y("designer rules step with an acceptance gate and storage folders", prepare);
 });
 
 describe("published versions", () => {

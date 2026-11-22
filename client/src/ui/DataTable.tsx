@@ -76,7 +76,7 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
       {/* Desktop / tablet table */}
       {/* Focusable so keyboard users can scroll a wide table horizontally (WCAG 2.1.1; axe scrollable-region-focusable). */}
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
-      <div tabIndex={0} role="region" aria-label={`${caption} table`} className="hidden overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface shadow-[var(--shadow-card)] md:block rp-forced-border">
+      <div tabIndex={0} role="region" aria-label={`${caption} table`} className="relative hidden overflow-x-auto rounded-[var(--radius-card)] border border-line bg-surface shadow-[var(--shadow-card)] md:block rp-forced-border">
         <table className="w-full border-collapse text-left text-sm">
           <caption className={cn(showCaption ? "px-4 py-3 text-left text-sm font-semibold text-ink" : "sr-only")}>{caption}</caption>
           <thead className="bg-surface-soft">

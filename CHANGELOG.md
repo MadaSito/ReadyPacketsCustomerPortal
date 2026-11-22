@@ -5,6 +5,67 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 04
+
+### Added
+
+- **Workflow phases and requirements** (`/admin/workflows`): enable `orders.workflow_rules.enabled`, then publish a workflow version with phase locks, upload slots and acknowledgements.
+- **Console order tools** (`/admin/orders`, `/admin/customers/:customerId`): create and reassign by capability with no switch; enable `orders.console_access.enabled` to grant or revoke delegated access.
+- **Audio recording and conversion** (`/admin/files`): enable `files.audio_conversion.enabled` for browser recording and local WebM/Opus conversion; the original is retained.
+- **Customer maintenance** (`/admin/maintenance`): enable the customer access notice and set a window separately from worker drain; staff and administrators can still sign in.
+- **Knowledge Base and Help Centre** (`/admin/knowledge`, `/help`): enable `feature.knowledge` and publish customer-facing articles.
+- **Community forum** (`/admin/community/settings`, `/community`): enable `feature.community` and configure categories, posting rules and moderation.
+- **Referrals** (`/admin/referrals`, `/account/referrals`): enable `feature.referrals` and configure `referrals.program` for reward rules and approval.
+- **Inbound API v1** (`/admin/api`, `/admin/api/log`): enable `publicApi.enabled` and issue scoped keys; eligible logged requests can be replayed with fresh verification.
+- **Signed webhooks** (`/admin/integrations/webhooks`): enable `feature.integrations.webhooks`; configure inbound endpoints or outbound subscriptions and review or rerun eligible deliveries.
+- **Cookies and consent** (`/admin/privacy`): enable `feature.privacy.consent` for the preference centre and ledger; `feature.integrations.posthog` and `feature.integrations.clarity` separately gate their vendors.
+- **Cart and checkout** (`/admin/carts`, `/cart`): enable `feature.cart`; server-side pricing, orders and invoices work without an online payment provider.
+- **Hosted online payments** (`/admin/payments`): set `payments.config.provider` to Stripe or Square after testing; `none` keeps invoice payment. [ADR 0035](docs/adr/0035-hosted-checkout-payments.md) partially supersedes ADR 0014.
+- **Storage Copy log** (`/admin/storage/copies`): no separate switch; records attempts when order files, backups or SharePoint order data are copied to enabled destinations.
+
+### Changed
+
+- **Customer navigation** (customer portal): desktop sidebar, smaller-screen drawer and phone shortcuts with More, with no separate switch; feature-dependent links stay hidden while off.
+- **Theme and responsive layout** (portal and console): System, Light and Dark are available without a feature switch; shared controls and layouts adapt to screen size.
+- **Accessibility** (`/accessibility`): public accessibility information and UI designed and tested against WCAG 2.2 AA; see the [verification record](docs/verification/ACCESSIBILITY.md) for coverage and gaps.
+- **Unknown mail outcomes** (`/admin/mail`): no automatic resend or failover; an administrator may queue a separate send after fresh verification and explicit acknowledgment of duplicate risk. No feature switch.
+
+### Security
+
+- **Application Protection** (`/admin/protection`): starts in Detect mode; review events before switching to Enforce or adding IP/country controls. Rate-limit budgets remain bounded.
+- **Session centre and restrictions** (`/admin/sessions`, `/admin/sign-in-log`, `/admin/session-restrictions`): logs and session-ending tools are available by capability; restrictions apply only as configured.
+- **Payment confirmation** (`/admin/payments`): enabled providers require both a valid webhook and matching payment details fetched from the provider; the browser return cannot mark an invoice paid.
+
+### Operations
+
+- **Native upgrade** (`deploy/upgrade.sh`): `0003_increment_04` is additive, with 48 new tables and 10 nullable columns on existing tables. Keep the encrypted backup and keys off-host before migration.
+- **Media and country data**: native install, upgrade and the image include FFmpeg and `prlimit` for optional audio conversion. The operator provides any optional country MMDB locally; no network lookup.
+
+### Added — part B, console order workspace
+
+- **Console order page** (`/admin/orders/:orderId`): a header with Rename order, Change reference, Reassign customer, Invoice and Refund, then status, payment and total badges. The tabs, in order, are Overview, Phases, Intake, Files, Messages, Automation, Sync, Invoices, Refund, Order history, Acceptances, Notes and Sharing. Each has its own address, and on narrow screens they become a drop-down list. No feature switch.
+- **Rename an order**: needs `orders.rename` (staff and administrators). The check is version-aware and the reference does not change. Each rename writes the audit event `order.renamed`, which records lengths only, and keeps the old and new names in the order's name history. Staff see "Renamed: old → new" in Order history; customers see "Order renamed".
+- **Order history** (replaces Activity): the order's status transitions next to its audited activity, paginated and filterable by category. Customers see only the subset meant for them.
+- **Automation tab** (formerly Production), per [ADR 0041](docs/adr/0041-order-automation-tab.md):
+  - The Phase I and Phase II cards say why a button is disabled.
+  - Pipeline history per order, with Retry for failed dispatches.
+  - Redeliver needs `orders.production.redeliver`, step-up, a reason and the phrase `REDELIVER`.
+  - Optional Phase III and Phase IV endpoints, hidden until configured.
+  - "Run actions" for workflow stage automations needs `orders.automations.run`.
+- **Refunds**, per [ADR 0038](docs/adr/0038-provider-refunds.md), which supersedes "refunds are manual" in ADR 0035:
+  - Stripe and Square refunds go through the provider's API, idempotent per refund; an unknown outcome is reconciled and never resent.
+  - Manual payments get recorded refunds.
+  - Needs `payments.refund` (administrators), step-up and the phrase `REFUND ORDER`.
+- **Policy acceptance gateway**, per [ADR 0039](docs/adr/0039-policy-acceptance-gateway.md): a workflow gate at order start or before a named step, with a checkbox or typed-name signature. The server refuses work on the order until each acting user accepts, and the evidence is append-only. There is an Acceptances tab and a printable receipt.
+- **Order file sync and folder routing**, per [ADR 0040](docs/adr/0040-order-file-sync-folder-routing.md):
+  - Folder templates per slot, with a workflow default, edited in the workflow designer and validated on save and at copy time.
+  - Uploads, recordings and converted audio are copied to the connections assigned to order files.
+  - Per-order SharePoint sync (or File sync) tab, with Retry for failed transfers (`files.manage`).
+
+### Operations — part B
+
+- **Migration `0004_increment_04_part_b`**: additive only. It adds 3 tables (`order_name_history`, `order_policy_acceptances`, `payment_refunds`), 13 nullable columns and indexes, and is applied by `deploy/upgrade.sh`. See [UPGRADE.md](docs/operations/UPGRADE.md).
+
 ## [Unreleased]
 
 ### Added

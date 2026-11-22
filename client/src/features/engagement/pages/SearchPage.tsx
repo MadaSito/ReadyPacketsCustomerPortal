@@ -235,7 +235,12 @@ export default function SearchPage() {
       />
 
       <Card>
-        <form onSubmit={onSubmit} role="search" className="grid gap-4 sm:grid-cols-12 sm:items-end">
+        <form
+          onSubmit={onSubmit}
+          role="search"
+          aria-label="Search results filters"
+          className="grid gap-4 sm:grid-cols-12 sm:items-end"
+        >
           <div className="sm:col-span-7">
             <Field label="Search terms" hint="Enter at least 2 characters (reference number or keywords).">
               <Input

@@ -57,3 +57,31 @@ The tests use a fake of the orders module's `listOrderPublicIdsForSync` (commit 
 - Real `GraphApiError.reasonCode` values map to EGRESS_DENIED, TIMEOUT, RESPONSE_TOO_LARGE and AUTH_FAILED.
 
 `graphDrive.test.ts` checks that no cleanup DELETE is sent after a lost fence.
+
+## Copy log hooks (increment 04, package R)
+
+`sharepoint.test.ts` (22/22, local fakes and the dev test MySQL) checks that:
+- created, updated and unchanged syncs give `written`, `written` and `not_written` rows, each with started and finished times and no verification claim;
+- a provider 503 gives a `failed` row with `SHAREPOINT_PROVIDER_UNAVAILABLE` and no provider text;
+- staging writes a `queued` row bound to the job ID;
+- nothing is recorded without an assigned destination.
+
+Not verified: the Copy log UI projection of these rows (owned by storage), and real tenants.
+
+## Graph drive routing (increment 04 part B, package W)
+
+`storage/adapters/graphDriveRouting.test.ts` passes 9/9 and `graphDrive.test.ts` passes 16/16, both against the local Graph fake. They check:
+- the name mapping is deterministic and idempotent;
+- long names are cut with a hash, and the 400-character path includes the library path;
+- an 8-segment folder path is created once and reused;
+- 12 concurrent uploads into a new folder create one folder per segment. Three different files with the same name become `clash.bin`, `clash (1).bin` and `clash (2).bin`, and three identical files share one item;
+- of two concurrent large uploads with the same name, the loser gets a retryable `DESTINATION_CONFLICT`, and nothing is replaced;
+- a re-run of an identical large file sends no final chunk;
+- a different file of the same size gets a suffix;
+- the target path keeps the drive's casing;
+- traversal is refused with no provider call.
+
+`sharepoint.test.ts` passes 23/23. A rename (updatedAt bump plus an `updated` event, as orders_engineer confirmed) updates the list row.
+
+Not verified: real SharePoint or OneDrive behaviour, which may differ from the fake. This covers commit-time 409s on upload sessions, eventual consistency after a 409 on folder create, the exact limits counted by the service, and case folding of non-ASCII names.
+

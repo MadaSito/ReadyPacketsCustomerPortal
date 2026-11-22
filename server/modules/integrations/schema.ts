@@ -115,6 +115,10 @@ export const integrationProductionDispatches = mysqlTable(
     isResend: boolean("is_resend").notNull().default(false),
     /** Controlled server-classified resend reason code only; NEVER stores raw operator prose (PW-07). */
     resendReason: varchar("resend_reason", { length: 64 }),
+    /** ULID of a failed/dead dispatch retried via `orders.production.trigger` (Increment 04 Part B T1). */
+    retryOfPublicId: varchar("retry_of_public_id", { length: 26 }),
+    /** ULID of an already-delivered dispatch redelivered via `orders.production.redeliver` step-up (Increment 04 Part B T1). */
+    redeliveryOfPublicId: varchar("redelivery_of_public_id", { length: 26 }),
     phase1ArtifactsConfirmed: boolean("phase1_artifacts_confirmed").notNull().default(false),
     requestedByUserId: refColumn("requested_by_user_id"),
     requestedByPublicId: varchar("requested_by_public_id", { length: 26 }),
@@ -134,6 +138,148 @@ export const integrationProductionDispatches = mysqlTable(
     index("idx_prod_dispatch_state_expiry").on(table.state, table.expiresAt, table.id),
     index("idx_prod_dispatch_job").on(table.jobPublicId),
     index("idx_prod_dispatch_order_ref").on(table.orderReference, table.createdAt),
+    index("idx_prod_dispatch_redelivery_of").on(table.redeliveryOfPublicId),
+  ],
+);
+
+/* ----------------------------------------------------- Increment 04 Package I: Webhooks */
+
+export const integrationWebhookSubscriptions = mysqlTable(
+  "integration_webhook_subscriptions",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    name: varchar("name", { length: 120 }).notNull(),
+    description: varchar("description", { length: 280 }),
+    targetUrlEnc: text("target_url_enc").notNull(),
+    targetUrlHost: varchar("target_url_host", { length: 253 }).notNull(),
+    targetUrlMasked: varchar("target_url_masked", { length: 320 }).notNull(),
+    eventsJson: text("events_json").notNull(),
+    status: varchar("status", { length: 24 }).notNull(), // "active" | "paused" | "disabled_failing"
+    signingSecretEnc: text("signing_secret_enc").notNull(),
+    signingSecretLast4: varchar("signing_secret_last4", { length: 4 }).notNull(),
+    previousSecretEnc: text("previous_secret_enc"),
+    previousSecretExpiresAt: utcDateTime("previous_secret_expires_at"),
+    consecutiveFailures: int("consecutive_failures", { unsigned: true }).notNull().default(0),
+    lastDeliveredAt: utcDateTime("last_delivered_at"),
+    lastFailedAt: utcDateTime("last_failed_at"),
+    lastFailureReason: varchar("last_failure_reason", { length: 64 }),
+    autoDisabledAt: utcDateTime("auto_disabled_at"),
+    createdByUserId: refColumn("created_by_user_id"),
+    updatedByUserId: refColumn("updated_by_user_id"),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    index("idx_webhook_sub_status_id").on(table.status, table.id),
+    index("idx_webhook_sub_updated_id").on(table.updatedAt, table.id),
+  ],
+);
+
+export const integrationWebhookInboundEndpoints = mysqlTable(
+  "integration_webhook_inbound_endpoints",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    name: varchar("name", { length: 120 }).notNull(),
+    endpointKey: varchar("endpoint_key", { length: 64 }).notNull(),
+    description: varchar("description", { length: 280 }),
+    enabled: boolean("enabled").notNull().default(false),
+    signingSecretEnc: text("signing_secret_enc").notNull(),
+    signingSecretLast4: varchar("signing_secret_last4", { length: 4 }).notNull(),
+    previousSecretEnc: text("previous_secret_enc"),
+    previousSecretExpiresAt: utcDateTime("previous_secret_expires_at"),
+    toleranceSeconds: int("tolerance_seconds", { unsigned: true }).notNull().default(300),
+    lastReceivedAt: utcDateTime("last_received_at"),
+    createdByUserId: refColumn("created_by_user_id"),
+    updatedByUserId: refColumn("updated_by_user_id"),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("uq_webhook_inbound_key").on(table.endpointKey),
+    index("idx_webhook_inbound_enabled_id").on(table.enabled, table.id),
+  ],
+);
+
+export const integrationWebhookDeliveries = mysqlTable(
+  "integration_webhook_deliveries",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    direction: varchar("direction", { length: 16 }).notNull(), // "outbound" | "inbound"
+    subscriptionId: refColumn("subscription_id"),
+    subscriptionPublicId: varchar("subscription_public_id", { length: 26 }),
+    inboundEndpointId: refColumn("inbound_endpoint_id"),
+    inboundEndpointPublicId: varchar("inbound_endpoint_public_id", { length: 26 }),
+    targetLabel: varchar("target_label", { length: 255 }).notNull(),
+    eventKey: varchar("event_key", { length: 120 }).notNull(),
+    externalEventId: varchar("external_event_id", { length: 128 }),
+    deduplicationKey: varchar("deduplication_key", { length: 160 }).notNull(),
+    status: varchar("status", { length: 24 }).notNull(),
+    httpMethod: varchar("http_method", { length: 10 }).notNull().default("POST"),
+    httpPath: varchar("http_path", { length: 255 }).notNull(),
+    httpStatus: int("http_status", { unsigned: true }),
+    durationMs: int("duration_ms", { unsigned: true }),
+    requestBytes: int("request_bytes", { unsigned: true }).notNull().default(0),
+    responseBytes: int("response_bytes", { unsigned: true }).notNull().default(0),
+    attemptCount: int("attempt_count", { unsigned: true }).notNull().default(0),
+    maxAttempts: int("max_attempts", { unsigned: true }).notNull().default(5),
+    nextAttemptAt: utcDateTime("next_attempt_at"),
+    jobPublicId: varchar("job_public_id", { length: 36 }),
+    activeFencingToken: bigint("active_fencing_token", { mode: "number", unsigned: true }).notNull().default(0),
+    reasonCode: varchar("reason_code", { length: 64 }),
+    correlationId: varchar("correlation_id", { length: 64 }).notNull(),
+    actorLabel: varchar("actor_label", { length: 96 }).notNull(),
+    payloadSha256: char("payload_sha256", { length: 64 }).notNull(),
+    tapEventEnc: text("tap_event_enc"),
+    payloadEnc: text("payload_enc"),
+    bodyTruncated: boolean("body_truncated").notNull().default(false),
+    bodyPurged: boolean("body_purged").notNull().default(false),
+    isReplay: boolean("is_replay").notNull().default(false),
+    replayOfPublicId: varchar("replay_of_public_id", { length: 26 }),
+    isTest: boolean("is_test").notNull().default(false),
+    searchText: varchar("search_text", { length: 512 }).notNull(),
+    expiresAt: utcDateTime("expires_at").notNull(),
+    completedAt: utcDateTime("completed_at"),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("uq_webhook_delivery_dedupe").on(table.direction, table.deduplicationKey),
+    index("idx_webhook_delivery_dir_created").on(table.direction, table.createdAt, table.id),
+    index("idx_webhook_delivery_sub_created").on(table.subscriptionPublicId, table.createdAt, table.id),
+    index("idx_webhook_delivery_inb_created").on(table.inboundEndpointPublicId, table.createdAt, table.id),
+    index("idx_webhook_delivery_event_created").on(table.eventKey, table.createdAt, table.id),
+    index("idx_webhook_delivery_status_next").on(table.status, table.nextAttemptAt, table.id),
+    index("idx_webhook_delivery_corr").on(table.correlationId),
+    index("idx_webhook_delivery_expiry").on(table.bodyPurged, table.expiresAt, table.id),
+    index("idx_webhook_delivery_created_id").on(table.createdAt, table.id),
+  ],
+);
+
+export const integrationWebhookDeliveryAttempts = mysqlTable(
+  "integration_webhook_delivery_attempts",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    deliveryId: refColumn("delivery_id").notNull(),
+    attemptNumber: int("attempt_number", { unsigned: true }).notNull(),
+    outcome: varchar("outcome", { length: 24 }).notNull(), // "succeeded" | "failed" | "rejected" | "unknown"
+    httpStatus: int("http_status", { unsigned: true }),
+    durationMs: int("duration_ms", { unsigned: true }).notNull().default(0),
+    reasonCode: varchar("reason_code", { length: 64 }),
+    responseBytes: int("response_bytes", { unsigned: true }).notNull().default(0),
+    responseEnc: text("response_enc"),
+    occurredAt: utcDateTime("occurred_at").notNull(),
+    createdAt: createdAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("uq_webhook_attempt_num").on(table.deliveryId, table.attemptNumber),
+    index("idx_webhook_attempt_delivery").on(table.deliveryId, table.attemptNumber),
   ],
 );
 

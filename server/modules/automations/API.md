@@ -132,8 +132,21 @@ Mounted at `appRouter.automations` (`server/modules/automations/router.ts`).
 | `automations.delete` | `mutation` | `automations.manage` (step-up) | `{ publicId, expectedVersion }` → `{ deleted: true }` |
 | `automations.triggerManual` | `mutation` | `automations.manage` (step-up) | `{ publicId, orderPublicId?, sampleFields? }` → `{ runPublicId, jobId }` |
 | `automations.testRun` | `mutation` | `automations.read` (dry-run) / `automations.manage` (`executeLive: true`) | `{ publicId?, trigger, conditions?, actions, sampleFields?, orderPublicId?, executeLive?: boolean }` → `AutomationTestRunResult` (defaults to `executeLive: false`, performing zero side effects) |
-| `automations.runs.list` | `query` | `automations.read` | `{ automationPublicId?, state?, cursor?, limit? }` → `{ items: AutomationRunView[], nextCursor }` |
-| `automations.runs.get` | `query` | `automations.read` | `{ runPublicId }` → `AutomationRunView` (includes ordered `steps` with timings, attempts, `state`, `reasonCode`, `safeSummary`) |
+| `automations.runs.list` | `query` | `automations.read` | `{ automationPublicId?, orderPublicId?, state?, cursor?, limit? }` → `{ items: AutomationRunView[], nextCursor }` |
+| `automations.runs.get` | `query` | `automations.read` | `{ runPublicId }` → `AutomationRunView` (includes ordered `steps` with timings, attempts, `state`, `reasonCode`, `safeSummary`, plus `orderPublicId`, `stageStepKey`, and `triggeredBy`) |
+| `automations.orderStageActions.get` | `query` | `orders.automations.run` (`staff` / `admin`) | `{ orderPublicId, runLimit? }` → `OrderStageActionsView` (steps of the order's pinned workflow version, enabled automations bound to each step, engine readiness, and recent order-scoped runs) |
+| `automations.orderStageActions.listRuns` | `query` | `orders.automations.run` (`staff` / `admin`) | `{ orderPublicId, cursor?, limit? }` → `{ items: AutomationRunView[], nextCursor }` |
+| `automations.orderStageActions.runForOrder` | `mutation` | `orders.automations.run` (`staff` / `admin`) | `{ orderPublicId, stepKey, idempotencyKey }` → `OrderStageActionsRunResult` |
+
+### 3.1 Workflow Stage Actions Binding & Safety Rules (Increment 04 Part B — Package T2)
+
+- **Step binding** (`automationBindsToWorkflowStep`):
+  - Only enabled event automations (`enabled === true` and `triggerMode === "event"`) are bound to workflow steps:
+    - `triggerKey === "order.created"` binds to the workflow's `initial` step (`step.kind === "initial"`).
+    - `triggerKey === "order.status_changed"` binds to `step` when its condition tree can match `to_status === step.key` and does not match an unmatched sentinel status (i.e. `to_status` `eq` / `in` rules targeting that step, including rules combined with `from_status` or `actor_role`; unconstrained global or `neq` catch-all rules do not bind to individual steps).
+- **Engine readiness**: if `automations.config.enabled === false`, `orderStageActions.get` returns `engineEnabled: false` with a clear `engineDisabledReason`, and `runForOrder` refuses with `NOT_CONFIGURED` / `AUTOMATIONS_DISABLED`.
+- **Per-run idempotency & rate limits**: `runForOrder` requires an `idempotencyKey` (`[A-Za-z0-9:_-]{8,64}`), hashes `(orderPublicId, stepKey, automationPublicId, idempotencyKey)` into `automation_runs.dedup_key`, tags each queued run row with `order_public_id`, `stage_step_key`, and `triggered_by_user_id`, and executes through `automations.execute_run` under existing global and per-automation rate limits.
+- **Status & permission safety**: automations remain unable to change order status or user/role permissions (`assertAllowedActionKey` at registration/save time plus `ACTION_PROHIBITED` defense-in-depth enforcement in the worker before any step executes).
 
 ---
 
@@ -147,6 +160,6 @@ Mounted at `appRouter.automations` (`server/modules/automations/router.ts`).
 - **Settings**:
   - `automations.config` (`{ enabled: false, globalRunsPerMinute: 120, defaultPerAutomationRunsPerHour: 60, maxPerAutomationRunsPerHour: 600, runRetentionDays: 90 }`).
 - **Durable Audit Events**:
-  - `automation.settings.updated`, `automation.created`, `automation.updated`, `automation.enabled`, `automation.disabled`, `automation.duplicated`, `automation.deleted`, `automation.manual.triggered`, `automation.test.executed`, `automation.run.completed`, `automation.run.failed`, `automation.run.unknown`, `automation.run.rate_limited`, `authz.automations.denied`.
+  - `automation.settings.updated`, `automation.created`, `automation.updated`, `automation.enabled`, `automation.disabled`, `automation.duplicated`, `automation.deleted`, `automation.manual.triggered`, `automation.test.executed`, `automation.run.completed`, `automation.run.failed`, `automation.run.unknown`, `automation.run.rate_limited`, `order.stage_actions.run` (resource `{ type: "order", publicId }`, `orderPublicId`, safe attributes `order_public_id` + `step_key`), `authz.automations.denied`.
 - **Health Component**:
   - `automations.engine` (`disabled` when `automations.config.enabled === false`, otherwise `ok` / `degraded` based on recent failed/unknown runs).

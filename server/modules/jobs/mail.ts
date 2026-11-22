@@ -4,12 +4,12 @@ import { z } from "zod";
 import type { DeploymentProfile } from "../../config/env.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
-import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, Tx } from "../../core/types.js";
+import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, SessionPrincipal, Tx } from "../../core/types.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportResult, PublishedMailTemplate } from "./mailPorts.js";
 import { HEADER_CONTROL, MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER, mailAddress as address } from "./mailSettings.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
-import { mailAttempts, mailAuditVerification, mailOutbox, mailTransportAttempts } from "./schema.js";
+import { mailAttempts, mailAuditVerification, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 const DELIVER = "jobs.mail.deliver";
 const EXPIRE = "jobs.mail.expire";
@@ -233,20 +233,41 @@ export class MailEngine implements Mailer {
     return enabled;
   }
 
-  async resend(tx: Tx, publicId: string): Promise<{ jobId: string }> {
+  async resend(tx: Tx, publicId: string, options: { expectedGeneration?: number; duplicateRiskAcceptedBy?: SessionPrincipal } = {}):
+    Promise<{ jobId: string }> {
     const { deps } = this;
     const [row] = await tx.select().from(mailOutbox).where(eq(mailOutbox.publicId, publicId)).limit(1).for("update");
     if (!row) throw notFound();
     const now = deps.clock.now();
     if (
-      (row.state !== "held" && row.state !== "failed") || row.payloadEnc === null
+      !["held", "failed", "unknown"].includes(row.state) || row.payloadEnc === null
       || row.expiresAt <= now || row.generation >= 20
     ) throw conflict("MAIL_RESEND_UNSAFE", "This message cannot be safely resent.");
+    if (options.expectedGeneration !== undefined && row.generation !== options.expectedGeneration) {
+      throw conflict("MAIL_RESEND_CHANGED", "This message changed. Review its latest attempt before resending.");
+    }
+    const actor = options.duplicateRiskAcceptedBy;
+    if (row.state === "unknown" && !actor) {
+      throw conflict("MAIL_DUPLICATE_RISK_NOT_ACKNOWLEDGED", "Acknowledge that the recipient may receive this message twice.");
+    }
+    if (actor && (row.state !== "unknown" || !row.jobPublicId)) {
+      throw conflict("MAIL_RESEND_CHANGED", "This message changed. Review its latest attempt before resending.");
+    }
     const generation = row.generation + 1;
     const jobPublicId = await this.#queue(tx, row, generation);
     await tx.update(mailOutbox).set({ generation, jobPublicId, state: "queued", reasonCode: null, updatedAt: now })
       .where(eq(mailOutbox.id, row.id));
-    await mailAudit(deps, tx, { ...row, jobPublicId }, "job.mail.resend.queued", "completed");
+    if (actor) {
+      await tx.insert(mailManualResends).values({ mailId: row.id, generation, queuedAt: now });
+      await deps.audit.record({
+        category: "job", eventName: "job.mail.resent_after_unknown", action: "transition", outcome: "completed",
+        reasonCode: "MAIL_DUPLICATE_RISK_ACKNOWLEDGED", actor: { userId: actor.userId, role: actor.role },
+        resource: { type: "mail", publicId: row.publicId }, correlationId: row.correlationId, jobId: row.jobPublicId!,
+        attributes: { resent_job_public_id: jobPublicId, generation },
+      }, tx);
+    } else {
+      await mailAudit(deps, tx, { ...row, jobPublicId }, "job.mail.resend.queued", "completed");
+    }
     return { jobId: jobPublicId };
   }
 
@@ -455,7 +476,7 @@ export class MailEngine implements Mailer {
       const reasonCode = expired ? "MAIL_EXPIRED" : status.reasonCode;
       await tx.update(mailOutbox).set({
         state: outcome, reasonCode, updatedAt: now,
-        ...(outcome === "accepted" || outcome === "unknown" || expired
+        ...(outcome === "accepted" || current.expiresAt <= now
           || (outcome === "failed" && !result.retryable) ? { payloadEnc: null } : {}),
       }).where(eq(mailOutbox.id, current.id));
       await mailAudit(deps, tx, current, `job.mail.${outcome}`,
@@ -565,14 +586,15 @@ export class MailEngine implements Mailer {
         const now = deps.clock.now();
         const rows = await tx.select().from(mailOutbox).where(and(
           lte(mailOutbox.expiresAt, now),
-          inArray(mailOutbox.state, ["queued", "held", "failed", "captured"]),
+          inArray(mailOutbox.state, ["queued", "held", "failed", "captured", "unknown"]),
           or(isNotNull(mailOutbox.payloadEnc), isNotNull(mailOutbox.captureEnc)),
         )).orderBy(asc(mailOutbox.expiresAt), asc(mailOutbox.id)).limit(50).for("update", { skipLocked: true });
         for (const row of rows) {
-          const state = row.state === "captured" ? "captured" : "expired";
+          const state = row.state === "captured" || row.state === "unknown" ? row.state : "expired";
           await tx.update(mailOutbox).set({ state, payloadEnc: null, captureEnc: null, updatedAt: now,
             reasonCode: state === "expired" ? "MAIL_EXPIRED" : row.reasonCode }).where(eq(mailOutbox.id, row.id));
-          await mailAudit(deps, tx, row, state === "expired" ? "job.mail.expired" : "job.mail.capture.purged",
+          await mailAudit(deps, tx, row, state === "expired" ? "job.mail.expired"
+            : state === "unknown" ? "job.mail.payload.purged" : "job.mail.capture.purged",
             state === "expired" ? "canceled" : "completed", "MAIL_EXPIRED", true);
         }
         return rows.length;

@@ -52,7 +52,7 @@ export function Posture({ items, keyConfigured, offHostStatusNote, policy, statu
           },
           { label: "Encryption key", value: keyConfigured ? <Badge tone="success">Configured</Badge> : <Badge tone="danger">Not configured</Badge> },
           { label: "Retention", value: policy ? `Keep last ${policy.keepLastCount}, at most ${policy.maxAgeDays} days` : "Unknown" },
-          { label: "Off-host copy", value: <span className="flex flex-col gap-1">{offsiteBadge}<span className="text-sm text-muted">{offHostStatusNote}</span></span>, wide: true },
+          { label: "Off-host copy", value: <span className="flex min-w-0 flex-col gap-1">{offsiteBadge}<span className="text-sm break-words [overflow-wrap:anywhere] text-muted">{offHostStatusNote}</span></span>, wide: true },
         ]} />
       </div>
     </Section>
@@ -143,16 +143,16 @@ export default function BackupsPage() {
         title="Backups"
         description="Encrypted backups of the database and stored files, with verification and isolated restore drills."
         actions={
-          <div className="flex flex-wrap gap-2">
-            <Button asChild variant="ghost" leadingIcon={<RotateCcw className="size-4" aria-hidden />}><Link href={`${BASE}/restore`}>How to restore</Link></Button>
-            {canRead ? <Button asChild variant="secondary" leadingIcon={<ArchiveIcon className="size-4" aria-hidden />}><Link href={`${BASE}/retention`}>Retention</Link></Button> : null}
+          <div className="flex min-w-0 max-w-full flex-wrap gap-2">
+            <Button asChild variant="ghost" className="h-auto max-w-full py-2 text-center whitespace-normal" leadingIcon={<RotateCcw className="size-4" aria-hidden />}><Link href={`${BASE}/restore`}>How to restore</Link></Button>
+            {canRead ? <Button asChild variant="secondary" className="h-auto max-w-full py-2 text-center whitespace-normal" leadingIcon={<ArchiveIcon className="size-4" aria-hidden />}><Link href={`${BASE}/retention`}>Retention</Link></Button> : null}
             {canRun ? (
-              <Button onClick={() => setConfirm(true)} disabled={first?.keyConfigured === false || maintenance.draining} loading={run.isPending}>Run backup now</Button>
+              <Button className="h-auto max-w-full py-2 text-center whitespace-normal" onClick={() => setConfirm(true)} disabled={first?.keyConfigured === false || maintenance.draining} loading={run.isPending}>Run backup now</Button>
             ) : null}
           </div>
         }
       />
-      <div className="space-y-8">
+      <div className="min-w-0 space-y-8">
         <MaintenanceNotice />
         {list.isPending ? <Skeleton lines={4} /> : list.error && !first ? <ErrorState error={list.error} onRetry={() => list.refetch()} /> : first ? (
           <Posture

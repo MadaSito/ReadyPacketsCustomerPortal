@@ -69,11 +69,13 @@ export interface AuthApi {
   presentation(): Promise<PublicPresentation>;
   /** jobs.maintenanceBanner (public). */
   maintenanceBanner(): Promise<{ active: boolean; message: string | null }>;
+  /** platform.bootstrap (public): client-visible feature switches (shell navigation `enabledBy`). */
+  bootstrap(): Promise<{ features: Record<string, boolean> }>;
   me(): Promise<MeResult>;
   passwordPolicy(): Promise<{ minLength: number; maxLength: number }>;
   signIn(input: { email: string; password: string }): Promise<{ nextStep: TransitionStep | null }>;
   signOut(): Promise<unknown>;
-  register(input: { email: string; name: string; password: string; acceptedPolicies?: string[] }): Promise<Accepted>;
+  register(input: { email: string; name: string; password: string; acceptedPolicies?: string[]; referralCode?: string }): Promise<Accepted>;
   verifyEmail(input: { token: string }): Promise<unknown>;
   resendVerification(): Promise<Accepted>;
   requestPasswordReset(input: { email: string }): Promise<Accepted>;
@@ -100,6 +102,7 @@ export function createAuthApi(client: unknown): AuthApi {
   return {
     presentation: () => q("platform", "presentation"),
     maintenanceBanner: () => q("jobs", "maintenanceBanner"),
+    bootstrap: () => q("platform", "bootstrap"),
     me: () => q("identity", "me"),
     passwordPolicy: () => q("identity", "passwordPolicy"),
     signIn: (i) => m("identity", "signIn", i),

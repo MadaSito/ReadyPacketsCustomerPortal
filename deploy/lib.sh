@@ -10,7 +10,7 @@ umask 077
 # A fixed locale as well: the output of several tools is read by these scripts.
 export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin LC_ALL=C.UTF-8
 
-readonly base=/opt/readypackets conf=/etc/readypackets storage=/var/lib/readypackets/storage
+readonly base=/opt/readypackets conf=/etc/readypackets storage=/var/lib/readypackets/storage geo=/var/lib/readypackets/geo
 readonly unit_dir=/etc/systemd/system nginx_dir=/etc/nginx
 readonly site="$nginx_dir/sites-enabled/readypackets-portal.conf"
 readonly acme_site="$nginx_dir/sites-enabled/readypackets-acme.conf"
@@ -139,6 +139,27 @@ check_host() {
         command -v "$command" >/dev/null || die "$command is required"
     done
 }
+apt_candidate() {
+    [[ -n $(apt-cache policy "$1" 2>/dev/null | awk '$1 == "Candidate:" && $2 != "(none)" { print $2 }') ]]
+}
+enable_universe() {
+    printf '    switching on the Ubuntu "universe" package component\n'
+    apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends software-properties-common
+    add-apt-repository --yes --no-update universe
+    apt-get -o DPkg::Lock::Timeout=600 update --quiet
+}
+install_media_tools() (
+    if [[ -x /usr/bin/ffmpeg && -x /usr/bin/prlimit ]] &&
+       [[ $(dpkg-query -W -f='${db:Status-Status}' ffmpeg 2>/dev/null) == installed ]]; then return 0; fi
+    umask 022
+    # Do not restart the live portal (or unrelated workloads) during apt preflight.
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1
+    apt-get -o DPkg::Lock::Timeout=600 update --quiet
+    if ! apt_candidate ffmpeg; then enable_universe; fi
+    apt_candidate ffmpeg || die 'ffmpeg is not available from the configured Ubuntu package sources'
+    apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends ffmpeg util-linux
+    [[ -x /usr/bin/ffmpeg && -x /usr/bin/prlimit ]] || die 'expected /usr/bin/ffmpeg and /usr/bin/prlimit'
+)
 prepare_dirs() {
     local name
     for name in readypackets readypackets-build; do
@@ -158,9 +179,10 @@ prepare_dirs() {
     root_directory "$conf" 700
     root_directory "$conf/secrets" 700
     root_directory /var/www/readypackets-acme 755
-    [[ ! -L /var/lib/readypackets && ! -L "$storage" && ! -L /var/cache/readypackets-build ]] ||
+    [[ ! -L /var/lib/readypackets && ! -L "$storage" && ! -L "$geo" && ! -L /var/cache/readypackets-build ]] ||
         die 'refusing symlinked state or cache directory'
     install -d -o root -g readypackets -m 0750 /var/lib/readypackets
+    install -d -o root -g readypackets -m 0750 "$geo"
     install -d -o readypackets -g readypackets -m 0700 "$storage"
     install -d -o readypackets-build -g readypackets-build -m 0700 /var/cache/readypackets-build
     [[ $(realpath -e "$storage") == "$storage" && $(realpath -e "$base") == "$base" ]] ||

@@ -14,6 +14,9 @@ import { createCredentialService } from "./credentials.js";
 import { IDENTITY_MAIL_TEMPLATES } from "./mail.js";
 import { argon2ParamsFor, createPasswordHasher } from "./password/hasher.js";
 import type { UserStatus } from "./schema.js";
+import { createGates } from "./gates.js";
+import { createSessionCentre, type SessionCentre } from "./sessionCentre.js";
+import { createSessionPolicy, createSignInLog } from "./sessionPolicy.js";
 import { createSessionService, type IssuedSession, type SessionListItem, type SessionState } from "./sessions.js";
 import { createTokenService } from "./tokens.js";
 import { createTransitionService } from "./transitions.js";
@@ -60,6 +63,8 @@ export interface IdentityModule extends ModuleLifecycle {
     timing(sessionId: string, opts?: { tx?: DbOrTx }): Promise<{ idleTimeoutSeconds: number; absoluteExpiresAt: Date } | null>;
     /** Service-internal (ops scripts only; never on tRPC/HTTP). See API.md "Ops sessions". */
     openOpsSession(userId: number, opts: { reason: "demo_seed"; tx?: Tx }): Promise<SessionPrincipal>;
+    /** Increment 04 port (packages E, C). Opens its own transaction; see API.md. */
+    endAllCustomers(actor: SessionPrincipal, input: { reasonCode: string }): Promise<{ ended: number }>;
   };
   transitions: {
     derive(userId: number, session?: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod; tx?: DbOrTx }): Promise<TransitionStep[]>;
@@ -84,6 +89,7 @@ export interface IdentityModule extends ModuleLifecycle {
   auth: AuthService;
   admin: AdminService;
   sso: SsoService;
+  centre: SessionCentre;
   listSessions(principal: SessionPrincipal): Promise<SessionListItem[]>;
 }
 
@@ -92,13 +98,22 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
   const repo = createUserRepo(deps);
   const tokens = createTokenService(deps);
   const transitions = createTransitionService(deps);
-  const sessions = createSessionService(deps, transitions);
-  const internals = { deps, hasher, repo, tokens, sessions, transitions };
+  const sessionPolicy = createSessionPolicy(deps);
+  const signInLog = createSignInLog(deps, sessionPolicy);
+  const sessions = createSessionService(deps, transitions, { policy: sessionPolicy, log: signInLog });
+  const gates = createGates(deps);
+  const internals = { deps, hasher, repo, tokens, sessions, transitions, gates, signInLog };
   const auth = createAuthService(internals);
   const credentials = createCredentialService(internals);
   const admin = createAdminService(internals, auth);
   const breakGlass = createBreakGlassService(internals);
-  const sso = createSsoService({ deps, repo, sessions, transitions, auth, authorizeInTx: admin.authorizeInTx });
+  const sso = createSsoService({ deps, repo, sessions, transitions, auth, gates, signInLog, authorizeInTx: admin.authorizeInTx });
+  const centre = createSessionCentre({ deps, sessions, policy: sessionPolicy, authorizeInTx: admin.authorizeInTx });
+  deps.jobs.register("identity.signin_log.prune", async () => {
+    const removed = await centre.pruneSignInLog();
+    return { outcome: "completed", safeCounts: { removed } };
+  }, { retrySafe: true });
+  deps.jobs.registerSchedule({ name: "identity.signin_log.prune", type: "identity.signin_log.prune", everyMs: 6 * 60 * 60_000 });
   deps.jobs.register("identity.sso.prune", async () => {
     const removed = await sso.prune();
     return { outcome: "completed", safeCounts: { removed } };
@@ -142,6 +157,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
       getState: sessions.getState,
       timing: sessions.timing,
       openOpsSession: sessions.openOpsSession,
+      endAllCustomers: centre.endAllCustomers,
     },
     transitions: {
       async derive(userId, session) {
@@ -157,7 +173,13 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     auth,
     admin,
     sso,
-    listSessions: (principal) => sessions.listForUser(principal.userId, principal.sessionId),
+    centre,
+    /** Package H: the public API reads customers through this module (customers only, audited as system). */
+    init() {
+      const publicApi = (deps.services as { publicApi?: { registerProvider?: (key: "customers", provider: typeof admin.apiCustomers) => void } }).publicApi;
+      publicApi?.registerProvider?.("customers", admin.apiCustomers);
+    },
+    listSessions: (principal) => sessions.listForUser(principal.userId, principal.sessionId, principal.role),
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
       try {

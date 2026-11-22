@@ -1,4 +1,5 @@
 import { act, fireEvent, screen } from "@testing-library/react";
+import type * as SlotsModule from "./slots";
 import { describe, expect, it, vi } from "vitest";
 import type { PublicPresentation } from "@/lib/authApi";
 import { readFileSync } from "node:fs";
@@ -10,7 +11,12 @@ import { previewNavigate, splitHash } from "./AppRouter";
 import { IDLE_DEFAULTS, absoluteWarningDelay, idleLimitMs, warnBeforeFor } from "./IdleTimeout";
 import { PublicFrame } from "./shell/PublicFrame";
 
-vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
+// Partial mock: keep every real export (new slots stay defined) and silence the network-backed feature slots.
+vi.mock("./slots", async (importOriginal) => {
+  const real = await importOriginal<typeof SlotsModule>();
+  const silent = Object.fromEntries(Object.keys(real).filter((name) => name.endsWith("Slot")).map((name) => [name, () => null]));
+  return { ...real, ...silent };
+});
 
 const presentation = (preview: boolean): PublicPresentation => ({ slides: [], slideshow: { autoAdvance: false, intervalSeconds: 8 }, supportText: "", announcement: null, preview });
 

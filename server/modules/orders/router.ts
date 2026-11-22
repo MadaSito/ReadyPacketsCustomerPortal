@@ -206,6 +206,13 @@ export const ordersRouter = router({
     )
     .mutation(({ ctx, input }) => ctx.services.orders.orders.transition(ctx.session, input)),
   sharing,
+  /** Part B (S1): console order workspace actions. */
+  console: router({
+    rename: staffProcedure
+      .use(requireCapability("orders.rename"))
+      .input(z.strictObject({ orderId: id, expectedVersion: version, name: z.string().max(400) }))
+      .mutation(({ ctx, input }) => ctx.services.orders.orders.rename(ctx.session, input)),
+  }),
   admin: router({
     list: staffProcedure
       .use(requireCapability("orders.read_all"))
@@ -270,5 +277,49 @@ export const ordersRouter = router({
       .mutation(({ ctx, input }) => ctx.services.orders.orders.reassign(ctx.session, input)),
     catalog: catalogAdmin,
     workflows: workflowsAdmin,
+    customerLookup: staffProcedure
+      .use(requireCapability("customers.read_all"))
+      .input(z.strictObject({ query: nfc(2, 120) }))
+      .query(({ ctx, input }) => ctx.services.orders.access.customerLookup(ctx.session, input)),
+    access: router({
+      list: staffProcedure
+        .use(requireCapability("orders.read_all"))
+        .input(z.union([z.strictObject({ orderId: id }), z.strictObject({ customerPublicId: id })]))
+        .query(({ ctx, input }) => ctx.services.orders.access.list(ctx.session, input)),
+      grant: adminProcedure
+        .use(requireCapability("orders.access.grant"))
+        .input(
+          z.strictObject({
+            scope: z.union([z.strictObject({ orderId: id }), z.strictObject({ customerPublicId: id })]),
+            email: z.string().trim().min(3).max(254).email(),
+            role: z.enum(GRANT_ROLES),
+          }),
+        )
+        .mutation(({ ctx, input }) => ctx.services.orders.access.grant(ctx.session, input)),
+      revoke: adminProcedure
+        .use(requireCapability("orders.access.grant"))
+        .input(z.strictObject({ grantId: id }))
+        .mutation(({ ctx, input }) => ctx.services.orders.access.revoke(ctx.session, input)),
+    }),
+  }),
+  requirements: router({
+    forOrder: protectedProcedure.input(z.strictObject({ orderId: id })).query(({ ctx, input }) => ctx.services.orders.requirements.forOrder(ctx.session, input)),
+    acknowledge: protectedProcedure
+      .input(
+        z.strictObject({
+          orderId: id,
+          statusKey,
+          ackKey: statusKey,
+          textSha256: z.string().regex(/^[a-f0-9]{64}$/),
+          typedName: nfc(0, 120).optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) => ctx.services.orders.requirements.acknowledge(ctx.session, input)),
+  }),
+  phases: router({
+    unlock: staffProcedure
+      .use(requireCapability("orders.phase.unlock"))
+      .input(z.strictObject({ orderId: id, phaseKey: statusKey, reason: nfc(10, 500), notifyCustomer: z.boolean() }))
+      .mutation(({ ctx, input }) => ctx.services.orders.requirements.unlockPhase(ctx.session, input)),
   }),
 });

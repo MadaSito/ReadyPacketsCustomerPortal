@@ -275,8 +275,12 @@ export class FakeGraph implements GraphHttpPort {
       return item === "conflict" ? err(409) : ok(201, this.itemJson(item, this.reportHashes));
     }
     if (method === "POST" && (m = /^\/items\/([^/:]+):\/([^/:]+):\/createUploadSession$/.exec(rest))) {
+      const parentId = decodeURIComponent(m[1]!);
+      const name = decodeURIComponent(m[2]!);
+      // conflictBehavior "fail" refuses an existing name at creation (and again at commit, below).
+      if ([...drive.items.values()].some((i) => i.parentId === parentId && i.name.toLowerCase() === name.toLowerCase())) return err(409, "nameAlreadyExists");
       const token = randomUUID();
-      this.sessions.set(token, { driveId: drive.id, parentId: decodeURIComponent(m[1]!), name: decodeURIComponent(m[2]!), size: Number.NaN, received: [], next: 0 });
+      this.sessions.set(token, { driveId: drive.id, parentId, name, size: Number.NaN, received: [], next: 0 });
       return ok(200, { uploadUrl: `https://${this.uploadHost}/_api/v2.0/drives/x/uploadSession?token=${token}`, expirationDateTime: "2030-01-01T00:00:00Z" });
     }
     if (method === "DELETE" && (m = /^\/items\/([^/:]+)$/.exec(rest))) {

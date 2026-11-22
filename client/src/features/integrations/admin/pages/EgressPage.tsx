@@ -25,6 +25,7 @@ export const PURPOSE_LABELS: Record<Purpose, string> = {
   webhook: "Webhook",
   sharepoint: "SharePoint",
   stripe: "Stripe",
+  square: "Square",
   antivirus: "Malware scanner",
   graph: "Microsoft Graph API",
   graph_upload: "Microsoft Graph upload session",

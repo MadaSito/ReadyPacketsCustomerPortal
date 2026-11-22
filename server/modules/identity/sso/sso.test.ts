@@ -16,7 +16,7 @@ import { createTestDeps, type TestHarness } from "../../../../tests/helpers/fake
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import { createEntraAssurance } from "../../assurance/entra.js";
 import { createIdentityModule, type IdentityModule } from "../index.js";
-import { customerRefHistory, customerRefReservations, identityTokens, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
 import { authorizationUrl, entraEndpoints, OidcValidationError, peekKeyId, verifyIdToken } from "./oidc.js";
 import { createFakeEntra, type FakeEntra, type FakeEntraIdentity } from "./testing.js";
 import type { SsoConfigInput } from "./service.js";
@@ -130,7 +130,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     db.db.select().from(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)));
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(async () => build());
@@ -272,6 +272,22 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       h.clock.advance(5 * 60_000 + 1);
       const ok = await signIn({ oid: id });
       expect(ok.location).toMatch(/^\/sso\/complete/);
+    });
+
+    it("refuses customers with SSO_MAINTENANCE during customer maintenance (no session); staff still sign in", async () => {
+      await configure();
+      const customer = await makeUser({ role: "customer" });
+      const cid = oid();
+      await bind(customer.publicId, cid);
+      const staff = await makeUser({ role: "staff", mfa: true });
+      const sid = oid();
+      await bind(staff.publicId, sid);
+      (h.services as unknown as Record<string, unknown>).jobAdmin = { maintenance: { customerAccess: async () => ({ active: true, message: null, expectedEnd: null }) } };
+      const before = await db.db.select().from(userSessions).where(eq(userSessions.userId, customer.id));
+      await rejects((await signIn({ oid: cid })).finish(), "SSO_MAINTENANCE");
+      expect(await db.db.select().from(userSessions).where(eq(userSessions.userId, customer.id))).toHaveLength(before.length);
+      const done = await (await signIn({ oid: sid })).finish();
+      expect(done.purpose).toBe("sign_in");
     });
 
     it("refuses unlinked identities, deactivated accounts and pending local remediation", async () => {

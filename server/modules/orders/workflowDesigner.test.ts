@@ -144,6 +144,54 @@ describe("validateDraft (pure)", () => {
   });
 });
 
+describe("acceptance gates and storage folders (part B, pure validation)", () => {
+  const POLICY = "01JD0000000000000000000P01";
+  const base = () => toDraft(DEFAULT_WORKFLOW);
+  const gate = (over: Record<string, unknown> = {}) => ({ key: "terms", policyPublicId: POLICY, point: "order_start" as const, signatureMode: "checkbox" as const, askAgainOnNewVersion: true, ...over });
+
+  it("accepts a valid gate at order start and at an active step", () => {
+    expect(codes({ ...base(), acceptanceGates: [gate(), gate({ key: "review_terms", point: { stepKey: "in_review" } })] })).toEqual([]);
+  });
+
+  it("reports key format/duplicates, missing policy, and missing/unknown/final step", () => {
+    const draft = {
+      ...base(),
+      acceptanceGates: [
+        gate({ key: "Bad Key" }),
+        gate(),
+        gate({ key: "terms" }),
+        gate({ key: "no_policy", policyPublicId: "" }),
+        gate({ key: "no_step", point: { stepKey: "" } }),
+        gate({ key: "ghost", point: { stepKey: "nowhere" } }),
+        gate({ key: "final", point: { stepKey: "completed" } }),
+      ],
+    } as WorkflowDraftDefinition;
+    expect(codes(draft)).toEqual([
+      "error:GATE_KEY_FORMAT@acceptanceGates.0.key",
+      "error:GATE_KEY_DUPLICATE@acceptanceGates.2.key",
+      "error:GATE_POLICY_REQUIRED@acceptanceGates.3.policyPublicId",
+      "error:GATE_STEP_REQUIRED@acceptanceGates.4.point",
+      "error:GATE_STEP_UNKNOWN@acceptanceGates.5.point",
+      "error:GATE_STEP_TERMINAL@acceptanceGates.6.point",
+    ]);
+  });
+
+  it("validates workflow and slot storage folders: tokens ok; traversal, absolute, backslash, unknown tokens and control characters refused", () => {
+    const withSlot = (storageFolder: string) => {
+      const draft = base();
+      draft.states[0] = { ...draft.states[0]!, requirements: { uploads: [{ key: "contract", label: "Contract", kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"], storageFolder }], acknowledgements: [] } };
+      return draft;
+    };
+    expect(codes({ ...base(), storageFolder: "customers/{customer_ref}/orders/{order_ref}/{phase}" })).toEqual([]);
+    expect(codes(withSlot("uploads/{slot}/{yyyy}-{mm}")).filter((c) => c.includes("FOLDER"))).toEqual([]);
+    for (const bad of ["../secrets", "a/../../b", "/etc/passwd", "a\\b", "orders/{unknown}", "a//b", "tab\there", "x:y", "con"]) {
+      expect(codes({ ...base(), storageFolder: bad }), bad).toContain("error:WORKFLOW_FOLDER_INVALID@storageFolder");
+      expect(codes(withSlot(bad)).some((c) => c.startsWith("error:UPLOAD_FOLDER_INVALID@states.0.requirements.uploads.0.storageFolder")), bad).toBe(true);
+    }
+  });
+
+});
+
 describe("designer service", () => {
   let standardId: string;
   let v1OrderId: string;
@@ -356,5 +404,18 @@ describe("automation trigger context (order triggers)", () => {
     expect(await resolve(tapEvent("order.created", null))).toEqual({});
     expect(await resolve(tapEvent("order.created", "x"))).toEqual({});
     expect(await resolve(tapEvent("order.created", "01ARZ3NDEKTSV4RRFFQ69G5FAV"))).toEqual({});
+  });
+});
+
+describe("acceptance gates publish guard (part B)", () => {
+  it("publishing gates needs workflow rules switched on (fail closed)", async () => {
+    const POLICY = "01JD0000000000000000000P01";
+    const draft = await mod.workflows.createDraft(admin.principal, { from: "blank", workflowKey: "gated", name: "Gated" });
+    const definition = structuredClone(BLANK_DRAFT);
+    definition.transitions.push({ from: "submitted", to: "completed", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: false });
+    definition.acceptanceGates = [{ key: "terms", policyPublicId: POLICY, point: "order_start", signatureMode: "checkbox", askAgainOnNewVersion: true }];
+    const saved = await mod.workflows.saveDraft(admin.principal, { draftId: draft.publicId, expectedVersion: 1, name: "Gated", definition });
+    expect(saved.publishable).toBe(true);
+    await expectError(mod.workflows.publishDraft(admin.principal, { draftId: draft.publicId, expectedVersion: saved.rowVersion, makeDefault: false }), "VALIDATION:WORKFLOW_RULES_DISABLED");
   });
 });

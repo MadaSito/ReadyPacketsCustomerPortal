@@ -557,6 +557,7 @@ export const recordRefundSchema = z.strictObject({
   reference: nfcTrimmedString(1, 128),
   notes: nfcTrimmedString(0, 500).optional(),
   refundedAt: z.coerce.date().optional(),
+  confirmationPhrase: z.string().trim().min(1).max(32),
   idempotencyKey: z.string().trim().min(8).max(128),
 });
 
@@ -637,6 +638,17 @@ export function computeInvoiceTotals(input: {
   };
 }
 
+export const INVOICE_PAYMENT_STATES = [
+  "unpaid",
+  "partially_paid",
+  "paid",
+  "partially_refunded",
+  "refunded",
+  "void",
+] as const;
+export type InvoicePaymentState = (typeof INVOICE_PAYMENT_STATES)[number];
+export type OrderHeaderPaymentState = "unpaid" | "paid" | "partially_refunded" | "refunded" | "void";
+
 /**
  * Deterministic derivation of invoice status from recorded issuance, void, payment and refund evidence.
  * Invoice status is NEVER set arbitrarily by a status-dropdown mutation.
@@ -653,6 +665,73 @@ export function deriveInvoiceStatus(evidence: {
   const netPaidMinor = evidence.grossPaidMinor - evidence.refundedMinor;
   if (evidence.totalMinor === 0) return "paid";
   return netPaidMinor >= evidence.totalMinor ? "paid" : "issued";
+}
+
+/**
+ * Deterministic derivation of invoice payment state (`unpaid | partially_paid | paid | partially_refunded | refunded | void`)
+ * without changing `InvoiceStatus` (`draft | issued | paid | void`).
+ */
+export function deriveInvoicePaymentState(evidence: {
+  issuedAt: Date | null;
+  voidedAt: Date | null;
+  totalMinor: number;
+  grossPaidMinor: number;
+  refundedMinor: number;
+}): InvoicePaymentState {
+  if (evidence.grossPaidMinor > 0 && evidence.refundedMinor >= evidence.grossPaidMinor) {
+    return "refunded";
+  }
+  if (evidence.grossPaidMinor > 0 && evidence.refundedMinor > 0) {
+    return "partially_refunded";
+  }
+  if (evidence.voidedAt !== null) return "void";
+  if (evidence.issuedAt !== null && evidence.totalMinor === 0) return "paid";
+  if (evidence.totalMinor > 0 && evidence.grossPaidMinor >= evidence.totalMinor) {
+    return "paid";
+  }
+  if (evidence.grossPaidMinor > 0) {
+    return "partially_paid";
+  }
+  return "unpaid";
+}
+
+export function deriveOrderPaymentSummaryState(
+  invoices: ReadonlyArray<{
+    issuedAt: Date | null;
+    voidedAt: Date | null;
+    totalMinor: number;
+    grossPaidMinor: number;
+    refundedMinor: number;
+  }>,
+): {
+  headerState: OrderHeaderPaymentState;
+  workspaceState: InvoicePaymentState | "none";
+} {
+  if (invoices.length === 0) {
+    return { headerState: "unpaid", workspaceState: "none" };
+  }
+  const totalGrossPaid = invoices.reduce((sum, i) => sum + i.grossPaidMinor, 0);
+  const totalRefunded = invoices.reduce((sum, i) => sum + i.refundedMinor, 0);
+  const nonVoid = invoices.filter((i) => i.voidedAt === null);
+
+  if (totalGrossPaid > 0 && totalRefunded >= totalGrossPaid) {
+    return { headerState: "refunded", workspaceState: "refunded" };
+  }
+  if (totalGrossPaid > 0 && totalRefunded > 0) {
+    return { headerState: "partially_refunded", workspaceState: "partially_refunded" };
+  }
+  if (nonVoid.length === 0) {
+    return { headerState: "void", workspaceState: "void" };
+  }
+  const nonVoidTotal = nonVoid.reduce((sum, i) => sum + i.totalMinor, 0);
+  const allIssued = nonVoid.every((i) => i.issuedAt !== null);
+  if (allIssued && (nonVoidTotal === 0 || totalGrossPaid >= nonVoidTotal)) {
+    return { headerState: "paid", workspaceState: "paid" };
+  }
+  if (totalGrossPaid > 0) {
+    return { headerState: "unpaid", workspaceState: "partially_paid" };
+  }
+  return { headerState: "unpaid", workspaceState: "unpaid" };
 }
 
 export function formatInvoiceNumber(prefix: string, issuedAt: Date, sequenceNumber: number): string {

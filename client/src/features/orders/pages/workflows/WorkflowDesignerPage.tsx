@@ -61,6 +61,7 @@ import {
   type WizardStepId,
   type WorkflowIssue,
 } from "./model";
+import { AcceptanceGatesEditor, PhasesEditor, RulesReviewSummary, StateRulesFields, StorageFolderEditor } from "./rulesFields";
 
 export default function WorkflowDesignerPage() {
   const { draftId = "" } = useParams<{ draftId: string }>();
@@ -306,6 +307,7 @@ function StepBody(props: StepBodyProps) {
     transitions: "Which moves are possible. Every status except a final one needs a way out.",
     who: "Who may make each move. The server enforces this for every request.",
     notices: "Whether the customer is told about each move, and whether the person moving it must write a note.",
+    rules: "Optional. Group statuses into phases and list what must be uploaded or accepted before an order can leave a status. Publishing these rules needs the workflow rules setting turned on in Settings.",
     review: "Check the summary, then publish. Orders already in progress keep the version they started on.",
   };
   const problems =
@@ -316,7 +318,7 @@ function StepBody(props: StepBodyProps) {
         title={blocked ? "Fix these problems to continue" : "Problems found when the draft was last saved"}
       />
     );
-  const noTransitions = definition.transitions.length === 0 && step !== "statuses" && step !== "transitions" && step !== "review";
+  const noTransitions = definition.transitions.length === 0 && step !== "statuses" && step !== "transitions" && step !== "rules" && step !== "review";
 
   return (
     <div className="flex flex-col gap-5">
@@ -405,6 +407,24 @@ function StepBody(props: StepBodyProps) {
         </ol>
       ) : null}
 
+      {step === "rules" ? (
+        <>
+          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
+          <ol className="flex flex-col gap-4">
+            {definition.states.map((state, index) => (
+              <li key={index}>
+                <fieldset className="rounded-[var(--radius-card)] border border-line p-4">
+                  <legend className="px-1 text-sm font-semibold text-ink">{`Status ${index + 1}: ${state.label.trim() || "(no label)"}`}</legend>
+                  <StateRulesFields definition={definition} state={state} index={index} issues={issues} onChange={(patch) => edit((current) => ({ ...current, ...updateState(current.definition, current.layout, index, patch) }))} />
+                </fieldset>
+              </li>
+            ))}
+          </ol>
+        </>
+      ) : null}
+
       {step === "review" ? <ReviewStep {...props} /> : null}
     </div>
   );
@@ -418,6 +438,7 @@ function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, set
       {publishable ? <Callout tone="success">The draft has no problems and is ready to publish.</Callout> : null}
       {dirty ? <Callout tone="info">You have unsaved changes. Publishing saves them first.</Callout> : null}
       <DefinitionTables definition={definition} />
+      <RulesReviewSummary definition={definition} />
       <Checkbox label="Use for new orders (default workflow)" description="If you leave this off, new orders keep using the current default." checked={makeDefault} onCheckedChange={setMakeDefault} />
       <Field label="Change note (optional)" hint="Shown in the version list, for example why the change was made.">
         <Textarea value={changeNote} maxLength={500} rows={3} onChange={(event) => setChangeNote(event.target.value)} />
@@ -540,6 +561,7 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
           <Card title={`Status: ${selectedState.label || "(no label)"}`} headingLevel={2}>
             <div className="flex flex-col gap-4">
               <StatusFields state={selectedState} index={indexOfId(selected.id)} issues={issues} onChange={(patch) => edit((current) => ({ ...current, ...updateState(current.definition, current.layout, indexOfId(selected.id), patch) }))} />
+              <StateRulesFields definition={definition} state={selectedState} index={indexOfId(selected.id)} issues={issues} onChange={(patch) => edit((current) => ({ ...current, ...updateState(current.definition, current.layout, indexOfId(selected.id), patch) }))} />
               <Button variant="danger" size="sm" onClick={() => remove(selected)}>
                 Remove status
               </Button>
@@ -572,6 +594,15 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
             <p className="text-body">Select a status or a transition on the canvas to edit it here. You can also use the forms below instead of dragging.</p>
           </Card>
         ) : null}
+        <Card title="Phases" headingLevel={2}>
+          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+        </Card>
+        <Card title="Acceptance and storage" headingLevel={2}>
+          <div className="flex flex-col gap-4">
+            <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
+            <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
+          </div>
+        </Card>
         <Card title="Add" headingLevel={2}>
           <div className="flex flex-col gap-4">
             <Button

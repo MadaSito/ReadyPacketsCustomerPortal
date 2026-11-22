@@ -9,7 +9,7 @@ export const dashboardFeature: FeatureRoutes = {
     { path: "/admin", access: "staff", title: "Overview", component: lazy(() => import("./pages/ConsoleOverviewPage")) },
   ],
   nav: [
-    { label: "Home", href: "/", icon: Home, area: "customer", access: "customer", order: 0 },
+    { label: "Dashboard", href: "/", icon: Home, area: "customer", access: "customer", order: 0 },
     { label: "Overview", href: "/admin", icon: LayoutDashboard, area: "console", group: "Overview", access: "staff", order: 0 },
   ],
 };

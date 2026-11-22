@@ -599,3 +599,6 @@ export const complianceProviderEvents = mysqlTable(
     uniqueIndex("cmp_pevt_prov_evt_uq").on(t.provider, t.providerEventId),
   ],
 );
+
+/* Order policy acceptance evidence (package V, owner identity_engineer). */
+export * from "./acceptanceSchema.js";

@@ -10,7 +10,8 @@ import type { Capability } from "../../../shared/capabilities.js";
 import type { ActorGuard } from "./actorGuard.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { MAX_CONFIG_DOCUMENT_BYTES } from "./configTransfer.js";
-import { adminProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
+import { adminProcedure, protectedProcedure, publicProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
+import { recordInputSchema, searchInputSchema } from "./consent.js";
 import type { PlatformModuleImpl } from "./module.js";
 import type { Services } from "../../container.js";
 
@@ -43,10 +44,24 @@ function settingWriteGuard(platform: PlatformModuleImpl, principal: SessionPrinc
 }
 
 const manage = adminProcedure.use(requireCapability("platform.settings.manage"));
+const consentRead = adminProcedure.use(requireCapability("privacy.consent.read"));
 
 export const platformRouter = router({
   setupStatus: publicProcedure.query(({ ctx }) => ctx.services.platform.setupStatus()),
   presentation: publicProcedure.query(({ ctx }) => ctx.services.platform.presentation()),
+  /** Public: clientVisible flag states + consent configuration (increment 04, package J). */
+  bootstrap: publicProcedure.query(({ ctx }) => impl(ctx.services).consent.bootstrap()),
+  consent: router({
+    inventory: publicProcedure.query(({ ctx }) => impl(ctx.services).consent.inventory()),
+    record: publicProcedure
+      .meta({ rateLimit: "form_submission" })
+      .input(recordInputSchema)
+      .mutation(({ ctx, input }) => {
+        const full = ctx.session && ctx.session.state === "full" ? ctx.session : null;
+        return impl(ctx.services).consent.record(input, { userPublicId: full?.userPublicId ?? null, ipAddress: ctx.request.ipAddress ?? null });
+      }),
+    mine: protectedProcedure.query(({ ctx }) => impl(ctx.services).consent.mine(ctx.session.userPublicId)),
+  }),
 
   admin: router({
     settings: router({
@@ -84,6 +99,14 @@ export const platformRouter = router({
           });
           return store.describeOne(input.key);
         }),
+    }),
+    consent: router({
+      stats: consentRead.input(z.strictObject({ days: z.number().int().min(1).max(400).default(30) })).query(({ ctx, input }) => impl(ctx.services).consent.stats(input.days)),
+      search: consentRead.input(searchInputSchema).query(({ ctx, input }) => impl(ctx.services).consent.search(input)),
+      export: consentRead
+        .meta({ rateLimit: "expensive" })
+        .input(searchInputSchema.omit({ cursor: true, limit: true }))
+        .mutation(({ ctx, input }) => impl(ctx.services).consent.exportCsv(input)),
     }),
     health: staffProcedure.use(requireCapability("platform.health.read")).query(({ ctx }) => ctx.services.platform.healthReport()),
     setupChecklist: adminProcedure.query(({ ctx }) => ctx.services.platform.setupChecklist()),

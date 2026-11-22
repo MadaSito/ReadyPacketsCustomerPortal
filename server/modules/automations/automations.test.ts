@@ -1105,4 +1105,512 @@ describe("automations module (Package J)", () => {
     expect(afterReclaim.reasonCode).toBe("WEBHOOK_LEASE_LOST_IN_FLIGHT");
     expect(afterReclaim.steps[0]!.state).toBe("unknown");
   });
+
+  it("lists workflow steps with bound automations and runs stage actions for staff with order context, idempotency, rate limits, and audit", async () => {
+    const admin = await insertSyntheticUser(h, t.db, {
+      role: "admin",
+      name: "Ada Admin",
+      stepUp: true,
+    });
+    const staff = await insertSyntheticUser(h, t.db, {
+      role: "staff",
+      name: "Sam Staff",
+      stepUp: false,
+    });
+    const customer = await insertSyntheticUser(h, t.db, {
+      role: "customer",
+      name: "Casey Customer",
+    });
+
+    const adminCaller = callerFor(admin.principal);
+    const staffCaller = callerFor(staff.principal);
+    const customerCaller = callerFor(customer.principal);
+
+    const order = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      12_500,
+      "Stage Actions Packet",
+    );
+    // Clear any initial order.created tap jobs from order placement before creating automations.
+    h.jobs.enqueued.length = 0;
+
+    // 1. Enabled `order.created` -> binds ONLY to `initial` step (`submitted`).
+    const createdAuto = await adminCaller.automations.create({
+      name: "Initial welcome alert",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.created" },
+      actions: [
+        {
+          stepKey: "notify_staff",
+          actionKey: "notification.send_in_app",
+          label: "Alert staff on intake",
+          config: {
+            recipientKey: "staff",
+            title: "Intake ready {{order_reference}}",
+            body: "Order {{order_reference}} is at {{order_status_label}}.",
+          },
+        },
+      ],
+    });
+
+    // 2. Enabled `order.status_changed` targeting `in_review` (maxRunsPerHour: 1 to also verify rate limits).
+    const reviewAuto = await adminCaller.automations.create({
+      name: "Review stage customer update",
+      description: "Sends customer + acting staff notice for review stage.",
+      enabled: true,
+      maxRunsPerHour: 1,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      conditions: {
+        match: "all",
+        groups: [
+          {
+            match: "all",
+            conditions: [{ field: "to_status", operator: "eq", value: "in_review" }],
+          },
+        ],
+      },
+      actions: [
+        {
+          stepKey: "notify_owner",
+          actionKey: "notification.send_in_app",
+          label: "Notify order owner",
+          config: {
+            recipientKey: "order_owner",
+            title: "Stage update {{order_reference}}",
+            body: "Your order {{order_reference}} stage action ran for {{order_status_label}}.",
+          },
+        },
+        {
+          stepKey: "notify_actor",
+          actionKey: "notification.send_in_app",
+          label: "Confirm to acting staff",
+          config: {
+            recipientKey: "actor",
+            title: "Ran review stage {{order_reference}}",
+            body: "Executed by {{actor_role}}.",
+          },
+        },
+      ],
+    });
+
+    // 3. Enabled `order.status_changed` with `in` operator targeting `in_progress` and `delivered`.
+    await adminCaller.automations.create({
+      name: "Production & delivery milestone",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      conditions: {
+        match: "all",
+        groups: [
+          {
+            match: "all",
+            conditions: [
+              { field: "to_status", operator: "in", value: ["in_progress", "delivered"] },
+            ],
+          },
+        ],
+      },
+      actions: [
+        {
+          stepKey: "milestone_ping",
+          actionKey: "notification.send_in_app",
+          config: {
+            recipientKey: "administrators",
+            title: "Milestone {{order_reference}}",
+            body: "Milestone {{to_status}}",
+          },
+        },
+      ],
+    });
+
+    // 4. Disabled automation targeting `in_review` + unconstrained catch-all + `neq` rule -> must NOT bind.
+    await adminCaller.automations.create({
+      name: "Disabled review rule",
+      enabled: false,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      conditions: {
+        match: "all",
+        groups: [
+          {
+            match: "all",
+            conditions: [{ field: "to_status", operator: "eq", value: "in_review" }],
+          },
+        ],
+      },
+      actions: [
+        {
+          stepKey: "noop",
+          actionKey: "notification.send_in_app",
+          config: { recipientKey: "administrators", title: "Disabled", body: "Disabled" },
+        },
+      ],
+    });
+    await adminCaller.automations.create({
+      name: "Global status catch-all",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      actions: [
+        {
+          stepKey: "catch_all",
+          actionKey: "notification.send_in_app",
+          config: { recipientKey: "administrators", title: "Any", body: "Any" },
+        },
+      ],
+    });
+    await adminCaller.automations.create({
+      name: "Non-canceled catch-all",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      conditions: {
+        match: "all",
+        groups: [
+          {
+            match: "all",
+            conditions: [{ field: "to_status", operator: "neq", value: "canceled" }],
+          },
+        ],
+      },
+      actions: [
+        {
+          stepKey: "not_canceled",
+          actionKey: "notification.send_in_app",
+          config: { recipientKey: "administrators", title: "Not canceled", body: "Not canceled" },
+        },
+      ],
+    });
+
+    // While engine is disabled (default): staff can inspect stage actions and sees clear engineDisabledReason.
+    const disabledView = await staffCaller.automations.orderStageActions.get({
+      orderPublicId: order.publicId,
+    });
+    expect(disabledView.engineEnabled).toBe(false);
+    expect(disabledView.engineDisabledReason).toContain("Automations engine is turned off");
+    expect(disabledView.canManageAutomations).toBe(false);
+    expect(disabledView.currentStatusKey).toBe("submitted");
+
+    const submittedStep = disabledView.steps.find((s) => s.stepKey === "submitted")!;
+    expect(submittedStep.isCurrentOrderStep).toBe(true);
+    expect(submittedStep.automations.map((a) => a.publicId)).toEqual([createdAuto.publicId]);
+
+    const reviewStep = disabledView.steps.find((s) => s.stepKey === "in_review")!;
+    expect(reviewStep.configuredAutomationCount).toBe(1);
+    expect(reviewStep.configuredActionCount).toBe(2);
+    expect(reviewStep.automations[0]!.publicId).toBe(reviewAuto.publicId);
+    expect(reviewStep.automations[0]!.actionLabels).toEqual([
+      "Notify order owner",
+      "Confirm to acting staff",
+    ]);
+
+    const deliveredStep = disabledView.steps.find((s) => s.stepKey === "delivered")!;
+    expect(deliveredStep.configuredAutomationCount).toBe(1);
+    const canceledStep = disabledView.steps.find((s) => s.stepKey === "canceled")!;
+    expect(canceledStep.configuredAutomationCount).toBe(0);
+
+    // Engine-disabled check refuses `runForOrder` with PRECONDITION_FAILED / AUTOMATIONS_DISABLED.
+    await expect(
+      staffCaller.automations.orderStageActions.runForOrder({
+        orderPublicId: order.publicId,
+        stepKey: "in_review",
+        idempotencyKey: "idem-disabled-0001",
+      }),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+
+    // Enable the automations engine as admin.
+    await adminCaller.automations.settings.update({ enabled: true });
+    const adminView = await adminCaller.automations.orderStageActions.get({
+      orderPublicId: order.publicId,
+    });
+    expect(adminView.engineEnabled).toBe(true);
+    expect(adminView.engineDisabledReason).toBeNull();
+    expect(adminView.canManageAutomations).toBe(true);
+
+    // Staff runs `in_review` stage actions WITHOUT step-up.
+    const firstRun = await staffCaller.automations.orderStageActions.runForOrder({
+      orderPublicId: order.publicId,
+      stepKey: "in_review",
+      idempotencyKey: "stage-idem-review-01",
+    });
+    expect(firstRun.orderPublicId).toBe(order.publicId);
+    expect(firstRun.stepKey).toBe("in_review");
+    expect(firstRun.queuedRuns).toHaveLength(1);
+    expect(firstRun.queuedRuns[0]!.deduplicated).toBe(false);
+
+    // Repeating with the same idempotencyKey deduplicates without queuing a second run or duplicate audit row.
+    const dupRun = await staffCaller.automations.orderStageActions.runForOrder({
+      orderPublicId: order.publicId,
+      stepKey: "in_review",
+      idempotencyKey: "stage-idem-review-01",
+    });
+    expect(dupRun.queuedRuns).toHaveLength(1);
+    expect(dupRun.queuedRuns[0]!.deduplicated).toBe(true);
+    expect(dupRun.queuedRuns[0]!.runPublicId).toBe(firstRun.queuedRuns[0]!.runPublicId);
+
+    await drainAutomationJobs();
+
+    // Verify run history row is tagged with orderPublicId, stageStepKey, and acting staff user.
+    const runsPage = await staffCaller.automations.orderStageActions.listRuns({
+      orderPublicId: order.publicId,
+    });
+    expect(runsPage.items).toHaveLength(1);
+    expect(runsPage.items[0]!.publicId).toBe(firstRun.queuedRuns[0]!.runPublicId);
+    expect(runsPage.items[0]!.state).toBe("completed");
+    expect(runsPage.items[0]!.orderPublicId).toBe(order.publicId);
+    expect(runsPage.items[0]!.stageStepKey).toBe("in_review");
+    expect(runsPage.items[0]!.triggeredBy).toEqual({
+      publicId: staff.publicId,
+      displayName: "Sam Staff",
+      role: "staff",
+    });
+
+    // Verify order context & recipients executed cleanly through the engine (without changing order status!).
+    const refreshedOrder = await orders.getOrderSummary(staff.principal, order.publicId);
+    expect(refreshedOrder.statusKey).toBe("submitted");
+
+    const customerNotifs = await customerCaller.engagement.notifications.list({});
+    expect(
+      customerNotifs.items.some(
+        (n) =>
+          n.title.includes(order.reference) &&
+          n.body.includes("Being reviewed"),
+      ),
+    ).toBe(true);
+    const staffNotifs = await staffCaller.engagement.notifications.list({});
+    expect(
+      staffNotifs.items.some(
+        (n) => n.title.includes(order.reference) && n.body.includes("Executed by staff."),
+      ),
+    ).toBe(true);
+
+    // Verify `order.stage_actions.run` appears in staff Order history under `automation` and is hidden from customers.
+    const staffHistory = await auditCenter.orderActivity(staff.principal, {
+      orderPublicId: order.publicId,
+      category: "automation",
+    });
+    expect(staffHistory.view).toBe("staff");
+    if (staffHistory.view === "staff") {
+      const stageAudit = staffHistory.items.filter(
+        (item) => item.eventName === "order.stage_actions.run",
+      );
+      expect(stageAudit).toHaveLength(1);
+      expect(stageAudit[0]!.details.step_key).toBe("in_review");
+    }
+    const customerHistory = await auditCenter.orderActivity(customer.principal, {
+      orderPublicId: order.publicId,
+    });
+    expect(customerHistory.items.some((i) => i.category === "automation")).toBe(false);
+
+    // Existing per-automation hourly limit (`maxRunsPerHour: 1`) still governs stage-action runs!
+    const rateLimitedRun = await staffCaller.automations.orderStageActions.runForOrder({
+      orderPublicId: order.publicId,
+      stepKey: "in_review",
+      idempotencyKey: "stage-idem-review-02",
+    });
+    expect(rateLimitedRun.queuedRuns[0]!.deduplicated).toBe(false);
+    await drainAutomationJobs();
+
+    const afterSecond = await staffCaller.automations.orderStageActions.listRuns({
+      orderPublicId: order.publicId,
+    });
+    expect(afterSecond.items).toHaveLength(2);
+    expect(afterSecond.items[0]!.state).toBe("rate_limited");
+    expect(afterSecond.items[0]!.reasonCode).toBe("AUTOMATION_RATE_LIMITED");
+  });
+
+  it("enforces customer permission boundary on orderStageActions router and service methods", async () => {
+    const admin = await insertSyntheticUser(h, t.db, { role: "admin", stepUp: true });
+    const customer = await insertSyntheticUser(h, t.db, { role: "customer" });
+    const order = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      9_000,
+      "Customer Boundary Order",
+    );
+
+    const customerCaller = callerFor(customer.principal);
+
+    await expect(
+      customerCaller.automations.orderStageActions.get({ orderPublicId: order.publicId }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    await expect(
+      customerCaller.automations.orderStageActions.listRuns({ orderPublicId: order.publicId }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    await expect(
+      customerCaller.automations.orderStageActions.runForOrder({
+        orderPublicId: order.publicId,
+        stepKey: "submitted",
+        idempotencyKey: "cust-denied-0001",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    // Direct service-layer boundary checks also fail closed with AUTOMATIONS_FORBIDDEN + durable denial audit.
+    await expect(
+      automationsMod.getOrderStageActions(customer.principal, { orderPublicId: order.publicId }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      reasonCode: "AUTOMATIONS_FORBIDDEN",
+    });
+    await expect(
+      automationsMod.runForOrder(customer.principal, {
+        orderPublicId: order.publicId,
+        stepKey: "submitted",
+        idempotencyKey: "cust-denied-0002",
+      }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      reasonCode: "AUTOMATIONS_FORBIDDEN",
+    });
+  });
+
+  it("proves a stage-action run cannot change order status or permissions even if persisted step rows are tampered", async () => {
+    const admin = await insertSyntheticUser(h, t.db, { role: "admin", stepUp: true });
+    const staff = await insertSyntheticUser(h, t.db, { role: "staff" });
+    const customer = await insertSyntheticUser(h, t.db, { role: "customer" });
+
+    const adminCaller = callerFor(admin.principal);
+    const staffCaller = callerFor(staff.principal);
+    await adminCaller.automations.settings.update({ enabled: true });
+
+    const order = await placeCustomerOrder(
+      admin.principal,
+      customer.principal,
+      15_000,
+      "Immutable Status & Role Proof",
+    );
+    h.jobs.enqueued.length = 0;
+
+    // Layer 1: Registration and create/update reject status-changing and permission-changing action keys.
+    expect(() => assertAllowedActionKey("order.status.set")).toThrow(/prohibited/i);
+    expect(() => assertAllowedActionKey("order.transition")).toThrow(/prohibited/i);
+    expect(() => assertAllowedActionKey("identity.role.assign")).toThrow(/prohibited/i);
+    expect(() => assertAllowedActionKey("identity.permission.grant")).toThrow(/prohibited/i);
+
+    expect(() =>
+      automationsMod.registerAutomationAction({
+        key: "order.status.set",
+        label: "Illegal status mutator",
+        description: "Must never register",
+        category: "Messaging",
+        owner: "automations",
+        requiresOrderContext: false,
+        forbidOnStaffOnlyTrigger: false,
+        retrySafe: true,
+        configFields: [],
+        configSchema: z.object({}),
+        async run() {
+          return { outcome: "completed" };
+        },
+      }),
+    ).toThrow(/prohibited/i);
+
+    await expect(
+      adminCaller.automations.create({
+        name: "Illegal status stage action",
+        enabled: true,
+        trigger: { kind: "event", triggerKey: "order.created" },
+        actions: [{ stepKey: "mut_status", actionKey: "order.status.set", config: {} }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+
+    await expect(
+      adminCaller.automations.create({
+        name: "Illegal role stage action",
+        enabled: true,
+        trigger: { kind: "event", triggerKey: "order.created" },
+        actions: [{ stepKey: "mut_role", actionKey: "identity.role.assign", config: {} }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+
+    // Layer 2: Even if a valid stage-bound automation's persisted version/run-step rows are tampered in DB
+    // before the worker executes a `runForOrder` job, the worker blocks execution with `ACTION_PROHIBITED`
+    // and leaves order status and user roles untouched.
+    const stageAuto = await adminCaller.automations.create({
+      name: "Stage action tampered at rest",
+      enabled: true,
+      trigger: { kind: "event", triggerKey: "order.status_changed" },
+      conditions: {
+        match: "all",
+        groups: [
+          {
+            match: "all",
+            conditions: [{ field: "to_status", operator: "eq", value: "in_review" }],
+          },
+        ],
+      },
+      actions: [
+        {
+          stepKey: "step_status",
+          actionKey: "notification.send_in_app",
+          config: { recipientKey: "administrators", title: "Safe", body: "Safe" },
+        },
+        {
+          stepKey: "step_role",
+          actionKey: "notification.send_in_app",
+          config: { recipientKey: "administrators", title: "Safe 2", body: "Safe 2" },
+        },
+      ],
+    });
+
+    const stageRun = await staffCaller.automations.orderStageActions.runForOrder({
+      orderPublicId: order.publicId,
+      stepKey: "in_review",
+      idempotencyKey: "tamper-proof-0001",
+    });
+    const runPublicId = stageRun.queuedRuns[0]!.runPublicId;
+
+    const [autoDbRow] = await t.db
+      .select({ id: automationTables.automations.id })
+      .from(automationTables.automations)
+      .where(eq(automationTables.automations.publicId, stageAuto.publicId));
+    const [runDbRow] = await t.db
+      .select({ id: automationTables.automationRuns.id })
+      .from(automationTables.automationRuns)
+      .where(eq(automationTables.automationRuns.publicId, runPublicId));
+
+    await t.db
+      .update(automationTables.automationVersions)
+      .set({
+        actionsJson: JSON.stringify([
+          { stepKey: "step_status", actionKey: "order.status.set", label: null, config: { to: "completed" } },
+          { stepKey: "step_role", actionKey: "identity.role.assign", label: null, config: { role: "admin" } },
+        ]),
+      })
+      .where(eq(automationTables.automationVersions.automationId, autoDbRow!.id));
+
+    await t.db
+      .update(automationTables.automationRunSteps)
+      .set({ actionKey: "order.status.set" })
+      .where(eq(automationTables.automationRunSteps.runId, runDbRow!.id));
+
+    await drainAutomationJobs();
+
+    const finishedRun = await adminCaller.automations.runs.get({ runPublicId });
+    expect(finishedRun.state).toBe("failed");
+    expect(finishedRun.reasonCode).toBe("ACTION_PROHIBITED");
+    expect(finishedRun.steps[0]!.state).toBe("failed");
+    expect(finishedRun.steps[0]!.reasonCode).toBe("ACTION_PROHIBITED");
+    expect(finishedRun.steps[1]!.state).toBe("skipped");
+    expect(finishedRun.steps[1]!.reasonCode).toBe("PRIOR_STEP_FAILED");
+
+    // Verify neither order status nor customer/staff roles changed in MySQL.
+    const [orderRowAfter] = await t.db
+      .select({ statusKey: orderTables.orders.statusKey })
+      .from(orderTables.orders)
+      .where(eq(orderTables.orders.publicId, order.publicId));
+    expect(orderRowAfter!.statusKey).toBe("submitted");
+
+    const [customerRowAfter] = await t.db
+      .select({ role: users.role })
+      .from(users)
+      .where(eq(users.id, customer.id));
+    const [staffRowAfter] = await t.db
+      .select({ role: users.role })
+      .from(users)
+      .where(eq(users.id, staff.id));
+    expect(customerRowAfter!.role).toBe("customer");
+    expect(staffRowAfter!.role).toBe("staff");
+  });
 });

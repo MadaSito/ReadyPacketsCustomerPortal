@@ -59,6 +59,16 @@ export const jobMaintenance = mysqlTable("job_maintenance", {
   updatedAt: updatedAtColumn(),
 });
 
+export const customerMaintenance = mysqlTable("customer_maintenance", {
+  id: int("id", { unsigned: true }).primaryKey(),
+  enabled: boolean("enabled").notNull().default(false),
+  message: varchar("message", { length: 500 }).notNull().default(""),
+  startsAt: utcDateTime("starts_at"),
+  endsAt: utcDateTime("ends_at"),
+  version: int("version", { unsigned: true }).notNull().default(0),
+  updatedAt: updatedAtColumn(),
+});
+
 export const mailOutbox = mysqlTable("mail_outbox", {
   id: idColumn(),
   publicId: publicIdColumn(),
@@ -106,6 +116,13 @@ export const mailTransportAttempts = mysqlTable("mail_transport_attempts", {
   startedAt: utcDateTime("started_at").notNull(),
   finishedAt: utcDateTime("finished_at"),
 }, (t) => [uniqueIndex("mail_transport_attempts_slot_uq").on(t.mailId, t.generation, t.purpose)]);
+
+export const mailManualResends = mysqlTable("mail_manual_resends", {
+  id: idColumn(),
+  mailId: refColumn("mail_id").notNull().references(() => mailOutbox.id),
+  generation: int("generation", { unsigned: true }).notNull(),
+  queuedAt: utcDateTime("queued_at").notNull(),
+}, (t) => [uniqueIndex("mail_manual_resends_generation_uq").on(t.mailId, t.generation)]);
 
 export const mailAuditVerification = mysqlTable("mail_audit_verification", {
   id: int("id", { unsigned: true }).primaryKey(),

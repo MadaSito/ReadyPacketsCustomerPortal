@@ -289,14 +289,13 @@ ensure_swap() {
     note "$swap_file is active and listed in /etc/fstab"
 }
 
-certbot_available() { [[ -n $(apt-cache policy certbot 2>/dev/null | awk '$1 == "Candidate:" && $2 != "(none)" { print $2 }') ]]; }
 install_packages() {
-    local -a packages=(ca-certificates curl git openssl xz-utils nginx mysql-server mysql-client)
+    local -a packages=(ca-certificates curl git openssl xz-utils nginx mysql-server mysql-client ffmpeg util-linux)
     local -a tools=(nginx mysql mysqldump mysqld git curl openssl xz)
     if ((self_signed)); then
-        say 'Installing system packages (Nginx, MySQL, Git, curl, OpenSSL)'
+        say 'Installing system packages (Nginx, MySQL, FFmpeg, Git, curl, OpenSSL)'
     else
-        say 'Installing system packages (Nginx, MySQL, Certbot, Git, curl, OpenSSL)'
+        say 'Installing system packages (Nginx, MySQL, FFmpeg, Certbot, Git, curl, OpenSSL)'
         packages+=(certbot)
         tools+=(certbot)
     fi
@@ -308,25 +307,23 @@ install_packages() {
     (
         # Package scripts expect the usual umask; ours is stricter.
         umask 022
+        # Intentional: scope the package-script environment to this subshell.
+        # shellcheck disable=SC2031
         export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
         apt-get -o DPkg::Lock::Timeout=600 update --quiet
-        if ((!self_signed)) && ! certbot_available; then
-            # Certbot is published in Ubuntu's "universe" component, which minimal images leave switched off.
-            printf '    switching on the Ubuntu "universe" package component (Certbot is published there)\n'
-            apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends software-properties-common
-            add-apt-repository --yes --no-update universe
-            apt-get -o DPkg::Lock::Timeout=600 update --quiet
-            certbot_available || {
-                printf 'ReadyPackets: the certbot package is not available from this server'"'"'s package sources.\n' >&2
-                exit 1
-            }
+        # FFmpeg is in "universe" even for self-signed installations, which still don't install Certbot.
+        if ! apt_candidate ffmpeg || { ((!self_signed)) && ! apt_candidate certbot; }; then
+            enable_universe
         fi
+        apt_candidate ffmpeg || die 'ffmpeg is not available from the configured Ubuntu package sources'
+        if ((!self_signed)); then apt_candidate certbot || die 'certbot is not available from the configured Ubuntu package sources'; fi
         apt-get -o DPkg::Lock::Timeout=600 install --yes --quiet --no-install-recommends "${packages[@]}"
     )
     local tool
     for tool in "${tools[@]}"; do
         command -v "$tool" >/dev/null || die "$tool is missing after the package installation"
     done
+    [[ -x /usr/bin/ffmpeg && -x /usr/bin/prlimit ]] || die 'expected /usr/bin/ffmpeg and /usr/bin/prlimit'
     mysqld --version | grep -Eq 'Ver[[:space:]]+8\.4\.' ||
         die "this installer expects MySQL 8.4 from the Ubuntu 26.04 archive, found: $(mysqld --version)"
 }

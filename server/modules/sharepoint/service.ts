@@ -22,6 +22,7 @@ import { graphDriveDiscovery } from "../storage/adapters/graphDrive.js";
 import { StorageAdapterError } from "../storage/adapters/graphDriveErrors.js";
 import type { GraphCredentials, GraphHttpPort } from "../storage/adapters/graphDrivePort.js";
 import { assertCurrentStorageAdmin } from "../storage/authz.js";
+import { recordCopyAttempt } from "../storage/copyLogWriter.js";
 import { buildOrderFields, fieldsHash, portalLinkFor, validListName } from "./fields.js";
 import { createListClient } from "./listClient.js";
 import { sharepointOrderSync, sharepointSyncConfig, type SharepointSyncState } from "./schema.js";
@@ -129,14 +130,32 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       .values({ orderPublicId, desiredVersion: 1, state: "pending" })
       .onDuplicateKeyUpdate({ set: { desiredVersion: sql`${sharepointOrderSync.desiredVersion} + 1`, state: "pending", reasonCode: null } });
     const [row] = await tx.select({ v: sharepointOrderSync.desiredVersion }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId));
-    await jobs.enqueue<SyncJobPayload>(
+    const { jobId } = await jobs.enqueue<SyncJobPayload>(
       SYNC_JOB,
       { orderPublicId, ...(options.backfillScope ? { backfillScope: options.backfillScope } : {}) },
       { idempotencyKey: options.idempotencyKey ?? `sharepoint:order:${orderPublicId}:v${row?.v ?? 1}`, ...(options.correlationId ? { correlationId: options.correlationId } : {}), maxAttempts: 6 },
       tx,
     );
+    // Copy log: stage attempt 1 against the intended connection (idempotent when the enqueue was deduplicated).
+    const connectionPublicId = await assignedConnection(tx);
+    if (connectionPublicId) await copyAttempt(tx, { orderPublicId, jobId, attempt: 1, connectionPublicId, correlationId: options.correlationId }, { phase: "queued" });
     return true;
   }
+
+  type CopyPhase =
+    | { phase: "queued" }
+    | { phase: "started" }
+    | { phase: "finished"; result: "written"; alreadyAudited?: true }
+    | { phase: "finished"; result: "failed" | "not_written"; errorCode?: string; alreadyAudited?: true };
+  /** Copy log hook (storage package R). Called only inside fenced owner transactions; no provider data. */
+  async function copyAttempt(tx: Tx, at: { orderPublicId: string; jobId: string; attempt: number; connectionPublicId: string; correlationId?: string | null }, phase: CopyPhase): Promise<void> {
+    await recordCopyAttempt(
+      deps,
+      { kind: "sharepoint_order", sourcePublicId: at.orderPublicId, connectionPublicId: at.connectionPublicId, jobPublicId: at.jobId, attempt: at.attempt, correlationId: at.correlationId ?? null, ...phase },
+      tx,
+    );
+  }
+  const attemptOf = (job: ClaimedJob<SyncJobPayload>, connectionPublicId: string) => ({ orderPublicId: job.payload.orderPublicId, jobId: job.jobId, attempt: job.attempt, connectionPublicId, correlationId: job.correlationId });
 
   /** orders change listener: runs inside the order write transaction; a throw aborts that write. */
   async function onOrderChange(event: { orderId: number; orderPublicId: string; kind: string }, tx: Tx): Promise<void> {
@@ -153,18 +172,23 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
    */
   async function followUp(tx: Tx, orderPublicId: string, latestVersion: number, targetVersion: number, job: ClaimedJob<SyncJobPayload>): Promise<void> {
     if (latestVersion <= targetVersion) return;
-    await jobs.enqueue<SyncJobPayload>(
+    const { jobId } = await jobs.enqueue<SyncJobPayload>(
       SYNC_JOB,
       // Bulk work stays bound to its authorized scope; ordinary change dispatch follows current settings.
       { orderPublicId, ...(job.payload.backfillScope ? { backfillScope: job.payload.backfillScope } : {}) },
       { idempotencyKey: `sharepoint:order:${orderPublicId}:v${latestVersion}:after:${job.jobId}`, correlationId: job.correlationId, maxAttempts: 6 },
       tx,
     );
+    const connectionPublicId = await assignedConnection(tx);
+    if (connectionPublicId) await copyAttempt(tx, { orderPublicId, jobId, attempt: 1, connectionPublicId, correlationId: job.correlationId }, { phase: "queued" });
   }
 
-  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string, targetVersion?: number): Promise<void> {
+  async function markFailure(orderPublicId: string, reasonCode: string, state: SharepointSyncState, job: ClaimedJob<SyncJobPayload>, claimToken: string, targetVersion?: number, connectionPublicId?: string): Promise<void> {
     await db.transaction(async (tx) => {
       await job.assertStillOwned(tx);
+      // Unknown outcome (the remote write may have landed) is reported as failed with its reason code: the
+      // copy log never claims a write it cannot confirm. The owner's result audit is in this transaction.
+      if (connectionPublicId) await copyAttempt(tx, attemptOf(job, connectionPublicId), { phase: "finished", result: "failed", errorCode: reasonCode, alreadyAudited: true });
       if (targetVersion !== undefined) {
         const [latest] = await tx.select({ v: sharepointOrderSync.desiredVersion, token: sharepointOrderSync.claimToken }).from(sharepointOrderSync).where(eq(sharepointOrderSync.orderPublicId, orderPublicId)).for("update");
         if (latest?.token === claimToken) await followUp(tx, orderPublicId, latest.v, targetVersion, job);
@@ -213,7 +237,18 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
       return { kind: "claimed" as const, row: locked };
     });
     if (claim.kind === "missing") return { outcome: "canceled", reasonCode: "SHAREPOINT_SYNC_NOT_STAGED" };
-    if (claim.kind === "caught_up") return { outcome: "completed", safeCounts: { unchanged: 1 } };
+    if (claim.kind === "caught_up") {
+      // Nothing to write: close this attempt as an intentional no-op (no result audit for no-ops).
+      const caughtUpConnection = await assignedConnection(db);
+      if (caughtUpConnection) {
+        await db.transaction(async (tx) => {
+          await job.assertStillOwned(tx);
+          await copyAttempt(tx, attemptOf(job, caughtUpConnection), { phase: "started" });
+          await copyAttempt(tx, attemptOf(job, caughtUpConnection), { phase: "finished", result: "not_written" });
+        });
+      }
+      return { outcome: "completed", safeCounts: { unchanged: 1 } };
+    }
     if (claim.kind === "busy") return { outcome: "failed", reasonCode: "SHAREPOINT_SYNC_BUSY", retryable: true };
     const row = claim.row;
     const targetVersion = row.desiredVersion;
@@ -229,9 +264,13 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     // Bulk work: the settings revision and destination this run will use (pinned below by beforeWrite)
     // must equal the scope the administrator authorized.
     if (job.payload.backfillScope !== undefined && job.payload.backfillScope !== `${settingsVersion}:${connectionPublicId}:${destinationVersion}`) {
-      await markFailure(orderPublicId, "SHAREPOINT_BACKFILL_SCOPE_CHANGED", "failed", job, claimToken, targetVersion);
+      await markFailure(orderPublicId, "SHAREPOINT_BACKFILL_SCOPE_CHANGED", "failed", job, claimToken, targetVersion, connectionPublicId);
       return { outcome: "canceled", reasonCode: "SHAREPOINT_BACKFILL_SCOPE_CHANGED" };
     }
+    await db.transaction(async (tx) => {
+      await job.assertStillOwned(tx);
+      await copyAttempt(tx, attemptOf(job, connectionPublicId), { phase: "started" });
+    });
     try {
       const readProvider = () => deps.services.storageConnections.readAssignedProvider({ purpose: "order_data", connectionPublicId, kind: "sharepoint", assertStillOwned: job.assertStillOwned });
       const provider = await readProvider();
@@ -242,7 +281,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
 
       const order = await deps.services.orders.getOrderSyncView(orderPublicId);
       if (!order) {
-        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken, targetVersion);
+        await markFailure(orderPublicId, "SHAREPOINT_ORDER_NOT_FOUND", "failed", job, claimToken, targetVersion, connectionPublicId);
         return { outcome: "failed", reasonCode: "SHAREPOINT_ORDER_NOT_FOUND", retryable: false };
       }
       const owner = await deps.services.identity.getUser(order.ownerUserId);
@@ -319,6 +358,9 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
           })
           .where(ownsClaim);
         await followUp(tx, orderPublicId, latest?.v ?? targetVersion, targetVersion, job);
+        // Readback confirms only the RpOrderId marker, not the field contents, so the copy is "written", not
+        // "verified". Unchanged items are an intentional no-op.
+        await copyAttempt(tx, attemptOf(job, connectionPublicId), action === "unchanged" ? { phase: "finished", result: "not_written", alreadyAudited: true } : { phase: "finished", result: "written", alreadyAudited: true });
         await audit.record(
           {
             category: "integration",
@@ -339,7 +381,7 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     } catch (error) {
       if (!(error instanceof StorageAdapterError) && !(error instanceof DomainError)) throw error; // lost fence etc.
       const { reasonCode, retryable } = reasonFor(error);
-      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken, targetVersion);
+      await markFailure(orderPublicId, reasonCode, retryable ? "pending" : "failed", job, claimToken, targetVersion, connectionPublicId);
       return { outcome: "failed", reasonCode, retryable };
     }
   }

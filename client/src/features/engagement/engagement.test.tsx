@@ -173,7 +173,7 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
       },
     );
 
-    const bellButton = await screen.findByRole("button", { name: "Notifications (2 unread)" });
+    const bellButton = await screen.findByRole("button", { name: "Notifications, 2 unread" });
     expect(bellButton).toBeInTheDocument();
     await expectNoAxeViolations(container);
 
@@ -187,6 +187,18 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
     await user.type(searchInput, "RP-2026");
     await user.click(screen.getByRole("button", { name: "Run search" }));
     expect(location.history.at(-1)).toBe("/search?q=RP-2026");
+  });
+
+  it("uses 'Notifications, 99+ unread' accessible label when unread count exceeds 99 (WCAG 2.5.3)", async () => {
+    const { container } = renderEngagement(
+      <NotificationBellPopover area="customer" />,
+      {
+        "engagement.notifications.unreadCount": () => ({ unreadCount: 150 }),
+      },
+    );
+    const bellButton = await screen.findByRole("button", { name: "Notifications, 99+ unread" });
+    expect(bellButton).toBeInTheDocument();
+    await expectNoAxeViolations(container);
   });
 
   it("renders OrderMessagesTab with XSS payload strictly as inert plain text, sends messages, and passes axe", async () => {
@@ -1002,12 +1014,16 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
 
     const staffSearchView = renderEngagement(
       <>
+        <GlobalSearchBox area="console" />
         <SearchPage />
         <LocationProbe />
       </>,
       { "engagement.search.query": () => mockSearchPayload },
       { path: "/admin/search?q=RP-2026", role: "staff" },
     );
+
+    expect(screen.getByRole("search", { name: "Global search" })).toBeInTheDocument();
+    expect(screen.getByRole("search", { name: "Search results filters" })).toBeInTheDocument();
 
     const staffOrderLink = await screen.findByRole("link", { name: /RP-2026-0001 — Exhibit B Packet/ });
     expect(staffOrderLink).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);

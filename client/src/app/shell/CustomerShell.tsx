@@ -1,158 +1,190 @@
 /**
- * Customer shell: sticky top bar (approved lockup, up to MAX_PRIMARY_NAV primary links ≥ xl plus a "More" menu
- * for any extra, notifications bell, theme, avatar menu with the account entries), a menu drawer between md and
- * xl, bottom navigation on phones (first 4 primary + "More" drawer) and the footer. Placement is decided by
- * `customerNavLayout` (shell-level rule, see `NavItem.placement`), so peers' registrations can't crowd the bar.
+ * Customer shell (increment 04, decision 16): sticky top bar (logo, notifications, System | Light | Dark
+ * control, account menu), a left sidebar with Main / Support / Account sections at ≥ lg (collapsible to icons,
+ * in-memory only), the same sections in a drawer below lg, and the phone bottom bar (4 entries + More) below md.
+ * Entries with `enabledBy` appear only while their feature switch is on. Exactly one entry is current
+ * (longest matching href).
  */
-import { ChevronDown, Menu } from "lucide-react";
+import { ChevronsLeft, ChevronsRight, Menu } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { ALL_NAV } from "@/app/registry";
 import type { MeUser } from "@/lib/authApi";
-import { BrandLogo, Drawer, DropdownMenu, IconButton } from "@/ui";
+import type { NavItem } from "@/lib/routes";
+import { BrandLogo, Drawer, IconButton, ThemeControl, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
-import { NotificationSlot } from "../slots";
-import { AccountMenu, customerNavLayout, Footer, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useActive, visibleNav } from "./common";
+import { CartBadgeSlot, CookieConsentSlot, NotificationSlot } from "../slots";
+import {
+  AccountMenu,
+  CUSTOMER_SECTIONS,
+  customerNavSections,
+  Footer,
+  MaintenanceBanner,
+  PreviewBanner,
+  SkipLink,
+  ThemeToggle,
+  useCurrentNav,
+  useEnabledNav,
+  visibleNav,
+  type CustomerNavSections,
+} from "./common";
 
 const GRID_COLS: Record<number, string> = { 1: "grid-cols-1", 2: "grid-cols-2", 3: "grid-cols-3", 4: "grid-cols-4", 5: "grid-cols-5" };
 
-const TOP_LINK =
-  "inline-flex min-h-11 shrink-0 items-center gap-2 rounded-[var(--radius-control)] px-3 text-sm font-medium whitespace-nowrap text-body hover:bg-surface-sunken hover:text-ink";
-const TOP_LINK_ACTIVE = "bg-action-soft text-action hover:bg-action-soft hover:text-action";
+function EntryLabel({ item }: { item: NavItem }) {
+  return (
+    <>
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      {item.href === "/cart" ? <CartBadgeSlot /> : null}
+    </>
+  );
+}
+
+function SectionNav({ sections, label, collapsed, onNavigate, isCurrent }: { sections: CustomerNavSections; label: string; collapsed?: boolean; onNavigate?: () => void; isCurrent: (href: string) => boolean }) {
+  return (
+    <nav aria-label={label} className="flex flex-col gap-5">
+      {CUSTOMER_SECTIONS.map(({ key, heading }) => {
+        const items = sections[key];
+        if (!items.length) return null;
+        return (
+          <div key={key}>
+            {heading ? <h2 className={cn("mb-1 px-3 text-xs font-semibold tracking-wide text-muted uppercase", collapsed && "sr-only")}>{heading}</h2> : <h2 className="sr-only">Main</h2>}
+            <ul className="flex flex-col gap-0.5">
+              {items.map((item) => {
+                const current = isCurrent(item.href);
+                const link = (
+                  <Link
+                    href={item.href}
+                    onClick={onNavigate}
+                    aria-current={current ? "page" : undefined}
+                    aria-label={collapsed ? item.label : undefined}
+                    className={cn(
+                      "flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm font-medium text-body hover:bg-surface-sunken hover:text-ink",
+                      current && "bg-action-soft text-action shadow-[inset_3px_0_0_var(--color-action)] hover:bg-action-soft hover:text-action",
+                      collapsed && "justify-center px-0",
+                    )}
+                  >
+                    <item.icon aria-hidden={true} className="size-5 shrink-0" />
+                    {collapsed ? null : <EntryLabel item={item} />}
+                  </Link>
+                );
+                return (
+                  <li key={item.href}>
+                    {collapsed ? (
+                      <Tooltip content={item.label} side="right">
+                        {link}
+                      </Tooltip>
+                    ) : (
+                      link
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        );
+      })}
+    </nav>
+  );
+}
 
 export function CustomerShell({ user, children }: { user: MeUser; children: ReactNode }) {
-  const layout = customerNavLayout(visibleNav(ALL_NAV, "customer", user.role));
-  const nav = [...layout.primary, ...layout.more];
-  const active = useActive();
-  const [moreOpen, setMoreOpen] = useState(false);
-  const primary = nav.slice(0, 4);
-  const overflow = [...nav.slice(4), ...layout.account];
-  const moreActive = layout.more.some((item) => active(item.href));
+  const items = useEnabledNav(visibleNav(ALL_NAV, "customer", user.role));
+  const sections = customerNavSections(items);
+  const all = [...sections.main, ...sections.Support, ...sections.Account];
+  const isCurrent = useCurrentNav(all);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
+  const phone = sections.phone;
+  const moreCurrent = all.some((item) => isCurrent(item.href) && !phone.includes(item));
 
   return (
     <div className="flex min-h-dvh flex-col bg-surface-soft">
+      <CookieConsentSlot />
       <SkipLink />
       <PreviewBanner />
       <MaintenanceBanner />
-      <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
-        <div className="mx-auto flex h-16 max-w-7xl items-center gap-3 px-3 sm:px-6 lg:px-8">
-          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex shrink-0 items-center rounded">
+      <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
+        <div className="flex h-16 items-center gap-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-6">
+          <IconButton label="Open navigation menu" icon={<Menu />} className="lg:hidden" onClick={() => setMenuOpen(true)} />
+          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex min-w-0 shrink items-center rounded max-[299px]:hidden">
             <BrandLogo label="" className="hidden w-48 sm:inline-flex" />
             <BrandLogo label="" variant="icon" className="h-9 sm:hidden" />
           </Link>
-          <nav aria-label="Primary" className="hidden min-w-0 flex-1 xl:block">
-            <ul className="flex min-w-0 items-center gap-1">
-              {layout.primary.map((item) => (
-                <li key={item.href}>
-                  <Link
-                    href={item.href}
-                    aria-current={active(item.href) ? "page" : undefined}
-                    className={cn(
-                      TOP_LINK,
-                      active(item.href) && TOP_LINK_ACTIVE,
-                    )}
-                  >
-                    <item.icon aria-hidden={true} className="size-4 shrink-0" />
-                    {item.label}
-                  </Link>
-                </li>
-              ))}
-              {layout.more.length ? (
-                <li>
-                  <DropdownMenu
-                    align="start"
-                    trigger={
-                      <button type="button" className={cn(TOP_LINK, moreActive && TOP_LINK_ACTIVE)}>
-                        More
-                        <ChevronDown aria-hidden="true" className="size-4 shrink-0" />
-                      </button>
-                    }
-                    items={layout.more.map((item) => ({
-                      label: item.label,
-                      asChild: (
-                        <Link href={item.href} aria-current={active(item.href) ? "page" : undefined}>
-                          <item.icon aria-hidden={true} />
-                          {item.label}
-                        </Link>
-                      ),
-                    }))}
-                  />
-                </li>
-              ) : null}
-            </ul>
-          </nav>
           <div className="ml-auto flex shrink-0 items-center gap-1">
             <NotificationSlot area="customer" />
-            <ThemeToggle />
-            <AccountMenu user={user} area="customer" items={layout.account} />
-            {nav.length > 0 ? (
-              <IconButton label="Open navigation menu" icon={<Menu />} className="hidden md:inline-flex xl:hidden" onClick={() => setMoreOpen(true)} />
-            ) : null}
+            <ThemeControl className="mx-1 hidden sm:inline-flex" />
+            <ThemeToggle className="sm:hidden" />
+            <AccountMenu user={user} area="customer" items={sections.Account} />
           </div>
         </div>
       </header>
 
-      <main id="main" tabIndex={-1} className="mx-auto w-full max-w-7xl min-w-0 flex-1 px-4 pt-6 pb-28 outline-none sm:px-6 md:pb-10 lg:px-8 lg:pt-8">
-        {children}
-      </main>
-      <Footer className="mb-16 md:mb-0" />
+      <div className="flex min-w-0 flex-1">
+        <aside
+          aria-label="Customer navigation"
+          className={cn("sticky top-16 hidden h-[calc(100dvh-4rem)] shrink-0 flex-col border-r border-line bg-surface lg:flex", collapsed ? "w-20" : "w-64")}
+        >
+          <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
+            <SectionNav sections={sections} label="Customer" collapsed={collapsed} isCurrent={isCurrent} />
+          </div>
+          <div className="border-t border-line p-3">
+            <button
+              type="button"
+              onClick={() => setCollapsed((c) => !c)}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              className={cn("flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm text-muted hover:bg-surface-sunken hover:text-ink", collapsed && "justify-center px-0")}
+            >
+              {collapsed ? <ChevronsRight aria-hidden="true" className="size-5" /> : <ChevronsLeft aria-hidden="true" className="size-5" />}
+              {collapsed ? null : "Collapse"}
+            </button>
+          </div>
+        </aside>
 
-      {/* Bottom navigation (phones) */}
-      {nav.length > 0 ? (
+        <div className="flex min-w-0 flex-1 flex-col">
+          <main id="main" tabIndex={-1} className="mx-auto w-full max-w-7xl min-w-0 flex-1 px-4 pt-6 pb-28 outline-none sm:px-6 md:pb-10 lg:px-8 lg:pt-8">
+            {children}
+          </main>
+          <Footer className="mb-[calc(3.5rem+env(safe-area-inset-bottom))] md:mb-0" />
+        </div>
+      </div>
+
+      {phone.length > 0 ? (
         <nav aria-label="Quick navigation" className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] md:hidden">
-          <ul className={cn("grid", GRID_COLS[primary.length + (overflow.length ? 1 : 0)])}>
-            {primary.map((item) => (
-              <li key={item.href}>
+          <ul className={cn("grid", GRID_COLS[phone.length + 1])}>
+            {phone.map((item) => (
+              <li key={item.href} className="min-w-0">
                 <Link
                   href={item.href}
-                  aria-current={active(item.href) ? "page" : undefined}
-                  className={cn("flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 text-[0.6875rem] font-medium text-muted", active(item.href) && "text-action")}
+                  aria-current={isCurrent(item.href) ? "page" : undefined}
+                  className={cn("flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 text-[0.6875rem] font-medium text-muted", isCurrent(item.href) && "text-action")}
                 >
                   <item.icon aria-hidden={true} className="size-5" />
                   <span className="max-w-full truncate">{item.label}</span>
                 </Link>
               </li>
             ))}
-            {overflow.length ? (
-              <li>
-                <button type="button" onClick={() => setMoreOpen(true)} className="flex min-h-14 w-full flex-col items-center justify-center gap-0.5 text-[0.6875rem] font-medium text-muted">
-                  <Menu aria-hidden="true" className="size-5" />
-                  More
-                </button>
-              </li>
-            ) : null}
+            <li className="min-w-0">
+              <button
+                type="button"
+                onClick={() => setMenuOpen(true)}
+                aria-haspopup="dialog"
+                className={cn("flex min-h-14 w-full flex-col items-center justify-center gap-0.5 text-[0.6875rem] font-medium text-muted", moreCurrent && "text-action")}
+              >
+                <Menu aria-hidden="true" className="size-5" />
+                More
+              </button>
+            </li>
           </ul>
         </nav>
       ) : null}
 
-      <Drawer open={moreOpen} onOpenChange={setMoreOpen} title="Menu" side="right" width="sm">
-        <nav aria-label="All sections" className="flex flex-col gap-5">
-          {[
-            { heading: null, items: nav },
-            { heading: "Your account", items: layout.account },
-          ].map(({ heading, items }) =>
-            items.length ? (
-              <div key={heading ?? "main"}>
-                {heading ? <h2 className="mb-1 px-3 text-xs font-semibold tracking-wide text-muted uppercase">{heading}</h2> : null}
-                <ul className="flex flex-col gap-1">
-                  {items.map((item) => (
-                    <li key={item.href}>
-                      <Link
-                        href={item.href}
-                        onClick={() => setMoreOpen(false)}
-                        aria-current={active(item.href) ? "page" : undefined}
-                        className={cn("flex min-h-11 items-center gap-3 rounded-[var(--radius-control)] px-3 text-[0.9375rem] font-medium text-ink hover:bg-surface-sunken", active(item.href) && "bg-action-soft text-action")}
-                      >
-                        <item.icon aria-hidden={true} className="size-5 shrink-0" />
-                        {item.label}
-                      </Link>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null,
-          )}
-        </nav>
+      <Drawer open={menuOpen} onOpenChange={setMenuOpen} title="Menu" side="left" width="sm">
+        <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
+        <div className="mt-6 border-t border-line pt-4 sm:hidden">
+          <ThemeControl showLabel />
+        </div>
       </Drawer>
     </div>
   );

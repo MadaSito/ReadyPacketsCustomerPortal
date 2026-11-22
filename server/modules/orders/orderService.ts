@@ -12,7 +12,7 @@ import type { AuditEmitter, Clock, Db, DbOrTx, FieldCrypto, Logger, Mailer, Sess
 import type { Services } from "../../container.js";
 import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
-import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderReferences, orders, orderStatusHistory } from "./schema.js";
+import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { compliancePort, engagementPort, filesPort, identityPort } from "./ports.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
@@ -21,6 +21,8 @@ import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionS
 import type { PacketTier } from "./schema.js";
 import { priceOrder } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
+import type { RequirementsService } from "./requirements.js";
+import type { OrderGatesService } from "./gates.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
 export interface OrderServiceDeps {
@@ -35,7 +37,21 @@ export interface OrderServiceDeps {
   policy: OrderPolicy;
   catalog: CatalogService;
   workflows: WorkflowService;
+  /** Increment 04: requirement guard + phase bookkeeping, run inside the transition tx. */
+  requirements: Pick<RequirementsService, "onTransition">;
+  /** Increment 04: copies active customer-wide console grants onto a new order (inside the create tx). */
+  access: { onOrderCreated(tx: Tx, input: { orderId: number; ownerUserId: number; now: Date }): Promise<number> };
+  /** Part B (B6): acceptance gate, run inside the transition tx. */
+  gates: Pick<OrderGatesService, "assertCustomerMayWork" | "assertSystemMayWork">;
+  /** Part B (B1): console payment badge; registered by compliance at init. Null ⇒ badge hidden. */
+  paymentSummary: () => OrderPaymentSummaryProvider | null;
 }
+
+export type OrderPaymentState = "unpaid" | "paid" | "partially_refunded" | "refunded" | "void";
+export type OrderPaymentSummaryProvider = (
+  orderPublicIds: string[],
+  tx: DbOrTx,
+) => Promise<Map<string, { state: OrderPaymentState; totalMinor: number; currency: string }>>;
 
 export const MAX_PAGE = 100;
 
@@ -57,6 +73,16 @@ export function decodeCursor(cursor: string | undefined | null): number | null {
   const match = /^o:(\d{1,15})$/.exec(raw);
   if (!match) throw validation("INVALID_CURSOR", "The list position is not valid. Reload the list.");
   return Number(match[1]);
+}
+
+function encodeNameCursor(at: Date, id: number): string {
+  return Buffer.from(`n:${at.getTime()}:${id}`, "utf8").toString("base64url");
+}
+function decodeNameCursor(cursor: string | undefined | null): { at: Date; id: number } | null {
+  if (!cursor) return null;
+  const match = /^n:(\d{1,15}):(\d{1,15})$/.exec(Buffer.from(cursor, "base64url").toString("utf8"));
+  if (!match) throw validation("INVALID_CURSOR", "The list position is not valid. Reload the list.");
+  return { at: new Date(Number(match[1])), id: Number(match[2]) };
 }
 
 /** Escapes LIKE wildcards so user input is always a literal prefix/substring. */
@@ -117,6 +143,21 @@ export function createOrderService(deps: OrderServiceDeps) {
    */
   const snapshot = <T>(fn: (tx: Tx) => Promise<T>) =>
     deps.db.transaction(fn, { isolationLevel: "repeatable read", withConsistentSnapshot: true });
+
+  /** B1 console header extras. A failing payment provider never breaks the order page (badge hidden). */
+  async function consoleHeader(tx: Tx, orderPublicId: string, ownerUserId: number) {
+    const owner = await identityPort(deps.services).getUser(ownerUserId, { tx });
+    let payment: { state: OrderPaymentState; totalMinor: number; currency: string } | null = null;
+    const provider = deps.paymentSummary();
+    if (provider) {
+      try {
+        payment = (await provider([orderPublicId], tx)).get(orderPublicId) ?? null;
+      } catch {
+        deps.logger.warn("order payment summary unavailable", { orderPublicId });
+      }
+    }
+    return { customer: owner ? { publicId: owner.publicId, name: owner.name, customerRef: owner.customerRef } : null, payment };
+  }
 
   const encryptNote = (body: string, publicId: string) => deps.crypto.encrypt(body, `order_notes.body:${publicId}`);
   const decryptNote = (bodyEnc: string, publicId: string) => {
@@ -186,6 +227,109 @@ export function createOrderService(deps: OrderServiceDeps) {
     } catch (error) {
       deps.logger.warn("order notification failed", { orderPublicId: order.publicId, kind, errorName: error instanceof Error ? error.name : "unknown" });
     }
+  }
+
+  /** Creates the order rows inside `tx` (actor already re-validated by the caller). */
+  async function createInTx(
+    tx: Tx,
+    principal: SessionPrincipal | null,
+    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+    ownerUserId: number,
+    prefix: string,
+    system?: { correlationId: string; channel: string },
+  ) {
+    const now = deps.clock.now();
+    const workflow = await workflows.ensureDefault(tx);
+    const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
+    const currency = lineItems[0]!.currency;
+    const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+    const totalMinor = pricing.totalMinor;
+    const reference = await allocateReference(tx, prefix, now);
+    const publicId = ulid(now.getTime());
+    const initial = initialState(workflow.definition);
+    await tx.insert(orders).values({
+      publicId,
+      reference,
+      ownerUserId,
+      projectName: input.projectName,
+      workflowVersionId: workflow.versionId,
+      statusKey: initial.key,
+      subtotalMinor: pricing.subtotalMinor,
+      discountMinor: pricing.discountMinor,
+      discountLabel: pricing.discountLabel,
+      totalMinor,
+      currency,
+      origin: "portal",
+      createdByUserId: principal?.userId ?? null,
+      createKey: input.idempotencyKey,
+      submittedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const [order] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, publicId));
+    const orderId = order!.id;
+    await tx.insert(orderLineItems).values(
+      lineItems.map((item, index) => ({
+        publicId: ulid(now.getTime()),
+        orderId,
+        productId: item.productId,
+        productVersionId: item.productVersionId,
+        productPublicId: item.productPublicId,
+        productVersionNumber: item.productVersionNumber,
+        name: item.name,
+        description: item.description,
+        features: item.features,
+        packetNumber: item.packetNumber,
+        tier: item.tier,
+        outcome: item.outcome,
+        timeline: item.timeline,
+        deliverables: item.deliverables,
+        unitPriceMinor: item.unitPriceMinor,
+        currency: item.currency,
+        quantity: item.quantity,
+        lineTotalMinor: item.lineTotalMinor,
+        sortOrder: index,
+        createdAt: now,
+      })),
+    );
+    await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal?.userId ?? null, now });
+    const note = input.note ? await insertNote(tx, { orderId, principal, visibility: "customer", body: input.note }) : null;
+    await tx.insert(orderStatusHistory).values({
+      publicId: ulid(now.getTime()),
+      orderId,
+      fromStatus: null,
+      toStatus: initial.key,
+      actorUserId: principal?.userId ?? null,
+      actorRole: principal?.role ?? "system",
+      reasonCode: "CREATED",
+      noteId: note?.id ?? null,
+      occurredAt: now,
+    });
+    const inherited = await deps.access.onOrderCreated(tx, { orderId, ownerUserId, now });
+    await deps.audit.record(
+      {
+        category: "business",
+        eventName: "order.created",
+        action: "create",
+        outcome: "completed",
+        actor: principal ? actorOf(principal) : { role: "system" },
+        ...(system ? { correlationId: system.correlationId } : {}),
+        resource: { type: "order", publicId },
+        attributes: {
+          currency,
+          total_minor: totalMinor,
+          discount_minor: pricing.discountMinor,
+          on_behalf: ownerUserId !== principal?.userId,
+          ...(system ? { channel: system.channel } : {}),
+          workflow_version: workflow.versionNumber,
+          inherited_grants: inherited,
+        },
+        safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
+      },
+      tx,
+    );
+    await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
+    return { orderId, publicId, reference, currency, pricing, lineItems };
   }
 
   async function ownerUser(publicId: string, tx?: DbOrTx) {
@@ -274,88 +418,8 @@ export function createOrderService(deps: OrderServiceDeps) {
           // No existing order row is locked here, so the actor check is the first statement.
           const actor = await assertActorCurrent(principal, tx, "orders.create");
           if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
-          const now = deps.clock.now();
-          const workflow = await workflows.ensureDefault(tx);
-          const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
-          const currency = lineItems[0]!.currency;
-          const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
-          const totalMinor = pricing.totalMinor;
-          const reference = await allocateReference(tx, prefix, now);
-          const publicId = ulid(now.getTime());
-          const initial = initialState(workflow.definition);
-          await tx.insert(orders).values({
-            publicId,
-            reference,
-            ownerUserId,
-            projectName: input.projectName,
-            workflowVersionId: workflow.versionId,
-            statusKey: initial.key,
-            subtotalMinor: pricing.subtotalMinor,
-            discountMinor: pricing.discountMinor,
-            discountLabel: pricing.discountLabel,
-            totalMinor,
-            currency,
-            origin: "portal",
-            createdByUserId: principal.userId,
-            createKey: input.idempotencyKey,
-            submittedAt: now,
-            createdAt: now,
-            updatedAt: now,
-          });
-          const [order] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.publicId, publicId));
-          const orderId = order!.id;
-          await tx.insert(orderLineItems).values(
-            lineItems.map((item, index) => ({
-              publicId: ulid(now.getTime()),
-              orderId,
-              productId: item.productId,
-              productVersionId: item.productVersionId,
-              productPublicId: item.productPublicId,
-              productVersionNumber: item.productVersionNumber,
-              name: item.name,
-              description: item.description,
-              features: item.features,
-              packetNumber: item.packetNumber,
-              tier: item.tier,
-              outcome: item.outcome,
-              timeline: item.timeline,
-              deliverables: item.deliverables,
-              unitPriceMinor: item.unitPriceMinor,
-              currency: item.currency,
-              quantity: item.quantity,
-              lineTotalMinor: item.lineTotalMinor,
-              sortOrder: index,
-              createdAt: now,
-            })),
-          );
-          await reserveReference(tx, { reference, orderId, reasonCode: "GENERATED", actorUserId: principal.userId, now });
-          const note = input.note ? await insertNote(tx, { orderId, principal, visibility: "customer", body: input.note }) : null;
-          await tx.insert(orderStatusHistory).values({
-            publicId: ulid(now.getTime()),
-            orderId,
-            fromStatus: null,
-            toStatus: initial.key,
-            actorUserId: principal.userId,
-            actorRole: principal.role,
-            reasonCode: "CREATED",
-            noteId: note?.id ?? null,
-            occurredAt: now,
-          });
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "order.created",
-              action: "create",
-              outcome: "completed",
-              actor: actorOf(principal),
-              resource: { type: "order", publicId },
-              attributes: { currency, total_minor: totalMinor, discount_minor: pricing.discountMinor, on_behalf: ownerUserId !== principal.userId, workflow_version: workflow.versionNumber },
-              safeCounts: { line_items: lineItems.length, packet_items: lineItems.filter((item) => item.packetNumber !== null).length },
-            },
-            tx,
-          );
-          await emitChange(tx, { orderId, orderPublicId: publicId, kind: "created" });
-          return { publicId, reference, created: true };
+          const result = await createInTx(tx, principal, input, ownerUserId, prefix);
+          return { publicId: result.publicId, reference: result.reference, created: true };
         });
       } catch (error) {
         // A concurrent duplicate submit with the same idempotency key resolves to the first order.
@@ -369,6 +433,51 @@ export function createOrderService(deps: OrderServiceDeps) {
         }
         throw error;
       }
+    },
+
+    /**
+     * Increment 04 (cart checkout, Decision 13): customer order creation inside the CALLER's transaction. Same
+     * validation, pricing, bundle rule and audit as `create`; the caller must not open another connection.
+     */
+    async createOrderFromCheckoutInTx(
+      principal: SessionPrincipal,
+      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+      tx: Tx,
+    ) {
+      if (principal.state !== "full" || principal.pendingSteps.length > 0) throw ORDER_NOT_FOUND();
+      if (principal.role !== "customer" || !roleHasCapability(principal.role, "orders.create")) throw forbidden("CAPABILITY_NOT_GRANTED");
+      await assertActorCurrent(principal, tx, "orders.create");
+      await compliancePort(deps.services)?.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+      const [existing] = await tx
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, totalMinor: orders.totalMinor })
+        .from(orders)
+        .where(and(eq(orders.ownerUserId, principal.userId), eq(orders.createKey, input.idempotencyKey)))
+        .limit(1);
+      const afterCommit = async () => undefined;
+      if (existing) {
+        const lines = await tx.select().from(orderLineItems).where(eq(orderLineItems.orderId, existing.id)).orderBy(asc(orderLineItems.sortOrder));
+        return {
+          ...existing,
+          created: false,
+          lineItems: lines.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
+          afterCommit,
+        };
+      }
+      const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX, tx);
+      const result = await createInTx(tx, principal, input, principal.userId, prefix);
+      return {
+        id: result.orderId,
+        publicId: result.publicId,
+        reference: result.reference,
+        created: true,
+        currency: result.currency,
+        subtotalMinor: result.pricing.subtotalMinor,
+        discountMinor: result.pricing.discountMinor,
+        discountLabel: result.pricing.discountLabel,
+        totalMinor: result.pricing.totalMinor,
+        lineItems: result.lineItems.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
+        afterCommit,
+      };
     },
 
     /* ------------------------------------------------------------------ list */
@@ -544,6 +653,8 @@ export function createOrderService(deps: OrderServiceDeps) {
             requiresNote: t.requiresNote,
           };
         }),
+        /** Part B (B1): console header only — customer name and payment badge (null when unknown or hidden). */
+        console: consoleView ? await consoleHeader(tx, order.publicId, order.ownerUserId) : null,
       };
       });
     },
@@ -599,6 +710,140 @@ export function createOrderService(deps: OrderServiceDeps) {
       });
     },
 
+    /**
+     * Part B (B2): console rename. Capability orders.rename (router + in-tx re-check), optimistic version,
+     * reference untouched, audit `order.renamed` (renamed flag + old/new length; names are not copied into audit), change event for the SharePoint row.
+     */
+    async rename(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; name: string }) {
+      const name = normalizeOrderName(input.name);
+      return deps.db.transaction(async (tx) => {
+        const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
+        if (view.accessRole !== "staff" && view.accessRole !== "admin") throw forbidden("STAFF_ONLY");
+        await assertActorCurrent(principal, tx, "orders.rename");
+        if (view.version !== input.expectedVersion) throw staleVersion();
+        const [row] = await tx.select({ projectName: orders.projectName }).from(orders).where(eq(orders.id, view.id)).limit(1);
+        const oldName = row?.projectName ?? "";
+        if (oldName === name) return { version: view.version, changed: false };
+        const result = await tx
+          .update(orders)
+          .set({ projectName: name, version: view.version + 1, updatedAt: deps.clock.now() })
+          .where(and(eq(orders.id, view.id), eq(orders.version, view.version)));
+        if (affectedRows(result) !== 1) throw staleVersion();
+        await tx.insert(orderNameHistory).values({
+          orderId: view.id,
+          oldName,
+          newName: name,
+          actorUserId: principal.userId,
+          actorRole: principal.role,
+          createdAt: deps.clock.now(),
+        });
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "order.renamed",
+            action: "update",
+            outcome: "completed",
+            actor: actorOf(principal),
+            resource: { type: "order", publicId: view.publicId },
+            // The audit envelope drops `*name*` keys as personal data, so the event records that the
+            // name changed and the lengths only; the current name lives on the order row (data minimising).
+            attributes: { order_public_id: view.publicId, renamed: true, old_length: oldName.length, new_length: name.length },
+          },
+          tx,
+        );
+        await emitChange(tx, { orderId: view.id, orderPublicId: view.publicId, kind: "updated" });
+        return { version: view.version + 1, changed: true };
+      });
+    },
+
+    /**
+     * Part B (S2 port, trusted — caller ran assertCanReadOrder): status transitions newest first, keyset on
+     * order_status_history.id. `customerView` hides internal notes (note → null) and uses customer labels.
+     */
+    async listStatusTransitions(orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean; tx?: DbOrTx }) {
+      const db = opts.tx ?? deps.db;
+      const limit = Math.min(Math.max(Math.trunc(opts.limit) || 1, 1), MAX_PAGE);
+      const before = decodeCursor(opts.cursor);
+      const [order] = await db.select({ workflowVersionId: orders.workflowVersionId }).from(orders).where(eq(orders.id, orderId)).limit(1);
+      if (!order) return { items: [], nextCursor: null };
+      const rows = await db
+        .select()
+        .from(orderStatusHistory)
+        .where(before === null ? eq(orderStatusHistory.orderId, orderId) : and(eq(orderStatusHistory.orderId, orderId), lt(orderStatusHistory.id, before)))
+        .orderBy(desc(orderStatusHistory.id))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const noteIds = page.map((entry) => entry.noteId).filter((id): id is number => id !== null);
+      const notes = noteIds.length ? await db.select().from(orderNotes).where(and(eq(orderNotes.orderId, orderId), inArray(orderNotes.id, noteIds))) : [];
+      const noteById = new Map(notes.map((note) => [note.id, note]));
+      const bound = await workflows.byVersionId(db, order.workflowVersionId);
+      const label = (key: string | null) => {
+        if (key === null) return null;
+        const state = findState(bound.definition, key);
+        return (opts.customerView ? state?.customerLabel : state?.label) ?? key;
+      };
+      const roleOf = (role: string): "customer" | "staff" | "admin" | "system" => (role === "admin" || role === "staff" || role === "system" ? role : "customer");
+      return {
+        items: page.map((entry) => {
+          const note = entry.noteId === null ? undefined : noteById.get(entry.noteId);
+          const visible = note !== undefined && (!opts.customerView || note.visibility === "customer");
+          return {
+            at: entry.occurredAt,
+            from: entry.fromStatus,
+            fromLabel: label(entry.fromStatus),
+            to: entry.toStatus,
+            toLabel: label(entry.toStatus)!,
+            note: visible ? decryptNote(note.bodyEnc, note.publicId) : null,
+            actorUserId: entry.actorUserId,
+            actorRole: roleOf(entry.actorRole),
+          };
+        }),
+        nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null,
+      };
+    },
+
+    /**
+     * Part B (B2 port for the Order history tab, trusted — caller ran assertCanReadOrder): renames newest first,
+     * ordered by (created_at DESC, id DESC) with a keyset cursor on the same pair (stable across timestamp ties,
+     * index order_name_history_order_idx). `customerView` returns a generic entry only: no old/new name (an
+     * earlier name may be a former owner's text after reassignment) and no actor id.
+     */
+    async listNameHistory(orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean; tx?: DbOrTx }) {
+      const db = opts.tx ?? deps.db;
+      const limit = Math.min(Math.max(Math.trunc(opts.limit) || 1, 1), MAX_PAGE);
+      const before = decodeNameCursor(opts.cursor);
+      const scope = eq(orderNameHistory.orderId, orderId);
+      const rows = await db
+        .select()
+        .from(orderNameHistory)
+        .where(
+          before === null
+            ? scope
+            : and(
+                scope,
+                or(
+                  lt(orderNameHistory.createdAt, before.at),
+                  and(eq(orderNameHistory.createdAt, before.at), lt(orderNameHistory.id, before.id)),
+                ),
+              ),
+        )
+        .orderBy(desc(orderNameHistory.createdAt), desc(orderNameHistory.id))
+        .limit(limit + 1);
+      const page = rows.slice(0, limit);
+      const roleOf = (role: string): "customer" | "staff" | "admin" | "system" => (role === "admin" || role === "staff" || role === "system" ? role : "customer");
+      const last = page[page.length - 1];
+      return {
+        items: page.map((entry) => ({
+          at: entry.createdAt,
+          oldName: opts.customerView ? null : entry.oldName,
+          newName: opts.customerView ? null : entry.newName,
+          actorUserId: opts.customerView ? null : entry.actorUserId,
+          actorRole: roleOf(entry.actorRole),
+        })),
+        nextCursor: rows.length > limit && last ? encodeNameCursor(last.createdAt, last.id) : null,
+      };
+    },
+
     async addNote(principal: SessionPrincipal, input: { orderId: string; body: string; visibility?: NoteVisibility }) {
       const result = await deps.db.transaction(async (tx) => {
         const view = await policy.assertCanWriteOrder(principal, input.orderId, { kind: "order", tx, forUpdate: true });
@@ -641,6 +886,10 @@ export function createOrderService(deps: OrderServiceDeps) {
           const transition = actor ? transitionsFrom(bound.definition, view.statusKey, actor).find((t) => t.to === input.toStatus) : undefined;
           if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
           if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+          // B6: a customer-side phase submit (any move out of a gated status) needs the gate met; cancel is always allowed.
+          if (actor === "customer" && !isCancelTarget(bound, transition.to))
+            await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });
+          await deps.requirements.onTransition(tx, principal, view, bound, transition.to);
           const now = deps.clock.now();
           const staffSide = actor !== "customer";
           const note = input.note
@@ -707,6 +956,115 @@ export function createOrderService(deps: OrderServiceDeps) {
         });
       }
       return { version: view.version + 1, statusKey: input.toStatus };
+    },
+
+    /**
+     * Increment 04 (public API, package H): a transition by an integration (service principal, no user). Allowed
+     * only where the pinned workflow lists actor `api`, only on unlocked orders, with the same requirement guard,
+     * phase bookkeeping, audit (actor system, correlated to the API request) and notifications.
+     */
+    async transitionAsSystem(input: { orderPublicId: string; expectedVersion: number; toStatus: string; note?: string; correlationId: string }) {
+      const outcome = await deps.db.transaction(async (tx) => {
+        const [row] = await tx.select().from(orders).where(eq(orders.publicId, input.orderPublicId)).limit(1).for("update");
+        if (!row) throw ORDER_NOT_FOUND();
+        if (row.lockState !== "none") throw orderLocked(row.lockState);
+        if (row.version !== input.expectedVersion) throw staleVersion();
+        const bound = await workflows.byVersionId(tx, row.workflowVersionId);
+        const transition = transitionsFrom(bound.definition, row.statusKey, "api").find((candidate) => candidate.to === input.toStatus);
+        if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
+        if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+        // B6: integrations act for the owner; the owner's acceptance is required (fail closed). Cancel is exempt.
+        if (!isCancelTarget(bound, transition.to))
+          await deps.gates.assertSystemMayWork({ tx, orderId: row.id, action: "phase_submit", statusKey: row.statusKey });
+        const owner = await identityPort(deps.services).getUser(row.ownerUserId, { tx });
+        const view: OrderAccessView = {
+          id: row.id,
+          publicId: row.publicId,
+          reference: row.reference,
+          ownerUserId: row.ownerUserId,
+          ownerPublicId: owner?.publicId ?? "",
+          statusKey: row.statusKey,
+          lockState: row.lockState,
+          locked: false,
+          readOnlyImported: false,
+          accessRole: "staff",
+          canWrite: true,
+          origin: row.origin,
+          version: row.version,
+          workflowVersionId: row.workflowVersionId,
+        };
+        await deps.requirements.onTransition(tx, null, view, bound, transition.to);
+        const now = deps.clock.now();
+        const note = input.note ? await insertNote(tx, { orderId: row.id, principal: null, visibility: "customer", body: input.note }) : null;
+        const result = await tx
+          .update(orders)
+          .set({ statusKey: transition.to, version: row.version + 1, updatedAt: now })
+          .where(and(eq(orders.id, row.id), eq(orders.version, row.version)));
+        if (affectedRows(result) !== 1) throw staleVersion();
+        await tx.insert(orderStatusHistory).values({
+          publicId: ulid(now.getTime()),
+          orderId: row.id,
+          fromStatus: row.statusKey,
+          toStatus: transition.to,
+          actorUserId: null,
+          actorRole: "system",
+          reasonCode: "API_TRANSITION",
+          noteId: note?.id ?? null,
+          occurredAt: now,
+        });
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "order.status.changed",
+            action: "transition",
+            outcome: "completed",
+            actor: { role: "system" },
+            correlationId: input.correlationId,
+            resource: { type: "order", publicId: row.publicId },
+            attributes: { from_status: row.statusKey, to_status: transition.to, workflow_version: bound.versionNumber, channel: "api" },
+          },
+          tx,
+        );
+        await emitChange(tx, { orderId: row.id, orderPublicId: row.publicId, kind: "status_changed" });
+        return { view, bound, notify: transition.notifyCustomer };
+      });
+      if (outcome.notify) {
+        const state = findState(outcome.bound.definition, input.toStatus);
+        const statusLabel = state?.customerLabel ?? input.toStatus;
+        await notifyParticipants(outcome.view, null, "order.status_changed", `${outcome.view.reference}: ${statusLabel}`, `Your order status is now “${statusLabel}”.`, {
+          template: "orders.status_changed",
+          vars: { reference: outcome.view.reference, statusLabel, link: `/orders/${outcome.view.publicId}` },
+          idempotencyKey: `order-status:${outcome.view.publicId}:${outcome.view.version + 1}`,
+        });
+      }
+      return { version: outcome.view.version + 1, statusKey: input.toStatus };
+    },
+
+    /** Increment 04 (public API): create for a customer by an integration (system actor, same pricing rules). */
+    async createAsSystem(input: { ownerPublicId: string; projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; correlationId: string }) {
+      const owner = await ownerUser(input.ownerPublicId);
+      if (!owner) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+      const [existing] = await deps.db
+        .select({ publicId: orders.publicId })
+        .from(orders)
+        .where(and(eq(orders.ownerUserId, owner.id), eq(orders.createKey, input.idempotencyKey)))
+        .limit(1);
+      if (existing) return { publicId: existing.publicId, created: false };
+      const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX);
+      try {
+        return await deps.db.transaction(async (tx) => {
+          const fresh = await ownerUser(input.ownerPublicId, tx);
+          if (!fresh) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+          const result = await createInTx(tx, null, input, fresh.id, prefix, { correlationId: input.correlationId, channel: "api" });
+          return { publicId: result.publicId, created: true };
+        });
+      } catch (error) {
+        if (isDuplicateKey(error)) {
+          const [again] = await deps.db.select({ publicId: orders.publicId }).from(orders).where(and(eq(orders.ownerUserId, owner.id), eq(orders.createKey, input.idempotencyKey))).limit(1);
+          if (again) return { publicId: again.publicId, created: false };
+        }
+        throw error;
+      }
     },
 
     /* ----------------------------------------------------------------- locks */
@@ -1093,7 +1451,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       if (!ULID_LIKE.test(orderPublicId)) return null;
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.publicId, orderPublicId))
         .limit(1);
@@ -1104,7 +1462,7 @@ export function createOrderService(deps: OrderServiceDeps) {
     async getOrderRefById(orderId: number, tx?: DbOrTx, options: { forUpdate?: boolean } = {}) {
       if (options.forUpdate && !tx) throw new DomainError("VALIDATION", "TX_REQUIRED", "A row lock requires a transaction.");
       const query = (tx ?? deps.db)
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, name: orders.projectName, ownerUserId: orders.ownerUserId, lockState: orders.lockState, statusKey: orders.statusKey, workflowVersionId: orders.workflowVersionId })
         .from(orders)
         .where(eq(orders.id, orderId))
         .limit(1);
@@ -1116,6 +1474,20 @@ export function createOrderService(deps: OrderServiceDeps) {
 }
 
 const ULID_LIKE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
+function isCancelTarget(bound: BoundWorkflow, to: string): boolean {
+  const target = findState(bound.definition, to);
+  return target ? isCancelState(target) : false;
+}
+
+/** B2: 1–120 characters after NFC + trim, no control characters. */
+export function normalizeOrderName(value: string): string {
+  const name = value.normalize("NFC").trim();
+  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
+  if (name.length < 1 || name.length > 120 || /[\u0000-\u001f\u007f-\u009f]/.test(name))
+    throw validation("ORDER_NAME_INVALID", "Enter an order name of 1 to 120 characters without control characters.");
+  return name;
+}
 
 export function affectedRows(result: unknown): number {
   const header = Array.isArray(result) ? result[0] : result;

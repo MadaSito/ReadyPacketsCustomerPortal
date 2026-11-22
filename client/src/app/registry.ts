@@ -20,6 +20,14 @@ import { automationsFeature } from "@/features/automations/routes";
 import { mailFeature } from "@/features/mail/routes";
 import { mailTemplatesFeature } from "@/features/mailTemplates/routes";
 import { storageFeature } from "@/features/storage/routes";
+import { accessibilityFeature } from "@/features/accessibility/routes";
+import { protectionFeature } from "@/features/protection/routes";
+import { referralsFeature } from "@/features/referrals/routes";
+import { publicApiFeature } from "@/features/publicApi/routes";
+import { paymentsFeature } from "@/features/payments/routes";
+import { communityFeature } from "@/features/community/routes";
+import { cartFeature } from "@/features/cart/routes";
+import { knowledgeFeature } from "@/features/knowledge/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
   authFeature,
@@ -41,6 +49,14 @@ export const FEATURES: readonly FeatureRoutes[] = [
   mailFeature,
   mailTemplatesFeature,
   storageFeature,
+  accessibilityFeature,
+  protectionFeature,
+  referralsFeature,
+  publicApiFeature,
+  paymentsFeature,
+  communityFeature,
+  cartFeature,
+  knowledgeFeature,
 ];
 
 export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);
@@ -61,3 +77,4 @@ export const ALL_NAV = FEATURES.flatMap((feature) => feature.nav ?? []).sort((a,
 export const ORDER_TABS = FEATURES.flatMap((feature) => feature.orderTabs ?? []).sort((a, b) => a.order - b.order);
 export const CUSTOMER_TABS = FEATURES.flatMap((feature) => feature.customerTabs ?? []).sort((a, b) => a.order - b.order);
 export const WIDGETS = FEATURES.flatMap((feature) => feature.widgets ?? []).sort((a, b) => a.order - b.order);
+export const SECURITY_CARDS = FEATURES.flatMap((feature) => feature.securityCards ?? []).sort((a, b) => a.order - b.order);

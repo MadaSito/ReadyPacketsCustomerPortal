@@ -6,7 +6,16 @@ Owner: portable_contract_engineer. Ships disabled. Tested against local fakes on
 `init()` registers `sharepoint` (purposes `order_files`, `backups`, `order_data`) and `onedrive` (`order_files`, `backups`) with `services.storageConnections.registerAdapter`, backed by `server/modules/storage/adapters/graphDrive*.ts`.
 
 - Config, sharepoint: `{ tenantId, clientId, siteUrl, siteId, driveId, driveName, rootFolderPath }`. Config, onedrive: `{ tenantId, clientId, userPrincipalName, driveId, driveName, rootFolderPath }`. Credentials: `{ clientSecret }`, which is write-only.
-- Simple PUT is used up to 4 MiB when the transport supports raw bodies. Otherwise uploads use upload sessions with 10 MiB chunks (multiples of 320 KiB) and `conflictBehavior: fail`. If an identical object already exists, the upload counts as idempotent; a different object fails with `DESTINATION_CONFLICT`. The adapter verifies the size and QuickXorHash (`verifiedTransportDigest: "quickxor"`).
+- Simple PUT is used up to 4 MiB when the transport supports raw bodies. Otherwise uploads use upload sessions with 10 MiB chunks (multiples of 320 KiB) and `conflictBehavior: fail`. If an identical object (size and QuickXorHash) already exists, it is reused. A different object is never overwritten: it is stored as the next free `name (n).ext` (up to 99). Large uploads compare the hash before committing the final chunk and cancel the session on a match. The adapter verifies the size and QuickXorHash (`verifiedTransportDigest: "quickxor"`).
+- Naming (increment 04 part B, package W; `graphDriveNames.ts`). Before any folder or write call, every segment is mapped deterministically:
+  - `" * : < > ? / \ |` become `_`, and control and format characters are dropped;
+  - leading spaces, trailing spaces and trailing dots are removed;
+  - CON/PRN/AUX/NUL/COM0–9/LPT0–9 (also with an extension), `desktop.ini` and `.lock` get a `_`;
+  - a leading `~$` becomes `~_`, `_vti_` becomes `_vti-`, and a top-level `forms` folder becomes `forms_`;
+  - names over 255 characters are cut with `~` plus 8 hex characters of SHA-256, keeping the extension.
+
+  `.`, `..`, `/`, `\`, empty segments and more than 12 segments are refused with `INVALID_INPUT`. The decoded path is checked against 400 characters; it includes the library's server-relative path, the configured root and the file name, plus room for a conflict suffix. If the path is too long, the file name is shortened first. If the folders alone are too long, the call fails with `INVALID_INPUT` before any write.
+- Folders are created one segment at a time with `conflictBehavior: fail`. A folder that a concurrent worker created is reused, keeping the drive's casing. `put()` returns `targetPath`, the real final segments below the configured root, including the committed file name. The adapter declares `putCreatesFolders: true`.
 - Upload-session URLs must be https on port 443, with no userinfo, and their host must be in the tenant lineage (`<tenant>.sharepoint.com`, `<tenant>-my.sharepoint.com`). They are sent through `uploadChunk`, narrowed to that exact host, and never carry the bearer token. The URLs are never logged and never included in errors.
 - `beforeWrite` runs before every side effect. It is also passed to the transport as `beforeSend`, which runs after token acquisition and before each send or replay. A lost fence propagates unchanged.
 - Binding: `graphDriveGraph.ts` connects the adapters to `services.integrations.createScopedGraphClient` and `.graph` (integrations runtime 7668b53). It supports raw small-file bodies and upload-session GET/DELETE through `uploadSessionControl`. The client runs the G-02 `beforeSend` fence after token acquisition and before each send, including cleanup DELETE. Nothing is sent after a lost fence; an abandoned session expires on the provider side. Verified against the real client over a local fake egress only.
@@ -46,6 +55,16 @@ Every procedure requires admin, `storage.manage` and a fresh step-up. Each call 
 ### Liveness
 
 A job that is refused because another job holds the order's claim (BUSY) retries with backoff and can run out of attempts. To cover that, the job holding the claim enqueues a fresh follow-up (`sharepoint:order:<id>:v<latest>:after:<jobId>`) when it releases the claim, whether it completed or failed permanently, if a newer version was staged in the meantime. This happens on every release, including a retryable failure on the last attempt. A follow-up that turns out to be redundant ends as caught up.
+
+### Copy log (storage package R)
+
+Order sync records one `storage_copy_attempts` row per job attempt (kind `sharepoint_order`) through `recordCopyAttempt`, always inside a fenced owner transaction:
+
+- queued: when a sync job is staged and a SharePoint destination is assigned (idempotent on deduplicated jobs);
+- started: after the destination is resolved, in its own `assertStillOwned` transaction;
+- finished: `written` for created/updated items (the readback checks only the RpOrderId marker, so never `verified`), `not_written` for unchanged or caught-up runs, `failed` with the fixed reason code (including unknown outcomes).
+
+No remote IDs, list names, paths or provider text are stored. The Copy log has no direct retry for SharePoint; the job queue's own retries (up to 6, safe because items are looked up by RpOrderId) apply. Runs with no assigned destination record nothing.
 
 ## Least privilege (administrator guidance)
 - For SharePoint, use an Entra app with `Sites.Selected`, granted `write` on the single chosen site only.

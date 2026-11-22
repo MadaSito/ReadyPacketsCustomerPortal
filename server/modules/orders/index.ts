@@ -3,7 +3,7 @@
  * Other modules import TYPES from here and reach the instance through `deps.services.orders` at call time.
  * See ./API.md for the contract (access policy, hooks, procedures, audit events).
  */
-import type { ModuleDeps } from "../../container.js";
+import type { ModuleDeps, Services } from "../../container.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import { createActorCheck } from "./actor.js";
 import { createCatalogService, type CatalogService } from "./catalog.js";
@@ -28,6 +28,18 @@ import type {
   OrderProductionScope,
 } from "./types.js";
 import { createWorkflowService, type WorkflowService } from "./workflows.js";
+import { createOrdersApiProvider } from "./publicApiProvider.js";
+import { createAccessService, type AccessService } from "./access.js";
+import { createRequirementsService, type FileUploadSlot, type FileUploadSlots, type RequirementsService } from "./requirements.js";
+export type { FileUploadSlot, FileUploadSlots, RequirementsView } from "./requirements.js";
+import { createGatesService, type OrderGatesService } from "./gates.js";
+export type { AcceptanceGate, OrderGateAction, OrderGateContext, OrderGatePoint, OrderGateProvider, OrderGatesService } from "./gates.js";
+import { createFolderRouting, type OrderFileFolderRouting } from "./folders.js";
+export type { OrderFileFolderRouting } from "./folders.js";
+import type { OrderPaymentSummaryProvider } from "./orderService.js";
+export type { OrderPaymentState, OrderPaymentSummaryProvider } from "./orderService.js";
+import { readSetting } from "../platform/index.js";
+import { ORDER_WORKFLOW_RULES_ENABLED } from "./settings.js";
 
 export type * from "./types.js";
 
@@ -65,7 +77,32 @@ export interface OrdersModule extends ModuleLifecycle {
   /** Increment 03: trusted keyset listing (ascending publicId, limit ≤ 500) for the sync backfill; ids only. */
   listOrderPublicIdsForSync(input: { afterPublicId?: string | null; limit: number }, tx?: DbOrTx): Promise<{ publicIds: string[]; nextAfter: string | null }>;
 
+  /** Increment 04 (Files port): writable upload slots of the current status for this actor. */
+  getFileUploadSlots(principal: SessionPrincipal, orderPublicId: string, tx?: Tx): Promise<FileUploadSlots>;
+  /** Increment 04 (Files port): throws PHASE_LOCKED / ORDER_LOCKED for writes tied to a read-only status. */
+  assertFileStatusWritable(principal: SessionPrincipal, orderPublicId: string, statusKey: string, tx?: Tx): Promise<void>;
+  /** Increment 04 (Files custody, trusted): slot definition from the pinned version; no actor filtering. */
+  getFileSlotForCustody(orderPublicId: string, statusKey: string, slotKey: string, tx: Tx): Promise<FileUploadSlot | null>;
+  /** Increment 04: is data tied to `statusKey` read-only because its phase is locked (trusted, in-tx). */
+  isStatusPhaseLocked(orderId: number, workflowVersionId: number, statusKey: string, tx: Tx): Promise<boolean>;
+
+  /** Increment 04 (cart checkout): customer order creation inside the caller's transaction. */
+  createOrderFromCheckoutInTx: OrderService["createOrderFromCheckoutInTx"];
+
+  /** Part B (B6): acceptance gate port — call `gates.assertCustomerMayWork` inside the protected write's tx. */
+  gates: OrderGatesService;
+  /** Part B (B7, trusted): storage folder templates from the pinned version; null for an unknown order. */
+  getOrderFileFolderRouting(input: { orderPublicId: string; statusKey: string; slotKey: string | null }, tx: Tx): Promise<OrderFileFolderRouting | null>;
+  /** Part B (S2, trusted — caller authorised first): status transitions newest first. */
+  listStatusTransitions: OrderService["listStatusTransitions"];
+  /** Part B (B2): renames for the Order history tab (trusted; caller authorizes; customerView hides staff ids). */
+  listNameHistory: OrderService["listNameHistory"];
+  /** Part B (B1): compliance registers the console payment badge source at init. */
+  registerPaymentSummaryProvider(provider: OrderPaymentSummaryProvider): void;
+
   /* ---- services used by the router ---- */
+  requirements: RequirementsService;
+  access: AccessService;
   catalog: CatalogService;
   workflows: WorkflowService;
   orders: OrderService;
@@ -77,12 +114,30 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const policy = createOrderPolicy({ db: deps.db, clock: deps.clock, audit: deps.audit });
   const actorCheck = createActorCheck(deps.services, deps.clock);
   const catalog = createCatalogService({ db: deps.db, clock: deps.clock, audit: deps.audit, settings: deps.settings, actorCheck });
-  const workflows = createWorkflowService({ db: deps.db, clock: deps.clock, audit: deps.audit, actorCheck });
-  const orders = createOrderService({ ...deps, policy, catalog, workflows });
+  const workflows = createWorkflowService({
+    db: deps.db,
+    clock: deps.clock,
+    audit: deps.audit,
+    actorCheck,
+    rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
+  });
+  const gates = createGatesService({ db: deps.db, policy, workflows });
+  const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck, gates });
+  const access = createAccessService({ ...deps, policy, actorCheck });
+  let paymentProvider: OrderPaymentSummaryProvider | null = null;
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, paymentSummary: () => paymentProvider });
+  const getOrderFileFolderRouting = createFolderRouting({ workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
 
+  const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
+
   return {
+    init() {
+      // Increment 04 (package H): /api/v1 orders provider. Absent public API module ⇒ nothing to register.
+      const publicApi = (deps.services as Partial<Services>).publicApi as unknown as { registerProvider?: (key: "orders", provider: unknown) => void } | undefined;
+      publicApi?.registerProvider?.("orders", apiProvider);
+    },
     assertCanReadOrder: policy.assertCanReadOrder,
     assertCanWriteOrder: policy.assertCanWriteOrder,
     assertCanReadOrderById: policy.assertCanReadOrderById,
@@ -102,6 +157,21 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     isPortableStatusSupported: portable.isPortableStatusSupported,
     preflightImportOrder: portable.preflightImportOrder,
     checkCatalogViability: catalog.checkViability,
+    getFileUploadSlots: requirements.getFileUploadSlots,
+    assertFileStatusWritable: requirements.assertFileStatusWritable,
+    isStatusPhaseLocked: requirements.isStatusPhaseLocked,
+    getFileSlotForCustody: requirements.getFileSlotForCustody,
+    createOrderFromCheckoutInTx: orders.createOrderFromCheckoutInTx,
+    gates,
+    getOrderFileFolderRouting,
+    listStatusTransitions: orders.listStatusTransitions,
+    listNameHistory: orders.listNameHistory,
+    registerPaymentSummaryProvider(provider) {
+      if (typeof provider !== "function") throw new Error("invalid payment summary provider");
+      paymentProvider = provider;
+    },
+    requirements,
+    access,
     catalog,
     workflows,
     orders,

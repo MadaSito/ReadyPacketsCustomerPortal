@@ -92,31 +92,73 @@ import {
   PRODUCTION_DELIVERY_JOB,
   PRODUCTION_DISPATCH_MAX_TTL_MS,
   PRODUCTION_MAX_ATTEMPTS,
+  PRODUCTION_PHASES,
   PRODUCTION_RECONCILE_JOB,
   PRODUCTION_SENDING_GRACE_MS,
+  PRODUCTION_SETTINGS_HREF,
   PRODUCTION_STALE_QUEUED_MS,
   type ControlledResendReason,
+  type LaterProductionPhase,
   type ListProductionDispatchesInput,
   type MaskedWebhookUrlView,
   type P101Payload,
   type P201Payload,
+  type P301Payload,
+  type P401Payload,
+  type ProductionDisabledReason,
+  type ProductionDisabledReasonCategory,
   type ProductionDispatchItem,
   type ProductionDispatchState,
   type ProductionDryRunResult,
+  type ProductionLaterPhasePreview,
   type ProductionOrderPreview,
   type ProductionPhase,
   type ProductionSettingsView,
   type ProductionWebhookService,
+  type RedeliverProductionDispatchInput,
+  type RequestLaterPhaseInput,
   type RequestP101Input,
   type RequestP201Input,
   type ResendProductionInput,
+  type RetryProductionDispatchInput,
   type UpdateProductionSettingsInput,
 } from "./production/index.js";
+import {
+  createInboundWebhooksHttpRouter,
+  createWebhooksService,
+  WEBHOOK_DELIVER_JOB,
+  WEBHOOK_DELIVERY_STATUSES,
+  WEBHOOK_DIRECTIONS,
+  WEBHOOK_MAX_ATTEMPTS,
+  WEBHOOK_PURGE_JOB,
+  WEBHOOK_SUBSCRIPTION_STATUSES,
+  type CreateWebhookInboundEndpointInput,
+  type CreateWebhookSubscriptionInput,
+  type InboundHttpReceiveInput,
+  type InboundHttpReceiveResult,
+  type ListWebhookDeliveriesInput,
+  type UpdateWebhookInboundEndpointInput,
+  type UpdateWebhookSubscriptionInput,
+  type UpdateWebhooksSettingsInput,
+  type WebhookCatalogueEventView,
+  type WebhookDeliveryAttemptView,
+  type WebhookDeliveryDetailView,
+  type WebhookDeliveryListItemView,
+  type WebhookDeliveryStatus,
+  type WebhookDirection,
+  type WebhookInboundEndpointView,
+  type WebhookPublishOptions,
+  type WebhookSubscriptionStatus,
+  type WebhookSubscriptionView,
+  type WebhooksService,
+  type WebhooksSettingsView,
+} from "./webhooks/index.js";
 
 // Ensure all `integrations.*` settings/secrets/flags register on module import.
 import "./settings.js";
 
 export {
+  createInboundWebhooksHttpRouter,
   createPinnedLookup,
   EGRESS_PRESET_KEYS,
   EGRESS_PROTOCOLS,
@@ -125,17 +167,27 @@ export {
   PRODUCTION_DELIVERY_JOB,
   PRODUCTION_DISPATCH_MAX_TTL_MS,
   PRODUCTION_MAX_ATTEMPTS,
+  PRODUCTION_PHASES,
   PRODUCTION_RECONCILE_JOB,
   PRODUCTION_SENDING_GRACE_MS,
+  PRODUCTION_SETTINGS_HREF,
   PRODUCTION_STALE_QUEUED_MS,
   SAML_RELEASE_BANNER,
   STRIPE_LEDGER_MUTATION_ENABLED,
   STRIPE_RELEASE_BANNER,
+  WEBHOOK_DELIVER_JOB,
+  WEBHOOK_DELIVERY_STATUSES,
+  WEBHOOK_DIRECTIONS,
+  WEBHOOK_MAX_ATTEMPTS,
+  WEBHOOK_PURGE_JOB,
+  WEBHOOK_SUBSCRIPTION_STATUSES,
   type AdminAnalyticsConfig,
   type AnalyticsCspPolicy,
   type AnalyticsService,
   type ControlledResendReason,
   type CreateEgressRuleInput,
+  type CreateWebhookInboundEndpointInput,
+  type CreateWebhookSubscriptionInput,
   type EgressAllowlistRuleView,
   type EgressFetchOptions,
   type EgressFetchResponse,
@@ -162,23 +214,35 @@ export {
   type GraphUploadChunkInput,
   type GraphUploadChunkResult,
   type GraphUploadSessionControlInput,
+  type InboundHttpReceiveInput,
+  type InboundHttpReceiveResult,
+  type LaterProductionPhase,
   type ListProductionDispatchesInput,
+  type ListWebhookDeliveriesInput,
   type MaskedWebhookUrlView,
   type P101Payload,
   type P201Payload,
+  type P301Payload,
+  type P401Payload,
   type PinnedEgressTarget,
+  type ProductionDisabledReason,
+  type ProductionDisabledReasonCategory,
   type ProductionDispatchItem,
   type ProductionDispatchState,
   type ProductionDryRunResult,
+  type ProductionLaterPhasePreview,
   type ProductionOrderPreview,
   type ProductionPhase,
   type ProductionSettingsView,
   type ProductionWebhookService,
   type ProviderState,
   type PublicAnalyticsConfig,
+  type RedeliverProductionDispatchInput,
+  type RequestLaterPhaseInput,
   type RequestP101Input,
   type RequestP201Input,
   type ResendProductionInput,
+  type RetryProductionDispatchInput,
   type ResolveEgressInput,
   type SamlScaffoldView,
   type ScaffoldsService,
@@ -202,6 +266,21 @@ export {
   type UpdateSamlScaffoldInput,
   type UpdateSmtpConfigInput,
   type UpdateStripeConfigInput,
+  type UpdateWebhookInboundEndpointInput,
+  type UpdateWebhookSubscriptionInput,
+  type UpdateWebhooksSettingsInput,
+  type WebhookCatalogueEventView,
+  type WebhookDeliveryAttemptView,
+  type WebhookDeliveryDetailView,
+  type WebhookDeliveryListItemView,
+  type WebhookDeliveryStatus,
+  type WebhookDirection,
+  type WebhookInboundEndpointView,
+  type WebhookPublishOptions,
+  type WebhookSubscriptionStatus,
+  type WebhookSubscriptionView,
+  type WebhooksService,
+  type WebhooksSettingsView,
 };
 
 export const PROVIDER_KEYS = ["smtp", "graph", "clarity", "posthog", "stripe", "saml", "sharepoint"] as const;
@@ -243,6 +322,7 @@ export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
   stripe: StripeService;
   scaffolds: ScaffoldsService;
   production: ProductionWebhookService;
+  webhooks: WebhooksService;
   /** Convenience hook consumed by `server/http` CSP middleware (`services.integrations.analyticsCsp(pathname)`). */
   analyticsCsp(pathname: string): Promise<AnalyticsCspPolicy | null>;
 }
@@ -260,6 +340,7 @@ export function createIntegrationsModule(
   const stripe = createStripeService(deps, checks);
   const scaffolds = createScaffoldsService(deps);
   const production = createProductionWebhookService(deps, egress, checks);
+  const webhooks = createWebhooksService(deps, egress);
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
     const [smtpView, graphView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
@@ -392,10 +473,12 @@ export function createIntegrationsModule(
     stripe,
     scaffolds,
     production,
+    webhooks,
     analyticsCsp: (pathname) => analytics.analyticsCsp(pathname),
 
     init(): void {
       deps.services.jobAdmin?.registerMailTransport?.(graphRuntime.mailTransport);
+      webhooks.init();
     },
 
     stop(): void {
@@ -404,10 +487,11 @@ export function createIntegrationsModule(
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();
-      const [statuses, prodView, prodCheck] = await Promise.all([
+      const [statuses, prodView, prodCheck, webhooksHealth] = await Promise.all([
         buildAllStatuses(),
         production.getSettings(),
         checks.get("production"),
+        webhooks.health(),
       ]);
       const base = statuses.map((p): ModuleHealth => {
         const component =
@@ -438,6 +522,7 @@ export function createIntegrationsModule(
         summary: prodView.summary,
         checkedAt,
       });
+      base.push(webhooksHealth);
       return base;
     },
   };

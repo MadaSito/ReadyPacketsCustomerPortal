@@ -31,6 +31,7 @@ function contentSecurityPolicy(nonce: string, preview: PreviewProfile, analytics
     "img-src 'self' data: blob:",
     "font-src 'self'",
     ["connect-src 'self'", ...exactHttpsOrigins(analytics?.connectSrc)].join(" "),
+    "media-src 'self' blob:",
     "manifest-src 'self'",
     "worker-src 'self'",
     ...(preview ? [] : ["frame-ancestors 'none'"]),
@@ -50,7 +51,7 @@ export function applySecurityHeaders(
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", [
-    "camera=()", "microphone=()", "geolocation=()", "payment=()", "usb=()",
+    "camera=()", "microphone=(self)", "geolocation=()", "payment=()", "usb=()",
     "publickey-credentials-create=(self)", "publickey-credentials-get=(self)",
   ].join(", "));
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");

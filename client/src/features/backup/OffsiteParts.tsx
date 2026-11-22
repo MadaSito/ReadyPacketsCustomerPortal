@@ -49,16 +49,16 @@ function ConditionRow({
   detail: string;
 }) {
   return (
-    <li className="flex items-start justify-between gap-3 rounded-[var(--radius-card)] border border-line bg-surface p-3">
-      <div className="flex items-start gap-2.5 min-w-0">
+    <li className="flex min-w-0 flex-wrap items-start justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface p-3">
+      <div className="flex min-w-0 items-start gap-2.5">
         {met ? (
           <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-success" aria-hidden="true" />
         ) : (
           <XCircle className="mt-0.5 size-5 shrink-0 text-danger" aria-hidden="true" />
         )}
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-ink">{title}</p>
-          <p className="text-sm text-muted">{detail}</p>
+          <p className="text-sm font-semibold break-words [overflow-wrap:anywhere] text-ink">{title}</p>
+          <p className="text-sm break-words [overflow-wrap:anywhere] text-muted">{detail}</p>
         </div>
       </div>
       <Badge tone={met ? "success" : "danger"}>{met ? "Met" : "Not met"}</Badge>
@@ -214,9 +214,13 @@ function OffsiteCopiesFormBody({ config }: { config: OffsiteConfig }) {
   return (
     <Section
       title="Off-site copies"
-      description="Select up to eight cloud storage connections to receive verified encrypted .rpbk archives. ReadyPackets never deletes remote copies automatically."
+      description={
+        <span className="break-words [overflow-wrap:anywhere]">
+          Select up to eight cloud storage connections to receive verified encrypted .rpbk archives. ReadyPackets never deletes remote copies automatically.
+        </span>
+      }
       actions={
-        <Button asChild size="sm" variant="secondary">
+        <Button asChild size="sm" variant="secondary" className="h-auto max-w-full py-1.5 text-center whitespace-normal">
           <Link href="/admin/storage">Manage storage connections</Link>
         </Button>
       }
@@ -271,13 +275,14 @@ function OffsiteCopiesFormBody({ config }: { config: OffsiteConfig }) {
                 return (
                   <li
                     key={row.connectionPublicId}
-                    className="rounded-[var(--radius-card)] border border-line bg-surface p-4 space-y-3"
+                    className="min-w-0 space-y-3 rounded-[var(--radius-card)] border border-line bg-surface p-4"
                   >
-                    <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="flex min-w-0 flex-wrap items-start justify-between gap-4">
                       <Checkbox
+                        className="min-w-0"
                         label={
-                          <span className="inline-flex flex-wrap items-center gap-2">
-                            <span>{row.name}</span>
+                          <span className="inline-flex min-w-0 flex-wrap items-center gap-2">
+                            <span className="break-words [overflow-wrap:anywhere]">{row.name}</span>
                             <Badge>{PROVIDER_KIND_LABELS[row.kind] ?? row.kind}</Badge>
                             {!row.connectionEnabled ? (
                               <Badge tone="warning">Connection disabled in Storage</Badge>
@@ -334,8 +339,8 @@ function OffsiteCopiesFormBody({ config }: { config: OffsiteConfig }) {
         </Callout>
 
         {canManage && rows.length > 0 ? (
-          <div className="flex justify-end">
-            <Button type="submit" loading={update.isPending} disabled={windowInvalid || overLimit}>
+          <div className="flex min-w-0 justify-end">
+            <Button type="submit" className="h-auto max-w-full py-2 text-center whitespace-normal" loading={update.isPending} disabled={windowInvalid || overLimit}>
               Save off-site settings
             </Button>
           </div>

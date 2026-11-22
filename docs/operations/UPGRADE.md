@@ -59,6 +59,7 @@ What `deploy/upgrade.sh` does and asks at each gate:
 
 1. **Preflight and isolated build (portal still online)**:
    - Verifies root custody of `/opt/readypackets-src`, `HEAD == $TARGET_SHA`, clean tracked files, Nginx config (`nginx -t`), TLS files, database/key secret files, swap, and free disk space.
+   - Installs Ubuntu's `ffmpeg` and `util-linux` packages if needed, before stopping services or starting database work. On minimal hosts the kit enables the `universe` package component if FFmpeg has no candidate. Allow access to your approved Ubuntu mirrors.
    - Builds and promotes `/opt/readypackets/releases/$TARGET_SHA` under the unprivileged `readypackets-build` sandbox (`InaccessiblePaths=/etc/readypackets`).
    - Prints live MySQL queue counts (`Current release`, `Target release`, `Portal maintenance`, `Running jobs`, `Unresolved unknown`) and prompts:
      - Type **`DRAINED`** to fence public traffic (`/etc/nginx/readypackets-maintenance` → HTTP `503` externally) and stop `readypackets-portal.service` and `readypackets-worker.service`.
@@ -93,6 +94,26 @@ What `deploy/upgrade.sh` does and asks at each gate:
    ```
 3. All new Increment 03 capabilities (external OIDC sign-in, e-mail template overrides, cloud storage connections, off-site backup copies, SharePoint order sync, and event/scheduled automations) **ship disabled by default** and change nothing until an administrator configures and enables them in the console.
 4. If an administrator loses access to their password or second factors on the host, see [Offline Administrator Recovery](ADMIN-RECOVERY.md).
+
+## Increment 04 and migration `0003`
+
+The native CI job is configured to start from Increment 03 at `89c5cb8`, enroll an administrator in MFA, seed customer and order data, upgrade to Increment 04 including [Part B](../engineering/INCREMENT_04_PART_B.md), and check that `0003_increment_04` and `0004_increment_04_part_b` are each recorded once. This is not acceptance on a live host. Rehearse the reviewed release and migrations on an isolated restore before upgrading production. Migration `0003_increment_04` adds 48 tables and 10 nullable columns; `0004_increment_04_part_b` adds the order workspace schema. MySQL DDL can still be partially applied if the upgrade is interrupted.
+
+1. **Prepare**: In the root-owned `/opt/readypackets-src` checkout, fetch and check out the exact reviewed full Increment 04 commit as in [section 2](#2-prepare-optreadypackets-src-at-the-reviewed-commit). Check that `HEAD` matches and the tracked tree is clean.
+2. **Drain**: Sign in with local administrator MFA, start worker maintenance at `/admin/maintenance`, and wait for zero running jobs and zero unresolved outcomes. Reconcile unknown jobs and stop other writers before proceeding. The new customer maintenance setting is separate; it does not drain jobs.
+3. **Run the same upgrader**: In `/opt/readypackets-src`, run `sudo bash deploy/upgrade.sh <reviewed-full-commit-sha>` without `--yes`. The script installs missing Ubuntu `ffmpeg` and `util-linux` packages before stopping services. At `DRAINED`, verify the displayed counts and confirm that public traffic can be fenced.
+4. **Back up before migration**: Record the verified backup ID; copy its encrypted archive off-host and compare its SHA-256 against the printed digest. Ensure the backup key is in separate off-host custody and that the application keys needed for recovery are available separately. Only then type `BACKUP-VERIFIED`.
+5. **Migrate and reopen**: Let the script apply both pending migrations, switch releases, refresh Nginx and check loopback and HTTPS edge health/readiness while traffic remains fenced. Do not run the migration files separately. Confirm `REOPEN` only after those checks pass. Sign in with MFA, use **End maintenance** to resume worker claims, and confirm edge readiness, a representative customer order, and normal queue processing.
+
+If migration starts and anything fails, keep writers stopped and ingress fenced. Reconcile the Drizzle journal and actual schema with the reviewed migration; either complete the forward fix under DBA review or restore the verified pre-upgrade backup into clean isolated targets and validate the prior release there. Do not delete the journal entry, drop new columns to undo the upgrade, or just swap the `current` symlink back. If traffic has already reopened, account for writes made after the backup before using any restored database as production.
+
+### What to switch on first
+
+- **Baseline**: Verify local administrator MFA, the recovery procedure, the audit trail, and `/admin/storage/copies`. The read-only Copy log needs no switch. New optional features are off by default; Increment 03 settings already in use are not reset.
+- **Protection**: Review events in Detect mode before enforcing rules. There are no country blocks by default and no MMDB is bundled. If needed, configure a local read-only MMDB and confirm address/country behavior and administrator recovery before enabling restrictions. See [Media and country database setup](MEDIA_AND_GEOIP.md).
+- **Customer features**: Enable and exercise one feature at a time with synthetic data in staging. Start with Knowledge or workflow configuration. FFmpeg being installed does not enable recording or conversion; test a conversion and confirm that the original is retained before enabling this for customers.
+- **Order file sync**: Review existing order-file assignments. For new copies, a slot folder overrides the workflow folder, and the default is `customers/{customer_ref}/orders/{order_ref}/{phase}`. Test a synthetic file end to end and compare the path in the order’s File sync tab and the Copy log. An optional path in a workflow does not turn on a storage destination or move a previously copied file.
+- **External services**: Confirm consent behavior before enabling analytics, and use a test receiver for API/webhooks. Leave `payments.config.provider` at `none` until you have verified the hosted redirect, signed callback, provider read-back and invoice result in the provider's test environment.
 
 ---
 

@@ -27,6 +27,7 @@ export const SETTING_GROUPS = [
   "portable",
   "analytics",
   "features",
+  "privacy",
 ] as const;
 export type SettingGroup = (typeof SETTING_GROUPS)[number];
 
@@ -105,6 +106,8 @@ export interface FeatureFlagDefinition extends CommonDefinition {
   default: false;
   sensitivity: "internal";
   exportable: boolean;
+  /** Exposed (on/off only) through the public `platform.bootstrap` query so the shell can hide navigation. */
+  clientVisible: boolean;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -204,6 +207,8 @@ export function defineFeatureFlag(input: {
   label: string;
   description: string;
   group?: SettingGroup;
+  /** Opt in to the public bootstrap (`features.enabled(flag)` on the client). The on/off state becomes public. */
+  clientVisible?: boolean;
 }): FeatureFlagDefinition {
   if (!FLAG_PATTERN.test(input.flag)) throw new Error(`invalid feature flag ${input.flag}`);
   const key = `feature.${input.flag}`;
@@ -220,6 +225,7 @@ export function defineFeatureFlag(input: {
     default: false,
     sensitivity: "internal",
     exportable: true,
+    clientVisible: input.clientVisible ?? false,
   });
 }
 

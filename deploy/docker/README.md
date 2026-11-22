@@ -113,6 +113,28 @@ Treat that file like the keys themselves. A copy of the database volume is only 
 the three secret volumes goes missing, the stack refuses to start and names the incomplete volume rather
 than creating new keys. If all administrators lose their password or second factors, run `./rp-docker.sh recover-admin --email <admin-email>` on an interactive host terminal (see [`docs/operations/ADMIN-RECOVERY.md`](../../docs/operations/ADMIN-RECOVERY.md)).
 
+## Optional country database
+
+FFmpeg and `prlimit` are packaged in the image; audio conversion remains off until enabled in the portal. For database sourcing, refresh and emergency bypass, follow [Media and country database setup](../../docs/operations/MEDIA_AND_GEOIP.md). The image does not include or download an MMDB.
+
+After initial setup, put the MMDB in a host directory controlled by root and use a Compose override to bind that directory read-only into the web service. Make the directory traversable and database readable by container GID `10001` (for remapped Docker, use the corresponding host group). Do not expose it to the database, Caddy, or the storage volume. Store this override outside the checkout:
+
+```yaml
+services:
+  web:
+    environment:
+      PROTECTION_MMDB_PATH: /var/lib/readypackets/geo/country.mmdb
+    volumes:
+      - type: bind
+        source: /srv/readypackets/geo
+        target: /var/lib/readypackets/geo
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+To apply it from `deploy/docker` after running the standard wrapper, run `docker compose --env-file .env -f compose.yaml -f /absolute/path/geo.override.yaml up -d --no-deps web`. Keep the same override in subsequent Compose commands that recreate `web`; `rp-docker.sh` uses the base Compose file only. On rotation, replace the host file atomically within the mounted directory and restart the web service with the same Compose files.
+
 ## Differences from the native kit
 
 | Topic | Native kit (`deploy/install.sh`) | This stack |

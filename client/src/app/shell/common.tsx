@@ -6,6 +6,7 @@ import type { UserRole } from "@shared/domain";
 import type { NavItem } from "@/lib/routes";
 import { useAuthApi, type MeUser } from "@/lib/authApi";
 import { useSignOut } from "@/lib/signOut";
+import { useConsent } from "@/lib/consent";
 import { Callout, DropdownMenu, IconButton, useTheme, type ThemePreference } from "@/ui";
 import { cn } from "@/ui/cn";
 import { RUNTIME } from "@/lib/runtime";
@@ -20,6 +21,17 @@ export function visibleNav(items: readonly NavItem[], area: NavItem["area"], rol
     if (item.access === "staff") return role === "staff" || role === "admin";
     return item.access === "customer";
   });
+}
+
+/** Drops entries whose feature switch (`NavItem.enabledBy`) is off, unknown or still loading. */
+export function useEnabledNav(items: readonly NavItem[]): NavItem[] {
+  const api = useAuthApi();
+  const needed = items.some((item) => item.enabledBy);
+  // Same public query as `@/lib/features` (platform.bootstrap), read through the AuthApi facade so the shell
+  // works without a tRPC provider in tests. Loading, failure or an unknown key ⇒ hidden (fail closed).
+  const bootstrap = useQuery({ queryKey: ["rp", "platform", "bootstrap", "nav"], queryFn: () => api.bootstrap(), enabled: needed, staleTime: 60_000, retry: false });
+  const features = bootstrap.data?.features ?? {};
+  return items.filter((item) => !item.enabledBy || (Object.hasOwn(features, item.enabledBy) && features[item.enabledBy] === true));
 }
 
 export type NavPlacement = NonNullable<NavItem["placement"]>;
@@ -66,6 +78,62 @@ export function customerNavLayout(items: readonly NavItem[]): CustomerNavLayout 
   for (const fallback of DEFAULT_ACCOUNT_NAV) if (!accountHrefs.has(fallback.href)) account.push(fallback);
   account.sort(byOrder);
   return { primary: primaryAll.slice(0, MAX_PRIMARY_NAV), more: primaryAll.slice(MAX_PRIMARY_NAV), account };
+}
+
+export type CustomerSection = "main" | "Support" | "Account";
+export const CUSTOMER_SECTIONS: readonly { key: CustomerSection; heading: string | null }[] = [
+  { key: "main", heading: null },
+  { key: "Support", heading: "Support" },
+  { key: "Account", heading: "Account" },
+];
+
+/** Customer sidebar section: explicit group wins; account-placed entries count as "Account". */
+export function customerSection(item: NavItem): CustomerSection {
+  if (item.group === "Support" || item.group === "Account") return item.group;
+  return navPlacement(item) === "account" ? "Account" : "main";
+}
+
+export interface CustomerNavSections {
+  main: NavItem[];
+  Support: NavItem[];
+  Account: NavItem[];
+  /** Phone bottom bar (at most 4). */
+  phone: NavItem[];
+}
+
+/** Preferred phone bottom-bar entries, in order; free slots are filled from the main section. */
+export const PHONE_BAR_HREFS = ["/", "/orders", "/orders/new", "/messages"] as const;
+
+export function customerNavSections(items: readonly NavItem[]): CustomerNavSections {
+  const visible = [...items].filter((item) => navPlacement(item) !== "hidden").sort((a, b) => a.order - b.order);
+  const out: CustomerNavSections = { main: [], Support: [], Account: [], phone: [] };
+  for (const item of visible) out[customerSection(item)].push(item);
+  const hrefs = new Set(out.Account.map((item) => item.href));
+  for (const fallback of DEFAULT_ACCOUNT_NAV) if (!hrefs.has(fallback.href)) out.Account.push(fallback);
+  out.Account.sort((a, b) => a.order - b.order);
+  const preferred = PHONE_BAR_HREFS.map((href) => out.main.find((item) => item.href === href)).filter((item): item is NavItem => Boolean(item));
+  const rest = out.main.filter((item) => !preferred.includes(item));
+  out.phone = [...preferred, ...rest].slice(0, 4);
+  return out;
+}
+
+/**
+ * The single current entry: the longest href that matches the location (so `/orders/new` wins over `/orders`,
+ * and `/admin/storage/copies` over `/admin/storage`).
+ */
+export function currentNavHref(location: string, hrefs: readonly string[]): string | null {
+  let best: string | null = null;
+  for (const href of hrefs) if (isActivePath(location, href) && (best === null || href.length > best.length)) best = href;
+  return best;
+}
+
+export function useCurrentNav(items: readonly NavItem[]) {
+  const [location] = useLocation();
+  const current = currentNavHref(
+    location,
+    items.map((item) => item.href),
+  );
+  return (href: string) => href === current;
 }
 
 export function isActivePath(location: string, href: string): boolean {
@@ -119,7 +187,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
         </div>
       }
       trigger={
-        <button type="button" aria-label={`Account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
+        <button type="button" aria-label={`${initials(user.name)}, account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
           <span aria-hidden="true" className="inline-flex size-9 items-center justify-center rounded-full bg-action text-sm font-semibold text-on-action">
             {initials(user.name)}
           </span>
@@ -152,18 +220,33 @@ export function Footer({ className }: { className?: string }) {
           © {year} {LEGAL_NAME}
         </p>
         <nav aria-label="Footer" className="flex flex-wrap gap-x-5 gap-y-1">
-          <Link href="/privacy" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-0">
+          <Link href="/privacy" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-6">
             Privacy
           </Link>
-          <Link href="/terms" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-0">
+          <Link href="/terms" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-6">
             Terms
           </Link>
-          <a href={PUBLIC_SITE_URL} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-0">
+          <Link href="/accessibility" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-6">
+            Accessibility
+          </Link>
+          <ManageCookiesButton />
+          <a href={PUBLIC_SITE_URL} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-11 items-center underline-offset-2 hover:text-ink hover:underline sm:min-h-6">
             readypackets.com<span className="sr-only"> (opens in a new tab)</span>
           </a>
         </nav>
       </div>
     </footer>
+  );
+}
+
+/** Persistent "Manage cookie preferences" control (decision 14); only when the consent feature is on. */
+export function ManageCookiesButton() {
+  const state = useConsent();
+  if (!state.enabled) return null;
+  return (
+    <button type="button" onClick={state.openPreferences} className="inline-flex min-h-11 items-center text-left underline-offset-2 hover:text-ink hover:underline sm:min-h-6">
+      Manage cookie preferences
+    </button>
   );
 }
 

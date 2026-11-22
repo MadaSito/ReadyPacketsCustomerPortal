@@ -1,17 +1,40 @@
 /**
- * Production pipeline webhooks (P101 / P201) — client contract types and presentation helpers.
- * Mirrors `trpc.integrations.production.*` (INCREMENT_02_CONTRACT.md §D & ADR 0023).
+ * Production pipeline webhooks (P101 / P201 / P301 / P401) — client contract types and presentation helpers.
+ * Mirrors `trpc.integrations.production.*` (INCREMENT_02_CONTRACT.md §D, INCREMENT_04_PART_B.md §B4 & ADR 0023).
  */
 import type { Tone } from "@/ui";
 
-export type ProductionPhase = "P101" | "P201";
-export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
+export type ProductionPhase = "P101" | "P201" | "P301" | "P401";
+export type ProductionDispatchState =
+  | "queued"
+  | "sending"
+  | "delivered"
+  | "failed"
+  | "dead"
+  | "unknown";
 export type ProductionSettingsState =
   | "disabled"
   | "not_configured"
   | "configured"
   | "degraded"
   | "failing";
+
+export type ProductionDisabledCategory =
+  | "pipeline_off"
+  | "endpoint_missing"
+  | "config_incomplete"
+  | "in_progress"
+  | "already_delivered"
+  | "retry_or_resend_required"
+  | "precondition";
+
+export interface ProductionDisabledReason {
+  code: string;
+  category: ProductionDisabledCategory;
+  message: string;
+  /** True when an administrator can resolve this in `/admin/integrations/production`. */
+  settingsActionable: boolean;
+}
 
 export interface ProductionUrlMask {
   host: string;
@@ -27,6 +50,10 @@ export interface ProductionSettingsView {
   p101UrlMask: ProductionUrlMask | null;
   p201UrlConfigured: boolean;
   p201UrlMask: ProductionUrlMask | null;
+  p301UrlConfigured: boolean;
+  p301UrlMask: ProductionUrlMask | null;
+  p401UrlConfigured: boolean;
+  p401UrlMask: ProductionUrlMask | null;
   authHeaderName: string;
   authHeaderValueConfigured: boolean;
   canonVersion: string;
@@ -38,6 +65,8 @@ export interface ProductionSettingsUpdateInput {
   enabled: boolean;
   p101Url?: string | null;
   p201Url?: string | null;
+  p301Url?: string | null;
+  p401Url?: string | null;
   authHeaderName?: string;
   authHeaderValue?: string | null;
   canonVersion: string;
@@ -94,6 +123,8 @@ export interface ProductionDispatchItem {
   responseSummary: string | null;
   lastReasonCode: string | null;
   resendReason: string | null;
+  retryOf: string | null;
+  redeliveryOf: string | null;
   requestedByPublicId: string | null;
   correlationId: string;
   createdAt: Date | string;
@@ -107,25 +138,44 @@ export interface ProductionValidationError {
   message: string;
 }
 
+export interface ProductionLaterPhasePreview {
+  configured: boolean;
+  eligible: boolean;
+  p101Delivered: boolean;
+  prerequisiteDelivered: boolean;
+  alreadyDelivered: boolean;
+  activeState: ProductionDispatchState | null;
+  validationErrors: ProductionValidationError[];
+  disabledReasons: ProductionDisabledReason[];
+  payload: P201Payload | null;
+}
+
 export interface ProductionOrderPreview {
   featureEnabled: boolean;
   featureConfigured: boolean;
+  settingsHref: string;
   p101: {
+    configured: boolean;
     eligible: boolean;
     alreadyDelivered: boolean;
     activeState: ProductionDispatchState | null;
     validationErrors: ProductionValidationError[];
+    disabledReasons: ProductionDisabledReason[];
     payload: P101Payload | null;
     maskedForViewer: boolean;
   };
   p201: {
+    configured: boolean;
     eligible: boolean;
     p101Delivered: boolean;
     alreadyDelivered: boolean;
     activeState: ProductionDispatchState | null;
     validationErrors: ProductionValidationError[];
+    disabledReasons: ProductionDisabledReason[];
     payload: P201Payload | null;
   };
+  p301: ProductionLaterPhasePreview;
+  p401: ProductionLaterPhasePreview;
 }
 
 export interface ProductionListDispatchesInput {
@@ -138,6 +188,7 @@ export interface ProductionListDispatchesInput {
 }
 
 export const PRODUCTION_PIPELINE_PATH = "/admin/integrations/production";
+export const REDELIVER_CONFIRM_PHRASE = "REDELIVER";
 
 export const RUN_MODE_RE = /^[a-z][a-z0-9_]{0,31}$/;
 export const RELEASE_STATUS_RE = /^[A-Za-z0-9_.-]{0,120}$/;
@@ -146,6 +197,15 @@ export const HEADER_NAME_RE = /^[A-Za-z0-9-]{1,64}$/;
 export const PHASE_LABELS: Record<ProductionPhase, string> = {
   P101: "Phase I intake (P101)",
   P201: "Phase II start (P201)",
+  P301: "Phase III start (P301)",
+  P401: "Phase IV start (P401)",
+};
+
+export const PHASE_START_LABELS: Record<ProductionPhase, string> = {
+  P101: "Start Phase I",
+  P201: "Start Phase II",
+  P301: "Start Phase III",
+  P401: "Start Phase IV",
 };
 
 export const DISPATCH_STATE_META: Record<ProductionDispatchState, { label: string; tone: Tone }> = {

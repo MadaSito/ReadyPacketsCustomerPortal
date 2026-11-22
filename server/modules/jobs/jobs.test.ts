@@ -8,27 +8,33 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createAuditEmitter } from "../audit/emitter.js";
 import { auditEvents } from "../audit/schema.js";
 import { createJobsAdmin } from "./admin.js";
+import { customerMaintenanceNotice } from "./customerMaintenance.js";
 import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
-import { createJobQueue, createMailer, engineFor } from "./queue.js";
+import { createJobQueue, createMailer, engineFor, JOB_TYPE } from "./queue.js";
+import {
+  REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, REFUND_RECONCILE_MAX_ATTEMPTS,
+  registerRefundNotice, registerRefundReconciliation, type RefundReconcileContext,
+} from "./refundSupport.js";
 import { jobsRouter } from "./router.js";
-import { jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailOutbox, mailTransportAttempts } from "./schema.js";
+import { customerMaintenance, jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 import { startWorker } from "./worker.js";
 
 let t: TestDb;
 beforeAll(async () => {
-  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailAuditVerification, auditEvents } });
+  t = await createTestDb({ schema: { jobRuns, jobAttempts, jobMaintenance, customerMaintenance, mailOutbox, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, auditEvents } });
 });
 afterAll(async () => t?.cleanup());
 beforeEach(async () => {
-  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, auditEvents]) {
+  for (const table of [jobAttempts, mailAttempts, mailTransportAttempts, mailManualResends, mailAuditVerification, mailOutbox, jobRuns, jobMaintenance, customerMaintenance, auditEvents]) {
     await t.db.delete(table);
   }
 });
 
 const done = async () => ({ outcome: "completed" as const });
+const inactiveCustomerAccess = { active: false, message: null, expectedEnd: null };
 async function expireLease(jobId?: string): Promise<void> {
   await t.db.update(jobRuns).set({ leaseUntil: sql`UTC_TIMESTAMP(3) - INTERVAL 1 SECOND` })
     .where(jobId === undefined ? eq(jobRuns.state, "running") : eq(jobRuns.publicId, jobId));
@@ -54,6 +60,201 @@ function fixture(profile: Parameters<typeof createTestDeps>[0] = {}, useDurableA
   h.services.identity = { sessions: { assertCurrent } } as unknown as typeof h.services.identity;
   return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent, durableAudit };
 }
+
+describe("Outbox generation replacement", () => {
+  const type = "storage.copy_order_file";
+  const safeReason = "STORAGE_PROVIDER_RETRY";
+
+  it("permits only a matching terminal failure inaccessible to generic Jobs retry", async () => {
+    const f = fixture();
+    f.jobs.register(type, async () => ({ outcome: "failed", reasonCode: safeReason, retryable: false }));
+    const { jobId } = await f.jobs.enqueue(type, {});
+    const canReplace = (expected = type) => t.db.transaction((tx) => f.admin.canReplaceFailedOutboxJob(jobId, expected, tx));
+    expect(await canReplace()).toBe(false);
+    const claim = (await f.engine.claim())!;
+    expect(await canReplace()).toBe(false);
+    await f.engine.execute(claim);
+    expect(await canReplace("storage.copy_backup")).toBe(false);
+    expect(await canReplace()).toBe(true);
+    await expect(f.admin.retry(f.operator, jobId)).rejects.toMatchObject({ reasonCode: "JOB_RETRY_UNSAFE" });
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({ state: "failed", allowRetry: false });
+  });
+
+  it("refuses automatic retries, generically retryable failures and an expired or unknown claim without rewriting them", async () => {
+    const f = fixture();
+    f.jobs.register<{ ambiguous?: boolean }>(type, async ({ payload }) => payload.ambiguous
+      ? { outcome: "unknown", reasonCode: "STORAGE_COPY_UNCERTAIN" }
+      : { outcome: "failed", reasonCode: safeReason, retryable: true });
+    const first = await f.jobs.enqueue(type, {}, { maxAttempts: 2 });
+    const canReplace = (jobId: string) => t.db.transaction((tx) => f.admin.canReplaceFailedOutboxJob(jobId, type, tx));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(first.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "queued" });
+    f.h.clock.advance(2_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(first.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "failed", allowRetry: true });
+    const second = await f.jobs.enqueue(type, { ambiguous: true });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await canReplace(second.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, second.jobId)).toMatchObject({ state: "unknown" });
+    const third = await f.jobs.enqueue(type, {});
+    await f.engine.claim();
+    await expireLease(third.jobId);
+    expect(await canReplace(third.jobId)).toBe(false);
+    expect(await f.admin.detail(f.operator, third.jobId)).toMatchObject({ state: "running" });
+  });
+});
+
+describe("Refund reconciliation support", () => {
+  const refundPublicId = "01JD0000000000000000000001";
+
+  it("stages one delayed lookup in the refund intent transaction without retaining a provider payload", async () => {
+    const f = fixture();
+    const lookup = vi.fn(async () => "settled" as const);
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    expect(REFUND_RECONCILE_JOB).toMatch(JOB_TYPE);
+    await expect(t.db.transaction(async (tx) => {
+      await enqueue(refundPublicId, tx);
+      throw new Error("intent rollback");
+    })).rejects.toThrow("intent rollback");
+    expect(await f.engine.claim()).toBeNull();
+    const runAt = new Date(f.h.clock.now().getTime() + 120_000);
+    const first = await t.db.transaction((tx) => enqueue(refundPublicId, tx, { runAt, correlationId: "refund-lookup" }));
+    expect(await t.db.transaction((tx) => enqueue(refundPublicId, tx))).toEqual(first);
+    expect(await f.engine.claim()).toBeNull();
+    const [stored] = await t.db.select().from(jobRuns);
+    expect(stored).toMatchObject({ runAt, retrySafe: true, maxAttempts: REFUND_RECONCILE_MAX_ATTEMPTS });
+    expect(stored?.payloadEnc).not.toContain(refundPublicId);
+    f.h.clock.advance(120_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(refundPublicId, expect.objectContaining({
+      jobId: first.jobId, signal: expect.any(AbortSignal), correlationId: "refund-lookup", assertStillOwned: expect.any(Function),
+    }));
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "completed" });
+  });
+
+  it("uses bounded backoff on inconclusive lookups and never exposes a generic retry after exhaustion", async () => {
+    const f = fixture();
+    const lookup = vi.fn(async () => "pending" as const);
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    const { jobId } = await t.db.transaction((tx) => enqueue(refundPublicId, tx));
+    for (let attempt = 1; attempt <= REFUND_RECONCILE_MAX_ATTEMPTS; attempt += 1) {
+      await f.engine.execute((await f.engine.claim())!);
+      const row = await f.admin.detail(f.operator, jobId);
+      expect(row).toMatchObject({ attempt, state: attempt < REFUND_RECONCILE_MAX_ATTEMPTS ? "queued" : "failed" });
+      f.h.clock.advance(3_600_000);
+    }
+    expect(await f.engine.claim()).toBeNull();
+    expect(lookup).toHaveBeenCalledTimes(REFUND_RECONCILE_MAX_ATTEMPTS);
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({
+      state: "failed", reasonCode: "REFUND_RECONCILE_EXHAUSTED", allowRetry: false,
+    });
+  });
+
+  it("refuses malformed payloads and supplies a live writer fence for local settlement", async () => {
+    const f = fixture();
+    const publish = vi.fn();
+    const lookup = vi.fn(async (_id: string, context: RefundReconcileContext) => {
+      await expireLease(context.jobId);
+      await t.db.transaction(async (tx) => {
+        await context.assertStillOwned(tx);
+        publish();
+      });
+      return "settled" as const;
+    });
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    const malformed = await f.jobs.enqueue(REFUND_RECONCILE_JOB, { refundPublicId, unexpected: true });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await f.admin.detail(f.operator, malformed.jobId)).toMatchObject({ reasonCode: "REFUND_RECONCILE_INVALID_JOB" });
+    expect(lookup).not.toHaveBeenCalled();
+    await t.db.transaction((tx) => enqueue(refundPublicId, tx));
+    const claim = (await f.engine.claim())!;
+    await f.engine.execute(claim);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(claim.job.signal.aborted).toBe(true);
+    expect(publish).not.toHaveBeenCalled();
+  });
+});
+
+describe("Customer maintenance policy", () => {
+  const immediate = { enabled: true, message: "", startsAt: null, endsAt: null, expectedVersion: 0 } as const;
+
+  it("keeps future messages private and enforces inclusive start, exclusive end independently of worker drain", async () => {
+    const f = fixture({}, true);
+    const start = new Date(f.h.clock.now().getTime() + 1_000).toISOString();
+    const end = new Date(f.h.clock.now().getTime() + 2_000).toISOString();
+    expect(await f.admin.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+    await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
+    expect(await f.admin.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+    expect(await f.admin.setCustomerMaintenance(f.operator, { ...immediate, startsAt: start, endsAt: end, message: "  Planned servicing  " }))
+      .toMatchObject({ phase: "scheduled", version: 1, message: "Planned servicing" });
+    f.h.clock.advance(999);
+    expect(await t.db.transaction((tx) => f.admin.maintenance.customerAccess(tx))).toEqual(inactiveCustomerAccess);
+    f.h.clock.advance(1);
+    expect(await t.db.transaction((tx) => f.admin.maintenance.customerAccess(tx)))
+      .toEqual({ active: true, message: "Planned servicing", expectedEnd: end });
+    f.h.clock.advance(1_000);
+    expect(await f.admin.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+    expect(await f.admin.customerMaintenance(f.operator)).toMatchObject({ phase: "ended", version: 1 });
+    expect(await f.admin.maintenanceBanner()).toMatchObject({ active: true });
+    const [event] = await t.db.select().from(auditEvents).where(eq(auditEvents.eventName, "job.customer_maintenance.changed"));
+    expect(event).toMatchObject({ reasonCode: "CUSTOMER_MAINTENANCE_CONFIGURED",
+      attributes: { enabled: true, starts_at: start, ends_at: end } });
+    expect(Object.keys(event!.attributes).sort()).toEqual(["enabled", "ends_at", "starts_at"]);
+    expect(customerMaintenanceNotice(event!.attributes, "https://portal.example.test")).toEqual({
+      windowLabel: `${start.slice(0, 10)} ${start.slice(11, 19)} UTC to ${end.slice(0, 10)} ${end.slice(11, 19)} UTC`,
+      summary: expect.stringContaining("Check the portal for current status."),
+      link: "https://portal.example.test/sign-in",
+    });
+  });
+
+  it("rejects unsafe text and invalid dates, and rechecks the persisted actor and step-up before writing", async () => {
+    const f = fixture();
+    await expect(f.admin.setCustomerMaintenance(fakePrincipal({ role: "staff" }), immediate)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(f.admin.setCustomerMaintenance(fakePrincipal({ role: "admin" }), immediate)).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    await expect(f.admin.setCustomerMaintenance(f.operator, { ...immediate, message: "<b>Not plain text</b>" }))
+      .rejects.toMatchObject({ reasonCode: "CUSTOMER_MAINTENANCE_MESSAGE_INVALID" });
+    await expect(f.admin.setCustomerMaintenance(f.operator, { ...immediate, startsAt: "2026-02-30T10:00:00Z" }))
+      .rejects.toMatchObject({ reasonCode: "CUSTOMER_MAINTENANCE_TIME_INVALID" });
+    await expect(f.admin.setCustomerMaintenance(f.operator, { ...immediate, endsAt: f.h.clock.now().toISOString() }))
+      .rejects.toMatchObject({ reasonCode: "CUSTOMER_MAINTENANCE_WINDOW_INVALID" });
+    f.assertCurrent.mockResolvedValueOnce({ pendingSteps: [], role: "admin", stepUpAt: new Date(0), mfaVerifiedAt: f.h.clock.now() });
+    await expect(f.admin.setCustomerMaintenance(f.operator, immediate)).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    f.assertCurrent.mockRejectedValueOnce(forbidden("SESSION_NOT_CURRENT"));
+    await expect(f.admin.setCustomerMaintenance(f.operator, immediate)).rejects.toMatchObject({ reasonCode: "SESSION_NOT_CURRENT" });
+    expect(await f.admin.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+    expect(f.h.audit.named("job.customer_maintenance.changed")).toHaveLength(0);
+  });
+
+  it("serializes versioned changes, fails closed on audit loss, and reads the latest policy despite an older transaction snapshot", async () => {
+    const f = fixture();
+    const peer = fixture();
+    f.h.audit.failRecords = true;
+    await expect(f.admin.setCustomerMaintenance(f.operator, immediate)).rejects.toMatchObject({ code: "AUDIT_UNAVAILABLE" });
+    expect(await t.db.select().from(customerMaintenance)).toHaveLength(0);
+    f.h.audit.failRecords = false;
+
+    await t.db.transaction(async (tx) => {
+      expect(await tx.select().from(customerMaintenance)).toHaveLength(0);
+      const writes = await Promise.allSettled([
+        f.admin.setCustomerMaintenance(f.operator, { ...immediate, message: "First" }),
+        peer.admin.setCustomerMaintenance(peer.operator, { ...immediate, message: "Second" }),
+      ]);
+      expect(writes.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(writes.find((result) => result.status === "rejected")).toMatchObject({ reason: { reasonCode: "CUSTOMER_MAINTENANCE_CHANGED" } });
+      expect(await f.admin.maintenance.customerAccess(tx)).toMatchObject({ active: true, expectedEnd: null });
+    }, { isolationLevel: "repeatable read" });
+
+    const current = await f.admin.customerMaintenance(f.operator);
+    expect(await f.admin.setCustomerMaintenance(f.operator, { ...immediate, message: current.message, expectedVersion: 1 }))
+      .toMatchObject({ version: 1 });
+    expect([...f.h.audit.named("job.customer_maintenance.changed"), ...peer.h.audit.named("job.customer_maintenance.changed")]).toHaveLength(1);
+    expect(await f.admin.setCustomerMaintenance(f.operator, { ...immediate, enabled: false, expectedVersion: 1 }))
+      .toMatchObject({ phase: "off", version: 2 });
+    expect(await f.admin.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+  });
+});
 
 describe("MySQL durable job leases", () => {
   it("claims once across independent concurrent workers and persists the claim audit atomically", async () => {
@@ -138,17 +339,17 @@ describe("MySQL durable job leases", () => {
     await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
     await f.jobs.enqueue("test.unsafe", null);
     expect(await f.engine.claim()).toBeNull();
-    expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "draining", running: 1 });
+    expect(await f.admin.workerMaintenance(f.operator)).toMatchObject({ state: "draining", running: 1 });
     await expireLease(a.jobId);
     expect(await f.engine.reap()).toBe(1);
     await f.engine.heartbeat(old);
     expect(old.job.signal.aborted).toBe(true);
-    expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 1 });
+    expect(await f.admin.workerMaintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 1 });
     expect(await f.admin.maintenanceBanner()).toMatchObject({ active: true });
     await expect(f.admin.setMaintenance(f.operator, { active: false, expectedActive: true })).rejects.toMatchObject({ reasonCode: "JOB_DRAIN_UNPROVED" });
     await expect(f.admin.retry(f.operator, a.jobId)).rejects.toMatchObject({ code: "MAINTENANCE" });
     await f.admin.acknowledgeUnknown(f.operator, a.jobId);
-    expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "queue_drained", unresolved: 0 });
+    expect(await f.admin.workerMaintenance(f.operator)).toMatchObject({ state: "queue_drained", unresolved: 0 });
     await f.admin.setMaintenance(f.operator, { active: false, expectedActive: true });
     await expect(f.admin.retry(f.operator, a.jobId)).rejects.toMatchObject({ reasonCode: "JOB_RETRY_UNSAFE" });
     expect(await f.admin.detail(f.operator, a.jobId)).toMatchObject({ state: "unknown", reconciledAt: expect.any(Date) });
@@ -164,7 +365,7 @@ describe("MySQL durable job leases", () => {
     await expireLease();
     expect(await f.engine.reap()).toBe(2);
     await f.admin.setMaintenance(f.operator, { active: true, expectedActive: false });
-    expect(await f.admin.maintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 2 });
+    expect(await f.admin.workerMaintenance(f.operator)).toMatchObject({ state: "unproved", unresolved: 2 });
     expect(await f.admin.cancel(f.operator, canceled)).toMatchObject({ state: "unknown" });
     expect(await f.admin.detail(f.operator, canceled)).toMatchObject({ reasonCode: "JOB_RETRY_CANCELED_UNCERTAIN" });
     await f.admin.cancel(f.operator, failed);
@@ -368,6 +569,23 @@ describe("MySQL durable job leases", () => {
     expect(await caller({ ...publicContext, session: null }).maintenanceBanner()).toEqual({
       active: true, message: "Maintenance is in progress. Some operations are temporarily unavailable.",
     });
+    const anonymous = caller({ ...publicContext, session: null });
+    const operator = caller({ ...publicContext, session: f.operator });
+    const endAll = vi.fn(async () => ({ ended: 3 }));
+    f.h.services.identity.sessions.endAllCustomers = endAll;
+    expect(await anonymous.maintenance.customerAccess()).toEqual(inactiveCustomerAccess);
+    await expect(anonymous.admin.customerMaintenance()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(operator.admin.endCustomerSessions()).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(endAll).not.toHaveBeenCalled();
+    await f.admin.setCustomerMaintenance(f.operator, { enabled: true, startsAt: null, endsAt: null,
+      message: "Planned work", expectedVersion: 0 });
+    expect(await anonymous.maintenance.customerAccess()).toEqual({ active: true, message: "Planned work", expectedEnd: null });
+    await expect(anonymous.admin.endCustomerSessions()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(caller({ ...publicContext, session: fakePrincipal({ role: "admin" }) }).admin.endCustomerSessions())
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(endAll).not.toHaveBeenCalled();
+    expect(await operator.admin.endCustomerSessions()).toEqual({ ended: 3 });
+    expect(endAll).toHaveBeenCalledExactlyOnceWith(f.operator, { reasonCode: "CUSTOMER_MAINTENANCE" });
   });
 
   it("permits one manual attempt after exhausted retryable failure, without resetting the fence", async () => {
@@ -470,6 +688,33 @@ describe("MySQL transactional mail outbox", () => {
     return { send, findRecipient };
   }
 
+  it("queues a single refund notice and redacts private refund data from retention and audit", async () => {
+    const f = fixture({}, true);
+    const ports = setDelivery(f, "accepted");
+    registerRefundNotice(f.mailer);
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.h.settings.set(MAIL_RETENTION_DAYS.key, 30);
+    const refundReference = "01JD0000000000000000000001";
+    const notice = {
+      template: REFUND_NOTICE_TEMPLATE_KEY, to: { userId: 22 }, idempotencyKey: `refund-notice:${refundReference}`,
+      vars: { orderReference: "SYNTHETIC-ORDER-123", refundAmount: "$24.00", refundReference },
+    };
+    await t.db.transaction((tx) => f.mailer.enqueue(notice, tx));
+    await t.db.transaction((tx) => f.mailer.enqueue(notice, tx));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(ports.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      to: "current@example.test",
+      subject: "A refund was recorded for your ReadyPackets order",
+      text: expect.stringContaining("A refund of $24.00 was recorded for your ReadyPackets order SYNTHETIC-ORDER-123."),
+    }));
+    const rows = await t.db.select().from(mailOutbox);
+    expect(rows).toHaveLength(1);
+    const kept = await f.admin.mailContent(f.operator, rows[0]!.publicId);
+    expect(kept.text).toContain("A refund of [REDACTED] was recorded for your ReadyPackets order [REDACTED].");
+    expect(kept.text).toContain("Refund reference: [REDACTED]");
+    expect(JSON.stringify(await t.db.select().from(auditEvents))).not.toContain(refundReference);
+  });
+
   it("deduplicates across transactions, encrypts variables, and holds when SMTP is unconfigured", async () => {
     const f = fixture();
     const ports = setDelivery(f, "not_configured");
@@ -507,6 +752,7 @@ describe("MySQL transactional mail outbox", () => {
       },
     } as unknown as typeof f.h.services.integrations;
     const jobs = createJobsModule({ ...f.h.deps, jobs: f.jobs, mailer: f.mailer });
+    expect(jobs.getBuiltinMailTemplates()).toContainEqual(expect.objectContaining({ key: REFUND_NOTICE_TEMPLATE_KEY }));
     await expect(jobs.getMailSenderIdentity()).resolves.toEqual(sender);
     const shared = { fromAddress: "shared@example.test", fromName: "Shared Ops", replyToAddress: "reply@example.test" };
     await f.h.settings.set(MAIL_SENDER.key, shared);
@@ -528,15 +774,54 @@ describe("MySQL transactional mail outbox", () => {
     await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
   });
 
-  it("keeps ambiguous transport outcomes unknown with no payload or resend", async () => {
+  it("requires explicit verified duplicate-risk acceptance and records a new generation with durable original-job evidence", async () => {
+    const f = fixture({}, true);
+    const smtp = setDelivery(f, "unknown");
+    await f.mailer.enqueue(input);
+    await f.engine.execute((await f.engine.claim())!);
+    const [row] = await t.db.select().from(mailOutbox);
+    const id = row!.publicId;
+    const options = { acknowledgeDuplicateRisk: true, expectedGeneration: 1 } as const;
+    expect(row).toMatchObject({ state: "unknown", payloadEnc: expect.any(String), generation: 1 });
+    expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
+    expect((await f.admin.listMail(f.operator, {})).items[0]?.canResend).toBe(true);
+    expect(await f.engine.claim()).toBeNull();
+    await expect(f.admin.resend(f.operator, id)).rejects.toMatchObject({ reasonCode: "MAIL_DUPLICATE_RISK_NOT_ACKNOWLEDGED" });
+    await expect(f.admin.resend(fakePrincipal({ role: "admin" }), id, options)).rejects.toMatchObject({ code: "STEP_UP_REQUIRED" });
+    f.assertCurrent.mockRejectedValueOnce(forbidden("SESSION_NOT_CURRENT"));
+    await expect(f.admin.resend(f.operator, id, options)).rejects.toMatchObject({ reasonCode: "SESSION_NOT_CURRENT" });
+    expect(smtp.send).toHaveBeenCalledTimes(1);
+    const { jobId } = await f.admin.resend(f.operator, id, options);
+    expect(jobId).not.toEqual(row!.jobPublicId);
+    expect(smtp.send).toHaveBeenCalledTimes(1);
+    expect((await f.admin.mailDetail(f.operator, id)).attempts).toMatchObject([
+      { purpose: "manual_resend_after_unknown", generation: 2, state: "queued" },
+      { purpose: "primary", generation: 1, state: "unknown" },
+    ]);
+    const [event] = await t.db.select().from(auditEvents).where(eq(auditEvents.eventName, "job.mail.resent_after_unknown"));
+    expect(event).toMatchObject({ actorUserId: f.operator.userId, actorRole: "admin", jobId: row!.jobPublicId,
+      attributes: { resent_job_public_id: jobId, generation: 2 } });
+    await f.engine.execute((await f.engine.claim())!);
+    await expect(f.admin.resend(f.operator, id, options)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_CHANGED" });
+    expect(smtp.send).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses expired and purged unknown payloads while preserving the original unknown outcome", async () => {
     const f = fixture();
     setDelivery(f, "unknown");
     await f.mailer.enqueue(input);
     await f.engine.execute((await f.engine.claim())!);
     const [row] = await t.db.select().from(mailOutbox);
-    expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
-    expect((await f.admin.list(f.operator, {})).items[0]?.state).toBe("unknown");
-    await expect(f.admin.resend(f.operator, row!.publicId)).rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+    const options = { acknowledgeDuplicateRisk: true } as const;
+    f.h.clock.advance(row!.expiresAt.getTime() - f.h.clock.now().getTime());
+    await expect(f.admin.resend({ ...f.operator, stepUpAt: f.h.clock.now() }, row!.publicId, options))
+      .rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
+    await f.jobs.enqueue("jobs.mail.expire", {});
+    await f.engine.execute((await f.engine.claim())!);
+    expect((await t.db.select().from(mailOutbox))[0]).toMatchObject({ state: "unknown", payloadEnc: null });
+    expect((await f.admin.listMail(f.operator, {})).items[0]?.canResend).toBe(false);
+    await expect(f.admin.resend({ ...f.operator, stepUpAt: f.h.clock.now() }, row!.publicId, options))
+      .rejects.toMatchObject({ reasonCode: "MAIL_RESEND_UNSAFE" });
   });
 
   it("preserves automation origin through a failed submission and operator resend, suppressing only those tap events", async () => {
@@ -597,7 +882,7 @@ describe("MySQL transactional mail outbox", () => {
     }
     const [row] = await t.db.select().from(mailOutbox);
     expect(active.job.signal.aborted).toBe(true);
-    expect(row).toMatchObject({ state: "unknown", payloadEnc: null });
+    expect(row).toMatchObject({ state: "unknown", payloadEnc: expect.any(String) });
     expect((await f.admin.mailDetail(f.operator, row!.publicId)).attempts[0]?.state).toBe("unknown");
   });
 
@@ -620,7 +905,8 @@ describe("MySQL transactional mail outbox", () => {
       expect(graph).toHaveBeenCalledTimes(switched ? 1 : 0);
       if (switched) expect(graph).toHaveBeenCalledWith(expect.objectContaining({ sender: configured }));
       const [row] = await t.db.select().from(mailOutbox);
-      expect(row).toMatchObject({ state: primary === "unknown" ? "unknown" : primary === "rejected" && !switched ? "failed" : "accepted", payloadEnc: null });
+      expect(row).toMatchObject({ state: primary === "unknown" ? "unknown" : primary === "rejected" && !switched ? "failed" : "accepted",
+        payloadEnc: primary === "unknown" ? expect.any(String) : null });
       const { attempts } = await f.admin.mailDetail(f.operator, row!.publicId);
       expect(attempts).toHaveLength(switched ? 2 : 1);
       expect(attempts).toContainEqual(expect.objectContaining({

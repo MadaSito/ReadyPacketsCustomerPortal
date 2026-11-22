@@ -415,6 +415,7 @@ describe("integrations module — DB-backed integration suite", () => {
       ["integrations.saml", "disabled"],
       ["integrations.sharepoint", "disabled"],
       ["integrations.production", "disabled"],
+      ["integrations.webhooks", "disabled"],
     ]);
 
     // Configure & enable SMTP WITHOUT running test message yet -> verified=false, health MUST be 'degraded' (never 'ok')!

@@ -117,6 +117,8 @@ var_free_kb=$(df --output=avail -k "$storage" | tail -1 | tr -d ' ')
 ((var_free_kb >= var_needed_kb)) ||
     die "at least $((var_needed_kb / 1024)) MB of free space is required on $(df --output=target "$storage" | tail -1) for the pre-upgrade backup"
 
+install_media_tools
+
 db_schema=$("$node" -e '
 const fs = require("node:fs");
 const u = new URL(fs.readFileSync(0, "utf8").trim());

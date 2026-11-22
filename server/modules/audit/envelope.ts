@@ -67,6 +67,11 @@ export interface AuditEnvelope {
   resource_type: string | null;
   resource_public_id: string | null;
   resource_ref: string | null;
+  /**
+   * Order the event belongs to (explicit `orderPublicId`, an order resource, or the `order_public_id` attribute).
+   * Optional for envelopes rebuilt from rows written before increment 04 part B. Hashed only when non-null.
+   */
+  order_public_id?: string | null;
   request_id: string | null;
   trace_id: string | null;
   span_id: string | null;
@@ -209,6 +214,7 @@ export function buildEnvelope(input: AuditEventInput, ctx: EnvelopeContext): Aud
 
   const attributes: Record<string, SafeAttributeValue> = {};
   let dropped = 0;
+  const orderPublicIdOf = (value: unknown): string | null => (typeof value === "string" && PUBLIC_ID_VALUE.test(value) ? value : null);
   const rawAttributes = input.attributes ?? {};
   const keys = Object.keys(rawAttributes);
   for (const key of keys) {
@@ -255,6 +261,10 @@ export function buildEnvelope(input: AuditEventInput, ctx: EnvelopeContext): Aud
     resource_type: input.resource?.type ?? null,
     resource_public_id: resourcePublicId,
     resource_ref: resourceRef,
+    order_public_id:
+      orderPublicIdOf(input.orderPublicId) ??
+      (input.resource?.type === "order" ? orderPublicIdOf(resourcePublicId) : null) ??
+      orderPublicIdOf(attributes.order_public_id),
     request_id: optId(request?.requestId),
     trace_id: request?.traceId && /^[0-9a-f]{32}$/.test(request.traceId) ? request.traceId : null,
     span_id: request?.spanId && /^[0-9a-f]{16}$/.test(request.spanId) ? request.spanId : null,
@@ -347,7 +357,10 @@ function canonicalValue(value: unknown): unknown {
 
 /** Canonical bytes "c1": JSON array of [field, value] pairs in CANONICAL_FIELDS order, nested keys sorted. */
 export function canonicalBytes(envelope: AuditEnvelope): string {
-  return JSON.stringify(CANONICAL_FIELDS.map((field) => [field, canonicalValue(envelope[field])]));
+  const pairs: [string, unknown][] = CANONICAL_FIELDS.map((field) => [field, canonicalValue(envelope[field])]);
+  // Appended only when present, so rows written before the column existed keep their original bytes ("c1").
+  if (envelope.order_public_id !== null && envelope.order_public_id !== undefined) pairs.push(["order_public_id", envelope.order_public_id]);
+  return JSON.stringify(pairs);
 }
 
 /**

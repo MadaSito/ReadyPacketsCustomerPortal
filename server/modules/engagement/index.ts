@@ -10,8 +10,10 @@ import { registerEngagementMailTemplates } from "./mail.js";
 import { createMessagesService, type MessagesService } from "./messagesService.js";
 import { createNotificationsService, type NotificationsService } from "./notificationsService.js";
 import { createPortableEngagementService } from "./portableService.js";
+import { createTicketsApiProvider } from "./publicApiProvider.js";
 import { createSearchService, type SearchService } from "./searchService.js";
 import { createTicketsService, type TicketsService } from "./ticketsService.js";
+import type { PublicApiProviders } from "../publicApi/ports.js";
 import type {
   ImportOrderMessageInput,
   ImportTicketInput,
@@ -105,6 +107,7 @@ export interface EngagementModule extends ModuleLifecycle {
   readonly tickets: TicketsService;
   readonly notifications: NotificationsService;
   readonly search: SearchService;
+  readonly publicApiProvider: PublicApiProviders["tickets"];
 }
 
 export function createEngagementModule(deps: ModuleDeps): EngagementModule {
@@ -115,6 +118,8 @@ export function createEngagementModule(deps: ModuleDeps): EngagementModule {
   const tickets = createTicketsService(deps, notifications);
   const search = createSearchService(deps);
   const portable = createPortableEngagementService(deps);
+  const publicApiProvider = createTicketsApiProvider(deps);
+  let providerRegistered = false;
 
   deps.jobs.register(
     NOTIFICATIONS_RETENTION_JOB_TYPE,
@@ -171,6 +176,25 @@ export function createEngagementModule(deps: ModuleDeps): EngagementModule {
     tickets,
     notifications,
     search,
+    publicApiProvider,
+    init() {
+      if (!providerRegistered) {
+        const pubApi = (
+          deps.services as unknown as {
+            publicApi?: {
+              registerProvider?: <K extends keyof PublicApiProviders>(
+                key: K,
+                provider: PublicApiProviders[K],
+              ) => void;
+            };
+          }
+        ).publicApi;
+        if (pubApi?.registerProvider) {
+          pubApi.registerProvider("tickets", publicApiProvider);
+          providerRegistered = true;
+        }
+      }
+    },
     health,
   };
 }

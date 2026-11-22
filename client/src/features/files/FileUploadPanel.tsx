@@ -1,9 +1,10 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { Upload } from "lucide-react";
-import type { FileCategory, FileVisibility, UploadPolicy } from "@server/modules/files/index";
+import type { FileCategory, FileUploadSlot, FileVisibility, UploadPolicy } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
-import { Button, Callout, Field, FileDropzone, Select, StatusBadge } from "@/ui";
+import { Button, Callout, Field, FileDropzone, Select, StatusBadge, Textarea } from "@/ui";
+import { AudioRecorder } from "./AudioRecorder";
 import { formatBytes } from "./format";
 
 export const categoryLabels: Record<FileCategory, string> = {
@@ -22,6 +23,10 @@ const uploadRefusals = new Map([
   ["UPLOAD_REQUEST_TOO_LARGE", "The total upload exceeds the request limit. Choose fewer or smaller files."],
   ["TOO_MANY_FILES", "This batch exceeds the file count limit."],
   ["ORDER_LOCKED", "This order is locked for file changes."],
+  ["ORDER_ACCEPTANCE_REQUIRED", "Accept the order's required policy before uploading files or saving a recording."],
+  ["PHASE_LOCKED", "This phase is locked for file changes."],
+  ["UPLOAD_SLOT_STATUS_CHANGED", "The order status changed. Reload to see the current upload slots."],
+  ["UPLOAD_SLOT_UNAVAILABLE", "This upload slot is no longer available to you."],
   ["AUDIT_WRITE_FAILED", "A security record could not be saved. Reload the list to confirm which files were saved."],
 ]);
 
@@ -45,29 +50,42 @@ export interface FileUploadPanelProps {
   staff: boolean;
   policy: UploadPolicy;
   replace?: { id: string; category: FileCategory; visibility: FileVisibility };
+  slot?: FileUploadSlot & { statusKey: string };
+  audio?: { enabled: boolean; maxMinutes: number } | null;
   onChanged: () => void | Promise<void>;
 }
 
-export function FileUploadPanel({ orderId, staff, policy, replace, onChanged }: FileUploadPanelProps) {
+export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, onChanged }: FileUploadPanelProps) {
   const hintId = useId();
+  const transcriptInput = useRef<HTMLTextAreaElement>(null);
   const [category, setCategory] = useState<FileCategory>(replace?.category ?? "supporting");
   const [visibility, setVisibility] = useState<FileVisibility>(replace?.visibility ?? "customer_visible");
   const [selection, setSelection] = useState<File[]>([]);
+  const [recording, setRecording] = useState(false);
   const [results, setResults] = useState<UploadOutcome[]>([]);
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const maxFiles = replace ? 1 : policy.maxFiles;
+  const [transcript, setTranscript] = useState("");
+  const maxFiles = replace ? 1 : Math.min(policy.maxFiles, slot?.maxCount ?? policy.maxFiles);
+  const extensions = slot ? policy.extensions.filter((extension) => {
+    if (slot.allowedTypes.length && !slot.allowedTypes.includes(extension)) return false;
+    return (slot.kind === "audio" ? ["wav", "webm", "ogg", "m4a"] : ["pdf", "png", "jpg"]).includes(extension);
+  }) : policy.extensions;
+  const allowsTranscript = selection.length === 1 && (slot?.kind === "audio" ||
+    /^(?:audio\/)|\.(?:wav|ogg|webm|m4a)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
   const categories = (Object.keys(categoryLabels) as FileCategory[]).filter((key) => staff || key !== "deliverable");
 
-  function choose(files: File[]) {
+  function choose(files: File[], isRecording = false) {
     setMessage(null);
     setResults([]);
+    setTranscript("");
+    setRecording(isRecording);
     if (files.length > maxFiles) {
       setSelection([]);
       setMessage(`Choose at most ${maxFiles} ${maxFiles === 1 ? "file" : "files"} per upload.`);
       return;
     }
-    if (files.reduce((total, file) => total + file.size, 0) + 1024 > policy.maxRequestBytes) {
+    if (files.some((file) => file.size > policy.maxFileBytes) || files.reduce((total, file) => total + file.size, 0) + 1024 > policy.maxRequestBytes) {
       setSelection([]);
       setMessage(`Choose files that fit within the ${formatBytes(policy.maxRequestBytes)} request limit.`);
       return;
@@ -80,10 +98,16 @@ export function FileUploadPanel({ orderId, staff, policy, replace, onChanged }: 
     setRunning(true);
     setMessage(null);
     setResults([]);
-    const query = new URLSearchParams({ category, visibility });
+    const query = new URLSearchParams({ category, visibility: slot ? "customer_visible" : visibility });
+    if (recording) query.set("source", "recording");
+    if (slot) {
+      query.set("slotKey", slot.key);
+      query.set("statusKey", slot.statusKey);
+    }
     if (replace) query.set("versionOf", replace.id);
     const payload = new FormData();
     for (const file of selection) payload.append("files", file);
+    if (allowsTranscript && transcript.trim()) payload.append("transcript", transcript.trim());
     try {
       const response = await sessionFetch(apiUrl(`/api/files/upload/${encodeURIComponent(orderId)}?${query.toString()}`), {
         method: "POST", body: payload, cache: "no-store",
@@ -109,7 +133,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, onChanged }: 
     }
   }
 
-  const accept = policy.extensions.flatMap((ext) => ext === "jpg" ? [".jpg", ".jpeg"] : [`.${ext}`]).join(",");
+  const accept = extensions.flatMap((ext) => ext === "jpg" ? [".jpg", ".jpeg"] : [`.${ext}`]).join(",");
   const finished = selection.length > 0 && results.length === selection.length;
   return (
     <div className="grid min-w-0 gap-4">
@@ -118,15 +142,20 @@ export function FileUploadPanel({ orderId, staff, policy, replace, onChanged }: 
           <Select value={category} onChange={(e) => setCategory(e.target.value as FileCategory)}
             options={categories.map((value) => ({ value, label: categoryLabels[value] }))} disabled={running} />
         </Field>
-        {staff ? <Field label="Visibility">
+        {staff && !slot ? <Field label="Visibility">
           <Select value={visibility} onChange={(e) => setVisibility(e.target.value as FileVisibility)} disabled={running}
             options={Object.entries(visibilityLabels).map(([value, label]) => ({ value, label }))} />
         </Field> : null}
       </div> : null}
-      {policy.extensions.length ? <FileDropzone onFiles={choose} accept={accept} multiple={maxFiles !== 1} maxSize={policy.maxFileBytes}
+      {slot ? <p className="text-sm text-body">Files in this slot are visible to authorized order readers.</p> : null}
+      {extensions.length ? <FileDropzone onFiles={choose} accept={accept} multiple={maxFiles !== 1} maxSize={policy.maxFileBytes}
         disabled={running} label={replace ? "Choose replacement file" : "Choose files"}
-        hint={`Approved formats: ${policy.extensions.map((ext) => ext.toUpperCase()).join(", ")}. Up to ${maxFiles} per upload.`} /> :
+        hint={`Approved formats: ${extensions.map((ext) => ext.toUpperCase()).join(", ")}. Up to ${maxFiles} per upload.`} /> :
         <Callout tone="warning" title="Uploads paused">No file formats are enabled. Existing files remain available to authorized readers.</Callout>}
+      {audio?.enabled && !running && !selection.length && slot?.kind !== "document" ?
+        <AudioRecorder extensions={extensions} maxSeconds={audio.maxMinutes * 60}
+          maxBytes={Math.min(policy.maxFileBytes, policy.maxRequestBytes - 1024)}
+          onChoose={(file) => { choose([file], true); window.requestAnimationFrame(() => transcriptInput.current?.focus()); }} /> : null}
       {message ? <Callout tone="warning" title="Upload notice" live="polite">{message}</Callout> : null}
       {selection.length ? <>
         <ul className="grid min-w-0 divide-y divide-line rounded-[var(--radius-card)] border border-line bg-surface px-3" aria-label="Selected files and upload results">
@@ -142,8 +171,11 @@ export function FileUploadPanel({ orderId, staff, policy, replace, onChanged }: 
             </li>;
           })}
         </ul>
+        {allowsTranscript ? <Field label="Audio transcript (optional)" hint="Plain text, up to 4,000 characters. The transcript has the same access rules as the recording.">
+          <Textarea ref={transcriptInput} value={transcript} disabled={running || finished} maxLength={4000} onChange={(event) => setTranscript(event.target.value)} rows={3} />
+        </Field> : null}
         <div className="flex flex-wrap items-center gap-2">
-          <Button leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }} disabled={running || finished || !policy.extensions.length} loading={running}>
+          <Button leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }} disabled={running || finished || !extensions.length} loading={running}>
             {replace ? "Upload new version" : `Upload ${selection.length === 1 ? "file" : `${selection.length} files`}`}
           </Button>
           <Button variant="ghost" disabled={running} onClick={() => choose([])}>{finished ? "Clear results" : "Clear selection"}</Button>

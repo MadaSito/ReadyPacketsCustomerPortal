@@ -48,10 +48,16 @@ export interface DurableAuditEmitter extends AuditEmitter {
   /** Waits until the best-effort queue is empty (tests, graceful shutdown). */
   flushNotes(): Promise<void>;
   stats(): AuditEmitterStats;
-  /** Installs the single in-transaction tap (automations). Returns a detach function. See tap.ts. */
+  /**
+   * Adds an in-transaction tap (automations, outbound webhooks; at most MAX_TAPS). Returns a detach function.
+   * Each tap is offered the event in its own savepoint, so one tap's ordinary failure never affects another. See tap.ts.
+   */
   setTap(tap: AuditTap): () => void;
   tapStats(): AuditTapStats;
 }
+
+/** Bounded so the per-event cost stays fixed: automations and outbound webhooks today. */
+export const MAX_TAPS = 4;
 
 export function isDurableAuditEmitter(value: AuditEmitter): value is DurableAuditEmitter {
   return typeof (value as Partial<DurableAuditEmitter>).stats === "function";
@@ -71,11 +77,10 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
   const queue: ReturnType<DurableAuditEmitter["build"]>[] = [];
   let flushing: Promise<void> | null = null;
   let dropsSinceReport = 0;
-  let tap: AuditTap | null = null;
+  let taps: readonly AuditTap[] = [];
   const tapStats: AuditTapStats = { offered: 0, suppressedAutomationOrigin: 0, failures: 0, lastFailureAt: null };
 
-  function wants(name: string): boolean {
-    if (!tap) return false;
+  function wants(tap: AuditTap, name: string): boolean {
     try {
       return tap.listens(name) === true;
     } catch {
@@ -84,14 +89,18 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
   }
 
   async function offer(envelope: AuditEnvelope, tx: Tx | undefined): Promise<void> {
-    const current = tap;
-    if (!current || !wants(envelope.event_name)) return;
+    const listening = taps.filter((t) => wants(t, envelope.event_name));
+    if (listening.length === 0) return;
     if (isAutomationOrigin(envelope.correlation_id) || isAutomationOrigin(envelope.parent_correlation_id)) {
       tapStats.suppressedAutomationOrigin += 1;
       return;
     }
-    tapStats.offered += 1;
     const tapEvent = toTapEvent(envelope);
+    for (const current of listening) await offerOne(current, tapEvent, envelope, tx);
+  }
+
+  async function offerOne(current: AuditTap, tapEvent: ReturnType<typeof toTapEvent>, envelope: AuditEnvelope, tx: Tx | undefined): Promise<void> {
+    tapStats.offered += 1;
     let callbackError: unknown;
     try {
       // Savepoint: a tap with several writes either lands completely or not at all. The callback's own error is kept,
@@ -208,7 +217,7 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
         log.error("durable audit write failed", { event_name: item.envelope.event_name, in_transaction: tx !== undefined, error });
         throw new AuditUnavailableError();
       }
-      if (tap) await offer(item.envelope, tx);
+      if (taps.length > 0) await offer(item.envelope, tx);
     },
     note(event: AuditEventInput): void {
       try {
@@ -233,10 +242,12 @@ export function createAuditEmitter(deps: AuditEmitterDeps): DurableAuditEmitter 
     },
     stats: () => ({ ...stats, notesQueued: queue.length }),
     setTap(next: AuditTap): () => void {
-      if (tap && tap !== next) throw new Error("an audit tap is already installed");
-      tap = next;
+      if (!taps.includes(next)) {
+        if (taps.length >= MAX_TAPS) throw new Error(`at most ${MAX_TAPS} audit taps can be installed`);
+        taps = [...taps, next];
+      }
       return () => {
-        if (tap === next) tap = null;
+        taps = taps.filter((t) => t !== next);
       };
     },
     tapStats: () => ({ ...tapStats }),

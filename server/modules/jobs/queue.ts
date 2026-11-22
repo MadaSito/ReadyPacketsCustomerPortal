@@ -443,7 +443,7 @@ export class JobEngine implements JobQueue {
     const outcome = mail.state === "sending" ? "unknown" : "failed";
     const reasonCode = outcome === "unknown" ? "MAIL_PROVIDER_OUTCOME_UNKNOWN" : "MAIL_NOT_STARTED";
     await tx.update(mailOutbox).set({ state: outcome, reasonCode, updatedAt: now,
-      ...(outcome === "unknown" ? { payloadEnc: null } : {}) }).where(eq(mailOutbox.id, mail.id));
+      ...(mail.expiresAt <= now ? { payloadEnc: null } : {}) }).where(eq(mailOutbox.id, mail.id));
     if (outcome === "unknown") {
       await tx.update(mailAttempts).set({ state: "unknown", reasonCode, finishedAt: now })
         .where(and(eq(mailAttempts.mailId, mail.id), eq(mailAttempts.generation, mail.generation), eq(mailAttempts.state, "sending")));

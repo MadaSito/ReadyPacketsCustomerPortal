@@ -233,7 +233,7 @@ jobs:
           sudo tail -80 /var/log/letsencrypt/letsencrypt.log || true
 
   upgrade:
-    name: upgrade from d964a3b (with pre-existing admin, customer, order and smoke)
+    name: upgrade from 89c5cb8 (with pre-existing admin, customer, order and smoke)
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -243,11 +243,10 @@ jobs:
           fetch-depth: 0
       - name: Make the runner look like a new server
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
-      - name: Install d964a3b, create live state, upgrade to HEAD and run smoke checks
+      - name: Install 89c5cb8, create live state, upgrade to HEAD and run smoke checks
         run: sudo bash scripts/ci/native-install-upgrade.sh "$PORTAL_HOST" "$ALIAS_HOST" "$ADMIN_EMAIL"
       - name: Diagnostics (on failure)
         if: failure()
         run: |
           sudo bash scripts/ci/native-install-run.sh diagnostics || true
           sudo cat /etc/readypackets/upgrade-state 2>/dev/null || true
-

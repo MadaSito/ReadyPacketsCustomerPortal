@@ -123,6 +123,9 @@ export const automationRuns = mysqlTable(
     triggerMode: mysqlEnum("trigger_mode", AUTOMATION_TRIGGER_MODES).notNull(),
     triggerKey: varchar("trigger_key", { length: 80 }),
     triggerEventId: varchar("trigger_event_id", { length: 64 }),
+    orderPublicId: char("order_public_id", { length: 26 }),
+    stageStepKey: varchar("stage_step_key", { length: 48 }),
+    triggeredByUserId: refColumn("triggered_by_user_id"),
     dedupKey: varchar("dedup_key", { length: 120 }).notNull(),
     correlationId: varchar("correlation_id", { length: 64 }).notNull(),
     isTest: boolean("is_test").notNull().default(false),
@@ -141,6 +144,7 @@ export const automationRuns = mysqlTable(
   (t) => [
     uniqueIndex("automation_runs_auto_dedup_uq").on(t.automationId, t.dedupKey),
     index("automation_runs_auto_queued_idx").on(t.automationId, t.queuedAt, t.id),
+    index("automation_runs_order_queued_idx").on(t.orderPublicId, t.queuedAt, t.id),
     index("automation_runs_state_queued_idx").on(t.state, t.queuedAt, t.id),
     index("automation_runs_queued_idx").on(t.queuedAt, t.id),
   ],

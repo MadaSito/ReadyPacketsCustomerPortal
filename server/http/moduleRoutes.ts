@@ -14,6 +14,8 @@ import { registerJobsHttpRoutes } from "../modules/jobs/http.js";
 import { registerPortableHttpRoutes } from "../modules/portable/http.js";
 import { registerBackupHttpRoutes } from "../modules/backup/http.js";
 import { registerIntegrationsHttpRoutes } from "../modules/integrations/http.js";
+import { registerKnowledgeHttpRoutes } from "../modules/knowledge/http.js";
+import { registerReferralsHttpRoutes } from "../modules/referrals/http.js";
 import { registerStorageOAuthRoutes } from "../modules/storage/oauth/http.js";
 
 /** Returns one router to mount at `/api` AFTER request context, session resolution, CSRF/origin and rate limits. */
@@ -32,6 +34,8 @@ export function createModuleHttpRouter(services: Services): Router {
   { const r = Router(); registerPortableHttpRoutes(r, services); api.use("/portable", r); }
   { const r = Router(); registerBackupHttpRoutes(r, services); api.use("/backup", r); }
   { const r = Router(); registerIntegrationsHttpRoutes(r, services); api.use("/integrations", r); }
+  { const r = Router(); registerKnowledgeHttpRoutes(r, services); api.use("/knowledge", r); }
+  { const r = Router(); registerReferralsHttpRoutes(r, services); api.use("/referrals", r); }
   registerStorageOAuthRoutes(api, services);
   return api;
 }

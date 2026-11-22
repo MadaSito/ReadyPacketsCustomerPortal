@@ -1,5 +1,6 @@
 import { isIP } from "node:net";
 import type { Request } from "express";
+import { isolatedRoutePrefix } from "./isolatedRoutes.js";
 
 const PROBE_PATHS = new Set(["/healthz", "/readyz"]);
 export const API_PATH = /^\/api(?:\/|$)/;
@@ -42,6 +43,7 @@ export function isNavigation(req: Request): boolean {
 const MODULES = new Set([
   "identity", "assurance", "orders", "files", "engagement", "compliance", "audit", "siem",
   "platform", "jobs", "portable", "backup", "integrations", "storage",
+  "knowledge", "referrals",
 ]);
 
 /** Only fixed labels are emitted; callback paths may carry credentials in their query. */
@@ -55,6 +57,8 @@ export function routeTemplate(req: Request): string {
   const path = req.path;
   const oauth = providerCallbackRoute(path);
   if (oauth) return oauth;
+  const isolated = isolatedRoutePrefix(path);
+  if (isolated) return `${isolated}/:route`;
   if (PROBE_PATHS.has(path) || path === "/robots.txt" || path === "/api/csrf") return path;
   if (path === SIGNED_WEBHOOK_PATH || path.startsWith(`${SIGNED_WEBHOOK_PATH}/`)) return `${SIGNED_WEBHOOK_PATH}/:provider`;
   if (path === TRPC_PATH || path.startsWith(`${TRPC_PATH}/`)) return `${TRPC_PATH}/:procedures`;

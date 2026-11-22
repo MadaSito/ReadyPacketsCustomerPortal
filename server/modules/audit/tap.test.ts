@@ -175,9 +175,24 @@ describe("audit tap (real MySQL)", () => {
     expect(abortsTransaction(Object.assign(new Error("SAVEPOINT sp1 does not exist"), { errno: 1305 }))).toBe(true);
   });
 
-  it("allows one tap at a time", () => {
-    install({ listens: () => false, onRecorded: async () => undefined });
-    expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/already installed/u);
+  it("fans out to several taps, each isolated in its own savepoint, and stays bounded", async () => {
+    const detachers: (() => void)[] = [];
+    try {
+      detachers.push(emitter.setTap({ listens: () => true, onRecorded: async (_e, tx) => { await (tx as Tx).insert(things).values({ label: "partial" }); throw new Error("first tap failed"); } }));
+      detachers.push(emitter.setTap({ listens: () => true, onRecorded: async (_e, tx) => { await (tx as Tx).insert(things).values({ label: "second" }); } }));
+      const silent = vi.fn(async () => undefined);
+      detachers.push(emitter.setTap({ listens: () => false, onRecorded: silent }));
+      await t.db.transaction(async (tx) => {
+        await tx.insert(things).values({ label: "business" });
+        await emitter.record(event(), tx);
+      });
+      expect((await t.db.select().from(things)).map((r) => r.label).sort()).toEqual(["business", "second"]);
+      expect(silent).not.toHaveBeenCalled();
+      detachers.push(emitter.setTap({ listens: () => false, onRecorded: async () => undefined }));
+      expect(() => emitter.setTap({ listens: () => false, onRecorded: async () => undefined })).toThrow(/at most 4/u);
+    } finally {
+      for (const d of detachers) d();
+    }
   });
 });
 
@@ -240,6 +255,12 @@ describe("trigger catalogue", () => {
     expect(entriesForEvent(tapEvent({ eventName: "engagement.ticket.replied", resource: ticket, attributes: { internal_only: true } }))).toEqual([]);
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_DISABLED" }))).toEqual([]);
     expect(entriesForEvent(tapEvent({ eventName: "job.maintenance.changed", resource: { type: "job_maintenance", publicId: null }, reasonCode: "MAINTENANCE_ENABLED" })).map((e) => e.key)).toEqual(["maintenance.enabled"]);
+  });
+
+  it("customer maintenance triggers on configuration only, not when it is switched off", () => {
+    const res = { type: "customer_maintenance", publicId: null };
+    expect(entriesForEvent(tapEvent({ eventName: "job.customer_maintenance.changed", resource: res, reasonCode: "CUSTOMER_MAINTENANCE_CONFIGURED", attributes: { enabled: true, starts_at: null, ends_at: null } })).map((e) => e.key)).toEqual(["customer_maintenance.configured"]);
+    expect(entriesForEvent(tapEvent({ eventName: "job.customer_maintenance.changed", resource: res, reasonCode: "CUSTOMER_MAINTENANCE_DISABLED", attributes: { enabled: false } }))).toEqual([]);
   });
 
   it("only customer-visible uploads reach file.uploaded (staff-only and legacy events never match)", () => {

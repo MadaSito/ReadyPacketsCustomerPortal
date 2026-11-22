@@ -27,10 +27,10 @@ export default function CustomerEngagementWidget() {
         <Skeleton lines={3} />
       ) : (
         <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
-            <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
+            <div className="flex min-w-0 items-center gap-2.5">
               <MessageSquare className="size-5 shrink-0 text-action" aria-hidden="true" />
-              <div>
+              <div className="min-w-0 break-words">
                 <p className="font-semibold text-ink">Order messages</p>
                 <p className="text-xs text-muted">Across accessible orders</p>
               </div>
@@ -40,10 +40,10 @@ export default function CustomerEngagementWidget() {
             </Badge>
           </div>
 
-          <div className="flex items-center justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
-            <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
+            <div className="flex min-w-0 items-center gap-2.5">
               <LifeBuoy className="size-5 shrink-0 text-action" aria-hidden="true" />
-              <div>
+              <div className="min-w-0 break-words">
                 <p className="font-semibold text-ink">Support tickets</p>
                 <p className="text-xs text-muted">
                   {(ticketSummary.data?.awaitingCustomerCount ?? 0) > 0

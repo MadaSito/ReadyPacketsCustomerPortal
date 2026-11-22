@@ -22,6 +22,7 @@ third-party service at runtime unless an administrator explicitly configured tha
 | nodemailer | runtime | optional SMTP delivery | disabled until configured |
 | yazl, yauzl | runtime | archive write/read for portable packages | |
 | compression | runtime | static response compression | not applied to secret-bearing dynamic responses |
+| mmdb-lib 3.0.5 (MIT) | runtime | read an operator-provided local MaxMind-format country database | no built-in MMDB parser; no cloud lookup, SDK transport or network dependency |
 | react, react-dom 19 | client | UI | |
 | wouter | client | routing (path; hash in preview) | |
 | radix-ui | client | accessible primitives | |
@@ -35,4 +36,5 @@ third-party service at runtime unless an administrator explicitly configured tha
 | tsx, esbuild | dev/build | run + bundle server | |
 | drizzle-kit | dev | migration generation, test schema | |
 | vitest, @vitest/coverage-v8, supertest, @testing-library/*, jsdom, axe-core | dev | tests | |
+| playwright-core (Apache-2.0) | dev | Shared Chromium driver for local accessibility and responsive QA | Uses an operator-provided executable; does not download browsers on install or ship in the portal |
 | eslint, typescript-eslint, eslint-plugin-react-hooks, eslint-plugin-jsx-a11y | dev | lint | |

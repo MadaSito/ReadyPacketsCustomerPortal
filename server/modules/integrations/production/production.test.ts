@@ -14,6 +14,7 @@
  *    retries, 5xx/429 retry -> `dead` at attempt 5, 4xx/3xx immediate `failed`, preexisting `sending` refusal
  *  - Single-connection pool (`connectionLimit: 1`) non-deadlock verification (`tx` passed everywhere)
  */
+import { createHash } from "node:crypto";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
@@ -57,6 +58,8 @@ import {
 
 const P101_TEST_URL = "https://hooks.production.example.test/webhooks/p101-secret-9876";
 const P201_TEST_URL = "https://hooks.production.example.test/webhooks/p201-secret-4321";
+const P301_TEST_URL = "https://hooks.production.example.test/webhooks/p301-secret-3301";
+const P401_TEST_URL = "https://hooks.production.example.test/webhooks/p401-secret-4401";
 
 function makeStepUpAdmin(h: TestHarness, overrides: Partial<SessionPrincipal> = {}): SessionPrincipal {
   const now = h.clock.now();
@@ -2047,5 +2050,1524 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
           e.reason_code === "PRODUCTION_DELIVERY_EXPIRED",
       ),
     ).toBe(true);
+  });
+
+  it("Part B: supports optional P301/P401 endpoints, preview disabledReasons + settingsHref, verbatim identity parity, destination pinning, and pre-send order revalidation", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    const adminCaller = createCaller(admin);
+    const staffCaller = createCaller(staff);
+
+    const { orderPublicId, ownerUserId } = seedOrderAndCustomer({
+      orderId: 960,
+      orderPublicId: "01JORDER000000000000000960",
+      reference: "ORD-2026-0960",
+      customerRef: "RPCUS-960ABCDEF",
+      packets: [{ packetNumber: 3, tier: "Premium" }],
+    });
+
+    // 1. Pipeline disabled -> disabledReasons reports pipeline_off + endpoint_missing + settingsHref
+    const offPreview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(offPreview.settingsHref).toBe("/admin/integrations/production");
+    expect(offPreview.p301.configured).toBe(false);
+    expect(offPreview.p401.configured).toBe(false);
+    expect(offPreview.p101.disabledReasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "PIPELINE_DISABLED",
+          category: "pipeline_off",
+          settingsActionable: true,
+        }),
+      ]),
+    );
+    expect(offPreview.p301.disabledReasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "P301_ENDPOINT_NOT_CONFIGURED",
+          category: "endpoint_missing",
+          settingsActionable: true,
+        }),
+      ]),
+    );
+
+    // 2. Enable P101 + P201 ONLY (P301/P401 unconfigured) -> requestP301 & requestP401 refused with NOT_CONFIGURED
+    await configureEnabledProduction(admin);
+    await expect(staffCaller.production.order.requestP301({ orderPublicId })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      cause: expect.objectContaining({
+        code: "NOT_CONFIGURED",
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+      }),
+    });
+    await expect(staffCaller.production.order.requestP401({ orderPublicId })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      cause: expect.objectContaining({
+        code: "NOT_CONFIGURED",
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+      }),
+    });
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.refused" &&
+          e.reasonCode === "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED" &&
+          e.orderPublicId === orderPublicId,
+      ),
+    ).toBe(true);
+
+    // 3. Configure P401 WITHOUT P301 -> verify masking, export exclusion, and direct P201 -> P401 gate
+    const withP401Only = await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p401Url: P401_TEST_URL,
+    });
+    expect(withP401Only.p301UrlConfigured).toBe(false);
+    expect(withP401Only.p301UrlMask).toBeNull();
+    expect(withP401Only.p401UrlConfigured).toBe(true);
+    expect(withP401Only.p401UrlMask).toEqual({
+      host: "hooks.production.example.test",
+      last4: "4401",
+    });
+
+    const platformStore = createSettingsStore({
+      db: tdb.db,
+      crypto: h.deps.crypto,
+      clock: h.clock,
+      audit: h.audit,
+      logger: h.deps.logger,
+    });
+    const transfer = createConfigTransfer({
+      db: tdb.db,
+      clock: h.clock,
+      audit: h.audit,
+      settings: platformStore,
+      installationId: "inst_test_part_b",
+      releaseRef: "2026.11.21",
+    });
+    const exportedBundle = await transfer.exportDocument(
+      { includeSecrets: true, passphrase: "correct-horse-battery-staple-export-key" },
+      async () => {},
+    );
+    expect(exportedBundle.document).not.toContain("p401-secret-4401");
+
+    const preRunPreview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(preRunPreview.p401.configured).toBe(true);
+    expect(preRunPreview.p401.eligible).toBe(false);
+    expect(preRunPreview.p401.disabledReasons.map((r) => r.code)).toContain("P101_NOT_DELIVERED");
+
+    // Deliver P101 first -> P401 now reports P201_NOT_DELIVERED (and NOT P301_NOT_DELIVERED since P301 is unconfigured)
+    await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const afterP101Preview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(afterP101Preview.p401.disabledReasons.map((r) => r.code)).toEqual(["P201_NOT_DELIVERED"]);
+
+    // Deliver P201, mutate upstream identifiers, then dispatch P401
+    await staffCaller.production.order.requestP201({ orderPublicId, phase1ArtifactsConfirmed: true });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    mockUsers.get(ownerUserId)!.customerRef = "RPCUS-MUTATED99";
+    mockOrders.get(orderPublicId)!.scope.reference = "ORD-MUTATED-9999";
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "staging",
+    });
+
+    const readyP401Preview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(readyP401Preview.p401.eligible).toBe(true);
+    expect(readyP401Preview.p401.disabledReasons).toEqual([]);
+
+    const queuedP401 = await staffCaller.production.order.requestP401({ orderPublicId });
+    expect(queuedP401.phase).toBe("P401");
+    expect(queuedP401.idempotencyKey).toBe(`rp-prod:p401:${queuedP401.publicId}`);
+    expect(queuedP401.identityTriple).toEqual({
+      customerId: "RPCUS-960ABCDEF",
+      orderId: "ORD-2026-0960",
+      runMode: "production",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(3);
+    expect(httpCalls[2]!.url).toBe(P401_TEST_URL);
+    expect(httpCalls[2]!.headers?.["Idempotency-Key"]).toBe(`rp-prod:p401:${queuedP401.publicId}`);
+    expect(JSON.parse(httpCalls[2]!.body)).toEqual({
+      customer_id: "RPCUS-960ABCDEF",
+      order_id: "ORD-2026-0960",
+      run_mode: "production",
+    });
+
+    // 4. Configure P301 as well -> verify dry-run test, P401 blocked on P301, DESTINATION_CHANGED & ORDER_LOCKED pre-send checks
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p301Url: P301_TEST_URL,
+      p401Url: P401_TEST_URL,
+    });
+    const httpCountBeforeDryRun = httpCalls.length;
+    const dryRunP301 = await adminCaller.production.settings.test({ phase: "P301" });
+    const dryRunP401 = await adminCaller.production.settings.test({ phase: "P401" });
+    expect(dryRunP301.allowed).toBe(true);
+    expect(dryRunP401.allowed).toBe(true);
+    expect(httpCalls).toHaveLength(httpCountBeforeDryRun);
+
+    const order2 = seedOrderAndCustomer({
+      orderId: 961,
+      orderPublicId: "01JORDER000000000000000961",
+      reference: "ORD-2026-0961",
+      customerRef: "RPCUS-961ABCDEF",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+    await staffCaller.production.order.requestP101({ orderPublicId: order2.orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    await staffCaller.production.order.requestP201({
+      orderPublicId: order2.orderPublicId,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const previewNeedP301 = await staffCaller.production.order.preview({ orderPublicId: order2.orderPublicId });
+    expect(previewNeedP301.p301.eligible).toBe(true);
+    expect(previewNeedP301.p401.eligible).toBe(false);
+    expect(previewNeedP301.p401.disabledReasons.map((r) => r.code)).toContain("P301_NOT_DELIVERED");
+    await expect(
+      staffCaller.production.order.requestP401({ orderPublicId: order2.orderPublicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_P301_NOT_DELIVERED" }),
+    });
+
+    // Queue P301, rotate P301 URL before worker runs -> worker stops with DESTINATION_CHANGED (zero HTTP calls)
+    const p301Pinned = await staffCaller.production.order.requestP301({ orderPublicId: order2.orderPublicId });
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p301Url: "https://hooks.production.example.test/webhooks/p301-rotated-7777",
+    });
+    const countBeforeRotatedRun = httpCalls.length;
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(countBeforeRotatedRun);
+    const histAfterRotate = await staffCaller.production.order.history({ orderPublicId: order2.orderPublicId });
+    const failedPinned = histAfterRotate.items.find((i) => i.publicId === p301Pinned.publicId);
+    expect(failedPinned?.state).toBe("failed");
+    expect(failedPinned?.lastReasonCode).toBe("DESTINATION_CHANGED");
+
+    // Staff retry is refused after URL rotation (Rule 2); admin step-up resend delivers against the rotated URL -> then queue P401 and place order on legal_hold before worker runs -> ORDER_LOCKED
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: order2.orderPublicId,
+        dispatchPublicId: p301Pinned.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DESTINATION_CHANGED" }),
+    });
+    const resentP301 = await adminCaller.production.order.resend({
+      orderPublicId: order2.orderPublicId,
+      phase: "P301",
+      reason: "Re-send P301 to rotated webhook endpoint after URL rotation.",
+    });
+    expect(resentP301.idempotencyKey).toBe(p301Pinned.idempotencyKey);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const p401Locked = await staffCaller.production.order.requestP401({ orderPublicId: order2.orderPublicId });
+    mockOrders.get(order2.orderPublicId)!.scope.lockState = "legal_hold";
+    const countBeforeLockedRun = httpCalls.length;
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(countBeforeLockedRun);
+    const histAfterLock = await staffCaller.production.order.history({ orderPublicId: order2.orderPublicId });
+    const lockedRow = histAfterLock.items.find((i) => i.publicId === p401Locked.publicId);
+    expect(lockedRow?.state).toBe("failed");
+    expect(lockedRow?.lastReasonCode).toBe("ORDER_LOCKED");
+  });
+
+  it("Part B: allows staff with orders.production.trigger to retry failed/dead dispatches while blocking retry once delivered or superseded", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    const customer = makeCustomer(h);
+    await configureEnabledProduction(admin);
+
+    const staffCaller = createCaller(staff);
+    const customerCaller = createCaller(customer);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 962,
+      orderPublicId: "01JORDER000000000000000962",
+      reference: "ORD-2026-0962",
+      packets: [{ packetNumber: 2, tier: "Standard" }],
+    });
+    const otherOrder = seedOrderAndCustomer({
+      orderId: 963,
+      orderPublicId: "01JORDER000000000000000963",
+      reference: "ORD-2026-0963",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+
+    // First attempt returns 400 -> terminal `failed`
+    nextHttpHandler = async () => ({
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"error":"bad_config"}', "utf8"),
+    });
+    const first = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Customer cannot retry or read history
+    await expect(
+      customerCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(customerCaller.production.order.history({ orderPublicId })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+
+    // Cross-order dispatchPublicId refused with NOT_FOUND
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: otherOrder.orderPublicId,
+        dispatchPublicId: first.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_NOT_FOUND" }),
+    });
+
+    // Staff retries failed dispatch (no step-up required) -> new row with `retryOf`
+    const retry1 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: first.publicId,
+    });
+    expect(retry1.publicId).not.toBe(first.publicId);
+    expect(retry1.retryOf).toBe(first.publicId);
+    expect(retry1.redeliveryOf).toBeNull();
+    expect(retry1.resendReason).toBe("OPERATOR_RETRY_AFTER_FAILURE");
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.retried" &&
+          e.orderPublicId === orderPublicId &&
+          e.attributes?.retry_of_public_id === first.publicId,
+      ),
+    ).toBe(true);
+
+    // While retry1 is queued, retrying again fails with PRODUCTION_DISPATCH_IN_PROGRESS
+    await expect(
+      staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_IN_PROGRESS" }),
+    });
+
+    // Exhaust retry1 to `dead` (5 x 503)
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+    const retry1JobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+    h.jobs.enqueued = [];
+    nextHttpHandler = async () => ({
+      status: 503,
+      headers: {},
+      body: Buffer.from("unavailable", "utf8"),
+    });
+    for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+      await handler({
+        jobId: retry1JobId,
+        type: PRODUCTION_DELIVERY_JOB,
+        payload: { dispatchId: retry1.publicId } as never,
+        attempt,
+        fencingToken: attempt,
+        correlationId: "corr_partb_retry_dead",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+    }
+
+    // Retrying superseded `first` fails with PRODUCTION_DISPATCH_SUPERSEDED
+    await expect(
+      staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_SUPERSEDED" }),
+    });
+
+    // Retrying latest `dead` `retry1` succeeds (`OPERATOR_RETRY_AFTER_DEAD_LETTER`) and delivers on 200
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const retry2 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: retry1.publicId,
+    });
+    expect(retry2.retryOf).toBe(retry1.publicId);
+    expect(retry2.resendReason).toBe("OPERATOR_RETRY_AFTER_DEAD_LETTER");
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Abuse guard: once P101 is delivered, staff CANNOT call `retry` on either `retry1` (old dead) or `retry2` (delivered)
+    for (const targetId of [first.publicId, retry1.publicId, retry2.publicId]) {
+      await expect(
+        staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: targetId }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+      });
+    }
+  });
+
+  it("Part B: enforces orders.production.redeliver step-up, REDELIVER phrase, audit reason hygiene, redeliveryOf linkage, and X-ReadyPackets-Redelivery-Of header", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const noStepUpAdmin = makeStepUpAdmin(h, { stepUpAt: null });
+    const staleStepUpAdmin = makeStepUpAdmin(h, {
+      stepUpAt: new Date(h.clock.now().getTime() - STEP_UP_MAX_AGE_MS - 5_000),
+    });
+    const staff = makeStaff(h);
+    const customer = makeCustomer(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const adminCaller = createCaller(stepUpAdmin);
+    const noStepUpCaller = createCaller(noStepUpAdmin);
+    const staleStepUpCaller = createCaller(staleStepUpAdmin);
+    const staffCaller = createCaller(staff);
+    const customerCaller = createCaller(customer);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 964,
+      orderPublicId: "01JORDER000000000000000964",
+      reference: "ORD-2026-0964",
+      packets: [{ packetNumber: 5, tier: "Premium" }],
+    });
+
+    // Deliver original P101
+    const original = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Also create a failed P201 to verify redeliver rejects non-delivered rows
+    nextHttpHandler = async () => ({
+      status: 422,
+      headers: {},
+      body: Buffer.from("invalid", "utf8"),
+    });
+    const failedP201 = await staffCaller.production.order.requestP201({
+      orderPublicId,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // 1. Customer & staff denied (`orders.production.redeliver` is admin + step-up only)
+    await expect(
+      customerCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Customer attempt",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-cust-attempt-001",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    await expect(
+      staffCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Staff attempt without capability",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-staff-attempt-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      cause: expect.objectContaining({ reasonCode: "CAPABILITY_NOT_GRANTED" }),
+    });
+
+    // 2. Admin without fresh step-up -> STEP_UP_REQUIRED
+    for (const caller of [noStepUpCaller, staleStepUpCaller]) {
+      await expect(
+        caller.production.order.redeliver({
+          orderPublicId,
+          dispatchPublicId: original.publicId,
+          reason: "Valid audit reason",
+          confirmation: "REDELIVER",
+          idempotencyKey: "rdlv-nostepup-001",
+        }),
+      ).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        cause: expect.objectContaining({
+          code: "STEP_UP_REQUIRED",
+          reasonCode: "STEP_UP_REQUIRED",
+        }),
+      });
+    }
+
+    // 3. Server-side validation of typed phrase `REDELIVER`, printable reason (3..280 chars), and `idempotencyKey`
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Valid audit reason",
+        confirmation: "redeliver",
+        idempotencyKey: "rdlv-badphrase-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_CONFIRMATION_REQUIRED" }),
+    });
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "  x ",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-badreason-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_REASON_REQUIRED" }),
+    });
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "bad\r\nheader-injection",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-crlf-reason-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_REASON_REQUIRED" }),
+    });
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Valid audit reason",
+        confirmation: "REDELIVER",
+        idempotencyKey: "short",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+
+    // 4. Non-delivered dispatch rejected (`PRODUCTION_DISPATCH_NOT_DELIVERED`)
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: failedP201.publicId,
+        reason: "Trying to redeliver a failed dispatch",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-failed-row-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_NOT_DELIVERED" }),
+    });
+
+    // 5. Valid step-up admin redelivery -> NEW delivery row with `redeliveryOf`, outbound header, and safe audit
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"replayed":true}', "utf8"),
+    });
+    const sensitiveProseReason = "SharePoint folder tree purged during maintenance — replay P101";
+    const redelivered = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: original.publicId,
+      reason: sensitiveProseReason,
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-valid-intent-001",
+    });
+
+    expect(redelivered.publicId).not.toBe(original.publicId);
+    expect(redelivered.redeliveryOf).toBe(original.publicId);
+    expect(redelivered.retryOf).toBeNull();
+    expect(redelivered.resendReason).toBe("OPERATOR_REPLAY_DELIVERED");
+    expect(redelivered.idempotencyKey).toMatch(/^rp-prod:p101:rdlv:[0-9a-f]{40}$/);
+
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const lastHttp = httpCalls[httpCalls.length - 1]!;
+    expect(lastHttp.headers?.["X-ReadyPackets-Delivery"]).toBe(redelivered.publicId);
+    expect(lastHttp.headers?.["X-ReadyPackets-Redelivery-Of"]).toBe(original.publicId);
+    expect(lastHttp.headers?.["Idempotency-Key"]).toBe(redelivered.idempotencyKey);
+    // Original P101 did NOT carry X-ReadyPackets-Redelivery-Of
+    expect(httpCalls[0]!.headers?.["X-ReadyPackets-Redelivery-Of"]).toBeUndefined();
+
+    // History preserves BOTH the original delivered row and the new redelivery row
+    const history = await staffCaller.production.order.history({ orderPublicId });
+    const newHistRow = history.items.find((i) => i.publicId === redelivered.publicId);
+    const origHistRow = history.items.find((i) => i.publicId === original.publicId);
+    expect(newHistRow?.state).toBe("delivered");
+    expect(newHistRow?.redeliveryOf).toBe(original.publicId);
+    expect(origHistRow?.state).toBe("delivered");
+    expect(origHistRow?.redeliveryOf).toBeNull();
+
+    // Audit records `integration.production.dispatch.redelivered` with `orderPublicId` and `reason_length` (NEVER raw prose)
+    const redeliverAudit = h.audit.events.find(
+      (e) =>
+        e.eventName === "integration.production.dispatch.redelivered" &&
+        e.resource?.publicId === redelivered.publicId,
+    );
+    expect(redeliverAudit).toBeDefined();
+    expect(redeliverAudit?.severity).toBe("WARN");
+    expect(redeliverAudit?.orderPublicId).toBe(orderPublicId);
+    expect(redeliverAudit?.attributes).toMatchObject({
+      phase: "P101",
+      order_public_id: orderPublicId,
+      redelivery_of_public_id: original.publicId,
+    });
+    expect(redeliverAudit?.safeCounts).toEqual({
+      reason_length: sensitiveProseReason.length,
+    });
+    expect(JSON.stringify(h.audit.events)).not.toContain("SharePoint folder tree purged");
+  });
+
+  it("Part B security: deduplicates post-delivery redeliver replays by operator idempotencyKey, blocks legacy resend on delivered phases, and refuses redeliver when a prior redelivery is unknown", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const adminCaller = createCaller(stepUpAdmin);
+    const staffCaller = createCaller(staff);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 965,
+      orderPublicId: "01JORDER000000000000000965",
+      reference: "ORD-2026-0965",
+      packets: [{ packetNumber: 2, tier: "Standard" }],
+    });
+
+    // Deliver P101 and P201
+    const origP101 = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const origP201 = await staffCaller.production.order.requestP201({
+      orderPublicId,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // 1. API-level refusal: legacy `production.order.resend` MUST reject already-delivered phases
+    // even when called by a step-up admin with `orders.production.trigger` + reason.
+    for (const phase of ["P101", "P201"] as const) {
+      await expect(
+        adminCaller.production.order.resend({
+          orderPublicId,
+          phase,
+          reason: "Attempting legacy resend bypass after delivery",
+          phase1ArtifactsConfirmed: true,
+        }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+      });
+    }
+
+    // 2. Confirmed redeliver intent #1 delivers HTTP 200; replaying the SAME `idempotencyKey` AFTER
+    // delivery returns the existing delivered dispatch with zero new DB row, job, HTTP call, or audit event.
+    const rdlv1 = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origP101.publicId,
+      reason: "Downstream workspace wiped — replay #1",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-op-intent-0001",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const callsAfterFirstDelivery = httpCalls.length;
+    const redeliverAuditsAfterFirst = h.audit.events.filter(
+      (e) => e.eventName === "integration.production.dispatch.redelivered",
+    ).length;
+
+    const postDeliveryReplay = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origP101.publicId,
+      reason: "Downstream workspace wiped — replay #1",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-op-intent-0001",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    expect(postDeliveryReplay.publicId).toBe(rdlv1.publicId);
+    expect(postDeliveryReplay.state).toBe("delivered");
+    expect(postDeliveryReplay.redeliveryOf).toBe(origP101.publicId);
+    expect(httpCalls.length).toBe(callsAfterFirstDelivery);
+    expect(
+      h.audit.events.filter((e) => e.eventName === "integration.production.dispatch.redelivered")
+        .length,
+    ).toBe(redeliverAuditsAfterFirst);
+
+    // Reusing the same `idempotencyKey` against a DIFFERENT dispatch on the order is rejected
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: origP201.publicId,
+        reason: "Accidental reuse of key on P201",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-op-intent-0001",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "IDEMPOTENCY_KEY_CONFLICT" }),
+    });
+
+    // 3. Explicit NEW `idempotencyKey` creates a second redelivery; if it ends in `unknown` (interrupted sending reconciled),
+    // replaying its own key returns the `unknown` row idempotently while a 3rd new intent is refused!
+    const rdlv2 = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origP101.publicId,
+      reason: "Explicit second replay intent",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-op-intent-0002",
+    });
+    expect(rdlv2.publicId).not.toBe(rdlv1.publicId);
+    h.jobs.enqueued = []; // simulate worker crash after transitioning to `sending`
+    await tdb.db
+      .update(integrationProductionDispatches)
+      .set({ state: "sending", attemptCount: 1, updatedAt: h.clock.now() })
+      .where(eq(integrationProductionDispatches.publicId, rdlv2.publicId));
+    h.clock.advance(12_000 + PRODUCTION_SENDING_GRACE_MS + 1_000);
+
+    const freshAdmin = makeStepUpAdmin(h);
+    const freshAdminCaller = createCaller(freshAdmin);
+
+    const replayUnknownIntent = await freshAdminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origP101.publicId,
+      reason: "Explicit second replay intent",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-op-intent-0002",
+    });
+    expect(replayUnknownIntent.publicId).toBe(rdlv2.publicId);
+    expect(replayUnknownIntent.state).toBe("unknown");
+
+    await expect(
+      freshAdminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: origP101.publicId,
+        reason: "Third intent while second redelivery is unknown",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-op-intent-0003",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_UNCERTAIN" }),
+    });
+  });
+
+  it("Part B security: enforces original-payload byte identity on retry and redeliver and refuses mutated relevant data", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const adminCaller = createCaller(stepUpAdmin);
+    const staffCaller = createCaller(staff);
+    const updateProdSettings = (overrides: {
+      canonVersion?: string;
+      runMode?: "production" | "staging" | "dry_run";
+      p301Url?: string;
+    }) =>
+      adminCaller.production.settings.update({
+        enabled: true,
+        canonVersion: overrides.canonVersion ?? "v3.0",
+        runMode: overrides.runMode ?? "production",
+        authHeaderName: "X-Webhook-Token",
+        timeoutMs: 12_000,
+        ...(overrides.p301Url !== undefined ? { p301Url: overrides.p301Url } : {}),
+      });
+    await updateProdSettings({ p301Url: P301_TEST_URL });
+
+    // --- Part 1: P101 retry & redeliver refuse mutated scope/customer/config and preserve exact SHA-256 bytes ---
+    const { orderPublicId: p101OrderPub, ownerUserId: p101OwnerId } = seedOrderAndCustomer({
+      orderId: 966,
+      orderPublicId: "01JORDER000000000000000966",
+      reference: "ORD-2026-0966",
+      customerRef: "RP-ORIG-966",
+      clientName: "Ada Lovelace",
+      clientEmail: "ada@client.example.test",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+
+    nextHttpHandler = async () => ({
+      status: 422,
+      headers: {},
+      body: Buffer.from("temporary downstream schema mismatch", "utf8"),
+    });
+    const failedP101 = await staffCaller.production.order.requestP101({
+      orderPublicId: p101OrderPub,
+      releaseStatus: "HOLD_INITIAL",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const failedP101Body = httpCalls[httpCalls.length - 1]!.body;
+
+    // Mutate order packet scope -> `retry` refused with `ORDER_SCOPE_CHANGED`
+    const orderEntry = mockOrders.get(p101OrderPub)!;
+    const savedPackets = [...orderEntry.scope.packets];
+    orderEntry.scope.packets = [
+      { packetNumber: 1, tier: "Standard" },
+      { packetNumber: 3, tier: "Premium" },
+    ];
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: p101OrderPub,
+        dispatchPublicId: failedP101.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORDER_SCOPE_CHANGED" }),
+    });
+    orderEntry.scope.packets = savedPackets;
+
+    // Mutate customer email -> `retry` refused with `ORIGINAL_PAYLOAD_UNVERIFIABLE`
+    const ownerEntry = mockUsers.get(p101OwnerId)!;
+    const savedEmail = ownerEntry.email;
+    ownerEntry.email = "mutated-ada@client.example.test";
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: p101OrderPub,
+        dispatchPublicId: failedP101.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE" }),
+    });
+    ownerEntry.email = savedEmail;
+
+    // Mutate `run_mode` -> `retry` refused with `ORIGINAL_PAYLOAD_UNVERIFIABLE`
+    await updateProdSettings({ runMode: "staging" });
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: p101OrderPub,
+        dispatchPublicId: failedP101.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE" }),
+    });
+    await updateProdSettings({ runMode: "production" });
+
+    // Restore original state -> `retry` succeeds with identical SHA-256 and identical wire JSON bytes
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const retriedP101 = await staffCaller.production.order.retry({
+      orderPublicId: p101OrderPub,
+      dispatchPublicId: failedP101.publicId,
+    });
+    expect(retriedP101.payloadSha256).toBe(failedP101.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.body).toBe(failedP101Body);
+
+    // Mutate `canonVersion` before `redeliver` of delivered P101 -> refused (`ORIGINAL_PAYLOAD_UNVERIFIABLE`)
+    await updateProdSettings({ canonVersion: "2026.09-drifted" });
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId: p101OrderPub,
+        dispatchPublicId: retriedP101.publicId,
+        reason: "Replay after canon drift must fail closed",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-p101-canon-drift",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE" }),
+    });
+    await updateProdSettings({ canonVersion: "v3.0" });
+
+    const redeliveredP101 = await adminCaller.production.order.redeliver({
+      orderPublicId: p101OrderPub,
+      dispatchPublicId: retriedP101.publicId,
+      reason: "Replay with verified original bytes",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-p101-verified-001",
+    });
+    expect(redeliveredP101.payloadSha256).toBe(failedP101.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.body).toBe(failedP101Body);
+
+    // --- Part 2: P201/P301 retry & redeliver replay the SELECTED dispatch's bytes (not newest P101 or mutated live fields) ---
+    const origP201 = await staffCaller.production.order.requestP201({
+      orderPublicId: p101OrderPub,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const origP201Body = httpCalls[httpCalls.length - 1]!.body;
+    expect(origP201Body).toBe('{"customer_id":"RP-ORIG-966","order_id":"ORD-2026-0966","run_mode":"production"}');
+
+    nextHttpHandler = async () => ({
+      status: 422,
+      headers: {},
+      body: Buffer.from("transient p301 rejection", "utf8"),
+    });
+    const failedOrigP301 = await staffCaller.production.order.requestP301({
+      orderPublicId: p101OrderPub,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Insert a NEWER delivered P101 row with DIFFERENT `{sentCustomerId, sentRunMode}` AND mutate live `customerRef` + `runMode`
+    ownerEntry.customerRef = "RP-MUTATED-LIVE";
+    await updateProdSettings({ runMode: "staging", p301Url: P301_TEST_URL });
+    const newerP101Payload = '{"canon_version":"v3.0","client_email":"ada@client.example.test","client_name":"Ada Lovelace","customer_id":"RP-NEWER-P101","order_id":"ORD-2026-0966","run_mode":"staging","packet":"P1","tier":"Standard","release_status":"","bundle_scope_manifest":""}';
+    await tdb.db.insert(integrationProductionDispatches).values({
+      publicId: "01JNEWERDELIVEREDP10100966",
+      orderId: 966,
+      orderPublicId: p101OrderPub,
+      orderReference: "ORD-2026-0966",
+      expectedOwnerUserId: p101OwnerId,
+      destinationFingerprint: "fp-newer-p101",
+      jobPublicId: "01JJOBNEWERP10100000000966",
+      expiresAt: new Date(h.clock.now().getTime() + PRODUCTION_DISPATCH_MAX_TTL_MS),
+      phase: "P101",
+      state: "delivered",
+      idempotencyKey: "rp-prod:p101:01JNEWERDELIVEREDP10100966",
+      payloadSha256: createHash("sha256").update(newerP101Payload).digest("hex"),
+      sentCustomerId: "RP-NEWER-P101",
+      sentOrderId: "ORD-2026-0966",
+      sentRunMode: "staging",
+      packet: "P1",
+      tier: "Standard",
+      bundleScopeManifest: "",
+      releaseStatus: "",
+      attemptCount: 1,
+      requestedByUserId: 1,
+      requestedByPublicId: stepUpAdmin.userPublicId,
+      correlationId: "corr_newer_p101_966",
+      deliveredAt: h.clock.now(),
+      createdAt: h.clock.now(),
+      updatedAt: h.clock.now(),
+    });
+
+    // Re-delivering `origP201` MUST replay `origP201`'s exact original `{customer_id:"RP-ORIG-966", run_mode:"production"}` bytes!
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const replayedOrigP201 = await adminCaller.production.order.redeliver({
+      orderPublicId: p101OrderPub,
+      dispatchPublicId: origP201.publicId,
+      reason: "Replay original P201 snapshot despite newer P101 row",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-p201-selected-row-001",
+    });
+    expect(replayedOrigP201.payloadSha256).toBe(origP201.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.body).toBe(origP201Body);
+
+    // Retrying `failedOrigP301` when a newer delivered P101 row differs -> replays selected `failedOrigP301` bytes!
+    const retriedP301 = await staffCaller.production.order.retry({
+      orderPublicId: p101OrderPub,
+      dispatchPublicId: failedOrigP301.publicId,
+    });
+    expect(retriedP301.payloadSha256).toBe(origP201.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.body).toBe(origP201Body);
+
+    // Tampering persisted `sentRunMode` on delivered `retriedP301` so it disagrees with `payloadSha256` -> refused fail-closed!
+    await tdb.db
+      .update(integrationProductionDispatches)
+      .set({ sentRunMode: "staging" })
+      .where(eq(integrationProductionDispatches.publicId, retriedP301.publicId));
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId: p101OrderPub,
+        dispatchPublicId: retriedP301.publicId,
+        reason: "Tampered row digest mismatch must refuse",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-p301-tampered-001",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORIGINAL_PAYLOAD_UNVERIFIABLE" }),
+    });
+  });
+
+  it("Part B security: carries original root Idempotency-Key across 5xx dead-letter exhaustion into operator retry (including chained retries), while deliberate redeliver issues a distinct key", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 970,
+      orderPublicId: "01JORDER000000000000000970",
+      reference: "ORD-2026-0970",
+      customerRef: "RP-RETRY-DEDUPE-970",
+      packets: [{ packetNumber: 1, tier: "Standard" }],
+    });
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+
+    const exhaustWith5xx = async (dispatchPublicId: string, httpStatus: number) => {
+      const enqueuedJobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+      h.jobs.enqueued = [];
+      nextHttpHandler = async ({ headers, body }) => {
+        const key = headers?.["Idempotency-Key"] ?? "";
+        // Simulate downstream committing side effects on attempt 3 before gateway returns 5xx!
+        if (!downstreamCommittedByKey.has(key) && httpCalls.length === 3) {
+          downstreamCommittedByKey.set(key, String(body ?? ""));
+          downstreamSideEffectRuns += 1;
+        }
+        return {
+          status: httpStatus,
+          headers: { "content-type": "text/plain" },
+          body: Buffer.from(`upstream ${httpStatus}`, "utf8"),
+        };
+      };
+
+      for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+        const res = await handler({
+          jobId: enqueuedJobId,
+          type: PRODUCTION_DELIVERY_JOB,
+          payload: { dispatchId: dispatchPublicId } as never,
+          attempt,
+          fencingToken: attempt,
+          correlationId: `corr_5xx_${dispatchPublicId}`,
+          signal: new AbortController().signal,
+          assertStillOwned: async () => {},
+        });
+        expect(res).toEqual({
+          outcome: "failed",
+          reasonCode: "PRODUCTION_HTTP_5XX",
+          retryable: attempt < PRODUCTION_MAX_ATTEMPTS,
+        });
+      }
+    };
+
+    const downstreamCommittedByKey = new Map<string, string>();
+    let downstreamSideEffectRuns = 0;
+
+    // 1. Initial P101 dispatch exhausts all 5 attempts on HTTP 503 -> `dead` (after committing side effects on attempt 3)
+    const initialDispatch = await staffCaller.production.order.requestP101({ orderPublicId });
+    const rootKey = initialDispatch.idempotencyKey;
+    expect(rootKey).toBe(`rp-prod:p101:${initialDispatch.publicId}`);
+
+    await exhaustWith5xx(initialDispatch.publicId, 503);
+    expect(downstreamSideEffectRuns).toBe(1);
+
+    const [deadInitial] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, initialDispatch.publicId));
+    expect(deadInitial?.state).toBe("dead");
+
+    // 2. Staff retries `dead` initialDispatch -> `retry1` carries root `Idempotency-Key`, while DB column stays unique (`<= 96` chars)
+    const retry1 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: initialDispatch.publicId,
+    });
+    expect(retry1.publicId).not.toBe(initialDispatch.publicId);
+    expect(retry1.retryOf).toBe(initialDispatch.publicId);
+    expect(retry1.resendReason).toBe("OPERATOR_RETRY_AFTER_DEAD_LETTER");
+    expect(retry1.idempotencyKey).toBe(rootKey);
+
+    const [retry1DbRow] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, retry1.publicId));
+    expect(retry1DbRow?.idempotencyKey).toBe(`${rootKey}:r:${retry1.publicId}`);
+    expect(retry1DbRow!.idempotencyKey.length).toBeLessThanOrEqual(96);
+
+    // 3. Chained 5xx exhaustion: `retry1` ALSO exhausts 5x HTTP 502 -> `dead`, then staff retries `retry1` -> `retry2`
+    await exhaustWith5xx(retry1.publicId, 502);
+    const retry2 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: retry1.publicId,
+    });
+    expect(retry2.retryOf).toBe(retry1.publicId);
+    expect(retry2.idempotencyKey).toBe(rootKey);
+
+    // Downstream recovers and deduplicates `retry2` via the preserved root `Idempotency-Key`!
+    nextHttpHandler = async ({ headers, body }) => {
+      const key = headers?.["Idempotency-Key"] ?? "";
+      if (!downstreamCommittedByKey.has(key)) {
+        downstreamCommittedByKey.set(key, String(body ?? ""));
+        downstreamSideEffectRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true,"deduped":true}', "utf8"),
+      };
+    };
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // All 11 HTTP attempts (5 on initialDispatch + 5 on retry1 + 1 on retry2) sent the EXACT same root Idempotency-Key!
+    expect(httpCalls).toHaveLength(PRODUCTION_MAX_ATTEMPTS * 2 + 1);
+    for (const call of httpCalls) {
+      expect(call.headers?.["Idempotency-Key"]).toBe(rootKey);
+      expect(call.headers?.["X-ReadyPackets-Redelivery-Of"]).toBeUndefined();
+    }
+    expect(downstreamSideEffectRuns).toBe(1);
+
+    const deliveryHeaders = new Set(httpCalls.map((c) => c.headers?.["X-ReadyPackets-Delivery"]));
+    expect(deliveryHeaders).toEqual(
+      new Set([initialDispatch.publicId, retry1.publicId, retry2.publicId]),
+    );
+
+    // Audit event for `retried` records the wire root Idempotency-Key
+    const retryAudits = h.audit.events.filter(
+      (e) => e.eventName === "integration.production.dispatch.retried" && e.orderPublicId === orderPublicId,
+    );
+    expect(retryAudits).toHaveLength(2);
+    expect(retryAudits[0]!.attributes?.idempotency_key).toBe(rootKey);
+    expect(retryAudits[1]!.attributes?.idempotency_key).toBe(rootKey);
+
+    // 4. Contrast with deliberate `redeliver`: issues a DISTINCT `Idempotency-Key` + `X-ReadyPackets-Redelivery-Of`
+    //    so the receiver intentionally executes a second run (`downstreamSideEffectRuns === 2`), while post-delivery
+    //    replay of the same `idempotencyKey` is deduplicated and staff `retry` on an already-delivered phase remains blocked!
+    nextHttpHandler = async ({ headers, body }) => {
+      const key = headers?.["Idempotency-Key"] ?? "";
+      if (!downstreamCommittedByKey.has(key)) {
+        downstreamCommittedByKey.set(key, String(body ?? ""));
+        downstreamSideEffectRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true,"freshRun":true}', "utf8"),
+      };
+    };
+    const deliberateRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: retry2.publicId,
+      reason: "Deliberate operator re-run after downstream purge",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-after-5xx-recovery-001",
+    });
+    expect(deliberateRedeliver.idempotencyKey).not.toBe(rootKey);
+    expect(deliberateRedeliver.idempotencyKey).toMatch(/^rp-prod:p101:rdlv:[0-9a-f]{40}$/);
+    expect(deliberateRedeliver.redeliveryOf).toBe(retry2.publicId);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const redeliverHttp = httpCalls[httpCalls.length - 1]!;
+    expect(redeliverHttp.headers?.["Idempotency-Key"]).toBe(deliberateRedeliver.idempotencyKey);
+    expect(redeliverHttp.headers?.["X-ReadyPackets-Redelivery-Of"]).toBe(retry2.publicId);
+    expect(downstreamSideEffectRuns).toBe(2);
+
+    // Replaying the admin's `idempotencyKey` after delivery returns `deliberateRedeliver` without another run
+    const callsBeforeReplay = httpCalls.length;
+    const replayedRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: retry2.publicId,
+      reason: "Deliberate operator re-run after downstream purge",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-after-5xx-recovery-001",
+    });
+    expect(replayedRedeliver.publicId).toBe(deliberateRedeliver.publicId);
+    expect(replayedRedeliver.state).toBe("delivered");
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(callsBeforeReplay);
+    expect(downstreamSideEffectRuns).toBe(2);
+
+    // Once `deliberateRedeliver` is delivered, retrying it or the earlier dead rows is blocked by `PRODUCTION_ALREADY_DELIVERED`
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId,
+        dispatchPublicId: deliberateRedeliver.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+    });
+  });
+
+  it("Part B B-T1-04 Rule 1: legacy production.order.resend of undelivered dead and unknown phases reuses the root wire Idempotency-Key and exact payload bytes while keeping admin step-up + reason", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const noStepUpAdmin = makeStepUpAdmin(h, { stepUpAt: null });
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const noStepUpCaller = createCaller(noStepUpAdmin);
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+
+    // 1. Undelivered `dead` phase -> `production.order.resend` reuses root wire Idempotency-Key + exact bytes
+    const deadOrder = seedOrderAndCustomer({
+      orderId: 971,
+      orderPublicId: "01JORDER000000000000000971",
+      reference: "ORD-2026-0971",
+      customerRef: "RP-RESEND-DEAD-971",
+      packets: [{ packetNumber: 2, tier: "Standard" }],
+    });
+
+    const dDead = await staffCaller.production.order.requestP101({
+      orderPublicId: deadOrder.orderPublicId,
+    });
+    const deadJobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+    h.jobs.enqueued = [];
+    const committedKeys = new Set<string>();
+    let downstreamRuns = 0;
+
+    nextHttpHandler = async ({ headers }) => {
+      const k = headers?.["Idempotency-Key"] ?? "";
+      if (!committedKeys.has(k) && httpCalls.length === 2) {
+        committedKeys.add(k);
+        downstreamRuns += 1;
+      }
+      return {
+        status: 503,
+        headers: {},
+        body: Buffer.from("gateway timeout after downstream commit", "utf8"),
+      };
+    };
+    for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+      await handler({
+        jobId: deadJobId,
+        type: PRODUCTION_DELIVERY_JOB,
+        payload: { dispatchId: dDead.publicId } as never,
+        attempt,
+        fencingToken: attempt,
+        correlationId: "corr_rule1_dead",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+    }
+    expect(downstreamRuns).toBe(1);
+
+    // Staff and non-step-up admin remain blocked on `resend`
+    await expect(
+      staffCaller.production.order.resend({
+        orderPublicId: deadOrder.orderPublicId,
+        phase: "P101",
+        reason: "Staff should not be allowed",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      noStepUpCaller.production.order.resend({
+        orderPublicId: deadOrder.orderPublicId,
+        phase: "P101",
+        reason: "Missing fresh step-up",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    // Mutating `releaseStatus` on `resend` of an undelivered attempt is refused so payload bytes stay identical to root
+    await expect(
+      adminCaller.production.order.resend({
+        orderPublicId: deadOrder.orderPublicId,
+        phase: "P101",
+        reason: "Attempted payload mutation on resend",
+        releaseStatus: "mutated-release-flag",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "ORDER_SCOPE_CHANGED" }),
+    });
+
+    nextHttpHandler = async ({ headers }) => {
+      const k = headers?.["Idempotency-Key"] ?? "";
+      if (!committedKeys.has(k)) {
+        committedKeys.add(k);
+        downstreamRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true}', "utf8"),
+      };
+    };
+    const resentFromDead = await adminCaller.production.order.resend({
+      orderPublicId: deadOrder.orderPublicId,
+      phase: "P101",
+      reason: "Downstream recovered — resend with preserved root key",
+    });
+    expect(resentFromDead.publicId).not.toBe(dDead.publicId);
+    expect(resentFromDead.idempotencyKey).toBe(dDead.idempotencyKey);
+    expect(resentFromDead.payloadSha256).toBe(dDead.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.headers?.["Idempotency-Key"]).toBe(dDead.idempotencyKey);
+    expect(downstreamRuns).toBe(1);
+
+    // 2. Undelivered `unknown` phase -> `production.order.resend` also reuses root wire Idempotency-Key
+    const unknownOrder = seedOrderAndCustomer({
+      orderId: 972,
+      orderPublicId: "01JORDER000000000000000972",
+      reference: "ORD-2026-0972",
+      customerRef: "RP-RESEND-UNK-972",
+      packets: [{ packetNumber: 3, tier: "Premium" }],
+    });
+    const dUnknown = await staffCaller.production.order.requestP101({
+      orderPublicId: unknownOrder.orderPublicId,
+    });
+    h.jobs.enqueued = [];
+    await tdb.db
+      .update(integrationProductionDispatches)
+      .set({ state: "sending", attemptCount: 1, updatedAt: h.clock.now() })
+      .where(eq(integrationProductionDispatches.publicId, dUnknown.publicId));
+    h.clock.advance(12_000 + PRODUCTION_SENDING_GRACE_MS + 1_000);
+
+    const freshAdminCaller = createCaller(makeStepUpAdmin(h));
+    const resentFromUnknown = await freshAdminCaller.production.order.resend({
+      orderPublicId: unknownOrder.orderPublicId,
+      phase: "P101",
+      reason: "Confirmed downstream state after interrupted send",
+    });
+    expect(resentFromUnknown.idempotencyKey).toBe(dUnknown.idempotencyKey);
+    expect(resentFromUnknown.payloadSha256).toBe(dUnknown.payloadSha256);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls[httpCalls.length - 1]!.headers?.["Idempotency-Key"]).toBe(dUnknown.idempotencyKey);
+  });
+
+  it("Part B B-T1-04 Rule 2: refuses retry with PRODUCTION_DESTINATION_CHANGED when destination fingerprint differs from root, allowing only admin step-up resend with root Idempotency-Key and destination_changed=true audit (no URL)", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    dnsAnswers["failover-hooks.production.example.test"] = [{ address: "93.184.216.36", family: 4 }];
+    await mod.egress.createAllowlistRule(stepUpAdmin, {
+      purpose: "webhook",
+      matchType: "host",
+      pattern: "failover-hooks.production.example.test",
+      port: 443,
+      protocol: "https:",
+      allowPrivateAddress: false,
+      justification: "Failover production webhook receiver",
+    });
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 973,
+      orderPublicId: "01JORDER000000000000000973",
+      reference: "ORD-2026-0973",
+      customerRef: "RP-DEST-CHANGE-973",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+
+    const dRoot = await staffCaller.production.order.requestP101({ orderPublicId });
+    const rootJobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+    h.jobs.enqueued = [];
+
+    nextHttpHandler = async () => ({
+      status: 502,
+      headers: {},
+      body: Buffer.from("bad gateway", "utf8"),
+    });
+    for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+      await handler({
+        jobId: rootJobId,
+        type: PRODUCTION_DELIVERY_JOB,
+        payload: { dispatchId: dRoot.publicId } as never,
+        attempt,
+        fencingToken: attempt,
+        correlationId: "corr_rule2_dead",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+    }
+
+    // Rotate P101 destination URL (with secret query token to verify zero URL leakage in audits)
+    const newSecretUrl =
+      "https://failover-hooks.production.example.test/webhooks/p101?sig=super_secret_query_token_973";
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      timeoutMs: 12_000,
+      authHeaderName: "X-Webhook-Secret",
+      p101Url: newSecretUrl,
+    });
+
+    // Staff `retry` (and even admin `retry`) MUST be refused with CONFLICT / PRODUCTION_DESTINATION_CHANGED
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId,
+        dispatchPublicId: dRoot.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DESTINATION_CHANGED" }),
+    });
+    await expect(
+      adminCaller.production.order.retry({
+        orderPublicId,
+        dispatchPublicId: dRoot.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DESTINATION_CHANGED" }),
+    });
+
+    // Admin step-up `resend` succeeds, reuses root `Idempotency-Key`, and records `destination_changed: true` with zero URL
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const adminResent = await adminCaller.production.order.resend({
+      orderPublicId,
+      phase: "P101",
+      reason: "Switched P101 ingress to failover receiver after outage",
+    });
+    expect(adminResent.idempotencyKey).toBe(dRoot.idempotencyKey);
+    expect(adminResent.payloadSha256).toBe(dRoot.payloadSha256);
+
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const failoverCall = httpCalls[httpCalls.length - 1]!;
+    expect(failoverCall.headers?.["Idempotency-Key"]).toBe(dRoot.idempotencyKey);
+    expect(failoverCall.url).toContain("failover-hooks.production.example.test");
+
+    const resentAudit = h.audit.events.find(
+      (e) =>
+        e.eventName === "integration.production.dispatch.resent" &&
+        e.resource?.publicId === adminResent.publicId,
+    );
+    expect(resentAudit).toBeDefined();
+    expect(resentAudit?.attributes).toMatchObject({
+      phase: "P101",
+      order_public_id: orderPublicId,
+      idempotency_key: dRoot.idempotencyKey,
+      destination_changed: true,
+    });
+    const serializedAudits = JSON.stringify(h.audit.events);
+    expect(serializedAudits).not.toContain("failover-hooks.production.example.test");
+    expect(serializedAudits).not.toContain("super_secret_query_token_973");
+  });
+
+  it("Part B B-T1-04 Rule 3: after a redelivery ends dead, refuses new redelivery intents with PRODUCTION_REDELIVERY_RETRY_REQUIRED while allowing retry of that dead redelivery row with the same redelivery wire Idempotency-Key via retryOf chain", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const staffCaller = createCaller(staff);
+    const adminCaller = createCaller(stepUpAdmin);
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 974,
+      orderPublicId: "01JORDER000000000000000974",
+      reference: "ORD-2026-0974",
+      customerRef: "RP-RDLV-DEAD-974",
+      packets: [{ packetNumber: 4, tier: "Premium" }],
+    });
+
+    // 1. Deliver initial P101
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const origDelivered = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // 2. Step-up admin triggers redelivery `rdlvDead`, which commits side effects downstream on attempt 3 then exhausts 5x 503 -> `dead`
+    const committedByKey = new Set<string>([origDelivered.idempotencyKey]);
+    let downstreamRuns = 1;
+
+    const rdlvDead = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origDelivered.publicId,
+      reason: "Replay after SharePoint folder cleanup",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-rule3-intent-001",
+    });
+    const rdlvWireKey = rdlvDead.idempotencyKey;
+    expect(rdlvWireKey).toMatch(/^rp-prod:p101:rdlv:[0-9a-f]{40}$/);
+
+    const rdlvJobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+    h.jobs.enqueued = [];
+    const callsBeforeRdlv = httpCalls.length;
+    nextHttpHandler = async ({ headers }) => {
+      const k = headers?.["Idempotency-Key"] ?? "";
+      if (!committedByKey.has(k) && httpCalls.length - callsBeforeRdlv === 3) {
+        committedByKey.add(k);
+        downstreamRuns += 1;
+      }
+      return {
+        status: 503,
+        headers: {},
+        body: Buffer.from("downstream 503 after accepting redelivery", "utf8"),
+      };
+    };
+    for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+      await handler({
+        jobId: rdlvJobId,
+        type: PRODUCTION_DELIVERY_JOB,
+        payload: { dispatchId: rdlvDead.publicId } as never,
+        attempt,
+        fencingToken: attempt,
+        correlationId: "corr_rule3_rdlv_dead",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+    }
+    expect(downstreamRuns).toBe(2);
+
+    // 3. Same `idempotencyKey` replays idempotently with zero new work; a NEW `idempotencyKey` is refused with PRODUCTION_REDELIVERY_RETRY_REQUIRED!
+    const sameIntentReplay = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origDelivered.publicId,
+      reason: "Replay after SharePoint folder cleanup",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-rule3-intent-001",
+    });
+    expect(sameIntentReplay.publicId).toBe(rdlvDead.publicId);
+    expect(sameIntentReplay.state).toBe("dead");
+    expect(h.jobs.enqueued).toHaveLength(0);
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: origDelivered.publicId,
+        reason: "Attempting fresh redelivery while previous redelivery is dead",
+        confirmation: "REDELIVER",
+        idempotencyKey: "rdlv-rule3-intent-002",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: expect.stringContaining(rdlvDead.publicId),
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_REDELIVERY_RETRY_REQUIRED" }),
+    });
+
+    // 4. Retrying `rdlvDead` via `production.order.retry` creates a retry in the `retryOf` chain carrying the SAME redelivery wire key!
+    nextHttpHandler = async ({ headers }) => {
+      const k = headers?.["Idempotency-Key"] ?? "";
+      if (!committedByKey.has(k)) {
+        committedByKey.add(k);
+        downstreamRuns += 1;
+      }
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: Buffer.from('{"ok":true,"dedupedRedelivery":true}', "utf8"),
+      };
+    };
+    const retriedRedelivery = await adminCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: rdlvDead.publicId,
+    });
+    expect(retriedRedelivery.retryOf).toBe(rdlvDead.publicId);
+    expect(retriedRedelivery.redeliveryOf).toBe(origDelivered.publicId);
+    expect(retriedRedelivery.idempotencyKey).toBe(rdlvWireKey);
+
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const retryHttp = httpCalls[httpCalls.length - 1]!;
+    expect(retryHttp.headers?.["Idempotency-Key"]).toBe(rdlvWireKey);
+    expect(retryHttp.headers?.["X-ReadyPackets-Redelivery-Of"]).toBe(origDelivered.publicId);
+    expect(downstreamRuns).toBe(2);
+
+    // Once the retried redelivery is delivered, further `retry` is refused with `PRODUCTION_ALREADY_DELIVERED`,
+    // and an explicit new redelivery intent is unblocked again.
+    await expect(
+      adminCaller.production.order.retry({
+        orderPublicId,
+        dispatchPublicId: retriedRedelivery.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+    });
+
+    const thirdRedeliver = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: origDelivered.publicId,
+      reason: "Subsequent intentional redelivery after dead redelivery was resolved",
+      confirmation: "REDELIVER",
+      idempotencyKey: "rdlv-rule3-intent-003",
+    });
+    expect(thirdRedeliver.idempotencyKey).not.toBe(rdlvWireKey);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(downstreamRuns).toBe(3);
   });
 });

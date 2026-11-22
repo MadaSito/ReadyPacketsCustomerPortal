@@ -10,11 +10,15 @@ import { sendPrivateDownload } from "../../http/downloads.js";
 import { getHttpState, requireFullSession } from "../../http/requestState.js";
 import type { StagedUpload, UploadAuthorization } from "./index.js";
 import { fileCategories, fileVisibilities } from "./schema.js";
+import { slotKeySchema, transcriptSchema } from "./settings.js";
 
 const options = z.strictObject({
   category: z.enum(fileCategories).default("supporting"),
   visibility: z.enum(fileVisibilities).default("customer_visible"),
   versionOf: z.string().length(26).regex(ULID_PATTERN).optional(),
+  slotKey: slotKeySchema.optional(),
+  statusKey: slotKeySchema.optional(),
+  source: z.literal("recording").optional(),
 });
 const downloadBody = z.strictObject({ ticket: z.string().length(43).regex(/^[a-zA-Z0-9_-]{43}$/) });
 const multipartInvalid = () => validation("INVALID_MULTIPART", "Send one or more files using the multipart file fields.");
@@ -24,7 +28,7 @@ const fileTooLarge = () => validation("FILE_TOO_LARGE", "The file exceeds the al
 
 type Candidate = { staged: StagedUpload } | { error: unknown };
 
-async function readMultipart(req: Request, services: Services, plan: UploadAuthorization): Promise<Candidate[]> {
+async function readMultipart(req: Request, services: Services, plan: UploadAuthorization): Promise<{ candidates: Candidate[]; transcript?: string }> {
   const type = req.get("content-type");
   if (!type || !/^multipart\/form-data(?:;|$)/iu.test(type)) throw multipartInvalid();
   const length = req.get("content-length");
@@ -36,7 +40,8 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
       headers: req.headers,
       preservePath: false,
       defParamCharset: "utf8",
-      limits: { files: requestedFiles, fields: 0, parts: requestedFiles + 1, fileSize: plan.rules.maxFileBytes + 1, headerPairs: 32 },
+      limits: { files: requestedFiles, fields: 1, fieldSize: 16_001, parts: requestedFiles + 2,
+        fileSize: plan.rules.maxFileBytes + 1, headerPairs: 32 },
     });
   } catch {
     throw multipartInvalid();
@@ -46,6 +51,7 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
   const active = new Set<Readable>();
   let envelopeError: DomainError | undefined;
   let total = 0;
+  let transcript: string | undefined;
   const meter = new Transform({
     transform(chunk: Buffer, _encoding, done) {
       total += chunk.length;
@@ -72,6 +78,19 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
   parser.once("filesLimit", () => fail(countExceeded()));
   parser.once("fieldsLimit", () => fail(multipartInvalid()));
   parser.once("partsLimit", () => fail(countExceeded()));
+  parser.on("field", (name, value, info) => {
+    if (name !== "transcript" || transcript !== undefined || info.nameTruncated || info.valueTruncated ||
+      !["7bit", "8bit", "binary"].includes(info.encoding.toLowerCase())) {
+      fail(multipartInvalid());
+      return;
+    }
+    const parsed = transcriptSchema.safeParse(value);
+    if (!parsed.success) {
+      fail(validation("INVALID_AUDIO_TRANSCRIPT", "The transcript must be plain text, up to 4,000 characters."));
+      return;
+    }
+    transcript = parsed.data;
+  });
   parser.on("file", (name, stream, info) => {
     if (envelopeError) {
       stream.on("error", () => {});
@@ -112,11 +131,14 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
     req.pipe(meter).pipe(parser);
     await fullyParsed.catch(() => { envelopeError ??= multipartInvalid(); });
     const candidates = await Promise.all(files);
+    if (transcript !== undefined && candidates.length !== 1) {
+      envelopeError ??= validation("INVALID_AUDIO_TRANSCRIPT", "Supply an optional transcript only for one audio upload.");
+    }
     if (envelopeError || candidates.length === 0) {
       await Promise.all(candidates.flatMap((candidate) => "staged" in candidate ? [services.files.cleanUpload(candidate.staged)] : []));
       throw envelopeError ?? multipartInvalid();
     }
-    return candidates;
+    return { candidates, transcript };
   } finally {
     req.off("aborted", aborted);
     req.off("error", aborted);
@@ -131,8 +153,9 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
     if (!orderId || orderId.length !== 26 || !ULID_PATTERN.test(orderId) || !query.success) throw multipartInvalid();
     const plan = await services.files.beginUpload(principal, orderId, query.data);
     let candidates: Candidate[];
+    let transcript: string | undefined;
     try {
-      candidates = await readMultipart(req, services, plan);
+      ({ candidates, transcript } = await readMultipart(req, services, plan));
     } catch (error) {
       if (error instanceof DomainError) {
         if (error.reasonCode === "UPLOAD_REQUEST_TOO_LARGE" && req.httpVersionMajor === 1) res.set("Connection", "close");
@@ -146,7 +169,7 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
         try {
           if ("error" in candidate) throw candidate.error;
           if (req.aborted || res.destroyed) throw validation("UPLOAD_INTERRUPTED", "The upload did not finish.");
-          results.push({ index, outcome: "completed", file: await services.files.commitUpload(principal, plan, candidate.staged) });
+          results.push({ index, outcome: "completed", file: await services.files.commitUpload(principal, plan, candidate.staged, transcript) });
         } catch (error) {
           if (error instanceof DomainError && error.code === "AUDIT_UNAVAILABLE") throw error;
           if (error instanceof DomainError && (["NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED", "LOCKED", "CONFLICT", "VALIDATION", "REMEDIATION_REQUIRED"].includes(error.code)

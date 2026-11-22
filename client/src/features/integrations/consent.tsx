@@ -1,35 +1,41 @@
 /**
- * Consent-Gated Public-Route Analytics Banner & Loader (`AnalyticsConsentSlot`, `useAnalyticsConsent`).
+ * Shared-Consent-Gated Public-Route Analytics Loader (`AnalyticsConsentSlot`, `useAnalyticsConsent`).
  *
- * Security & privacy guarantees:
- *  1. Renders and loads NOTHING unless at least one analytics provider is admin-enabled (disabled by default).
- *  2. Strictly restricted to exact non-sensitive public routes (`/privacy`, `/terms`), clean URLs with
+ * Increment 04 Package J cutover:
+ *  1. Single consent authority (`@/lib/consent`):
+ *     - Renders NO independent banner and keeps NO independent opt-in state.
+ *     - When `privacy.consent` (`consent.enabled()`) is off, `consent.has(...)` is false and NOTHING loads or captures.
+ *     - Separate category gates: PostHog requires `consent.has("analytics")`; Microsoft Clarity requires
+ *       `consent.has("session_replay")`.
+ *  2. Strictly restricted to exact non-sensitive public legal routes (`/privacy`, `/terms`), clean URLs with
  *     EMPTY query string and EMPTY hash (`location.search === "" && location.hash === ""`), non-preview
  *     path routing (`!RUNTIME.preview`), and unauthenticated visitors (`session.view.status === "anonymous"`).
- *     Authentication, remediation, recovery, customer orders/files/messages/invoices, account security,
+ *     Public `/accessibility`, authentication, remediation, recovery, customer portal, account security,
  *     and all `/admin` routes are permanently excluded.
- *  3. Consent state lives exclusively in volatile JS memory for the current tab session — NEVER in
- *     `localStorage`, `sessionStorage`, `indexedDB` or cookies.
- *  4. Re-validates provider identifiers client-side before building fixed vendor URLs (never arbitrary
- *     HTML or script snippets).
- *  5. PostHog uses direct, credential-less `fetch` (`$process_person_profile: false`, ephemeral per-view ID)
- *     so zero PostHog SDK code executes in the portal JS realm.
- *  6. Synchronous JS-Realm Quarantine (INT-01) + Pre-History Guard:
+ *  3. Vendor consent APIs & withdrawal teardown (`consent.subscribe(...)`):
+ *     - PostHog: cookieless (`credentials: "omit"`, `$process_person_profile: false`, ephemeral per-view ID)
+ *       with explicit `opt_in_capturing()` on grant and `opt_out_capturing()` + cookie/storage purge on withdrawal.
+ *     - Microsoft Clarity: script appended ONLY after `session_replay` consent, told via `clarity("consent")`
+ *       and `clarity("consentv2", ...)`, and torn down via `clarity("consent", false)` + `clarity("stop")` +
+ *       script removal + cookie/storage purge on withdrawal, expiry, policy-version change, or cross-tab revoke.
+ *     - Any withdrawal/expiry while `isRealmTainted()` is true immediately requests a clean JS realm reload.
+ *  4. Synchronous JS-Realm Quarantine (INT-01) + Pre-History Guard:
  *     - Calls `markRealmTainted("clarity")` / `markRealmTainted("posthog")` from `@/lib/realmTaint`
  *       SYNCHRONOUSLY on the line immediately BEFORE appending the Clarity `<script>` element or sending
  *       the PostHog `fetch` request.
- *     - Wraps `history.pushState`/`replaceState` (staying armed for the lifetime of the tainted document,
- *       including after the first blocked call while async document replacement is in flight) so SPA
- *       history calls to non-public paths or `?search`/`#hash` URLs are refused before `pushState` mutates
- *       `window.location`. Browser-driven `popstate`/`hashchange` events occur after the browser updates
- *       the URL; capture-phase listeners stop router propagation and immediately request a clean realm.
- *     - App-root `<RealmTaintBoundary>` + `<TaintedRouteGate>` (`@/app/RealmTaint`) enforce render-phase
- *       React DOM quarantine; same-origin script/API authority in a vendor-loaded document remains an
- *       acknowledged residual outside the DOM interlock.
+ *     - Wraps `history.pushState`/`replaceState` and capture-phase `popstate`/`hashchange` so leaving clean
+ *       `/privacy` or `/terms` tears down vendor state and triggers `requestCleanRealm(...)`.
  */
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { useLocation } from "wouter";
+import {
+  __resetConsentForTests,
+  consent,
+  removeVendorData,
+  useConsent,
+  type ConsentState,
+} from "@/lib/consent";
 import {
   __resetRealmTaintForTests,
   cleanRealmPath,
@@ -40,22 +46,22 @@ import {
 import { RUNTIME } from "@/lib/runtime";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
-import { Button } from "@/ui";
 
 export type AnalyticsConsentDecision = "undecided" | "granted" | "denied";
 
+/** Exact public legal routes eligible for optional visitor analytics (`/accessibility` is intentionally excluded). */
 export const CLIENT_ALLOWED_ANALYTICS_PATHS = ["/privacy", "/terms"] as const;
 
 export const ANALYTICS_CONSENT_COPY = {
   heading: "Optional public-page analytics",
   body: (provider: string) =>
-    `May we enable ${provider} on public legal pages for this session? Sign-in, security, customer portal and administrative pages never load external analytics.`,
-  allow: "Allow for session",
-  decline: "Decline",
-  grantedStatus: "Public-page analytics active for this session.",
-  withdraw: "Withdraw consent",
-  declinedStatus: "Analytics declined for this session.",
-  changePreference: "Change preference",
+    `Visitor consent from the privacy banner controls ${provider} on /privacy and /terms only. Sign-in, security, accessibility, customer portal and administrative pages never load external analytics.`,
+  allow: "Accept in cookie preferences",
+  decline: "Reject all",
+  grantedStatus: "Public-page analytics active under your cookie preferences.",
+  withdraw: "Cookie preferences",
+  declinedStatus: "Optional analytics off under your cookie preferences.",
+  changePreference: "Cookie preferences",
 } as const;
 
 const CLARITY_ID_PATTERN = /^[A-Za-z0-9]{6,32}$/;
@@ -99,31 +105,53 @@ function isSafeHttpsOriginClient(value: string | null | undefined): value is str
   }
 }
 
-/* ------------------------------ In-memory consent + preventive pre-history guard */
+/* ------------------------------ Vendor consent controllers + preventive pre-history guard */
 
-let currentDecision: AnalyticsConsentDecision = "undecided";
+interface PostHogGlobalLike {
+  opt_in_capturing?: () => void;
+  opt_out_capturing?: () => void;
+  reset?: () => void;
+}
+
+let posthogCapturingEnabled = false;
 let consentHistoryGuardArmed = false;
 let realmLeavingPending = false;
 let historyWrappersInstalled = false;
 let origPushState: History["pushState"] | null = null;
 let origReplaceState: History["replaceState"] | null = null;
-const listeners = new Set<() => void>();
-
-function emitChange(): void {
-  for (const listener of listeners) listener();
-}
-
-function subscribeConsent(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
-}
-
-function getConsentSnapshot(): AnalyticsConsentDecision {
-  return currentDecision;
-}
 
 export function isAnalyticsRealmTainted(): boolean {
   return isRealmTainted();
+}
+
+export function isPostHogCapturingEnabled(): boolean {
+  return posthogCapturingEnabled;
+}
+
+function optInPostHogCapturing(): void {
+  posthogCapturingEnabled = true;
+  if (typeof window !== "undefined") {
+    const win = window as Window & { posthog?: PostHogGlobalLike };
+    try {
+      win.posthog?.opt_in_capturing?.();
+    } catch {
+      // Ignore vendor global errors; portal uses cookieless fetch below.
+    }
+  }
+}
+
+function optOutPostHogCapturing(): void {
+  posthogCapturingEnabled = false;
+  if (typeof window !== "undefined") {
+    const win = window as Window & { posthog?: PostHogGlobalLike };
+    try {
+      win.posthog?.opt_out_capturing?.();
+      win.posthog?.reset?.();
+    } catch {
+      // Ignore vendor teardown errors.
+    }
+  }
+  removeVendorData("analytics");
 }
 
 function teardownClarityGlobalsAndScript(): void {
@@ -131,6 +159,7 @@ function teardownClarityGlobalsAndScript(): void {
     const win = window as Window & { clarity?: (...args: unknown[]) => void };
     try {
       win.clarity?.("consent", false);
+      win.clarity?.("consentv2", { ad_Storage: "denied", analytics_Storage: "denied" });
       win.clarity?.("stop");
     } catch {
       // Ignore vendor teardown errors prior to full-document navigation/reload.
@@ -141,6 +170,12 @@ function teardownClarityGlobalsAndScript(): void {
     document.querySelectorAll('script[data-rp-clarity="true"]').forEach((el) => el.remove());
     document.documentElement.removeAttribute("data-clarity-mask");
   }
+  removeVendorData("session_replay");
+}
+
+function teardownAllVendors(): void {
+  optOutPostHogCapturing();
+  teardownClarityGlobalsAndScript();
 }
 
 function ensurePreventiveHistoryGuardsInstalled(): void {
@@ -174,11 +209,8 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
         isCleanEligibleUrl(resolved);
 
       if (!staysOnCleanPublicLegal) {
-        // Intercept programmatic `history.pushState`/`replaceState` before mutating `window.location`.
-        // Keep `consentHistoryGuardArmed` + `realmLeavingPending` latched so subsequent history calls
-        // in the dying document are also blocked while async full-document navigation completes.
         realmLeavingPending = true;
-        teardownClarityGlobalsAndScript();
+        teardownAllVendors();
         const targetPath = cleanRealmPath(resolved?.pathname ?? window.location.pathname);
         const mode = isEligibleAnalyticsPath(targetPath) ? "replace" : "assign";
         requestCleanRealm(mode, targetPath);
@@ -195,14 +227,12 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
     guardHistoryMutation(origReplaceState!, data, unused, url);
   };
 
-  // Note: browser `popstate`/`hashchange` fires after the browser updates `window.location`;
-  // stop router propagation and immediately request a full-document navigation into a clean realm.
   const onCaptureUrlMutation = (event: Event): void => {
     if (!consentHistoryGuardArmed || !isRealmTainted()) return;
     if (realmLeavingPending || !isWindowAtCleanEligiblePath()) {
       event.stopImmediatePropagation();
       realmLeavingPending = true;
-      teardownClarityGlobalsAndScript();
+      teardownAllVendors();
       const targetPath = cleanRealmPath(window.location.pathname);
       requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
     }
@@ -211,28 +241,14 @@ function ensurePreventiveHistoryGuardsInstalled(): void {
   window.addEventListener("hashchange", onCaptureUrlMutation, { capture: true });
 }
 
-/** Resets volatile consent & realm-taint state (used by tests). */
+/** Resets shared consent, vendor controllers & realm-taint state (used by tests). */
 export function resetAnalyticsConsentForTests(): void {
-  currentDecision = "undecided";
+  posthogCapturingEnabled = false;
   consentHistoryGuardArmed = false;
   realmLeavingPending = false;
-  teardownClarityGlobalsAndScript();
+  teardownAllVendors();
+  __resetConsentForTests();
   __resetRealmTaintForTests();
-  emitChange();
-}
-
-export function setAnalyticsConsent(next: AnalyticsConsentDecision): void {
-  const prev = currentDecision;
-  currentDecision = next;
-  if (prev === "granted" && next !== "granted" && isRealmTainted()) {
-    // Keep history guard armed until the full-document reload replaces this tainted realm.
-    realmLeavingPending = true;
-    teardownClarityGlobalsAndScript();
-    emitChange();
-    requestCleanRealm("replace", typeof window !== "undefined" ? window.location.pathname : "/privacy");
-    return;
-  }
-  emitChange();
 }
 
 function subscribeWindowUrl(cb: () => void): () => void {
@@ -252,19 +268,25 @@ function getCleanUrlSnapshot(): string {
 
 export function useAnalyticsConsent() {
   const [pathname] = useLocation();
-  const decision = useSyncExternalStore(subscribeConsent, getConsentSnapshot, getConsentSnapshot);
+  const state = useConsent();
   useSyncExternalStore(subscribeWindowUrl, getCleanUrlSnapshot, () => "");
   const isEligibleRoute = isEligibleAnalyticsPath(pathname) && isWindowAtCleanEligiblePath(pathname);
 
-  const grant = useCallback(() => setAnalyticsConsent("granted"), []);
-  const deny = useCallback(() => setAnalyticsConsent("denied"), []);
-  const reset = useCallback(() => setAnalyticsConsent("undecided"), []);
+  const analyticsAllowed = state.enabled && state.decided && state.choices.analytics;
+  const sessionReplayAllowed = state.enabled && state.decided && state.choices.session_replay;
+  const decision: AnalyticsConsentDecision = !state.enabled || !state.decided
+    ? "undecided"
+    : analyticsAllowed || sessionReplayAllowed
+      ? "granted"
+      : "denied";
+
+  const openPreferences = useCallback(() => consent.openPreferences(), []);
 
   return {
     decision,
-    grant,
-    deny,
-    reset,
+    analyticsAllowed,
+    sessionReplayAllowed,
+    openPreferences,
     isEligibleRoute,
   };
 }
@@ -272,6 +294,7 @@ export function useAnalyticsConsent() {
 function mountClarityTag(projectId: string, pathname: string): void {
   if (typeof document === "undefined" || !CLARITY_ID_PATTERN.test(projectId)) return;
   if (!isWindowAtCleanEligiblePath(pathname)) return;
+  if (!consent.enabled() || !consent.has("session_replay")) return;
 
   const existing = document.querySelector('script[data-rp-clarity="true"]');
   if (existing) return;
@@ -292,6 +315,10 @@ function mountClarityTag(projectId: string, pathname: string): void {
     win.clarity = fn;
   }
 
+  // Inform Clarity via its consent API only after explicit `session_replay` consent.
+  win.clarity("consent");
+  win.clarity("consentv2", { ad_Storage: "denied", analytics_Storage: "granted" });
+
   const script = document.createElement("script");
   script.async = true;
   script.src = `https://www.clarity.ms/tag/${encodeURIComponent(projectId)}`;
@@ -306,6 +333,7 @@ function mountClarityTag(projectId: string, pathname: string): void {
 function sendMinimalPostHogPageview(host: string, key: string, pathname: string): void {
   if (!POSTHOG_KEY_PATTERN.test(key) || !isSafeHttpsOriginClient(host)) return;
   if (!isWindowAtCleanEligiblePath(pathname)) return;
+  if (!consent.enabled() || !consent.has("analytics") || !posthogCapturingEnabled) return;
   if (typeof fetch !== "function") return;
 
   ensurePreventiveHistoryGuardsInstalled();
@@ -351,14 +379,20 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
   const [pathname] = useLocation();
   const session = useSession();
   const trpc = useTRPC();
-  const { decision, grant, deny, reset } = useAnalyticsConsent();
+  const consentState = useConsent();
 
   const cleanEligibleRoute = isEligibleAnalyticsPath(pathname) && isWindowAtCleanEligiblePath(pathname);
   const isAnonymousVisitor = session.view.status === "anonymous";
 
+  const analyticsConsented =
+    consentState.enabled && consentState.decided && consentState.choices.analytics;
+  const sessionReplayConsented =
+    consentState.enabled && consentState.decided && consentState.choices.session_replay;
+  const anyCategoryConsented = analyticsConsented || sessionReplayConsented;
+
   const configQuery = useQuery({
     ...trpc.integrations.publicAnalyticsConfig.queryOptions(),
-    enabled: configOverride === undefined && cleanEligibleRoute && isAnonymousVisitor,
+    enabled: configOverride === undefined && cleanEligibleRoute && isAnonymousVisitor && consentState.enabled,
     staleTime: 60_000,
   });
 
@@ -373,99 +407,140 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
       POSTHOG_KEY_PATTERN.test(cfg.posthog.key) &&
       isSafeHttpsOriginClient(cfg.posthog.host),
   );
-  const anyProviderActive = clarityReady || posthogReady;
 
   const lastCapturedPathRef = useRef<string | null>(null);
+  const mountedClarityIdRef = useRef<string | null>(null);
+  const activePostHogSigRef = useRef<string | null>(null);
+  const prevGrantedRef = useRef<{ analytics: boolean; session_replay: boolean }>({
+    analytics: false,
+    session_replay: false,
+  });
+
+  // Subscribe directly to `@/lib/consent` so cross-tab storage revocations, renewal expiry, policy-version
+  // bumps, or disabling `privacy.consent` tear down vendor state synchronously and replace any tainted realm.
+  // NOTE on unload vs ledger call: `CookieConsent` / `useConsentDecision` persists removals synchronously to
+  // `localStorage` (`rp.consent.v1`) via `applyConsentDecision` BEFORE invoking `emit()` (and before the async
+  // server ledger RPC), so even when `requestCleanRealm` reloads the document immediately, local denial is
+  // already durable in `rp.consent.v1` and wins on reload regardless of ledger network completion.
+  useEffect(() => {
+    const handleTransition = (next: ConsentState): void => {
+      const nextAnalytics = next.enabled && next.decided && next.choices.analytics;
+      const nextReplay = next.enabled && next.decided && next.choices.session_replay;
+      const prev = prevGrantedRef.current;
+
+      const analyticsRevoked = prev.analytics && !nextAnalytics;
+      const replayRevoked = prev.session_replay && !nextReplay;
+      prevGrantedRef.current = { analytics: nextAnalytics, session_replay: nextReplay };
+
+      if (!nextAnalytics) {
+        lastCapturedPathRef.current = null;
+        activePostHogSigRef.current = null;
+        optOutPostHogCapturing();
+      }
+      if (!nextReplay) {
+        mountedClarityIdRef.current = null;
+        teardownClarityGlobalsAndScript();
+      }
+      if ((analyticsRevoked || replayRevoked) && isRealmTainted() && !realmLeavingPending) {
+        realmLeavingPending = true;
+        teardownAllVendors();
+        const targetPath = typeof window !== "undefined" ? cleanRealmPath(window.location.pathname) : "/privacy";
+        requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
+      }
+    };
+
+    prevGrantedRef.current = {
+      analytics: consent.enabled() && consent.has("analytics"),
+      session_replay: consent.enabled() && consent.has("session_replay"),
+    };
+    return consent.subscribe(handleTransition);
+  }, []);
 
   useEffect(() => {
-    if (!cleanEligibleRoute || !isAnonymousVisitor || !anyProviderActive || decision !== "granted") {
+    const requestReloadIfTainted = (): void => {
+      if (isRealmTainted() && !realmLeavingPending) {
+        realmLeavingPending = true;
+        teardownAllVendors();
+        const targetPath = typeof window !== "undefined" ? cleanRealmPath(window.location.pathname) : "/privacy";
+        requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
+      }
+    };
+
+    // Route exit or any non-anonymous session state (`loading`, `remediation`, `full`, etc.) immediately
+    // tears down all vendors and replaces a tainted realm without depending on shell navigation alone.
+    if (!cleanEligibleRoute || !isAnonymousVisitor) {
       lastCapturedPathRef.current = null;
+      mountedClarityIdRef.current = null;
+      activePostHogSigRef.current = null;
+      teardownAllVendors();
+      requestReloadIfTainted();
       return;
     }
 
-    if (clarityReady && cfg?.clarity.projectId) {
-      mountClarityTag(cfg.clarity.projectId, pathname);
+    if (!anyCategoryConsented) {
+      lastCapturedPathRef.current = null;
+      mountedClarityIdRef.current = null;
+      activePostHogSigRef.current = null;
+      teardownAllVendors();
+      requestReloadIfTainted();
+      return;
     }
 
-    if (posthogReady && cfg?.posthog.host && cfg?.posthog.key && lastCapturedPathRef.current !== pathname) {
-      lastCapturedPathRef.current = pathname;
-      sendMinimalPostHogPageview(cfg.posthog.host, cfg.posthog.key, pathname);
+    // Detect runtime provider disable or projectId/key rotation on query refetch while still consented.
+    const nextClarityId = sessionReplayConsented && clarityReady && cfg?.clarity.projectId ? cfg.clarity.projectId : null;
+    if (mountedClarityIdRef.current !== null && mountedClarityIdRef.current !== nextClarityId) {
+      mountedClarityIdRef.current = null;
+      teardownClarityGlobalsAndScript();
+      requestReloadIfTainted();
+      return;
+    }
+
+    const nextPostHogSig =
+      analyticsConsented && posthogReady && cfg?.posthog.host && cfg?.posthog.key
+        ? `${cfg.posthog.host}|${cfg.posthog.key}`
+        : null;
+    if (activePostHogSigRef.current !== null && activePostHogSigRef.current !== nextPostHogSig) {
+      lastCapturedPathRef.current = null;
+      activePostHogSigRef.current = null;
+      optOutPostHogCapturing();
+      requestReloadIfTainted();
+      return;
+    }
+
+    if (nextClarityId) {
+      mountClarityTag(nextClarityId, pathname);
+      mountedClarityIdRef.current = nextClarityId;
+    } else {
+      teardownClarityGlobalsAndScript();
+    }
+
+    if (nextPostHogSig && cfg?.posthog.host && cfg?.posthog.key) {
+      activePostHogSigRef.current = nextPostHogSig;
+      optInPostHogCapturing();
+      if (lastCapturedPathRef.current !== pathname) {
+        lastCapturedPathRef.current = pathname;
+        sendMinimalPostHogPageview(cfg.posthog.host, cfg.posthog.key, pathname);
+      }
+    } else {
+      lastCapturedPathRef.current = null;
+      optOutPostHogCapturing();
     }
   }, [
-    anyProviderActive,
+    analyticsConsented,
+    anyCategoryConsented,
     cfg?.clarity.projectId,
     cfg?.posthog.host,
     cfg?.posthog.key,
     clarityReady,
     cleanEligibleRoute,
-    decision,
     isAnonymousVisitor,
     pathname,
     posthogReady,
+    sessionReplayConsented,
   ]);
 
-  if (!cleanEligibleRoute || !isAnonymousVisitor || !anyProviderActive) {
-    return null;
-  }
-
-  if (decision === "granted") {
-    return (
-      <aside
-        aria-label="Analytics privacy preference"
-        className="fixed bottom-4 right-4 z-40 flex items-center gap-3 rounded-[var(--radius-card)] border border-line bg-surface px-4 py-2.5 text-sm text-body shadow-[var(--shadow-card)]"
-      >
-        <span className="text-muted">{ANALYTICS_CONSENT_COPY.grantedStatus}</span>
-        <Button size="sm" variant="secondary" onClick={deny}>
-          {ANALYTICS_CONSENT_COPY.withdraw}
-        </Button>
-      </aside>
-    );
-  }
-
-  if (decision === "denied") {
-    return (
-      <aside
-        aria-label="Analytics privacy preference"
-        className="fixed bottom-4 right-4 z-40 flex items-center gap-3 rounded-[var(--radius-card)] border border-line bg-surface px-4 py-2.5 text-sm text-body shadow-[var(--shadow-card)]"
-      >
-        <span className="text-muted">{ANALYTICS_CONSENT_COPY.declinedStatus}</span>
-        <Button size="sm" variant="ghost" onClick={reset}>
-          {ANALYTICS_CONSENT_COPY.changePreference}
-        </Button>
-      </aside>
-    );
-  }
-
-  const providerLabel =
-    clarityReady && posthogReady
-      ? "Microsoft Clarity and PostHog"
-      : clarityReady
-        ? "Microsoft Clarity"
-        : "PostHog";
-
-  return (
-    <section
-      aria-labelledby="rp-analytics-consent-heading"
-      className="fixed inset-x-3 bottom-3 z-40 mx-auto max-w-2xl rounded-[var(--radius-card)] border border-line bg-surface p-4 text-body shadow-[var(--shadow-card)] sm:inset-x-6 sm:bottom-6 sm:p-5"
-    >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0 space-y-1">
-          <h2 id="rp-analytics-consent-heading" className="text-sm font-semibold text-ink">
-            {ANALYTICS_CONSENT_COPY.heading}
-          </h2>
-          <p className="text-sm text-muted">{ANALYTICS_CONSENT_COPY.body(providerLabel)}</p>
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <Button size="sm" variant="secondary" onClick={deny}>
-            {ANALYTICS_CONSENT_COPY.decline}
-          </Button>
-          <Button size="sm" variant="primary" onClick={grant}>
-            {ANALYTICS_CONSENT_COPY.allow}
-          </Button>
-        </div>
-      </div>
-    </section>
-  );
+  // Headless loader: all visitor consent UI is owned by `CookieConsent` (`@/features/platform/consent`).
+  return null;
 }
 
 export default AnalyticsConsentSlot;

@@ -158,6 +158,8 @@ describe("FlowCanvas", () => {
     const onDelete = vi.fn();
     renderUi(<Demo onConnect={onConnect} onDelete={onDelete} />);
     const received = await screen.findByRole("button", { name: /^Status: Received/ });
+    // WCAG 2.5.3: the accessible name is the visible text (plus hidden separators), never a divergent aria-label.
+    expect(received).not.toHaveAttribute("aria-label");
     expect(screen.getByRole("group", { name: "Workflow canvas" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start: from Received to In production" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Zoom in" })).toBeInTheDocument();

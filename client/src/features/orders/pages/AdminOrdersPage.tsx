@@ -6,6 +6,7 @@ import { Link, useSearch } from "wouter";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
 import { DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
+import { NewOrderForCustomerButton } from "../ConsoleOrderTools";
 import { LOCK_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -51,7 +52,7 @@ export default function AdminOrdersPage() {
 
   return (
     <>
-      <PageHeader title="Orders" description="Every customer order. Filter by reference, status, lock, customer or date." />
+      <PageHeader title="Orders" description="Every customer order. Filter by reference, status, lock, customer or date." actions={<NewOrderForCustomerButton />} />
       <div className="flex flex-col gap-6">
         <FilterBar
           search={draft.referencePrefix}

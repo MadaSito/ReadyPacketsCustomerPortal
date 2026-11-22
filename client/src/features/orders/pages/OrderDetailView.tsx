@@ -3,25 +3,28 @@
  * Owner: orders_engineer. The server decides visibility (customer view never contains internal notes).
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Suspense, useState, type FormEvent } from "react";
-import { useLocation, useParams } from "wouter";
+import { Suspense, useState, type FormEvent, type ReactNode } from "react";
+import { useParams } from "wouter";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
-import { ORDER_TABS } from "@/app/registry";
+import { FEATURES, ORDER_TABS } from "@/app/registry";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
-  Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
-  Skeleton, Spinner, Tabs, Textarea, useToast,
+  Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
+  RouteTabPanel, RouteTabs, Skeleton, Spinner, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
-import { ConsoleActions } from "../ConsoleActions";
+import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
+import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 type Area = "customer" | "console";
 
+/** Part B: full-width banners contributed by other features (e.g. the acceptance gate), between header and tabs. */
+const ORDER_BANNERS = FEATURES.flatMap((feature) => feature.orderBanners ?? []).sort((a, b) => a.order - b.order);
+
 export function OrderDetailView({ area }: { area: Area }) {
   const { orderId = "", tab } = useParams<{ orderId: string; tab?: string }>();
-  const [, navigate] = useLocation();
   const trpc = useTRPC();
   const consoleArea = area === "console";
   const base = consoleArea ? "/admin/orders" : "/orders";
@@ -47,42 +50,42 @@ export function OrderDetailView({ area }: { area: Area }) {
 
   const order = query.data;
   const lockState = order.lockState as LockState;
-  const builtIn = [
-    { value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
-    { value: "activity", label: "Activity", content: <Activity order={order} area={area} /> },
-    { value: "sharing", label: "Sharing", content: <SharingPanel orderId={order.publicId} canShare={order.canShare} locked={lockState !== "none"} /> },
-  ];
-  const contributed = ORDER_TABS.filter((t) => t.access === "customer" || consoleArea).map((t) => {
-    const Component = t.component;
-    const Badge = t.badge;
-    return {
-      value: t.key,
-      label: t.label,
-      badge: Badge ? <Badge orderId={order.publicId} area={area} /> : undefined,
-      content: (
-        <Suspense fallback={<Spinner label={`Loading ${t.label}`} />}>
-          <Component orderId={order.publicId} area={area} />
-        </Suspense>
-      ),
-    };
-  });
-  const items = [...builtIn, ...contributed];
-  const active = items.some((item) => item.value === tab) ? tab! : "overview";
+  const tabs = orderTabItems(order, area);
+  // The old "Activity" URL keeps working: it now opens Notes.
+  const requested = tab === "activity" ? "notes" : tab;
+  const active = tabs.some((item) => item.value === requested) ? requested! : "overview";
+  const header = consoleArea ? order.console : null;
+  const placed = formatDateTime(order.submittedAt ?? order.createdAt, "date");
+  const description = consoleArea
+    ? [order.reference, header?.customer?.name ?? "Customer unavailable", `placed ${placed}`].join(" · ")
+    : `Order ${order.reference}`;
 
   return (
     <>
       <PageHeader
         breadcrumbs={<Breadcrumbs items={[...crumbs, { label: order.reference }]} />}
         title={order.projectName}
-        description={`Order ${order.reference}`}
+        description={description}
         meta={
-          <span className="flex flex-wrap gap-2">
+          <span className="flex flex-wrap items-center gap-2">
             <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
             <LockBadge state={lockState} />
+            {header?.payment ? <Badge tone={PAYMENT_TONES[header.payment.state]}>{PAYMENT_LABELS[header.payment.state]}</Badge> : null}
+            {consoleArea ? (
+              <Badge tone="neutral">
+                Total <Money value={money(order.totalMinor, order.currency)} />
+              </Badge>
+            ) : null}
           </span>
         }
-        actions={<TransitionControl order={order} />}
+        actions={consoleArea ? undefined : <TransitionControl order={order} />}
       />
+      {consoleArea ? (
+        <div className="mb-6 flex flex-col gap-2">
+          <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} name={order.projectName} />
+          <TransitionControl order={order} />
+        </div>
+      ) : null}
       {lockState !== "none" ? (
         <div className="mb-4">
           <Callout tone={lockState === "legal_hold" ? "warning" : "info"} title={undefined}>
@@ -90,22 +93,120 @@ export function OrderDetailView({ area }: { area: Area }) {
           </Callout>
         </div>
       ) : null}
-      {consoleArea ? (
-        <div className="mb-6">
-          <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} />
-        </div>
-      ) : null}
-      <Tabs
+      {ORDER_BANNERS.filter((b) => b.area === "both" || b.area === area).map((b) => {
+        const Banner = b.component;
+        return (
+          <Suspense key={b.key} fallback={null}>
+            <Banner orderId={order.publicId} area={area} />
+          </Suspense>
+        );
+      })}
+      {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
+      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      <RouteTabs
+        idBase="order-tabs"
         label="Order sections"
         value={active}
-        onValueChange={(value) => navigate(value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${value}`, { replace: true })}
-        items={items}
+        items={tabs.map((item) => ({
+          value: item.value,
+          label: item.label,
+          href: item.value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${item.value}`,
+          labelContent: item.labelContent,
+        }))}
       />
+      <RouteTabPanel idBase="order-tabs" value={active} className="mt-4">
+        {tabs.find((item) => item.value === active)?.content}
+      </RouteTabPanel>
     </>
   );
 }
 
 type OrderDetail = inferRouterOutputs<AppRouter>["orders"]["get"];
+type ConsoleDetail = inferRouterOutputs<AppRouter>["orders"]["admin"]["get"];
+type PaymentState = NonNullable<NonNullable<ConsoleDetail["console"]>["payment"]>["state"];
+
+const PAYMENT_LABELS: Record<PaymentState, string> = {
+  unpaid: "Unpaid",
+  paid: "Paid",
+  partially_refunded: "Partially refunded",
+  refunded: "Refunded",
+  void: "Void",
+};
+const PAYMENT_TONES: Record<PaymentState, Tone> = {
+  unpaid: "warning",
+  paid: "success",
+  partially_refunded: "info",
+  refunded: "neutral",
+  void: "neutral",
+};
+
+/**
+ * B1 tab order. Built-in and contributed tabs share one ordering (numbers published to the tab owners):
+ * Overview 0, Phases 10 (console), Intake 20, Files 30, Messages 40, Automation 50, Sync 60, Invoices 70,
+ * Refund 80, Order history 90, Acceptances 100, Notes 105, Sharing 110. Each tab keeps its own URL segment.
+ */
+export const BUILT_IN_TAB_ORDER = { overview: 0, phases: 10, notes: 105, sharing: 110 } as const;
+
+interface TabEntry {
+  order: number;
+  value: string;
+  label: string;
+  labelContent?: ReactNode;
+  content: ReactNode;
+}
+
+function orderTabItems(order: OrderDetail, area: Area): TabEntry[] {
+  const consoleArea = area === "console";
+  const lockState = order.lockState as LockState;
+  const builtIn: TabEntry[] = [
+    { order: BUILT_IN_TAB_ORDER.overview, value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
+    ...(consoleArea
+      ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <WorkflowRulesPanel orderId={order.publicId} area={area} /> }]
+      : []),
+    { order: BUILT_IN_TAB_ORDER.notes, value: "notes", label: "Notes", content: <Activity order={order} area={area} /> },
+    {
+      order: BUILT_IN_TAB_ORDER.sharing,
+      value: "sharing",
+      label: "Sharing",
+      content: <SharingPanel orderId={order.publicId} canShare={order.canShare} locked={lockState !== "none"} />,
+    },
+  ];
+  const contributed: TabEntry[] = ORDER_TABS.filter((t) => t.access === "customer" || consoleArea).map((t) => {
+    const Component = t.component;
+    const Badge = t.badge;
+    const Label = t.labelComponent;
+    // RouteTabs: the strip shows `labelContent` (live label + optional badge); the narrow-screen select keeps `label`.
+    const labelContent =
+      Label || Badge ? (
+        <span className="inline-flex items-center gap-1.5">
+          {Label ? (
+            <Suspense fallback={t.label}>
+              <Label orderId={order.publicId} area={area} />
+            </Suspense>
+          ) : (
+            t.label
+          )}
+          {Badge ? (
+            <Suspense fallback={null}>
+              <Badge orderId={order.publicId} area={area} />
+            </Suspense>
+          ) : null}
+        </span>
+      ) : undefined;
+    return {
+      order: t.order,
+      value: t.key,
+      label: t.label,
+      labelContent,
+      content: (
+        <Suspense fallback={<Spinner label={`Loading ${t.label}`} />}>
+          <Component orderId={order.publicId} area={area} />
+        </Suspense>
+      ),
+    };
+  });
+  return [...builtIn, ...contributed].sort((a, b) => a.order - b.order);
+}
 
 function Overview({ order, area }: { order: OrderDetail; area: Area }) {
   return (
@@ -137,7 +238,8 @@ function Overview({ order, area }: { order: OrderDetail; area: Area }) {
           ]}
         />
       </Card>
-      <div className="min-w-0 lg:col-span-2">
+      <div className="flex min-w-0 flex-col gap-6 lg:col-span-2">
+        {area === "console" ? <ReferenceHistory orderId={order.publicId} /> : null}
         <DataTable
           caption="Items"
           showCaption
@@ -229,7 +331,9 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
       toast.show({ tone: "success", title: "Note added" });
       await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
     } catch (err) {
-      setError(errorMessage(err));
+      const message = errorMessage(err);
+      setError(message.startsWith("Some items are still needed") ? `${message} See “Needed before the next step” on this page.` : message);
+      await queryClient.invalidateQueries({ queryKey: trpc.orders.requirements.forOrder.queryKey({ orderId: order.publicId }) });
     }
   };
   return (

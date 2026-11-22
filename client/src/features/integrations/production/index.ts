@@ -35,11 +35,11 @@ export const productionAdminNav: readonly NavItem[] = [
 
 export const productionOrderTabs: readonly OrderTab[] = [
   {
-    key: "production",
-    label: "Production",
+    key: "automation",
+    label: "Automation",
     component: OrderProductionTab,
     access: "staff",
-    order: 30,
+    order: 50,
   },
 ];
 

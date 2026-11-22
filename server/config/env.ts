@@ -60,6 +60,10 @@ export const ENV_VARIABLES: readonly EnvVariable[] = [
   { name: "RP_AUDIT_CHAIN_KEY", secret: true, required: true, description: "Base64 32-byte audit tamper-evidence chain key" },
   { name: "RP_LOG_LEVEL", secret: false, required: false, description: "debug | info | warn | error (default info)" },
   { name: "RP_MIGRATIONS_DIR", secret: false, required: false, description: "Directory holding the release's Drizzle migrations (default ./migrations)" },
+  { name: "RP_FFMPEG_PATH", secret: false, required: false, description: "Absolute path to the operator-managed FFmpeg executable (default /usr/bin/ffmpeg)" },
+  { name: "PROTECTION_MMDB_PATH", secret: false, required: false, description: "Absolute path to an optional local IP-to-country MMDB file; no network lookup" },
+  { name: "PROTECTION_DISABLED", secret: false, required: false, description: "0 (default) or 1 (emergency application Protection bypass; does not bypass authorization)" },
+  { name: "PROTECTION_COUNTRY_HEADER", secret: false, required: false, description: "Optional x-readypackets-country header supplied and overwritten by an explicitly trusted custom direct proxy" },
   // Read and validated by the owning module (documented here so the doctor recognizes them).
   { name: "RP_BACKUP_KEY", secret: true, required: false, consumer: "backup", description: "Backup encryption keyring JSON or 32-byte key; prefer RP_BACKUP_KEY_FILE (0600)" },
   { name: "RP_BACKUP_KEY_ID", secret: false, required: false, consumer: "backup", description: "Key id used for new backup archives" },
@@ -133,6 +137,12 @@ export function isNumericIpOrCidr(value: string): boolean {
 
 const proxySchema = z.string().max(64).refine(isNumericIpOrCidr, "must be an exact numeric IP address or CIDR");
 
+const absoluteFilePath = z.string().max(1024).refine(
+  (path) => isAbsolute(path) && !path.endsWith("/") &&
+    [...path].every((character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127),
+  "must be an absolute file path without control characters",
+);
+
 const configSchema = z.object({
   nodeEnv: z.enum(["production", "development", "test"]),
   deploymentProfile: z.enum(DEPLOYMENT_PROFILES),
@@ -162,6 +172,10 @@ const configSchema = z.object({
   auditChainKey: base64Key32,
   logLevel: z.enum(["debug", "info", "warn", "error"]),
   migrationsDir: z.string().min(1).max(1024),
+  ffmpegPath: absoluteFilePath,
+  protectionMmdbPath: absoluteFilePath.optional(),
+  protectionDisabled: z.enum(["0", "1"]).transform((value) => value === "1"),
+  protectionCountryHeader: z.literal("x-readypackets-country").optional(),
 });
 
 export type AppConfig = Readonly<z.infer<typeof configSchema>> & {
@@ -199,6 +213,10 @@ const FIELD_TO_VARIABLE: Record<string, string> = {
   auditChainKey: "RP_AUDIT_CHAIN_KEY",
   logLevel: "RP_LOG_LEVEL",
   migrationsDir: "RP_MIGRATIONS_DIR",
+  ffmpegPath: "RP_FFMPEG_PATH",
+  protectionMmdbPath: "PROTECTION_MMDB_PATH",
+  protectionDisabled: "PROTECTION_DISABLED",
+  protectionCountryHeader: "PROTECTION_COUNTRY_HEADER",
 };
 
 export interface ConfigProblem {
@@ -326,6 +344,10 @@ function evaluate(env: Env, options: LoadOptions): Evaluation {
     auditChainKey: secrets.RP_AUDIT_CHAIN_KEY,
     logLevel: env.RP_LOG_LEVEL ?? "info",
     migrationsDir: env.RP_MIGRATIONS_DIR ?? "migrations",
+    ffmpegPath: env.RP_FFMPEG_PATH || "/usr/bin/ffmpeg",
+    protectionMmdbPath: env.PROTECTION_MMDB_PATH || undefined,
+    protectionDisabled: env.PROTECTION_DISABLED || "0",
+    protectionCountryHeader: env.PROTECTION_COUNTRY_HEADER || undefined,
   };
 
   // Placeholder screening on raw secret text (before schema checks, which would not explain why).

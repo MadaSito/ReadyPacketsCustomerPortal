@@ -30,6 +30,7 @@ import {
   type StorageModule,
   type StorageProviderKind,
 } from "../storage/contracts.js";
+import { recordCopyAttempt } from "../storage/copyLogWriter.js";
 
 export type OffsiteConnectionReadiness = "ready" | "untested" | "failed" | "missing_credentials";
 import { assertBackupActorInTx, assertBackupPrincipalPrecheck } from "./actorGuard.js";
@@ -664,7 +665,7 @@ export async function updateOffsiteBackupConfig(
 }
 
 async function stageCopiesInTx(
-  deps: Pick<ModuleDeps, "clock" | "jobs">,
+  deps: Pick<ModuleDeps, "clock" | "jobs" | "audit">,
   tx: Tx,
   archive: Pick<
     BackupArchiveRow,
@@ -716,6 +717,20 @@ async function stageCopiesInTx(
         { idempotencyKey, correlationId: options.correlationId },
         tx,
       );
+      await recordCopyAttempt(
+        deps,
+        {
+          kind: "backup_archive",
+          sourcePublicId: archive.publicId,
+          connectionPublicId: dest.connectionPublicId,
+          jobPublicId: enqueued.jobId,
+          attempt: 1,
+          correlationId: options.correlationId,
+          bytes: archive.encryptedSizeBytes,
+          phase: "queued",
+        },
+        tx,
+      );
       await tx
         .update(backupRemoteCopies)
         .set({
@@ -749,6 +764,20 @@ async function stageCopiesInTx(
         connectionPublicId: dest.connectionPublicId,
       } satisfies RemoteCopyJobPayload,
       { idempotencyKey, correlationId: options.correlationId },
+      tx,
+    );
+    await recordCopyAttempt(
+      deps,
+      {
+        kind: "backup_archive",
+        sourcePublicId: archive.publicId,
+        connectionPublicId: dest.connectionPublicId,
+        jobPublicId: enqueued.jobId,
+        attempt: 1,
+        correlationId: options.correlationId,
+        bytes: archive.encryptedSizeBytes,
+        phase: "queued",
+      },
       tx,
     );
     await tx.insert(backupRemoteCopies).values({
@@ -788,7 +817,7 @@ async function stageCopiesInTx(
  * No-op in standalone `run-backup.js` CLI (`storageConnections` absent), where the worker sweep picks up verified rows.
  */
 export async function maybeStageAutomaticOffsiteCopies(
-  deps: Pick<ModuleDeps, "db" | "clock" | "settings" | "jobs" | "services" | "logger">,
+  deps: Pick<ModuleDeps, "db" | "clock" | "settings" | "jobs" | "audit" | "services" | "logger">,
   backupPublicId: string,
   correlationId: string,
 ): Promise<void> {
@@ -820,14 +849,71 @@ export async function maybeStageAutomaticOffsiteCopies(
   });
 }
 
+export async function mayRetryBackupOffsiteCopy(
+  deps: Pick<ModuleDeps, "settings" | "services">,
+  input: { backupPublicId: string; connectionPublicId: string; jobPublicId: string },
+  tx: Tx,
+): Promise<boolean> {
+  if (!getStorageModule(deps)) return false;
+  const policy = await readSetting(deps.settings, BACKUP_OFFSITE_POLICY, tx);
+  const activeEnabled = await listActiveEnabledDestinations(deps, policy, tx);
+  if (!activeEnabled.some((d) => d.connectionPublicId === input.connectionPublicId)) {
+    return false;
+  }
+
+  const [archive] = await tx
+    .select({
+      id: backupArchives.id,
+      state: backupArchives.state,
+      verificationStatus: backupArchives.verificationStatus,
+      purgedAt: backupArchives.purgedAt,
+      storageKey: backupArchives.storageKey,
+      archiveSha256: backupArchives.archiveSha256,
+      encryptedSizeBytes: backupArchives.encryptedSizeBytes,
+    })
+    .from(backupArchives)
+    .where(eq(backupArchives.publicId, input.backupPublicId))
+    .limit(1);
+  if (
+    !archive ||
+    archive.state !== "completed" ||
+    archive.verificationStatus !== "verified" ||
+    archive.purgedAt !== null ||
+    !archive.storageKey ||
+    !archive.archiveSha256 ||
+    archive.encryptedSizeBytes === null
+  ) {
+    return false;
+  }
+
+  const [copyRow] = await tx
+    .select({
+      state: backupRemoteCopies.state,
+      jobPublicId: backupRemoteCopies.jobPublicId,
+    })
+    .from(backupRemoteCopies)
+    .where(
+      and(
+        eq(backupRemoteCopies.backupId, archive.id),
+        eq(backupRemoteCopies.connectionPublicId, input.connectionPublicId),
+      ),
+    )
+    .limit(1);
+
+  return Boolean(copyRow && copyRow.state === "failed" && copyRow.jobPublicId === input.jobPublicId);
+}
+
 export async function copyBackupOffsiteNow(
   deps: Pick<ModuleDeps, "db" | "clock" | "settings" | "jobs" | "audit" | "services">,
   isMaintenanceDraining: () => Promise<boolean>,
   principal: SessionPrincipal,
-  input: { backupPublicId: string; connectionPublicId?: string },
+  input: { backupPublicId: string; connectionPublicId?: string; expectedFailedJobId?: string },
 ): Promise<{ queued: BackupRemoteCopySummary[] }> {
   const now = deps.clock.now();
   assertBackupPrincipalPrecheck(principal, "backup.run", now);
+  if (input.expectedFailedJobId !== undefined && !input.connectionPublicId) {
+    throw validation("CONNECTION_REQUIRED", "A specific destination is required when retrying a failed copy attempt.");
+  }
   if (await isMaintenanceDraining()) {
     throw new DomainError(
       "MAINTENANCE",
@@ -892,7 +978,7 @@ export async function copyBackupOffsiteNow(
 
     if (input.connectionPublicId) {
       const [existing] = await tx
-        .select({ state: backupRemoteCopies.state })
+        .select({ state: backupRemoteCopies.state, jobPublicId: backupRemoteCopies.jobPublicId })
         .from(backupRemoteCopies)
         .where(
           and(
@@ -900,12 +986,21 @@ export async function copyBackupOffsiteNow(
             eq(backupRemoteCopies.connectionPublicId, input.connectionPublicId),
           ),
         )
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (existing?.state === "completed") {
         throw conflict(
           "REMOTE_COPY_ALREADY_COMPLETED",
           "This verified backup has already been copied and digest-verified at that destination.",
         );
+      }
+      if (input.expectedFailedJobId !== undefined) {
+        if (!existing || existing.state !== "failed" || existing.jobPublicId !== input.expectedFailedJobId) {
+          throw conflict(
+            "COPY_RETRY_STALE",
+            "That failed copy attempt is no longer the latest retryable state for this destination.",
+          );
+        }
       }
     }
 
@@ -974,8 +1069,43 @@ export async function executeRemoteCopyJob(
         .where(eq(backupRemoteCopies.publicId, payload.remoteCopyPublicId))
         .limit(1)
         .for("update");
-      if (!copyRow) return { status: "missing" as const };
-      if (copyRow.state === "completed") return { status: "already_completed" as const, size: copyRow.verifiedBytes ?? 0 };
+      if (!copyRow) {
+        await recordCopyAttempt(
+          deps,
+          {
+            kind: "backup_archive",
+            sourcePublicId: payload.backupPublicId,
+            connectionPublicId: payload.connectionPublicId,
+            jobPublicId: job.jobId,
+            attempt: job.attempt,
+            correlationId: job.correlationId,
+            phase: "finished",
+            result: "not_written",
+            errorCode: "REMOTE_COPY_MISSING",
+          },
+          tx,
+        );
+        return { status: "missing" as const };
+      }
+      if (copyRow.state === "completed") {
+        await recordCopyAttempt(
+          deps,
+          {
+            kind: "backup_archive",
+            sourcePublicId: payload.backupPublicId,
+            connectionPublicId: copyRow.connectionPublicId,
+            jobPublicId: job.jobId,
+            attempt: job.attempt,
+            correlationId: job.correlationId,
+            bytes: copyRow.verifiedBytes,
+            phase: "finished",
+            result: "not_written",
+            errorCode: "ALREADY_COMPLETED",
+          },
+          tx,
+        );
+        return { status: "already_completed" as const, size: copyRow.verifiedBytes ?? 0 };
+      }
 
       const [archive] = await tx
         .select()
@@ -1014,6 +1144,23 @@ export async function executeRemoteCopyJob(
             correlationId: job.correlationId,
             attributes: { connection_public_id: copyRow.connectionPublicId },
             safeCounts: { attempt_count: attemptNumber },
+          },
+          tx,
+        );
+        await recordCopyAttempt(
+          deps,
+          {
+            kind: "backup_archive",
+            sourcePublicId: archivePublicId,
+            connectionPublicId: copyRow.connectionPublicId,
+            jobPublicId: job.jobId,
+            attempt: job.attempt,
+            correlationId: job.correlationId,
+            bytes: archive?.encryptedSizeBytes ?? null,
+            phase: "finished",
+            result: "not_written",
+            errorCode: "DESTINATION_NOT_ACTIVE",
+            alreadyAudited: true,
           },
           tx,
         );
@@ -1057,6 +1204,23 @@ export async function executeRemoteCopyJob(
           },
           tx,
         );
+        await recordCopyAttempt(
+          deps,
+          {
+            kind: "backup_archive",
+            sourcePublicId: archivePublicId,
+            connectionPublicId: copyRow.connectionPublicId,
+            jobPublicId: job.jobId,
+            attempt: job.attempt,
+            correlationId: job.correlationId,
+            bytes: archive?.encryptedSizeBytes ?? null,
+            phase: "finished",
+            result: "not_written",
+            errorCode: reason,
+            alreadyAudited: true,
+          },
+          tx,
+        );
         return { status: "unverified" as const, reason };
       }
 
@@ -1080,6 +1244,20 @@ export async function executeRemoteCopyJob(
           updatedAt: startedAt,
         })
         .where(eq(backupRemoteCopies.id, copyRow.id));
+      await recordCopyAttempt(
+        deps,
+        {
+          kind: "backup_archive",
+          sourcePublicId: archivePublicId,
+          connectionPublicId: copyRow.connectionPublicId,
+          jobPublicId: job.jobId,
+          attempt: job.attempt,
+          correlationId: job.correlationId,
+          bytes: expectedSize,
+          phase: "started",
+        },
+        tx,
+      );
 
       return { status: "ready" as const };
     });
@@ -1202,6 +1380,36 @@ export async function executeRemoteCopyJob(
         },
         tx,
       );
+      await recordCopyAttempt(
+        deps,
+        digestVerified
+          ? {
+              kind: "backup_archive",
+              sourcePublicId: archivePublicId,
+              connectionPublicId: payload.connectionPublicId,
+              jobPublicId: job.jobId,
+              attempt: job.attempt,
+              correlationId: job.correlationId,
+              bytes: putResult.size,
+              phase: "finished",
+              result: "verified",
+              verification: "checksum",
+              alreadyAudited: true,
+            }
+          : {
+              kind: "backup_archive",
+              sourcePublicId: archivePublicId,
+              connectionPublicId: payload.connectionPublicId,
+              jobPublicId: job.jobId,
+              attempt: job.attempt,
+              correlationId: job.correlationId,
+              bytes: putResult.size,
+              phase: "finished",
+              result: "written",
+              alreadyAudited: true,
+            },
+        tx,
+      );
     });
 
     await evaluateAndRecordPolicyTransition(deps, job.correlationId);
@@ -1243,6 +1451,23 @@ export async function executeRemoteCopyJob(
               correlationId: job.correlationId,
               attributes: { connection_public_id: payload.connectionPublicId },
               safeCounts: { attempt_count: attemptNumber },
+            },
+            tx,
+          );
+          await recordCopyAttempt(
+            deps,
+            {
+              kind: "backup_archive",
+              sourcePublicId: archivePublicId,
+              connectionPublicId: payload.connectionPublicId,
+              jobPublicId: job.jobId,
+              attempt: job.attempt,
+              correlationId: job.correlationId,
+              bytes: expectedSize > 0 ? expectedSize : null,
+              phase: "finished",
+              result: "failed",
+              errorCode: reasonCode,
+              alreadyAudited: true,
             },
             tx,
           );

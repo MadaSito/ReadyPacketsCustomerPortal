@@ -11,7 +11,16 @@
   - Per-automation hourly and global per-minute rate limits (`rate_limited`), retry with backoff on `retrySafe: true` transient failures, and `beforeSend` lease-fenced `webhook.call` via `integrations.egress.fetchPinned` (`unknown` / `partial_unknown` on post-`beforeSend` transport failure or lost lease — never dispatched twice).
 - **API (`router.ts`, `authz.ts`)**: Mounted at `appRouter.automations` behind `automations.read` and `automations.manage` (step-up + in-transaction `users` `FOR UPDATE` + `identity.sessions.assertCurrent` re-validation).
 
+## Increment 04 Part B — Package T2 (Workflow Stage Actions Server, B4)
+- **Additive Schema (`schema.ts` + `migrations/0004_increment_04_part_b.sql`)**: Added nullable `order_public_id` (`char(26)`), `stage_step_key` (`varchar(48)`), `triggered_by_user_id` (`bigint unsigned`), and `automation_runs_order_queued_idx` `(order_public_id, queued_at, id)` on `automation_runs`.
+- **Stage Action Binding & Execution (`contracts.ts`, `authz.ts`, `service.ts`, `router.ts`)**:
+  - `automations.orderStageActions.{get, listRuns, runForOrder}` guarded by `staffProcedure.use(requireCapability("orders.automations.run"))` plus service-level `assertAutomationsCapabilityPreflight` and in-transaction `assertAutomationsActorInTx`.
+  - Lists every step of the order's pinned workflow version with enabled event automations bound to that step (`order.created` on `initial`; `order.status_changed` whose `to_status` condition targets that step).
+  - Enforces engine-enabled readiness (`NOT_CONFIGURED` / `AUTOMATIONS_DISABLED` with clear reason), per-run SHA-256 idempotency (`stage:<sha256>`), existing global and per-automation rate limits, order + actor tagging on `automation_runs`, and durable `order.stage_actions.run` audit event (`resource: { type: "order", publicId }`, `orderPublicId`, `attributes: { order_public_id, step_key }`).
+  - Defense-in-depth `ACTION_PROHIBITED` check in `handleExecuteRunJob` guarantees stage-action runs cannot change order status or permissions even if persisted step rows are tampered at rest.
+
 ## Scoped Checks Executed
-- `scripts/dev/tc.sh 'server/modules/automations|server/modules/engagement|server/container|server/trpc/root|client/src/features/automations'` — 0 errors
-- `scripts/dev/lint.sh server/modules/automations server/modules/engagement` — 0 errors, 0 warnings
-- `scripts/dev/test.sh server/modules/automations/automations.test.ts server/modules/engagement/engagement.test.ts` — 21/21 real-MySQL tests passed
+- `scripts/dev/tc.sh` (unfiltered workspace typecheck) — 0 errors in `server/modules/automations/**` and `client/src/features/engagement/**`
+- `scripts/dev/lint.sh server/modules/automations client/src/features/engagement/routes.tsx` — 0 errors, 0 warnings
+- `scripts/dev/test.sh server/modules/automations/automations.test.ts` — 12/12 real-MySQL tests passed
+- `scripts/dev/test.sh client/src/features/engagement/engagement.test.tsx` — 7/7 jsdom + axe tests passed

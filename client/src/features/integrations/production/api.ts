@@ -1,7 +1,6 @@
 /**
  * Typed tRPC proxy bridge for `trpc.integrations.production.*`.
- * Keeps `client/src/features/integrations/production/**` strictly typed both before and after
- * the server router mount lands in `server/modules/integrations/router.ts`.
+ * Keeps `client/src/features/integrations/production/**` strictly typed against the Part B T1 server surface.
  */
 import type { UseMutationOptions, UseQueryOptions } from "@tanstack/react-query";
 import { useTRPC, useTRPCClient } from "@/lib/trpc";
@@ -33,6 +32,14 @@ interface MutationProcedure<TInput, TOutput> {
   ) => UseMutationOptions<TOutput, unknown, TInput>;
 }
 
+export interface ProductionRedeliverInput {
+  orderPublicId: string;
+  dispatchPublicId: string;
+  reason: string;
+  confirmation: string;
+  idempotencyKey: string;
+}
+
 export interface ProductionTRPCProxy {
   pathKey: () => readonly unknown[];
   settings: {
@@ -54,6 +61,13 @@ export interface ProductionTRPCProxy {
       { orderPublicId: string; phase1ArtifactsConfirmed: boolean },
       ProductionDispatchItem
     >;
+    requestP301: MutationProcedure<{ orderPublicId: string }, ProductionDispatchItem>;
+    requestP401: MutationProcedure<{ orderPublicId: string }, ProductionDispatchItem>;
+    retry: MutationProcedure<
+      { orderPublicId: string; dispatchPublicId: string },
+      ProductionDispatchItem
+    >;
+    redeliver: MutationProcedure<ProductionRedeliverInput, ProductionDispatchItem>;
     resend: MutationProcedure<
       {
         orderPublicId: string;
@@ -93,6 +107,21 @@ export interface ProductionTRPCClient {
         orderPublicId: string;
         phase1ArtifactsConfirmed: boolean;
       }) => Promise<ProductionDispatchItem>;
+    };
+    requestP301: {
+      mutate: (input: { orderPublicId: string }) => Promise<ProductionDispatchItem>;
+    };
+    requestP401: {
+      mutate: (input: { orderPublicId: string }) => Promise<ProductionDispatchItem>;
+    };
+    retry: {
+      mutate: (input: {
+        orderPublicId: string;
+        dispatchPublicId: string;
+      }) => Promise<ProductionDispatchItem>;
+    };
+    redeliver: {
+      mutate: (input: ProductionRedeliverInput) => Promise<ProductionDispatchItem>;
     };
     resend: {
       mutate: (input: {

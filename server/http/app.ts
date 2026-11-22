@@ -24,6 +24,9 @@ import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
+import { createInboundWebhooksHttpRouter } from "../modules/integrations/webhooks/http.js";
+import { createPaymentReturnHttpRouter, createPaymentWebhooksHttpRouter } from "../modules/payments/http.js";
+import { createPublicApiHttpRouter } from "../modules/publicApi/http.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
   issueAnonymousCsrfToken, matchesSessionCsrfToken, secureEqual,
@@ -33,8 +36,9 @@ import { rateLimitAddress } from "../security/rateLimitAddress.js";
 import { createTrpcContext } from "../trpc/context.js";
 import { appRouter } from "../trpc/root.js";
 import { API_PATH, SIGNED_WEBHOOK_PATH, TRPC_PATH, acceptsLocalProbe, clientAddress, isNavigation, providerCallbackRoute, requestHost, routeTemplate } from "./edge.js";
-import { createEdgeAdmission } from "./edgeAdmission.js";
+import { createEdgeAdmission, edgeAdmissionBucket, type RateLimitBucket } from "./edgeAdmission.js";
 import { sendSafeError, trpcRetryAfter } from "./errors.js";
+import { createIsolatedHttpRouter, isolatedRoutePrefix, type IsolatedRouterFactories } from "./isolatedRoutes.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
 import { getHttpState, setHttpState } from "./requestState.js";
@@ -50,6 +54,7 @@ export interface AppOptions {
   trpcRouter?: AnyTRPCRouter;
   moduleRouter?: Router;
   signedWebhookRouter?: Router;
+  isolatedRouters?: IsolatedRouterFactories;
 }
 
 const JSON_LIMIT_BYTES = 256 * 1024;
@@ -93,22 +98,20 @@ function batchSizeForError(req: Request): number | undefined {
   return count > 0 && count <= MAX_BATCH_SIZE ? count : undefined;
 }
 
-function tRpcBudget(router: AnyTRPCRouter, calls: readonly string[]): RateLimitCategory {
+function tRpcProcedureBudget(router: AnyTRPCRouter, path: string): RateLimitCategory {
   const procedures: Record<string, AnyTRPCProcedure> = router._def.procedures;
+  const meta = Object.hasOwn(procedures, path) ? procedures[path]?._def.meta : undefined;
+  return meta && typeof meta === "object" && "rateLimit" in meta && typeof meta.rateLimit === "string" &&
+    Object.hasOwn(CATEGORY_PRIORITY, meta.rateLimit) ? meta.rateLimit as RateLimitCategory : "api";
+}
+
+function tRpcBudget(router: AnyTRPCRouter, calls: readonly string[]): RateLimitCategory {
   let strictest: RateLimitCategory = "api";
   for (const path of calls) {
-    const meta = Object.hasOwn(procedures, path) ? procedures[path]?._def.meta : undefined;
-    if (!meta || typeof meta !== "object" || !("rateLimit" in meta) || typeof meta.rateLimit !== "string" ||
-        !Object.hasOwn(CATEGORY_PRIORITY, meta.rateLimit)) continue;
-    const category = meta.rateLimit as RateLimitCategory;
+    const category = tRpcProcedureBudget(router, path);
     if (CATEGORY_PRIORITY[category] > CATEGORY_PRIORITY[strictest]) strictest = category;
   }
   return strictest;
-}
-
-async function applyRateLimit(services: Services, category: RateLimitCategory, key: string, cost = 1): Promise<void> {
-  const verdict = await services.rateLimiter.consume(category, key, cost);
-  if (!verdict.allowed) throw rateLimited(verdict.retryAfterSeconds);
 }
 
 function rateLimited(retryAfterSeconds: number): DomainError {
@@ -122,7 +125,16 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   if (options.staticDir) assertSeparateStorage(options.staticDir, config.storageDir);
   const anonymousKey = Buffer.from(config.tokenHashKey, "base64");
   const admission = createEdgeAdmission(anonymousKey);
+  const limitedRequests = new WeakMap<Request, RateLimitBucket>();
+  const admissionBucket = (req: Request) => options.staticDir ? edgeAdmissionBucket(req.method, req.path) : "edge_requests";
   const currentAddress = () => rateLimitAddress(getRequestContext()?.ipAddress);
+  async function applyRateLimit(req: Request, category: RateLimitCategory, key: string, cost = 1): Promise<void> {
+    const verdict = await services.rateLimiter.consume(category, key, cost);
+    if (!verdict.allowed) {
+      limitedRequests.set(req, category);
+      throw rateLimited(verdict.retryAfterSeconds);
+    }
+  }
   function noteDenial(kind: 1 | 2 | 4, event: Pick<AuditEventInput, "eventName" | "reasonCode" | "attributes">): void {
     if (admission.shouldNote(currentAddress(), services.clock.now().getTime(), kind)) {
       try {
@@ -169,12 +181,14 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     res.setHeader("X-Request-Id", context.requestId);
     runWithRequestContext(context, () => {
       res.once("close", () => runWithRequestContext(context, () => {
+        const status = res.writableFinished ? res.statusCode : 499;
+        const rateLimitBucket = limitedRequests.get(req) ?? (status === 429 ? "unclassified" : undefined);
         services.logger.info("http request", {
-          method, route,
-          status: res.writableFinished ? res.statusCode : 499,
+          method, route, status, ...(rateLimitBucket ? { rateLimitBucket } : {}),
           durationMs: Math.round(performance.now() - started),
           requestId: context.requestId, traceId: context.traceId, spanId: context.spanId,
         });
+        if (rateLimitBucket) void services.protection?.recordRateLimit(req, route, rateLimitBucket).catch(() => undefined);
       }));
       next();
     });
@@ -198,7 +212,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       throw validation("INVALID_REQUEST_TARGET", "The request target is invalid.");
     }
     // Path-pattern test only (no lookup): provider callbacks exist on the canonical host and nowhere else.
-    if (!canonicalHost && providerCallbackRoute(req.path)) throw notFound();
+    const isolated = isolatedRoutePrefix(req.path);
+    if ((!canonicalHost && (providerCallbackRoute(req.path) || isolated)) || (isolated && preview)) throw notFound();
     if (!accepted) {
       if (alias) {
         // Concatenate only an origin-form target to the known origin; never resolve a user-controlled URL.
@@ -217,8 +232,34 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   // No database, credential lookup or durable audit before this admission gate.
   app.use((req, _res, next) => {
     if (PROBE_PATHS.has(req.path) && (req.method === "GET" || req.method === "HEAD")) return next();
-    const retry = admission.consume(currentAddress(), services.clock.now().getTime());
-    if (retry > 0) throw rateLimited(retry);
+    const bucket = admissionBucket(req);
+    const retry = admission.consume(currentAddress(), services.clock.now().getTime(), bucket);
+    if (retry > 0) {
+      limitedRequests.set(req, bucket);
+      throw rateLimited(retry);
+    }
+    next();
+  });
+
+  app.use(async (req, _res, next) => {
+    const { protection } = services;
+    if (protection && (await protection.inspect(req)).action === "block") {
+      throw new DomainError("FORBIDDEN", "PROTECTION_BLOCKED", "This request was refused by the portal's protection policy.");
+    }
+    next();
+  });
+
+  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? {
+    publicApi: createPublicApiHttpRouter,
+    inboundWebhooks: createInboundWebhooksHttpRouter,
+    paymentWebhooks: createPaymentWebhooksHttpRouter,
+    paymentReturn: createPaymentReturnHttpRouter,
+  }, async (req, _res, next) => {
+    await applyRateLimit(req, "api", `ip:${currentAddress()}`);
+    next();
+  }));
+
+  app.use((req, _res, next) => {
     const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");
     if (!pathIn(SIGNED_WEBHOOK_PATH, req.path) && !preview?.usesExplicitCredentials &&
         (bootstrap || !SAFE_METHODS.has(req.method)) && !hasCanonicalOrigin(req, canonical.origin, bootstrap)) {
@@ -239,7 +280,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       if (req.method !== "POST") throw notFound();
       if (!req.is("application/json")) throw validation("UNSUPPORTED_WEBHOOK_CONTENT", "This endpoint accepts JSON.");
       const subject = `ip:${currentAddress()}`;
-      await applyRateLimit(services, "api", subject);
+      await applyRateLimit(req, "api", subject);
       next();
     }) satisfies RequestHandler,
     express.raw({ type: "application/json", limit: WEBHOOK_LIMIT, inflate: false }),
@@ -256,14 +297,15 @@ export function createApp(services: Services, options: AppOptions = {}): Express
         throw validation("INVALID_PROCEDURE_PATH", "The requested operation is not valid.");
       }
       if (calls.length > MAX_BATCH_SIZE) throw validation("BATCH_TOO_LARGE", "This batch includes too many operations.");
-      await applyRateLimit(services, tRpcBudget(router, calls), `edge:${subject}`, calls.length);
+      await applyRateLimit(req, tRpcBudget(router, calls), `edge:${subject}`, calls.length);
     } else if (API_PATH.test(req.path)) {
-      const category = pathIn("/api/files", req.path) || pathIn("/api/portable", req.path) || pathIn("/api/backup", req.path)
+      const category = pathIn("/api/files", req.path) || pathIn("/api/knowledge/attachments", req.path.toLowerCase()) ||
+          pathIn("/api/portable", req.path) || pathIn("/api/backup", req.path)
         ? "expensive" : pathIn("/api/identity", req.path) || pathIn("/api/assurance", req.path)
           ? "auth_high_risk" : "api";
-      await applyRateLimit(services, category, subject);
+      await applyRateLimit(req, category, subject);
     } else if (isNavigation(req) && !PROBE_PATHS.has(req.path)) {
-      await applyRateLimit(services, "standard_browsing", subject);
+      await applyRateLimit(req, "standard_browsing", subject);
     }
     next();
   });
@@ -316,11 +358,15 @@ export function createApp(services: Services, options: AppOptions = {}): Express
   app.use(TRPC_PATH, createExpressMiddleware({
     router,
     createContext: ({ req }) => createTrpcContext(services, req),
-    onError({ error, path }) {
+    onError({ error, path, req }) {
       const cause = error.cause;
       if (cause instanceof DomainError && cause.code === "RATE_LIMITED" && path &&
           Object.hasOwn(router._def.procedures, path)) {
-        noteDenial(4, { eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: path } });
+        const bucket = tRpcProcedureBudget(router, path);
+        const previous = limitedRequests.get(req);
+        if (!previous || (Object.hasOwn(CATEGORY_PRIORITY, previous) &&
+            CATEGORY_PRIORITY[bucket] > CATEGORY_PRIORITY[previous as RateLimitCategory])) limitedRequests.set(req, bucket);
+        noteDenial(4, { eventName: "http.rate_limited", reasonCode: "RATE_LIMITED", attributes: { procedure: path, rateLimitBucket: bucket } });
       }
     },
     maxBatchSize: MAX_BATCH_SIZE,

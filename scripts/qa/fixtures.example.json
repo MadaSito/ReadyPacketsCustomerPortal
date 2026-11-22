@@ -1,0 +1,17 @@
+{
+  "sessions": {
+    "customer": "customer.state.json",
+    "staff": "staff.state.json",
+    "admin": "admin.state.json"
+  },
+  "cases": {
+    "/account/sessions": [
+      {
+        "role": "customer",
+        "redirectsTo": "/account/security",
+        "title": "Account security · ReadyPackets",
+        "heading": "Account security"
+      }
+    ]
+  }
+}

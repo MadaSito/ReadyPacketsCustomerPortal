@@ -73,3 +73,14 @@ Evidence classes: **AT** = automated test (real MySQL where noted), **RV** = cod
 - Session revocation is not re-checked inside mutation transactions (role/status are).
 - Concurrency of verify vs. sealing is bounded to the sampled head (statement-level reads, not one snapshot).
 - UI: jsdom + axe tests only; no browser layout, screen-reader or 320–1920 px visual verification (NV).
+
+## Increment 04 Part B — S2 / T2 evidence
+
+| Requirement | Evidence |
+| --- | --- |
+| Order-scoped activity, indexed lookup, categories, customer/staff projections, scoped opaque cursor | `server/modules/audit/orderActivity.test.ts` (real MySQL), 15/15, including a cross-customer probe, cursor replay by another reader/view, customer file visibility, no staff name, IP or internal ids |
+| Status lane: transitions + renames, deterministic keyset merge at limits 1/2/3/50, customer generic rename, no internal notes | same file (`status lane …` tests) |
+| History tab UI, filter, paging, focus kept on the last page, axe light/dark (customer and console) | `client/src/features/audit/orderHistory.test.tsx`, 11/11 |
+| T2 panel: hidden without `orders.automations.run`/on FORBIDDEN, confirmed idempotent run, engine-off fails closed, focus return, axe light/dark incl. dialog | `client/src/features/automations/orderStageActions.test.tsx`, 11/11 |
+
+Not verified here: a real browser at 320 px and visual contrast (jsdom + axe only); the orders/identity ports in the server activity tests are fakes (real-HTTP isolation is in assurance's `tests/integration/isolation.test.ts`); migration 0004 applied only by /root's migration test.

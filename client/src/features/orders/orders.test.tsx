@@ -13,6 +13,7 @@ import OrdersListPage from "./pages/OrdersListPage";
 import OrdersPipelineWidget from "./OrdersPipelineWidget";
 import RecentOrdersWidget from "./RecentOrdersWidget";
 import { ordersFeature } from "./routes";
+import { pageA11y } from "@/test/a11y";
 import { newIdempotencyKey } from "./shared";
 
 /** Generic fake of the tRPC/TanStack proxy: every procedure path resolves through `handlers`. */
@@ -48,6 +49,15 @@ function proxy(path: string[]): unknown {
 vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
 vi.mock("@/app/registry", () => ({
+  FEATURES: [
+    {
+      routes: [],
+      orderBanners: [
+        { key: "gate", order: 0, area: "both", component: ({ orderId, area }: { orderId: string; area: string }) => <p>Gate banner for {orderId} in {area}</p> },
+        { key: "console_only", order: 1, area: "console", component: () => <p>Console only banner</p> },
+      ],
+    },
+  ],
   ORDER_TABS: [
     { key: "files", label: "Files", access: "customer", order: 30, component: ({ orderId, area }: { orderId: string; area: string }) => <p>Files tab for {orderId} in {area}</p> },
     { key: "invoices_admin", label: "Billing (staff)", access: "staff", order: 40, component: () => <p>staff only tab</p> },
@@ -355,7 +365,7 @@ describe("order detail host", () => {
     const { container } = renderDetail(`/orders/${ORDER_ID}`);
     expect(await screen.findByRole("heading", { level: 1, name: "Synthetic project" })).toBeInTheDocument();
     const tabs = screen.getByRole("tablist", { name: "Order sections" });
-    expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Overview", "Activity", "Sharing", "Files"]);
+    expect(within(tabs).getAllByRole("tab").map((t) => t.textContent)).toEqual(["Overview", "Files", "Notes", "Sharing"]);
     expect(screen.getAllByText("Synthetic item").length).toBeGreaterThan(0);
     await expectNoAxeViolations(container);
   });
@@ -454,7 +464,7 @@ describe("console", () => {
     await expectNoAxeViolations(dialog);
     await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    for (const action of ["Change lock", "Change reference", "Reassign to another customer"]) {
+    for (const action of ["Change lock", "Change reference", "Reassign customer"]) {
       await user.click(screen.getByRole("button", { name: action }));
       dialog = await screen.findByRole("dialog");
       await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
@@ -480,15 +490,15 @@ describe("console", () => {
       </Route>,
       { path: `/admin/orders/${ORDER_ID}` },
     );
-    expect(await screen.findByText("Order RP-2026-000001")).toBeInTheDocument();
+    expect(await screen.findByText(/^RP-2026-000001 · /)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Change reference" }));
     const dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText(/New reference/), "RP-QA-0001");
     await user.selectOptions(within(dialog).getByLabelText(/Reason/), "CORRECTION");
     await user.click(within(dialog).getByRole("button", { name: "Change reference" }));
     expect(await screen.findByText("Reference changed")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("Order RP-QA-0001")).toBeInTheDocument());
-    expect(screen.queryByText("Order RP-2026-000001")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/^RP-QA-0001 · /)).toBeInTheDocument());
+    expect(screen.queryByText(/^RP-2026-000001 · /)).not.toBeInTheDocument();
     expect(within(screen.getByRole("navigation", { name: /breadcrumb/i })).getByText("RP-QA-0001")).toBeInTheDocument();
     expect(screen.getAllByText("RP-QA-0001").length).toBeGreaterThanOrEqual(2); // breadcrumb + summary (subtitle asserted above)
     expect(calls.find((c) => c.path === "orders.admin.changeReference")?.input).toMatchObject({ orderId: ORDER_ID, expectedVersion: 3, newReference: "RP-QA-0001", reasonCode: "CORRECTION" });
@@ -498,6 +508,7 @@ describe("console", () => {
     session.role = "admin";
     handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions: [] }));
     handlers.set("orders.admin.referenceHistory", () => [{ reference: "RP-2026-000001", status: "active", reasonCode: "CREATED", assignedAt: now, retiredAt: null }]);
+    handlers.set("orders.admin.customerLookup", () => [{ publicId: "01JTESTUSER00000000000000B", name: "Synthetic Customer B", customerRef: null, emailMasked: "s***@example.test" }]);
     const user = userEvent.setup();
     const { container } = renderUi(
       <Route path="/admin/orders/:orderId">
@@ -508,10 +519,15 @@ describe("console", () => {
     await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
     expect(within(screen.getByRole("tablist")).getByRole("tab", { name: "Billing (staff)" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
-    await user.click(screen.getByRole("button", { name: "Reassign to another customer" }));
+    await user.click(screen.getByRole("button", { name: "Reassign customer" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeDisabled();
     await user.type(within(dialog).getByLabelText("Type RP-2026-000001 to confirm"), "RP-2026-000001");
+    // Still disabled until a new owner is picked from the customer search (no raw ID field).
+    expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Find new owner/), "Synthetic");
+    await user.click(await within(dialog).findByRole("radio", { name: /Synthetic Customer B/ }));
+    expect(within(dialog).getByText("s***@example.test")).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeEnabled();
     await expectNoAxeViolations(dialog);
   });
@@ -559,6 +575,8 @@ describe("console orders pipeline widget", () => {
     expect(screen.getByRole("link", { name: "All orders" })).toHaveAttribute("href", "/admin/orders");
     expect(screen.getByRole("link", { name: "1+ In review orders" })).toHaveAttribute("href", "/admin/orders?status=in_review");
     expect(screen.getByRole("link", { name: "0 Awaiting customer orders" })).toBeInTheDocument();
+    // WCAG 2.5.8: each count link keeps a target of at least 24x24 CSS px.
+    expect(screen.getByRole("link", { name: "0 Awaiting customer orders" })).toHaveClass("inline-flex", "min-h-6", "min-w-6");
     expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(1);
     expect(calls.filter((c) => c.path === "orders.admin.list")).toHaveLength(5);
     await expectNoAxeViolations(container);
@@ -705,4 +723,170 @@ describe("dashboard widget and helpers", () => {
     expect(a).toMatch(/^[A-Za-z0-9_-]{16,80}$/);
     expect(newIdempotencyKey()).not.toBe(a);
   });
+});
+
+describe("increment 04 part B — console order workspace (S1)", () => {
+  const consoleDetail = (over: Record<string, unknown> = {}) => ({
+    ...detail,
+    accessRole: "admin",
+    transitions: [],
+    console: { customer: { publicId: "01JTESTUSER00000000000000A", name: "Synthetic Customer", customerRef: null }, payment: { state: "paid", totalMinor: 2500, currency: "USD" } },
+    ...over,
+  });
+  const renderConsole = (path = `/admin/orders/${ORDER_ID}`) =>
+    renderUi(
+      <>
+        <Route path="/admin/orders/:orderId">
+          <AdminOrderDetailPage />
+        </Route>
+        <Route path="/admin/orders/:orderId/:tab">
+          <AdminOrderDetailPage />
+        </Route>
+      </>,
+      { path },
+    );
+  const setup = () => {
+    session.role = "admin";
+    let current = consoleDetail();
+    handlers.set("orders.admin.get", () => current);
+    handlers.set("orders.admin.referenceHistory", () => []);
+    handlers.set("orders.console.rename", (input) => {
+      const { name } = input as { name: string };
+      current = { ...current, projectName: name, version: current.version + 1 };
+      return { version: current.version, changed: true };
+    });
+  };
+
+  it("header shows reference · customer · placed date, status/lock/payment/total badges and the B1 action row in order", async () => {
+    setup();
+    renderConsole();
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    expect(screen.getByText(/^RP-2026-000001 · Synthetic Customer · placed /)).toBeInTheDocument();
+    expect(screen.getByText("Paid")).toBeInTheDocument();
+    expect(screen.getAllByText(/^Total/).length).toBeGreaterThan(0);
+    const group = screen.getByRole("group", { name: "Order actions" });
+    const names = Array.from(group.querySelectorAll("a, button")).map((el) => el.textContent?.trim());
+    expect(names.slice(0, 5)).toEqual(["Rename order", "Change reference", "Reassign customer", "Invoice", "Refund"]);
+    expect(within(group).getByRole("link", { name: "Invoice" })).toHaveAttribute("href", `/admin/orders/${ORDER_ID}/invoices`);
+    expect(within(group).getByRole("link", { name: "Refund" })).toHaveAttribute("href", `/admin/orders/${ORDER_ID}/refund`);
+  });
+
+  it("tabs follow the published order (built-in and contributed share one ordering); /activity opens Notes", async () => {
+    setup();
+    renderConsole(`/admin/orders/${ORDER_ID}/activity`);
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    const tabs = within(screen.getByRole("tablist", { name: "Order sections" })).getAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Overview", "Phases", "Files", "Billing (staff)", "Notes", "Sharing"]);
+    expect(screen.getByRole("tab", { name: "Notes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("href", `/admin/orders/${ORDER_ID}/files`);
+  });
+
+  it("renders contributed order banners between header and tabs, filtered by area", async () => {
+    setup();
+    renderConsole();
+    expect(await screen.findByText(`Gate banner for ${ORDER_ID} in console`)).toBeInTheDocument();
+    expect(screen.getByText("Console only banner")).toBeInTheDocument();
+    handlers.set("orders.get", () => detail);
+    session.role = "customer";
+  });
+
+  it("customer order page shows only customer/both banners, before the requirements checklist", async () => {
+    handlers.set("orders.get", () => detail);
+    handlers.set("orders.requirements.forOrder", () => ({
+      phases: [],
+      status: { key: "submitted", label: "Submitted", phaseKey: null },
+      uploads: [{ key: "brief", label: "Synthetic brief", hint: null, kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"], count: 0, met: false, canUpload: true }],
+      acknowledgements: [],
+      unmet: 1,
+      readOnly: false,
+      readOnlyReason: null,
+      canUnlock: false,
+      acceptancePending: true,
+    }));
+    renderUi(
+      <Route path="/orders/:orderId">
+        <OrderDetailPage />
+      </Route>,
+      { path: `/orders/${ORDER_ID}` },
+    );
+    expect(await screen.findByText(`Gate banner for ${ORDER_ID} in customer`)).toBeInTheDocument();
+    expect(screen.queryByText("Console only banner")).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Order actions" })).not.toBeInTheDocument();
+    // The blocking gate comes first, then the checklist it pauses.
+    const checklist = await screen.findByRole("heading", { name: "Needed before the next step (Submitted)" });
+    const banner = screen.getByText(`Gate banner for ${ORDER_ID} in customer`);
+    expect(banner.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("Rename order: keyboard opens the dialog, Escape returns focus to the button, saving keeps the reference", async () => {
+    setup();
+    const user = userEvent.setup();
+    renderConsole();
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    const button = screen.getByRole("button", { name: "Rename order" });
+    button.focus();
+    await user.keyboard("{Enter}");
+    let dialog = await screen.findByRole("dialog");
+    const field = within(dialog).getByLabelText(/Order name/);
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await expectNoAxeViolations(dialog);
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await waitFor(() => expect(document.activeElement).toBe(button));
+    expect(calls.some((c) => c.path === "orders.console.rename")).toBe(false);
+    expect(field).not.toBeInTheDocument();
+
+    await user.click(button);
+    dialog = await screen.findByRole("dialog");
+    const input = within(dialog).getByLabelText(/Order name/);
+    await user.clear(input);
+    await user.click(within(dialog).getByRole("button", { name: "Save name" }));
+    expect(await within(dialog).findByText("Enter a name for the order.")).toBeInTheDocument();
+    await user.type(input, "Renamed synthetic");
+    await user.click(within(dialog).getByRole("button", { name: "Save name" }));
+    expect(await screen.findByText("Order renamed")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "Renamed synthetic" })).toBeInTheDocument();
+    expect(screen.getByText(/^RP-2026-000001 · /)).toBeInTheDocument();
+    expect(calls.find((c) => c.path === "orders.console.rename")?.input).toEqual({ orderId: ORDER_ID, expectedVersion: 3, name: "Renamed synthetic" });
+  });
+
+  it("staff without admin see Rename but not the admin-only reference/reassign actions", async () => {
+    setup();
+    session.role = "staff";
+    renderConsole();
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    const group = screen.getByRole("group", { name: "Order actions" });
+    expect(within(group).getByRole("button", { name: "Rename order" })).toBeInTheDocument();
+    expect(within(group).queryByRole("button", { name: "Change reference" })).not.toBeInTheDocument();
+    expect(within(group).queryByRole("button", { name: "Reassign customer" })).not.toBeInTheDocument();
+  });
+});
+
+describe("console order workspace — page axe (light & dark)", () => {
+  const prepare = async (openDialog: boolean) => {
+    session.role = "admin";
+    handlers.set("orders.admin.get", () => ({
+      ...detail,
+      accessRole: "admin",
+      transitions: [],
+      console: { customer: { publicId: "01JTESTUSER00000000000000A", name: "Synthetic Customer", customerRef: null }, payment: { state: "unpaid", totalMinor: 2500, currency: "USD" } },
+    }));
+    handlers.set("orders.admin.referenceHistory", () => []);
+    document.title = "Synthetic project · Orders";
+    renderUi(
+      <main>
+        <Route path="/admin/orders/:orderId">
+          <AdminOrderDetailPage />
+        </Route>
+      </main>,
+      { path: `/admin/orders/${ORDER_ID}` },
+    );
+    await screen.findByRole("heading", { level: 1, name: "Synthetic project" });
+    if (openDialog) {
+      await userEvent.click(screen.getByRole("button", { name: "Rename order" }));
+      await screen.findByRole("dialog");
+    }
+  };
+  pageA11y("console order page", () => prepare(false));
+  pageA11y("console order page with Rename dialog open", () => prepare(true));
 });

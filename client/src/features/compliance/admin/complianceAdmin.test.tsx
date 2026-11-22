@@ -12,6 +12,7 @@ import InvoiceDetailPage from "./InvoiceDetailPage";
 import InvoicesAdminPage from "./InvoicesAdminPage";
 import PoliciesAdminPage from "./PoliciesAdminPage";
 import PolicyDetailPage from "./PolicyDetailPage";
+import { OrderInvoicesTab } from "../customer/InvoicePages";
 import { acceptanceCounts, blankField, draftsToFields, type FieldDraft, type PolicyAcceptance } from "./model";
 
 /** Generic fake of the tRPC/TanStack proxy: every procedure path resolves through `handlers`. */
@@ -321,6 +322,7 @@ describe("invoices", () => {
     orderReference: "RP-2026-000001",
     invoiceNumber: "INV-2026-0001",
     status: "issued",
+    paymentState: "partially_paid" as const,
     currency: "USD",
     subtotalMinor: 10000,
     discountMinor: 0,
@@ -359,6 +361,8 @@ describe("invoices", () => {
     const user = userEvent.setup();
     const { container } = renderUi(<InvoicesAdminPage />, { path: "/admin/invoices" });
     expect((await screen.findAllByRole("link", { name: "INV-2026-0001" }))[0]).toHaveAttribute("href", `/admin/invoices/${INV}`);
+    expect(screen.getByText(/Online payments and refunds are handled from the order's Refund tab and Payments settings\./)).toBeInTheDocument();
+    expect(screen.queryByText(/not available in this release/i)).not.toBeInTheDocument();
     expect(screen.getAllByText("$58.25")[0]).toBeInTheDocument();
     await expectNoAxeViolations(container);
     await user.selectOptions(screen.getAllByLabelText("Status")[0]!, "paid");
@@ -384,7 +388,7 @@ describe("invoices", () => {
     expect(callsTo("compliance.invoices.admin.createDraft")[0]?.input).toMatchObject({ orderPublicId: ORDER, currency: "USD", lines: [{ description: "Synthetic review", quantity: 2, unitAmountMinor: 12525 }], discountMinor: 0, taxMinor: 0 });
   });
 
-  it("shows detail, balance and the Stripe notice, and records a manual payment with typed confirmation and a stable idempotency key", async () => {
+  it("shows detail, balance and the order Refund tab link, and records a manual payment with typed confirmation and a stable idempotency key", async () => {
     handlers.set("compliance.invoices.get", () => detail);
     let attempts = 0;
     handlers.set("compliance.invoices.admin.recordManualPayment", () => {
@@ -395,7 +399,9 @@ describe("invoices", () => {
     const user = userEvent.setup();
     const { container } = pageByPath(`/admin/invoices/${INV}`, <InvoiceDetailPage />, "/admin/invoices/:invoiceId");
     expect(await screen.findByRole("heading", { level: 1, name: "Invoice INV-2026-0001" })).toBeInTheDocument();
-    expect(screen.getByText(/Not available in this release/)).toBeInTheDocument();
+    expect(screen.getByText("Payments and refunds")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "order's Refund tab" })).toHaveAttribute("href", `/admin/orders/${ORDER}/refund`);
+    expect(screen.queryByText(/not available in this release/i)).not.toBeInTheDocument();
     expect(screen.getAllByText("$58.25").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("button", { name: /Download PDF/ })[0]).toBeInTheDocument();
     await expectNoAxeViolations(container);
@@ -430,14 +436,23 @@ describe("invoices", () => {
     await user.type(within(dialog).getByLabelText(/^Amount/), "60");
     await user.selectOptions(within(dialog).getByLabelText(/^Reason/), "OVERPAYMENT");
     await user.type(within(dialog).getByLabelText(/^Reference/), "RF-1");
-    await user.type(within(dialog).getByLabelText(/to confirm/), "INV-2026-0001");
+    await user.type(within(dialog).getByLabelText(/to confirm/), "REFUND ORDER");
     await user.click(within(dialog).getByRole("button", { name: "Record refund" }));
     expect(await within(dialog).findByText(/from 0.01 to 50.00/)).toBeInTheDocument();
     expect(callsTo("compliance.invoices.admin.recordRefund")).toHaveLength(0);
     await user.clear(within(dialog).getByLabelText(/^Amount/));
     await user.type(within(dialog).getByLabelText(/^Amount/), "20");
     await user.click(within(dialog).getByRole("button", { name: "Record refund" }));
-    await waitFor(() => expect(callsTo("compliance.invoices.admin.recordRefund")[0]?.input).toMatchObject({ paymentPublicId: PAY, amountMinor: 2000, reasonCode: "OVERPAYMENT", reference: "RF-1", currency: "USD" }));
+    await waitFor(() =>
+      expect(callsTo("compliance.invoices.admin.recordRefund")[0]?.input).toMatchObject({
+        paymentPublicId: PAY,
+        amountMinor: 2000,
+        reasonCode: "OVERPAYMENT",
+        reference: "RF-1",
+        currency: "USD",
+        confirmationPhrase: "REFUND ORDER",
+      }),
+    );
     expect((callsTo("compliance.invoices.admin.recordRefund")[0]?.input as { idempotencyKey: string }).idempotencyKey.length).toBeGreaterThanOrEqual(8);
     await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
 
@@ -459,5 +474,57 @@ describe("invoices", () => {
     expect(screen.queryByRole("button", { name: "Record payment" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Void" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Refund payment/ })).not.toBeInTheDocument();
+  });
+
+  it("console OrderInvoicesTab offers New invoice for this order for staff with invoices.manage and links invoices to /admin/invoices/:id", async () => {
+    session.role = "staff";
+    handlers.set("compliance.invoices.listForOrder", () => ({
+      orderPublicId: ORDER,
+      orderReference: "RP-2026-000001",
+      lockState: "none",
+      onlinePaymentConfigured: false,
+      items: [],
+    }));
+    const emptyView = renderUi(
+      <>
+        <h1>Order RP-2026-000001</h1>
+        <OrderInvoicesTab orderId={ORDER} area="console" />
+      </>,
+    );
+    const emptyCreateLink = await screen.findByRole("link", { name: "New invoice for this order" });
+    expect(emptyCreateLink).toHaveAttribute("href", `/admin/invoices?order=${ORDER}`);
+    await expectNoAxeViolations(emptyView.container);
+    emptyView.unmount();
+
+    const draftSummary = {
+      ...summary,
+      invoicePublicId: "01JTEST0000000000000000099",
+      invoiceNumber: null,
+      status: "draft" as const,
+      issuedAt: null,
+    };
+    handlers.set("compliance.invoices.listForOrder", () => ({
+      orderPublicId: ORDER,
+      orderReference: "RP-2026-000001",
+      lockState: "none",
+      onlinePaymentConfigured: false,
+      items: [summary, draftSummary],
+    }));
+    const populatedView = renderUi(
+      <>
+        <h1>Order RP-2026-000001</h1>
+        <OrderInvoicesTab orderId={ORDER} area="console" />
+      </>,
+    );
+    expect(await screen.findByRole("link", { name: "INV-2026-0001" })).toHaveAttribute("href", `/admin/invoices/${INV}`);
+    expect(screen.getByRole("link", { name: "Draft invoice" })).toHaveAttribute("href", `/admin/invoices/${draftSummary.invoicePublicId}`);
+    expect(screen.getByRole("link", { name: "New invoice for this order" })).toHaveAttribute("href", `/admin/invoices?order=${ORDER}`);
+    await expectNoAxeViolations(populatedView.container);
+    populatedView.unmount();
+
+    session.role = "customer";
+    renderUi(<OrderInvoicesTab orderId={ORDER} area="console" />);
+    expect(await screen.findByRole("link", { name: "INV-2026-0001" })).toHaveAttribute("href", `/admin/invoices/${INV}`);
+    expect(screen.queryByRole("link", { name: "New invoice for this order" })).not.toBeInTheDocument();
   });
 });

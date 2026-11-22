@@ -1,10 +1,13 @@
 import { browserSupportsWebAuthn, startRegistration } from "@simplewebauthn/browser";
 import { useQuery } from "@tanstack/react-query";
 import { Fingerprint, KeyRound, Smartphone } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { Suspense, useState, type FormEvent, type ReactNode } from "react";
+import type { UserRole } from "@shared/domain";
+import { SECURITY_CARDS } from "@/app/registry";
 import { clearRecoveryBatch, stageRecoveryBatch } from "@/lib/recoveryBatch";
+import type { SecurityCard } from "@/lib/routes";
 import { RUNTIME } from "@/lib/runtime";
-import { useRefreshSession } from "@/lib/session";
+import { useRefreshSession, useSession } from "@/lib/session";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, CodeBlock, ConfirmDialog, DateTime, Dialog, EmptyState,
@@ -38,11 +41,32 @@ type Confirmation = { kind: "regenerate" | "disable_totp" } | { kind: "remove_pa
 
 const heading = <PageHeader title="Account security" description="Manage the methods you use to verify your identity when you sign in or make sensitive changes." />;
 
+const TWO_FACTOR_ORDER = 20;
+const roleRank = { customer: 0, staff: 1, admin: 2 } as const;
+
+/** The registry owns ordering. Contributors provide their own labelled regions. */
+export function SecurityCardSlot({ viewerRole, position, cards = SECURITY_CARDS }: {
+  viewerRole: UserRole | undefined;
+  position: "before" | "after";
+  cards?: readonly SecurityCard[];
+}) {
+  if (!viewerRole) return null;
+  return cards.filter(({ access, order }) => roleRank[viewerRole] >= roleRank[access] && (
+    position === "before" ? order < TWO_FACTOR_ORDER : order >= TWO_FACTOR_ORDER
+  )).map(({ key, component: Component }) => (
+    <Suspense key={key} fallback={<Spinner label="Loading security settings" />}>
+      <Component />
+    </Suspense>
+  ));
+}
+
 export default function SecurityPage() {
   const trpc = useTRPC();
   const api = useTRPCClient().assurance;
   const stepUp = useStepUp();
   const refreshSession = useRefreshSession();
+  const { me, view } = useSession();
+  const role = view.status === "full" ? me?.user.role : undefined;
   const state = useQuery(trpc.assurance.getState.queryOptions());
   const passkeys = useQuery(trpc.assurance.listPasskeys.queryOptions());
   const refresh = () => { void state.refetch(); void passkeys.refetch(); };
@@ -63,11 +87,13 @@ export default function SecurityPage() {
   };
   return <SecuritySettings state={state.data} passkeys={passkeys.data} actions={actions} stepUp={stepUp} refresh={refresh}
     onUnacknowledgedExit={() => { void refreshSession(); }}
-    passkeysSupported={!RUNTIME.preview && browserSupportsWebAuthn()} />;
+    passkeysSupported={!RUNTIME.preview && browserSupportsWebAuthn()}
+    beforeTwoFactor={<SecurityCardSlot viewerRole={role} position="before" />}
+    afterTwoFactor={<SecurityCardSlot viewerRole={role} position="after" />} />;
 }
 
 export function SecuritySettings({
-  state, passkeys, actions, stepUp, refresh, passkeysSupported, onUnacknowledgedExit,
+  state, passkeys, actions, stepUp, refresh, passkeysSupported, onUnacknowledgedExit, beforeTwoFactor, afterTwoFactor,
 }: {
   state: SecurityState;
   passkeys: Passkeys;
@@ -76,6 +102,8 @@ export function SecuritySettings({
   refresh: () => void;
   passkeysSupported: boolean;
   onUnacknowledgedExit: () => void;
+  beforeTwoFactor?: ReactNode;
+  afterTwoFactor?: ReactNode;
 }) {
   const [dialog, setDialog] = useState<ActiveDialog>(null);
   const [confirm, setConfirm] = useState<Confirmation>(null);
@@ -163,6 +191,7 @@ export function SecuritySettings({
       <div className="grid gap-4">
         {error && !dialog && !confirm ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
         {status ? <Callout tone="success" live="polite">{status}</Callout> : null}
+        {beforeTwoFactor}
         <Card as="section" title="Authenticator app" description="Use six-digit, time-based codes from your authenticator app."
           actions={<Badge tone={state.totpEnrolled ? "success" : "neutral"}>{state.totpEnrolled ? "Enabled" : "Not set up"}</Badge>}>
           <div className="flex flex-wrap gap-2">
@@ -207,6 +236,7 @@ export function SecuritySettings({
           </Button>
         </Card>
         {busy && !dialog && !confirm ? <Spinner label="Working on your security settings" /> : null}
+        {afterTwoFactor}
       </div>
       {confirm ? <ConfirmDialog open onOpenChange={(open) => !open && (setConfirm(null), setError(undefined))}
         destructive title={confirm.kind === "regenerate" ? "Replace your recovery codes?" : confirm.kind === "disable_totp" ? "Remove your authenticator app?" : "Remove this passkey?"}

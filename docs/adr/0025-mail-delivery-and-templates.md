@@ -9,8 +9,9 @@ audit copy, use Microsoft Graph, or edit the wording.
 ## Decision
 - Transports sit behind one interface: SMTP and Microsoft Graph (`sendMail`, application permission).
   The administrator chooses a primary and an optional secondary. The secondary is used only when the
-  primary definitely did not accept the message. An unknown outcome is never replayed and never fails
-  over (as before this change); it is shown for operator review, so delivery can never produce a duplicate.
+  primary definitely did not accept the message. An unknown outcome is never automatically retried or
+  failed over. While the encrypted payload is retained, an administrator with fresh verification may
+  explicitly acknowledge that the recipient may receive a duplicate and queue an audited new attempt.
 - One sender identity (from address, name, reply-to) applies to every transport.
 - An audit copy address can be set for all outgoing mail. Messages that carry single-use secrets (reset,
   activation, invitation, verification links) are copied with those values redacted.

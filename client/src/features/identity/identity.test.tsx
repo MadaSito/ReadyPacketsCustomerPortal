@@ -12,7 +12,6 @@ import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } f
 import AccountPage from "./pages/AccountPage";
 import CustomerDetailPage from "./pages/CustomerDetailPage";
 import CustomersPage from "./pages/CustomersPage";
-import SessionsPage from "./pages/SessionsPage";
 import StaffPage from "./pages/StaffPage";
 
 vi.mock("@/app/registry", () => ({
@@ -87,34 +86,10 @@ describe("Account pages", () => {
     await expectNoAxeViolations();
   });
 
-  it("validates the password form client-side before calling the server", async () => {
-    const { calls } = renderPage(<AccountPage />, { ...noSso }, { role: "customer" });
+  it("points to the Security page for password and sessions", async () => {
+    renderPage(<AccountPage />, { ...noSso }, { role: "customer" });
     await screen.findByRole("heading", { level: 1, name: "Your account" });
-    await userEvent.type(await screen.findByLabelText(/^Current password/), "old passphrase here");
-    await userEvent.type(screen.getByLabelText(/^New password/), "too short");
-    await userEvent.click(screen.getByRole("button", { name: "Change password" }));
-    expect(await screen.findByText(/^Use at least \d+ characters\.$/)).toBeInTheDocument();
-    expect(calls.filter((c) => c.path !== "identity.sso.myLink")).toHaveLength(0);
-    await expectNoAxeViolations();
-  });
-
-  it("lists sessions and signs out other sessions after confirmation", async () => {
-    const { calls } = renderPage(<SessionsPage />, {
-      "identity.sessions.list": () => ({
-        items: [
-          { sessionId: "01JD0000000000000000000101", current: true, createdAt: date, lastSeenAt: date, expiresAt: date, deviceSummary: "Firefox on Linux" },
-          { sessionId: "01JD0000000000000000000102", current: false, createdAt: date, lastSeenAt: date, expiresAt: date, deviceSummary: "Safari on iOS" },
-        ],
-      }),
-      "identity.sessions.revokeOthers": () => ({ revoked: 1 }),
-    }, { role: "customer" });
-    const table = await screen.findByRole("table", { name: "Your active sessions" });
-    expect(within(table).getByText("This device")).toBeInTheDocument();
-    expect(within(table).getByRole("button", { name: "Sign out Safari on iOS" })).toBeInTheDocument();
-    await expectNoAxeViolations();
-    await userEvent.click(screen.getByRole("button", { name: "Sign out all other sessions" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Sign out others" }));
-    await waitFor(() => expect(calls.some((c) => c.path === "identity.sessions.revokeOthers")).toBe(true));
+    expect(await screen.findByRole("link", { name: "Open security settings" })).toHaveAttribute("href", "/account/security");
   });
 });
 

@@ -1,13 +1,22 @@
-import { HardDrive, RefreshCw } from "lucide-react";
+import { HardDrive, HardDriveDownload, RefreshCw } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
+import { CopyLogPage } from "./CopyLogPage";
+import { OrderFileSyncTab, OrderFileSyncTabLabel } from "./OrderFileSyncTab";
 import { SharePointOrderSyncPage } from "./SharePointOrderSyncPage";
 import { StorageConnectionWizardPage } from "./StorageConnectionWizardPage";
 import { StorageConnectionsPage } from "./StorageConnectionsPage";
 
 const guard = { access: "admin", capability: "storage.manage" } as const;
+const copyGuard = { access: "admin", capability: "storage.copies.read" } as const;
 
 export const storageFeature: FeatureRoutes = {
   routes: [
+    {
+      ...copyGuard,
+      path: "/admin/storage/copies",
+      title: "Copy log",
+      component: CopyLogPage,
+    },
     {
       ...guard,
       path: "/admin/storage",
@@ -51,6 +60,25 @@ export const storageFeature: FeatureRoutes = {
       area: "console",
       group: "Integrations",
       order: 64,
+    },
+    {
+      ...copyGuard,
+      label: "Copy log",
+      href: "/admin/storage/copies",
+      icon: HardDriveDownload,
+      area: "console",
+      group: "Integrations",
+      order: 64.5,
+    },
+  ],
+  orderTabs: [
+    {
+      key: "sync",
+      label: "File sync",
+      labelComponent: OrderFileSyncTabLabel,
+      access: "staff",
+      order: 60,
+      component: OrderFileSyncTab,
     },
   ],
 };

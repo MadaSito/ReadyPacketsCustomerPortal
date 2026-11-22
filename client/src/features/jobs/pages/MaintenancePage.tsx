@@ -6,6 +6,7 @@ import {
   Badge, Button, Callout, Card, ConfirmDialog, ErrorState, KeyValueList, PageHeader,
   Skeleton, StepUpCancelledError, useStepUp,
 } from "@/ui";
+import { CustomerMaintenanceControls } from "./CustomerMaintenanceControls";
 
 export default function MaintenancePage() {
   const trpc = useTRPC();
@@ -35,7 +36,8 @@ export default function MaintenancePage() {
     }
   };
   return <>
-    <PageHeader title="Maintenance" description="Pause new worker claims and review what is still running." />
+    <PageHeader title="Maintenance" description="Manage customer access and background worker admission independently." />
+    <CustomerMaintenanceControls />
     {query.isError ? <ErrorState error={query.error} onRetry={() => void query.refetch()} /> : null}
     {query.isPending ? <Skeleton lines={5} /> : null}
     {message ? <Callout tone="success" live="polite">{message}</Callout> : null}

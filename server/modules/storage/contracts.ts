@@ -1,6 +1,8 @@
 import type { Readable } from "node:stream";
 import type { z } from "zod";
 import type { DbOrTx, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
+import type { CopyLogService } from "./copyLog.js";
+import type { OrderCopiesService } from "./orderCopies.js";
 
 export const STORAGE_PROVIDER_KINDS = ["s3", "azure_blob", "dropbox", "google_drive", "sharepoint", "onedrive"] as const;
 export type StorageProviderKind = (typeof STORAGE_PROVIDER_KINDS)[number];
@@ -22,6 +24,8 @@ export interface StoragePutInput {
 
 export interface StoragePutResult {
   remoteId: string;
+  /** Provider-observed path segments relative to the configured root, including the final file name. */
+  targetPath?: readonly string[];
   /** A byte count independently observed by the provider, not echoed from the request. */
   size: number;
   /** Provider-reported SHA-256 only; unset when unavailable. Never return ETAG, MD5 or a request echo here. */
@@ -48,6 +52,8 @@ export class StorageAdapterError extends Error {
 }
 
 export interface StorageAdapter {
+  /** When set, put validates the full target and creates any folders behind its own write fences. */
+  putCreatesFolders?: true;
   test(signal?: AbortSignal): Promise<StorageTestResult>;
   ensureFolder(path: readonly string[], signal?: AbortSignal, beforeWrite?: () => Promise<void>): Promise<void>;
   put(input: StoragePutInput): Promise<StoragePutResult>;
@@ -121,6 +127,8 @@ export interface StorageCopyInput extends StoragePutInput {
 }
 
 export interface StorageModule extends ModuleLifecycle {
+  copies: CopyLogService;
+  orderCopies: OrderCopiesService;
   registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
     kind: StorageProviderKind, definition: StorageAdapterDefinition<C, S>,
   ): void;
@@ -150,7 +158,7 @@ export interface StorageModule extends ModuleLifecycle {
   /** Worker-side: fail closed if disabled/unassigned; verify provider-reported size and digest. */
   copy(input: StorageCopyInput): Promise<StoragePutResult>;
   /** Called inside file publication; stages durable jobs for the active order-file assignments. */
-  stageOrderFile(filePublicId: string, tx: Tx): Promise<void>;
+  stageOrderFile(filePublicId: string, tx: Tx, metadata?: { orderPublicId: string }): Promise<void>;
   /** Automation-only bulk staging, bounded and constrained to the current order_files assignment. */
   stageOrderFilesForAutomation(input: {
     orderPublicId: string; filePublicId?: string; connectionPublicId?: string; correlationId: string; signal: AbortSignal;

@@ -252,6 +252,7 @@ const FORBIDDEN_CUSTOM_WEBHOOK_HEADERS = new Set([
   "cookie",
   "idempotency-key",
   "x-readypackets-delivery",
+  "x-readypackets-redelivery-of",
   "x-correlation-id",
 ]);
 
@@ -542,6 +543,36 @@ export const INTEGRATIONS_PRODUCTION_P201_URL = defineSecret({
     .refine(isValidProductionWebhookUrl, "P201 URL must be a valid HTTPS URL without embedded credentials."),
 });
 
+export const INTEGRATIONS_PRODUCTION_P301_URL = defineSecret({
+  key: "integrations.production.p301_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase III (P301) webhook destination URL",
+  description: "Optional encrypted HTTPS webhook destination URL for Phase III (P301) production dispatches.",
+  exportable: false,
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P301 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
+export const INTEGRATIONS_PRODUCTION_P401_URL = defineSecret({
+  key: "integrations.production.p401_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase IV (P401) webhook destination URL",
+  description: "Optional encrypted HTTPS webhook destination URL for Phase IV (P401) production dispatches.",
+  exportable: false,
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P401 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
 export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
   key: "integrations.production.auth_value",
   owner: "integrations",
@@ -550,6 +581,43 @@ export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
   description: "Encrypted shared secret or bearer value sent on P101/P201 requests when an auth header name is configured.",
   exportable: false,
   schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid authentication header characters."),
+});
+
+/* ----------------------------------------------------- Increment 04 Package I: Webhooks settings */
+
+export const webhooksConfigSettingSchema = z.strictObject({
+  /** Retention days for encrypted request/response payloads (0..90; 0 omits/purges bodies and disables replay). */
+  retentionDays: z.number().int().min(0).max(90),
+  /** Consecutive terminal failures before an outbound subscription transitions to `disabled_failing`. */
+  autoDisableThreshold: z.number().int().min(3).max(50),
+  /** Outbound HTTPS request timeout in milliseconds (1_000..30_000). */
+  deliveryTimeoutMs: z.number().int().min(1_000).max(30_000),
+});
+export type WebhooksConfigSetting = z.infer<typeof webhooksConfigSettingSchema>;
+
+export const DEFAULT_WEBHOOKS_CONFIG: WebhooksConfigSetting = {
+  retentionDays: 30,
+  autoDisableThreshold: 10,
+  deliveryTimeoutMs: 10_000,
+};
+
+export const INTEGRATIONS_WEBHOOKS_FLAG = defineFeatureFlag({
+  flag: "integrations.webhooks",
+  owner: "integrations",
+  group: "integrations",
+  label: "Outbound webhook subscriptions and inbound endpoints",
+  description: "Enable signed outbound webhook subscriptions and inbound automation webhook endpoints.",
+});
+
+export const INTEGRATIONS_WEBHOOKS_CONFIG = defineSetting({
+  key: "integrations.webhooks.config",
+  owner: "integrations",
+  group: "integrations",
+  label: "Webhooks delivery and retention policy",
+  description: "Retention period for redacted encrypted webhook bodies, auto-disable threshold, and request timeout.",
+  schema: webhooksConfigSettingSchema,
+  default: DEFAULT_WEBHOOKS_CONFIG,
+  sensitivity: "internal",
 });
 
 /**

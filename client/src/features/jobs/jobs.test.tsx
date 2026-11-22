@@ -6,8 +6,11 @@ import superjson from "superjson";
 import { describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
 import type { AppRouter } from "@server/trpc/root";
+import { RouteFocus } from "@/app/RouteFocus";
 import { TRPCProvider } from "@/lib/trpc";
+import { pageA11y } from "@/test/a11y";
 import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
+import { CustomerMaintenanceBanner } from "./CustomerMaintenanceBanner";
 import JobDetailPage from "./pages/JobDetailPage";
 import JobsPage from "./pages/JobsPage";
 import MailPage from "./pages/MailPage";
@@ -17,6 +20,8 @@ import SchedulesPage from "./pages/SchedulesPage";
 const jobId = "01JD0000000000000000000001";
 const mailId = "01JD0000000000000000000002";
 const date = new Date("2026-11-20T12:00:00.000Z");
+const customerOff = { enabled: false, message: "", startsAt: null, endsAt: null, active: false, phase: "off", version: 0 };
+const workerOpen = { active: false, running: 0, unresolved: 0, state: "open" };
 
 function renderConsole(page: ReactElement, records: Record<string, (input: unknown) => unknown>, path?: string) {
   const queryClient = createTestQueryClient();
@@ -91,6 +96,33 @@ describe("Jobs administration pages", () => {
     await expectNoAxeViolations();
   });
 
+  it("warns about duplicates before explicitly resending unknown mail and labels the queued attempt", async () => {
+    const user = userEvent.setup();
+    const resend = vi.fn(() => ({ jobId }));
+    renderConsole(<MailPage />, {
+      "jobs.admin.listMail": () => ({
+        items: [{ publicId: mailId, template: "test.unknown", state: "unknown", generation: 1,
+          correlationId: "test_mail", canResend: true, updatedAt: date }], nextCursor: null,
+      }),
+      "jobs.admin.resend": resend,
+      "jobs.admin.mailDetail": () => ({ attempts: [{
+        generation: 2, purpose: "manual_resend_after_unknown", transport: null, state: "queued", finishedAt: date,
+      }] }),
+    });
+    const outgoing = await screen.findByRole("table", { name: "Outgoing mail" });
+    await user.click(within(outgoing).getByRole("button", { name: `Resend message ${mailId}` }));
+    const dialog = screen.getByRole("alertdialog", { name: "Resend after an unknown outcome?" });
+    expect(within(dialog).getByText(/recipient may receive the message twice/i)).toBeVisible();
+    expect(resend).not.toHaveBeenCalled();
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Acknowledge risk and queue resend" }));
+    expect(await screen.findByText(/it has not been sent/i)).toBeVisible();
+    expect(resend).toHaveBeenCalledExactlyOnceWith({ publicId: mailId, expectedGeneration: 1, acknowledgeDuplicateRisk: true });
+    await user.click(within(outgoing).getByRole("button", { name: `Attempts for message ${mailId}` }));
+    const history = await screen.findByRole("table", { name: "Message attempt history" });
+    expect(await within(history).findByText("Manual resend after unknown outcome")).toBeVisible();
+  });
+
   it("displays both retained bodies without interpreting HTML or caching the mutation", async () => {
     const user = userEvent.setup();
     const html = '<img src="https://remote.example.test/pixel"><a href="https://remote.example.test/">[REDACTED]</a>';
@@ -151,6 +183,19 @@ describe("Jobs administration pages", () => {
     await expectNoAxeViolations();
   });
 
+  it("includes the visible View job label in the schedule link's accessible name", async () => {
+    renderConsole(<SchedulesPage />, {
+      "jobs.admin.schedules": () => ({ paused: false, items: [
+        { name: "test.daily", everyMs: 86_400_000, nextSlot: date, last: { slot: date, state: "completed", jobId } },
+      ] }),
+    });
+    const table = await screen.findByRole("table", { name: "Recurring work" });
+    const link = within(table).getByRole("link", { name: "View job for test.daily" });
+    expect(link).toHaveAttribute("href", `/admin/jobs/${jobId}`);
+    expect(within(link).getByText("View job")).toBeVisible();
+    await expectNoAxeViolations(table);
+  });
+
   it("confirms before enabling maintenance and blocks reopening with unresolved work", async () => {
     const user = userEvent.setup();
     let active = false;
@@ -164,6 +209,7 @@ describe("Jobs administration pages", () => {
         ? { active, running: 0, unresolved: 1, state: "unproved" }
         : { active, running: 0, unresolved: 0, state: "open" },
       "jobs.admin.setMaintenance": toggle,
+      "jobs.admin.customerMaintenance": () => customerOff,
     });
     await user.click(await screen.findByRole("button", { name: "Start maintenance" }));
     const dialog = screen.getByRole("alertdialog", { name: "Start maintenance?" });
@@ -174,5 +220,68 @@ describe("Jobs administration pages", () => {
     expect(toggle).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Maintenance remains on")).toBeInTheDocument();
     await expectNoAxeViolations();
+  });
+
+  it("confirms customer access changes independently and explicitly confirms ending sessions", async () => {
+    const user = userEvent.setup();
+    let settings = customerOff;
+    const save = vi.fn((input: unknown) => {
+      expect(input).toEqual({ enabled: true, message: "Planned maintenance", startsAt: null, endsAt: null, expectedVersion: 0 });
+      settings = { ...customerOff, enabled: true, active: true, message: "Planned maintenance", phase: "active", version: 1 };
+      return settings;
+    });
+    const end = vi.fn(() => ({ ended: 3 }));
+    renderConsole(<MaintenancePage />, {
+      "jobs.admin.maintenance": () => workerOpen,
+      "jobs.admin.customerMaintenance": () => settings,
+      "jobs.admin.setCustomerMaintenance": save,
+      "jobs.admin.endCustomerSessions": end,
+    });
+    await user.click(await screen.findByRole("checkbox", { name: "Enable customer maintenance" }));
+    await user.type(screen.getByRole("textbox", { name: "Public message" }), "Planned maintenance");
+    await user.click(screen.getByRole("button", { name: "Review customer access change" }));
+    const review = screen.getByRole("alertdialog", { name: "Save customer maintenance settings?" });
+    expect(save).not.toHaveBeenCalled();
+    await expectNoAxeViolations(review);
+    await user.click(within(review).getByRole("button", { name: "Save settings" }));
+    const revoke = await screen.findByRole("button", { name: "End customer sessions now" });
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(end).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Start maintenance" })).toBeEnabled();
+    await user.click(revoke);
+    const dialog = screen.getByRole("alertdialog", { name: "End all customer sessions?" });
+    const confirm = within(dialog).getByRole("button", { name: "End customer sessions" });
+    expect(confirm).toBeDisabled();
+    await expectNoAxeViolations(dialog);
+    await user.type(within(dialog).getByRole("textbox", { name: /type end customer sessions/i }), "END CUSTOMER SESSIONS");
+    await user.click(confirm);
+    expect(await screen.findByText("3 customer sessions ended.")).toBeVisible();
+    expect(end).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
+  it("renders customer maintenance status as inert text and includes the UTC expected end", async () => {
+    renderConsole(<CustomerMaintenanceBanner />, {
+      "jobs.maintenance.customerAccess": () => ({ active: true, message: "<img src=/public>", expectedEnd: date.toISOString() }),
+    });
+    const message = await screen.findByText("<img src=/public>");
+    expect(message).toBeVisible();
+    const banner = message.closest('[role="status"]');
+    expect(banner).not.toBeNull();
+    expect(banner?.querySelector("img")).toBeNull();
+    expect(banner?.querySelector("time")).toHaveAttribute("datetime", date.toISOString());
+  });
+
+  pageA11y("Maintenance console and customer banner", async () => {
+    renderConsole(<main id="main">
+      <CustomerMaintenanceBanner />
+      <MaintenancePage />
+      <RouteFocus title="Maintenance" path="/admin/maintenance" />
+    </main>, {
+      "jobs.maintenance.customerAccess": () => ({ active: true, message: "Planned maintenance", expectedEnd: date.toISOString() }),
+      "jobs.admin.maintenance": () => workerOpen,
+      "jobs.admin.customerMaintenance": () => ({ ...customerOff, enabled: true, active: true, phase: "active" }),
+    }, "/admin/maintenance");
+    await screen.findByText("Planned maintenance");
+    await screen.findByRole("button", { name: "End customer sessions now" });
   });
 });

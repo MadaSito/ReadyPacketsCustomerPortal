@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { ConsoleShell } from "@/app/shell/ConsoleShell";
 import type { MeResult } from "@/lib/authApi";
 import { expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import type {
@@ -448,7 +449,7 @@ describe("Storage connections & SharePoint order sync UI", () => {
     cleanup();
   });
 
-  it("registers /admin/storage and sibling /admin/sharepoint-sync without prefix collision", () => {
+  it("registers storage, the nested Copy log, and sibling SharePoint sync without prefix collision", () => {
     expect(storageFeature.nav).toEqual([
       expect.objectContaining({
         label: "Storage connections",
@@ -464,7 +465,26 @@ describe("Storage connections & SharePoint order sync UI", () => {
         order: 64,
         capability: "storage.manage",
       }),
+      expect.objectContaining({
+        label: "Copy log",
+        href: "/admin/storage/copies",
+        group: "Integrations",
+        capability: "storage.copies.read",
+      }),
     ]);
+    expect(storageFeature.routes.map((route) => route.path)).toEqual(expect.arrayContaining([
+      "/admin/storage", "/admin/storage/copies", "/admin/sharepoint-sync",
+    ]));
+
+    const session = adminSession();
+    if (!session.user) throw new Error("Expected a console test user");
+    renderUi(<ConsoleShell user={session.user}><h1>Copy log page</h1></ConsoleShell>, {
+      path: "/admin/storage/copies", api: fakeAuthApi({ me: async () => session }),
+    });
+    const nav = within(screen.getByRole("navigation", { name: "Console" }));
+    expect(nav.getAllByRole("link", { current: "page" })).toEqual([nav.getByRole("link", { name: "Copy log" })]);
+    expect(nav.getByRole("link", { name: "Storage connections" })).not.toHaveAttribute("aria-current");
+    expect(nav.getByRole("link", { name: "SharePoint order sync" })).not.toHaveAttribute("aria-current");
   });
 
   it("completes two-step OAuth fragment finish, warns when remoteRevoked is false on Disconnect, saves backup destinations, and passes axe", async () => {

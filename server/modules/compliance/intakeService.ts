@@ -481,11 +481,29 @@ export function createIntakeService(deps: ModuleDeps) {
       forUpdate: true,
     });
     const liveActor = await assertLiveActorInTx(deps, principal, tx);
+    const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
     if (liveActor.role !== principal.role) {
-      await ordersSvc.assertCanWriteOrder({ ...principal, role: liveActor.role }, input.orderPublicId, {
+      await ordersSvc.assertCanWriteOrder(livePrincipal, input.orderPublicId, {
         kind: "intake",
         tx,
         forUpdate: true,
+      });
+    }
+
+    if (liveActor.role === "customer") {
+      if (!ordersSvc.gates || typeof ordersSvc.gates.assertCustomerMayWork !== "function") {
+        throw new DomainError(
+          "UNAVAILABLE",
+          "ORDER_GATES_UNAVAILABLE",
+          "This action is temporarily unavailable. Please try again later.",
+        );
+      }
+      await ordersSvc.gates.assertCustomerMayWork({
+        tx,
+        orderId: orderView.id,
+        actor: livePrincipal,
+        action: "intake",
+        statusKey: orderView.statusKey ?? null,
       });
     }
 

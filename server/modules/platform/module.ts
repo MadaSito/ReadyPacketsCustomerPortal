@@ -12,6 +12,7 @@ import type { PlatformFieldCrypto } from "../../security/fieldCrypto.js";
 import { createConfigTransfer, type ConfigTransfer } from "./configTransfer.js";
 import type { HealthReport, PlatformModule, SchemaStatus, SetupChecklistItem } from "./index.js";
 import { createPresentationService, type PresentationService } from "./presentation.js";
+import { CONSENT_PURGE_JOB, createConsentService, type ConsentService } from "./consent.js";
 import { computeSchemaStatus, schemaContractError } from "./schemaContract.js";
 import { PRESENTATION_SLIDES, slidesSchema } from "./settings.js";
 import { getSettingDefinition } from "./settingsRegistry.js";
@@ -45,6 +46,8 @@ export interface PlatformInternals {
   /** In-transaction re-validation of the acting administrator (see actorGuard.ts). */
   actorGuard(principal: SessionPrincipal, capability?: Capability): ActorGuard;
   presentationService: PresentationService;
+  /** Cookie consent ledger, inventory and public bootstrap (increment 04, package J). */
+  consent: ConsentService;
   configTransfer(): ConfigTransfer;
 }
 
@@ -110,6 +113,19 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
   };
 
   const presentationService = createPresentationService({ db, clock, audit, settings: deps.settings, storage });
+  const consent = createConsentService({ db, clock, crypto: deps.crypto, audit, settings: deps.settings, logger });
+  deps.jobs.register(CONSENT_PURGE_JOB, async (job) => {
+    await job.assertStillOwned();
+    const counts = await consent.purge();
+    if (counts.superseded || counts.expired) {
+      await audit.record({
+        category: "admin", eventName: "privacy.consent.purged", action: "purge", outcome: "completed",
+        actor: { role: "system" }, resource: { type: "consent_ledger" }, safeCounts: counts, correlationId: job.correlationId, jobId: job.jobId,
+      });
+    }
+    return { outcome: "completed", safeCounts: counts };
+  }, { retrySafe: true });
+  deps.jobs.registerSchedule({ name: CONSENT_PURGE_JOB, type: CONSENT_PURGE_JOB, everyMs: 6 * 60 * 60_000 });
 
   async function schemaStatus(): Promise<SchemaStatus> {
     try {
@@ -393,6 +409,7 @@ export function createPlatformModule(deps: ModuleDeps): PlatformModuleImpl {
     updateSetting,
     actorGuard: (principal, capability) => createActorGuard(deps.services, clock, principal, capability),
     presentationService,
+    consent,
     configTransfer: () =>
       createConfigTransfer({
         db,

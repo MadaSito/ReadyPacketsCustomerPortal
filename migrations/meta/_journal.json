@@ -22,6 +22,20 @@
       "when": 1795289378826,
       "tag": "0002_integrations_mail_sso_automations",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1795306435692,
+      "tag": "0003_increment_04",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1795313920896,
+      "tag": "0004_increment_04_part_b",
+      "breakpoints": true
     }
   ]
 }

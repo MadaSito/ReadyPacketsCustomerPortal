@@ -5,14 +5,18 @@ import { mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTemplate, ModuleLifecycle } from "../../core/types.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport } from "./mailPorts.js";
 import { engineFor, ensureMaintenanceGate } from "./queue.js";
+import { registerRefundNotice } from "./refundSupport.js";
 import { startWorker, type WorkerHandle } from "./worker.js";
 
 export type { WorkerHandle } from "./worker.js";
 export type { OutboxJobDisposition } from "./admin.js";
+export type { CustomerAccessStatus } from "./customerMaintenance.js";
 export type {
   MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportMessage,
   MailTransportResult, PublishedMailTemplate,
 } from "./mailPorts.js";
+export { REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, registerRefundReconciliation } from "./refundSupport.js";
+export type { RefundReconcileContext, RefundReconciler } from "./refundSupport.js";
 export type JobsModule = ReturnType<typeof createJobsAdmin> & ModuleLifecycle & {
   startWorker(): Promise<WorkerHandle>;
   registerMailTransport(transport: MailTransport): void;
@@ -23,6 +27,7 @@ export type JobsModule = ReturnType<typeof createJobsAdmin> & ModuleLifecycle & 
 };
 
 export function createJobsModule(deps: ModuleDeps): JobsModule {
+  registerRefundNotice(deps.mailer);
   const mailer = mailEngineFor(deps.mailer);
   // Call these ports lazily, after the container has attached peer modules.
   mailer?.registerDelivery({

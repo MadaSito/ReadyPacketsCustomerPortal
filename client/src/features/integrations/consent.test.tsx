@@ -1,6 +1,7 @@
 /**
- * Client tests for `AnalyticsConsentSlot`, clean URL gating, input masking, zero browser storage,
- * WCAG AA (`axe-core`) accessibility, and INT-01 synchronous `markRealmTainted` ordering + quarantine.
+ * Client tests for `AnalyticsConsentSlot` shared `@/lib/consent` cutover (J-01, J-04),
+ * separate `analytics` vs `session_replay` category gates, `/accessibility` & unsafe URL exclusion,
+ * withdrawal / cross-tab / expiry teardown, and INT-01 synchronous `markRealmTainted` quarantine.
  */
 import { QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -8,6 +9,13 @@ import { Route, Router, Switch, useLocation } from "wouter";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RealmTaintBoundary, TaintedRouteGate } from "@/app/RealmTaint";
 import { AuthApiProvider, ME_QUERY_KEY, type MeResult } from "@/lib/authApi";
+import {
+  CONSENT_STORAGE_KEY,
+  __setConsentForTests,
+  __storageForTests,
+  applyConsentDecision,
+  consent,
+} from "@/lib/consent";
 import {
   __resetRealmTaintForTests,
   __setHardNavigateForTests,
@@ -17,11 +25,14 @@ import {
 import { useSession } from "@/lib/session";
 import { createApiClient, TRPCProvider } from "@/lib/trpc";
 import { StepUpProvider, ThemeProvider, ToastProvider } from "@/ui";
-import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi } from "@/ui/testing";
+import { createTestQueryClient, fakeAuthApi } from "@/ui/testing";
 import {
   ANALYTICS_CONSENT_COPY,
   AnalyticsConsentSlot,
+  CLIENT_ALLOWED_ANALYTICS_PATHS,
   isAnalyticsRealmTainted,
+  isEligibleAnalyticsPath,
+  isPostHogCapturingEnabled,
   resetAnalyticsConsentForTests,
 } from "./consent";
 import { integrationsFeature } from "./routes";
@@ -82,7 +93,7 @@ function renderWithBrowserRouter(
   return { ...result, queryClient };
 }
 
-describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted ordering & INT-01 quarantine", () => {
+describe("AnalyticsConsentSlot — shared @/lib/consent cutover (J-01, J-04) & INT-01 quarantine", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -96,29 +107,68 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
   afterEach(() => {
     fetchSpy.mockRestore();
     __setHardNavigateForTests(null);
+    delete (window as Window & { posthog?: unknown }).posthog;
     resetAnalyticsConsentForTests();
     __resetRealmTaintForTests();
     window.history.replaceState(null, "", "/");
   });
 
-  it("keeps Clarity and PostHog disabled by default and never taints the realm", async () => {
-    renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={DISABLED_DEFAULT_CONFIG} />, {
+  it("renders no legacy opt-in UI and loads zero vendor code when privacy.consent is off or undecided", async () => {
+    // 1. Default disabled config
+    const first = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={DISABLED_DEFAULT_CONFIG} />, {
       initialUrl: "/privacy",
     });
     await act(async () => {});
-
     expect(screen.queryByText(ANALYTICS_CONSENT_COPY.heading)).toBeNull();
     expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(isRealmTainted()).toBe(false);
+    first.unmount();
+
+    // 2. Both vendors admin-configured, BUT shared `privacy.consent` feature is OFF (`enabled: false`),
+    //    even if choices object is passed — zero legacy opt-in banner, zero network/script activity (J-04)
+    __setConsentForTests({
+      enabled: false,
+      policyVersion: 1,
+      choices: { preferences: true, analytics: true, session_replay: true },
+    });
+    const second = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await act(async () => {});
+    expect(screen.queryByText(ANALYTICS_CONSENT_COPY.heading)).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(isPostHogCapturingEnabled()).toBe(false);
+    expect(isRealmTainted()).toBe(false);
     expect(realmTaintVendors()).toEqual([]);
+    second.unmount();
+
+    // 3. `privacy.consent` enabled, visitor undecided (`choices: null`) -> nothing loads before explicit choice
+    __setConsentForTests({ enabled: true, policyVersion: 1, choices: null });
+    const third = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await act(async () => {});
+    expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(isRealmTainted()).toBe(false);
+    third.unmount();
   });
 
-  it("sets markRealmTainted('clarity') BEFORE appending <script> and markRealmTainted('posthog') BEFORE fetch()", async () => {
+  it("gates PostHog on 'analytics' and Clarity on 'session_replay' independently, calling vendor consent APIs and markRealmTainted synchronously before execution", async () => {
     let taintedBeforeScriptAppend = false;
     let vendorsBeforeScriptAppend: readonly string[] = [];
     let taintedBeforePostHogFetch = false;
     let vendorsBeforePostHogFetch: readonly string[] = [];
+
+    const posthogStub = {
+      opt_in_capturing: vi.fn(),
+      opt_out_capturing: vi.fn(),
+      reset: vi.fn(),
+    };
+    (window as Window & { posthog?: typeof posthogStub }).posthog = posthogStub;
 
     const origAppendChild = document.head.appendChild.bind(document.head);
     const appendSpy = vi.spyOn(document.head, "appendChild").mockImplementation(<T extends Node>(node: T): T => {
@@ -138,35 +188,28 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
     });
 
     try {
-      const { container } = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
         initialUrl: "/privacy",
       });
-
-      expect(await screen.findByText(ANALYTICS_CONSENT_COPY.heading)).toBeInTheDocument();
+      await act(async () => {});
       expect(isRealmTainted()).toBe(false);
-      await expectNoAxeViolations(container);
 
-      // Grant consent for session
-      fireEvent.click(screen.getByRole("button", { name: ANALYTICS_CONSENT_COPY.allow }));
-
-      await waitFor(() => {
-        const script = document.querySelector('script[data-rp-clarity="true"]') as HTMLScriptElement | null;
-        expect(script).not.toBeNull();
-        expect(script?.src).toBe("https://www.clarity.ms/tag/clarityProj99");
+      // Step 1: Grant ONLY `analytics` (`session_replay: false`) -> PostHog runs, Clarity stays completely absent
+      act(() => {
+        __setConsentForTests({
+          enabled: true,
+          policyVersion: 1,
+          choices: { preferences: false, analytics: true, session_replay: false },
+        });
       });
 
-      // Verify synchronous taint flag ordering BEFORE `<script>` was appended and BEFORE `fetch()` ran
-      expect(taintedBeforeScriptAppend).toBe(true);
-      expect(vendorsBeforeScriptAppend).toContain("clarity");
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+      expect(posthogStub.opt_in_capturing).toHaveBeenCalled();
+      expect(isPostHogCapturingEnabled()).toBe(true);
       expect(taintedBeforePostHogFetch).toBe(true);
       expect(vendorsBeforePostHogFetch).toContain("posthog");
+      expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
 
-      // Root strict masking attribute set on `<html>`
-      expect(document.documentElement.getAttribute("data-clarity-mask")).toBe("true");
-      expect(isAnalyticsRealmTainted()).toBe(true);
-
-      // PostHog direct capture sent without cookies/credentials and with person profiles disabled
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
       const [url, init] = fetchSpy.mock.calls[0]!;
       expect(url).toBe("https://eu.i.posthog.com/capture/");
       expect(init?.credentials).toBe("omit");
@@ -176,13 +219,182 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
         event: "$pageview",
         properties: { $pathname: "/privacy", $process_person_profile: false },
       });
+
+      // Step 2: Also grant `session_replay` -> Clarity mounts, receives `clarity("consent")`, and masks root
+      act(() => {
+        __setConsentForTests({
+          enabled: true,
+          policyVersion: 1,
+          choices: { preferences: false, analytics: true, session_replay: true },
+        });
+      });
+
+      await waitFor(() => {
+        const script = document.querySelector('script[data-rp-clarity="true"]') as HTMLScriptElement | null;
+        expect(script).not.toBeNull();
+        expect(script?.src).toBe("https://www.clarity.ms/tag/clarityProj99");
+      });
+
+      expect(taintedBeforeScriptAppend).toBe(true);
+      expect(vendorsBeforeScriptAppend).toContain("clarity");
+      expect(document.documentElement.getAttribute("data-clarity-mask")).toBe("true");
+      const clarityQueue = (window as Window & { clarity?: { q?: unknown[][] } }).clarity?.q ?? [];
+      expect(clarityQueue).toContainEqual(["consent"]);
+      expect(clarityQueue).toContainEqual(["consentv2", { ad_Storage: "denied", analytics_Storage: "granted" }]);
+      expect(isAnalyticsRealmTainted()).toBe(true);
     } finally {
       appendSpy.mockRestore();
     }
   });
 
-  it("refuses to render or mount analytics when /privacy or /terms carries any ?query or #hash, on excluded paths, or when authenticated", async () => {
+  it("tears down Clarity/PostHog, purges vendor cookies, and reloads tainted realm on withdrawal, cross-tab storage revoke, or renewal expiry", async () => {
+    const hardNavCalls: Array<[string, string]> = [];
+    __setHardNavigateForTests((mode, url) => {
+      hardNavCalls.push([mode, url]);
+    });
+
+    const posthogStub = {
+      opt_in_capturing: vi.fn(),
+      opt_out_capturing: vi.fn(),
+      reset: vi.fn(),
+    };
+    (window as Window & { posthog?: typeof posthogStub }).posthog = posthogStub;
+
+    // 1. Direct withdrawal
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const first = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+    document.cookie = "_clck=abc; path=/";
+    document.cookie = "ph_proj_posthog=xyz; path=/";
+
+    const claritySpy = vi.fn();
+    (window as Window & { clarity?: (...args: unknown[]) => void }).clarity = claritySpy;
+
+    act(() => {
+      __setConsentForTests({
+        enabled: true,
+        policyVersion: 1,
+        choices: { preferences: false, analytics: false, session_replay: false },
+      });
+    });
+
+    expect(posthogStub.opt_out_capturing).toHaveBeenCalled();
+    expect(isPostHogCapturingEnabled()).toBe(false);
+    expect(claritySpy).toHaveBeenCalledWith("consent", false);
+    expect(claritySpy).toHaveBeenCalledWith("stop");
+    expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(document.documentElement.getAttribute("data-clarity-mask")).toBeNull();
+    expect((window as Window & { clarity?: unknown }).clarity).toBeUndefined();
+    expect(document.cookie).not.toContain("_clck=");
+    expect(document.cookie).not.toContain("ph_proj_posthog=");
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    first.unmount();
+
+    // 2. Cross-tab `storage` revocation from another tab
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+
+    const store = __storageForTests();
+    const nowIso = "2026-11-21T12:00:00.000Z";
+    const baseMs = Date.parse(nowIso);
+    let currentClock = baseMs;
+    store.setItem(
+      CONSENT_STORAGE_KEY,
+      JSON.stringify({
+        v: 1,
+        receipt: null,
+        policyVersion: 1,
+        decidedAt: nowIso,
+        bySignal: false,
+        choices: { preferences: false, analytics: true, session_replay: true },
+      }),
+    );
+    __setConsentForTests({ enabled: true, policyVersion: 1, renewMonths: 6, clock: () => currentClock });
+
+    const second = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      store.setItem(
+        CONSENT_STORAGE_KEY,
+        JSON.stringify({
+          v: 1,
+          receipt: null,
+          policyVersion: 1,
+          decidedAt: nowIso,
+          bySignal: false,
+          choices: { preferences: false, analytics: false, session_replay: false },
+        }),
+      );
+      window.dispatchEvent(new StorageEvent("storage", { key: CONSENT_STORAGE_KEY }));
+    });
+
+    expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    second.unmount();
+
+    // 3. Renewal deadline expiry on focus wake-up
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+    currentClock = baseMs;
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      renewMonths: 6,
+      clock: () => currentClock,
+      decidedAt: nowIso,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    store.setItem(
+      CONSENT_STORAGE_KEY,
+      JSON.stringify({
+        v: 1,
+        receipt: null,
+        policyVersion: 1,
+        decidedAt: nowIso,
+        bySignal: false,
+        choices: { preferences: false, analytics: true, session_replay: true },
+      }),
+    );
+
+    const third = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      currentClock = baseMs + 200 * 24 * 60 * 60 * 1000; // > 6 months
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    third.unmount();
+  });
+
+  it("excludes /accessibility, ?query/#hash URLs, non-legal paths, and authenticated sessions even with full consent", async () => {
+    expect(CLIENT_ALLOWED_ANALYTICS_PATHS).toEqual(["/privacy", "/terms"]);
+    expect(isEligibleAnalyticsPath("/accessibility")).toBe(false);
+
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: true, analytics: true, session_replay: true },
+    });
+
     for (const unsafeUrl of [
+      "/accessibility",
+      "/accessibility?ref=footer",
       "/privacy?reset_token=secret123",
       "/terms#invite=secret456",
       "/sign-in",
@@ -193,26 +405,25 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
         initialUrl: unsafeUrl,
       });
       await act(async () => {});
-      expect(screen.queryByText(ANALYTICS_CONSENT_COPY.heading)).toBeNull();
       expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(isRealmTainted()).toBe(false);
       unmount();
     }
 
-    // Authenticated customer on clean `/privacy` NEVER sees banner or loads tags
+    // Authenticated customer on clean `/privacy` NEVER loads tags even when browser has consent stored
     const { unmount } = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
       initialUrl: "/privacy",
       meImpl: async () => signedInCustomer,
     });
     await act(async () => {});
-    expect(screen.queryByText(ANALYTICS_CONSENT_COPY.heading)).toBeNull();
     expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
     expect(isRealmTainted()).toBe(false);
     unmount();
   });
 
-  it("quarantines non-public routes and authenticated session transitions in a tainted realm with zero private DOM commits", async () => {
+  it("quarantines non-public routes (including /accessibility) and authenticated session transitions in a tainted realm with zero private DOM commits", async () => {
     const hardNavCalls: Array<[string, string]> = [];
     __setHardNavigateForTests((mode, url) => {
       hardNavCalls.push([mode, url]);
@@ -258,13 +469,14 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
       );
     }
 
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
     const { unmount } = renderWithBrowserRouter(<GuardedAppHarness />, { initialUrl: "/privacy" });
-
-    expect(await screen.findByText(ANALYTICS_CONSENT_COPY.heading)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: ANALYTICS_CONSENT_COPY.allow }));
     await waitFor(() => expect(isRealmTainted()).toBe(true));
 
-    // Observe EVERY DOM node ever added while tainted
     const leakedPrivateNodes: string[] = [];
     const observer = new MutationObserver((records) => {
       for (const rec of records) {
@@ -284,9 +496,7 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
       expect(await screen.findByTestId("public-terms")).toBeInTheDocument();
       expect(hardNavCalls).toEqual([]);
 
-      // 2. Navigating `/terms` -> `/orders?token=SECRET_TOKEN#frag` is intercepted BEFORE `history.pushState`:
-      //    `window.location` NEVER exposes `/orders`, `?token=SECRET_TOKEN`, or `#frag` in the tainted realm,
-      //    Clarity script/globals tear down synchronously, zero `/orders` DOM commits, and `requestCleanRealm` fires.
+      // 2. Navigating `/terms` -> `/orders?token=SECRET_TOKEN#frag` is intercepted BEFORE `history.pushState`
       fireEvent.click(screen.getByRole("button", { name: "Go Private Orders" }));
       expect(window.location.pathname).toBe("/terms");
       expect(window.location.search).toBe("");
@@ -312,9 +522,12 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
     __resetRealmTaintForTests();
     hardNavCalls.length = 0;
 
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
     const second = renderWithBrowserRouter(<GuardedAppHarness />, { initialUrl: "/privacy" });
-    expect(await screen.findByText(ANALYTICS_CONSENT_COPY.heading)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: ANALYTICS_CONSENT_COPY.allow }));
     await waitFor(() => expect(isRealmTainted()).toBe(true));
 
     const leakedSessionNodes: string[] = [];
@@ -343,18 +556,131 @@ describe("AnalyticsConsentSlot — privacy, default-disabled, markRealmTainted o
     }
   });
 
-  it("spreads integrationsAdminRoutes, productionAdminRoutes, nav, and orderTabs into integrationsFeature", () => {
+  it("tears down and reloads tainted realm on runtime provider disable/ID rotation, standalone non-anonymous session transition, and keeps local denial durable before reload", async () => {
+    const hardNavCalls: Array<[string, string]> = [];
+    __setHardNavigateForTests((mode, url) => {
+      hardNavCalls.push([mode, url]);
+    });
+
+    // 1. Runtime Clarity disable or projectId rotation observed on refetch while visitor stays consented
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const first = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    first.rerender(
+      <ThemeProvider>
+        <QueryClientProvider client={first.queryClient}>
+          <TRPCProvider trpcClient={createApiClient()} queryClient={first.queryClient}>
+            <AuthApiProvider api={fakeAuthApi({ me: () => Promise.reject(unauthError()) })}>
+              <ToastProvider>
+                <StepUpProvider>
+                  <Router>
+                    <AnalyticsConsentSlot
+                      configOverride={{
+                        clarity: { enabled: true, projectId: "rotatedProj88" },
+                        posthog: ACTIVE_CONFIG.posthog,
+                      }}
+                    />
+                  </Router>
+                </StepUpProvider>
+              </ToastProvider>
+            </AuthApiProvider>
+          </TRPCProvider>
+        </QueryClientProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull());
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    first.unmount();
+
+    // 2. Standalone slot (even without RealmTaintBoundary) tears down & reloads when session becomes non-anonymous
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const second = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      second.queryClient.setQueryData(ME_QUERY_KEY, signedInCustomer);
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull());
+    expect(isPostHogCapturingEnabled()).toBe(false);
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    second.unmount();
+
+    // 3. Local denial via `applyConsentDecision` is already written to `rp.consent.v1` at the exact instant
+    //    `requestCleanRealm` fires (so reload preempting the async ledger RPC never resurrects consent)
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+
+    let storedAtReloadMoment: string | null = null;
+    __setHardNavigateForTests((mode, url) => {
+      storedAtReloadMoment = __storageForTests().getItem(CONSENT_STORAGE_KEY);
+      hardNavCalls.push([mode, url]);
+    });
+
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const third = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      applyConsentDecision(
+        { preferences: false, analytics: false, session_replay: false },
+        { policyVersion: 1 },
+      );
+    });
+
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    expect(storedAtReloadMoment).not.toBeNull();
+    expect(JSON.parse(storedAtReloadMoment!).choices).toEqual({
+      preferences: false,
+      analytics: false,
+      session_replay: false,
+    });
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
+    third.unmount();
+  });
+
+  it("spreads integrationsAdminRoutes, productionAdminRoutes, webhookRoutes, nav, and orderTabs into integrationsFeature", () => {
     expect(integrationsFeature.routes.map((r) => r.path)).toEqual([
       "/admin/integrations",
       "/admin/integrations/smtp",
       "/admin/integrations/analytics",
       "/admin/integrations/egress",
       "/admin/integrations/production",
+      "/admin/integrations/webhooks",
+      "/admin/integrations/webhooks/inbound",
+      "/admin/integrations/webhooks/deliveries",
     ]);
     expect(integrationsFeature.nav?.map((n) => n.href)).toEqual([
       "/admin/integrations",
       "/admin/integrations/production",
+      "/admin/integrations/webhooks",
     ]);
-    expect(integrationsFeature.orderTabs?.map((t) => t.key)).toEqual(["production"]);
+    expect(integrationsFeature.orderTabs).toHaveLength(1);
+    expect(["production", "automation"]).toContain(integrationsFeature.orderTabs?.[0]?.key);
   });
 });

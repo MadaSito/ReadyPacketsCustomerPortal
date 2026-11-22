@@ -6,10 +6,11 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
+import { jobAttempts, jobRuns } from "../jobs/schema.js";
 import { orderFilesCopyAction } from "./automation.js";
 import { StorageAdapterError, type StorageConnectionView } from "./contracts.js";
 import { createStorageModule, type StorageModule } from "./index.js";
-import { storageAssignments, storageConnections, storageFileCopies } from "./schema.js";
+import { storageAssignments, storageConnections, storageCopyAttempts, storageFileCopies } from "./schema.js";
 
 const jobType = "storage.copy_order_file";
 const sourceBytes = Buffer.from("synthetic local order file");
@@ -29,15 +30,17 @@ let visitEnsure: (() => Promise<void>) | undefined;
 let sourceUnavailable: boolean;
 let sourceVisibility: "customer_visible" | "staff_only";
 let currentVersion: boolean;
+let route: { slotTemplate: string | null; workflowTemplate: string | null; phaseLabel: string | null };
+let finalPath: readonly string[] | undefined;
 let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string, data: Buffer) => void>>;
 let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies } });
+  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies, storageCopyAttempts, jobRuns, jobAttempts } });
 });
 afterAll(() => db?.cleanup());
 beforeEach(async () => {
-  for (const table of [storageFileCopies, storageAssignments, storageConnections]) await db.db.delete(table);
+  for (const table of [storageCopyAttempts, storageFileCopies, storageAssignments, storageConnections, jobAttempts, jobRuns]) await db.db.delete(table);
   h = createTestDeps({ db: db.db });
   admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
   stepUp = admin.stepUpAt;
@@ -47,6 +50,8 @@ beforeEach(async () => {
   sourceUnavailable = false;
   sourceVisibility = "customer_visible";
   currentVersion = true;
+  route = { slotTemplate: null, workflowTemplate: null, phaseLabel: "Intake" };
+  finalPath = undefined;
   adapterPuts = vi.fn();
   adapterRemovals = vi.fn();
   h.services.identity = {
@@ -54,6 +59,13 @@ beforeEach(async () => {
       return { role: principal.role, stepUpAt: stepUp, pendingSteps: [] };
     } },
   } as unknown as TestHarness["services"]["identity"];
+  h.services.orders = {
+    async assertCanReadOrder() { return {}; },
+    async getOrderFileFolderRouting() { return route; },
+  } as unknown as TestHarness["services"]["orders"];
+  h.services.jobAdmin = {
+    async canReplaceFailedOutboxJob() { return true; },
+  } as unknown as TestHarness["services"]["jobAdmin"];
   module = createStorageModule(h.deps);
   module.registerAdapter("dropbox", {
     configSchema: testProvider, credentialsSchema: testSecrets, purposes: ["order_files", "backups"],
@@ -66,7 +78,7 @@ beforeEach(async () => {
           const data = await buffer(input.body);
           adapterPuts(input.path, input.name, data);
           if (providerFault) throw providerFault;
-          return { remoteId: "synthetic-remote-reference", size: data.length, sha256: overrideDigest ?? input.sha256 };
+          return { remoteId: "synthetic-remote-reference", size: data.length, sha256: overrideDigest ?? input.sha256, targetPath: finalPath };
         },
         async remove() { adapterRemovals(); },
       };
@@ -97,14 +109,19 @@ async function stage() {
         storageKey, size: sourceBytes.length, sha256: local.sha256, contentType: "application/octet-stream",
         displayName: "Synthetic ../Doc.pdf", extension: "pdf", ownerUserId: 42, visibility: sourceVisibility, currentVersion,
         customerName: "E\u0301lodie Beispiel", customerReference: "RPCUS-TEST00001", customerPublicId: ulid(),
-        orderReference: "Order / synthetic", orderPublicId, filePublicId,
+        orderReference: "Order / synthetic", orderName: "../A/B", orderPublicId, filePublicId,
+        statusKey: "intake", slotKey: "documents", createdAt: new Date("2026-11-21T15:30:00Z"),
       };
     },
     async listOrderFileCopyCandidates(requestedOrder: string) {
       return !sourceUnavailable && requestedOrder === orderPublicId ? [filePublicId] : null;
     },
+    async listOrderFileCopyMetadata(requestedOrder: string, ids: string[]) {
+      return requestedOrder === orderPublicId && ids.includes(filePublicId)
+        ? [{ filePublicId, displayName: "Synthetic ../Doc.pdf", sourceAvailable: !sourceUnavailable }] : [];
+    },
   } as unknown as TestHarness["services"]["files"];
-  await db.db.transaction((tx) => module.stageOrderFile(filePublicId, tx));
+  await db.db.transaction((tx) => module.stageOrderFile(filePublicId, tx, { orderPublicId }));
   return { filePublicId, storageKey, orderPublicId };
 }
 
@@ -188,14 +205,21 @@ describe("fenced order-file copy jobs", () => {
     await module.assignments.set(admin, { purpose: "order_files", connectionPublicIds: [first.publicId, second.publicId] });
     const { storageKey } = await stage();
     expect(h.jobs.enqueued).toHaveLength(2);
+    const queued = await db.db.select().from(storageCopyAttempts);
+    expect(queued).toHaveLength(2);
+    expect(queued.every((row) => row.kind === "order_file" && row.state === "queued")).toBe(true);
     expect(await h.jobs.runAll(jobType)).toEqual([
       { outcome: "completed", safeCounts: { files: 1, digestVerified: 1 } },
       { outcome: "completed", safeCounts: { files: 1, digestVerified: 1 } },
     ]);
     const copies = await db.db.select().from(storageFileCopies);
     expect(copies.every((row) => row.state === "copied" && row.digestVerified)).toBe(true);
-    expect(JSON.stringify([copies, h.audit.events])).not.toMatch(/Beispiel|RPCUS-|synthetic-remote-reference/u);
-    expect(adapterPuts.mock.calls[0]?.[0]?.[1]).toMatch(/^Él Beispiel RPCUS-TEST00001/u);
+    const attempts = await db.db.select().from(storageCopyAttempts);
+    expect(attempts.map((row) => row.publicId).sort()).toEqual(queued.map((row) => row.publicId).sort());
+    expect(attempts.every((row) => row.state === "verified" && row.verification === "checksum" && row.bytes === sourceBytes.length)).toBe(true);
+    expect(h.audit.named("storage.copy_result")).toHaveLength(0);
+    expect(JSON.stringify([copies, attempts, h.audit.events])).not.toMatch(/Beispiel|RPCUS-|synthetic-remote-reference/u);
+    expect(adapterPuts.mock.calls[0]?.[0]).toEqual(["customers", "RPCUS-TEST00001", "orders", "Order _ synthetic", "Intake"]);
     expect(h.storage.objects.get(storageKey)).toEqual(sourceBytes);
     expect(adapterRemovals).not.toHaveBeenCalled();
   });
@@ -210,6 +234,70 @@ describe("fenced order-file copy jobs", () => {
     expect((await db.db.select().from(storageFileCopies))[0]).toMatchObject({
       state: "skipped", reasonCode: "STORAGE_ASSIGNMENT_INACTIVE",
     });
+    expect((await db.db.select().from(storageCopyAttempts))[0]).toMatchObject({
+      state: "not_written", verification: null, errorCode: "STORAGE_ASSIGNMENT_INACTIVE",
+    });
+  });
+
+  it("uses slot, then workflow, then assignment default and records the provider-observed path", async () => {
+    const { file } = await provision();
+    route = { slotTemplate: "slot/{slot}/{order_name}/{yyyy}/{mm}", workflowTemplate: "workflow/{phase}", phaseLabel: "Stage 1" };
+    finalPath = ["Slot", "documents", "_A_B", "2026", "11", "Accepted (1).pdf"];
+    await h.jobs.runAll(jobType);
+    expect(adapterPuts.mock.calls[0]?.[0]).toEqual(["slot", "documents", "_A_B", "2026", "11"]);
+    let transfers = await module.orderCopies.forOrder(admin, { orderPublicId: file.orderPublicId });
+    expect(transfers).toMatchObject({ hasAssignedConnection: true, hasSharePoint: false,
+      totals: { total: 1, synced: 1, inProgress: 0, failed: 0 },
+      items: [{ fileName: "Synthetic ../Doc.pdf", phase: "Stage 1", targetPath: finalPath.join("/"), state: "verified" }],
+    });
+    expect((await module.copies.list(admin, { orderPublicId: file.orderPublicId })).items[0]?.targetPath).toBe(finalPath.join("/"));
+    expect((await module.copies.list(admin, { orderPublicId: ulid() })).items).toEqual([]);
+    expect(JSON.stringify(await db.db.select().from(storageCopyAttempts))).not.toContain("Accepted (1).pdf");
+    route.slotTemplate = null;
+    finalPath = undefined;
+    const next = await stage();
+    await h.jobs.runAll(jobType);
+    expect(adapterPuts.mock.calls[1]?.[0]).toEqual(["workflow", "Stage 1"]);
+    transfers = await module.orderCopies.forOrder(admin, { orderPublicId: next.orderPublicId });
+    expect(transfers.items).toHaveLength(1);
+    await expect(module.orderCopies.forOrder(admin, {
+      orderPublicId: next.orderPublicId, cursor: (await module.copies.list(admin, { orderPublicId: file.orderPublicId })).items[0]!.publicId,
+    })).rejects.toMatchObject({ reasonCode: "COPY_ATTEMPT_NOT_FOUND" });
+  });
+
+  it("refuses an unsafe pinned folder before touching the provider and retries only a current scoped, intact source", async () => {
+    const { file } = await provision();
+    route.slotTemplate = "escape/../private";
+    const { jobId } = h.jobs.enqueued[0]!;
+    expect(await h.jobs.runAll(jobType)).toEqual([{ outcome: "failed", reasonCode: "STORAGE_FOLDER_INVALID", retryable: false }]);
+    expect(adapterPuts).not.toHaveBeenCalled();
+    await db.db.insert(jobRuns).values({
+      publicId: jobId, type: jobType, state: "failed", correlationId: "synthetic", allowRetry: false,
+      attempt: 1, maxAttempts: 6, runAt: h.clock.now(),
+    });
+    const [attempt] = (await module.orderCopies.forOrder(admin, { orderPublicId: file.orderPublicId })).items;
+    expect(attempt).toMatchObject({ state: "failed", canRetry: true, targetPath: null });
+    const input = { orderPublicId: file.orderPublicId, publicId: attempt!.publicId };
+    await expect(module.orderCopies.forOrder(fakePrincipal({ role: "customer" }), input)).rejects.toMatchObject({ reasonCode: "ORDER_COPY_DENIED" });
+    await expect(module.orderCopies.retryOrderFile(admin, { ...input, orderPublicId: ulid() })).rejects.toMatchObject({ reasonCode: "COPY_RETRY_UNAVAILABLE" });
+    h.storage.objects.delete(file.storageKey);
+    await expect(module.orderCopies.retryOrderFile(admin, input)).rejects.toMatchObject({ reasonCode: "COPY_RETRY_UNAVAILABLE" });
+    h.storage.objects.set(file.storageKey, sourceBytes);
+    route.slotTemplate = "safe/{slot}";
+    const concurrent = await Promise.allSettled([
+      module.orderCopies.retryOrderFile(admin, input), module.orderCopies.retryOrderFile(admin, input),
+    ]);
+    expect(concurrent.filter((result) => result.status === "fulfilled")).toEqual([{ status: "fulfilled", value: { queued: true } }]);
+    expect(concurrent.filter((result) => result.status === "rejected")).toEqual([
+      expect.objectContaining({ reason: expect.objectContaining({ reasonCode: "COPY_RETRY_UNAVAILABLE" }) }),
+    ]);
+    await expect(module.orderCopies.retryOrderFile(admin, input)).rejects.toMatchObject({ reasonCode: "COPY_RETRY_UNAVAILABLE" });
+    expect(h.jobs.enqueued).toHaveLength(1);
+    expect(h.audit.named("order.file.copy.retry_queued")).toEqual([
+      expect.objectContaining({ orderPublicId: file.orderPublicId, resource: { type: "file", publicId: file.filePublicId } }),
+    ]);
+    expect((await module.orderCopies.forOrder(admin, { orderPublicId: file.orderPublicId })).totals)
+      .toEqual({ total: 1, synced: 0, inProgress: 1, failed: 0 });
   });
 
   it("rechecks current source scope after folder setup and before writing", async () => {
@@ -228,7 +316,7 @@ describe("fenced order-file copy jobs", () => {
   });
 
   it("hands duplicate-safe failures to bounded queue backoff and does not replay an ambiguous outcome", async () => {
-    await provision();
+    const { file } = await provision();
     providerFault = new StorageAdapterError("RATE_LIMITED", true);
     const pending = h.jobs.enqueued[0]!;
     expect(pending.options?.maxAttempts).toBe(6);
@@ -238,7 +326,15 @@ describe("fenced order-file copy jobs", () => {
     h.jobs.enqueued.push(pending);
     providerFault = new StorageAdapterError("OUTCOME_UNKNOWN");
     expect(await h.jobs.runAll(jobType)).toEqual([{ outcome: "unknown", reasonCode: "STORAGE_COPY_UNCERTAIN" }]);
-    expect(h.audit.named("storage.order_file.copy").at(-1)?.outcome).toBe("unknown");
+    expect(h.audit.named("order.file.copy.unknown").at(-1)?.outcome).toBe("unknown");
+    await db.db.insert(jobRuns).values({
+      publicId: pending.jobId, type: jobType, state: "unknown", correlationId: "synthetic",
+      attempt: 1, maxAttempts: 6, runAt: h.clock.now(),
+    });
+    const [item] = (await module.orderCopies.forOrder(admin, { orderPublicId: file.orderPublicId })).items;
+    expect(item?.canRetry).toBe(false);
+    await expect(module.orderCopies.retryOrderFile(admin, { orderPublicId: file.orderPublicId, publicId: item!.publicId }))
+      .rejects.toMatchObject({ reasonCode: "COPY_RETRY_UNAVAILABLE" });
   });
 
   it("deduplicates automation replays, preserves their origin, and cannot target an unassigned destination", async () => {
@@ -258,7 +354,7 @@ describe("fenced order-file copy jobs", () => {
     expect(h.jobs.enqueued).toHaveLength(1);
     expect(h.jobs.enqueued[0]?.options?.correlationId).toBe(input.correlationId);
     await h.jobs.runAll(jobType);
-    expect(h.audit.named("storage.order_file.copy").map((row) => row.correlationId))
+    expect(h.audit.events.filter((row) => row.eventName.startsWith("order.file.copy.")).map((row) => row.correlationId))
       .toEqual([input.correlationId, input.correlationId]);
   });
 

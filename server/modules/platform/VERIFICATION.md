@@ -55,3 +55,16 @@ Server tests use isolated MySQL databases created with `tests/helpers/testDb.ts`
 | Edit dialog: Form tab by default, JSON tab on the same value, client pre-checks, server `details.fields` mapped onto fields (`aria-invalid`), axe clean | `client/src/features/platform/platform.test.tsx`, `fieldForm.test.ts` |
 | Settings page: search (live count for screen readers), collapsible groups (disclosure buttons with `aria-expanded`), link-out rows for E-mail delivery / Storage / SharePoint sync / Single sign-on, axe clean | `platform.test.tsx` |
 | Not run here: browser checks at 320 px and keyboard walkthrough (no browser in this sandbox); the layout is single-column below `sm` and uses kit controls |  |
+
+## Increment 04, package J: cookie consent
+
+| Check | Evidence |
+|---|---|
+| Authorisation matrix: bootstrap/inventory/record public; `mine` needs a session; stats/search/export admin + `privacy.consent.read` (customer, staff, anonymous refused); consent settings not writable by customers; user id only from a full session, never from input | `consentRouter.example.test.ts` |
+| Validation: strict inputs (unknown keys, oversize receipt, bad action/category refused); action/choices consistency; GPC can only reject; CSV formula neutralisation; default inventory valid | `consent.test.ts` |
+| Abuse: disabled feature refuses; stale policy version refused; forged/junk receipts never join another browser's history; record rate-limited (`form_submission`), export `expensive` | `consent.test.ts`, `router.ts` meta |
+| Privacy: no IP in clear (HMAC only), no user agent; `mine` selected by session user only; purge after retention (superseded / expired); `forgetUser` unlinks the account | `consent.test.ts` |
+| Client store: nothing optional before a choice or while off; policy change and expiry re-ask (long-lived tab, single notification, no timer loop); cross-tab withdrawal; vendor cookie removal; removals-only before the ledger call; tampered storage ignored | `client/src/lib/consent.test.ts` |
+| Banner: equal Reject/Accept buttons, first in tab order, non-modal (page not inert), GPC auto-reject without banner, failed acceptance grants nothing, failed withdrawal still applied locally, policy-change prompt, live "Cookie preferences saved" | `client/src/features/platform/consent/consent.test.tsx` |
+| axe (light + dark): `/account/privacy`, `/admin/privacy`, banner over a sign-in page, preference centre open | `consent.test.tsx` (`pageA11y`) |
+| Not checked here: real-browser layout at 320 px / 400 % zoom, screen-reader walkthrough, colour contrast in a browser, PostHog/Clarity network behaviour (owned by integrations_engineer's loader) | — |
