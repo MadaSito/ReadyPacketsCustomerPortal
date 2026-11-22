@@ -256,12 +256,13 @@ export function createAccessService(deps: AccessDeps) {
         await notifyBoth({ ownerUserId: done.view.ownerUserId, granteeUserId: done.grantee.userId, granted: true, role: input.role, label: `order ${done.view.reference}`, link: `/orders/${done.view.publicId}`, key: `order.access:${done.publicId}:granted` });
         return { grantId: done.publicId, scope: "order" as const, ordersCovered: 1 };
       }
-      const owner = await activeCustomer(input.scope.customerPublicId);
+      const customerPublicId = input.scope.customerPublicId;
+      const owner = await activeCustomer(customerPublicId);
       const done = await deps.db.transaction(async (tx) => {
         const orderIds = await lockCustomerOrders(tx, owner.id);
         await deps.actorCheck(principal, tx, "orders.access.grant");
         await assertEnabled(tx);
-        const fresh = await activeCustomer(input.scope.customerPublicId, tx);
+        const fresh = await activeCustomer(customerPublicId, tx);
         const grantee = await resolveGrantee(input.email, fresh.id, tx);
         const liveKey = `${fresh.id}:${grantee.userId}`;
         const [existing] = await tx.select({ id: orderCustomerGrants.id }).from(orderCustomerGrants).where(eq(orderCustomerGrants.liveKey, liveKey)).limit(1).for("update");

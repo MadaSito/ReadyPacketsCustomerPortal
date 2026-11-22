@@ -161,7 +161,7 @@ export function AcknowledgementDialog({ orderId, statusKey, ack, onClose }: { or
           </Field>
         ) : null}
         {error ? (
-          <Callout tone="danger" live>
+          <Callout tone="danger" live="assertive">
             {error}
           </Callout>
         ) : null}
@@ -213,7 +213,7 @@ export function UnlockPhaseDialog({ orderId, phases, onClose }: { orderId: strin
         </Field>
         <Switch label="Notify the customer" checked={notifyCustomer} onCheckedChange={setNotify} />
         {error ? (
-          <Callout tone="danger" live>
+          <Callout tone="danger" live="assertive">
             {error}
           </Callout>
         ) : null}
