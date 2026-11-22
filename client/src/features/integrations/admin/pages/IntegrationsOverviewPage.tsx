@@ -1,6 +1,6 @@
 /** /admin/integrations — truthful status cards for every integration plus links to the pages that configure them. */
 import { useQuery } from "@tanstack/react-query";
-import { BarChart3, CreditCard, FileStack, KeyRound, Mail, Network, ScanEye } from "lucide-react";
+import { BarChart3, CreditCard, FileStack, KeyRound, Mail, Network, ScanEye, Webhook } from "lucide-react";
 import type { ReactNode } from "react";
 import { Link } from "wouter";
 import { useTRPC } from "@/lib/trpc";
@@ -15,7 +15,7 @@ const META: Record<ProviderKey, { title: string; icon: typeof Mail; href?: strin
   clarity: { title: "Microsoft Clarity", icon: ScanEye, href: INTEGRATION_PATHS.analytics, manage: "Configure analytics", blurb: "Optional, consent-gated session analytics on public legal pages only." },
   posthog: { title: "PostHog", icon: BarChart3, href: INTEGRATION_PATHS.analytics, manage: "Configure analytics", blurb: "Optional, consent-gated product analytics on public legal pages only." },
   saml: { title: "SAML single sign-on", icon: KeyRound, blurb: "Federated sign-in. Local sign-in with multi-factor verification stays the only active method." },
-  stripe: { title: "Stripe", icon: CreditCard, blurb: "Card payments. Design scaffold only — no payment is taken through Stripe in this release." },
+  stripe: { title: "Stripe", icon: CreditCard, href: "/admin/payments", manage: "Open payments", blurb: "Card payments through Stripe and Square are configured in Payments. Legacy integration scaffold stays disabled for compatibility." },
   sharepoint: { title: "SharePoint", icon: FileStack, blurb: "Document library sync with Microsoft 365. Design scaffold only." },
 };
 
@@ -49,6 +49,13 @@ export default function IntegrationsOverviewPage() {
               </li>
             ))}
             <li className="min-w-0">
+              <Card as="article" className="h-full" title={<CardTitle icon={Webhook}>Webhooks</CardTitle>}
+                description="Signed outbound event subscriptions, inbound webhook endpoints and the delivery log."
+                footer={<Link href="/admin/integrations/webhooks" className={buttonClasses("secondary", "sm")}>Manage webhooks</Link>}>
+                <p className="text-sm text-muted">Disabled by default; outbound destinations must match the egress allowlist over HTTPS port 443.</p>
+              </Card>
+            </li>
+            <li className="min-w-0">
               <Card as="article" className="h-full" title={<CardTitle icon={Network}>Outbound connections</CardTitle>}
                 description="The egress allowlist every integration must pass before the server opens a connection."
                 footer={<Link href={INTEGRATION_PATHS.egress} className={buttonClasses("secondary", "sm")}>Review allowlist</Link>}>
@@ -71,7 +78,8 @@ function ProviderCard({ providerKey, row, loading, scaffold }: {
 }) {
   const meta = META[providerKey];
   const scaffoldOnly = row?.scaffoldOnly ?? false;
-  const manage = !scaffoldOnly && meta.href && meta.manage
+  const allowManageLink = !scaffoldOnly || providerKey === "stripe";
+  const manage = allowManageLink && meta.href && meta.manage
     ? <Link href={meta.href} className={buttonClasses("secondary", "sm")} aria-label={`${meta.manage} (${meta.title})`}>{meta.manage}</Link>
     : undefined;
   return (

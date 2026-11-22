@@ -115,13 +115,17 @@ describe("Integrations overview", () => {
     expect(within(await card("E-mail (SMTP)")).getByText("Configured — not yet verified")).toBeInTheDocument();
     expect(within(await card("Microsoft Clarity")).getByText("Not configured")).toBeInTheDocument();
     expect(within(await card("PostHog")).getByText("Configured")).toBeInTheDocument();
-    for (const name of ["Stripe", "SAML single sign-on", "SharePoint"]) {
+    for (const name of ["SAML single sign-on", "SharePoint"]) {
       const c = await card(name);
       await waitFor(() => expect(within(c).getAllByText("Not available in this release").length).toBeGreaterThan(0));
       expect(within(c).queryByRole("link")).toBeNull();
     }
+    const stripeCard = await card("Stripe");
+    await waitFor(() => expect(within(stripeCard).getAllByText("Not available in this release").length).toBeGreaterThan(0));
+    expect(within(stripeCard).getByRole("link", { name: /Open payments/ })).toHaveAttribute("href", "/admin/payments");
     expect(within(await card("SAML single sign-on")).getByText(/local sign-in with MFA is the only active method/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Configure e-mail/ })).toHaveAttribute("href", "/admin/integrations/smtp");
+    expect(screen.getByRole("link", { name: "Manage webhooks" })).toHaveAttribute("href", "/admin/integrations/webhooks");
     expect(screen.getByRole("link", { name: "Review allowlist" })).toHaveAttribute("href", "/admin/integrations/egress");
     expect(container.querySelectorAll("h1")).toHaveLength(1);
     await expectNoAxeViolations(container);
@@ -208,7 +212,7 @@ describe("Analytics settings", () => {
 
     await userEvent.clear(screen.getByLabelText(/Project API key/));
     await userEvent.type(screen.getByLabelText(/Project API key/), "phc_abcdefghijkl1234");
-    expect(screen.getByText(/May we enable Microsoft Clarity and PostHog/)).toBeInTheDocument();
+    expect(screen.getByText(/Visitor consent from the privacy banner controls Microsoft Clarity and PostHog/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Save analytics settings" }));
 
     // Switching a vendor on needs a typed risk acknowledgement before anything reaches the server (INT-01).
