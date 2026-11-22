@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-22 (after increment 04, parts A and B, and the preview tests of prompt 20). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-22 (increment 05 documented; verification facts pending from the integrator). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -58,7 +58,11 @@ listed under "Verified" has not been proven and must not be described as working
 | Refunds (increment 04 part B) | provider refund for Stripe / Square payments, "recorded only" for manual payments, typed `REFUND ORDER` and administrator step-up, reconcile job for unknown outcomes; ADR 0038 | `server/modules/{payments,compliance,jobs}`, `client/src/features/payments/OrderRefundTab.tsx` |
 | Policy acceptance gateway (increment 04 part B) | per acting user; append-only evidence; receipt; Acceptances tab; gates uploads, recordings, intake, acknowledgements and phase submission; staff and cancellation not gated; ADR 0039 | `server/modules/compliance` (acceptance), `client/src/features/compliance/acceptance` |
 | Migrations (increment 04) | `migrations/0003_increment_04.sql` and `migrations/0004_increment_04_part_b.sql`, both additive | `migrations/` |
-| Documentation | 41 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
+| Workflow transfer (increment 05) | export of one, several or all workflows as a JSON package with a SHA-256 digest (detects damage, not a signature); import with preview, always as drafts, provenance in `order_workflow_imports`; automations not transferred; off by default (`orders.workflow_transfer.enabled`); ADR 0042 | `server/modules/orders/workflowTransfer*.ts`, `docs/guides/WORKFLOW_TRANSFER.md` |
+| Cart suggestions (increment 05) | up to three server-priced add-on, tier-upgrade or bundle-completion suggestions; accept and dismiss; admin page `/admin/carts/suggestions`; off by default (`feature.cart.upsell`); ADR 0043 | `server/modules/cart`, `client/src/features/cart` |
+| Discount codes (increment 05) | codes, batches up to 5,000, fragment links (`/promo#promo=<CODE>`); redemption inside order creation; 50 % global guard; uniform refusals, rate limit and pause; conservative release rule; console `/admin/promotions`; off by default (`feature.promotions`); ADR 0044 | `server/modules/promotions`, `client/src/features/promotions`, `server/modules/{cart,orders,compliance}` |
+| Policy acceptance log centre (increment 05) | read-only Log, Coverage and Policy updates at `/admin/policy-acceptances`, customer profile Policies tab, step-up CSV export up to 5,000 rows; always on; ADR 0045 | `server/modules/compliance`, `client/src/features/compliance/pages/acceptances` |
+| Documentation | 45 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
 
@@ -260,6 +264,13 @@ Fixed in this pass: the preview's in-app verification link did nothing (token re
 a dead "Send a new link" after confirming while signed in; a `SecurityError` when cookies are unavailable
 during analytics clean-up.
 
+## Verification for increment 05
+
+> **PLACEHOLDER — to be completed by /root.** platform_engineer has not seen any increment 05 check run.
+> Nothing in increment 05 is verified until /root replaces this block with the checks it ran and saw
+> (type check, test files, migration `0005_increment_05`, preview checks, security review outcome).
+> Not-verified items for increment 05: _placeholder — /root to supply._
+
 ## Not verified
 
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
@@ -345,6 +356,14 @@ during analytics clean-up.
   - "Order history" shows the pipeline events as "Integration production dispatch requested / delivered";
   - the `dispatch.requested` audit event does not carry the dispatch correlation reference;
   - a referral reward is recorded as credited by an administrator; the portal does not apply it to an invoice by itself.
+- Increment 05 assumptions awaiting owner confirmation (ADRs 0042–0045 are "Accepted (owner confirmation requested)"):
+  - workflow imports are always drafts, and automations are not transferred;
+  - when a code and the bundle discount both apply, the larger discount wins unless the code allows combining;
+  - the global guard caps discounts at 50 % of the subtotal;
+  - a redemption stays used after a refund. It is released only if nothing was paid, no invoice is payable and no provider payment attempt ever existed; anything else, including an error, keeps it used. To compensate a customer, the administrator issues a new code;
+  - API v1 does not accept discount codes;
+  - staff (not only administrators) can read the acceptance log.
+- Increment 05 follow-ups are tracked in `docs/security/INCREMENT_05_REVIEW.md`.
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).
