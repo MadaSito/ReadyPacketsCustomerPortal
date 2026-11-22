@@ -10,7 +10,7 @@ import type { AuditCtx } from "./access.js";
 import { createChainService } from "./chain.js";
 import { createAuditEmitter, type DurableAuditEmitter } from "./emitter.js";
 import { canonicalBytes } from "./envelope.js";
-import { classifyOrderEvent, listOrderActivity, listOrderStatusHistory } from "./orderActivity.js";
+import { classifyOrderEvent, humanizeEventName, listOrderActivity, listOrderStatusHistory } from "./orderActivity.js";
 import { rowToEnvelope } from "./rows.js";
 import * as auditSchema from "./schema.js";
 import { auditEvents } from "./schema.js";
@@ -143,7 +143,7 @@ describe("order activity port (real MySQL)", () => {
     const byName = Object.fromEntries(page.items.map((i) => [`${i.eventName}:${i.outcome}`, i]));
     expect(byName["order.status.changed:completed"]).toMatchObject({ actor: STAFF_NAME, actorRole: "staff", category: "status" });
     expect(byName["order.production.dispatch.failed:failed"]).toMatchObject({ actor: "System", category: "production" });
-    expect(byName["order.mystery.thing:completed"]).toMatchObject({ category: "other", label: "order.mystery.thing" });
+    expect(byName["order.mystery.thing:completed"]).toMatchObject({ category: "other", label: "Order mystery thing" });
     expect(page.items.every((i) => i.correlationId?.startsWith("corr-"))).toBe(true);
     expect(JSON.stringify(page)).not.toContain("203.0.113.77");
     expect(JSON.stringify(page)).not.toContain("order_public_id");
@@ -186,7 +186,7 @@ describe("order activity port (real MySQL)", () => {
     const files = await listOrderActivity(ctx, staff, { orderPublicId: ORDER_A, category: "files" });
     expect(files.items).toHaveLength(3);
     const other = await listOrderActivity(ctx, staff, { orderPublicId: ORDER_A, category: "other" });
-    expect(other.items.map((i) => i.label)).toEqual(["order.mystery.thing"]);
+    expect(other.items.map((i) => i.label)).toEqual(["Order mystery thing"]);
     expect((await listOrderActivity(ctx, owner, { orderPublicId: ORDER_A, category: "production" })).items).toEqual([]);
     expect((await listOrderActivity(ctx, owner, { orderPublicId: ORDER_A, category: "other" })).items).toEqual([]);
   });
@@ -253,6 +253,21 @@ describe("order activity port (real MySQL)", () => {
     await expect(listOrderStatusHistory(ctx, sharer, { orderPublicId: ORDER_A, limit: 1, cursor: first.nextCursor })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
     await expect(listOrderStatusHistory(ctx, staff, { orderPublicId: ORDER_A, limit: 1, cursor: first.nextCursor })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
     await expect(listOrderStatusHistory(ctx, owner, { orderPublicId: ORDER_A, limit: 1, cursor: "AAAA" })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
+  });
+
+  it("invoice and payment events get friendly labels in Payments; unknown ones are humanised", async () => {
+    const names = ["invoice.created", "invoice.issued", "invoice.payment.recorded", "invoice.refund.recorded", "invoice.voided", "invoice.refund.refused", "invoice.brand_new.thing"];
+    for (const eventName of names) await emit(staff, { eventName, outcome: "completed", resource: { type: "invoice", publicId: "inv_synthetic_0001" }, attributes: { order_public_id: ORDER_A } });
+    const page = await staffPage({ orderPublicId: ORDER_A, category: "payments" });
+    expect(page.items.map((i) => i.label).sort()).toEqual(
+      ["Invoice created", "Invoice issued", "Payment recorded", "Refund recorded", "Invoice voided", "Refund refused", "Invoice brand new thing"].sort(),
+    );
+    expect(page.items.every((i) => i.category === "payments")).toBe(true);
+    expect((await listOrderActivity(ctx, staff, { orderPublicId: ORDER_A, category: "other" })).items).toEqual([]);
+    const customer = await listOrderActivity(ctx, owner, { orderPublicId: ORDER_A, category: "payments" });
+    expect(customer.items.map((i) => i.label).sort()).toEqual(["Invoice issued", "Invoice voided", "Payment recorded", "Refund recorded"]);
+    expect(humanizeEventName("invoice.refund.recorded")).toBe("Invoice refund recorded");
+    expect(humanizeEventName("payment.provider_event.x")).toBe("Payment provider event x");
   });
 
   it("classifies exact customer entries before their wildcard", () => {

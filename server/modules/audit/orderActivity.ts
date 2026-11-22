@@ -72,8 +72,34 @@ export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze
   { pattern: "order.stage_actions.run", category: "automation", label: "Workflow stage actions run", customer: false },
   { pattern: "automation.manual.triggered", category: "automation", label: "Automation run", customer: false },
   { pattern: "payment.refund.succeeded", category: "payments", label: "Refund issued", customer: true },
-  { pattern: "payment.refund.*", category: "payments", label: "Refund", customer: false },
+  { pattern: "payment.refund.prepared", category: "payments", label: "Refund prepared", customer: false },
+  { pattern: "payment.refund.sent", category: "payments", label: "Refund sent to the payment provider", customer: false },
+  { pattern: "payment.refund.failed", category: "payments", label: "Refund failed", customer: false },
+  { pattern: "payment.refund.unknown", category: "payments", label: "Refund outcome unknown", customer: false },
+  { pattern: "payment.created", category: "payments", label: "Payment created", customer: false },
+  { pattern: "payment.updated", category: "payments", label: "Payment updated", customer: false },
+  { pattern: "invoice.created", category: "payments", label: "Invoice created", customer: false },
+  { pattern: "invoice.draft_updated", category: "payments", label: "Invoice draft updated", customer: false },
+  { pattern: "invoice.updated", category: "payments", label: "Invoice updated", customer: false },
+  { pattern: "invoice.issued", category: "payments", label: "Invoice issued", customer: true },
+  { pattern: "invoice.paid", category: "payments", label: "Invoice paid", customer: true },
+  { pattern: "invoice.payment.recorded", category: "payments", label: "Payment recorded", customer: true },
+  { pattern: "invoice.payment.refused", category: "payments", label: "Payment refused", customer: false },
+  { pattern: "invoice.refund.recorded", category: "payments", label: "Refund recorded", customer: true },
+  { pattern: "invoice.refund.refused", category: "payments", label: "Refund refused", customer: false },
+  { pattern: "invoice.voided", category: "payments", label: "Invoice voided", customer: true },
+  { pattern: "invoice.downloaded", category: "payments", label: "Invoice downloaded", customer: false },
+  { pattern: "invoice.provider_event.scaffold_recorded", category: "payments", label: "Payment provider event recorded", customer: false },
+  /* Wildcards label with the humanised event name (see `humanizeEventName`). */
+  { pattern: "payment.*", category: "payments", label: "", customer: false },
+  { pattern: "invoice.*", category: "payments", label: "", customer: false },
 ]);
+
+/** "invoice.refund.recorded" → "Invoice refund recorded": unknown or wildcard events never show a dotted identifier. */
+export function humanizeEventName(eventName: string): string {
+  const words = eventName.replace(/[._]+/gu, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Activity";
+}
 
 function matches(entry: CatalogueEntry, eventName: string): boolean {
   return entry.pattern.endsWith(".*") ? eventName.startsWith(entry.pattern.slice(0, -1)) : eventName === entry.pattern;
@@ -209,7 +235,8 @@ export async function listOrderActivity(ctx: AuditCtx, principal: SessionPrincip
 
 function base(row: Row) {
   const entry = classifyOrderEvent(row.eventName);
-  return { at: row.occurredAt.toISOString(), category: entry?.category ?? ("other" as const), label: entry?.label ?? row.eventName };
+  const label = entry && !entry.pattern.endsWith(".*") && entry.label ? entry.label : humanizeEventName(row.eventName);
+  return { at: row.occurredAt.toISOString(), category: entry?.category ?? ("other" as const), label };
 }
 
 function customerItem(ctx: AuditCtx, principal: SessionPrincipal, row: Row): OrderActivityCustomerItem {
