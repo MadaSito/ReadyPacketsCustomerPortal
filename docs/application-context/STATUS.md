@@ -175,15 +175,18 @@ checks listed in each module's `VERIFICATION.md`, and the second-engineer securi
 
 ## Verified for increment 04 (integrator's own runs)
 
-Automated, whole project, on branch `feat/increment-04` at commit `1c55cb8` (the two later commits change one
-example string, re-tested, and documentation):
+Automated, whole project, on branch `feat/increment-04` at commit `b00f8df`:
 
 - type check clean; ESLint clean with `--max-warnings 0`
-- full test run: 168 files, 2034 tests passed, 4 placeholders (`todo`), no failures. This includes
+- full test run: 168 files, 2041 tests passed, 4 placeholders (`todo`), no failures. This includes
   `tests/migrations.test.ts` (committed migrations produce exactly the declared schema). Two earlier full
   runs on the same branch each had one test fail under load and pass when run alone
-  (`consent.test.tsx`, `mailTemplates.test.tsx`); neither failed in the final run
-- production build and preview build succeed (at `efb7fa8`)
+  (`consent.test.tsx`, `mailTemplates.test.tsx`); neither failed in the last two full runs
+- the two code commits after `b00f8df` (`838de62` wrapping of radio option text, and the "New order"
+  heading kept visible while the order wizard loads) were checked with the type check, ESLint on the changed
+  files and their test files (`ui.test.tsx`, `increment04.test.tsx`, `storage.test.tsx`,
+  `complianceCustomer.test.tsx`), not with another full run
+- production build succeeds at the head of the branch; preview build succeeded at `efb7fa8`
 - `shellcheck -x` clean on the deployment and CI scripts listed in the `native-install` and `container`
   workflows
 - migrations `0003_increment_04` and `0004_increment_04_part_b` applied to a populated development
@@ -208,6 +211,12 @@ Browser, development profile with cookie sessions and synthetic data, Chromium, 
   acknowledgement request are both refused by the server with HTTP 409 `ORDER_ACCEPTANCE_REQUIRED`; after
   acceptance the gate disappears and the receipt link appears
 - console "Acceptances (1)" tab shows the record (who, when, policy and version, text fingerprint, receipt)
+- customer upload of a PDF into a document requirement and of an M4A file into an audio requirement: both
+  accepted, the checklist counts them, and the worker produced the WebM copy ("Converted WebM audio"); the
+  console Files tab lists all three; with no storage connection assigned the console "File sync" tab says so
+  and nothing is queued
+- `/orders/new` keeps its page heading during load (6 of 6 navigations) and `/admin/storage/new` has no
+  horizontal overflow at 240 px in both themes, at the head of the branch
 
 Checks on pull request 8 (GitHub-hosted runners): see the pull request for the final run of `ci`,
 `security`, `container` and `native-install`. The `native-install` workflow includes an upgrade from the
@@ -216,7 +225,12 @@ previous release (`89c5cb8`) that asserts both new migrations are applied.
 Reported by the engineering team and reviewed, but not re-run by the integrator: the per-module test
 files quoted in each module's `VERIFICATION.md`; the security review
 (`docs/verification/INCREMENT_04_SECURITY_REVIEW.md`, no open release blockers); the accessibility and
-responsive browser sweeps of part A and part B (`docs/verification/ACCESSIBILITY.md`).
+responsive browser sweeps (`docs/verification/ACCESSIBILITY.md`): a full sweep at build `50a7dd6`
+(accessibility 1002 checks, 26 failed; responsive 2672 checks at eight widths from 240 px to 2560 px, 46
+failed; 24 fixtures missing in each), fixes, and a targeted recheck of the failed routes at `b00f8df` that
+passed except the two items the integrator rechecked above. The routes that passed in the full sweep were
+not swept again after the fixes. Browser zoom and assistive technology were not exercised. The integrator
+did not exercise the in-browser audio recorder in a browser; it has component tests only.
 
 ## Not verified
 
