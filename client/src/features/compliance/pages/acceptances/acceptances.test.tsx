@@ -580,10 +580,15 @@ describe("Package D2 — Policy Acceptance Log Centre & Customer Policies Tab", 
   });
 
   it("renders Coverage tab, Policy updates tab, keyboard RouteTabs navigation, Customer Policies tab, and Exact Version Text page", async () => {
-    // Start on Log tab and navigate via keyboard ArrowRight + Space to Coverage
+    // Start on Log tab and exercise Home/End + ArrowRight + Space keyboard navigation on RouteTabs
     const view = renderRoutes("/admin/policy-acceptances", "staff");
     const logTab = await screen.findByRole("tab", { name: "Log" });
     logTab.focus();
+    await userEvent.keyboard("{End}");
+    const updatesTab = screen.getByRole("tab", { name: "Policy updates" });
+    expect(document.activeElement).toBe(updatesTab);
+    await userEvent.keyboard("{Home}");
+    expect(document.activeElement).toBe(logTab);
     await userEvent.keyboard("{ArrowRight}");
     const coverageTab = screen.getByRole("tab", { name: "Coverage" });
     expect(document.activeElement).toBe(coverageTab);
@@ -651,6 +656,74 @@ describe("Package D2 — Policy Acceptance Log Centre & Customer Policies Tab", 
       await screen.findByText("You do not have permission to view policy acceptance records."),
     ).toBeInTheDocument();
     expect(screen.queryByText("No policy acceptances recorded yet")).toBeNull();
+  });
+
+  it("keeps LoadMore active when bounded scan returns 0 rows with a non-null nextCursor (Log & Customer Policies tabs)", async () => {
+    // 1. AcceptanceLogTab: sparse page 1 (`items: [], nextCursor: "cursor_sparse_2"`) -> page 2 match
+    const logView = renderRoutes("/admin/policy-acceptances", "staff", {
+      "compliance.policies.admin.acceptanceLog.list": (rawInput) => {
+        const input = (rawInput ?? {}) as AcceptanceLogFilterInput & { cursor?: string };
+        if (input.cursor === "cursor_sparse_2") {
+          return { items: [logItemCurrent()], nextCursor: null };
+        }
+        return { items: [], nextCursor: "cursor_sparse_2" };
+      },
+    });
+
+    const sparseSummary = await screen.findByText(
+      "No matches on this page yet. Load more to keep searching.",
+    );
+    expect(sparseSummary).toHaveAttribute("role", "status");
+    // Final empty state is NOT prematurely rendered while nextCursor exists
+    expect(screen.queryByText("No policy acceptances recorded yet")).toBeNull();
+    expect(screen.queryByText("No matching acceptance records")).toBeNull();
+
+    const loadMoreBtn = screen.getByRole("button", { name: "Load more records" });
+    loadMoreBtn.focus();
+    await userEvent.click(loadMoreBtn);
+
+    expect((await screen.findAllByText("Cara Customer")).length).toBeGreaterThan(0);
+    await waitFor(() => {
+      const finalSummary = screen.getByText("Showing 1 acceptance record");
+      expect(finalSummary).toHaveAttribute("role", "status");
+      expect(document.activeElement).toBe(finalSummary);
+    });
+    logView.unmount();
+
+    // 2. CustomerPoliciesTab: sparse page 1 (`history: [], nextCursor: "cust_sparse_2"`) -> page 2 match
+    renderWithTrpc(
+      <CustomerDetailHost customerId={CUST_CARA} />,
+      baseFixtures("staff", {
+        "compliance.policies.admin.acceptanceLog.forCustomer": (rawInput) => {
+          const input = (rawInput ?? {}) as { cursor?: string };
+          if (input.cursor === "cust_sparse_2") {
+            return {
+              ...customerProfileFixture,
+              history: [logItemCurrent()],
+              nextCursor: null,
+            };
+          }
+          return {
+            ...customerProfileFixture,
+            history: [],
+            nextCursor: "cust_sparse_2",
+          };
+        },
+      }),
+      {
+        path: `/admin/customers/${CUST_CARA}`,
+        role: "staff",
+      },
+    );
+
+    expect(
+      await screen.findByText("No matches on this page yet. Load more to keep searching."),
+    ).toHaveAttribute("role", "status");
+    expect(screen.queryByText("No acceptances recorded for this customer")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Load more history" }));
+    expect(
+      await screen.findByText("Showing 1 acceptance record"),
+    ).toHaveAttribute("role", "status");
   });
 });
 

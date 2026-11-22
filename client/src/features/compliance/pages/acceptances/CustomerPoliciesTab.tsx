@@ -170,6 +170,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
   const firstPage = profileQuery.data?.pages[0];
   const policyRows = firstPage?.policies ?? [];
   const historyRows = profileQuery.data?.pages.flatMap((page) => page.history) ?? [];
+  const hasMoreHistory = Boolean(profileQuery.hasNextPage);
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -222,28 +223,37 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
               </Button>
             )}
             empty={
-              <EmptyState
-                size="sm"
-                headingLevel={3}
-                title="No acceptances recorded for this customer"
-                description="When this customer accepts a policy at registration, checkout, re-acceptance, or an order gate, the immutable record appears here."
-              />
+              hasMoreHistory ? (
+                <EmptyState
+                  size="sm"
+                  headingLevel={3}
+                  title="No matches on this page yet"
+                  description="Older acceptance batches remain for this customer. Select Load more history below to keep searching."
+                />
+              ) : (
+                <EmptyState
+                  size="sm"
+                  headingLevel={3}
+                  title="No acceptances recorded for this customer"
+                  description="When this customer accepts a policy at registration, checkout, re-acceptance, or an order gate, the immutable record appears here."
+                />
+              )
             }
           />
 
-          {historyRows.length > 0 ? (
-            <LoadMore
-              hasMore={Boolean(profileQuery.hasNextPage)}
-              loading={profileQuery.isFetchingNextPage}
-              onLoadMore={() => void profileQuery.fetchNextPage()}
-              summary={`Showing ${historyRows.length} acceptance ${historyRows.length === 1 ? "record" : "records"}`}
-              label="Load more history"
-            />
-          ) : (
-            <p role="status" className="sr-only">
-              0 acceptance records for this customer.
-            </p>
-          )}
+          <LoadMore
+            hasMore={hasMoreHistory}
+            loading={profileQuery.isFetchingNextPage}
+            onLoadMore={() => void profileQuery.fetchNextPage()}
+            summary={
+              historyRows.length > 0
+                ? `Showing ${historyRows.length} acceptance ${historyRows.length === 1 ? "record" : "records"}`
+                : hasMoreHistory
+                  ? "No matches on this page yet. Load more to keep searching."
+                  : "0 acceptance records for this customer."
+            }
+            label="Load more history"
+          />
         </div>
       </Card>
 

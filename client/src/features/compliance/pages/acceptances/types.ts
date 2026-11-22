@@ -265,5 +265,6 @@ export interface AcceptanceLogProcedures {
 
 export function useAcceptanceLogProcedures(): AcceptanceLogProcedures {
   const trpc = useTRPC();
-  return (trpc.compliance.policies.admin as unknown as { acceptanceLog: AcceptanceLogProcedures }).acceptanceLog;
+  const realProcedures = trpc.compliance.policies.admin.acceptanceLog;
+  return realProcedures as unknown as AcceptanceLogProcedures;
 }

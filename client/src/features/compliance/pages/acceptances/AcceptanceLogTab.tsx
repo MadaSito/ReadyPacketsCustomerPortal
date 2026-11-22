@@ -98,6 +98,7 @@ export function AcceptanceLogTab({
   }, [filterOptionsQuery.data, filters.policyDocumentPublicId]);
 
   const rows = listQuery.data?.pages.flatMap((page) => page.items);
+  const hasMore = Boolean(listQuery.hasNextPage);
 
   const columns = useMemo<readonly Column<AcceptanceLogItem>[]>(
     () => [
@@ -326,39 +327,47 @@ export function AcceptanceLogTab({
           </Button>
         )}
         empty={
-          <EmptyState
-            variant={activeFilterCount > 0 ? "filtered" : "default"}
-            title={
-              activeFilterCount > 0
-                ? "No matching acceptance records"
-                : "No policy acceptances recorded yet"
-            }
-            description={
-              activeFilterCount > 0
-                ? "Adjust or clear the filters to inspect broader policy acceptance evidence."
-                : "Account, checkout, and order-gate acceptances appear here automatically as customers accept policies."
-            }
-            onClearFilters={activeFilterCount > 0 ? onResetFilters : undefined}
-          />
+          hasMore ? (
+            <EmptyState
+              variant="filtered"
+              title="No matches on this page yet"
+              description="This scan window contained no matching records, and older acceptance history remains. Select Load more records below to keep searching."
+            />
+          ) : (
+            <EmptyState
+              variant={activeFilterCount > 0 ? "filtered" : "default"}
+              title={
+                activeFilterCount > 0
+                  ? "No matching acceptance records"
+                  : "No policy acceptances recorded yet"
+              }
+              description={
+                activeFilterCount > 0
+                  ? "Adjust or clear the filters to inspect broader policy acceptance evidence."
+                  : "Account, checkout, and order-gate acceptances appear here automatically as customers accept policies."
+              }
+              onClearFilters={activeFilterCount > 0 ? onResetFilters : undefined}
+            />
+          )
         }
       />
 
       {!listQuery.isPending && !listQuery.isError ? (
-        rows && rows.length > 0 ? (
-          <LoadMore
-            hasMore={Boolean(listQuery.hasNextPage)}
-            loading={listQuery.isFetchingNextPage}
-            onLoadMore={() => void listQuery.fetchNextPage()}
-            summary={`Showing ${rows.length} acceptance ${rows.length === 1 ? "record" : "records"}`}
-            label="Load more records"
-          />
-        ) : (
-          <p role="status" className="sr-only">
-            {activeFilterCount > 0
-              ? "0 matching acceptance records."
-              : "0 policy acceptance records."}
-          </p>
-        )
+        <LoadMore
+          hasMore={hasMore}
+          loading={listQuery.isFetchingNextPage}
+          onLoadMore={() => void listQuery.fetchNextPage()}
+          summary={
+            rows && rows.length > 0
+              ? `Showing ${rows.length} acceptance ${rows.length === 1 ? "record" : "records"}`
+              : hasMore
+                ? "No matches on this page yet. Load more to keep searching."
+                : activeFilterCount > 0
+                  ? "0 matching acceptance records."
+                  : "0 policy acceptance records."
+          }
+          label="Load more records"
+        />
       ) : null}
 
       <AcceptanceEvidenceDialog
