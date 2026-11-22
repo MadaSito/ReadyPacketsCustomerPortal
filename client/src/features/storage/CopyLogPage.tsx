@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, HardDriveDownload } from "lucide-react";
-import { Link } from "wouter";
+import { Link, useSearch } from "wouter";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Button, Callout, DataTable, DateTime, Drawer, EmptyState, ErrorState, Field, Input, KeyValueList,
@@ -28,6 +28,7 @@ const emptyDraft: Draft = { kind: "", state: "", connection: "", text: "", from:
 const stateTones = { queued: "info", written: "info", verified: "success", failed: "danger", not_written: "neutral" } as const;
 const options = (labels: Readonly<Record<string, string>>) => Object.entries(labels).map(([value, label]) => ({ value, label }));
 const bytesLabel = (bytes: number | null) => bytes === null ? "Not recorded" : `${bytes.toLocaleString()} bytes`;
+const orderIdPattern = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
 
 function filtersFrom(draft: Draft): Filters {
   if (draft.from && draft.through && draft.from > draft.through) throw new Error("The start date must be on or before the end date.");
@@ -57,12 +58,17 @@ export function CopyLogPage() {
   const client = useQueryClient();
   const toast = useToast();
   const stepUp = useStepUp();
+  const orderParams = new URLSearchParams(useSearch()).getAll("orderPublicId");
+  const orderPublicId = orderParams.length === 1 && orderIdPattern.test(orderParams[0] ?? "") ? orderParams[0] : undefined;
+  const invalidOrderFilter = orderParams.length > 0 && orderPublicId === undefined;
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   const [applied, setApplied] = useState<Filters>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const list = useInfiniteQuery(trpc.storage.copies.list.infiniteQueryOptions(applied, {
+  const effective = { ...applied, ...(orderPublicId ? { orderPublicId } : {}) };
+  const list = useInfiniteQuery(trpc.storage.copies.list.infiniteQueryOptions(effective, {
     getNextPageParam: (page) => page.nextCursor ?? undefined,
+    enabled: !invalidOrderFilter,
   }));
   const connections = useInfiniteQuery(trpc.storage.copies.connections.infiniteQueryOptions({}, {
     getNextPageParam: (page) => page.nextCursor ?? undefined,
@@ -83,7 +89,7 @@ export function CopyLogPage() {
 
   async function exportMatches() {
     try {
-      const result = await exportCsv.mutateAsync(applied);
+      const result = await exportCsv.mutateAsync(effective);
       saveCsv(result.csv);
       toast.show({
         title: "CSV downloaded",
@@ -121,6 +127,13 @@ export function CopyLogPage() {
         actions={<Button variant="secondary" leadingIcon={<Download className="size-4" aria-hidden="true" />}
           loading={exportCsv.isPending} disabled={list.isPending || list.isError} onClick={() => void exportMatches()}>Export CSV</Button>} />
       <div className="space-y-5">
+        {invalidOrderFilter && <Callout tone="warning" title="Invalid order filter">
+          <Link href="/admin/storage/copies" className="text-link underline">View the unfiltered Copy log</Link>
+        </Callout>}
+        {orderPublicId && <Callout tone="info" title="Filtered to one order">
+          <code className="break-all text-xs">{orderPublicId}</code>{" "}
+          <Link href="/admin/storage/copies" className="text-link underline">Clear order filter</Link>
+        </Callout>}
         <form className="space-y-4 rounded-[var(--radius-card)] border border-line bg-surface p-4"
           aria-label="Filter copy attempts" onSubmit={(event) => {
             event.preventDefault();
@@ -155,7 +168,8 @@ export function CopyLogPage() {
               <Input type="search" maxLength={96} value={draft.text} onChange={(event) => setDraft({ ...draft, text: event.target.value })} />
             </Field>
           </div>
-          <p className="text-sm text-muted">Default: last seven days. Select a range of up to 90 days.</p>
+          <p className="text-sm text-muted">{orderPublicId ? "Showing this order’s full history unless a date range is set." :
+            "Default: last seven days."} Select a range of up to 90 days.</p>
           {formError && <Callout tone="danger" title="Check the date range" live="assertive">{formError}</Callout>}
           {connections.isError && <Callout tone="warning" title="Connection choices could not be loaded">
             You can still search by destination ID. <Button variant="ghost" onClick={() => void connections.refetch()}>Reload connections</Button>
@@ -174,7 +188,7 @@ export function CopyLogPage() {
           }))} />
         </section>}
         <div aria-live="polite" className="sr-only">{rows ? `${rows.length.toLocaleString()} attempts shown` : ""}</div>
-        <DataTable caption="Storage copy attempts" rows={rows} rowKey={(row) => row.publicId} loading={list.isPending}
+        {!invalidOrderFilter && <DataTable caption="Storage copy attempts" rows={rows} rowKey={(row) => row.publicId} loading={list.isPending}
           error={list.isError && !list.data ? list.error : undefined} onRetry={() => void list.refetch()}
           empty={<EmptyState icon={HardDriveDownload} title="No matching copy attempts"
             description="Try different filters. Attempts are recorded from the Copy log rollout onward."
@@ -186,13 +200,15 @@ export function CopyLogPage() {
             </div> },
             { key: "time", header: "Time", cell: (row) => <DateTime value={row.createdAt} /> },
             { key: "destination", header: "Destination", cell: (row) => <span className="break-words">{row.connectionName ?? row.connectionPublicId}</span> },
+            { key: "target", header: "Target path", cell: (row) => row.targetPath ?
+              <code className="break-all text-xs">{row.targetPath}</code> : "Not recorded" },
             { key: "state", header: "State", cell: (row) => <div>
               <Badge tone={stateTones[row.state]}>{states[row.state]}</Badge>
               <span className="mt-1 block text-xs text-muted">Attempt {row.attempt.toLocaleString()}</span>
             </div> },
           ]}
           rowActions={(row) => <Button variant="ghost" aria-label={`View ${kinds[row.kind]} copy attempt ${row.publicId}`}
-            onClick={() => setSelected(row.publicId)}>Details</Button>} />
+            onClick={() => setSelected(row.publicId)}>Details</Button>} />}
         {list.isFetchNextPageError && <ErrorState error={list.error} onRetry={() => void list.fetchNextPage()} />}
         <LoadMore loading={list.isFetchingNextPage} hasMore={list.hasNextPage} onLoadMore={() => void list.fetchNextPage()} />
       </div>
@@ -207,8 +223,10 @@ export function CopyLogPage() {
               attempt.verification === "provider_readback" ? "Confirmed by provider read-back" : "Not verified" },
             { label: "Source kind", value: kinds[attempt.kind] },
             { label: "Source ID", value: <code className="break-all text-xs">{attempt.sourcePublicId}</code> },
+            { label: "Order ID", value: attempt.orderPublicId ? <code className="break-all text-xs">{attempt.orderPublicId}</code> : "Not recorded" },
             { label: "Connection", value: attempt.connectionName ?? "Connection not available" },
             { label: "Connection ID", value: <code className="break-all text-xs">{attempt.connectionPublicId}</code> },
+            { label: "Target path", value: attempt.targetPath ? <code className="break-all text-xs">{attempt.targetPath}</code> : "Not recorded", wide: true },
             { label: "Size", value: bytesLabel(attempt.bytes) },
             { label: "Attempt", value: attempt.attempt.toLocaleString() },
             { label: "Job ID", value: <code className="break-all text-xs">{attempt.jobPublicId}</code> },

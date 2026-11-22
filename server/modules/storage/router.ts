@@ -1,5 +1,6 @@
-import { adminProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { adminProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { copyLogConnections, copyLogDetail, copyLogFilters, copyLogList } from "./copyLog.js";
+import { orderCopyList, orderCopyRetry } from "./orderCopies.js";
 import { storageAssignment, storageCreate, storageGet, storageList, storageTest, storageUpdate } from "./validation.js";
 
 const admin = adminProcedure.use(requireCapability("storage.manage"));
@@ -7,6 +8,10 @@ const copyReader = adminProcedure.use(requireCapability("storage.copies.read"));
 
 export const storageRouter = router({
   copies: router({
+    forOrder: staffProcedure.use(requireCapability("orders.read_all")).input(orderCopyList)
+      .query(({ ctx, input }) => ctx.services.storageConnections.orderCopies.forOrder(ctx.session, input)),
+    retryOrderFile: staffProcedure.use(requireCapability("files.manage")).meta({ rateLimit: "expensive" }).input(orderCopyRetry)
+      .mutation(({ ctx, input }) => ctx.services.storageConnections.orderCopies.retryOrderFile(ctx.session, input, ctx.request.requestId)),
     list: copyReader.input(copyLogList).query(({ ctx, input }) => ctx.services.storageConnections.copies.list(ctx.session, input)),
     detail: copyReader.input(copyLogDetail).query(({ ctx, input }) => ctx.services.storageConnections.copies.detail(ctx.session, input)),
     connections: copyReader.input(copyLogConnections).query(({ ctx, input }) => ctx.services.storageConnections.copies.connections(ctx.session, input)),

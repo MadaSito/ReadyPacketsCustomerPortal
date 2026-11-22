@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import superjson from "superjson";
 import { expect, it } from "vitest";
+import { Router } from "wouter";
 import { RouteFocus } from "@/app/RouteFocus";
 import { TRPCProvider } from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
@@ -13,15 +14,17 @@ import { CopyLogPage } from "./CopyLogPage";
 const path = "/admin/storage/copies";
 const publicId = "01JD0000000000000000000001";
 const connectionPublicId = "01JD0000000000000000000002";
+const orderPublicId = "01JD0000000000000000000004";
 const time = new Date("2026-11-21T13:00:00.000Z");
 const row = {
   publicId, connectionPublicId, connectionName: "Office storage", provider: "dropbox", jobPublicId: publicId,
   sourcePublicId: "01JD0000000000000000000003", kind: "order_file", attempt: 1, createdAt: time,
   startedAt: time, finishedAt: time, bytes: 481, state: "written", verified: false,
-  verification: null, errorCode: null, correlationId: "copy-test",
+  verification: null, errorCode: null, correlationId: "copy-test", orderPublicId,
+  targetPath: "customers/RPCUS-TEST00001/orders/RP-42/file.webm",
 };
 
-function renderCopyLog() {
+function renderCopyLog(search = "") {
   const queryClient = createTestQueryClient();
   const requests: Array<{ route: string; input: unknown }> = [];
   const trpcClient = createTRPCClient<AppRouter>({
@@ -46,7 +49,9 @@ function renderCopyLog() {
     })],
   });
   renderUi(<main><RouteFocus title="Copy log" path={path} /><CopyLogPage /></main>, {
-    queryClient, path, wrapper: (tree) => <TRPCProvider queryClient={queryClient} trpcClient={trpcClient}>{tree}</TRPCProvider>,
+    queryClient, path, wrapper: (tree) => <Router searchHook={() => search}>
+      <TRPCProvider queryClient={queryClient} trpcClient={trpcClient}>{tree}</TRPCProvider>
+    </Router>,
   });
   return requests;
 }
@@ -55,6 +60,17 @@ pageA11y(path, async () => {
   renderCopyLog();
   await screen.findByRole("heading", { level: 1, name: "Copy log" });
   await screen.findByRole("table", { name: "Storage copy attempts" });
+});
+
+it("applies the order deep-link scope and exposes the logged target path in the table and details", async () => {
+  const requests = renderCopyLog(`orderPublicId=${orderPublicId}`);
+  const user = userEvent.setup();
+  const table = await screen.findByRole("table", { name: "Storage copy attempts" });
+  expect(within(table).getByText(row.targetPath)).toBeInTheDocument();
+  expect(requests).toContainEqual({ route: "storage.copies.list", input: { direction: "forward", orderPublicId } });
+  await user.click(within(table).getByRole("button", { name: /View Order file copy attempt/ }));
+  const drawer = await screen.findByRole("dialog", { name: "Copy attempt details" });
+  expect(await within(drawer).findByText(row.targetPath)).toBeVisible();
 });
 
 it("applies named filters and opens unverified write details by keyboard", async () => {

@@ -14,6 +14,9 @@ type AttemptIdentity = {
   attempt: number;
   correlationId?: string | null;
   bytes?: number | null;
+  orderPublicId?: string;
+  targetPathEnc?: string;
+  phaseLabelEnc?: string;
 };
 
 export type CopyAttemptEvent = AttemptIdentity & (

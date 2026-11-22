@@ -6,6 +6,7 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import type { ModuleHealth, SessionPrincipal, Tx } from "../../core/types.js";
 import { jobAttempts, jobRuns } from "../jobs/schema.js";
 import { COPY_KINDS, COPY_STATES, type CopyState } from "./copyLogTypes.js";
+import { copyAttemptPrivateAad } from "./copyLogWriter.js";
 import { storageConnections, storageCopyAttempts as attempts } from "./schema.js";
 import { storagePublicId } from "./validation.js";
 
@@ -17,6 +18,7 @@ const filterFields = {
   kind: z.enum(COPY_KINDS).optional(),
   state: z.enum(COPY_STATES).optional(),
   connectionPublicId: storagePublicId.optional(),
+  orderPublicId: storagePublicId.optional(),
   from: z.iso.datetime().optional(),
   through: z.iso.datetime().optional(),
   text: z.string().trim().min(1).max(96).optional(),
@@ -59,6 +61,8 @@ const fields = {
   publicId: attempts.publicId,
   kind: attempts.kind,
   sourcePublicId: attempts.sourcePublicId,
+  orderPublicId: attempts.orderPublicId,
+  targetPathEnc: attempts.targetPathEnc,
   connectionPublicId: attempts.connectionPublicId,
   connectionName: storageConnections.name,
   provider: storageConnections.kind,
@@ -83,10 +87,6 @@ function loggedRows(tx: Tx, where: SQL | undefined, limit: number) {
 }
 type Row = Awaited<ReturnType<typeof loggedRows>>[number];
 
-function view({ id: _id, ...row }: Row) {
-  return { ...row, verified: row.state === "verified" };
-}
-
 function conditions(filters: Filters, now: Date) {
   const through = filters.through ? new Date(filters.through) : now;
   const from = filters.from ? new Date(filters.from) : new Date(through.getTime() - DEFAULT_DAYS * DAY_MS);
@@ -96,10 +96,11 @@ function conditions(filters: Filters, now: Date) {
   }
   const text = filters.text;
   return and(
-    gte(attempts.createdAt, from), lte(attempts.createdAt, through),
+    ...(!filters.orderPublicId || filters.from || filters.through ? [gte(attempts.createdAt, from), lte(attempts.createdAt, through)] : []),
     filters.kind ? eq(attempts.kind, filters.kind) : undefined,
     filters.state ? eq(state, filters.state) : undefined,
     filters.connectionPublicId ? eq(attempts.connectionPublicId, filters.connectionPublicId) : undefined,
+    filters.orderPublicId ? eq(attempts.orderPublicId, filters.orderPublicId) : undefined,
     text ? or(...[attempts.sourcePublicId, attempts.connectionPublicId, correlation, storageConnections.name, errorCode]
       .map((column) => sql`locate(${text}, ${column}) > 0`)) : undefined,
   );
@@ -125,6 +126,13 @@ function csv(rows: Row[]): string {
 
 export function createCopyLogService(deps: ModuleDeps) {
   const { db, clock, audit, services } = deps;
+  function view({ id: _id, targetPathEnc, ...row }: Row) {
+    let targetPath: string | null = null;
+    try {
+      if (targetPathEnc) targetPath = deps.crypto.decrypt(targetPathEnc, copyAttemptPrivateAad("target_path", row.jobPublicId, row.attempt));
+    } catch { /* An unreadable historical label is not needed to inspect the outcome. */ }
+    return { ...row, targetPath, verified: row.state === "verified" };
+  }
 
   async function read<T>(principal: SessionPrincipal, fn: (tx: Tx) => Promise<T>) {
     if (principal.state !== "full" || principal.role !== "admin" || !roleHasCapability(principal.role, "storage.copies.read")) {
@@ -158,7 +166,8 @@ export function createCopyLogService(deps: ModuleDeps) {
     async list(principal: SessionPrincipal, input: z.infer<typeof copyLogList>) {
       const filters = conditions(input, clock.now());
       return read(principal, async (tx) => {
-        const cursor = input.cursor ? await lookup(tx, input.cursor) : null;
+        const [cursor] = input.cursor ? await loggedRows(tx, and(filters, eq(attempts.publicId, input.cursor)), 1) : [];
+        if (input.cursor && !cursor) throw notFound("COPY_ATTEMPT_NOT_FOUND");
         const limit = input.limit ?? 40;
         const rows = await loggedRows(tx, and(filters, cursor ? or(lt(attempts.createdAt, cursor.createdAt),
           and(eq(attempts.createdAt, cursor.createdAt), lt(attempts.id, cursor.id))) : undefined), limit + 1);

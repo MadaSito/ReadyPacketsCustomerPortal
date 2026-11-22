@@ -27,3 +27,9 @@ All cloud tests use local protocol fakes. No live tenant, bucket or provider acc
 - Connection test proves access to the bucket/container, not write scope, destination retention, restored backups, or isolation between different accounts.
 - Order file jobs snapshot the selected destinations at accepted upload time. Changing an assignment does not backfill existing files or remove any remote bytes. Imported files are never automatically sent when adopted.
 - S3-compatible endpoints must support the expected HTTPS, SigV4, object properties and conditional-create semantics; the actual behavior of each provider or custom service is unverified. Native Azure MD5 and other alternate digests are transport checks, not SHA-256.
+
+## Increment 04 Part B: Order file routing and transfers
+
+- **Folder contract**: [`orderFileFolder.test.ts`](../../../shared/orderFileFolder.test.ts) checks unsafe literals, traversal, provider-reserved names, controls, token expansion, and paths that become too long or reserved only after expansion.
+- **Service**: [`storage.test.ts`](storage.test.ts) uses real MySQL and synthetic files/provider responses for slot/workflow/default precedence, observed target paths, encrypted attempt metadata, order scope and cursors, missing local sources, stale retries and counts. The Jobs lock is exercised in the [Jobs suite](../jobs/VERIFICATION.md); these cases use a job port fake.
+- **Console**: [`copyLog.test.tsx`](../../../client/src/features/storage/copyLog.test.tsx) covers the order deep link, bounded target-path display, and light/dark axe checks in jsdom. These checks do not establish real-browser layout, screen reader behavior, or live SharePoint/OneDrive verification.

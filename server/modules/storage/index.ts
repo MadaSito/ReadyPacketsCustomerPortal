@@ -15,6 +15,7 @@ import type {
 import { StorageAdapterError } from "./contracts.js";
 import { copyLogHealth, createCopyLogService } from "./copyLog.js";
 import { registerFileCopies } from "./fileCopies.js";
+import { createOrderCopies } from "./orderCopies.js";
 import { storageAssignments, storageConnections } from "./schema.js";
 import { copyMetadata, storageAssignment, storageCreate, storageGet, storageList, storagePublicId, storageTest, storageUpdate } from "./validation.js";
 
@@ -166,6 +167,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
 
   const service: StorageModule = {
     copies: createCopyLogService(deps),
+    orderCopies: createOrderCopies(deps, (publicId, tx, version) => assigned("order_files", publicId, tx, version)),
     registerAdapter<C extends StorageConfig, S extends StorageCredentials>(
       kind: StorageProviderKind, def: StorageAdapterDefinition<C, S>,
     ) {
@@ -321,8 +323,10 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
           await check();
         };
         await beforeWrite();
-        await adapter.ensureFolder(input.path, input.signal, beforeWrite);
-        await beforeWrite();
+        if (!adapter.putCreatesFolders) {
+          await adapter.ensureFolder(input.path, input.signal, beforeWrite);
+          await beforeWrite();
+        }
         result = await adapter.put({ ...input, beforeWrite });
       } catch (error) {
         if (!(error instanceof StorageAdapterError)) throw error;
@@ -343,8 +347,8 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
       });
       return result;
     },
-    async stageOrderFile(filePublicId, tx) {
-      await copies.stage(filePublicId, await activeRows("order_files", tx), tx);
+    async stageOrderFile(filePublicId, tx, metadata) {
+      await copies.stage(filePublicId, await activeRows("order_files", tx), tx, metadata?.orderPublicId);
     },
     async stageOrderFilesForAutomation(input) {
       const orderPublicId = checked(storagePublicId, input.orderPublicId);
@@ -364,7 +368,7 @@ export function createStorageModule(deps: ModuleDeps): StorageModule {
         let queued = 0;
         for (const fileId of files) {
           input.signal.throwIfAborted();
-          queued += await copies.stage(fileId, destinations, tx, input.correlationId);
+          queued += await copies.stage(fileId, destinations, tx, orderPublicId, input.correlationId);
         }
         return { queued };
       }, { isolationLevel: "read committed" });
