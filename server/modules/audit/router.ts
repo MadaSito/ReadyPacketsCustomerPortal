@@ -1,11 +1,13 @@
 /**
  * Audit module — tRPC router (mounted at `trpc.audit.*`). Owner: audit engineer.
- * Every procedure is admin-only; the capability is checked here AND re-checked inside the service.
+ * Every procedure is admin-only (capability checked here AND re-checked inside the service), except
+ * `orderActivity`, which follows the orders read policy and returns the customer-safe projection to customers.
  */
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { AUDIT_CATEGORIES } from "../../core/types.js";
-import { adminProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { adminProcedure, protectedProcedure, requireCapability, router } from "../../trpc/trpc.js";
+import { ORDER_ACTIVITY_CATEGORIES, ORDER_ACTIVITY_MAX_PAGE } from "./orderActivity.js";
 import { CASE_SEVERITIES, CASE_STATUSES } from "./cases.js";
 import { EXPORT_FORMATS, EXPORT_PROFILES } from "./formats.js";
 import { auditQuerySchema, MAX_PAGE, PIVOT_KINDS, STAT_BUCKETS, STAT_DIMENSIONS } from "./query.js";
@@ -29,6 +31,14 @@ const searchInput = z.strictObject({
 });
 
 export const auditRouter = router({
+  orderActivity: protectedProcedure
+    .input(z.strictObject({
+      orderPublicId: z.string().regex(/^[A-Za-z0-9_-]{10,64}$/),
+      category: z.enum(ORDER_ACTIVITY_CATEGORIES).optional(),
+      cursor: z.string().max(600).regex(/^[A-Za-z0-9_-]*$/).nullish(),
+      limit: z.number().int().min(1).max(ORDER_ACTIVITY_MAX_PAGE).optional(),
+    }))
+    .query(({ ctx, input }) => ctx.services.auditCenter.orderActivity(ctx.session, input)),
   search: read.meta({ rateLimit: "expensive" }).input(searchInput).query(({ ctx, input }) => ctx.services.auditCenter.search(ctx.session, input)),
   event: read.input(z.strictObject({ eventId })).query(({ ctx, input }) => ctx.services.auditCenter.getEvent(ctx.session, input.eventId)),
   revealSourceAddress: read.meta({ rateLimit: "expensive" }).input(z.strictObject({ eventId }))

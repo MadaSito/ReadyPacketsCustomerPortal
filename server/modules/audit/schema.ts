@@ -58,6 +58,8 @@ export const auditEvents = mysqlTable(
     resourceType: varchar("resource_type", { length: 48 }),
     resourcePublicId: varchar("resource_public_id", { length: 64 }),
     resourceRef: char("resource_ref", { length: 32 }),
+    /** Increment 04 part B (0004): order the event belongs to; hashed only when non-null (see canonicalBytes). */
+    orderPublicId: varchar("order_public_id", { length: 64 }),
     requestId: varchar("request_id", { length: 64 }),
     traceId: char("trace_id", { length: 32 }),
     spanId: char("span_id", { length: 16 }),
@@ -90,6 +92,7 @@ export const auditEvents = mysqlTable(
     index("ix_audit_outcome_time").on(t.outcome, t.occurredAt),
     index("ix_audit_actor_time").on(t.actorRef, t.occurredAt),
     index("ix_audit_res_time").on(t.resourceType, t.resourceRef, t.occurredAt),
+    index("ix_audit_order_time").on(t.orderPublicId, t.occurredAt, t.eventId),
     index("ix_audit_req").on(t.requestId),
     index("ix_audit_trace").on(t.traceId),
     index("ix_audit_corr_time").on(t.correlationId, t.occurredAt),

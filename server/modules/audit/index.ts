@@ -11,6 +11,7 @@ import { isDurableAuditEmitter } from "./emitter.js";
 import { projectForExternal, type AuditEnvelope, type ExternalAuditEvent } from "./envelope.js";
 import * as exportsSvc from "./exports.js";
 import * as integrity from "./integrity.js";
+import * as orderActivity from "./orderActivity.js";
 import * as retention from "./retention.js";
 import * as searchSvc from "./search.js";
 import { TRIGGER_CATALOGUE, type TriggerCatalogueEntry } from "./triggerCatalogue.js";
@@ -22,6 +23,8 @@ export type { AuditTap, AuditTapEvent, AuditTapStats } from "./tap.js";
 export { AUTOMATION_ORIGIN_PREFIX, automationCorrelationId, isAutomationOrigin } from "./tap.js";
 export type { TriggerCatalogueEntry, TriggerField, TriggerRecipient } from "./triggerCatalogue.js";
 export { TRIGGER_CATALOGUE } from "./triggerCatalogue.js";
+export type { OrderActivityCategory, OrderActivityCustomerItem, OrderActivityPage, OrderActivityStaffItem } from "./orderActivity.js";
+export { ORDER_ACTIVITY_CATALOGUE, ORDER_ACTIVITY_CATEGORIES } from "./orderActivity.js";
 export type { AuditQuery, Group as AuditQueryGroup, Term as AuditQueryTerm, PivotKind, StatBucket, StatDimension } from "./query.js";
 
 export const SEAL_JOB = "audit.chain.seal";
@@ -45,6 +48,12 @@ export interface AuditModule extends ModuleLifecycle {
   tapStats(): AuditTapStats | null;
   /** The curated trigger catalogue (event names, labels, condition/template fields, addressable people). */
   triggerCatalogue(): readonly TriggerCatalogueEntry[];
+
+  /**
+   * Part B (S2): order-scoped history for the order page. Customers and staff alike; access is the orders
+   * read policy; customers get the customer-safe projection.
+   */
+  orderActivity: Tail<typeof orderActivity.listOrderActivity>;
 
   /* ---- audit center (principal-scoped, capability re-checked, self-audited) ---- */
   search: Tail<typeof searchSvc.search>;
@@ -120,6 +129,7 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
     sealPending: (options) => chain.sealPending(options),
     verifyChain: (options) => chain.verify(options),
 
+    orderActivity: bind(ctx, orderActivity.listOrderActivity),
     search: bind(ctx, searchSvc.search),
     getEvent: bind(ctx, searchSvc.getEvent),
     revealSourceAddress: bind(ctx, searchSvc.revealSourceAddress),

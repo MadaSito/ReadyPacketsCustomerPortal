@@ -1,0 +1,254 @@
+/**
+ * Order history (increment 04 part B, S2): the order-scoped audit port. Owner: audit engineer.
+ *
+ * Returns only audit events whose subject is ONE order — `audit_events.order_public_id` (new rows), or the order
+ * as resource (rows written before that column existed). Two projections:
+ *  - customer: curated, customer-visible event names only; actor is "You", "ReadyPackets staff", "ReadyPackets"
+ *    or "Someone with access to this order"; no names, IP, pseudonyms, correlation or event ids;
+ *  - staff: every order-scoped event, actor role + display name, outcome, reason code, correlation id and safe
+ *    attributes. Never the source address (that stays in the audit center behind `audit.read`).
+ * Access is the orders policy (`assertCanReadOrder`): a customer without access gets NOT_FOUND.
+ */
+import { and, desc, eq, inArray, isNull, like, lt, not, or, sql, type SQL } from "drizzle-orm";
+import { validation } from "../../core/errors.js";
+import type { SessionPrincipal } from "../../core/types.js";
+import type { AuditCtx } from "./access.js";
+import { auditEvents } from "./schema.js";
+
+export const ORDER_ACTIVITY_CATEGORIES = ["details", "status", "access", "phases", "acceptance", "files", "storage", "production", "automation", "payments", "other"] as const;
+export type OrderActivityCategory = (typeof ORDER_ACTIVITY_CATEGORIES)[number];
+export const ORDER_ACTIVITY_MAX_PAGE = 50;
+
+interface CatalogueEntry {
+  /** Exact event name, or a prefix ending in `.*`. */
+  pattern: string;
+  category: Exclude<OrderActivityCategory, "other">;
+  label: string;
+  customer: boolean;
+  /** Customers see the event only when this attribute has exactly this value (fail closed when absent). */
+  customerRequires?: { key: string; value: string };
+}
+const CUSTOMER_FILE = { key: "file_visibility", value: "customer_visible" } as const;
+
+/**
+ * Event names other modules emit for an order. Publish additions to their owners; an order-scoped event that is
+ * not listed still shows to staff under "other" with its event name, never to customers.
+ */
+export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze([
+  { pattern: "order.created", category: "details", label: "Order created", customer: true },
+  { pattern: "order.updated", category: "details", label: "Order details updated", customer: true },
+  { pattern: "order.renamed", category: "details", label: "Order renamed", customer: true },
+  { pattern: "order.reference.changed", category: "details", label: "Order reference changed", customer: true },
+  { pattern: "order.reassigned", category: "details", label: "Order moved to another customer", customer: false },
+  { pattern: "order.reassign.refused", category: "details", label: "Order move refused", customer: false },
+  { pattern: "order.imported", category: "details", label: "Order imported", customer: false },
+  { pattern: "order.note.added", category: "details", label: "Note added", customer: false },
+  { pattern: "order.status.changed", category: "status", label: "Status changed", customer: true },
+  { pattern: "order.transition.denied", category: "status", label: "Status change refused", customer: false },
+  { pattern: "order.lock.changed", category: "status", label: "Order lock changed", customer: true },
+  { pattern: "order.access.granted", category: "access", label: "Access granted", customer: true },
+  { pattern: "order.access.revoked", category: "access", label: "Access removed", customer: true },
+  { pattern: "order.share.invited", category: "access", label: "Invitation sent", customer: true },
+  { pattern: "order.share.revoked", category: "access", label: "Invitation withdrawn", customer: true },
+  { pattern: "order.phase.submitted", category: "phases", label: "Phase submitted", customer: true },
+  { pattern: "order.phase.reviewed", category: "phases", label: "Phase reviewed", customer: true },
+  { pattern: "order.phase.locked", category: "phases", label: "Phase locked", customer: true },
+  { pattern: "order.phase.reopened", category: "phases", label: "Phase reopened", customer: true },
+  { pattern: "order.phase.unlocked", category: "phases", label: "Phase unlocked", customer: true },
+  { pattern: "order.acknowledgement.recorded", category: "acceptance", label: "Acknowledgement recorded", customer: true },
+  { pattern: "order.acceptance.recorded", category: "acceptance", label: "Policy accepted", customer: true },
+  { pattern: "order.acceptance.*", category: "acceptance", label: "Acceptance gate", customer: false },
+  { pattern: "file.uploaded", category: "files", label: "File uploaded", customer: true, customerRequires: CUSTOMER_FILE },
+  { pattern: "order.file.uploaded", category: "files", label: "File uploaded", customer: true, customerRequires: CUSTOMER_FILE },
+  { pattern: "order.file.recorded", category: "files", label: "Recording saved", customer: true, customerRequires: CUSTOMER_FILE },
+  { pattern: "order.file.converted", category: "files", label: "Recording converted", customer: true, customerRequires: CUSTOMER_FILE },
+  { pattern: "file.audio.conversion", category: "files", label: "Recording converted", customer: true, customerRequires: CUSTOMER_FILE },
+  { pattern: "order.file.copy.*", category: "storage", label: "File copy to storage", customer: false },
+  { pattern: "storage.order_file.copy", category: "storage", label: "File copy to storage", customer: false },
+  { pattern: "storage.copy_result", category: "storage", label: "Storage copy result", customer: false },
+  { pattern: "sharepoint.order.sync", category: "storage", label: "SharePoint order sync", customer: false },
+  { pattern: "order.production.*", category: "production", label: "Production pipeline", customer: false },
+  { pattern: "integration.production.dispatch.*", category: "production", label: "Production dispatch", customer: false },
+  { pattern: "order.stage_actions.run", category: "automation", label: "Workflow stage actions run", customer: false },
+  { pattern: "automation.manual.triggered", category: "automation", label: "Automation run", customer: false },
+  { pattern: "payment.refund.succeeded", category: "payments", label: "Refund issued", customer: true },
+  { pattern: "payment.refund.*", category: "payments", label: "Refund", customer: false },
+]);
+
+function matches(entry: CatalogueEntry, eventName: string): boolean {
+  return entry.pattern.endsWith(".*") ? eventName.startsWith(entry.pattern.slice(0, -1)) : eventName === entry.pattern;
+}
+/** First match wins, so exact customer entries are listed before their wildcard. */
+export function classifyOrderEvent(eventName: string): CatalogueEntry | null {
+  return ORDER_ACTIVITY_CATALOGUE.find((e) => matches(e, eventName)) ?? null;
+}
+
+function likePrefix(prefix: string): string {
+  return `${prefix.replace(/[\\%_]/gu, (c) => `\\${c}`)}%`;
+}
+function nameOf(entry: CatalogueEntry): SQL {
+  return entry.pattern.endsWith(".*") ? like(auditEvents.eventName, likePrefix(entry.pattern.slice(0, -1))) : eq(auditEvents.eventName, entry.pattern);
+}
+/** `withRequirements`: add each entry's customer attribute requirement (customer view). */
+function nameCondition(entries: readonly CatalogueEntry[], withRequirements = false): SQL | undefined {
+  const plain = entries.filter((e) => !(withRequirements && e.customerRequires));
+  const exact = plain.filter((e) => !e.pattern.endsWith(".*")).map((e) => e.pattern);
+  const parts: SQL[] = [...(exact.length ? [inArray(auditEvents.eventName, exact)] : []), ...plain.filter((e) => e.pattern.endsWith(".*")).map(nameOf)];
+  for (const e of entries) {
+    if (!withRequirements || !e.customerRequires) continue;
+    const path = `$.${e.customerRequires.key}`;
+    parts.push(and(nameOf(e), sql`JSON_UNQUOTE(JSON_EXTRACT(${auditEvents.attributes}, ${path})) = ${e.customerRequires.value}`)!);
+  }
+  return parts.length ? or(...parts) : undefined;
+}
+
+export interface OrderActivityInput {
+  orderPublicId: string;
+  category?: OrderActivityCategory;
+  cursor?: string | null;
+  limit?: number;
+}
+export interface OrderActivityCustomerItem {
+  key: string;
+  at: string;
+  category: OrderActivityCategory;
+  label: string;
+  actor: string;
+  /** Only fixed vocabularies (status keys, phase keys). */
+  details: Record<string, string>;
+}
+export interface OrderActivityStaffItem extends Omit<OrderActivityCustomerItem, "details"> {
+  eventId: string;
+  eventName: string;
+  outcome: string;
+  reasonCode: string | null;
+  actorRole: string;
+  correlationId: string | null;
+  details: Record<string, string | number | boolean | null>;
+}
+export type OrderActivityPage =
+  | { view: "customer"; items: OrderActivityCustomerItem[]; nextCursor: string | null }
+  | { view: "staff"; items: OrderActivityStaffItem[]; nextCursor: string | null };
+
+const CUSTOMER_DETAIL_KEYS = new Set(["from_status", "to_status", "phase", "phase_key", "lock_state"]);
+const HIDDEN_DETAIL_KEY = /(^order_public_id$|_ref$|_hash$|_sha256$|address|_ip$)/u;
+const CUSTOMER_OUTCOMES = ["completed", "succeeded"];
+
+/**
+ * Opaque cursor: AES-GCM over the sort anchor, bound (AAD) to order, viewer, projection and category, so it
+ * reveals no event id and cannot be replayed for another order, person or filter.
+ */
+function cursorAad(principal: SessionPrincipal, orderPublicId: string, view: string, category: string | undefined): string {
+  return `audit.order_activity.cursor:${orderPublicId}:${principal.userId}:${view}:${category ?? "all"}`;
+}
+function encodeCursor(ctx: AuditCtx, aad: string, at: Date, eventId: string): string {
+  return Buffer.from(ctx.deps.crypto.encrypt(`${at.toISOString()}|${eventId}`, aad), "utf8").toString("base64url");
+}
+function decodeCursor(ctx: AuditCtx, aad: string, cursor: string): { at: Date; eventId: string } {
+  let text: string;
+  try {
+    text = ctx.deps.crypto.decrypt(Buffer.from(cursor, "base64url").toString("utf8"), aad);
+  } catch {
+    throw validation("CURSOR_INVALID", "The page cursor is not valid.");
+  }
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([0-9A-HJKMNP-TV-Z]{26})$/u.exec(text);
+  const at = match ? new Date(match[1]!) : null;
+  if (!match || !at || Number.isNaN(at.getTime())) throw validation("CURSOR_INVALID", "The page cursor is not valid.");
+  return { at, eventId: match[2]! };
+}
+
+type Row = typeof auditEvents.$inferSelect;
+
+export async function listOrderActivity(ctx: AuditCtx, principal: SessionPrincipal, input: OrderActivityInput): Promise<OrderActivityPage> {
+  const { deps } = ctx;
+  // Orders policy decides visibility (NOT_FOUND for customers without access; staff/admin per their policy).
+  const order = await deps.services.orders.assertCanReadOrder(principal, input.orderPublicId);
+  const customerView = principal.role === "customer";
+  const limit = Math.min(Math.max(input.limit ?? 25, 1), ORDER_ACTIVITY_MAX_PAGE);
+
+  let entries: readonly CatalogueEntry[] | null = null; // null = no name restriction
+  if (customerView) entries = ORDER_ACTIVITY_CATALOGUE.filter((e) => e.customer);
+  if (input.category && input.category !== "other") entries = (entries ?? ORDER_ACTIVITY_CATALOGUE).filter((e) => e.category === input.category);
+  if ((entries !== null && entries.length === 0) || (customerView && input.category === "other")) return { view: customerView ? "customer" : "staff", items: [], nextCursor: null };
+  const names = entries ? nameCondition(entries, customerView) : undefined;
+  const otherOnly = input.category === "other" ? nameCondition(ORDER_ACTIVITY_CATALOGUE) : undefined;
+
+  const aad = cursorAad(principal, order.publicId, customerView ? "customer" : "staff", input.category);
+  const cursor = input.cursor ? decodeCursor(ctx, aad, input.cursor) : null;
+  const before = cursor
+    ? or(lt(auditEvents.occurredAt, cursor.at), and(eq(auditEvents.occurredAt, cursor.at), lt(auditEvents.eventId, cursor.eventId)))
+    : undefined;
+  const common = and(
+    names,
+    otherOnly ? not(otherOnly) : undefined,
+    customerView ? inArray(auditEvents.outcome, CUSTOMER_OUTCOMES) : undefined,
+    before,
+  );
+  const orderRef = deps.crypto.pseudonym(`order:${order.publicId}`, "audit.resource").slice(0, 32);
+  const newest = [desc(auditEvents.occurredAt), desc(auditEvents.eventId)] as const;
+  // Two indexed lookups (ix_audit_order_time; ix_audit_res_time for rows from before the column), merged here.
+  const [bySubject, byResource] = await Promise.all([
+    deps.db.select().from(auditEvents).where(and(eq(auditEvents.orderPublicId, order.publicId), common)).orderBy(...newest).limit(limit + 1),
+    deps.db
+      .select()
+      .from(auditEvents)
+      .where(and(eq(auditEvents.resourceType, "order"), eq(auditEvents.resourceRef, orderRef), isNull(auditEvents.orderPublicId), common))
+      .orderBy(...newest)
+      .limit(limit + 1),
+  ]);
+  const merged = [...bySubject, ...byResource].sort((a, b) => b.occurredAt.getTime() - a.occurredAt.getTime() || (a.eventId < b.eventId ? 1 : -1));
+  const page = merged.slice(0, limit);
+  const nextCursor = merged.length > limit && page.length ? encodeCursor(ctx, aad, page[page.length - 1]!.occurredAt, page[page.length - 1]!.eventId) : null;
+
+  if (customerView) {
+    return { view: "customer", items: page.map((row) => customerItem(ctx, principal, row)), nextCursor };
+  }
+  const people = await actorNames(ctx, page);
+  return { view: "staff", items: page.map((row) => staffItem(row, people)), nextCursor };
+}
+
+function base(row: Row) {
+  const entry = classifyOrderEvent(row.eventName);
+  return { at: row.occurredAt.toISOString(), category: entry?.category ?? ("other" as const), label: entry?.label ?? row.eventName };
+}
+
+function customerItem(ctx: AuditCtx, principal: SessionPrincipal, row: Row): OrderActivityCustomerItem {
+  const details: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row.attributes ?? {})) if (CUSTOMER_DETAIL_KEYS.has(k) && typeof v === "string") details[k] = v;
+  let actor: string;
+  if (row.actorRole === "staff" || row.actorRole === "admin") actor = "ReadyPackets staff";
+  else if (row.actorRole === "customer") actor = row.actorUserId === principal.userId ? "You" : "Someone with access to this order";
+  else actor = "ReadyPackets";
+  return { key: ctx.deps.crypto.pseudonym(row.eventId, "audit.order_activity").slice(0, 16), ...base(row), actor, details };
+}
+
+function staffItem(row: Row, names: Map<number, string>): OrderActivityStaffItem {
+  const details: Record<string, string | number | boolean | null> = {};
+  for (const [k, v] of Object.entries(row.attributes ?? {})) if (!HIDDEN_DETAIL_KEY.test(k)) details[k] = v;
+  const role = row.actorRole;
+  const actor = row.actorUserId !== null ? (names.get(row.actorUserId) ?? `Former ${role === "customer" ? "customer" : "staff member"}`) : role === "system" ? "System" : "Anonymous";
+  return {
+    key: row.eventId,
+    eventId: row.eventId,
+    eventName: row.eventName,
+    ...base(row),
+    actor,
+    actorRole: role,
+    outcome: row.outcome,
+    reasonCode: row.reasonCode,
+    correlationId: row.correlationId,
+    details,
+  };
+}
+
+async function actorNames(ctx: AuditCtx, rows: Row[]): Promise<Map<number, string>> {
+  const ids = [...new Set(rows.map((r) => r.actorUserId).filter((id): id is number => id !== null))].slice(0, ORDER_ACTIVITY_MAX_PAGE);
+  const out = new Map<number, string>();
+  await Promise.all(
+    ids.map(async (id) => {
+      const user = await ctx.deps.services.identity.getUser(id);
+      if (user) out.set(id, user.name);
+    }),
+  );
+  return out;
+}
