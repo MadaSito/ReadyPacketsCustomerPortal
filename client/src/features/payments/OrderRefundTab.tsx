@@ -192,8 +192,17 @@ function RefundWorkspace({ orderId }: { orderId: string }) {
   return <OrderRefundPanel key={orderId} payments={workspace.data.payments} canIssueRefund={workspace.data.canIssueRefund}
     submit={async (values) => {
       try {
-        return await stepUp.run(() => client.payments.refunds.create.mutate({ ...order, ...values }),
+        const result = await stepUp.run(() => client.payments.refunds.create.mutate({ ...order, ...values }),
           { reason: "A recent identity check is required to submit a refund." });
+        if (result.status === "succeeded") {
+          void Promise.all([
+            cache.invalidateQueries(trpc.orders.admin.get.queryFilter({ orderId })),
+            cache.invalidateQueries(trpc.audit.orderActivity.infiniteQueryFilter(order)),
+            cache.invalidateQueries(trpc.audit.orderStatusHistory.infiniteQueryFilter(order)),
+            cache.invalidateQueries(trpc.compliance.invoices.listForOrder.queryFilter(order)),
+          ]);
+        }
+        return result;
       } finally {
         void cache.invalidateQueries({ queryKey: trpc.payments.refunds.forOrder.queryKey(order) });
       }

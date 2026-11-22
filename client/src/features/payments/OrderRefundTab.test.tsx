@@ -1,12 +1,18 @@
+import { useQuery } from "@tanstack/react-query";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createTRPCClient, httpLink } from "@trpc/client";
+import { createTRPCOptionsProxy } from "@trpc/tanstack-react-query";
 import type { ComponentProps } from "react";
+import superjson from "superjson";
 import { expect, it, vi } from "vitest";
+import type { AppRouter } from "@server/trpc/root";
 import { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput";
+import { TRPCProvider, useTRPC } from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { StepUpCancelledError } from "@/ui";
-import { renderUi } from "@/ui/testing";
-import { OrderRefundPanel } from "./OrderRefundTab";
+import { createTestQueryClient, renderUi } from "@/ui/testing";
+import OrderRefundTab, { OrderRefundPanel } from "./OrderRefundTab";
 
 type Props = ComponentProps<typeof OrderRefundPanel>;
 const payment: Props["payments"][number] = {
@@ -144,4 +150,55 @@ it("labels manual refunds as recorded only and prevents submitting more than the
   await userEvent.click(confirm);
   expect(await screen.findByText("No money was moved by the portal.")).toBeVisible();
   expect(submit).toHaveBeenCalledWith(expect.objectContaining({ amountMinor: 1600 }));
+});
+
+it("refreshes the active payment badge and invalidates cached history and invoices for only the refunded order", async () => {
+  const orderId = "01JD0000000000000000000001";
+  const otherId = "01JD0000000000000000000002";
+  const queryClient = createTestQueryClient();
+  queryClient.setQueryDefaults([], { gcTime: Infinity });
+  let refunded = false;
+  const client = createTRPCClient<AppRouter>({
+    links: [httpLink({
+      url: "https://portal.example.test/rpc", transformer: superjson,
+      fetch: async (request) => {
+        const path = new URL(String(request)).pathname.slice("/rpc/".length);
+        let data: unknown;
+        if (path === "orders.admin.get") data = { console: { payment: { state: refunded ? "partially_refunded" : "paid" } } };
+        else if (path === "payments.refunds.forOrder") data = { canIssueRefund: true, payments: [payment] };
+        else if (path === "payments.refunds.create") {
+          refunded = true;
+          data = { status: "succeeded", executionKind: "provider_refund" };
+        } else throw new Error(`Unexpected synthetic request: ${path}`);
+        return Response.json({ result: { data: superjson.serialize(data) } });
+      },
+    })],
+  });
+  const keys = createTRPCOptionsProxy<AppRouter>({ client, queryClient });
+  const activeOrderKeys = [
+    keys.audit.orderActivity.infiniteQueryKey({ orderPublicId: orderId, limit: 25 }),
+    keys.audit.orderActivity.infiniteQueryKey({ orderPublicId: orderId, limit: 25, category: "payments" }),
+    keys.audit.orderStatusHistory.infiniteQueryKey({ orderPublicId: orderId, limit: 25 }),
+    keys.compliance.invoices.listForOrder.queryKey({ orderPublicId: orderId }),
+  ];
+  const unrelatedKey = keys.audit.orderActivity.infiniteQueryKey({ orderPublicId: otherId, limit: 25, category: "payments" });
+  for (const key of [...activeOrderKeys, unrelatedKey]) queryClient.setQueryData([...key], {});
+
+  function HeaderState() {
+    const trpc = useTRPC();
+    const detail = useQuery(trpc.orders.admin.get.queryOptions({ orderId }));
+    return <p>Header payment state: {detail.data?.console?.payment?.state}</p>;
+  }
+  renderUi(<main><HeaderState /><OrderRefundTab orderId={orderId} area="console" /></main>, {
+    queryClient, wrapper: (tree) => <TRPCProvider trpcClient={client} queryClient={queryClient}>{tree}</TRPCProvider>,
+  });
+  expect(await screen.findByText("Header payment state: paid")).toBeVisible();
+  await screen.findByRole("region", { name: "Order payments table" });
+  const dialog = within(await open());
+  await userEvent.type(dialog.getByLabelText(/Refund reason/u), "Customer request");
+  await userEvent.type(dialog.getByLabelText(/type REFUND ORDER to confirm/i), "REFUND ORDER");
+  await userEvent.click(dialog.getByRole("button", { name: "Send refund" }));
+  expect(await screen.findByText("Header payment state: partially_refunded")).toBeVisible();
+  for (const key of activeOrderKeys) expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+  expect(queryClient.getQueryState(unrelatedKey)?.isInvalidated).toBe(false);
 });
