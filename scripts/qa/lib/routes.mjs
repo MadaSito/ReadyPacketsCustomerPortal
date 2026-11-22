@@ -101,8 +101,56 @@ export async function qaRouteScenarios() {
   return resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
 }
 
+/** Thrown when the QA instance answered 429: a shared-IP throttle, not a page defect. */
+export class QaRateLimitedError extends Error {
+  constructor(retryAfterSeconds) {
+    super("The QA instance rate-limited this scenario.");
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/**
+ * Opens a scenario; if any same-origin response was 429, waits for Retry-After (bounded) and retries once.
+ * `open` must create a fresh page each attempt. A second 429 is reported as rate limited, never as a pass or a defect.
+ */
+export async function withQaRateLimitRetry(open, log = () => {}, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await open();
+    } catch (error) {
+      if (!(error instanceof QaRateLimitedError) || attempt > 0) throw error;
+      const wait = Math.min(Math.max(error.retryAfterSeconds, 5), 120);
+      log(`  Rate limited by the QA instance; retrying once after ${wait}s.`);
+      await sleep(wait * 1000);
+    }
+  }
+}
+
 export async function openQaRoute(page, baseUrl, scenario, theme, beforeSteps) {
+  let retryAfter = 0;
+  const onResponse = (response) => {
+    if (response.status() !== 429 || new URL(response.url()).origin !== new URL(baseUrl).origin) return;
+    retryAfter = Math.max(retryAfter, Number(response.headers()["retry-after"]) || 60);
+  };
+  page.on("response", onResponse);
+  try {
+    await openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps);
+  } catch (error) {
+    if (error instanceof QaRateLimitedError) throw error;
+    if (retryAfter) throw new QaRateLimitedError(retryAfter);
+    throw error;
+  } finally {
+    page.off("response", onResponse);
+  }
+}
+
+async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
   const probe = await page.request.get(new URL("/api/trpc/identity.me", baseUrl).href, { timeout: 8_000, maxRedirects: 0 });
+  if (probe.status() === 429) {
+    const seconds = Number(probe.headers()["retry-after"]) || 60;
+    await probe.dispose();
+    throw new QaRateLimitedError(seconds);
+  }
   try {
     const { result } = await probe.json();
     const session = result?.data?.json;

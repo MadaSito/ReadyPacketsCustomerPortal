@@ -6,7 +6,7 @@
 // Requires QA_BASE_URL (disposable QA origin). Optional: QA_CHROMIUM_PATH, QA_ROUTE_FIXTURES, QA_ROUTE_FILTER,
 // QA_WIDTHS (comma list, partial run). Never prints raw Playwright errors (they may include tokens).
 import { launchQaBrowser } from "./lib/browser.mjs";
-import { openQaRoute, qaRouteScenarios } from "./lib/routes.mjs";
+import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
 
 const ALL_WIDTHS = [240, 320, 390, 768, 1024, 1440, 1920, 2560];
 const MIN_TARGET = 24;
@@ -80,6 +80,7 @@ async function main() {
   const { browser, baseUrl } = await launchQaBrowser();
   let runs = 0;
   let failures = 0;
+  let rateLimited = 0;
   try {
     const { cases, missing, partial } = await qaRouteScenarios();
     if (partial || partialWidths) console.log("Partial run: QA_ROUTE_FILTER or QA_WIDTHS was supplied. Not release-wide responsive evidence.");
@@ -90,14 +91,19 @@ async function main() {
           const height = width < 768 ? 800 : 900;
           const scope = `${scenario.name} · ${theme} · ${width}px`;
           runs++;
-          const context = await browser.newContext({
-            colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
-            acceptDownloads: false, serviceWorkers: "block", hasTouch: width < 1024, isMobile: false,
-          });
+          let context;
           try {
-            await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
-            const page = await context.newPage();
-            await openQaRoute(page, baseUrl, scenario, theme);
+            let page;
+            await withQaRateLimitRetry(async () => {
+              await context?.close();
+              context = await browser.newContext({
+                colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
+                acceptDownloads: false, serviceWorkers: "block", hasTouch: width < 1024, isMobile: false,
+              });
+              await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+              page = await context.newPage();
+              await openQaRoute(page, baseUrl, scenario, theme);
+            }, (line) => console.log(line));
             const result = await measure(page, MIN_TARGET);
             const problems = [];
             if (result.width > width) problems.push(`viewport did not reflow to ${width}px`);
@@ -108,16 +114,21 @@ async function main() {
               failures++;
               console.error(`FAIL ${scope}: ${problems.join("; ")}`);
             } else console.log(`PASS ${scope}`);
-          } catch {
+          } catch (error) {
             failures++;
+            if (error instanceof QaRateLimitedError) {
+              rateLimited++;
+              console.error(`FAIL ${scope}: rate limited by the QA instance twice (not a page result; re-run this route).`);
+              continue;
+            }
             console.error(`FAIL ${scope}: browser could not reach or measure the expected state (check QA origin, features and fixture).`);
           } finally {
-            await context.close();
+            await context?.close();
           }
         }
       }
     }
-    console.log(`Responsive check: ${runs} executed, ${failures} failed, ${missing.length} missing fixture entries. Widths: ${list.join(", ")}.`);
+    console.log(`Responsive check: ${runs} executed, ${failures} failed (${rateLimited} rate limited), ${missing.length} missing fixture entries. Widths: ${list.join(", ")}.`);
     if (!runs || failures || missing.length) process.exitCode = 1;
   } finally {
     await browser.close();

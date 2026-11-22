@@ -25,3 +25,12 @@ Raw browser errors are never printed because they can contain tokens.
 writes `<role>.state.json` (0600) into `QA_STATE_DIR` (0700, which must be outside the repo), and it refuses to type
 credentials unless `QA_EXPECT_ORIGIN` equals `QA_BASE_URL`. Credentials come from `QA_<ROLE>_EMAIL` / `_PASSWORD` /
 `_TOTP_SECRET`. Put the fixture file in the same directory so relative session paths resolve.
+
+## Rate limits
+
+Every QA browser shares one client IP, so a full run can exceed the instance's per-IP budgets (each page load makes
+several tRPC calls). If the instance answers 429, the runners wait for `Retry-After` (5–120 s) and retry the
+scenario once in a fresh context. A second 429 is reported as `rate limited … (not a page result)` and counted
+separately in the summary; it is never a pass or a page defect. On a disposable QA instance an administrator can raise
+the `api` and `standard_browsing` budgets within their safe bounds in Console → Protection → Rate limits, then
+restore the defaults afterwards.

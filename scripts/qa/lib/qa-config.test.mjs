@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { parseQaBaseUrl, qaChromiumPath } from "./browser.mjs";
-import { matchesQaRoute, resolveQaScenarios } from "./routes.mjs";
+import { matchesQaRoute, QaRateLimitedError, resolveQaScenarios, withQaRateLimitRetry } from "./routes.mjs";
 import { setLiteralZoom } from "./zoom.mjs";
 
 test("QA setup accepts only plain HTTP origins", () => {
@@ -73,4 +73,17 @@ test("literal zoom requires browser-reported zoom and waits for the matching DPR
   await setLiteralZoom(page, worker, 4, 320);
   await assert.rejects(setLiteralZoom(page, { evaluate: async () => 1 }, 4, 320), /did not report/);
   await assert.rejects(setLiteralZoom({ evaluate: async () => ({ dpr: 1, width: 800 }) }, worker, 4, 320), /desktop zoom baseline/);
+});
+
+test("QA rate-limit retry waits once, then reports rate limiting instead of a page result", async () => {
+  const waits = [];
+  const sleep = async (ms) => { waits.push(ms); };
+  let calls = 0;
+  assert.equal(await withQaRateLimitRetry(async () => { calls++; if (calls === 1) throw new QaRateLimitedError(2); return "ok"; }, () => {}, sleep), "ok");
+  assert.deepEqual(waits, [5000]);
+  await assert.rejects(withQaRateLimitRetry(async () => { throw new QaRateLimitedError(500); }, () => {}, sleep), QaRateLimitedError);
+  assert.equal(waits.at(-1), 120000);
+  let other = 0;
+  await assert.rejects(withQaRateLimitRetry(async () => { other++; throw new Error("page defect"); }, () => {}, sleep), /page defect/);
+  assert.equal(other, 1);
 });

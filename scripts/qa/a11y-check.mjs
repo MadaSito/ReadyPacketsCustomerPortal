@@ -2,7 +2,7 @@
 /* global document, window -- These globals are used inside Chromium page.evaluate. */
 import axe from "axe-core";
 import { launchQaBrowser } from "./lib/browser.mjs";
-import { openQaRoute, qaRouteScenarios } from "./lib/routes.mjs";
+import { openQaRoute, qaRouteScenarios, QaRateLimitedError, withQaRateLimitRetry } from "./lib/routes.mjs";
 import { createQaZoomDriver, setLiteralZoom } from "./lib/zoom.mjs";
 
 const tags = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"];
@@ -37,6 +37,7 @@ async function main() {
   const literalZoom = "openZoomProfile" in driver;
   let runs = 0;
   let failures = 0;
+  let rateLimited = 0;
   try {
     const { cases, missing, partial } = await qaRouteScenarios();
     if (partial) console.log("Partial run: QA_ROUTE_FILTER was supplied. Not release-wide accessibility evidence.");
@@ -49,24 +50,27 @@ async function main() {
           runs++;
           let close;
           try {
-            let context;
             let page;
-            let zoom;
-            if (literalZoom) {
-              const profile = await driver.openZoomProfile(theme, scenario.storageState);
-              ({ context, page, close } = profile);
-              zoom = () => setLiteralZoom(page, profile.worker, factor, width);
-            } else {
-              context = await driver.browser.newContext({
-                colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
-                acceptDownloads: false, serviceWorkers: "block",
-              });
-              close = () => context.close();
-              page = await context.newPage();
-            }
-            // A disposable instance should not contact external analytics, fonts, or services during QA.
-            await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
-            await openQaRoute(page, baseUrl, scenario, theme, zoom);
+            await withQaRateLimitRetry(async () => {
+              let context;
+              let zoom;
+              await close?.();
+              if (literalZoom) {
+                const profile = await driver.openZoomProfile(theme, scenario.storageState);
+                ({ context, page, close } = profile);
+                zoom = () => setLiteralZoom(page, profile.worker, factor, width);
+              } else {
+                context = await driver.browser.newContext({
+                  colorScheme: theme, viewport: { width, height }, storageState: scenario.storageState,
+                  acceptDownloads: false, serviceWorkers: "block",
+                });
+                close = () => context.close();
+                page = await context.newPage();
+              }
+              // A disposable instance should not contact external analytics, fonts, or services during QA.
+              await context.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
+              await openQaRoute(page, baseUrl, scenario, theme, zoom);
+            }, (line) => console.log(line));
             const result = await scan(page);
             const problems = [...result.violations];
             if (!result.lang) problems.push("missing document language");
@@ -77,8 +81,13 @@ async function main() {
               console.error(`FAIL ${scope}: ${problems.join("; ")}`);
             } else console.log(`PASS automated checks ${scope}`);
             if (result.incomplete.length) console.log(`  Manual review required: ${result.incomplete.join(", ")}`);
-          } catch {
+          } catch (error) {
             failures++;
+            if (error instanceof QaRateLimitedError) {
+              rateLimited++;
+              console.error(`FAIL ${scope}: rate limited by the QA instance twice (not a page result; re-run this route).`);
+              continue;
+            }
             // Playwright diagnostics may include a route's synthetic ID or a reset token. Do not print raw errors.
             console.error(`FAIL ${scope}: browser could not reach or scan the expected state (check QA origin, features and fixture).`);
           } finally {
@@ -87,7 +96,7 @@ async function main() {
         }
       }
     }
-    console.log(`Automated a11y: ${runs} executed, ${failures} failed, ${missing.length} missing fixture entries. ${literalZoom ? "Literal zoom verified for passing cases; manual checks still required." : "Literal 200%/400% browser zoom and manual checks are still required."}`);
+    console.log(`Automated a11y: ${runs} executed, ${failures} failed (${rateLimited} rate limited), ${missing.length} missing fixture entries. ${literalZoom ? "Literal zoom verified for passing cases; manual checks still required." : "Literal 200%/400% browser zoom and manual checks are still required."}`);
     if (!runs || failures || missing.length) process.exitCode = 1;
   } finally {
     if (!literalZoom) await driver.browser.close();
