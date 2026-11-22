@@ -80,17 +80,25 @@ export interface OrderPaymentExposure {
   grossPaidMinor: number;
   payableInvoiceOpen: boolean;
   providerCapturePending: boolean;
+  /**
+   * /root scope decision (closes G-C3-02): true when ANY provider payment attempt row has ever been created for the
+   * order, whatever its status (failed, cancelled, expired, ambiguous). Missing ⇒ treated as true (stays used).
+   */
+  providerAttemptEver: boolean;
 }
 export type OrderPaymentExposurePort = (tx: Tx, orderPublicId: string) => Promise<OrderPaymentExposure>;
 export function paymentExposurePort(services: Services): OrderPaymentExposurePort | null {
   return method<OrderPaymentExposurePort>((services as Partial<Services>).compliance, "orderPaymentExposureInTx");
 }
 
-/** True only for a well-formed answer proving nothing was paid and nothing can still be captured. */
+/**
+ * Strictly conservative release fence: true only for a well-formed answer proving nothing was paid, no invoice is
+ * payable, and no provider payment attempt was ever created. Anything else (or a missing field) ⇒ stays used.
+ */
 export function releaseIsSafe(exposure: unknown): boolean {
   if (!exposure || typeof exposure !== "object") return false;
   const e = exposure as Partial<OrderPaymentExposure>;
-  return e.grossPaidMinor === 0 && e.payableInvoiceOpen === false && e.providerCapturePending === false;
+  return e.grossPaidMinor === 0 && e.payableInvoiceOpen === false && e.providerCapturePending === false && e.providerAttemptEver === false;
 }
 
 /* ---------------- Increment 05 (C3): promotions port, binding signatures from INCREMENT_05_CONTRACT §3 ---------------- */

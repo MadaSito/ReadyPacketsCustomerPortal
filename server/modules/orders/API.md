@@ -298,11 +298,14 @@ Setting `orders.console_access.enabled` (default **false**) gates `access.grant`
 - `orders.promo_discount_minor` (int, default 0) and `orders.promo_label` (nullable, ≤ 120 characters) are written once at create.
 - Order detail and summary views expose `promoDiscountMinor` and `promoLabel`.
 - `OrderAccessView` (ports) gains these optional fields: `discountMinor`, `discountLabel` (the combined label), `promoDiscountMinor`, `promoLabel` and `bundleDiscountMinor`. They are used for compliance invoices; no bundle label is stored separately.
+- `catalog.listActive(tx?, { forShare? })`: pass the caller's `tx` so the read uses that connection. `forShare` adds `FOR SHARE` to the group and product reads, so a concurrent deactivation or repricing waits for the cart's transaction.
+- With a code, `quote`, `create` and `admin.createForCustomer` run under the optional `promotions.guardAttempt(actorUserId, fn)` **outside** the orders transaction. That function applies the rate limits and the lockout check, and records a refusal after rollback. Checkout (a tx the caller holds) is not wrapped.
+- A code that contributes nothing (the bundle wins, or the cap leaves 0) is returned as `promo: null`. The order stores no promo figures or label for it, and promotions writes no redemption.
 - Portable order records carry `promoDiscountMinor` / `promoLabel` (optional on import, default 0 / null).
 
 ### C3: release on cancel (decision G-C3-02)
 
-On cancellation the orders transaction asks `services.compliance.orderPaymentExposureInTx(tx, orderPublicId)`. It calls `promotions.releaseForOrderInTx(tx, { orderPublicId, reason: "order_cancelled" })` only when the answer is **exactly** `{ grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false }`.
+On cancellation the orders transaction asks `services.compliance.orderPaymentExposureInTx(tx, orderPublicId)`. It calls `promotions.releaseForOrderInTx(tx, { orderPublicId, reason: "order_cancelled" })` only when the answer is **exactly** `{ grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false, providerAttemptEver: false }`. Under /root's conservative scope decision, a provider payment attempt row that has **ever** existed for the order, in any status (failed, cancelled, expired or ambiguous), keeps the code used. A missing field counts as exposure.
 
 Any exposure, a missing port or an error keeps the redemption used, and the cancel still succeeds. A refund never releases a redemption. A manual release is `promotions.admin.releaseRedemption`, which the promotions module owns.
 

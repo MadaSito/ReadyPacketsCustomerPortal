@@ -195,13 +195,13 @@ describe("promotion codes on orders (C3)", () => {
         return value;
       },
     };
-    const none = { grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false };
+    const none = { grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false, providerAttemptEver: false };
     try {
       const unpaid = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
       exposureOf.set(unpaid.publicId, none);
       await mod.orders.transition(alice.principal, { orderId: unpaid.publicId, expectedVersion: (await rowOf(unpaid.publicId)).version, toStatus: "canceled" });
       expect(promos.released).toEqual([unpaid.publicId]);
-      for (const exposure of [{ ...none, grossPaidMinor: 1 }, { ...none, payableInvoiceOpen: true }, { ...none, providerCapturePending: true }, "throw", { grossPaidMinor: 0 }]) {
+      for (const exposure of [{ ...none, grossPaidMinor: 1 }, { ...none, payableInvoiceOpen: true }, { ...none, providerCapturePending: true }, { ...none, providerAttemptEver: true }, { grossPaidMinor: 0, payableInvoiceOpen: false, providerCapturePending: false }, "throw", { grossPaidMinor: 0 }]) {
         const kept = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
         exposureOf.set(kept.publicId, exposure);
         await mod.orders.transition(alice.principal, { orderId: kept.publicId, expectedVersion: (await rowOf(kept.publicId)).version, toStatus: "canceled" });

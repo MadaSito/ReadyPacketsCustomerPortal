@@ -141,7 +141,7 @@ Not checked here: a real browser (RouteTabs overflow and select below 480 px, fo
 | Redeem in the create tx before the order row; promo figures stored; the last redemption goes once; a later failure (audit) rolls the redemption back with the order | automated-test (fake port, real tx) | promotions.test.ts |
 | Staff for a customer: eligibility for the customer; staff cannot use a code for themselves | automated-test | promotions.test.ts |
 | Checkout in the caller's tx accepts a code and returns the figures | automated-test | promotions.test.ts |
-| Release on cancel only on exact zero exposure; exposure, a missing port or an error keeps the redemption and the cancel succeeds | automated-test (fake exposure port) | promotions.test.ts |
+| Release on cancel only on exact zero exposure, including no provider attempt ever (`providerAttemptEver: false`). Exposure, an attempt, a missing field or port, or an error keeps the redemption, and the cancel succeeds | automated-test (fake exposure port) | promotions.test.ts |
 | A code never travels in a URL (`quote` GET refuses it; `quoteWithPromo` is a POST mutation); inconsistent outcome refused; API v1 refuses codes | automated-test | promotions.test.ts (10 tests in total) |
 | Wizard: field outside the wizard form (no nested forms); Enter and Apply only quote, never create; total announced in an always-mounted polite region; code sent on create; a code dropped after a selection change stays removed | automated-test | client orders.test.tsx (41 tests, incl. 2 C3 and axe on the review step) |
 | Staff new-order dialog: code priced for the customer (`forCustomerPublicId`), un-applied on any change of customer or items | code review only | ConsoleOrderTools.tsx (rules.test.tsx 21 pass; no dedicated promo test) |
@@ -149,10 +149,12 @@ Not checked here: a real browser (RouteTabs overflow and select below 480 px, fo
 | Export: published definitions with layout, portable policy refs, no local ids; selection; audited | automated-test | workflowTransfer.test.ts |
 | Abuse cases: oversized, too deep, not JSON, wrong format version, `__proto__`/`constructor`/`prototype`, unknown keys, digest mismatch (no override), duplicate keys, 51 workflows, HTML/script in names, unknown references, unmatched slugs | automated-test | workflowTransfer.test.ts (14 tests) |
 | Apply: drafts only, unique keys, draft of existing, decisions complete, nothing published, idempotent replay | automated-test | workflowTransfer.test.ts |
+| C1 attempt guard wraps quote / create / staff-for-customer outside the tx; a refusal reaches it after rollback (no rows); checkout and code-less calls are not wrapped; a zero-contribution code leaves no promo figures | automated-test (fake guard) | promotions.test.ts (12 tests) |
+| `catalog.listActive(tx, { forShare })` returns the same catalog on the caller's connection | automated-test | packets.test.ts (9) |
 | Existing order and designer behaviour unchanged | automated-test | orders.test.ts (35), workflowDesigner.test.ts (20) |
 
 Run: `scripts/dev/test.sh` per file (above), `scripts/dev/tc.sh` (no errors under `orders/`; errors at the time were in other packages' in-progress files), ESLint on all changed paths.
 
-Tested only against fakes: the promotions port (real module is audit_engineer's); the compliance `orderPaymentExposureInTx` port (being implemented by compliance_engineer; until it lands every cancel keeps the redemption — fail closed); `compliance.listPublishedPolicies` for policy mapping.
+Tested only against fakes: the promotions port (real module is audit_engineer's); the compliance `orderPaymentExposureInTx` port (live in 76ad28d, but until it returns `providerAttemptEver` every cancel keeps the redemption, which is fail closed); the real `guardAttempt` (siem_engineer); `compliance.listPublishedPolicies` for policy mapping.
 
 Not verified: real concurrent redemptions across connections; the HTTP body cap for transfer procedures; a real browser (320 px, zoom, dark mode contrast, screen-reader reading of the announcement); the transfer UI (files_engineer).
