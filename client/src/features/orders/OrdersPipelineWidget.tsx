@@ -57,7 +57,10 @@ export default function OrdersPipelineWidget() {
                 <div key={status.key} className="rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
                   <dt className="text-xs text-muted">{label}</dt>
                   <dd className="mt-1 text-xl font-semibold text-ink">
-                    <Link href={`/admin/orders?status=${status.key}`} className="underline-offset-2 hover:underline">
+                    <Link
+                      href={`/admin/orders?status=${status.key}`}
+                      className="inline-flex min-h-6 min-w-6 items-center justify-center rounded-sm underline-offset-2 hover:underline"
+                    >
                       {data.items.length}
                       {data.nextCursor ? "+" : ""}{" "}
                       <span className="sr-only">{label} orders</span>

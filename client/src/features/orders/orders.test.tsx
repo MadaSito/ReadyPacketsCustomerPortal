@@ -565,6 +565,8 @@ describe("console orders pipeline widget", () => {
     expect(screen.getByRole("link", { name: "All orders" })).toHaveAttribute("href", "/admin/orders");
     expect(screen.getByRole("link", { name: "1+ In review orders" })).toHaveAttribute("href", "/admin/orders?status=in_review");
     expect(screen.getByRole("link", { name: "0 Awaiting customer orders" })).toBeInTheDocument();
+    // WCAG 2.5.8: each count link keeps a target of at least 24x24 CSS px.
+    expect(screen.getByRole("link", { name: "0 Awaiting customer orders" })).toHaveClass("inline-flex", "min-h-6", "min-w-6");
     expect(screen.getAllByRole("heading", { level: 2 })).toHaveLength(1);
     expect(calls.filter((c) => c.path === "orders.admin.list")).toHaveLength(5);
     await expectNoAxeViolations(container);
