@@ -109,6 +109,7 @@ function EdgeLine(props: EdgeProps<RpEdge>) {
         <button
           type="button"
           aria-label={name}
+          data-flow-edge-label=""
           aria-pressed={selected ? "true" : "false"}
           aria-describedby={api.helpId}
           onClick={() => api.select({ type: "edge", id })}
@@ -163,6 +164,35 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
     return () => window.cancelAnimationFrame(frame);
   }, [nodes]);
 
+  // Transition buttons sit at the path midpoints, which coincide for two-way pairs and for parallel routes, and
+  // can land under a step card. Overlapping targets fail WCAG 2.5.8 and hide each other, so after layout nudge
+  // each label (in DOM order, deterministic) to the nearest free spot. Uses the independent CSS `translate`
+  // property, which React's style prop (`transform`) never touches; flow units, so pan and zoom keep it valid.
+  const settleLabels = useCallback(() => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const zoom = flow.getZoom() || 1;
+    const buttons = [...frame.querySelectorAll<HTMLElement>("[data-flow-edge-label]")];
+    for (const button of buttons) button.style.translate = "";
+    const box = (element: Element) => {
+      const r = element.getBoundingClientRect();
+      return { left: r.left / zoom, top: r.top / zoom, right: r.right / zoom, bottom: r.bottom / zoom };
+    };
+    const GAP = 4;
+    const taken = [...frame.querySelectorAll(".react-flow__node")].map(box);
+    const hits = (b: { left: number; top: number; right: number; bottom: number }) =>
+      taken.some((t) => b.left < t.right + GAP && b.right > t.left - GAP && b.top < t.bottom + GAP && b.bottom > t.top - GAP);
+    for (const button of buttons) {
+      const b = box(button);
+      const step = b.bottom - b.top + GAP * 2;
+      const tries: Array<[number, number]> = [[0, 0]];
+      for (let i = 1; i <= 6; i += 1) tries.push([0, step * i], [0, -step * i], [step * 2 * i, 0], [-step * 2 * i, 0]);
+      const [dx, dy] = tries.find(([x, y]) => !hits({ left: b.left + x, right: b.right + x, top: b.top + y, bottom: b.bottom + y })) ?? [0, 0];
+      if (dx || dy) button.style.translate = `${dx}px ${dy}px`;
+      taken.push({ left: b.left + dx, right: b.right + dx, top: b.top + dy, bottom: b.bottom + dy });
+    }
+  }, [flow]);
+
   const rfNodes = useMemo<RpNode[]>(
     () =>
       [...nodes]
@@ -207,6 +237,17 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
       })),
     [edges, labels, selected],
   );
+  // Two frames: xyflow measures nodes, then positions edge labels from the measured handles.
+  useEffect(() => {
+    let second = 0;
+    const first = window.requestAnimationFrame(() => {
+      second = window.requestAnimationFrame(settleLabels);
+    });
+    return () => {
+      window.cancelAnimationFrame(first);
+      window.cancelAnimationFrame(second);
+    };
+  }, [shownNodes, rfEdges, settleLabels]);
 
   const select = useCallback((selection: FlowSelection) => onSelect?.(selection), [onSelect]);
 
@@ -342,12 +383,16 @@ function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConn
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             onNodesChange={(changes) => {
+              let resized = false;
               for (const change of changes) {
+                if (change.type === "dimensions") resized = true;
                 if (change.type === "position" && change.dragging && change.position) {
                   const position = change.position;
                   setDragging((prev) => ({ ...prev, [change.id]: position }));
                 }
               }
+              // First measurement (or a card resizing) moves the edge midpoints.
+              if (resized) window.requestAnimationFrame(settleLabels);
             }}
             onNodeDragStop={(_event, node) => {
               setDragging((prev) => {

@@ -76,7 +76,7 @@ export function Field({ label, hint, error, required = false, hideLabel, id, lab
           {labelAside ? <div className="text-sm">{labelAside}</div> : null}
         </div>
         {hint ? (
-          <p id={hintId} className="text-sm text-muted">
+          <p id={hintId} className="text-sm break-words text-muted">
             {hint}
           </p>
         ) : null}
@@ -181,7 +181,7 @@ export function Checkbox({ label, description, checked, defaultChecked, onChecke
             {required ? <span className="sr-only"> (required)</span> : null}
           </label>
           {description ? (
-            <p id={descId} className="text-sm text-muted">
+            <p id={descId} className="text-sm break-words text-muted">
               {description}
             </p>
           ) : null}
@@ -219,7 +219,7 @@ export function Switch({ label, description, checked, defaultChecked, onCheckedC
           {label}
         </label>
         {description ? (
-          <p id={descId} className="text-sm text-muted">
+          <p id={descId} className="text-sm break-words text-muted">
             {description}
           </p>
         ) : null}
@@ -273,7 +273,7 @@ export function RadioGroup({ legend, options, value, defaultValue, onValueChange
         {required ? <span className="sr-only"> (required)</span> : null}
       </legend>
       {hint ? (
-        <p id={hintId} className="mb-2 text-sm text-muted">
+        <p id={hintId} className="mb-2 text-sm break-words text-muted">
           {hint}
         </p>
       ) : null}
