@@ -62,6 +62,42 @@ The same scenario catalogue is available to the responsive runner. Catalogue ent
 | `/account/security`, two-factor content and recovery confirmation | Passed, both themes (`assurance.test.tsx`, four cases); real registered Identity cards not covered by these fixture cases | Not checked | Not checked |
 | Public sign-in, registration, reset, policy, SSO and fallback; account-transition routes | Not checked in this review | Not checked | Not checked |
 | Customer orders/files/audio, account/sessions, policies/privacy, support/messages, notifications/search, and feature-flagged customer flows | Not checked in this review | Not checked | Not checked |
-| Staff/admin routes and registered detail tabs, including protection, identity, privacy, audit, payments, integrations, and operations | Not checked in this review | Not checked | Not checked |
+| Staff/admin routes and registered detail tabs, including protection, identity, privacy, audit, payments, integrations, and operations | Not checked in this review | Automated sweep at `50a7dd6`, targeted recheck at `b00f8df`; see Increment 04 automated run below | Not checked |
+| Customer routes (all catalogued, synthetic fixtures) | See page tests | Automated sweep at `50a7dd6`, targeted recheck at `b00f8df`; see Increment 04 automated run below | Not checked |
 
 Use one row per concrete route/state when recording results. Include the commit, fixtures (non-secret names), role, browser/OS/assistive technology versions, themes, zoom/viewport and the evidence source. Attach a short finding and disposition for failures. The route catalogue gives the full route inventory; these grouped unchecked rows make no claim about other suites or live accessibility.
+
+## Increment 04 automated Chromium run
+
+This is automated evidence only. Literal 200%/400% browser zoom (`QA_LITERAL_ZOOM`) was not used, and no assistive technology (NVDA, JAWS, VoiceOver, TalkBack) was exercised. The reflow numbers come from viewport widths, not real browser zoom. Axe "incomplete" results, such as colour contrast over overlays, still need manual review and are not counted as passes. All data was synthetic, on an isolated local dev instance (`127.0.0.1:5034`) with dedicated synthetic local MFA accounts (customer, staff, admin). Session-state files, logs and screenshots were stored outside the repository with private permissions and are not part of this evidence.
+
+### Full sweep at build `50a7dd6` (22 Nov 2026)
+
+| Runner | Executed | Failed | Rate-limited | Not checked (missing fixture) | Widths |
+| --- | --- | --- | --- | --- | --- |
+| `scripts/qa/a11y-check.mjs` | 1002 | 26 | 0 | 24 | runner default |
+| `scripts/qa/responsive-check.mjs` | 2672 | 46 | 0 | 24 | 240, 320, 390, 768, 1024, 1440, 1920, 2560 |
+
+Routes with failures were sent to their owning features. The UI foundation fixes from this round: `02ecbb1` (buttons wrap below 360 px), `445e025` (card and page-header action rows), `620cae1` (DataTable scroll region contains positioned cells), `88b1765` (RouteTabs re-measure), `00b4899` (workflow canvas label overlap, field hints wrap). Fixes in other features: `069a7d2` (customer credentials tab), `0bf7e56` (webhooks), `12ffb84` (customer engagement widget), `b00f8df` (referrals heading), `f34a9a4` (backups at 240 px), `c2caddd` (invoice link target).
+
+### Targeted recheck at build `b00f8df` (22 Nov 2026)
+
+Only the routes and widths that failed in the full sweep were rerun, plus `/admin/storage/new` at 240 px and the customer Credentials tab at 320 px in both themes. This was not a new full sweep.
+
+| Route | Check | Width(s) | Result |
+| --- | --- | --- | --- |
+| `/admin/customers/:customerId#credentials` | axe | — | Fixed, 6 executed / 0 failed |
+| `/admin/integrations/webhooks` (incl. inbound, deliveries) | axe | — | Fixed, 18 / 0 |
+| `/admin/referrals` | axe | — | Fixed, 12 / 0 |
+| `/admin/sharepoint-sync` | axe | — | Fixed, 6 / 0 |
+| `/orders/new` | axe | — | **Still failing**: 6 / 3, `page-has-heading-one` (intermittent). The policy gate's heading is hidden by the route Suspense fallback while the lazy page loads. Routed to compliance. |
+| `/account/security`, `/account/sessions`, `/admin/audit/integrity`, `/admin/catalog`, `/admin/maintenance`, `/admin/orders/:orderId/automation`, `/admin/orders/:orderId/sync`, `/admin/settings` | overflow | 240 | Fixed, 0 failed |
+| `/admin/backups` | overflow | 240 | Fixed, 6 / 0 (1 case not checked: missing fixture) |
+| `/admin/customers/:customerId` (incl. `#credentials`, `#orders`), light and dark | overflow | 240, 320 | Fixed, 20 / 0 |
+| `/admin/integrations/webhooks` | overflow | 768, 1024 | Fixed, 12 / 0 |
+| `/admin/knowledge` | overflow | 1024 | Fixed, 12 / 0 |
+| `/invoices` | overflow | 390 | Fixed, 18 / 0 |
+| Customer `/`, light and dark | overflow | 240 | Fixed, 0 px overflow |
+| `/admin/storage/new` | overflow | 240 | **Failing at `b00f8df`**: 2 / 2, 4 px. Caused by an unbreakable token in a radio option description. Fixed in `838de62` (radio labels and descriptions wrap). The fix was checked with an in-page style simulation (0 px) but not yet rerun on a rebuilt server. |
+
+Open items: rerun `/orders/new` (axe) and `/admin/storage/new` (240 px) on a build that contains the compliance fix and `838de62`. Manual keyboard, assistive technology, contrast and literal zoom checks from the checklist above remain outstanding for all routes.
