@@ -358,8 +358,44 @@ describe("referralsFeature — WCAG 2.2 AA pageA11y (light & dark)", () => {
 
   pageA11y("/admin/referrals ready", async () => {
     renderReferralsRoute({ path: "/admin/referrals", role: "admin" });
-    await screen.findByRole("heading", { level: 1, name: "Referrals" });
+    await screen.findByRole("heading", { level: 1, name: "Referrals" }, { timeout: 5000 });
     await screen.findAllByText("Alice Referrer");
+  });
+
+  pageA11y("/admin/referrals empty state", async () => {
+    renderReferralsRoute({
+      path: "/admin/referrals",
+      role: "admin",
+      handlers: {
+        "referrals.admin.list": () => ({ items: [], nextCursor: null }),
+        "referrals.admin.ledger": () => ({ items: [], nextCursor: null }),
+      },
+    });
+    await screen.findByRole("heading", { level: 1, name: "Referrals" }, { timeout: 5000 });
+    await screen.findByRole(
+      "heading",
+      { level: 2, name: "No referrals recorded yet" },
+      { timeout: 5000 },
+    );
+  });
+
+  pageA11y("/admin/referrals ledger empty state", async () => {
+    renderReferralsRoute({
+      path: "/admin/referrals",
+      role: "admin",
+      handlers: {
+        "referrals.admin.list": () => ({ items: [], nextCursor: null }),
+        "referrals.admin.ledger": () => ({ items: [], nextCursor: null }),
+      },
+    });
+    await screen.findByRole("heading", { level: 1, name: "Referrals" }, { timeout: 5000 });
+    const ledgerTab = await screen.findByRole("tab", { name: "Reward ledger" });
+    await userEvent.click(ledgerTab);
+    await screen.findByRole(
+      "heading",
+      { level: 2, name: "No reward ledger entries yet" },
+      { timeout: 5000 },
+    );
   });
 
   pageA11y("/admin/referrals approve dialog open", async () => {

@@ -1063,7 +1063,7 @@ export default function AdminReferralsPage() {
                         title="No matching referrals"
                         description="Adjust or clear your filters to view other referral records."
                         onClearFilters={handleResetFilters}
-                        headingLevel={3}
+                        headingLevel={2}
                       />
                     ) : (
                       <EmptyState
@@ -1071,7 +1071,7 @@ export default function AdminReferralsPage() {
                         icon={Gift}
                         title="No referrals recorded yet"
                         description="Customer attributions appear here once the referral programme is enabled and new customers register with a referral link."
-                        headingLevel={3}
+                        headingLevel={2}
                       />
                     )
                   }
@@ -1124,7 +1124,7 @@ export default function AdminReferralsPage() {
                       icon={Wallet}
                       title="No reward ledger entries yet"
                       description="Approved referral rewards and applied account credits are appended here permanently."
-                      headingLevel={3}
+                      headingLevel={2}
                     />
                   }
                 />
