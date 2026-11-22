@@ -444,7 +444,7 @@ function toWireIdempotencyKey(storedKey: string): string {
   return storedKey.replace(RETRY_STORAGE_SUFFIX_RE, "");
 }
 
-function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: DispatchRow[]): string {
+function resolveRetryRootRow(targetRow: DispatchRow, existingRows: readonly DispatchRow[]): DispatchRow {
   const byPublicId = new Map(existingRows.map((r) => [r.publicId, r]));
   const visited = new Set<string>();
   let current: DispatchRow = targetRow;
@@ -456,7 +456,11 @@ function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: DispatchR
     }
     current = parent;
   }
-  return toWireIdempotencyKey(current.idempotencyKey);
+  return current;
+}
+
+function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: readonly DispatchRow[]): string {
+  return toWireIdempotencyKey(resolveRetryRootRow(targetRow, existingRows).idempotencyKey);
 }
 
 function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
@@ -1155,6 +1159,7 @@ export function createProductionWebhookService(
       bundleScopeManifest?: string | null;
       isResend?: boolean;
       action?: DispatchActionKind;
+      extraAttrs?: Record<string, SafeAttributeValue>;
     },
   ): Promise<void> {
     const action = input.action ?? (input.isResend ? "resend" : "request");
@@ -1176,6 +1181,7 @@ export function createProductionWebhookService(
           tier: input.tier ?? null,
           bundle_scope_manifest: input.bundleScopeManifest ?? null,
           http_status: null,
+          ...input.extraAttrs,
         },
       },
       tx,
@@ -1206,6 +1212,7 @@ export function createProductionWebhookService(
       redeliveryOfPublicId?: string | null;
       idempotencyKeyOverride?: string;
       retryRootWireKey?: string;
+      destinationChanged?: boolean;
       dispatchKind?: DispatchActionKind;
       reasonLength?: number;
       phase1ArtifactsConfirmed: boolean;
@@ -1294,6 +1301,9 @@ export function createProductionWebhookService(
     };
     if (params.isResend && params.resendReasonCode) {
       reqAttrs.resend_reason_code = params.resendReasonCode;
+    }
+    if (typeof params.destinationChanged === "boolean") {
+      reqAttrs.destination_changed = params.destinationChanged;
     }
 
     const auditEventName =
@@ -2545,7 +2555,7 @@ export function createProductionWebhookService(
       orderPublicId: string;
       targetRow: DispatchRow;
       existingRows: DispatchRow[];
-      action: "retry" | "redeliver";
+      action: "retry" | "redeliver" | "resend";
     },
   ): Promise<{ ok: true; prepared: PreparedPhaseDispatch } | { ok: false; error: DomainError }> {
     const orders = requireOrders();
@@ -3900,15 +3910,35 @@ export function createProductionWebhookService(
               `Cannot retry ${phase} while a dispatch is queued or sending.`,
             );
           }
-          // Abuse guard: staff with `orders.production.trigger` cannot bypass `orders.production.redeliver`
-          // step-up by retrying an older failed row once the phase has been delivered.
-          if (phaseRows.some((r) => r.state === "delivered")) {
+
+          const rootRow = resolveRetryRootRow(targetRow, phaseRows);
+          // Abuse guard: once an intent chain has been delivered (or an initial undelivered chain is superseded by a
+          // delivered phase row), `retry` is refused; retrying an undelivered `dead`/`failed` redelivery row (`rootRow`
+          // has `redeliveryOfPublicId !== null` and zero delivered rows in its `retryOf` chain) is permitted and
+          // preserves that redelivery's wire `Idempotency-Key`.
+          const intentChainDelivered = phaseRows.some(
+            (r) =>
+              r.state === "delivered" &&
+              resolveRetryRootRow(r, phaseRows).publicId === rootRow.publicId,
+          );
+          const initialPhaseAlreadyDelivered =
+            rootRow.redeliveryOfPublicId === null &&
+            phaseRows.some((r) => r.state === "delivered");
+          if (intentChainDelivered || initialPhaseAlreadyDelivered) {
             throw conflict(
               "PRODUCTION_ALREADY_DELIVERED",
               `${phaseDisplayLabel(phase)} (${phase}) has already been delivered; re-sending requires an administrator with step-up authentication and REDELIVER confirmation.`,
             );
           }
-          if (targetRow.state === "unknown" || phaseRows.some((r) => r.state === "unknown")) {
+          if (
+            targetRow.state === "unknown" ||
+            phaseRows.some(
+              (r) =>
+                r.state === "unknown" &&
+                (rootRow.redeliveryOfPublicId === null ||
+                  resolveRetryRootRow(r, phaseRows).publicId === rootRow.publicId),
+            )
+          ) {
             throw conflict(
               "PRODUCTION_DISPATCH_UNCERTAIN",
               `A ${phase} attempt ended with an uncertain outcome; verify downstream state before re-sending.`,
@@ -3938,9 +3968,35 @@ export function createProductionWebhookService(
             return prep;
           }
 
+          if (
+            prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint ||
+            prep.prepared.destinationFingerprint !== targetRow.destinationFingerprint
+          ) {
+            await recordRefusedAuditInTx(tx, {
+              phase,
+              orderPublicId: access.publicId,
+              reasonCode: "PRODUCTION_DESTINATION_CHANGED",
+              packet: targetRow.packet ?? null,
+              tier: targetRow.tier ?? null,
+              bundleScopeManifest: targetRow.bundleScopeManifest ?? null,
+              action: "retry",
+              extraAttrs: {
+                target_dispatch_public_id: targetRow.publicId,
+                destination_changed: true,
+              },
+            });
+            return {
+              ok: false,
+              error: conflict(
+                "PRODUCTION_DESTINATION_CHANGED",
+                "Webhook destination or authentication changed since the original dispatch; an administrator with step-up verification must use Re-send.",
+              ),
+            };
+          }
+
           const resendReasonCode: ControlledResendReason =
             targetRow.state === "dead" ? "OPERATOR_RETRY_AFTER_DEAD_LETTER" : "OPERATOR_RETRY_AFTER_FAILURE";
-          const retryRootWireKey = resolveRetryRootWireKey(targetRow, existingRows);
+          const retryRootWireKey = resolveRetryRootWireKey(targetRow, phaseRows);
 
           const item = await enqueueDispatchInTx(tx, {
             principal,
@@ -3961,7 +4017,7 @@ export function createProductionWebhookService(
             isResend: true,
             resendReasonCode,
             retryOfPublicId: targetRow.publicId,
-            redeliveryOfPublicId: null,
+            redeliveryOfPublicId: rootRow.redeliveryOfPublicId ?? null,
             retryRootWireKey,
             dispatchKind: "retry",
             phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
@@ -4075,13 +4131,37 @@ export function createProductionWebhookService(
               `Cannot re-deliver ${phase} while a dispatch is queued or sending.`,
             );
           }
+
+          const latestRedeliveryRow =
+            phaseRows.find((r) => resolveRetryRootRow(r, phaseRows).redeliveryOfPublicId !== null) ?? null;
+          const latestRedeliveryRoot = latestRedeliveryRow
+            ? resolveRetryRootRow(latestRedeliveryRow, phaseRows)
+            : null;
+          const latestRedeliveryChain = latestRedeliveryRoot
+            ? phaseRows.filter(
+                (r) => resolveRetryRootRow(r, phaseRows).publicId === latestRedeliveryRoot.publicId,
+              )
+            : [];
+          const latestRedeliveryDelivered = latestRedeliveryChain.some((r) => r.state === "delivered");
+
           if (
             phaseRows[0]?.state === "unknown" ||
-            phaseRows.some((r) => r.redeliveryOfPublicId !== null && r.state === "unknown")
+            latestRedeliveryRow?.state === "unknown" ||
+            (!latestRedeliveryDelivered && latestRedeliveryChain.some((r) => r.state === "unknown"))
           ) {
             throw conflict(
               "PRODUCTION_DISPATCH_UNCERTAIN",
-              `Cannot re-deliver ${phase} while a prior delivery outcome is uncertain; verify downstream state first.`,
+              `Cannot start a new ${phase} redelivery while the latest redelivery outcome is unknown; verify downstream state and retry or resolve the prior attempt first.`,
+            );
+          }
+          if (
+            !latestRedeliveryDelivered &&
+            (latestRedeliveryRow?.state === "dead" ||
+              latestRedeliveryChain.some((r) => r.state === "dead"))
+          ) {
+            throw conflict(
+              "PRODUCTION_REDELIVERY_RETRY_REQUIRED",
+              `The latest ${phase} redelivery ended in dead-letter state; retry that redelivery row (${latestRedeliveryRow!.publicId}) so its original Idempotency-Key is preserved.`,
             );
           }
 
@@ -4185,21 +4265,68 @@ export function createProductionWebhookService(
           }
 
           // PW-07: Classify into controlled server code; NEVER store or audit raw `input.reason` prose.
-          const resendReasonCode = classifyResendReasonCode(phaseRows[0]!);
+          const latestRow = phaseRows[0]!;
+          const rootRow = phaseRows[phaseRows.length - 1]!;
+          const resendReasonCode = classifyResendReasonCode(latestRow);
 
-          const prep = await preparePhasePayloadInTx(tx, {
+          if (input.phase === "P201" && input.phase1ArtifactsConfirmed !== true) {
+            await recordRefusedAuditInTx(tx, {
+              phase: "P201",
+              orderPublicId: access.publicId,
+              reasonCode: "PHASE1_ARTIFACTS_UNCONFIRMED",
+              packet: rootRow.packet ?? null,
+              tier: rootRow.tier ?? null,
+              bundleScopeManifest: rootRow.bundleScopeManifest ?? null,
+              isResend: true,
+              action: "resend",
+            });
+            return {
+              ok: false,
+              error: validation(
+                "PHASE1_ARTIFACTS_UNCONFIRMED",
+                "Confirm Phase I SharePoint output artifacts before re-sending Phase II (P201).",
+              ),
+            };
+          }
+
+          if (
+            input.phase === "P101" &&
+            input.releaseStatus !== undefined &&
+            input.releaseStatus.trim() !== (rootRow.releaseStatus ?? "")
+          ) {
+            await recordRefusedAuditInTx(tx, {
+              phase: "P101",
+              orderPublicId: access.publicId,
+              reasonCode: "ORDER_SCOPE_CHANGED",
+              packet: rootRow.packet ?? null,
+              tier: rootRow.tier ?? null,
+              bundleScopeManifest: rootRow.bundleScopeManifest ?? null,
+              isResend: true,
+              action: "resend",
+            });
+            return {
+              ok: false,
+              error: conflict(
+                "ORDER_SCOPE_CHANGED",
+                "Cannot change releaseStatus when re-sending an undelivered dispatch; payload bytes must match the original attempt.",
+              ),
+            };
+          }
+
+          const prep = await reconstructExactDispatchPayloadInTx(tx, {
             orderId: access.id,
             orderPublicId: access.publicId,
-            phase: input.phase,
+            targetRow: rootRow,
             existingRows,
-            releaseStatusOverride: input.releaseStatus,
-            requireExplicitP201Confirm: true,
-            phase1ArtifactsConfirmed: input.phase1ArtifactsConfirmed === true,
             action: "resend",
           });
           if (!prep.ok) {
             return prep;
           }
+
+          const retryRootWireKey = toWireIdempotencyKey(rootRow.idempotencyKey);
+          const destinationChanged =
+            prep.prepared.destinationFingerprint !== rootRow.destinationFingerprint;
 
           const item = await enqueueDispatchInTx(tx, {
             principal,
@@ -4219,7 +4346,10 @@ export function createProductionWebhookService(
             releaseStatus: prep.prepared.releaseStatus,
             isResend: true,
             resendReasonCode,
+            retryRootWireKey,
+            destinationChanged,
             dispatchKind: "resend",
+            reasonLength: reason.length,
             phase1ArtifactsConfirmed: prep.prepared.phase1ArtifactsConfirmed,
           });
           return { ok: true, item };
