@@ -790,6 +790,23 @@ describe("cart module — atomic checkout, policy enforcement, Decision 12 retur
       "NOT_FOUND:CART_NOT_FOUND",
     );
 
+    // Two-reference consistency: when both `cartPublicId` and `attemptPublicId` are supplied, mismatch fails closed (`CART_NOT_FOUND`)
+    const wrongAttemptId = ulid();
+    await expectDomainError(
+      cartMod.getCheckoutStatus(alice.principal, {
+        cartPublicId: checkoutRes.cartPublicId,
+        attemptPublicId: wrongAttemptId,
+      }),
+      "NOT_FOUND:CART_NOT_FOUND",
+    );
+    await expectDomainError(
+      cartMod.restoreCheckout(alice.principal, {
+        cartPublicId: checkoutRes.cartPublicId,
+        attemptPublicId: wrongAttemptId,
+      }),
+      "NOT_FOUND:CART_NOT_FOUND",
+    );
+
     // Explicit POST `restoreCheckout` cancels the unpaid attempt and restores items + draft fields into Alice's open cart
     const restored1 = await callerFor(alice.principal).cart.restoreCheckout({ attemptPublicId: attemptId });
     expect(restored1.restored).toBe(true);

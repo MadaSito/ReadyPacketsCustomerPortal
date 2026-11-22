@@ -1296,6 +1296,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
         await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: cartRow.publicId });
         throw cartNotFound();
       }
+      if (input.attemptPublicId && cartRow.paymentAttemptPublicId !== input.attemptPublicId) {
+        throw cartNotFound();
+      }
       if (!cartRow.checkoutInvoicePublicId || !cartRow.checkoutOrderPublicId || !cartRow.checkoutOrderReference) {
         throw conflict("CART_NOT_CHECKED_OUT", "This cart has not completed checkout yet.");
       }
@@ -1390,6 +1393,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
             deniedOtherCustomer = true;
             throw cartNotFound();
           }
+          if (input.attemptPublicId && sourceCart.paymentAttemptPublicId !== input.attemptPublicId) {
+            throw cartNotFound();
+          }
 
           // Idempotent repeat: already restored -> return current open cart without duplicating items
           if (sourceCart.status === "restored") {
@@ -1406,11 +1412,12 @@ export function createCartService(deps: ModuleDeps): CartModule {
             throw conflict("CART_NOT_RESTORABLE", "This cart cannot be restored.");
           }
 
+          const resolvedAttemptId = input.attemptPublicId ?? sourceCart.paymentAttemptPublicId ?? undefined;
           const cancelResult = await paymentsSvc.cancelAttemptIfUnpaid(
             principal,
             {
               invoicePublicId: sourceCart.checkoutInvoicePublicId,
-              ...(sourceCart.paymentAttemptPublicId ? { attemptPublicId: sourceCart.paymentAttemptPublicId } : {}),
+              ...(resolvedAttemptId ? { attemptPublicId: resolvedAttemptId } : {}),
             },
             tx,
           );
