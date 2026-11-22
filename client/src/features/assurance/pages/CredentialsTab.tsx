@@ -139,7 +139,8 @@ export function CredentialAdmin({
       <Card as="section" title="Multi-factor authentication" description="Reset enrollment only after confirming the user’s identity according to your support policy."
         actions={<Badge tone="warning">High impact</Badge>}>
         <p className="mb-3 text-sm text-body">Resetting removes all authenticator apps, passkeys and recovery codes. It also signs the user out of every active session.</p>
-        <Button variant="secondary" leadingIcon={<ShieldAlert aria-hidden="true" />} onClick={() => {
+        <Button variant="secondary" className="max-w-full whitespace-normal py-2 text-center"
+          leadingIcon={<ShieldAlert aria-hidden="true" />} onClick={() => {
           setError(undefined); setNotice(undefined); setPassword(""); setConfirm("mfa");
         }}>Reset multi-factor authentication</Button>
       </Card>

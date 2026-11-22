@@ -121,6 +121,21 @@ pageA11y("/account/security recovery confirmation", async () => {
 });
 
 describe("credentials administration widget", () => {
+  it("allows the reset MFA action label to wrap and still requires confirmation", async () => {
+    const actions: CredentialsActions = {
+      setCredential: missing, resetMfa: vi.fn(async () => ({ ok: true as const })),
+    };
+    renderUi(<CredentialAdmin customerId={target} actions={actions} stepUp={runDirectly} email={{ state: "ready" }} />, { wrapper: withCustomer });
+    const trigger = screen.getByRole("button", { name: "Reset multi-factor authentication" });
+    expect(trigger).toHaveClass("whitespace-normal", "max-w-full");
+    expect(trigger).not.toHaveClass("whitespace-nowrap");
+    fireEvent.click(trigger);
+    const confirm = await screen.findByRole("alertdialog", { name: "Reset multi-factor authentication?" });
+    expect(actions.resetMfa).not.toHaveBeenCalled();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Reset MFA" }));
+    await waitFor(() => expect(actions.resetMfa).toHaveBeenCalledExactlyOnceWith(target));
+  });
+
   it("disables email when the provider is unavailable, and reveals then discards the generated password", async () => {
     const temporaryPassword = "synthetic only generated value";
     const actions: CredentialsActions = {
