@@ -9,7 +9,6 @@ import { createPromotionsService, type PromotionsService } from "./service.js";
 export * from "./settings.js";
 export * from "./contracts.js";
 export type {
-  CheckPromotionInput,
   CreatePromotionInput,
   GenerateBatchInput,
   ListPromotionsInput,

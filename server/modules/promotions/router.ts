@@ -4,7 +4,6 @@ import { DomainError } from "../../core/errors.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import {
   adminProcedure,
-  protectedProcedure,
   requireCapability,
   router,
   staffProcedure,
@@ -59,13 +58,6 @@ const promotionScopeSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
-const promotionLineSchema = z.strictObject({
-  productPublicId: publicIdField,
-  packetNumber: z.number().int().min(1).max(255).nullable(),
-  tierKey: z.string().min(1).max(32).nullable(),
-  lineTotalMinor: z.number().int().min(0).max(1_000_000_000),
-});
-
 const readGuard = staffProcedure.use(requireCapability("promotions.read"));
 const manageGuard = adminProcedure.use(requireCapability("promotions.manage"));
 
@@ -81,24 +73,6 @@ const statsInputSchema = z
   .optional();
 
 export const promotionsRouter = router({
-  /**
-   * Customer / console code preview check. Always a POST mutation so codes never travel in URLs.
-   */
-  check: protectedProcedure
-    .meta({ rateLimit: "auth_high_risk" })
-    .input(
-      z.strictObject({
-        code: z.string().min(1).max(64),
-        customerPublicId: publicIdField.optional(),
-        currency: z.string().length(3),
-        lines: z.array(promotionLineSchema).max(200),
-        subtotalMinor: z.number().int().min(0).max(1_000_000_000),
-        bundleDiscountMinor: z.number().int().min(0).max(1_000_000_000),
-        bundleLabel: z.string().max(120).nullable(),
-      }),
-    )
-    .mutation(({ ctx, input }) => promotionsSvc(ctx.services).check(ctx.session, input)),
-
   admin: router({
     list: readGuard
       .input(

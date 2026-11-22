@@ -36,7 +36,7 @@ Manage discount codes at `/admin/promotions` (designed and tested against WCAG 2
 
 ## Abuse controls and SIEM telemetry
 
-- `promotions.check` (plus active quote/order code entry via `guardAttempt`) is rate-limited per account and per blind-indexed normalized IPv4 / IPv6 `/64` address.
+- Code application (`cart.applyCode`, `orders.quoteWithPromo`, `orders.create`, and `orders.admin.createForCustomer` via `services.promotions.guardAttempt` / `preview`) uses server-computed prices exclusively (no client-priced code check endpoint is exposed) and is rate-limited per account and per blind-indexed normalized IPv4 / IPv6 `/64` address.
 - After **any 5 failed checks within 15 minutes** (including failures from rolled-back order submissions, and even if a valid preview occurred in between), code checks for that account pause for 15 minutes (`PROMO_ATTEMPTS_BLOCKED`) and emit `promotion.attempts_blocked` (`WARN`), which forwards to configured SIEM/syslog sinks.
 - Unknown, paused, revoked, scheduled, expired, exhausted, and unentitled codes all return the uniform message `"This code cannot be applied."` Cart hints (minimum subtotal or eligible items) appear only after customer entitlement succeeds.
 - Customer e-mail must be verified; staff and administrators cannot redeem codes for their own accounts. Raw code strings are encrypted at rest, looked up by HMAC blind index, and never written to logs or audit records.

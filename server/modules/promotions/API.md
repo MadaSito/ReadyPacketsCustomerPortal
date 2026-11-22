@@ -22,12 +22,12 @@ Owner: `siem_engineer` (`server/modules/promotions/**`)
 - **Admin custom code rule**: `6..32` characters matching `/^[A-Z0-9][A-Z0-9-]{4,30}[A-Z0-9]$/` (uppercase `A–Z`, `0–9`, internal `-`; no leading or trailing hyphen).
 - **Batch code generation**: CSPRNG (`crypto.randomInt`) over unambiguous alphabet `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (excludes `0, O, 1, I, L`), `12` random characters; optional `codePrefix` matches `/^[A-Z0-9]{1,12}$/` and formats as `<PREFIX>-<12 RANDOM CHARS>`.
 - **Label/code separation**: `create` and `update` reject `label` when `label.trim().toUpperCase()` equals the normalized code (or prefix) with `VALIDATION` / `LABEL_MATCHES_CODE` so secret codes never leak via `label` onto orders, invoices, or audit records.
-- **Customer `check` / `preview`**: normalizes with `trim().toUpperCase()`; any malformed, out-of-range, or unknown string executes a bounded dummy MySQL lookup + decrypt path for §4 timing parity and fails closed with the uniform `PROMO_NOT_APPLICABLE` error. Rate-limited per account (`promo:acct:<userId>`) and per normalized IPv4/IPv6 `/64` prefix (`rateLimitAddress` -> `blindIndex(..., "promo_check.ip")`); any 5 failed attempts within 15 minutes (even with valid previews in between) pause code attempts for 15 minutes and emit `promotion.attempts_blocked` (`WARN`).
+- **Internal `preview` / `guardAttempt` evaluation**: normalizes with `trim().toUpperCase()`; any malformed, out-of-range, or unknown string executes a bounded dummy MySQL lookup + decrypt path for §4 timing parity and fails closed with the uniform `PROMO_NOT_APPLICABLE` error. Rate-limited per account (`promo:acct:<userId>`) and per normalized IPv4/IPv6 `/64` prefix (`rateLimitAddress` -> `blindIndex(..., "promo_check.ip")`); any 5 failed attempts within 15 minutes (even with valid previews in between) pause code attempts for 15 minutes and emit `promotion.attempts_blocked` (`WARN`).
 
 ## Settings Keys
 
 1. `feature.promotions` (`boolean`, default `false`, `clientVisible: true`, `writeCapability: "promotions.manage"`):
-   - Master switch. When `false`, `promotions.check`, `preview`, and `redeemInTx` refuse with `PROMO_NOT_APPLICABLE`. Switching on/off is audited.
+   - Master switch. When `false`, `guardAttempt`, `preview`, and `redeemInTx` refuse with `PROMO_NOT_APPLICABLE`. Switching on/off is audited.
 2. `promotions.policy` (`{ maxDiscountPercent: number }`, default `{ maxDiscountPercent: 50 }`, integer `1..100`, `writeCapability: "promotions.manage"`):
    - Global "Largest discount per order" hard ceiling capping combined `(bundle + promo)` discount at `Math.floor((subtotalMinor * maxDiscountPercent) / 100)`. Round-half-up applies only to percentage promotion math, never to the global ceiling (so a `$0.01` subtotal under a `50%` guard caps at `0`, never `1¢`). Order totals are never negative.
 
@@ -120,9 +120,7 @@ Raw codes, batch code arrays, request payloads, and `#promo=` URLs are **never**
 ## tRPC Router Shapes (`trpc.promotions.*`)
 
 ### Customer / Order Entry
-- `promotions.check` (`protectedProcedure`, mutation):
-  - Input: `{ code: string; customerPublicId?: string; currency: string; lines: { productPublicId: string; packetNumber: number | null; tierKey: string | null; lineTotalMinor: number }[]; subtotalMinor: number; bundleDiscountMinor: number; bundleLabel: string | null }`
-  - Output: `PromotionOutcome`
+- No direct customer `promotions.*` procedure is exposed (preventing client-supplied line prices or standalone code-oracle probing per contract §4). Customers and console operators apply codes exclusively through server-priced `cart.applyCode` and `orders.quoteWithPromo` / `orders.create` / `orders.admin.createForCustomer`, which call `services.promotions.{guardAttempt,preview,redeemInTx}`.
 
 ### Admin Console (`trpc.promotions.admin.*`)
 

@@ -351,21 +351,6 @@ export interface GenerateBatchInput {
   idempotencyKey: string;
 }
 
-export interface CheckPromotionInput {
-  code: string;
-  customerPublicId?: string;
-  currency: string;
-  lines: {
-    productPublicId: string;
-    packetNumber: number | null;
-    tierKey: string | null;
-    lineTotalMinor: number;
-  }[];
-  subtotalMinor: number;
-  bundleDiscountMinor: number;
-  bundleLabel: string | null;
-}
-
 export interface PromotionsService {
   isEnabled(opts?: { tx?: DbOrTx }): Promise<boolean>;
   guardAttempt<T>(actorUserId: number, fn: () => Promise<T>): Promise<T>;
@@ -378,7 +363,6 @@ export interface PromotionsService {
     tx: Tx,
     input: { orderPublicId: string; reason: "order_cancelled" },
   ): Promise<{ released: boolean }>;
-  check(actor: SessionPrincipal, input: CheckPromotionInput): Promise<PromotionOutcome>;
   admin: {
     list(actor: SessionPrincipal, input: ListPromotionsInput): Promise<CursorPage<PromotionView>>;
     get(actor: SessionPrincipal, publicId: string): Promise<PromotionView>;
@@ -752,7 +736,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
   /**
    * Caller-side interactive attempt permit & post-rollback failure accounting.
-   * Must be called OUTSIDE any open business transaction (`orders.quote`, `orders.create`, `cart.applyCode`, `promotions.check`)
+   * Must be called OUTSIDE any open business transaction (`orders.quote`, `orders.create`, `cart.applyCode`)
    * so rate-limiter and failure writes never take a second pool connection inside `tx` and survive rollback.
    */
   async function guardAttempt<T>(actorUserId: number, fn: () => Promise<T>): Promise<T> {
@@ -902,7 +886,18 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       throw promoNotApplicable();
     }
 
-    // 1. Customer account verification (verified email, active customer role — staff/admins cannot redeem for themselves).
+    // 1. Cross-customer actor check (`orders.manage` required when `actorUserId !== customerUserId`) + customer verification.
+    if (ctx.actorUserId !== ctx.customerUserId) {
+      const [actorRow] = await dbOrTx
+        .select({ id: users.id, role: users.role, status: users.status })
+        .from(users)
+        .where(eq(users.id, ctx.actorUserId))
+        .limit(1);
+      if (!actorRow || actorRow.status !== "active" || !roleHasCapability(actorRow.role, "orders.manage")) {
+        throw forbidden("CAPABILITY_NOT_GRANTED");
+      }
+    }
+
     const [customer] = await dbOrTx
       .select({
         id: users.id,
@@ -1486,36 +1481,6 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     return { released: Boolean(res?.released) };
   }
 
-  async function check(
-    actor: SessionPrincipal,
-    input: CheckPromotionInput,
-  ): Promise<PromotionOutcome> {
-    let customerUserId = actor.userId;
-    if (input.customerPublicId && input.customerPublicId !== actor.userPublicId) {
-      if (!roleHasCapability(actor.role, "orders.manage")) {
-        throw forbidden("CAPABILITY_NOT_GRANTED");
-      }
-      const [owner] = await deps.db
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.publicId, input.customerPublicId))
-        .limit(1);
-      if (!owner) throw promoNotApplicable();
-      customerUserId = owner.id;
-    }
-
-    return preview({
-      code: input.code,
-      customerUserId,
-      actorUserId: actor.userId,
-      currency: input.currency,
-      lines: input.lines,
-      subtotalMinor: input.subtotalMinor,
-      bundleDiscountMinor: input.bundleDiscountMinor,
-      bundleLabel: input.bundleLabel,
-    });
-  }
-
   async function insertBatchCodesInTx(
     tx: Tx,
     batchRow: PromoBatchRow,
@@ -1664,7 +1629,6 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     preview,
     redeemInTx,
     releaseForOrderInTx,
-    check,
 
     admin: {
       async list(actor, input) {

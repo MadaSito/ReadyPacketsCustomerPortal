@@ -256,18 +256,11 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       stepUp: true,
     });
 
+    // No customer-reachable `promotions.check` oracle exists on `promotionsRouter` (customers apply codes only via server-priced `cart.applyCode` / `orders.quoteWithPromo`).
+    expect("check" in promotionsRouter._def.procedures).toBe(false);
+
     // Anonymous refused everywhere.
     await expect(anon.caller.admin.list()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
-    await expect(
-      anon.caller.check({
-        code: "WINTER26",
-        currency: "USD",
-        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
-        subtotalMinor: 10_000,
-        bundleDiscountMinor: 0,
-        bundleLabel: null,
-      }),
-    ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
 
     // Customer refused on admin read & write.
     const custCall = callerFor(customer.principal);
@@ -344,7 +337,6 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     const admin = await seedUser({ email: "admin2@synthetic.test", role: "admin", stepUp: true });
     const alice = await seedUser({ email: "alice2@synthetic.test", role: "customer" });
     const adminCall = callerFor(admin.principal);
-    const aliceCall = callerFor(alice.principal);
 
     const dupLabelErr = await adminCall.caller.admin
       .create({
@@ -371,9 +363,11 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     const settingsDefault = await adminCall.caller.admin.getSettings();
     expect(settingsDefault).toEqual({ enabled: false, maxDiscountPercent: 50 });
 
-    const offErr = await aliceCall.caller
-      .check({
+    const offErr = await mod
+      .preview({
         code: "WELCOME-10",
+        customerUserId: alice.id,
+        actorUserId: alice.id,
         currency: "USD",
         lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
         subtotalMinor: 10_000,
@@ -389,8 +383,10 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     expect(updatedSettings.enabled).toBe(true);
     expect(h.audit.events.some((e) => e.eventName === "promotion.settings_updated")).toBe(true);
 
-    const ok = await aliceCall.caller.check({
+    const ok = await mod.preview({
       code: "  welcome-10 ",
+      customerUserId: alice.id,
+      actorUserId: alice.id,
       currency: "USD",
       lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
       subtotalMinor: 10_000,
@@ -603,10 +599,31 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       bundleLabel: null as string | null,
     };
 
+    const previewAs = (
+      actor: { id: number; principal: SessionPrincipal },
+      customerUserId: number,
+      override: Partial<typeof smallOrderInput> = {},
+    ) =>
+      runWithRequestContext(
+        newRequestContext("test", {
+          ipAddress: "203.0.113.10",
+          actor: {
+            userId: actor.id,
+            role: actor.principal.role,
+            sessionId: actor.principal.sessionId,
+          },
+        }),
+        () =>
+          mod.preview({
+            ...smallOrderInput,
+            ...override,
+            customerUserId,
+            actorUserId: actor.id,
+          }),
+      );
+
     // Outsider (wrong domain) with $50 cart -> uniform PROMO_NOT_APPLICABLE (NOT PROMO_MIN_SUBTOTAL!).
-    const outsiderCall = callerFor(outsider.principal);
-    const outErr = await outsiderCall.caller
-      .check(smallOrderInput)
+    const outErr = await previewAs(outsider, outsider.id)
       .then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
     expect(outErr.safe).toMatchObject({
       reasonCode: "PROMO_NOT_APPLICABLE",
@@ -614,35 +631,30 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     });
 
     // Unverified e-mail customer on @partner.org -> uniform PROMO_NOT_APPLICABLE!
-    const unverifiedCall = callerFor(unverified.principal);
-    const unvErr = await unverifiedCall.caller
-      .check(smallOrderInput)
+    const unvErr = await previewAs(unverified, unverified.id)
       .then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
     expect(unvErr.safe?.reasonCode).toBe("PROMO_NOT_APPLICABLE");
 
     // Staff self-redemption -> uniform PROMO_NOT_APPLICABLE; staff checking ON BEHALF of insider -> PROMO_MIN_SUBTOTAL!
-    const staffCall = callerFor(staff.principal);
-    const staffSelfErr = await staffCall.caller
-      .check(smallOrderInput)
+    const staffSelfErr = await previewAs(staff, staff.id)
       .then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
     expect(staffSelfErr.safe?.reasonCode).toBe("PROMO_NOT_APPLICABLE");
 
-    const staffForInsiderErr = await staffCall.caller
-      .check({ ...smallOrderInput, customerPublicId: insider.publicId })
+    const staffForInsiderErr = await previewAs(staff, insider.id)
       .then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
     expect(staffForInsiderErr.safe?.reasonCode).toBe("PROMO_MIN_SUBTOTAL");
 
-    // IDOR: outsider attempting to check using insider's `customerPublicId` is refused with FORBIDDEN!
+    // IDOR: outsider attempting to preview on behalf of insider (`actorUserId !== customerUserId` without `orders.manage`) is refused with FORBIDDEN!
     await expect(
-      outsiderCall.caller.check({ ...smallOrderInput, customerPublicId: insider.publicId }),
+      previewAs(outsider, insider.id),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
 
-    // First-order-only: once insider has a non-canceled order, insider receives uniform PROMO_NOT_APPLICABLE.
+    // First-order-only: once insider has a historical order, insider receives uniform PROMO_NOT_APPLICABLE.
     await seedOrderRow({ ownerUserId: insider.id, statusKey: "submitted" });
-    const insiderCall = callerFor(insider.principal);
-    const notFirstErr = await insiderCall.caller
-      .check({ ...smallOrderInput, subtotalMinor: 25_000, lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 25_000 }] })
-      .then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
+    const notFirstErr = await previewAs(insider, insider.id, {
+      subtotalMinor: 25_000,
+      lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 25_000 }],
+    }).then(() => { throw new Error("expected rejection"); }, (e: unknown) => extractSafeError(e));
     expect(notFirstErr.safe?.reasonCode).toBe("PROMO_NOT_APPLICABLE");
 
     // Passive `recheck: true` never increments failed attempts even when paused/invalid.
@@ -670,13 +682,11 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
 
     // Outsider already had 1 interactive failure above; 4 more interactive failures reach 5 in 15m -> PROMO_ATTEMPTS_BLOCKED + WARN audit!
     for (let i = 2; i <= 4; i += 1) {
-      const e = await outsiderCall.caller
-        .check({ ...smallOrderInput, code: `GUESS-000${i}` })
+      const e = await previewAs(outsider, outsider.id, { code: `GUESS-000${i}` })
         .then(() => { throw new Error("expected rejection"); }, (err: unknown) => extractSafeError(err));
       expect(e.safe?.reasonCode).toBe("PROMO_NOT_APPLICABLE");
     }
-    const fifthErr = await outsiderCall.caller
-      .check({ ...smallOrderInput, code: "GUESS-0005" })
+    const fifthErr = await previewAs(outsider, outsider.id, { code: "GUESS-0005" })
       .then(() => { throw new Error("expected rejection"); }, (err: unknown) => extractSafeError(err));
     expect(fifthErr.safe?.reasonCode).toBe("PROMO_ATTEMPTS_BLOCKED");
 
@@ -698,16 +708,12 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       code: "OPEN-10-NOW",
     });
 
-    const stillBlocked = await outsiderCall.caller
-      .check({ ...smallOrderInput, code: "OPEN-10-NOW" })
+    const stillBlocked = await previewAs(outsider, outsider.id, { code: "OPEN-10-NOW" })
       .then(() => { throw new Error("expected rejection"); }, (err: unknown) => extractSafeError(err));
     expect(stillBlocked.safe?.reasonCode).toBe("PROMO_ATTEMPTS_BLOCKED");
 
     h.clock.advance(15 * 60 * 1000 + 1_000);
-    const unblocked = await outsiderCall.caller.check({
-      ...smallOrderInput,
-      code: "OPEN-10-NOW",
-    });
+    const unblocked = await previewAs(outsider, outsider.id, { code: "OPEN-10-NOW" });
     expect(unblocked.promoDiscountMinor).toBe(500);
   });
 
