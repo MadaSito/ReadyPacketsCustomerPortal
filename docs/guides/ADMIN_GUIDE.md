@@ -45,6 +45,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
 - [Workflow export and import](./WORKFLOW_TRANSFER.md) (increment 05): move workflows between portals as drafts; enable `orders.workflow_transfer.enabled` first.
 - [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md): configure order phases, requirements and staff actions.
 - [Cart and checkout](./CART_AND_CHECKOUT.md): configure checkout, fulfillment requirements and cart operations.
@@ -157,17 +158,112 @@ You add gates in the workflow designer: choose the policy, the gate point, the s
 
 ## Discount codes
 
-_Draft (increment 05). The full section follows when the promotions owners deliver their guide text._
+Open **Operations → Discount codes** (`/admin/promotions`). The pages are `/admin/promotions`, `/new`, `/redemptions`, `/:promotionId` and `/:promotionId/edit`, plus the public link landing page `/promo`. The design is set out in [ADR 0044](../adr/0044-discount-codes.md), and customer help is in [Using a discount code](./DISCOUNT_CODES_HELP.md).
+
+### Who can do what
+
+- Staff with `promotions.read` see the list, masked codes and redemptions.
+- Administrators with `promotions.manage` can:
+  - create, edit, pause, resume and revoke codes;
+  - show codes and generate batches;
+  - export CSV and release redemptions;
+  - change the settings.
+- Every change asks for your password and second factor again (step-up) and is recorded in the audit log.
+
+### Switching it on
+
+The **Discount codes** switch on the page (`feature.promotions`) is off by default. While it is off, no code can be applied anywhere, and existing orders keep their discounts.
+
+### Creating a code
+
+1. Choose **New discount code**.
+2. Enter an internal name (seen by staff only) and the label customers see. The label must not be the code itself.
+3. Choose a percentage, with an optional largest amount, or a fixed amount with its currency. The type cannot be changed later.
+4. Choose what the code applies to (everything, products, tiers or packet sizes) and its conditions:
+   - a minimum subtotal;
+   - a start and end;
+   - the total number of uses, and uses per customer (default 1);
+   - first order only;
+   - only certain customers or e-mail domains;
+   - whether it combines with the bundle discount (otherwise the larger discount applies).
+5. Choose how the code is made: your own code (6–32 letters, digits or hyphens), a generated code, or a batch of up to 5,000 single-use codes with an optional prefix of 1–12 letters or digits.
+
+After creating it, copy the code or its link (`/promo#promo=<CODE>`). The code is in the part of the link after `#`, so it never reaches the server's access logs. Later, **Show code and link** reveals it again, and each reveal is audited.
+
+### Largest discount per order
+
+The setting `promotions.policy.maxDiscountPercent` (default 50%) caps the bundle and code discounts together as a share of the subtotal, and a total is never negative. Changing it needs step-up.
+
+### Pause, resume and revoke
+
+Pause and resume can be undone. Revoke is permanent. Orders already placed always keep their discount.
+
+### Abuse controls
+
+- Every code check is rate limited. After 5 failed checks in 15 minutes, the account cannot check codes for 15 minutes, and a warning (`promotion.attempts_blocked`) goes to the audit log and the SIEM.
+- Customers see the same message for every refusal: "This code cannot be applied."
+- A verified e-mail is required.
+- Staff and administrators cannot redeem codes for themselves.
+- When staff create an order for a customer, eligibility is judged for that customer.
+- Codes cannot be used through API v1.
 
 ### When a redemption is released
 
-A discount code counts as used as soon as an order is placed with it. It is given back only when **all** of these are true:
+A code counts as used as soon as an order is placed with it. It is given back only when **all** of these are true:
 
 - nothing has been paid for the order, not even part of an invoice;
 - none of the order's invoices can still be paid (issued, open or partially paid);
 - no online payment was ever started for the order, including failed, cancelled or expired ones.
 
-When the order is cancelled and all three hold, ReadyPackets releases the redemption automatically. An administrator can also release it by hand from the redemptions list (`promotions.manage`, step-up and a reason), but only under the same three conditions. In every other case the redemption stays used, even after a refund, and the cancellation still goes ahead. To make it up to the customer, give them a new code.
+When an order is cancelled and all three hold, ReadyPackets releases the redemption automatically. After you have voided or settled the invoice by hand, an administrator can choose **Release** on the redemptions list. Release needs a reason of at least 5 characters, and the server checks the same rule and refuses otherwise. In every other case the redemption stays used, even after a refund, and the cancellation still goes ahead. To make it up to the customer, give them a new code.
+
+### Exports
+
+The CSV exports of codes and redemptions are built by the server with formula-safe cells. They need step-up and are audited. Store them as secrets.
+
+## Policy acceptances
+
+Open **Billing & compliance → Policy acceptances** (`/admin/policy-acceptances`). Staff and administrators with `policies.acceptances.read` can view it, and it is always on. It is a read-only view of the recorded evidence; nothing here changes or deletes a record ([ADR 0045](../adr/0045-policy-acceptance-log-centre.md)). Times are shown in your time zone, with the exact UTC time alongside.
+
+### Log
+
+The log can be filtered by:
+
+- customer name, e-mail or reference;
+- policy and exact version;
+- accepted date range;
+- source (Registration, Order gate, Checkout, Re-acceptance, Imported historical) and method (Tick box, Typed name);
+- version status (Current or Superseded);
+- order reference.
+
+**View evidence** opens the full record. It includes the linked order (for order-gate acceptances), an address pseudonym, the correlation ID, the full SHA-256 content hash and the exact policy text accepted. Typed signer names are shown only to administrators with `policies.manage`; other viewers see **Encrypted**.
+
+**Export CSV** needs `policies.acceptances.export` (administrators) and step-up. It downloads up to 5,000 matching records with formula characters neutralised, and is audited.
+
+### Coverage
+
+**Coverage** (`/admin/policy-acceptances/coverage`) shows, for each active policy that requires acceptance:
+
+- the current version and when it was published;
+- how many active customers have accepted it and how many are outstanding;
+- the outstanding customers, with the last version each one accepted (or **Never accepted**).
+
+### Policy updates
+
+**Policy updates** (`/admin/policy-acceptances/updates`) lists every published version with:
+
+- the publication time, the hash prefix and the change summary;
+- the administrator who published it;
+- how many customers have accepted it.
+
+**Open exact text** shows the version on its own page (`/admin/policy-acceptances/versions/:versionId`), with **Print**.
+
+### Customer profile: Policies tab
+
+On a customer's page (`/admin/customers/:customerId`), the **Policies** tab shows:
+
+- the status of each active policy: **Accepted — Current version**, **Update pending**, **Pending — Not yet accepted** or **Not required**;
+- the customer's full acceptance history, with **View evidence** and links to the exact text of each version.
 
 ## Storage copy log
 
