@@ -1,7 +1,7 @@
 /**
  * Audit module — tRPC router (mounted at `trpc.audit.*`). Owner: audit engineer.
  * Every procedure is admin-only (capability checked here AND re-checked inside the service), except
- * `orderActivity`, which follows the orders read policy and returns the customer-safe projection to customers.
+ * `orderActivity` and `orderStatusHistory`, which follows the orders read policy and returns the customer-safe projection to customers.
  */
 import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
@@ -39,6 +39,13 @@ export const auditRouter = router({
       limit: z.number().int().min(1).max(ORDER_ACTIVITY_MAX_PAGE).optional(),
     }))
     .query(({ ctx, input }) => ctx.services.auditCenter.orderActivity(ctx.session, input)),
+  orderStatusHistory: protectedProcedure
+    .input(z.strictObject({
+      orderPublicId: z.string().regex(/^[A-Za-z0-9_-]{10,64}$/),
+      cursor: z.string().max(800).regex(/^[A-Za-z0-9_-]*$/).nullish(),
+      limit: z.number().int().min(1).max(ORDER_ACTIVITY_MAX_PAGE).optional(),
+    }))
+    .query(({ ctx, input }) => ctx.services.auditCenter.orderStatusHistory(ctx.session, input)),
   search: read.meta({ rateLimit: "expensive" }).input(searchInput).query(({ ctx, input }) => ctx.services.auditCenter.search(ctx.session, input)),
   event: read.input(z.strictObject({ eventId })).query(({ ctx, input }) => ctx.services.auditCenter.getEvent(ctx.session, input.eventId)),
   revealSourceAddress: read.meta({ rateLimit: "expensive" }).input(z.strictObject({ eventId }))

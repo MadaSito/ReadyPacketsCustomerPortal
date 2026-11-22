@@ -10,7 +10,7 @@ import type { AuditCtx } from "./access.js";
 import { createChainService } from "./chain.js";
 import { createAuditEmitter, type DurableAuditEmitter } from "./emitter.js";
 import { canonicalBytes } from "./envelope.js";
-import { classifyOrderEvent, listOrderActivity } from "./orderActivity.js";
+import { classifyOrderEvent, listOrderActivity, listOrderStatusHistory } from "./orderActivity.js";
 import { rowToEnvelope } from "./rows.js";
 import * as auditSchema from "./schema.js";
 import { auditEvents } from "./schema.js";
@@ -23,6 +23,19 @@ const sharer = fakePrincipal({ role: "customer" });
 const outsider = fakePrincipal({ role: "customer" });
 const staff = fakePrincipal({ role: "staff" });
 const STAFF_NAME = "Synthetic Staffer";
+const at = (m: number) => new Date(Date.UTC(2026, 10, 19, 9, m));
+const TRANSITIONS = [
+  { id: 4, at: at(40), from: "review", to: "done", note: "Staff-only synthetic note", internal: true, actor: staff.userId, role: "staff" as const },
+  { id: 3, at: at(30), from: "draft", to: "review", note: "Customer synthetic note", internal: false, actor: owner.userId, role: "customer" as const },
+  { id: 2, at: at(20), from: "new", to: "draft", note: null, internal: false, actor: null, role: "system" as const },
+  { id: 1, at: at(10), from: null, to: "new", note: null, internal: false, actor: sharer.userId, role: "customer" as const },
+];
+/** Ids newest first; id 3 ties with transition id 3 (at 30) to exercise the deterministic tie order. */
+const RENAMES = [
+  { id: 3, at: at(30), oldName: "Synthetic name B", newName: "Synthetic name C" },
+  { id: 2, at: at(25), oldName: "Synthetic name A", newName: "Synthetic name B" },
+  { id: 1, at: at(5), oldName: "Synthetic name 0", newName: "Synthetic name A" },
+];
 
 describe("order activity port (real MySQL)", () => {
   let t: TestDb;
@@ -53,7 +66,23 @@ describe("order activity port (real MySQL)", () => {
       assertCanReadOrder: async (principal: SessionPrincipal, orderPublicId: string) => {
         const allowed = principal.role !== "customer" || ((principal.userId === owner.userId || principal.userId === sharer.userId) && orderPublicId === ORDER_A);
         if (!allowed || (orderPublicId !== ORDER_A && orderPublicId !== ORDER_B)) throw notFound("ORDER_NOT_FOUND");
-        return { publicId: orderPublicId };
+        return { id: orderPublicId === ORDER_A ? 1 : 2, publicId: orderPublicId };
+      },
+      listStatusTransitions: async (orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean }) => {
+        const all = TRANSITIONS.filter((x) => orderId === 1 && (opts.cursor ? x.id < Number(opts.cursor) : true));
+        const page = all.slice(0, opts.limit);
+        return {
+          items: page.map((x) => ({ at: x.at, from: x.from, fromLabel: x.from, to: x.to, toLabel: x.to, note: opts.customerView && x.internal ? null : x.note, actorUserId: x.actor, actorRole: x.role })),
+          nextCursor: all.length > opts.limit ? String(page[page.length - 1]!.id) : null,
+        };
+      },
+      listNameHistory: async (orderId: number, opts: { cursor?: string | null; limit: number; customerView: boolean }) => {
+        const all = RENAMES.filter((x) => orderId === 1 && (opts.cursor ? x.id < Number(opts.cursor) : true));
+        const page = all.slice(0, opts.limit);
+        return {
+          items: page.map((x) => ({ at: x.at, oldName: x.oldName, newName: x.newName, actorUserId: opts.customerView ? null : staff.userId, actorRole: "staff" as const })),
+          nextCursor: all.length > opts.limit ? String(page[page.length - 1]!.id) : null,
+        };
       },
     };
     const identity = { getUser: async (id: number) => (id === staff.userId ? { name: STAFF_NAME } : id === owner.userId ? { name: "Synthetic Owner" } : null) };
@@ -180,6 +209,50 @@ describe("order activity port (real MySQL)", () => {
     expect(await ctx.chain.verify()).toMatchObject({ ok: true });
     await t.db.update(auditEvents).set({ orderPublicId: ORDER_B }).where(eq(auditEvents.eventId, env.event_id));
     expect(await ctx.chain.verify()).toMatchObject({ ok: false });
+  });
+
+  it("status lane: customers get generic renames, no staff identity and no internal notes; staff see names", async () => {
+    const page = await listOrderStatusHistory(ctx, owner, { orderPublicId: ORDER_A });
+    expect(page.items.map((i) => [i.kind, i.actor, i.to ?? null])).toEqual([
+      ["transition", "ReadyPackets staff", "done"],
+      ["transition", "You", "review"],
+      ["rename", "ReadyPackets staff", null],
+      ["rename", "ReadyPackets staff", null],
+      ["transition", "ReadyPackets", "draft"],
+      ["transition", "Someone with access to this order", "new"],
+      ["rename", "ReadyPackets staff", null],
+    ]);
+    const json = JSON.stringify(page);
+    for (const leak of [STAFF_NAME, "Staff-only synthetic note", "Synthetic name", "oldName", "newName"]) expect(json).not.toContain(leak);
+    const staffView = await listOrderStatusHistory(ctx, staff, { orderPublicId: ORDER_A });
+    expect(staffView.items[0]).toMatchObject({ actor: STAFF_NAME, note: "Staff-only synthetic note" });
+    expect(staffView.items.filter((i) => i.kind === "rename").map((i) => `${i.oldName} -> ${i.newName}`)).toEqual([
+      "Synthetic name B -> Synthetic name C", "Synthetic name A -> Synthetic name B", "Synthetic name 0 -> Synthetic name A",
+    ]);
+    await expect(listOrderStatusHistory(ctx, outsider, { orderPublicId: ORDER_A })).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it.each([1, 2, 3, 50])("status lane keyset merge at limit %i returns every entry once in deterministic order", async (limit) => {
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const page = await listOrderStatusHistory(ctx, staff, { orderPublicId: ORDER_A, limit, cursor });
+      expect(page.items.length).toBeLessThanOrEqual(limit);
+      seen.push(...page.items.map((i) => (i.kind === "transition" ? `t:${i.to}` : `r:${i.newName}`)));
+      if (page.nextCursor) expect(Buffer.from(page.nextCursor, "base64url").toString("utf8")).not.toMatch(/"c"|review|2026/u);
+      cursor = page.nextCursor;
+      pages += 1;
+    } while (cursor && pages < 20);
+    expect(seen).toEqual(["t:done", "t:review", "r:Synthetic name C", "r:Synthetic name B", "t:draft", "t:new", "r:Synthetic name A"]);
+  });
+
+  it("status lane cursor is bound to the reader and view", async () => {
+    const first = await listOrderStatusHistory(ctx, owner, { orderPublicId: ORDER_A, limit: 1 });
+    expect(first.nextCursor).not.toBeNull();
+    await expect(listOrderStatusHistory(ctx, sharer, { orderPublicId: ORDER_A, limit: 1, cursor: first.nextCursor })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
+    await expect(listOrderStatusHistory(ctx, staff, { orderPublicId: ORDER_A, limit: 1, cursor: first.nextCursor })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
+    await expect(listOrderStatusHistory(ctx, owner, { orderPublicId: ORDER_A, limit: 1, cursor: "AAAA" })).rejects.toMatchObject({ reasonCode: "CURSOR_INVALID" });
   });
 
   it("classifies exact customer entries before their wildcard", () => {

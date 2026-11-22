@@ -252,3 +252,133 @@ async function actorNames(ctx: AuditCtx, rows: Row[]): Promise<Map<number, strin
   );
   return out;
 }
+
+
+/* ------------------------------------------------------------------ status lane (transitions + renames) */
+
+export interface OrderStatusHistoryItem {
+  key: string;
+  kind: "transition" | "rename";
+  at: string;
+  actor: string;
+  /** transition */
+  from?: string | null;
+  fromLabel?: string | null;
+  to?: string;
+  toLabel?: string;
+  note?: string | null;
+  /** rename — staff/admin projection only; customers get a generic "Order renamed" entry (lead decision, B2). */
+  oldName?: string | null;
+  newName?: string | null;
+}
+export interface OrderStatusHistoryPage {
+  view: "customer" | "staff";
+  items: OrderStatusHistoryItem[];
+  nextCursor: string | null;
+}
+
+/** Per-lane keyset position: `c` = the orders-port cursor (null = from the start), `e` = lane exhausted. */
+interface LanePos { c: string | null; e: boolean }
+interface LaneState { t: LanePos; r: LanePos }
+const START: LanePos = { c: null, e: false };
+
+function isLanePos(v: unknown): v is LanePos {
+  if (!v || typeof v !== "object") return false;
+  const { c, e } = v as { c: unknown; e: unknown };
+  return (c === null || (typeof c === "string" && c.length <= 200)) && typeof e === "boolean";
+}
+
+/**
+ * Left column of the Order history tab: lifecycle transitions and renames, merged by a two-lane keyset merge.
+ * Each lane keeps its own orders-port cursor; a page takes `limit` items in total, newest first, with a
+ * deterministic tie order (equal timestamps: transition before rename; within a lane, the port's id order).
+ * When a lane is only partly consumed, its cursor is re-derived by re-reading exactly the consumed prefix, so
+ * no entry is skipped or repeated and there is no fixed window.
+ */
+export async function listOrderStatusHistory(
+  ctx: AuditCtx,
+  principal: SessionPrincipal,
+  input: { orderPublicId: string; cursor?: string | null; limit?: number },
+): Promise<OrderStatusHistoryPage> {
+  const { deps } = ctx;
+  const order = await deps.services.orders.assertCanReadOrder(principal, input.orderPublicId);
+  const customerView = principal.role === "customer";
+  const view = customerView ? "customer" : "staff";
+  const limit = Math.min(Math.max(input.limit ?? 25, 1), ORDER_ACTIVITY_MAX_PAGE);
+  const aad = `audit.order_status_history.cursor:${order.publicId}:${principal.userId}:${view}`;
+  let state: LaneState = { t: START, r: START };
+  if (input.cursor) {
+    try {
+      const parsed: unknown = JSON.parse(deps.crypto.decrypt(Buffer.from(input.cursor, "base64url").toString("utf8"), aad));
+      if (!parsed || typeof parsed !== "object" || !isLanePos((parsed as LaneState).t) || !isLanePos((parsed as LaneState).r)) throw new Error("shape");
+      state = parsed as LaneState;
+    } catch {
+      throw validation("CURSOR_INVALID", "The page cursor is not valid.");
+    }
+  }
+  const orders = deps.services.orders;
+  const readT = (pos: LanePos, n: number) => orders.listStatusTransitions(order.id, { cursor: pos.c, limit: n, customerView });
+  const readR = (pos: LanePos, n: number) => orders.listNameHistory(order.id, { cursor: pos.c, limit: n, customerView });
+  const empty = { items: [], nextCursor: null };
+  const [tPage, rPage] = await Promise.all([state.t.e ? empty : readT(state.t, limit), state.r.e ? empty : readR(state.r, limit)]);
+  const ts = tPage.items as Awaited<ReturnType<typeof readT>>["items"];
+  const rs = rPage.items as Awaited<ReturnType<typeof readR>>["items"];
+
+  // Two-pointer merge; lane order is preserved so each lane contributes a prefix of its page.
+  const picked: ({ lane: "t"; v: (typeof ts)[number] } | { lane: "r"; v: (typeof rs)[number] })[] = [];
+  let ti = 0;
+  let ri = 0;
+  while (picked.length < limit && (ti < ts.length || ri < rs.length)) {
+    const t = ts[ti];
+    const r = rs[ri];
+    if (t && (!r || t.at.getTime() >= r.at.getTime())) picked.push({ lane: "t", v: ts[ti++]! });
+    else picked.push({ lane: "r", v: rs[ri++]! });
+  }
+
+  const advance = async (pos: LanePos, page: { items: unknown[]; nextCursor: string | null }, used: number, reread: (p: LanePos, n: number) => Promise<{ nextCursor: string | null }>): Promise<LanePos> => {
+    if (pos.e || used === 0) return pos;
+    if (used === page.items.length) return page.nextCursor ? { c: page.nextCursor, e: false } : { c: null, e: true };
+    const prefix = await reread(pos, used);
+    return prefix.nextCursor ? { c: prefix.nextCursor, e: false } : { c: null, e: true };
+  };
+  const exhausted = (pos: LanePos, page: { items: unknown[]; nextCursor: string | null }) => pos.e || (page.items.length === 0 && page.nextCursor === null);
+  const nextState: LaneState = {
+    t: exhausted(state.t, tPage) ? { c: null, e: true } : await advance(state.t, tPage, ti, readT),
+    r: exhausted(state.r, rPage) ? { c: null, e: true } : await advance(state.r, rPage, ri, readR),
+  };
+  const more = !nextState.t.e || !nextState.r.e;
+
+  const people = customerView ? new Map<number, string>() : await namesFor(ctx, picked.map((p) => p.v.actorUserId));
+  const actorOf = (userId: number | null, role: string): string => {
+    if (customerView) {
+      if (role === "staff" || role === "admin") return "ReadyPackets staff";
+      if (role === "system") return "ReadyPackets";
+      return userId === principal.userId ? "You" : "Someone with access to this order";
+    }
+    if (userId === null) return role === "system" ? "System" : "ReadyPackets staff";
+    return people.get(userId) ?? (role === "customer" ? "Former customer" : "Former staff member");
+  };
+  const keyOf = (kind: string, at: Date, i: number) => deps.crypto.pseudonym(`${order.publicId}:${kind}:${at.toISOString()}:${i}:${input.cursor ?? ""}`, "audit.order_status_history").slice(0, 16);
+
+  const items: OrderStatusHistoryItem[] = picked.map((p, i) => {
+    if (p.lane === "t") {
+      const t = p.v;
+      return { key: keyOf("t", t.at, i), kind: "transition", at: t.at.toISOString(), actor: actorOf(t.actorUserId, t.actorRole), from: t.from, fromLabel: t.fromLabel, to: t.to, toLabel: t.toLabel, note: t.note };
+    }
+    const r = p.v;
+    const base: OrderStatusHistoryItem = { key: keyOf("r", r.at, i), kind: "rename", at: r.at.toISOString(), actor: actorOf(r.actorUserId, r.actorRole) };
+    return customerView ? base : { ...base, oldName: r.oldName, newName: r.newName };
+  });
+  const nextCursor = more ? Buffer.from(deps.crypto.encrypt(JSON.stringify(nextState), aad), "utf8").toString("base64url") : null;
+  return { view, items, nextCursor };
+}
+
+async function namesFor(ctx: AuditCtx, ids: (number | null)[]): Promise<Map<number, string>> {
+  const unique = [...new Set(ids.filter((id): id is number => id !== null))].slice(0, ORDER_ACTIVITY_MAX_PAGE * 2);
+  const out = new Map<number, string>();
+  await Promise.all(unique.map(async (id) => {
+    const user = await ctx.deps.services.identity.getUser(id);
+    if (user) out.set(id, user.name);
+  }));
+  return out;
+}
