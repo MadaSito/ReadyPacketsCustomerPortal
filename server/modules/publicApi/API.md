@@ -53,7 +53,7 @@ services.publicApi.registerProvider<K extends ProviderKey>(key: K, provider: Pub
 
 Conventions: `Authorization: Bearer rpk_<prefix>_<secret>`; optional request signing
 `X-RP-Timestamp` (unix seconds, ±300 s) + `X-RP-Signature: v1=<hex HMAC-SHA256(signingSecret, ts + "\n" +
-METHOD + "\n" + path?query + "\n" + body)>` (mandatory when the key requires it; each signature accepted once);
+METHOD + "\n" + "/api/v1" + path?query + "\n" + body)>` (the signed target includes the `/api/v1` prefix) (mandatory when the key requires it; each signature accepted once);
 `Idempotency-Key` (1–128 `[A-Za-z0-9._:-]`) on writes — same key + same body returns the stored response,
 same key + different body → 422 `IDEMPOTENCY_KEY_REUSED`; lists take `cursor`, `limit` (≤ 100),
 `updated_since` and resource filters; responses `{ data, next_cursor }`. Errors are
@@ -78,7 +78,23 @@ same key + different body → 422 `IDEMPOTENCY_KEY_REUSED`; lists take `cursor`,
 Replay executes the stored call again through the same pipeline under the **original key's current**
 scopes (revoked/expired key → refused), with a new request id, `replay = true`, `X-ReadyPackets-Replay: 1`
 and, for writes, the fresh idempotency key `replay:<originalRequestId>` (a double click never writes twice).
-Writes need `confirmWrite: true`. Refused when the stored body was truncated (> 64 KiB) or purged.
+Writes need `confirmWrite: true`. Only **eligible** calls store a replay payload: reads that passed every
+check (key, IP, signature, rate, route, scope, validation) and reached the provider, and writes the provider
+completed freshly (2xx). Refused, undispatched, unknown-outcome and idempotent-repeat writes are never
+replayable (`API_REPLAY_UNAVAILABLE`), nor bodies > 64 KiB or purged rows.
+
+## Request log storage
+
+- Clear columns hold only server-derived or validated values: method, route template, the concrete path only
+  when it matched a route (ids are pattern-checked; otherwise `unmatched`), status, duration, error code, key
+  public id, request id. The request id is the HTTP request-context id (joins HTTP and protection events).
+- `X-Correlation-Id` from an authenticated caller is stored only as `c:<keyed digest>`; `log.list` with
+  `correlationId` matches the exact value via the digest. Idempotency keys are stored only as keyed digests
+  (also in `api_idempotency`).
+- Redacted request/response views, the client IP and the exact replay payload are encrypted with per-row AAD.
+- `search` matches path, route, error code and request id only (payloads are encrypted, not searchable).
+- A write whose outcome is unknown (5xx after the provider ran) keeps its idempotency reservation until TTL;
+  a retry with the same key gets 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` and is never re-run.
 
 ## Audit events
 
@@ -93,4 +109,11 @@ idempotency / signature-replay rows in bounded batches.
 
 ## Schema (additive)
 
-`api_settings`, `api_keys`, `api_request_log`, `api_idempotency`, `api_signature_nonces`.
+`api_settings`, `api_keys`, `api_request_log`, `api_idempotency`, `api_signature_nonces`, `api_rate_windows`
+(per-key minute counters). Final for increment 04.
+
+## Mount points
+
+Server: `createPublicApiModule(deps)` → `PublicApiModule` (`services.publicApi`), `publicApiRouter` (tRPC
+`publicApi`), `createPublicApiHttpRouter(services)` (`/api/v1`). Client: `publicApiFeature` from
+`client/src/features/publicApi/routes` — `/admin/api`, `/admin/api/log`, `/admin/api/log/:requestId`.
