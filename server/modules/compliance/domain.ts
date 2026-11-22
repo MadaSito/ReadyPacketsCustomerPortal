@@ -737,3 +737,55 @@ export function deriveOrderPaymentSummaryState(
 export function formatInvoiceNumber(prefix: string, issuedAt: Date, sequenceNumber: number): string {
   return `${prefix}-${issuedAt.getUTCFullYear()}-${String(sequenceNumber).padStart(6, "0")}`;
 }
+
+/* ------------------------------------------- acceptance log centre (D1) */
+
+export const acceptanceLogSourceSchema = z.enum([
+  "registration",
+  "portal_acceptance",
+  "portal_reacceptance",
+  "checkout",
+  "order_gate",
+  "imported_historical",
+]);
+
+export const acceptanceLogMethodSchema = z.enum(["checkbox", "typed_signature", "imported"]);
+
+export const acceptanceFreshnessSchema = z.enum(["current", "superseded"]);
+
+const acceptanceLogFilterFields = {
+  customerQuery: nfcTrimmedString(1, 120).optional(),
+  customerPublicId: publicIdSchema.optional(),
+  policyDocumentPublicId: publicIdSchema.optional(),
+  versionPublicId: publicIdSchema.optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  source: acceptanceLogSourceSchema.optional(),
+  method: acceptanceLogMethodSchema.optional(),
+  freshness: acceptanceFreshnessSchema.optional(),
+  orderReference: nfcTrimmedString(1, 64).optional(),
+};
+
+export const acceptanceLogFilterSchema = z.strictObject(acceptanceLogFilterFields);
+
+export const acceptanceLogListSchema = z.strictObject({
+  ...acceptanceLogFilterFields,
+  cursor: z.string().min(1).max(128).optional(),
+  limit: z.number().int().min(1).max(100).default(50),
+});
+
+export const acceptanceLogCoverageSchema = z.strictObject({
+  documentPublicId: publicIdSchema.optional(),
+  outstandingLimit: z.number().int().min(1).max(250).default(100),
+});
+
+export const acceptanceLogUpdatesSchema = z.strictObject({
+  documentPublicId: publicIdSchema.optional(),
+});
+
+export const acceptanceLogForCustomerSchema = z.strictObject({
+  customerPublicId: publicIdSchema,
+  cursor: z.string().min(1).max(128).optional(),
+  limit: z.number().int().min(1).max(100).default(25),
+});
+

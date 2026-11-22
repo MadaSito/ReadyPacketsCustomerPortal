@@ -11,6 +11,11 @@ import {
   staffProcedure,
 } from "../../trpc/trpc.js";
 import {
+  acceptanceLogCoverageSchema,
+  acceptanceLogFilterSchema,
+  acceptanceLogForCustomerSchema,
+  acceptanceLogListSchema,
+  acceptanceLogUpdatesSchema,
   acceptPolicySchema,
   createInvoiceDraftSchema,
   createPolicyDocumentSchema,
@@ -145,6 +150,88 @@ export const complianceRouter = router({
         .query(async ({ ctx, input }) => {
           return ctx.services.compliance.policies.admin.listAcceptances(ctx.session, input ?? {});
         }),
+
+      /**
+       * Policy Acceptance Log Centre (Increment 05 Package D1 / Decision D4).
+       * Mounted on `protectedProcedure` so the service guard enforces Increment 05 §4:
+       * `customer` -> `NOT_FOUND`, `staff` without capability -> `FORBIDDEN`,
+       * `export` -> `policies.acceptances.export` + live step-up + transactional audit.
+       */
+      acceptanceLog: router({
+        filterOptions: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({}).optional())
+          .query(async ({ ctx }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.filterOptions(ctx.session);
+          }),
+
+        list: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogListSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.list(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        detail: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({ publicId: publicIdSchema }))
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.detail(ctx.session, input);
+          }),
+
+        coverage: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogCoverageSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.coverage(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        updates: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogUpdatesSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.updates(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        forCustomer: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogForCustomerSchema)
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.forCustomer(
+              ctx.session,
+              input,
+            );
+          }),
+
+        versionText: protectedProcedure
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({ versionPublicId: publicIdSchema }))
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.versionText(
+              ctx.session,
+              input,
+            );
+          }),
+
+        export: protectedProcedure
+          .meta({ rateLimit: "form_submission" })
+          .input(acceptanceLogFilterSchema.optional())
+          .mutation(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.export(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+      }),
     }),
   }),
 

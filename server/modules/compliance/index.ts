@@ -58,6 +58,28 @@ import {
   type PortableEvidenceOptions,
 } from "./portableService.js";
 import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
+export type {
+  AcceptanceEvidenceKind,
+  AcceptanceFilterOptionsView,
+  AcceptanceFreshness,
+  AcceptanceLogCustomerSummary,
+  AcceptanceLogDetailView,
+  AcceptanceLogExportResult,
+  AcceptanceLogFilterInput,
+  AcceptanceLogItem,
+  AcceptanceLogListInput,
+  AcceptanceLogMethod,
+  AcceptanceLogService,
+  AcceptanceLogSource,
+  CustomerPolicyAcceptanceProfileView,
+  CustomerPolicyRequirementState,
+  CustomerPolicyStatusRow,
+  PolicyCoverageDocumentView,
+  PolicyCoverageOutstandingCustomer,
+  PolicyCoverageView,
+  PolicyUpdateHistoryItem,
+  PolicyVersionReadView,
+} from "./acceptanceLogService.js";
 
 export type {
   BookSettledRefundInput,

@@ -7,6 +7,7 @@ import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
+import { createAcceptanceLogService } from "./acceptanceLogService.js";
 import {
   decodeIdCursor,
   encodeIdCursor,
@@ -1357,6 +1358,8 @@ export function createPoliciesService(deps: ModuleDeps) {
     };
   }
 
+  const acceptanceLog = createAcceptanceLogService(deps);
+
   return {
     listPublished,
     requiredAcceptancesFor,
@@ -1377,6 +1380,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       deleteDraftVersion: adminDeleteDraftVersion,
       publishVersion: adminPublishVersion,
       listAcceptances: adminListAcceptances,
+      acceptanceLog,
     },
     healthCounts,
   };
