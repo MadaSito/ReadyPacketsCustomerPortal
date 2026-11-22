@@ -173,7 +173,7 @@ export default function AcceptanceGate({ orderId, area }: AcceptanceGateProps) {
       as="section"
       aria-label="Policy acceptance required"
       title="Please review and accept before you continue"
-      description="You can read this order, but uploads, recordings, questionnaire answers and phase submissions are paused until you accept. Everyone with access to the order accepts for themselves."
+      description="You can read this order, but uploads, recordings, questionnaire answers, acknowledgements and phase submissions are paused until you accept. Everyone with access to the order accepts for themselves."
       actions={<ShieldCheck className="h-5 w-5 text-brand" aria-hidden />}
     >
       <div className="flex flex-col gap-8">

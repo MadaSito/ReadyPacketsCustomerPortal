@@ -15,6 +15,7 @@ import { ulid } from "../../core/ids.js";
 import type { AuditEmitter, Clock, Db, FieldCrypto, Logger, SessionPrincipal, Tx } from "../../core/types.js";
 import type { Services } from "../../container.js";
 import type { ActorCheck } from "./actor.js";
+import type { OrderGatesService } from "./gates.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { engagementPort } from "./ports.js";
 import { orderAcknowledgements, orderNotes, orderPhaseLocks, orders } from "./schema.js";
@@ -41,6 +42,8 @@ export interface RequirementsDeps {
   policy: OrderPolicy;
   workflows: WorkflowService;
   actorCheck: ActorCheck;
+  /** Part B: an unmet acceptance gate pauses customer acknowledgements too (fails closed; staff never gated). */
+  gates: Pick<OrderGatesService, "assertCustomerMayWork" | "gatesOf">;
 }
 
 export type PhasePosition = "done" | "current" | "upcoming";
@@ -55,6 +58,8 @@ export interface RequirementsView {
   readOnly: boolean;
   readOnlyReason: ReadOnlyReason;
   canUnlock: boolean;
+  /** Part B: the customer has an unmet acceptance gate, so their uploads and acknowledgements are paused (display hint; writes re-check). */
+  acceptancePending: boolean;
 }
 
 export interface FileUploadSlot {
@@ -250,6 +255,15 @@ export function createRequirementsService(deps: RequirementsDeps) {
           const req = state?.requirements ?? { uploads: [], acknowledgements: [] };
           const counts = await uploadCounts(tx, view, view.statusKey, req.uploads, false);
           const acks = req.acknowledgements.length ? await ackRows(tx, view, view.statusKey) : [];
+          // Display only: any refusal (unmet, provider missing or failing) shows as paused; the write paths enforce.
+          let acceptancePending = false;
+          if (side === "customer" && deps.gates.gatesOf(definition).length > 0) {
+            try {
+              await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "acknowledge", statusKey: view.statusKey });
+            } catch {
+              acceptancePending = true;
+            }
+          }
           const uploads = req.uploads.map(({ hint, ...slot }) => {
             const count = counts.get(slot.key) ?? 0;
             const filesSide = actor !== null && slot.uploadedBy.includes(actor) && !orderBlocked;
@@ -276,6 +290,7 @@ export function createRequirementsService(deps: RequirementsDeps) {
             readOnly: orderBlocked || actor === null,
             readOnlyReason,
             canUnlock: isStaffSide(view) && roleHasCapability(principal.role, "orders.phase.unlock") && phaseView.some((phase) => phase.locked),
+            acceptancePending,
           };
         },
         { isolationLevel: "repeatable read", withConsistentSnapshot: true },
@@ -293,6 +308,7 @@ export function createRequirementsService(deps: RequirementsDeps) {
         if (side === "staff" && !roleHasCapability(principal.role, "orders.manage")) throw ORDER_NOT_FOUND();
         await deps.actorCheck(principal, tx, side === "staff" ? "orders.manage" : undefined);
         if (orderLockBlocks(view)) throw orderLocked(view.lockState);
+        if (side === "customer") await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "acknowledge", statusKey: view.statusKey });
         const bound = await workflows.byVersionId(tx, view.workflowVersionId);
         if (input.statusKey !== view.statusKey) {
           const rows = await phaseRows(tx, view.id);

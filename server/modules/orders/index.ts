@@ -121,9 +121,9 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     actorCheck,
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
   });
-  const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck });
-  const access = createAccessService({ ...deps, policy, actorCheck });
   const gates = createGatesService({ db: deps.db, policy, workflows });
+  const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck, gates });
+  const access = createAccessService({ ...deps, policy, actorCheck });
   let paymentProvider: OrderPaymentSummaryProvider | null = null;
   const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, paymentSummary: () => paymentProvider });
   const getOrderFileFolderRouting = createFolderRouting({ workflows });

@@ -93,6 +93,7 @@ const rules = (overrides: Record<string, unknown> = {}) => ({
   readOnly: false,
   readOnlyReason: null,
   canUnlock: false,
+  acceptancePending: false,
   ...overrides,
 });
 
@@ -126,6 +127,19 @@ describe("order page rules", () => {
     expect(screen.getByText("0 of 2 done")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Upload Signed contract" })).toHaveAttribute("href", `/orders/${ORDER_ID}/files`);
     expect(screen.getByRole("button", { name: "Read and accept: Synthetic terms" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
+  });
+
+  it("an unmet acceptance gate disables Upload and Read and accept with an explanation", async () => {
+    handlers.set("orders.requirements.forOrder", () => rules({ acceptancePending: true }));
+    const { container } = renderCustomerOrder();
+    const upload = await screen.findByRole("button", { name: "Upload Signed contract" });
+    const accept = screen.getByRole("button", { name: "Read and accept: Synthetic terms" });
+    expect(upload).toBeDisabled();
+    expect(accept).toBeDisabled();
+    expect(screen.queryByRole("link", { name: "Upload Signed contract" })).not.toBeInTheDocument();
+    expect(upload).toHaveAccessibleDescription("Uploads and acknowledgements are paused until you accept the policy shown above.");
+    expect(accept).toHaveAccessibleDescription("Uploads and acknowledgements are paused until you accept the policy shown above.");
     await expectNoAxeViolations(container);
   });
 

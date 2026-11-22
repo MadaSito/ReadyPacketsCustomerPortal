@@ -25,6 +25,9 @@ export function WorkflowRulesPanel({ orderId, area }: { orderId: string; area: "
   const hasRules = data.phases.length > 0 || data.uploads.length > 0 || data.acknowledgements.length > 0;
   if (!hasRules) return null;
   const filesHref = `${area === "console" ? "/admin/orders" : "/orders"}/${orderId}/files`;
+  // Part B: an unmet acceptance gate pauses the customer's work. The server refuses anyway; this explains why.
+  const paused = area === "customer" && data.acceptancePending === true;
+  const pausedId = `rules-paused-${orderId}`;
   const items = [
     ...data.uploads.map((slot) => ({
       key: `upload:${slot.key}`,
@@ -38,7 +41,11 @@ export function WorkflowRulesPanel({ orderId, area }: { orderId: string; area: "
         .filter(Boolean)
         .join(". "),
       state: slot.met ? (slot.minCount === 0 ? ("optional" as const) : ("done" as const)) : data.readOnly ? ("blocked" as const) : ("todo" as const),
-      action: slot.canUpload ? (
+      action: slot.canUpload && paused ? (
+        <Button variant="secondary" size="sm" disabled aria-label={`Upload ${slot.label}`} aria-describedby={pausedId}>
+          Upload
+        </Button>
+      ) : slot.canUpload ? (
         <Link href={filesHref} className={buttonClasses("secondary", "sm")} aria-label={`Upload ${slot.label}`}>
           Upload
         </Link>
@@ -57,7 +64,11 @@ export function WorkflowRulesPanel({ orderId, area }: { orderId: string; area: "
             ? "Our team needs to accept this"
             : "Our team will confirm this",
       state: item.met ? ("done" as const) : item.canAccept ? ("todo" as const) : ("blocked" as const),
-      action: item.canAccept ? (
+      action: item.canAccept && paused ? (
+        <Button variant="primary" size="sm" disabled aria-label={`Read and accept: ${item.title}`} aria-describedby={pausedId}>
+          Read and accept
+        </Button>
+      ) : item.canAccept ? (
         <Button variant="primary" size="sm" onClick={() => setAck(item)} aria-label={`Read and accept: ${item.title}`}>
           Read and accept
         </Button>
@@ -83,6 +94,11 @@ export function WorkflowRulesPanel({ orderId, area }: { orderId: string; area: "
       ) : null}
       {data.readOnlyReason === "order_locked" ? null : lockedPhases.length > 0 && area === "customer" ? (
         <Callout tone="info">Earlier phases are locked so your submitted items stay as they were reviewed. Contact us if something needs to change.</Callout>
+      ) : null}
+      {paused && items.length > 0 ? (
+        <Callout tone="warning">
+          <span id={pausedId}>Uploads and acknowledgements are paused until you accept the policy shown above.</span>
+        </Callout>
       ) : null}
       {items.length > 0 ? (
         <Checklist

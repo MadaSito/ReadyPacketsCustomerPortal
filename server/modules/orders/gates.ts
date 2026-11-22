@@ -22,7 +22,7 @@ import type { WorkflowService } from "./workflows.js";
 import type { AcceptanceGate, WorkflowDefinition } from "./workflowTypes.js";
 
 export type { AcceptanceGate } from "./workflowTypes.js";
-export type OrderGateAction = "upload" | "record" | "intake" | "phase_submit";
+export type OrderGateAction = "upload" | "record" | "intake" | "acknowledge" | "phase_submit";
 export type OrderGatePoint = { kind: "order_start" } | { kind: "step"; stepKey: string };
 
 export interface OrderGateProvider {

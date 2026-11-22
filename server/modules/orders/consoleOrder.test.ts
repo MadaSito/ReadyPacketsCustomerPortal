@@ -13,7 +13,8 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrderGateProvider, type OrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
 import { orderNameHistory, orders } from "./schema.js";
-import { DEFAULT_WORKFLOW, type WorkflowDefinition } from "./workflowTypes.js";
+import { sha256Hex } from "./requirements.js";
+import { acknowledgementText, DEFAULT_WORKFLOW, type WorkflowDefinition } from "./workflowTypes.js";
 import type { BoundWorkflow } from "./workflows.js";
 import { FakeEngagement, FakeFiles, fakeIdentity, idemKey, insertUser, ordersTestSchema, type TestUser } from "./testSupport.js";
 
@@ -270,6 +271,35 @@ describe("orders.gates (B6)", () => {
       expect((await mod.gates.context(order.publicId, staff.principal))?.actorAccess).toBe("staff");
       expect(await mod.gates.context(order.publicId, bob.principal)).toBeNull();
       expect(await mod.gates.context("01JD0000000000000000000ZZZ", alice.principal)).toBeNull();
+    });
+  });
+
+  it("an unmet gate pauses customer acknowledgements in the same tx (nothing recorded); staff acknowledgements are not gated", async () => {
+    mod.gates.registerProvider("acceptance", provider);
+    const custAck = { key: "brief_ok", title: "Brief confirmation", body: "Synthetic brief is complete.", acceptedBy: "customer" as const, requireTypedName: false };
+    const staffAck = { key: "checked", title: "Staff check", body: "Synthetic check done.", acceptedBy: "staff" as const, requireTypedName: false };
+    const base = gated("order_start");
+    const definition: WorkflowDefinition = {
+      ...base,
+      states: base.states.map((state) => (state.key === "submitted" ? { ...state, requirements: { uploads: [], acknowledgements: [custAck, staffAck] } } : state)),
+    };
+    const order = await newOrder();
+    await withDefinition(definition, async () => {
+      const input = { orderId: order.publicId, statusKey: "submitted", ackKey: custAck.key, textSha256: sha256Hex(acknowledgementText(custAck)) };
+      await expectError(mod.requirements.acknowledge(alice.principal, input), "CONFLICT:ORDER_ACCEPTANCE_REQUIRED");
+      expect(calls.at(-1)).toMatchObject({ actor: { userId: alice.id }, point: { kind: "order_start" } });
+      const paused = await mod.requirements.forOrder(alice.principal, { orderId: order.publicId });
+      expect(paused.acknowledgements.find((a) => a.key === custAck.key)?.met).toBe(false);
+      expect(paused.acceptancePending).toBe(true);
+      expect((await mod.requirements.forOrder(staff.principal, { orderId: order.publicId })).acceptancePending).toBe(false);
+      const before = calls.length;
+      await mod.requirements.acknowledge(staff.principal, { orderId: order.publicId, statusKey: "submitted", ackKey: staffAck.key, textSha256: sha256Hex(acknowledgementText(staffAck)) });
+      expect(calls.length).toBe(before);
+      accepted.add(alice.id);
+      await mod.requirements.acknowledge(alice.principal, input);
+      const done = await mod.requirements.forOrder(alice.principal, { orderId: order.publicId });
+      expect(done.acknowledgements.find((a) => a.key === custAck.key)?.met).toBe(true);
+      expect(done.acceptancePending).toBe(false);
     });
   });
 
