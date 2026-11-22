@@ -21,7 +21,7 @@ import * as complianceTables from "../compliance/schema.js";
 import { createComplianceModule, type ComplianceModule } from "../compliance/index.js";
 import * as cartTables from "./schema.js";
 import { CART_ABANDONED_TTL_HOURS, CART_FEATURE_FLAG } from "./settings.js";
-import type { CartCheckoutStatusView, CartPaymentsPort } from "./ports.js";
+import type { CartPaymentsPort } from "./ports.js";
 import {
   CART_JOB_EXPIRE_ABANDONED,
   CART_SCHEDULE_EXPIRE_ABANDONED,
@@ -44,9 +44,10 @@ interface FakeAttemptState {
   orderReference: string;
   invoiceNumber: string | null;
   ownerUserId: number;
+  cartPublicId: string | null;
   provider: "stripe" | "square";
   environment: "test" | "live";
-  status: "pending" | "paid" | "failed" | "cancelled" | "expired";
+  status: "created" | "redirected" | "paid" | "failed" | "cancelled" | "expired";
   invoiceStatus: "issued" | "paid" | "void";
   currency: string;
   subtotalMinor: number;
@@ -54,6 +55,7 @@ interface FakeAttemptState {
   taxMinor: number;
   totalMinor: number;
   redirectUrl: string;
+  createdAt: Date;
   expiresAt: Date;
 }
 
@@ -68,25 +70,29 @@ class FakePayments implements CartPaymentsPort {
 
   constructor(private readonly db: TestDb["db"]) {}
 
-  async getPublicConfig() {
+  async isOnlineCheckoutEnabled() {
+    return this.provider !== "none";
+  }
+
+  async getPublicCheckoutConfig() {
     return {
       provider: this.provider,
-      environment: this.environment,
-      onlinePaymentEnabled: this.provider !== "none",
+      mode: this.environment,
+      currency: "USD",
     };
   }
 
   async startCheckout(
     invoicePublicId: string,
-    _returnUrls: { successPath: string; cancelPath: string },
-    ctx: { principal: SessionPrincipal; cartPublicId?: string; idempotencyKey: string },
+    _returnUrls?: { successPath?: string; cancelPath?: string },
+    ctx?: { principal?: SessionPrincipal; cartPublicId?: string; idempotencyKey?: string },
   ) {
     this.startCalls += 1;
     if (this.provider === "none") {
       return { mode: "invoice" as const, invoicePublicId };
     }
     const existing = this.attemptsByInvoice.get(invoicePublicId);
-    if (existing && existing.status === "pending") {
+    if (existing && (existing.status === "created" || existing.status === "redirected")) {
       return {
         mode: "redirect" as const,
         attemptPublicId: existing.attemptPublicId,
@@ -110,7 +116,8 @@ class FakePayments implements CartPaymentsPort {
       .limit(1);
 
     const attemptPublicId = ulid();
-    const expiresAt = new Date(Date.now() + 30 * 60_000);
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + 30 * 60_000);
     const redirectUrl = `https://checkout.stripe.example.test/pay/${attemptPublicId}`;
     const state: FakeAttemptState = {
       attemptPublicId,
@@ -118,10 +125,11 @@ class FakePayments implements CartPaymentsPort {
       orderPublicId: ord!.publicId,
       orderReference: ord!.reference,
       invoiceNumber: inv!.invoiceNumber,
-      ownerUserId: ctx.principal.userId,
+      ownerUserId: ctx?.principal?.userId ?? ord!.ownerUserId,
+      cartPublicId: ctx?.cartPublicId ?? null,
       provider: this.provider,
       environment: this.environment,
-      status: "pending",
+      status: "redirected",
       invoiceStatus: "issued",
       currency: inv!.currency,
       subtotalMinor: inv!.subtotalMinor,
@@ -129,6 +137,7 @@ class FakePayments implements CartPaymentsPort {
       taxMinor: inv!.taxMinor,
       totalMinor: inv!.totalMinor,
       redirectUrl,
+      createdAt,
       expiresAt,
     };
     this.attemptsById.set(attemptPublicId, state);
@@ -147,7 +156,7 @@ class FakePayments implements CartPaymentsPort {
   async getCheckoutStatus(
     principal: SessionPrincipal,
     input: { invoicePublicId?: string; attemptPublicId?: string },
-  ): Promise<CartCheckoutStatusView> {
+  ) {
     this.statusCalls += 1;
     const state = input.attemptPublicId
       ? this.attemptsById.get(input.attemptPublicId)
@@ -162,18 +171,26 @@ class FakePayments implements CartPaymentsPort {
       return {
         invoicePublicId: state.invoicePublicId,
         invoiceNumber: state.invoiceNumber,
-        orderPublicId: state.orderPublicId,
-        orderReference: state.orderReference,
         invoiceStatus: state.invoiceStatus,
-        attemptPublicId: state.attemptPublicId,
-        attemptStatus: state.status,
-        provider: state.provider,
-        currency: state.currency,
-        subtotalMinor: state.subtotalMinor,
-        discountMinor: state.discountMinor,
-        taxMinor: state.taxMinor,
-        totalMinor: state.totalMinor,
+        amountMinor: state.totalMinor,
         balanceDueMinor: state.invoiceStatus === "paid" ? 0 : state.totalMinor,
+        currency: state.currency,
+        providerConfigured: this.provider,
+        environment: state.environment,
+        attempt: {
+          attemptPublicId: state.attemptPublicId,
+          provider: state.provider,
+          environment: state.environment,
+          status: state.status,
+          cartPublicId: state.cartPublicId,
+          amountMinor: state.totalMinor,
+          currency: state.currency,
+          createdAt: state.createdAt,
+          redirectedAt: state.createdAt,
+          paidAt: state.status === "paid" ? state.createdAt : null,
+          expiresAt: state.expiresAt,
+          failureReasonCode: null,
+        },
       };
     }
 
@@ -195,18 +212,13 @@ class FakePayments implements CartPaymentsPort {
       return {
         invoicePublicId: inv.publicId,
         invoiceNumber: inv.invoiceNumber,
-        orderPublicId: ord.publicId,
-        orderReference: ord.reference,
         invoiceStatus: inv.status,
-        attemptPublicId: null,
-        attemptStatus: "none",
-        provider: null,
-        currency: inv.currency,
-        subtotalMinor: inv.subtotalMinor,
-        discountMinor: inv.discountMinor,
-        taxMinor: inv.taxMinor,
-        totalMinor: inv.totalMinor,
+        amountMinor: inv.totalMinor,
         balanceDueMinor: inv.status === "paid" ? 0 : inv.totalMinor,
+        currency: inv.currency,
+        providerConfigured: this.provider,
+        environment: this.environment,
+        attempt: null,
       };
     }
 
@@ -225,7 +237,7 @@ class FakePayments implements CartPaymentsPort {
         ? this.attemptsByInvoice.get(input.invoicePublicId)
         : undefined;
     if (!state) {
-      return { cancelled: false, attemptPublicId: null, status: "none" as const };
+      return { cancelled: false, attemptPublicId: null, status: null };
     }
     if (state.ownerUserId !== principal.userId) {
       throw new DomainError("NOT_FOUND", "ATTEMPT_NOT_FOUND", "The requested item was not found.");
@@ -233,7 +245,7 @@ class FakePayments implements CartPaymentsPort {
     if (state.status === "paid" || state.invoiceStatus === "paid") {
       return { cancelled: false, attemptPublicId: state.attemptPublicId, status: "paid" as const };
     }
-    if (state.status === "pending") {
+    if (state.status === "created" || state.status === "redirected") {
       state.status = "cancelled";
       return { cancelled: true, attemptPublicId: state.attemptPublicId, status: "cancelled" as const };
     }
@@ -279,14 +291,10 @@ async function expectDomainError(promise: Promise<unknown>, expected: string) {
 
 function callerFor(principal: SessionPrincipal | null) {
   return createCaller({
-    req: newRequestContext(),
-    session: principal,
-    clientIp: "198.51.100.24",
-    userAgent: "vitest-cart-suite/1.0",
     services: h.services,
-    rateLimiter: h.rateLimiter,
-    audit: h.audit,
-    logger: h.deps.logger,
+    session: principal,
+    request: newRequestContext("test"),
+    transport: { issue() {}, clear() {} },
   });
 }
 
@@ -348,10 +356,7 @@ beforeAll(async () => {
       active: true,
       name: "Packet 1 — Basic",
       description: "Core strategy packet",
-      scopeSummary: "Strategy baseline",
       deliverables: [{ title: "Roadmap", detail: "Baseline roadmap" }],
-      exclusions: [],
-      prerequisites: [],
       outcome: "Approved roadmap",
       timeline: "5 business days",
       features: ["Roadmap"],
@@ -370,13 +375,10 @@ beforeAll(async () => {
       active: true,
       name: "Packet 1 — Premium",
       description: "Premium strategy packet",
-      scopeSummary: "Full executive workshop",
       deliverables: [
         { title: "Roadmap", detail: "Full roadmap" },
         { title: "Board deck", detail: "Executive board deck" },
       ],
-      exclusions: [],
-      prerequisites: [],
       outcome: "Executive alignment",
       timeline: "7 business days",
       features: ["Roadmap", "Board deck"],
@@ -395,10 +397,7 @@ beforeAll(async () => {
       active: true,
       name: "Packet 2 — Basic",
       description: "Architecture blueprint",
-      scopeSummary: "Target architecture",
       deliverables: [{ title: "Architecture blueprint", detail: "Target blueprint" }],
-      exclusions: [],
-      prerequisites: [],
       outcome: "Target architecture",
       timeline: "10 business days",
       features: ["Blueprint"],
@@ -469,7 +468,10 @@ describe("cart module — feature gate, authorization matrix, and worker registr
     expect(await callerFor(alice.principal).cart.badgeCount()).toEqual({ enabled: false, itemCount: 0 });
     await expectDomainError(cartMod.getMyCart(alice.principal), "NOT_FOUND:CART_FEATURE_DISABLED");
     await expectDomainError(
-      cartMod.addItems(alice.principal, { items: [{ productPublicId: packet1Essential, quantity: 1 }] }),
+      cartMod.addItems(alice.principal, {
+        items: [{ productPublicId: packet1Essential, quantity: 1 }],
+        replacePacketTiers: true,
+      }),
       "NOT_FOUND:CART_FEATURE_DISABLED",
     );
   });
@@ -489,7 +491,7 @@ describe("cart module — feature gate, authorization matrix, and worker registr
 
     // 3. Customer forbidden on console open-carts endpoints (`carts.read_all`)
     await expect(callerFor(alice.principal).cart.admin.listOpen({})).rejects.toThrow();
-    await expectDomainError(cartMod.adminListOpen(alice.principal, {}), "FORBIDDEN:CAPABILITY_NOT_GRANTED");
+    await expectDomainError(cartMod.adminListOpen(alice.principal, { limit: 25 }), "FORBIDDEN:CAPABILITY_NOT_GRANTED");
 
     // 4. Remediation session refused
     const remediationPrincipal: SessionPrincipal = {
@@ -514,7 +516,10 @@ describe("cart module — single open cart, tier switching, optimistic locking, 
 
     // Packet quantity > 1 is rejected
     await expectDomainError(
-      cartMod.addItems(alice.principal, { items: [{ productPublicId: packet1Essential, quantity: 2 }] }),
+      cartMod.addItems(alice.principal, {
+        items: [{ productPublicId: packet1Essential, quantity: 2 }],
+        replacePacketTiers: true,
+      }),
       "VALIDATION:PACKET_QUANTITY_ONE",
     );
 
@@ -575,19 +580,15 @@ describe("cart module — single open cart, tier switching, optimistic locking, 
       productId: packet2Essential,
       expectedVersion: p2Row!.version,
       groupId: v3.items.find((i) => i.productPublicId === packet2Essential)
-        ? (await ordersMod.catalog.listAll(admin.principal)).find((g) => g.products.some((p) => p.publicId === packet2Essential))!.publicId
+        ? (await ordersMod.catalog.listAll()).find((g) => g.products.some((p) => p.publicId === packet2Essential))!.publicId
         : "",
-      productKey: "p2-basic",
       packetNumber: 2,
       tier: "Basic",
       sortOrder: 1,
       active: true,
       name: "Packet 2 — Basic",
       description: "Architecture blueprint",
-      scopeSummary: "Target architecture",
       deliverables: [{ title: "Architecture blueprint", detail: "Target blueprint" }],
-      exclusions: [],
-      prerequisites: [],
       outcome: "Target architecture",
       timeline: "10 business days",
       features: ["Blueprint"],
@@ -665,6 +666,7 @@ describe("cart module — atomic checkout, policy enforcement, Decision 12 retur
         cartPublicId,
         expectedVersion: cartBefore.version,
         projectName: "Hijack Attempt",
+        note: "",
         billing: cartBefore.billing!,
         policyAcceptances: [{ versionPublicId: publishedPolicyVersionId, contentHash: publishedPolicyHash }],
         idempotencyKey: "idem-bob-hijack-0001",
@@ -679,6 +681,7 @@ describe("cart module — atomic checkout, policy enforcement, Decision 12 retur
         cartPublicId,
         expectedVersion: cartBefore.version,
         projectName: "Horizon Renewal",
+        note: "",
         billing: cartBefore.billing!,
         policyAcceptances: [],
         idempotencyKey: "idem-missing-policy-0001",
@@ -693,6 +696,7 @@ describe("cart module — atomic checkout, policy enforcement, Decision 12 retur
         cartPublicId,
         expectedVersion: cartBefore.version,
         projectName: "Horizon Renewal",
+        note: "",
         billing: cartBefore.billing!,
         policyAcceptances: [{ versionPublicId: publishedPolicyVersionId, contentHash: publishedPolicyHash }],
         idempotencyKey: "idem-audit-fail-0001",
