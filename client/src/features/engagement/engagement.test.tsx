@@ -1014,12 +1014,16 @@ describe("engagement feature UI — accessibility, plain-text XSS inertness, cus
 
     const staffSearchView = renderEngagement(
       <>
+        <GlobalSearchBox area="console" />
         <SearchPage />
         <LocationProbe />
       </>,
       { "engagement.search.query": () => mockSearchPayload },
       { path: "/admin/search?q=RP-2026", role: "staff" },
     );
+
+    expect(screen.getByRole("search", { name: "Global search" })).toBeInTheDocument();
+    expect(screen.getByRole("search", { name: "Search results filters" })).toBeInTheDocument();
 
     const staffOrderLink = await screen.findByRole("link", { name: /RP-2026-0001 — Exhibit B Packet/ });
     expect(staffOrderLink).toHaveAttribute("href", `/admin/orders/${ORDER_ID}`);

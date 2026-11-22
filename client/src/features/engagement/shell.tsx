@@ -275,7 +275,12 @@ export function GlobalSearchBox({ area, className }: GlobalSearchBoxProps) {
   };
 
   return (
-    <form role="search" onSubmit={onSubmit} className={className ?? "flex items-center gap-2"}>
+    <form
+      role="search"
+      aria-label="Global search"
+      onSubmit={onSubmit}
+      className={className ?? "flex items-center gap-2"}
+    >
       <Field label="Global search" hideLabel>
         <Input
           type="search"
