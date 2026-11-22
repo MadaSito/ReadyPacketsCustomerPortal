@@ -59,7 +59,7 @@ across the wire, no secrets or personal data in logs). This file adds only what 
      designer validator — the same rules as publishing), digest check, format version check. Returns a
      plan per workflow: valid / invalid with field-level findings, whether a workflow with the same key
      exists, and the list of references with their resolution (matched by slug / not found).
-  2. `apply`: for each workflow the administrator chooses **Create as new workflow** (key made unique,
+  2. `applyImport` (tRPC reserves the name `apply`): for each workflow the administrator chooses **Create as new workflow** (key made unique,
      name kept), **Add as a draft of the existing workflow**, or **Skip**; every unresolved reference must
      be mapped to a local policy or the gate removed explicitly. Idempotency key required.
 - **Imported workflows are always drafts.** Nothing is published, no default is changed and no existing
@@ -67,6 +67,9 @@ across the wire, no secrets or personal data in logs). This file adds only what 
 - Capability `workflows.import` (administrators, step-up). Audit `workflow.import_previewed` (digest,
   counts) and `workflow.imported` (digest, source label, outcome per key). A wrong digest is a blocking
   error with a plain message; "import anyway" is not offered.
+- Transport: the two import procedures are called without batching and have their own request body limit
+  (4 MiB plus a 256 KiB envelope) in the application and in the reverse proxy; every other route keeps
+  the general 256 KiB limit.
 - The package is untrusted input: parse with a depth and size guard, reject unknown keys, never `eval`,
   never use a value as an object key without the own-property check, never render imported text as HTML.
 
@@ -223,7 +226,8 @@ redeemInTx(tx: Tx, ctx: PromotionContext & { orderPublicId: string; correlationI
 releaseForOrderInTx(tx: Tx, input: { orderPublicId: string; reason: "order_cancelled" }): Promise<{ released: boolean }>;
 ```
 
-- Orders: `create`, `createOrderFromCheckoutInTx` and `quote` accept an optional `promoCode`. When
+- Orders: `create`, `createOrderFromCheckoutInTx` and `quote` accept an optional `promoCode`. A procedure
+  that carries a code is always a POST (mutation), never a GET query, so the code is not part of a URL. When
   `feature.promotions` is off or the module is absent the field is rejected with the uniform error.
   New order columns `promo_discount_minor` (int, default 0) and `promo_label` (nullable). `discount_minor`
   and `discount_label` remain the totals that every existing reader uses.
