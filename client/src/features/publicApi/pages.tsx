@@ -13,10 +13,22 @@ import { publicApiPages } from "./routes";
 type Out = inferRouterOutputs<AppRouter>["publicApi"]["admin"];
 type In = inferRouterInputs<AppRouter>["publicApi"]["admin"];
 type Key = Out["keys"]["list"]["items"][number];
-type KeyForm = In["keys"]["create"];
+// Dates are coerced on the server, so the inferred input type is too loose to use for form state.
+type KeyForm = Omit<In["keys"]["create"], "expiresAt"> & { expiresAt: Date | string | null };
 type Scope = KeyForm["scopes"][number];
 type LogRow = Out["log"]["list"]["items"][number];
-type LogFilter = NonNullable<In["log"]["list"]>;
+type LogFilter = {
+  search?: string;
+  statusClass?: "2xx" | "3xx" | "4xx" | "5xx";
+  method?: "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
+  replay?: boolean;
+  from?: Date;
+  to?: Date;
+  keyId?: string;
+  correlationId?: string;
+  cursor?: string | null;
+  limit?: number;
+};
 type Feedback = { error: boolean; message: string };
 type Secrets = { title: string; token?: string | null; signingSecret?: string | null };
 

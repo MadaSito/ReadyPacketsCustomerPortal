@@ -142,7 +142,11 @@ export function createSharepointService(deps: ModuleDeps, port: GraphHttpPort) {
     return true;
   }
 
-  type CopyPhase = { phase: "queued" } | { phase: "started" } | { phase: "finished"; result: "written" | "failed" | "not_written"; errorCode?: string; alreadyAudited?: true };
+  type CopyPhase =
+    | { phase: "queued" }
+    | { phase: "started" }
+    | { phase: "finished"; result: "written"; alreadyAudited?: true }
+    | { phase: "finished"; result: "failed" | "not_written"; errorCode?: string; alreadyAudited?: true };
   /** Copy log hook (storage package R). Called only inside fenced owner transactions; no provider data. */
   async function copyAttempt(tx: Tx, at: { orderPublicId: string; jobId: string; attempt: number; connectionPublicId: string; correlationId?: string | null }, phase: CopyPhase): Promise<void> {
     await recordCopyAttempt(
