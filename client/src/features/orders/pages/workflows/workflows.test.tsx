@@ -306,14 +306,14 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     await user.click(within(gates).getByRole("checkbox", { name: "Ask again when the policy has a new version" }));
 
     const storage = screen.getByRole("group", { name: "Storage folder" });
-    expect(within(storage).getByText("customers/CUST-0042/orders/RP-2026-000123/Intake")).toBeInTheDocument();
+    expect(within(storage).getByText("customers/RPCUS-A1B2C3D4E/orders/RP-2026-000123/Intake")).toBeInTheDocument();
     const folder = within(storage).getByLabelText(/Default storage folder/);
     await user.type(folder, "../secret");
     expect(within(storage).getByText("No example yet: the folder path is not valid.")).toBeInTheDocument();
     await user.clear(folder);
     await user.click(folder);
     await user.paste("clients/{customer_ref}/{order_ref}");
-    expect(within(storage).getByText("clients/CUST-0042/RP-2026-000123")).toBeInTheDocument();
+    expect(within(storage).getByText("clients/RPCUS-A1B2C3D4E/RP-2026-000123")).toBeInTheDocument();
 
     // Per-slot folder overrides the workflow default in the example.
     await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
