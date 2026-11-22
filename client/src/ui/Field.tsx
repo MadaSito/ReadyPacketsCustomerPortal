@@ -309,8 +309,8 @@ export function RadioGroup({ legend, options, value, defaultValue, onValueChange
                 <RRadioGroup.Indicator className="block size-2.5 rounded-full bg-action" />
               </RRadioGroup.Item>
               <span className="min-w-0">
-                <span className="block text-sm font-medium text-ink">{option.label}</span>
-                {option.description ? <span className="block text-sm text-muted">{option.description}</span> : null}
+                <span className="block text-sm font-medium break-words text-ink">{option.label}</span>
+                {option.description ? <span className="block text-sm break-words text-muted">{option.description}</span> : null}
               </span>
             </label>
           );
