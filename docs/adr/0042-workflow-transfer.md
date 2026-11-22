@@ -17,6 +17,10 @@ The owner asks to export workflows individually, as a selection or all at once, 
   2. **Apply.** For each workflow the administrator chooses **Create as new workflow** (the key is made unique), **Add as a draft of the existing workflow**, or **Skip**. Every unresolved reference must be mapped to a local policy or its gate removed explicitly. Apply needs an idempotency key.
 - **Switch.** The feature sits behind the setting `orders.workflow_transfer.enabled`, which is off by default; switching it on is audited. The procedures are `orders.admin.workflows.transfer.{status,export,preview,applyImport}`.
 - **Pending drafts.** An existing workflow that already has a pending draft cannot receive a second one from an import. Choose another option or finish that draft first.
+- **As implemented** (orders_engineer):
+  - The workflow description is exported as `null`, because there is no description column.
+  - Imported drafts record their source as `blank`. Provenance is kept in `order_workflow_imports` and the audit trail.
+  - Customers and staff get FORBIDDEN from the admin procedures.
 - **Imports are always drafts.** Nothing is published, no default is changed and no existing order is touched. The administrator reviews and publishes in the designer.
 - **Guards.** Import needs `workflows.import` (administrators) and step-up. It writes the audit events `workflow.import_previewed` and `workflow.imported`, the latter with the outcome for each key. A wrong digest blocks the import, and "import anyway" is not offered.
 - **Untrusted input.** The package is parsed with depth and size guards. Unknown keys are rejected, and `__proto__` / `constructor` keys are never used as object keys. Nothing is `eval`'d, and imported text is never rendered as HTML.

@@ -45,6 +45,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Workflow export and import](./WORKFLOW_TRANSFER.md) (increment 05): move workflows between portals as drafts; enable `orders.workflow_transfer.enabled` first.
 - [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md): configure order phases, requirements and staff actions.
 - [Cart and checkout](./CART_AND_CHECKOUT.md): configure checkout, fulfillment requirements and cart operations.
 - [Hosted online payments](../../server/modules/payments/ADMIN_GUIDE.md): configure hosted checkout providers and reconcile payment outcomes.
