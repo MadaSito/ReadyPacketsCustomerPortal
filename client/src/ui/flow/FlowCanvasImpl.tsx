@@ -66,7 +66,6 @@ function NodeCard({ id, data, selected }: NodeProps<RpNode>) {
       <button
         type="button"
         data-flow-node={id}
-        aria-label={`${node.kind ? `${node.kind}: ` : ""}${node.label}${node.sublabel ? `, ${node.sublabel}` : ""}${connecting ? ", connecting from this step" : ""}`}
         aria-pressed={selected ? "true" : "false"}
         aria-describedby={api.helpId}
         onClick={() => api.select({ type: "node", id })}
@@ -79,9 +78,11 @@ function NodeCard({ id, data, selected }: NodeProps<RpNode>) {
           connecting && "outline-2 outline-offset-4 outline-dashed outline-action",
         )}
       >
-        {node.kind ? <span className="text-xs font-semibold tracking-wide text-muted uppercase">{node.kind}</span> : null}
-        <span className="w-full font-semibold break-words text-ink">{node.label}</span>
-        {node.sublabel ? <span className="w-full text-sm break-words text-muted">{node.sublabel}</span> : null}
+        {/* The name comes from the visible text (WCAG 2.5.3); sr-only separators keep it readable. */}
+        {node.kind ? <span className="text-xs font-semibold tracking-wide text-muted uppercase">{node.kind}<span className="sr-only">:</span></span> : null}{" "}
+        <span className="w-full font-semibold break-words text-ink">{node.label}{node.sublabel || connecting ? <span className="sr-only">,</span> : null}</span>{" "}
+        {node.sublabel ? <span className="w-full text-sm break-words text-muted">{node.sublabel}{connecting ? <span className="sr-only">,</span> : null}</span> : null}{" "}
+        {connecting ? <span className="sr-only">connecting from this step</span> : null}
       </button>
       <Handle type="source" position={Position.Right} isConnectable={api.canConnect} className="rp-flow-handle" />
     </>
