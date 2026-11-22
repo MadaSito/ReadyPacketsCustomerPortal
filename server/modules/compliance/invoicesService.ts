@@ -9,9 +9,13 @@ import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./act
 import {
   computeInvoiceTotals,
   decodeIdCursor,
+  deriveInvoicePaymentState,
   deriveInvoiceStatus,
+  deriveOrderPaymentSummaryState,
   encodeIdCursor,
   formatInvoiceNumber,
+  type InvoicePaymentState,
+  type OrderHeaderPaymentState,
 } from "./domain.js";
 import { renderInvoicePdf } from "./invoicePdf.js";
 import {
@@ -74,6 +78,7 @@ export interface InvoiceSummaryView {
   orderReference: string;
   invoiceNumber: string | null;
   status: InvoiceStatus;
+  paymentState: InvoicePaymentState;
   currency: string;
   subtotalMinor: number;
   discountMinor: number;
@@ -226,6 +231,108 @@ export interface CheckoutInvoiceSnapshot {
   origin: "portal" | "import";
 }
 
+export interface OrderPaymentSummary {
+  state: OrderHeaderPaymentState;
+  totalMinor: number;
+  currency: string;
+}
+
+export interface OrderInvoiceRefundLedgerEntry {
+  refundId: number;
+  refundPublicId: string;
+  paymentId: number;
+  paymentPublicId: string;
+  amountMinor: number;
+  currency: string;
+  reasonCode: string;
+  reference: string;
+  provider: string | null;
+  providerEventId: string | null;
+  notes: string | null;
+  refundedAt: Date;
+  origin: "portal" | "import";
+}
+
+export interface OrderInvoicePaymentLedgerEntry {
+  paymentId: number;
+  paymentPublicId: string;
+  invoiceId: number;
+  invoicePublicId: string;
+  invoiceNumber: string;
+  invoiceStatus: InvoiceStatus;
+  invoicePaymentState: InvoicePaymentState;
+  method: PaymentMethod;
+  provider: string | null;
+  reference: string;
+  providerEventId: string | null;
+  capturedMinor: number;
+  ledgerRefundedMinor: number;
+  currency: string;
+  receivedAt: Date;
+  origin: "portal" | "import";
+  ledgerRefunds: OrderInvoiceRefundLedgerEntry[];
+}
+
+export interface OrderRefundLedgerSnapshot {
+  orderPublicId: string;
+  orderPaymentState: InvoicePaymentState | "none";
+  orderHeaderState: OrderHeaderPaymentState;
+  payments: OrderInvoicePaymentLedgerEntry[];
+}
+
+export interface LockedOrderPaymentForRefund {
+  orderId: number;
+  orderPublicId: string;
+  orderReference: string;
+  ownerUserId: number;
+  invoiceId: number;
+  invoicePublicId: string;
+  invoiceNumber: string;
+  invoiceStatus: InvoiceStatus;
+  invoicePaymentState: InvoicePaymentState;
+  currency: string;
+  totalMinor: number;
+  paymentId: number;
+  paymentPublicId: string;
+  method: PaymentMethod;
+  provider: string | null;
+  providerReference: string;
+  providerEventId: string | null;
+  capturedMinor: number;
+  paidAt: Date;
+  ledgerRefunds: Array<{
+    refundPublicId: string;
+    amountMinor: number;
+    idempotencyKey: string;
+    providerEventId: string | null;
+  }>;
+}
+
+export interface BookSettledRefundInput {
+  invoiceId: number;
+  paymentId: number;
+  amountMinor: number;
+  currency: string;
+  reasonCode: string;
+  reference: string;
+  notes?: string | null | undefined;
+  refundedAt: Date;
+  recordedByUserId: number | null;
+  idempotencyKey: string;
+  provider?: "stripe" | "square" | null | undefined;
+  providerEventId?: string | null | undefined;
+}
+
+export interface BookSettledRefundResult {
+  complianceRefundPublicId: string;
+  invoiceStatus: InvoiceStatus;
+  invoicePaymentState: InvoicePaymentState;
+  orderPaymentState: InvoicePaymentState | "none";
+  balanceDueMinor: number;
+  fullyRefundedInvoice: boolean;
+  duplicate: boolean;
+}
+
 
 function isStaffOrAdmin(principal: SessionPrincipal): boolean {
   return principal.role === "staff" || principal.role === "admin";
@@ -363,6 +470,45 @@ export function createInvoicesService(deps: ModuleDeps) {
     }
   }
 
+  async function dispatchInvoiceRefundedInTx(
+    tx: Tx,
+    event: {
+      invoicePublicId: string;
+      orderPublicId: string;
+      customerUserId: number;
+      currency: string;
+      totalMinor: number;
+      refundedMinor: number;
+      fullyRefunded: boolean;
+      refundedAt: Date;
+    },
+  ): Promise<void> {
+    if (!event.fullyRefunded) return;
+    const referralsSvc = (
+      deps.services as unknown as {
+        referrals?: {
+          onInvoiceRefunded?: (
+            evt: {
+              invoicePublicId: string;
+              orderPublicId: string;
+              customerUserId: number;
+              currency: string;
+              totalMinor: number;
+              refundedMinor: number;
+              fullyRefunded: boolean;
+              refundedAt: Date;
+            },
+            opts?: { tx?: Tx },
+          ) => Promise<unknown>;
+        };
+      }
+    ).referrals;
+
+    if (referralsSvc && typeof referralsSvc.onInvoiceRefunded === "function") {
+      await referralsSvc.onInvoiceRefunded(event, { tx });
+    }
+  }
+
   async function computeLedgerSums(
     dbOrTx: DbOrTx,
     invoiceIds: readonly number[],
@@ -417,6 +563,13 @@ export function createInvoicesService(deps: ModuleDeps) {
       grossPaidMinor: sums.grossPaidMinor,
       refundedMinor: sums.refundedMinor,
     });
+    const derivedPaymentState = deriveInvoicePaymentState({
+      issuedAt: inv.issuedAt,
+      voidedAt: inv.voidedAt,
+      totalMinor: inv.totalMinor,
+      grossPaidMinor: sums.grossPaidMinor,
+      refundedMinor: sums.refundedMinor,
+    });
     const netPaidMinor = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
     const balanceDueMinor =
       derivedStatus === "void" || derivedStatus === "draft"
@@ -429,6 +582,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       orderReference,
       invoiceNumber: inv.invoiceNumber,
       status: derivedStatus,
+      paymentState: derivedPaymentState,
       currency: inv.currency,
       subtotalMinor: inv.subtotalMinor,
       discountMinor: inv.discountMinor,
@@ -1625,6 +1779,25 @@ export function createInvoicesService(deps: ModuleDeps) {
         tx,
       );
 
+      if (sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor) {
+        const orderRef =
+          typeof ordersSvc.getOrderRefById === "function"
+            ? await ordersSvc.getOrderRefById(inv.orderId, tx)
+            : null;
+        if (orderRef) {
+          await dispatchInvoiceRefundedInTx(tx, {
+            invoicePublicId: inv.publicId,
+            orderPublicId: orderView.publicId,
+            customerUserId: orderRef.ownerUserId,
+            currency,
+            totalMinor: inv.totalMinor,
+            refundedMinor: sums.refundedMinor,
+            fullyRefunded: true,
+            refundedAt,
+          });
+        }
+      }
+
       return {
         refundPublicId,
         invoiceStatus: nextStatus,
@@ -2337,6 +2510,544 @@ export function createInvoicesService(deps: ModuleDeps) {
     };
   }
 
+  async function getOrderPaymentSummaries(
+    orderPublicIds: readonly string[],
+    dbOrTx?: DbOrTx,
+  ): Promise<Map<string, OrderPaymentSummary>> {
+    const out = new Map<string, OrderPaymentSummary>();
+    const uniqueOrderIds = [...new Set(orderPublicIds.filter((id) => id.length > 0))];
+    if (uniqueOrderIds.length === 0) return out;
+    const db = dbOrTx ?? deps.db;
+
+    const invoices = await db
+      .select()
+      .from(complianceInvoices)
+      .where(inArray(complianceInvoices.orderPublicId, uniqueOrderIds))
+      .orderBy(asc(complianceInvoices.id));
+    if (invoices.length === 0) return out;
+
+    const sumsMap = await computeLedgerSums(
+      db,
+      invoices.map((inv) => inv.id),
+    );
+
+    const byOrder = new Map<string, Array<typeof complianceInvoices.$inferSelect>>();
+    for (const inv of invoices) {
+      const list = byOrder.get(inv.orderPublicId) ?? [];
+      list.push(inv);
+      byOrder.set(inv.orderPublicId, list);
+    }
+
+    for (const [orderPubId, rows] of byOrder) {
+      const evidence = rows.map((inv) => {
+        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        return {
+          issuedAt: inv.issuedAt,
+          voidedAt: inv.voidedAt,
+          totalMinor: inv.totalMinor,
+          grossPaidMinor: sums.grossPaidMinor,
+          refundedMinor: sums.refundedMinor,
+        };
+      });
+      const { headerState } = deriveOrderPaymentSummaryState(evidence);
+      const nonVoid = rows.filter((r) => r.voidedAt === null);
+      const activeRows = nonVoid.length > 0 ? nonVoid : rows;
+      const totalMinor = activeRows.reduce((sum, r) => sum + r.totalMinor, 0);
+      const currency = activeRows[0]?.currency ?? "USD";
+      out.set(orderPubId, {
+        state: headerState,
+        totalMinor,
+        currency,
+      });
+    }
+
+    return out;
+  }
+
+  async function computeOrderWorkspacePaymentState(
+    dbOrTx: DbOrTx,
+    orderPublicId: string,
+  ): Promise<{ headerState: OrderHeaderPaymentState; workspaceState: InvoicePaymentState | "none" }> {
+    const rows = await dbOrTx
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.orderPublicId, orderPublicId))
+      .orderBy(asc(complianceInvoices.id));
+    if (rows.length === 0) {
+      return { headerState: "unpaid", workspaceState: "none" };
+    }
+    const sumsMap = await computeLedgerSums(
+      dbOrTx,
+      rows.map((r) => r.id),
+    );
+    return deriveOrderPaymentSummaryState(
+      rows.map((inv) => {
+        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        return {
+          issuedAt: inv.issuedAt,
+          voidedAt: inv.voidedAt,
+          totalMinor: inv.totalMinor,
+          grossPaidMinor: sums.grossPaidMinor,
+          refundedMinor: sums.refundedMinor,
+        };
+      }),
+    );
+  }
+
+  async function listOrderPaymentsAndRefunds(
+    orderPublicId: string,
+    dbOrTx?: DbOrTx,
+    opts?: { includeNotes?: boolean },
+  ): Promise<OrderRefundLedgerSnapshot> {
+    const db = dbOrTx ?? deps.db;
+    const includeNotes = opts?.includeNotes ?? true;
+    const invoices = await db
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.orderPublicId, orderPublicId))
+      .orderBy(asc(complianceInvoices.id));
+
+    if (invoices.length === 0) {
+      return {
+        orderPublicId,
+        orderPaymentState: "none",
+        orderHeaderState: "unpaid",
+        payments: [],
+      };
+    }
+
+    const invoiceIds = invoices.map((i) => i.id);
+    const invById = new Map(invoices.map((i) => [i.id, i]));
+    const [sumsMap, paymentRows, refundRows] = await Promise.all([
+      computeLedgerSums(db, invoiceIds),
+      db
+        .select()
+        .from(complianceInvoicePayments)
+        .where(
+          and(
+            inArray(complianceInvoicePayments.invoiceId, invoiceIds),
+            eq(complianceInvoicePayments.status, "succeeded"),
+          ),
+        )
+        .orderBy(desc(complianceInvoicePayments.receivedAt), desc(complianceInvoicePayments.id)),
+      db
+        .select()
+        .from(complianceInvoiceRefunds)
+        .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds))
+        .orderBy(desc(complianceInvoiceRefunds.refundedAt), desc(complianceInvoiceRefunds.id)),
+    ]);
+
+    const summaryStates = deriveOrderPaymentSummaryState(
+      invoices.map((inv) => {
+        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        return {
+          issuedAt: inv.issuedAt,
+          voidedAt: inv.voidedAt,
+          totalMinor: inv.totalMinor,
+          grossPaidMinor: sums.grossPaidMinor,
+          refundedMinor: sums.refundedMinor,
+        };
+      }),
+    );
+
+    const pmtPubById = new Map(paymentRows.map((p) => [p.id, p.publicId]));
+    const refundsByPaymentId = new Map<number, OrderInvoiceRefundLedgerEntry[]>();
+    for (const r of refundRows) {
+      const paymentPublicId = pmtPubById.get(r.paymentId);
+      if (!paymentPublicId) continue;
+      const list = refundsByPaymentId.get(r.paymentId) ?? [];
+      list.push({
+        refundId: r.id,
+        refundPublicId: r.publicId,
+        paymentId: r.paymentId,
+        paymentPublicId,
+        amountMinor: r.amountMinor,
+        currency: r.currency,
+        reasonCode: r.reasonCode,
+        reference: r.reference,
+        provider: r.provider,
+        providerEventId: r.providerEventId,
+        notes:
+          includeNotes && r.notesEnc
+            ? deps.crypto.decrypt(r.notesEnc, `compliance_invoice_refunds.notes:${r.publicId}`)
+            : null,
+        refundedAt: r.refundedAt,
+        origin: r.origin,
+      });
+      refundsByPaymentId.set(r.paymentId, list);
+    }
+
+    const payments: OrderInvoicePaymentLedgerEntry[] = [];
+    for (const p of paymentRows) {
+      const inv = invById.get(p.invoiceId);
+      if (!inv) continue;
+      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const invoiceStatus = deriveInvoiceStatus({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      });
+      const invoicePaymentState = deriveInvoicePaymentState({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      });
+      const ledgerRefunds = refundsByPaymentId.get(p.id) ?? [];
+      const ledgerRefundedMinor = ledgerRefunds.reduce((sum, item) => sum + item.amountMinor, 0);
+      payments.push({
+        paymentId: p.id,
+        paymentPublicId: p.publicId,
+        invoiceId: inv.id,
+        invoicePublicId: inv.publicId,
+        invoiceNumber: inv.invoiceNumber ?? inv.publicId,
+        invoiceStatus,
+        invoicePaymentState,
+        method: p.method,
+        provider: p.provider,
+        reference: p.reference,
+        providerEventId: p.providerEventId,
+        capturedMinor: p.amountMinor,
+        ledgerRefundedMinor,
+        currency: p.currency,
+        receivedAt: p.receivedAt,
+        origin: p.origin,
+        ledgerRefunds,
+      });
+    }
+
+    return {
+      orderPublicId,
+      orderPaymentState: summaryStates.workspaceState,
+      orderHeaderState: summaryStates.headerState,
+      payments,
+    };
+  }
+
+  async function lockOrderPaymentForRefundInTx(
+    tx: Tx,
+    input: { orderPublicId: string; paymentPublicId: string },
+  ): Promise<LockedOrderPaymentForRefund> {
+    const [candidatePmt] = await tx
+      .select({
+        id: complianceInvoicePayments.id,
+        invoiceId: complianceInvoicePayments.invoiceId,
+        status: complianceInvoicePayments.status,
+      })
+      .from(complianceInvoicePayments)
+      .where(eq(complianceInvoicePayments.publicId, input.paymentPublicId))
+      .limit(1);
+    if (!candidatePmt || candidatePmt.status !== "succeeded") {
+      throw notFound("PAYMENT_NOT_FOUND");
+    }
+
+    const [inv] = await tx
+      .select()
+      .from(complianceInvoices)
+      .where(
+        and(
+          eq(complianceInvoices.id, candidatePmt.invoiceId),
+          eq(complianceInvoices.orderPublicId, input.orderPublicId),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!inv) {
+      throw notFound("PAYMENT_NOT_FOUND");
+    }
+    if (inv.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
+    }
+
+    const [pmt] = await tx
+      .select()
+      .from(complianceInvoicePayments)
+      .where(
+        and(
+          eq(complianceInvoicePayments.id, candidatePmt.id),
+          eq(complianceInvoicePayments.invoiceId, inv.id),
+          eq(complianceInvoicePayments.status, "succeeded"),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!pmt) {
+      throw notFound("PAYMENT_NOT_FOUND");
+    }
+
+    const ordersSvc = requireOrdersService();
+    const orderRef =
+      typeof ordersSvc.getOrderRefById === "function"
+        ? await ordersSvc.getOrderRefById(inv.orderId, tx, { forUpdate: true })
+        : null;
+    if (!orderRef || orderRef.publicId !== input.orderPublicId) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+    if (orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only") {
+      throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against invoice ledger changes.", {
+        lockState: orderRef.lockState,
+      });
+    }
+
+    const [sumsMap, ledgerRefundRows] = await Promise.all([
+      computeLedgerSums(tx, [inv.id]),
+      tx
+        .select({
+          refundPublicId: complianceInvoiceRefunds.publicId,
+          amountMinor: complianceInvoiceRefunds.amountMinor,
+          idempotencyKey: complianceInvoiceRefunds.idempotencyKey,
+          providerEventId: complianceInvoiceRefunds.providerEventId,
+        })
+        .from(complianceInvoiceRefunds)
+        .where(eq(complianceInvoiceRefunds.paymentId, pmt.id)),
+    ]);
+    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+
+    return {
+      orderId: orderRef.id,
+      orderPublicId: orderRef.publicId,
+      orderReference: orderRef.reference,
+      ownerUserId: orderRef.ownerUserId,
+      invoiceId: inv.id,
+      invoicePublicId: inv.publicId,
+      invoiceNumber: inv.invoiceNumber ?? inv.publicId,
+      invoiceStatus: deriveInvoiceStatus({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      }),
+      invoicePaymentState: deriveInvoicePaymentState({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      }),
+      currency: inv.currency,
+      totalMinor: inv.totalMinor,
+      paymentId: pmt.id,
+      paymentPublicId: pmt.publicId,
+      method: pmt.method,
+      provider: pmt.provider,
+      providerReference: pmt.reference,
+      providerEventId: pmt.providerEventId,
+      capturedMinor: pmt.amountMinor,
+      paidAt: pmt.receivedAt,
+      ledgerRefunds: ledgerRefundRows,
+    };
+  }
+
+  async function bookSettledRefundInTx(
+    tx: Tx,
+    input: BookSettledRefundInput,
+  ): Promise<BookSettledRefundResult> {
+    const now = deps.clock.now();
+    const currency = input.currency.toUpperCase();
+
+    const [inv] = await tx
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.id, input.invoiceId))
+      .for("update")
+      .limit(1);
+    if (!inv) {
+      throw notFound("INVOICE_NOT_FOUND");
+    }
+    if (inv.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
+    }
+
+    const [pmt] = await tx
+      .select()
+      .from(complianceInvoicePayments)
+      .where(
+        and(
+          eq(complianceInvoicePayments.id, input.paymentId),
+          eq(complianceInvoicePayments.invoiceId, inv.id),
+          eq(complianceInvoicePayments.status, "succeeded"),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!pmt) {
+      throw notFound("PAYMENT_NOT_FOUND");
+    }
+
+    const [existingIdem] = await tx
+      .select()
+      .from(complianceInvoiceRefunds)
+      .where(
+        and(
+          eq(complianceInvoiceRefunds.invoiceId, inv.id),
+          eq(complianceInvoiceRefunds.idempotencyKey, input.idempotencyKey),
+        ),
+      )
+      .limit(1);
+
+    if (existingIdem) {
+      const [sumsMap, orderState] = await Promise.all([
+        computeLedgerSums(tx, [inv.id]),
+        computeOrderWorkspacePaymentState(tx, inv.orderPublicId),
+      ]);
+      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const invoiceStatus = deriveInvoiceStatus({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      });
+      const invoicePaymentState = deriveInvoicePaymentState({
+        issuedAt: inv.issuedAt,
+        voidedAt: inv.voidedAt,
+        totalMinor: inv.totalMinor,
+        grossPaidMinor: sums.grossPaidMinor,
+        refundedMinor: sums.refundedMinor,
+      });
+      const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+      return {
+        complianceRefundPublicId: existingIdem.publicId,
+        invoiceStatus,
+        invoicePaymentState,
+        orderPaymentState: orderState.workspaceState,
+        balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
+        fullyRefundedInvoice: sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor,
+        duplicate: true,
+      };
+    }
+
+    if (currency !== inv.currency) {
+      throw validation("CURRENCY_MISMATCH", `Refund currency (${currency}) must match invoice currency (${inv.currency}).`);
+    }
+
+    const priorPaymentRefunds = await tx
+      .select({ amountMinor: complianceInvoiceRefunds.amountMinor })
+      .from(complianceInvoiceRefunds)
+      .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
+    const alreadyRefunded = priorPaymentRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
+    if (alreadyRefunded + input.amountMinor > pmt.amountMinor) {
+      throw conflict(
+        "REFUND_EXCEEDS_REFUNDABLE",
+        "Refund amount exceeds the remaining refundable amount on that payment.",
+      );
+    }
+
+    const complianceRefundPublicId = ulid(now.getTime());
+    const notesEnc = input.notes?.trim()
+      ? deps.crypto.encrypt(input.notes.trim(), `compliance_invoice_refunds.notes:${complianceRefundPublicId}`)
+      : null;
+
+    await tx.insert(complianceInvoiceRefunds).values({
+      publicId: complianceRefundPublicId,
+      invoiceId: inv.id,
+      paymentId: pmt.id,
+      amountMinor: input.amountMinor,
+      currency,
+      reasonCode: input.reasonCode,
+      reference: input.reference,
+      notesEnc,
+      refundedAt: input.refundedAt,
+      recordedByUserId: input.recordedByUserId,
+      idempotencyKey: input.idempotencyKey,
+      provider: input.provider ?? null,
+      providerEventId: input.providerEventId ?? null,
+      origin: "portal",
+      createdAt: now,
+    });
+
+    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+    const nextStatus = deriveInvoiceStatus({
+      issuedAt: inv.issuedAt,
+      voidedAt: inv.voidedAt,
+      totalMinor: inv.totalMinor,
+      grossPaidMinor: sums.grossPaidMinor,
+      refundedMinor: sums.refundedMinor,
+    });
+    const nextPaymentState = deriveInvoicePaymentState({
+      issuedAt: inv.issuedAt,
+      voidedAt: inv.voidedAt,
+      totalMinor: inv.totalMinor,
+      grossPaidMinor: sums.grossPaidMinor,
+      refundedMinor: sums.refundedMinor,
+    });
+    const nextBalance = Math.max(0, inv.totalMinor - Math.max(0, sums.grossPaidMinor - sums.refundedMinor));
+
+    if (nextStatus !== inv.status) {
+      await tx
+        .update(complianceInvoices)
+        .set({
+          status: nextStatus,
+          version: inv.version + 1,
+          updatedAt: now,
+        })
+        .where(eq(complianceInvoices.id, inv.id));
+    }
+
+    await deps.audit.record(
+      {
+        category: "business",
+        eventName: "invoice.refund.recorded",
+        action: "create",
+        outcome: "completed",
+        actor: input.recordedByUserId
+          ? { userId: input.recordedByUserId, role: "admin" }
+          : { role: "system" },
+        resource: { type: "invoice_refund", publicId: complianceRefundPublicId },
+        attributes: {
+          invoice_public_id: inv.publicId,
+          payment_public_id: pmt.publicId,
+          order_public_id: inv.orderPublicId,
+          reason_code: input.reasonCode,
+          amount_minor: input.amountMinor,
+          currency,
+          provider: input.provider ?? "manual",
+          derived_invoice_status: nextStatus,
+          derived_payment_state: nextPaymentState,
+        },
+      },
+      tx,
+    );
+
+    const fullyRefundedInvoice = sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor;
+    if (fullyRefundedInvoice) {
+      const ordersSvc = requireOrdersService();
+      const orderRef =
+        typeof ordersSvc.getOrderRefById === "function"
+          ? await ordersSvc.getOrderRefById(inv.orderId, tx)
+          : null;
+      if (orderRef) {
+        await dispatchInvoiceRefundedInTx(tx, {
+          invoicePublicId: inv.publicId,
+          orderPublicId: inv.orderPublicId,
+          customerUserId: orderRef.ownerUserId,
+          currency,
+          totalMinor: inv.totalMinor,
+          refundedMinor: sums.refundedMinor,
+          fullyRefunded: true,
+          refundedAt: input.refundedAt,
+        });
+      }
+    }
+
+    const orderState = await computeOrderWorkspacePaymentState(tx, inv.orderPublicId);
+
+    return {
+      complianceRefundPublicId,
+      invoiceStatus: nextStatus,
+      invoicePaymentState: nextPaymentState,
+      orderPaymentState: orderState.workspaceState,
+      balanceDueMinor: nextBalance,
+      fullyRefundedInvoice,
+      duplicate: false,
+    };
+  }
+
   async function healthCounts(): Promise<{ issuedUnpaidInvoices: number }> {
     const [row] = await deps.db
       .select({ total: count() })
@@ -2358,6 +3069,10 @@ export function createInvoicesService(deps: ModuleDeps) {
     getInvoiceForCheckout,
     bookVerifiedProviderPayment,
     onInvoicePaid,
+    getOrderPaymentSummaries,
+    listOrderPaymentsAndRefunds,
+    lockOrderPaymentForRefundInTx,
+    bookSettledRefundInTx,
     admin: {
       list: adminList,
       createDraft: adminCreateDraft,

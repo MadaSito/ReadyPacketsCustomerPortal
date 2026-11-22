@@ -1,4 +1,11 @@
+import type { Clock } from "../../../core/types.js";
+import type { EgressPolicy } from "../../integrations/egress.js";
 import type { ActivePaymentProvider, PaymentEnvironmentMode } from "../schema.js";
+
+export interface PaymentProviderAdapterDeps {
+  readonly egress: Pick<EgressPolicy, "fetchPinned">;
+  readonly clock: Clock;
+}
 
 export interface ProviderCredentials {
   mode: PaymentEnvironmentMode;
@@ -7,6 +14,8 @@ export interface ProviderCredentials {
   /** Required for Square (`location_id` for `/v2/online-checkout/payment-links`). */
   squareLocationId?: string | null | undefined;
 }
+
+export type DecryptedProviderCredentials = ProviderCredentials;
 
 export interface ProviderCreateCheckoutInput {
   attemptPublicId: string;
@@ -56,7 +65,12 @@ export type ProviderVerifyWebhookOutput =
       providerRef: string | null;
       providerOrderRef: string | null;
       providerPaymentRef: string | null;
-      outcomeHint: "paid" | "failed" | "expired" | "ignored";
+      providerRefundRef?: string | null | undefined;
+      refundPublicIdHint?: string | null | undefined;
+      refundStatusHint?: "pending" | "succeeded" | "failed" | null | undefined;
+      refundAmountMinorHint?: number | null | undefined;
+      refundCurrencyHint?: string | null | undefined;
+      outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "ignored";
     }
   | {
       ok: false;
@@ -83,6 +97,68 @@ export interface ProviderFetchedPayment {
   attemptPublicId: string | null;
   invoicePublicId: string | null;
   paidAt: Date | null;
+}
+
+export type ProviderRefundExecutionOutcome =
+  | {
+      readonly outcome: "succeeded" | "pending";
+      readonly providerRefundRef: string;
+      readonly settledAt: Date | null;
+    }
+  | {
+      /** Definitive provider 4xx refusal where no refund was created (releases refundable reservation). */
+      readonly outcome: "failed";
+      readonly failureReasonCode: string;
+    }
+  | {
+      /** Network timeout, 5xx, rate-limit, or unparseable body. NEVER resend POST automatically! */
+      readonly outcome: "unknown";
+      readonly failureReasonCode: string;
+    };
+
+export interface CreateProviderRefundInput {
+  readonly credentials: ProviderCredentials;
+  readonly refundPublicId: string;
+  /** Deterministic idempotency key (`rp-refund-${refundPublicId}`). */
+  readonly providerIdempotencyKey: string;
+  /** Opaque Square/provider marker: `ReadyPackets refund ${refundPublicId}` (never operator reason PII). */
+  readonly refundMarker: string;
+  readonly orderPublicId: string;
+  readonly invoicePublicId: string;
+  readonly invoiceNumber: string;
+  readonly providerPaymentRef: string;
+  readonly amountMinor: number;
+  readonly currency: string;
+  readonly signal?: AbortSignal | undefined;
+  readonly beforeSend?: (() => Promise<void>) | undefined;
+}
+
+export interface LookupProviderRefundInput {
+  readonly credentials: ProviderCredentials;
+  readonly refundPublicId: string;
+  readonly providerIdempotencyKey: string;
+  readonly refundMarker: string;
+  readonly providerPaymentRef: string;
+  readonly providerRefundRef: string | null;
+  readonly amountMinor: number;
+  readonly currency: string;
+  readonly signal?: AbortSignal | undefined;
+  readonly beforeSend?: (() => Promise<void>) | undefined;
+}
+
+export interface ProviderRefundLookupResult {
+  /** `"absent"` = provider authoritatively responded and has no matching refund on the payment; `"unknown"` = transient/network lookup error (keep retrying). */
+  readonly status: "succeeded" | "pending" | "failed" | "absent" | "unknown";
+  readonly providerRefundRef: string | null;
+  readonly failureReasonCode: string | null;
+  readonly settledAt: Date | null;
+}
+
+export interface PaymentRefundAdapter<P extends ActivePaymentProvider = ActivePaymentProvider> {
+  readonly provider: P;
+  createRefund(input: CreateProviderRefundInput): Promise<ProviderRefundExecutionOutcome>;
+  /** Read-only GET lookup (NEVER sends POST). Used by reconcile job and webhook verification. */
+  lookupRefund(input: LookupProviderRefundInput): Promise<ProviderRefundLookupResult>;
 }
 
 export interface PaymentProviderAdapter {

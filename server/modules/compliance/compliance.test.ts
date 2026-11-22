@@ -165,6 +165,9 @@ function buildFakeOrdersModule(ordersByPubId: Map<string, FakeOrderRecord>): Ord
         }));
       return { items, nextAfter: null };
     },
+    gates: {
+      async assertCustomerMayWork() {},
+    },
     orders: {
       async get(principal: SessionPrincipal, orderPublicId: string) {
         const o = ordersByPubId.get(orderPublicId);

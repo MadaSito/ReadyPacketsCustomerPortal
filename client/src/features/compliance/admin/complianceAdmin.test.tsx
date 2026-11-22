@@ -321,6 +321,7 @@ describe("invoices", () => {
     orderReference: "RP-2026-000001",
     invoiceNumber: "INV-2026-0001",
     status: "issued",
+    paymentState: "partially_paid" as const,
     currency: "USD",
     subtotalMinor: 10000,
     discountMinor: 0,

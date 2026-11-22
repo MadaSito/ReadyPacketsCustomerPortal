@@ -112,6 +112,28 @@ export interface PolicyDocumentAdminSummary {
   updatedAt: Date;
 }
 
+export interface PolicyGateVersionView {
+  id: number;
+  publicId: string;
+  versionNumber: number;
+  versionLabel: string;
+  contentFormat: PolicyContentFormat;
+  bodyText: string;
+  contentHash: string;
+  effectiveAt: Date;
+  publishedAt: Date | null;
+}
+
+export interface PolicyForGateView {
+  documentId: number;
+  documentPublicId: string;
+  slug: string;
+  title: string;
+  audience: PolicyAudience;
+  active: boolean;
+  currentVersion: PolicyGateVersionView | null;
+}
+
 async function assertAdminPoliciesReadCapability(
   deps: ModuleDeps,
   principal: SessionPrincipal,
@@ -1226,6 +1248,102 @@ export function createPoliciesService(deps: ModuleDeps) {
     };
   }
 
+  async function versionForGate(
+    policyPublicId: string,
+    tx?: DbOrTx,
+  ): Promise<PolicyForGateView | null> {
+    const dbOrTx = tx ?? deps.db;
+    const [doc] = await dbOrTx
+      .select()
+      .from(policyDocuments)
+      .where(eq(policyDocuments.publicId, policyPublicId))
+      .limit(1);
+    if (!doc) return null;
+    if (!doc.active) {
+      return {
+        documentId: doc.id,
+        documentPublicId: doc.publicId,
+        slug: doc.slug,
+        title: doc.title,
+        audience: doc.audience,
+        active: false,
+        currentVersion: null,
+      };
+    }
+    const [ver] = await dbOrTx
+      .select()
+      .from(policyVersions)
+      .where(
+        and(
+          eq(policyVersions.documentId, doc.id),
+          eq(policyVersions.status, "published"),
+          eq(policyVersions.origin, "portal"),
+          lte(policyVersions.effectiveAt, deps.clock.now()),
+        ),
+      )
+      .orderBy(desc(policyVersions.versionNumber), desc(policyVersions.id))
+      .limit(1);
+    return {
+      documentId: doc.id,
+      documentPublicId: doc.publicId,
+      slug: doc.slug,
+      title: doc.title,
+      audience: doc.audience,
+      active: doc.active,
+      currentVersion: ver
+        ? {
+            id: ver.id,
+            publicId: ver.publicId,
+            versionNumber: ver.versionNumber,
+            versionLabel: ver.versionLabel,
+            contentFormat: ver.contentFormat,
+            bodyText: ver.bodyText,
+            contentHash: ver.contentHash,
+            effectiveAt: ver.effectiveAt,
+            publishedAt: ver.publishedAt,
+          }
+        : null,
+    };
+  }
+
+  async function versionById(
+    versionId: number,
+    tx?: DbOrTx,
+  ): Promise<PolicyForGateView | null> {
+    const dbOrTx = tx ?? deps.db;
+    const [ver] = await dbOrTx
+      .select()
+      .from(policyVersions)
+      .where(eq(policyVersions.id, versionId))
+      .limit(1);
+    if (!ver) return null;
+    const [doc] = await dbOrTx
+      .select()
+      .from(policyDocuments)
+      .where(eq(policyDocuments.id, ver.documentId))
+      .limit(1);
+    if (!doc) return null;
+    return {
+      documentId: doc.id,
+      documentPublicId: doc.publicId,
+      slug: doc.slug,
+      title: doc.title,
+      audience: doc.audience,
+      active: doc.active,
+      currentVersion: {
+        id: ver.id,
+        publicId: ver.publicId,
+        versionNumber: ver.versionNumber,
+        versionLabel: ver.versionLabel,
+        contentFormat: ver.contentFormat,
+        bodyText: ver.bodyText,
+        contentHash: ver.contentHash,
+        effectiveAt: ver.effectiveAt,
+        publishedAt: ver.publishedAt,
+      },
+    };
+  }
+
   async function healthCounts(): Promise<{ publishedDocuments: number; requiredDocuments: number }> {
     const [pubRow] = await deps.db
       .select({ total: count() })
@@ -1246,6 +1364,8 @@ export function createPoliciesService(deps: ModuleDeps) {
     accept,
     recordRegistrationAcceptances,
     recordCheckoutAcceptances,
+    versionForGate,
+    versionById,
     admin: {
       listDocuments: adminListDocuments,
       getDocument: adminGetDocument,
