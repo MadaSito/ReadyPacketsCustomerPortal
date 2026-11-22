@@ -46,7 +46,7 @@ Owner: audit engineer. Server: `server/modules/promotions` (siem_engineer, see i
 
 `list` (infinite), `get`, `stats`, `create`, `update`, `pause`, `resume`, `revoke`, `generateBatch`, `reveal`, `redemptions` (infinite), `releaseRedemption`, `exportCodes`, `exportRedemptions`, `getSettings`, `updateSettings`.
 
-Every write, reveal, release and export runs through `useStepUp().run`. The typed bridge is in `api.ts`, with view types `import type` from `@server/modules/promotions/contracts`.
+Every write, reveal, release and export runs through `useStepUp().run`. `api.ts` is typed against the mounted router, with view types `import type` from `@server/modules/promotions/contracts`.
 
 ## Settings keys
 
@@ -85,7 +85,7 @@ After creation, copy the code or its link. Later, Show code and link reveals it 
 - Orders already placed always keep their discount.
 
 **Redemptions and release**
-- A redemption is released automatically only when an order is cancelled and nothing was ever paid, with no invoice or payment left open.
+- A redemption is released automatically only when an order is cancelled, nothing was ever paid, no invoice is open and no online payment attempt was ever started.
 - Otherwise it stays used.
 - After you void or settle the invoice by hand, an administrator can choose Release, which needs a reason. The server checks the same rule and refuses otherwise (ADR 0044).
 
