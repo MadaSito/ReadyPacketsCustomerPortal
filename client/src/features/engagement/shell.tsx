@@ -102,8 +102,9 @@ export function NotificationBellPopover({ area: _area }: NotificationBellPopover
     markingAll,
   } = useNotificationBellData({ includeList: open });
 
+  const badgeLabel = unreadCount > 99 ? "99+" : String(unreadCount);
   const buttonLabel =
-    unreadCount > 0 ? `Notifications (${unreadCount} unread)` : "Notifications";
+    unreadCount > 0 ? `Notifications, ${badgeLabel} unread` : "Notifications";
 
   return (
     <Drawer
@@ -126,7 +127,7 @@ export function NotificationBellPopover({ area: _area }: NotificationBellPopover
               aria-hidden="true"
               className="pointer-events-none absolute -top-0.5 -right-0.5 inline-flex min-w-5 items-center justify-center rounded-full bg-action px-1.5 py-0.5 text-xs leading-none font-semibold text-on-action"
             >
-              {unreadCount > 99 ? "99+" : unreadCount}
+              {badgeLabel}
             </span>
           ) : null}
         </Button>
