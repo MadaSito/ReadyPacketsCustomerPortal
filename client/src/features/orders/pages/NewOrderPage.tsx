@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PackageOpen } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
+import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, EmptyState, ErrorState, Field, Input, KeyValueList, Money, PageHeader, Skeleton, Textarea, useToast } from "@/ui";
 import { isPacketCatalog, nonPacketGroups, PacketPicker, packetItems, PacketSummary, useOrderQuote } from "../customer/packets";
@@ -29,6 +30,9 @@ export default function NewOrderPage() {
   const [, navigate] = useLocation();
   const catalog = useQuery(trpc.orders.catalog.list.queryOptions());
   const create = useMutation(trpc.orders.create.mutationOptions());
+  // Increment 04: with the cart feature on, the wizard fills the cart and checkout creates the order.
+  const cartEnabled = useFeatureEnabled("cart");
+  const addToCart = useMutation(trpc.cart.addItems.mutationOptions());
   const [step, setStep] = useState(0);
   const [quantities, setQuantities] = useState<Record<string, string>>({});
   const [selection, setSelection] = useState<Record<number, string | null>>({});
@@ -140,6 +144,13 @@ export default function NewOrderPage() {
     setError(null);
     setPolicyBlocked(false);
     try {
+      if (cartEnabled) {
+        await addToCart.mutateAsync({ items, projectName: projectName.trim(), note: note.trim() ? note.trim() : undefined });
+        await queryClient.invalidateQueries({ queryKey: trpc.cart.pathKey() });
+        toast.show({ tone: "success", title: "Added to your cart", description: "Review and check out when you are ready." });
+        navigate("/cart");
+        return;
+      }
       const result = await create.mutateAsync({
         projectName: projectName.trim(),
         items,
@@ -319,8 +330,8 @@ export default function NewOrderPage() {
               Back
             </Button>
           )}
-          <Button type="submit" loading={create.isPending}>
-            {step === STEPS.length - 1 ? "Submit order" : "Continue"}
+          <Button type="submit" loading={create.isPending || addToCart.isPending}>
+            {step === STEPS.length - 1 ? (cartEnabled ? "Add to cart" : "Submit order") : "Continue"}
           </Button>
         </div>
       </form>
