@@ -8,7 +8,7 @@
 #      refusal gates, and run deploy/upgrade.sh --yes <candidate-sha>.
 #   4. Verify release symlinks (previous -> 89c5cb8, current -> HEAD), verified pre-upgrade backup archive,
 #      post-upgrade admin sign-in + MFA, Maintenance mode clear, pre-upgrade order + customer preservation,
-#      migration 0003 and existing integration endpoints.
+#      migrations 0003 and 0004 exactly once each, and existing integration endpoints.
 #   5. Run the full scripts/ci/native-install-smoke.sh suite against the upgraded installation.
 set -euo pipefail
 set +x
@@ -283,16 +283,18 @@ pre_upgrade_backups=$(mysql --no-defaults --protocol=socket --batch --skip-colum
     --execute="SELECT COUNT(*) FROM readypackets.backup_archives WHERE trigger_kind = 'pre_upgrade' AND state = 'completed' AND verification_status = 'verified'")
 expect 'verified pre_upgrade backup count' "$pre_upgrade_backups" 1
 
-step 'verifying migration 0003 was applied exactly once'
 shopt -s nullglob
-migration_files=("$repo_dir"/migrations/0003_*.sql)
-[[ ${#migration_files[@]} == 1 ]] || fail 'expected exactly one migration 0003 file'
-migration_hash=$(sha256sum -- "${migration_files[0]}")
-migration_hash=${migration_hash%% *}
-[[ $migration_hash =~ ^[0-9a-f]{64}$ ]] || fail 'unexpected migration hash'
-expect 'migration 0003 journal entries' \
-    "$(mysql --no-defaults --protocol=socket --batch --skip-column-names readypackets \
-        --execute="SELECT COUNT(*) FROM __drizzle_migrations WHERE hash='$migration_hash'")" 1
+for migration_version in 0003 0004; do
+    step "verifying migration $migration_version was applied exactly once"
+    migration_files=("$repo_dir"/migrations/"${migration_version}"_*.sql)
+    [[ ${#migration_files[@]} == 1 ]] || fail "expected exactly one migration $migration_version file"
+    migration_hash=$(sha256sum -- "${migration_files[0]}")
+    migration_hash=${migration_hash%% *}
+    [[ $migration_hash =~ ^[0-9a-f]{64}$ ]] || fail "unexpected migration $migration_version hash"
+    expect "migration $migration_version journal entries" \
+        "$(mysql --no-defaults --protocol=socket --batch --skip-column-names readypackets \
+            --execute="SELECT COUNT(*) FROM __drizzle_migrations WHERE hash='$migration_hash'")" 1
+done
 
 step 'verifying post-upgrade sign-in, MFA, Maintenance clear, pre-upgrade order survival and existing integration routes'
 python3 - "$origin" "$ca_cert" "$admin_email" "$work/permanent.password" "$work/state.json" <<'PY'
@@ -393,7 +395,7 @@ trpc_mutate(
 cleared = trpc_mutate("jobs.admin.setMaintenance", {"active": False, "expectedActive": True})
 assert cleared["active"] is False
 
-# Verify the pre-upgrade customer and order survived migration 0003 intact.
+# Verify the pre-upgrade customer and order survived both migrations intact.
 loaded_customer = trpc_query("identity.admin.customers.get", {"customerId": state["customerPublicId"]})
 assert loaded_customer["customer"]["customerRef"] == state["customerRef"], f"customer mismatch: {loaded_customer}"
 
