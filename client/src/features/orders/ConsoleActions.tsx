@@ -1,6 +1,7 @@
-/** Console-only order administration: lock, reference change, reassignment. Owner: orders_engineer. */
+/** Console-only order action row (B1): rename, reference change, reassignment, invoice, refund, lock, access. Owner: orders_engineer. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { Link } from "wouter";
 import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
 import { errorMessage, useTRPC } from "@/lib/trpc";
@@ -8,7 +9,7 @@ import { Badge, Button, Callout, Card, DateTime, Dialog, Field, Input, Select, S
 import { AccessDialog, CustomerPicker, NewOrderForCustomerDialog, type PickedCustomer } from "./ConsoleOrderTools";
 import { LOCK_LABELS, newIdempotencyKey, type LockState } from "./shared";
 
-type Props = { orderId: string; version: number; lockState: LockState; reference: string };
+type Props = { orderId: string; version: number; lockState: LockState; reference: string; name: string };
 
 const LOCK_REASONS = [
   { value: "REVIEW_STARTED", label: "Review started" },
@@ -28,7 +29,7 @@ const REASSIGN_REASONS = [
   { value: "CORRECTION", label: "Created for the wrong customer" },
 ];
 
-export function ConsoleActions({ orderId, version, lockState, reference }: Props) {
+export function ConsoleActions({ orderId, version, lockState, reference, name }: Props) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const toast = useToast();
@@ -41,7 +42,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
    * Every successful change patches the cached detail immediately (so the header, breadcrumb and summary
    * update without waiting for a refetch) and then invalidates every orders query (detail, list, history).
    */
-  const patchDetail = (patch: { version?: number; reference?: string; lockState?: LockState }) => {
+  const patchDetail = (patch: { version?: number; reference?: string; lockState?: LockState; projectName?: string }) => {
     queryClient.setQueryData(trpc.orders.admin.get.queryKey({ orderId }), (current) => (current ? { ...current, ...patch } : current));
   };
   const refresh = () => queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey(), refetchType: "all" });
@@ -62,8 +63,18 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
     }),
   );
   const reassign = useMutation(trpc.orders.admin.reassign.mutationOptions({ onSuccess: () => refresh() }));
-  const history = useQuery(trpc.orders.admin.referenceHistory.queryOptions({ orderId }));
-  const [dialog, setDialog] = useState<"lock" | "reference" | "reassign" | null>(null);
+  const rename = useMutation(
+    trpc.orders.console.rename.mutationOptions({
+      onSuccess: async (result, input) => {
+        patchDetail({ version: result.version, projectName: input.name.normalize("NFC").trim() });
+        await refresh();
+      },
+    }),
+  );
+  const canRename = role !== undefined && role !== "customer" && roleHasCapability(role, "orders.rename");
+  const canRefund = role !== undefined && role !== "customer" && roleHasCapability(role, "payments.refund");
+  const [newName, setNewName] = useState(name);
+  const [dialog, setDialog] = useState<"lock" | "reference" | "reassign" | "rename" | null>(null);
   const [lockTarget, setLockTarget] = useState<LockState>(lockState === "none" ? "review" : "none");
   const [reasonCode, setReasonCode] = useState("");
   const [newReference, setNewReference] = useState("");
@@ -74,8 +85,21 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
   // Stable per dialog opening so a retried reassignment is idempotent on the server.
   const [operationId, setOperationId] = useState(newIdempotencyKey);
 
-  const open = (kind: "lock" | "reference" | "reassign") => {
+  const submitRename = async () => {
+    setError(null);
+    const value = newName.normalize("NFC").trim();
+    if (!value) return setError("Enter a name for the order.");
+    if (value === name) return setDialog(null);
+    try {
+      await rename.mutateAsync({ orderId, expectedVersion: version, name: value });
+      done("Order renamed");
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+  const open = (kind: "lock" | "reference" | "reassign" | "rename") => {
     setDialog(kind);
+    setNewName(name);
     setReasonCode("");
     setError(null);
     setConfirmText("");
@@ -86,7 +110,7 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
     toast.show({ tone: "success", title });
     setDialog(null);
   };
-  const busy = setLock.isPending || changeReference.isPending || reassign.isPending;
+  const busy = setLock.isPending || changeReference.isPending || reassign.isPending || rename.isPending;
   const close = () => {
     if (!busy) setDialog(null);
   };
@@ -113,49 +137,77 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
     .map((state) => ({ value: state, label: LOCK_LABELS[state] }));
   const adminOnlyNow = lockState === "legal_hold" || lockState === "imported_read_only";
 
+  const base = `/admin/orders/${orderId}`;
   return (
-    <Card title="Administration" description="Changes here are audited.">
-      <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap gap-2">
-          {canManage && (isAdmin || !adminOnlyNow) ? (
-            <Button variant="secondary" onClick={() => open("lock")}>
-              Change lock
-            </Button>
-          ) : null}
-          {isAdmin ? (
-            <Button variant="secondary" onClick={() => open("reference")}>
-              Change reference
-            </Button>
-          ) : null}
-          {isAdmin ? (
-            <Button variant="danger" onClick={() => open("reassign")}>
-              Reassign to another customer
-            </Button>
-          ) : null}
-          <Button variant="secondary" onClick={() => setPanel("access")}>
-            Access for other users
+    <>
+      {/* B1 action row: Rename order, Change reference, Reassign customer, Invoice, Refund, then the extras. */}
+      <div role="group" aria-label="Order actions" className="flex flex-wrap gap-2">
+        {canRename ? (
+          <Button variant="secondary" onClick={() => open("rename")}>
+            Rename order
           </Button>
-          {canManage ? (
-            <Button variant="secondary" onClick={() => setPanel("new")}>
-              New order for a customer
-            </Button>
-          ) : null}
-        </div>
-        {history.data && history.data.length > 1 ? (
-          <div>
-            <h3 className="text-sm font-semibold text-ink">Reference history</h3>
-            <ul className="mt-1 flex flex-col gap-1 text-sm text-body">
-              {history.data.map((entry) => (
-                <li key={`${entry.reference}-${entry.status}`} className="flex flex-wrap items-center gap-2">
-                  <span className="break-all">{entry.reference}</span>
-                  <Badge tone={entry.status === "active" ? "success" : "neutral"}>{entry.status === "active" ? "Current" : "Retired (reserved)"}</Badge>
-                  <DateTime value={entry.assignedAt} format="date" />
-                </li>
-              ))}
-            </ul>
-          </div>
+        ) : null}
+        {isAdmin ? (
+          <Button variant="secondary" onClick={() => open("reference")}>
+            Change reference
+          </Button>
+        ) : null}
+        {isAdmin ? (
+          <Button variant="secondary" onClick={() => open("reassign")}>
+            Reassign customer
+          </Button>
+        ) : null}
+        <Button variant="secondary" asChild>
+          <Link href={`${base}/invoices`}>Invoice</Link>
+        </Button>
+        {canRefund ? (
+          <Button variant="danger" asChild>
+            <Link href={`${base}/refund`}>Refund</Link>
+          </Button>
+        ) : null}
+        {canManage && (isAdmin || !adminOnlyNow) ? (
+          <Button variant="secondary" onClick={() => open("lock")}>
+            Change lock
+          </Button>
+        ) : null}
+        <Button variant="secondary" onClick={() => setPanel("access")}>
+          Access for other users
+        </Button>
+        {canManage ? (
+          <Button variant="secondary" onClick={() => setPanel("new")}>
+            New order for a customer
+          </Button>
         ) : null}
       </div>
+
+      <Dialog
+        open={dialog === "rename"}
+        onOpenChange={(value) => (value ? undefined : close())}
+        title="Rename order"
+        description={`The reference ${reference} does not change. The rename is recorded in the order history.`}
+        footer={
+          <>
+            {cancelButton}
+            <Button loading={rename.isPending} onClick={() => void submitRename()}>
+              Save name
+            </Button>
+          </>
+        }
+      >
+        <form
+          className="flex flex-col gap-4"
+          noValidate
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitRename();
+          }}
+        >
+          {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
+          <Field label="Order name" required hint="1 to 120 characters.">
+            <Input value={newName} onChange={(event) => setNewName(event.target.value)} maxLength={120} autoComplete="off" />
+          </Field>
+        </form>
+      </Dialog>
 
       <Dialog
         open={dialog === "lock"}
@@ -255,6 +307,26 @@ export function ConsoleActions({ orderId, version, lockState, reference }: Props
       </Dialog>
       <AccessDialog open={panel === "access"} onClose={() => setPanel(null)} scope={{ orderId }} subject={reference} />
       {canManage ? <NewOrderForCustomerDialog open={panel === "new"} onClose={() => setPanel(null)} /> : null}
+    </>
+  );
+}
+
+/** Console: retired references stay reserved forever; shown on the Overview tab when there is more than one. */
+export function ReferenceHistory({ orderId }: { orderId: string }) {
+  const trpc = useTRPC();
+  const history = useQuery(trpc.orders.admin.referenceHistory.queryOptions({ orderId }));
+  if (!history.data || history.data.length <= 1) return null;
+  return (
+    <Card title="Reference history">
+      <ul className="flex flex-col gap-1 text-sm text-body">
+        {history.data.map((entry) => (
+          <li key={`${entry.reference}-${entry.status}`} className="flex flex-wrap items-center gap-2">
+            <span className="break-all">{entry.reference}</span>
+            <Badge tone={entry.status === "active" ? "success" : "neutral"}>{entry.status === "active" ? "Current" : "Retired (reserved)"}</Badge>
+            <DateTime value={entry.assignedAt} format="date" />
+          </li>
+        ))}
+      </ul>
     </Card>
   );
 }

@@ -77,6 +77,12 @@ export interface DetailTab<Props> {
   order: number;
   /** Optional small component rendered next to the label (e.g. unread count). */
   badge?: ComponentType<Props>;
+  /**
+   * Optional dynamic label rendered IN PLACE OF `label` (text only, e.g. "SharePoint sync (2)"). `label` stays
+   * required: it is shown while the component loads and remains the fallback name. Count queries must be cheap
+   * and must not run for users who cannot see the tab (the host only mounts it for visible tabs).
+   */
+  labelComponent?: ComponentType<Props>;
 }
 export type OrderTab = DetailTab<{ orderId: string; area: "customer" | "console" }>;
 export type CustomerTab = DetailTab<{ customerId: string }>;

@@ -10,10 +10,10 @@ import type { AppRouter } from "@server/trpc/root";
 import { ORDER_TABS } from "@/app/registry";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
-  Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
-  Skeleton, Spinner, Tabs, Textarea, useToast,
+  Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
+  Skeleton, Spinner, Tabs, Textarea, formatDateTime, useToast, type Tone,
 } from "@/ui";
-import { ConsoleActions } from "../ConsoleActions";
+import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
@@ -48,17 +48,116 @@ export function OrderDetailView({ area }: { area: Area }) {
 
   const order = query.data;
   const lockState = order.lockState as LockState;
+  const tabs = orderTabItems(order, area);
+  // The old "Activity" URL keeps working: it now opens Notes.
+  const requested = tab === "activity" ? "notes" : tab;
+  const active = tabs.some((item) => item.value === requested) ? requested! : "overview";
+  const header = consoleArea ? order.console : null;
+  const placed = formatDateTime(order.submittedAt ?? order.createdAt, "date");
+  const description = consoleArea
+    ? [order.reference, header?.customer?.name ?? "Customer unavailable", `placed ${placed}`].join(" · ")
+    : `Order ${order.reference}`;
+
+  return (
+    <>
+      <PageHeader
+        breadcrumbs={<Breadcrumbs items={[...crumbs, { label: order.reference }]} />}
+        title={order.projectName}
+        description={description}
+        meta={
+          <span className="flex flex-wrap items-center gap-2">
+            <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
+            <LockBadge state={lockState} />
+            {header?.payment ? <Badge tone={PAYMENT_TONES[header.payment.state]}>{PAYMENT_LABELS[header.payment.state]}</Badge> : null}
+            {consoleArea ? (
+              <Badge tone="neutral">
+                Total <Money value={money(order.totalMinor, order.currency)} />
+              </Badge>
+            ) : null}
+          </span>
+        }
+        actions={consoleArea ? undefined : <TransitionControl order={order} />}
+      />
+      {consoleArea ? (
+        <div className="mb-6 flex flex-col gap-2">
+          <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} name={order.projectName} />
+          <TransitionControl order={order} />
+        </div>
+      ) : null}
+      {lockState !== "none" ? (
+        <div className="mb-4">
+          <Callout tone={lockState === "legal_hold" ? "warning" : "info"} title={undefined}>
+            {LOCK_DESCRIPTIONS[lockState]}
+          </Callout>
+        </div>
+      ) : null}
+      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      <Tabs
+        label="Order sections"
+        value={active}
+        onValueChange={(value) => navigate(value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${value}`, { replace: true })}
+        items={tabs}
+      />
+    </>
+  );
+}
+
+type OrderDetail = inferRouterOutputs<AppRouter>["orders"]["get"];
+type ConsoleDetail = inferRouterOutputs<AppRouter>["orders"]["admin"]["get"];
+type PaymentState = NonNullable<NonNullable<ConsoleDetail["console"]>["payment"]>["state"];
+
+const PAYMENT_LABELS: Record<PaymentState, string> = {
+  unpaid: "Unpaid",
+  paid: "Paid",
+  partially_refunded: "Partially refunded",
+  refunded: "Refunded",
+  void: "Void",
+};
+const PAYMENT_TONES: Record<PaymentState, Tone> = {
+  unpaid: "warning",
+  paid: "success",
+  partially_refunded: "info",
+  refunded: "neutral",
+  void: "neutral",
+};
+
+/**
+ * B1 tab order. Built-in and contributed tabs share one ordering (numbers published to the tab owners):
+ * Overview 0, Phases 10 (console), Intake 20, Files 30, Messages 40, Automation 50, Sync 60, Invoices 70,
+ * Refund 80, Order history 90, Acceptances 100, Notes 105, Sharing 110. Each tab keeps its own URL segment.
+ */
+export const BUILT_IN_TAB_ORDER = { overview: 0, phases: 10, notes: 105, sharing: 110 } as const;
+
+function orderTabItems(order: OrderDetail, area: Area) {
+  const consoleArea = area === "console";
+  const lockState = order.lockState as LockState;
   const builtIn = [
-    { value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
-    { value: "activity", label: "Activity", content: <Activity order={order} area={area} /> },
-    { value: "sharing", label: "Sharing", content: <SharingPanel orderId={order.publicId} canShare={order.canShare} locked={lockState !== "none"} /> },
+    { order: BUILT_IN_TAB_ORDER.overview, value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
+    ...(consoleArea
+      ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <WorkflowRulesPanel orderId={order.publicId} area={area} /> }]
+      : []),
+    { order: BUILT_IN_TAB_ORDER.notes, value: "notes", label: "Notes", content: <Activity order={order} area={area} /> },
+    {
+      order: BUILT_IN_TAB_ORDER.sharing,
+      value: "sharing",
+      label: "Sharing",
+      content: <SharingPanel orderId={order.publicId} canShare={order.canShare} locked={lockState !== "none"} />,
+    },
   ];
   const contributed = ORDER_TABS.filter((t) => t.access === "customer" || consoleArea).map((t) => {
     const Component = t.component;
     const Badge = t.badge;
+    const Label = t.labelComponent;
     return {
+      order: t.order,
       value: t.key,
-      label: t.label,
+      label: Label ? (
+        <Suspense fallback={t.label}>
+          <Label orderId={order.publicId} area={area} />
+        </Suspense>
+      ) : (
+        t.label
+      ),
       badge: Badge ? <Badge orderId={order.publicId} area={area} /> : undefined,
       content: (
         <Suspense fallback={<Spinner label={`Loading ${t.label}`} />}>
@@ -67,47 +166,8 @@ export function OrderDetailView({ area }: { area: Area }) {
       ),
     };
   });
-  const items = [...builtIn, ...contributed];
-  const active = items.some((item) => item.value === tab) ? tab! : "overview";
-
-  return (
-    <>
-      <PageHeader
-        breadcrumbs={<Breadcrumbs items={[...crumbs, { label: order.reference }]} />}
-        title={order.projectName}
-        description={`Order ${order.reference}`}
-        meta={
-          <span className="flex flex-wrap gap-2">
-            <OrderStatusBadge label={order.statusLabel} tone={order.statusTone} />
-            <LockBadge state={lockState} />
-          </span>
-        }
-        actions={<TransitionControl order={order} />}
-      />
-      {lockState !== "none" ? (
-        <div className="mb-4">
-          <Callout tone={lockState === "legal_hold" ? "warning" : "info"} title={undefined}>
-            {LOCK_DESCRIPTIONS[lockState]}
-          </Callout>
-        </div>
-      ) : null}
-      <WorkflowRulesPanel orderId={order.publicId} area={area} />
-      {consoleArea ? (
-        <div className="mb-6">
-          <ConsoleActions orderId={order.publicId} version={order.version} lockState={lockState} reference={order.reference} />
-        </div>
-      ) : null}
-      <Tabs
-        label="Order sections"
-        value={active}
-        onValueChange={(value) => navigate(value === "overview" ? `${base}/${order.publicId}` : `${base}/${order.publicId}/${value}`, { replace: true })}
-        items={items}
-      />
-    </>
-  );
+  return [...builtIn, ...contributed].sort((a, b) => a.order - b.order);
 }
-
-type OrderDetail = inferRouterOutputs<AppRouter>["orders"]["get"];
 
 function Overview({ order, area }: { order: OrderDetail; area: Area }) {
   return (
@@ -139,7 +199,8 @@ function Overview({ order, area }: { order: OrderDetail; area: Area }) {
           ]}
         />
       </Card>
-      <div className="min-w-0 lg:col-span-2">
+      <div className="flex min-w-0 flex-col gap-6 lg:col-span-2">
+        {area === "console" ? <ReferenceHistory orderId={order.publicId} /> : null}
         <DataTable
           caption="Items"
           showCaption
