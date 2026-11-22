@@ -77,7 +77,7 @@ beforeAll(async () => {
       ],
       transitions: [
         { from: "submitted", to: "completed", allowedBy: ["customer", "staff", "admin", "api"], notifyCustomer: false, requiresNote: false },
-        { from: "submitted", to: "canceled", allowedBy: ["customer", "staff", "admin"], notifyCustomer: false, requiresNote: false },
+        { from: "submitted", to: "canceled", allowedBy: ["customer", "staff", "admin", "api"], notifyCustomer: false, requiresNote: false },
       ],
       acceptanceGates: [{
         key: gateKey, policyPublicId: policy.documentPublicId,
@@ -207,6 +207,10 @@ describe("Order acceptance on assembled customer write paths", () => {
     const { publicId: orderId } = await createOrder("proof");
     const { publicId: secondOrderId } = await createOrder("still-blocked");
     const addr = "203.0.113.248";
+    // The pre-existing general policy acceptance procedure is not order-gate evidence.
+    Browser.ok(await owner.browser.mutate("compliance.policies.accept", {
+      orderPublicId: orderId, versionPublicId: policyVersionId, contentHash: textSha256,
+    }));
     const view = Browser.ok(await owner.browser.query<{
       blocking: boolean; gates: { key: string; policy: { text: string; textSha256: string; versionId: string } }[];
     }>("compliance.acceptance.forOrder", { orderId }));
@@ -260,6 +264,22 @@ describe("Order acceptance on assembled customer write paths", () => {
     const allowed = await submit("synthetic-after-owner-signature");
     expect(allowed.status).toBe(200);
     expect(allowed.body).toMatchObject({ data: { status: { key: "completed" }, version: expectedVersion + 1 } });
+  });
+
+  it("does not require acceptance for an allowed cancellation in the portal or via API v1", async () => {
+    const portal = await createOrder("cancel-portal");
+    const api = await createOrder("cancel-api");
+    const readGate = (orderId: string) => owner.browser.query("compliance.acceptance.forOrder", { orderId });
+    expect(Browser.ok(await readGate(portal.publicId))).toMatchObject({ blocking: true });
+    expect(Browser.ok(await readGate(api.publicId))).toMatchObject({ blocking: true });
+    Browser.ok(await owner.browser.mutate("orders.transition", {
+      orderId: portal.publicId, expectedVersion: portal.version, toStatus: "canceled",
+    }));
+    const result = await sys.http.post(`/api/v1/orders/${api.publicId}/transitions`)
+      .set("Host", HOST).set("Authorization", `Bearer ${apiToken}`).set("Idempotency-Key", "synthetic-cancel-before-signing")
+      .send({ expectedVersion: api.version, toStatusKey: "canceled" });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ data: { status: { key: "canceled" }, version: api.version + 1 } });
   });
 
   it("requires new evidence after policy publication and never serves policy text reclassified as staff-only", async () => {
