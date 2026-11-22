@@ -187,7 +187,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
         </div>
       }
       trigger={
-        <button type="button" aria-label={`Account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
+        <button type="button" aria-label={`${initials(user.name)}, account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
           <span aria-hidden="true" className="inline-flex size-9 items-center justify-center rounded-full bg-action text-sm font-semibold text-on-action">
             {initials(user.name)}
           </span>
