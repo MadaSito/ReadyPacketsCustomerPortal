@@ -53,6 +53,9 @@ export const storageCopyAttempts = mysqlTable("storage_copy_attempts", {
   publicId: publicIdColumn(),
   kind: mysqlEnum("kind", COPY_KINDS).notNull(),
   sourcePublicId: char("source_public_id", { length: 26 }).notNull(),
+  orderPublicId: char("order_public_id", { length: 26 }),
+  targetPathEnc: text("target_path_enc"),
+  phaseLabelEnc: text("phase_label_enc"),
   connectionPublicId: char("connection_public_id", { length: 26 }).notNull(),
   jobPublicId: varchar("job_public_id", { length: 64 }).notNull(),
   attempt: int("attempt", { unsigned: true }).notNull(),
@@ -70,4 +73,5 @@ export const storageCopyAttempts = mysqlTable("storage_copy_attempts", {
   index("storage_copy_attempt_conn_idx").on(t.connectionPublicId, t.createdAt, t.id),
   index("storage_copy_attempt_kind_idx").on(t.kind, t.createdAt, t.id),
   index("storage_copy_attempt_state_idx").on(t.state, t.createdAt, t.id),
+  index("storage_copy_attempt_order_idx").on(t.orderPublicId, t.createdAt, t.id),
 ]);
