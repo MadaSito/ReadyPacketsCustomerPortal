@@ -41,7 +41,6 @@ import {
   type CartView,
   type CheckoutCartResult,
   type CheckoutConfirmationState,
-  type CheckoutStatusResult,
   type PacketTierName,
   type RestoreCheckoutResult,
 } from "./types.js";

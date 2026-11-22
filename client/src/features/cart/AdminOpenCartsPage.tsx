@@ -10,7 +10,7 @@ import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ShoppingCart } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useTRPC } from "@/lib/trpc";
 import {
   Badge,
@@ -49,10 +49,18 @@ export function AdminOpenCartsPage() {
 
   const [searchDraft, setSearchDraft] = useState("");
   const [submittedSearch, setSubmittedSearch] = useState("");
-  const [extraRows, setExtraRows] = useState<AdminOpenCartRow[]>([]);
-  const [cursorOverride, setCursorOverride] = useState<string | null | undefined>(undefined);
+  const [paginationState, setPaginationState] = useState<{
+    key: string;
+    extraRows: AdminOpenCartRow[];
+    cursorOverride: string | null | undefined;
+    loadMoreError: unknown;
+  }>({
+    key: "",
+    extraRows: [],
+    cursorOverride: undefined,
+    loadMoreError: null,
+  });
   const [loadingMore, setLoadingMore] = useState(false);
-  const [loadMoreError, setLoadMoreError] = useState<unknown>(null);
   const [selectedCartId, setSelectedCartId] = useState<string | null>(null);
 
   const firstPage = useQuery(
@@ -62,11 +70,12 @@ export function AdminOpenCartsPage() {
     }),
   );
 
-  useEffect(() => {
-    setExtraRows([]);
-    setCursorOverride(undefined);
-    setLoadMoreError(null);
-  }, [submittedSearch, firstPage.dataUpdatedAt]);
+  const activePageKey = `${submittedSearch}::${firstPage.dataUpdatedAt}`;
+  const currentPagination =
+    paginationState.key === activePageKey
+      ? paginationState
+      : { key: activePageKey, extraRows: [], cursorOverride: undefined, loadMoreError: null };
+  const { extraRows, cursorOverride, loadMoreError } = currentPagination;
 
   const detailQuery = useQuery(
     trpc.cart.admin.getOpen.queryOptions(
@@ -92,7 +101,12 @@ export function AdminOpenCartsPage() {
   const loadNextPage = async () => {
     if (!nextCursor || loadingMore) return;
     setLoadingMore(true);
-    setLoadMoreError(null);
+    setPaginationState((prev) => ({
+      key: activePageKey,
+      extraRows: prev.key === activePageKey ? prev.extraRows : [],
+      cursorOverride: prev.key === activePageKey ? prev.cursorOverride : undefined,
+      loadMoreError: null,
+    }));
     try {
       const next = await queryClient.fetchQuery(
         trpc.cart.admin.listOpen.queryOptions({
@@ -101,13 +115,23 @@ export function AdminOpenCartsPage() {
           limit: PAGE_SIZE,
         }),
       );
-      setExtraRows((prev) => {
-        const seen = new Set([...baseRows, ...prev].map((r) => r.cartPublicId));
-        return [...prev, ...next.items.filter((item) => !seen.has(item.cartPublicId))];
+      setPaginationState((prev) => {
+        const priorRows = prev.key === activePageKey ? prev.extraRows : [];
+        const seen = new Set([...baseRows, ...priorRows].map((r) => r.cartPublicId));
+        return {
+          key: activePageKey,
+          extraRows: [...priorRows, ...next.items.filter((item) => !seen.has(item.cartPublicId))],
+          cursorOverride: next.nextCursor,
+          loadMoreError: null,
+        };
       });
-      setCursorOverride(next.nextCursor);
     } catch (err) {
-      setLoadMoreError(err);
+      setPaginationState((prev) => ({
+        key: activePageKey,
+        extraRows: prev.key === activePageKey ? prev.extraRows : [],
+        cursorOverride: prev.key === activePageKey ? prev.cursorOverride : undefined,
+        loadMoreError: err,
+      }));
     } finally {
       setLoadingMore(false);
     }

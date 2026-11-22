@@ -151,7 +151,7 @@ export interface CartModule extends ModuleLifecycle {
 
 | Procedure | Kind | Guard | Output / Notes |
 | --- | --- | --- | --- |
-| `cart.admin.listOpen` | query | `staff`/`admin` + `carts.read_all` | `{ search?, cursor?, limit? (1..100, default 25) }` -> `{ featureEnabled, abandonedTtlHours, items: AdminOpenCartSummary[], nextCursor }` (customer display name + customerRef, item count, live server subtotal/discount/total, lastActivityAt, expiresAt; **no decrypted billing PII or order notes**) |
+| `cart.admin.listOpen` | query | `staff`/`admin` + `carts.read_all` | `{ search?, cursor?, limit? (1..100, default 25) }` -> `{ featureEnabled, abandonedTtlHours, items: AdminOpenCartSummary[], nextCursor }` (`customerRef` + `customerPublicId`, item count, live server subtotal/discount/total, lastActivityAt, expiresAt; **no decrypted billing PII or order notes**) |
 | `cart.admin.getOpen` | query | `staff`/`admin` + `carts.read_all` | `{ cartPublicId }` -> `AdminOpenCartDetail` (read-only line items + live bundle/tax/total breakdown; no billing PII) |
 
 ---
