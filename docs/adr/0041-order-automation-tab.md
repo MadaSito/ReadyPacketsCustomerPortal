@@ -10,7 +10,7 @@ The owner asks to see and start the Production Pipeline integrations from each o
 - Phase I (P101) and Phase II (P201) cards keep the payload preview and start buttons. A disabled button says why (pipeline off, endpoint missing, a precondition), and administrators get a link to the pipeline settings.
 - "This order's pipeline history" lists every dispatch for the order with its phase, state, attempts, HTTP status, times and correlation id.
   - **Retry** (`orders.production.trigger`) resends a failed dispatch.
-  - **Redeliver** applies to a dispatch that was already delivered. It creates a new delivery marked `redeliveryOf`, because the receiver may start a second production run. It needs `orders.production.redeliver` (administrators, step-up), a reason and the typed phrase `REDELIVER`.
+  - **Redeliver** applies to a dispatch that was already delivered. It creates a new delivery marked `redeliveryOf`, because the receiver may start a second production run. It needs `orders.production.redeliver` (administrators, step-up), a reason of 3–280 characters and the typed phrase `REDELIVER`. The new delivery carries the header `X-ReadyPackets-Redelivery-Of`.
 - Optional **Phase III (P301)** and **Phase IV (P401)** endpoints can be added in the pipeline settings.
   - They use the same signing, egress pinning, outbox and reconciliation as P201, with the payload `{customer_id, order_id, run_mode}`.
   - Their start buttons appear only when the endpoint is configured.
@@ -23,7 +23,9 @@ The owner asks to see and start the Production Pipeline integrations from each o
 - "Workflow stage actions" lists, for each step of the order's workflow version, the enabled automations bound to it ("N configured actions").
   - "Run actions" (`orders.automations.run`, staff and administrators) runs them for this order now through the automations engine.
   - The engine must be enabled; otherwise the panel shows a notice with a link.
-  - Every run is recorded in the run history. Automations still cannot change status or permissions (0026).
+  - The steps shown are those of the order's pinned workflow version. The bound automations are the `Order created` rules on the initial step and the `Order status changed` rules whose `to_status` targets that step.
+  - Every run uses an idempotency key, obeys the global and per-automation rate limits, is recorded in the run history and writes `order.stage_actions.run`. No step-up is needed. Automations still cannot change status or permissions (0026).
+  - Procedures: `automations.orderStageActions.{get,listRuns,runForOrder}`.
 - A "Webhook rules" note states that:
   - P201 must match P101 (`customer_id`, `order_id`, `run_mode`);
   - the bundle scope manifest is a JSON string;

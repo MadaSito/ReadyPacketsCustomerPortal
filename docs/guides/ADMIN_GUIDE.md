@@ -84,9 +84,15 @@ When a Start button is disabled, the card explains why: the pipeline is switched
 **This order's pipeline history** lists every dispatch with its phase, state, attempt count, last HTTP status, times and correlation ID.
 
 - **Retry** queues a fresh attempt for a failed or dead-lettered dispatch.
-- **Redeliver** re-sends a dispatch that was already delivered. It needs an administrator with `orders.production.redeliver`, fresh step-up, a reason and the typed word `REDELIVER`. It creates a new delivery marked as a redelivery, because the receiver may start a second production run.
+- **Redeliver** re-sends a dispatch that was already delivered. It needs an administrator with `orders.production.redeliver`, fresh step-up, a reason (3–280 characters) and the typed word `REDELIVER`. It creates a new delivery marked as a redelivery, because the receiver may start a second production run.
 
-**Workflow stage actions** lists, for each step of the order's workflow, the enabled automations bound to it. Staff and administrators with `orders.automations.run` can select **Run actions** to run them for this order now. Every run appears in the run history. The automations engine must be switched on, and automations can never change an order's status or permissions.
+**Workflow stage actions** lists every step of the order's workflow version with the enabled automations bound to it. These are **Order created** rules on the first step, and **Order status changed** rules that target that step.
+
+- Staff and administrators with `orders.automations.run` can select **Run actions** to run them for this order now. No step-up is needed.
+- Administrators also get a link to **Automations** (`/admin/automations`).
+- If the automations engine is off, **Run actions** is disabled with an explanation.
+- Each run uses an idempotency key and obeys rate limits. It appears in the run history and in **Order history**.
+- Stage actions can never change an order's status or permissions.
 
 The **Webhook rules** note reminds you of three rules:
 
@@ -105,6 +111,16 @@ Open the **SharePoint sync** tab to inspect outbound copies of the order's uploa
 
 You choose the destination folder in the workflow designer (**Storage folder**), either per upload or recording slot or as a workflow default. Otherwise the connection's assignment default applies. The available placeholders are `{customer_ref}`, `{order_ref}`, `{order_name}`, `{phase}`, `{slot}`, `{yyyy}` and `{mm}`. The designer shows an example path and refuses unsafe paths. Local storage remains the system of record, so a failed remote copy never blocks the customer.
 
+SharePoint and OneDrive have their own naming rules, so ReadyPackets adjusts file and folder names automatically:
+
+- **Characters:** `" * : < > ? |` become underscores. Leading and trailing spaces and trailing dots are removed.
+- **Reserved names:** names such as `CON` or `desktop.ini` get an underscore.
+- **Long names:** these are shortened with a short code, and the extension is kept.
+- **Path length:** the full path, including the library address, the root folder and the file name, must stay within 400 characters. Otherwise the copy fails with "invalid input" before anything is written.
+- **Existing files:** these are never overwritten. An identical file is reused, and a different file with the same name is saved as "name (1).ext", "name (2).ext" and so on.
+
+The Copy log shows the final path.
+
 ### Refunds
 
 The **Refund** tab shows each captured payment, its provider (Stripe, Square or manual), the amount already refunded or reserved, and the amount still available to refund. Staff without `payments.refund` can review this but cannot submit refunds.
@@ -114,15 +130,15 @@ To issue a refund, you need an administrator account with `payments.refund` and 
 - **Stripe and Square:** ReadyPackets saves the refund before it contacts the provider. If the result cannot be confirmed, the refund shows as **unknown**. ReadyPackets then checks the provider again in the background and never sends the refund a second time. An unknown result does not mean the refund failed. Do not issue another refund for that payment, in the portal or in the provider's dashboard, while it is unresolved.
 - **Manual payments:** use **Record refund** only after you have refunded the customer outside ReadyPackets. Recording a refund does not move money.
 - **Customer notice:** if you chose to notify the customer, the notice is queued only after the provider confirms the refund or a manual refund is recorded. Mail delivery status is tracked separately from refund status.
-- **Referral rewards:** when an order's first paid invoice is refunded in full, any referral reward tied to it is flagged for manual review.
+- **Referral rewards:** when an order's first paid invoice is refunded in full, any pending or approved referral reward tied to it goes back to manual review with the note `QUALIFYING_INVOICE_REFUNDED`.
 
 ### Acceptances
 
-When a workflow has a policy gate, the customer, and everyone with access to the order, must accept the policy. The gate applies either before they can work on the order or before a named phase can be submitted. Until then they can read the order but cannot upload, record, answer intake or submit. The server enforces this, not the page. Staff are not gated.
+When a workflow has a policy gate, the customer, and everyone with access to the order, must accept the policy. The gate applies either before they can work on the order or before a named phase can be submitted. Until then they can read the order but cannot upload, record, answer questionnaires or submit a phase. The server refuses these, not just the page, and an acceptance cannot be reused on another order. Cancelling an order is never blocked by a gate. Staff and administrators are never gated.
 
-The **Acceptances (n)** tab lists each record, for example "Signed by <name> using typed signature", with the time, policy and version. The source address is shown only to users with `sessions.read_all`. Each record keeps a fingerprint (SHA-256) of the exact policy text that was shown, so you can prove which version was accepted. Open a record to print its receipt.
+The **Acceptances (n)** tab lists each record, for example "Signed by <name> using typed signature", with the time, policy and version. The source address is shown only to users with `sessions.read_all`, and viewing it is audited. Each record keeps a fingerprint (SHA-256) of the exact policy text that was shown, so you can prove which version was accepted. Open a record to print its receipt.
 
-You add gates in the workflow designer: choose the policy, the gate point, the signature mode (checkbox or typed full name) and whether to ask again when the policy gets a new version.
+You add gates in the workflow designer: choose the policy, the gate point, the signature mode (checkbox or typed full name) and whether to ask again when the policy gets a new version. If it asks again, customers must accept the new text. No acceptance e-mail is sent.
 
 ## Storage copy log
 
