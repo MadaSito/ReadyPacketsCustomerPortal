@@ -115,6 +115,19 @@ describe("consent store", () => {
     expect(document.cookie).toContain("keep_me");
   });
 
+  it("still applies a withdrawal when the document refuses cookie access (sandboxed frame)", () => {
+    __setConsentForTests({ enabled: true, policyVersion: 1, choices: ALL, clock });
+    const refuse = () => { throw new DOMException("The document is sandboxed", "SecurityError"); };
+    const spy = vi.spyOn(Document.prototype, "cookie", "get").mockImplementation(refuse);
+    try {
+      expect(() => applyConsentDecision(NONE, { policyVersion: 1 })).not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
+  });
+
   it("records a GPC default as a signal-made rejection", () => {
     configureConsent({ enabled: true, policyVersion: 1, renewMonths: 12 });
     applyConsentDecision(NONE, { policyVersion: 1, bySignal: true });

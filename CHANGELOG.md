@@ -120,6 +120,12 @@ procedure.
 - `deploy/upgrade.sh` no longer stops at the draining phase with "clean shutdown not proved": it read each
   service's exit record after disabling the service, when systemd had already dropped the record. It now
   stops, checks and then disables, and the refusal prints the record it read.
+- E-mail confirmation: a confirmation link followed inside the portal while the "Confirm your email" page
+  is already open is now used (the preview profile's demo link did nothing before), the server is called
+  once per link, and a signed-in person whose address is already confirmed sees "Email confirmed" with
+  "Continue" instead of a "Send a new link" button that had nothing left to do.
+- Removing analytics vendor data no longer throws where the browser refuses cookie access (for example a
+  sandboxed frame).
 - Forced password change after the first sign-in: the page now asks for the "Temporary password" (with a
   hint), no longer shows the misleading advice about passwords "used here before", reports a wrong
   temporary password on that field, and gives password managers the account's sign-in name so that a

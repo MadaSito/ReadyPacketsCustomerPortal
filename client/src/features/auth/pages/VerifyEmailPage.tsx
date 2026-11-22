@@ -19,18 +19,25 @@ export default function VerifyEmailPage() {
   const [resent, setResent] = useState<Accepted | null>(null);
   const [resendError, setResendError] = useState<string | null>(null);
   const [resending, setResending] = useState(false);
-  const started = useRef(false);
+  const startedFor = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!token || started.current) return;
-    started.current = true;
+    // Exactly one server call per token. A token can also arrive after mount, when a link to this same
+    // route is followed in-app (the preview profile's demo link), so the latest token is what is verified.
+    if (!token || startedFor.current === token) return;
+    startedFor.current = token;
+    setState({ kind: "verifying" });
     api.verifyEmail({ token }).then(
-      () => setState({ kind: "verified" }),
-      (err) => setState({ kind: "failed", message: errorMessage(err, "This verification link is invalid or has expired.") }),
+      () => { if (startedFor.current === token) setState({ kind: "verified" }); },
+      (err) => { if (startedFor.current === token) setState({ kind: "failed", message: errorMessage(err, "This verification link is invalid or has expired.") }); },
     );
   }, [api, token]);
 
   const signedIn = view.status === "remediation" || view.status === "full";
+  // The session is replaced when a signed-in person confirms, which can remount this page without its
+  // token, and the address may equally have been confirmed in another tab. Either way the server no
+  // longer lists the step, so say so and offer Continue instead of a "Send a new link" that does nothing.
+  const alreadyConfirmed = signedIn && state.kind === "idle" && !!me && !me.pendingSteps.includes("verify_email");
   const resend = async () => {
     setResending(true);
     setResendError(null);
@@ -52,7 +59,7 @@ export default function VerifyEmailPage() {
       </AuthLayout>
     );
   }
-  if (state.kind === "verified") {
+  if (state.kind === "verified" || alreadyConfirmed) {
     return (
       <AuthLayout title="Email confirmed">
         <Callout tone="success" live="polite">

@@ -108,16 +108,23 @@ export function useFocusOnError(error: string | null) {
   return ref;
 }
 
+function readToken(search: string): string | null {
+  const value = new URLSearchParams(search).get("token");
+  return value && value.length <= 512 ? value : null;
+}
+
 /**
- * Reads `?token=` once, then removes it from the address bar and history (history.replaceState) so it
+ * Reads `?token=`, then removes it from the address bar and history (history.replaceState) so it
  * does not linger in history, screenshots or Referer headers. Returns the token held in memory.
+ * A token that arrives later on the same mounted page (an in-app link to the same route, as the
+ * preview profile's demo link is) replaces the held one; stripping the address never clears it.
  */
 export function useOneTimeToken(): string | null {
   const search = useSearch();
-  const [token] = useState(() => {
-    const value = new URLSearchParams(search).get("token");
-    return value && value.length <= 512 ? value : null;
-  });
+  const incoming = readToken(search);
+  const [token, setToken] = useState(incoming);
+  // Adopt a later token while rendering (derived state), so no effect has to copy it across.
+  if (incoming && incoming !== token) setToken(incoming);
   useEffect(() => {
     if (!token) return;
     const url = new URL(window.location.href);
