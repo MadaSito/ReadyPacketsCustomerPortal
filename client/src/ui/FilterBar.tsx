@@ -37,7 +37,7 @@ export function FilterBar({ search, onSearchChange, onSearchSubmit, searchLabel 
     <div className={cn("mb-4 flex flex-col gap-3", className)}>
       <div className="flex flex-wrap items-end gap-2">
         {onSearchChange ? (
-          <form role="search" onSubmit={submit} className="flex min-w-0 flex-1 basis-60 items-center gap-2">
+          <form role="search" aria-label={searchLabel} onSubmit={submit} className="flex min-w-0 flex-1 basis-60 items-center gap-2">
             <label htmlFor="rp-filter-search" className="sr-only">
               {searchLabel}
             </label>

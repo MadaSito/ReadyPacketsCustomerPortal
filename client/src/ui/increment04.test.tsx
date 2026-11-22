@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Package } from "lucide-react";
 import {
   Checklist,
+  FilterBar,
   checklistSummary,
   CodeSamples,
   CopyField,
@@ -167,5 +168,10 @@ describe("Inputs", () => {
     await user.type(input, "{Backspace}");
     expect(screen.queryByText("refunds")).toBeNull();
     await expectNoAxeViolations(container);
+  });
+
+  it("labels the FilterBar search landmark so it stays unique beside the shell search", () => {
+    renderUi(<FilterBar search="" onSearchChange={() => {}} searchLabel="Search orders" />);
+    expect(screen.getByRole("search", { name: "Search orders" })).toBeInTheDocument();
   });
 });
