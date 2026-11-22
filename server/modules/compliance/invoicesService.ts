@@ -119,6 +119,7 @@ export interface OrderPaymentExposure {
   grossPaidMinor: number;
   payableInvoiceOpen: boolean;
   providerCapturePending: boolean;
+  providerAttemptEver: boolean;
 }
 
 export interface RecordProviderPaymentInput {
@@ -386,19 +387,23 @@ export function createInvoicesService(deps: ModuleDeps) {
 
   /**
    * Workflow-aware check matching `orders/workflowTypes.ts:isCancelState` (`kind === "terminal" && /cancel/.test(key)`),
-   * covering `canceled`, `cancelled`, and custom cancel-like terminal workflow states.
+   * resolved directly against the `FOR UPDATE`-locked `(workflowVersionId, statusKey)` so `REPEATABLE READ`
+   * snapshots never re-read stale order rows.
    */
   async function isOrderCancelledInTx(
-    orderPublicId: string,
+    workflowVersionId: number | undefined,
     statusKey: string,
     tx: Tx,
   ): Promise<boolean> {
     const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-    if (ordersSvc && typeof ordersSvc.getOrderSyncView === "function") {
-      const syncView = await ordersSvc.getOrderSyncView(orderPublicId, tx);
-      if (syncView) {
-        return syncView.status.kind === "terminal" && /cancel/.test(syncView.status.key);
-      }
+    if (
+      workflowVersionId !== undefined &&
+      ordersSvc?.workflows &&
+      typeof ordersSvc.workflows.byVersionId === "function"
+    ) {
+      const bound = await ordersSvc.workflows.byVersionId(tx, workflowVersionId);
+      const state = bound.definition.states.find((s) => s.key === statusKey);
+      return Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
     }
     return /cancel/.test(statusKey);
   }
@@ -1024,7 +1029,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         tx,
         forUpdate: true,
       });
-      if (await isOrderCancelledInTx(orderView.publicId, orderView.statusKey, tx)) {
+      if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
         throw conflict("ORDER_CANCELLED", "Cannot create an invoice for a cancelled order.");
       }
 
@@ -1227,7 +1232,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         tx,
         forUpdate: true,
       });
-      if (await isOrderCancelledInTx(orderView.publicId, orderView.statusKey, tx)) {
+      if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
         throw conflict("ORDER_CANCELLED", "Cannot issue an invoice for a cancelled order.");
       }
 
@@ -2217,7 +2222,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         lockState: orderView.lockState,
       });
     }
-    if (await isOrderCancelledInTx(orderView.publicId, orderView.statusKey, tx)) {
+    if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
       throw conflict("ORDER_CANCELLED", "Cannot issue a checkout invoice for a cancelled order.");
     }
 
@@ -3300,41 +3305,70 @@ export function createInvoicesService(deps: ModuleDeps) {
       orderId = orderRef.id;
     }
 
-    const invoices = await tx
-      .select()
-      .from(complianceInvoices)
-      .where(
-        orderId !== null
-          ? eq(complianceInvoices.orderId, orderId)
-          : eq(complianceInvoices.orderPublicId, orderPublicId),
-      )
-      .orderBy(asc(complianceInvoices.id))
-      .for("update");
+    let invoices;
+    try {
+      invoices = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(
+          orderId !== null
+            ? eq(complianceInvoices.orderId, orderId)
+            : eq(complianceInvoices.orderPublicId, orderPublicId),
+        )
+        .orderBy(asc(complianceInvoices.id))
+        .for("share", { noWait: true });
+    } catch {
+      return {
+        grossPaidMinor: 1,
+        payableInvoiceOpen: true,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      };
+    }
+
+    const paymentsSvc = (deps.services as Partial<typeof deps.services>).payments;
 
     if (invoices.length === 0) {
+      const attemptExp =
+        paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function"
+          ? await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, [])
+          : { providerCapturePending: false, providerAttemptEver: false };
       return {
         grossPaidMinor: 0,
         payableInvoiceOpen: false,
-        providerCapturePending: false,
+        providerCapturePending: attemptExp.providerCapturePending,
+        providerAttemptEver: attemptExp.providerAttemptEver,
       };
     }
 
     const invoiceIds = invoices.map((inv) => inv.id);
-    const [paymentRows, refundRows] = await Promise.all([
-      tx
-        .select()
-        .from(complianceInvoicePayments)
-        .where(inArray(complianceInvoicePayments.invoiceId, invoiceIds))
-        .orderBy(asc(complianceInvoicePayments.id))
-        .for("update"),
-      tx
-        .select({
-          invoiceId: complianceInvoiceRefunds.invoiceId,
-          amountMinor: complianceInvoiceRefunds.amountMinor,
-        })
-        .from(complianceInvoiceRefunds)
-        .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds)),
-    ]);
+    let paymentRows;
+    let refundRows;
+    try {
+      [paymentRows, refundRows] = await Promise.all([
+        tx
+          .select()
+          .from(complianceInvoicePayments)
+          .where(inArray(complianceInvoicePayments.invoiceId, invoiceIds))
+          .orderBy(asc(complianceInvoicePayments.id))
+          .for("share", { noWait: true }),
+        tx
+          .select({
+            invoiceId: complianceInvoiceRefunds.invoiceId,
+            amountMinor: complianceInvoiceRefunds.amountMinor,
+          })
+          .from(complianceInvoiceRefunds)
+          .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds))
+          .for("share", { noWait: true }),
+      ]);
+    } catch {
+      return {
+        grossPaidMinor: 1,
+        payableInvoiceOpen: true,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      };
+    }
 
     let grossPaidMinor = 0;
     const grossByInvoice = new Map<number, number>();
@@ -3360,17 +3394,18 @@ export function createInvoicesService(deps: ModuleDeps) {
       return inv.totalMinor - invNetPaid > 0;
     });
 
-    // Fail closed if existing invoices are present and the payments evidence port is unavailable.
-    const paymentsSvc = (deps.services as Partial<typeof deps.services>).payments;
-    const providerCapturePending =
-      paymentsSvc && typeof paymentsSvc.hasPendingCaptureForInvoicesInTx === "function"
-        ? await paymentsSvc.hasPendingCaptureForInvoicesInTx(tx, invoiceIds)
-        : true;
+    // Fail closed if existing invoices are present and the payments evidence port is unavailable,
+    // or if ANY payment_attempts row has EVER been created for this order/invoices (regardless of status).
+    const attemptExp =
+      paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function"
+        ? await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, invoiceIds)
+        : { providerCapturePending: true, providerAttemptEver: true };
 
     return {
       grossPaidMinor,
       payableInvoiceOpen,
-      providerCapturePending,
+      providerCapturePending: attemptExp.providerCapturePending,
+      providerAttemptEver: attemptExp.providerAttemptEver,
     };
   }
 

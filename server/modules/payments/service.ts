@@ -677,12 +677,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         if (!lockedOrder) {
           throw notFound("INVOICE_NOT_FOUND");
         }
-        const orderCancelled =
-          typeof ordersSvc.getOrderSyncView === "function"
-            ? await ordersSvc.getOrderSyncView(lockedOrder.publicId, tx).then((view) =>
-                view ? view.status.kind === "terminal" && /cancel/.test(view.status.key) : /cancel/.test(lockedOrder.statusKey),
-              )
-            : /cancel/.test(lockedOrder.statusKey);
+        let orderCancelled = /cancel/.test(lockedOrder.statusKey);
+        if (ordersSvc.workflows && typeof ordersSvc.workflows.byVersionId === "function") {
+          const bound = await ordersSvc.workflows.byVersionId(tx, lockedOrder.workflowVersionId);
+          const state = bound.definition.states.find((s) => s.key === lockedOrder.statusKey);
+          orderCancelled = Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
+        }
         if (orderCancelled) {
           throw conflict("ORDER_CANCELLED", "Cannot start payment for a cancelled order.");
         }
@@ -842,81 +842,45 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         `payment_attempts.redirect_url:${preAttempt.attemptPublicId}`,
       );
 
-      const wasConcurrentlyCancelled = await deps.db.transaction(async (tx) => {
-        const [lockedAttempt] = await tx
-          .select()
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.id, preAttempt.attemptId))
-          .for("update")
-          .limit(1);
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .update(paymentAttempts)
+          .set({
+            status: "redirected",
+            providerRef: createdSession.providerRef,
+            providerOrderRef: createdSession.providerOrderRef ?? null,
+            providerPaymentRef: createdSession.providerPaymentRef ?? null,
+            redirectUrlEnc,
+            redirectedAt: completedAt,
+            expiresAt,
+            version: 2,
+            updatedAt: completedAt,
+          })
+          .where(and(eq(paymentAttempts.id, preAttempt.attemptId), eq(paymentAttempts.version, 1)));
 
-        if (!lockedAttempt) {
-          return false;
-        }
-
-        if (lockedAttempt.status === "cancelled") {
-          // Locally cancelled while provider createCheckout was in flight: still persist providerRef
-          // so webhooks/reconciliation can track the external session to terminal provider proof,
-          // and refuse handing out the redirect URL.
-          await tx
-            .update(paymentAttempts)
-            .set({
-              providerRef: createdSession.providerRef,
-              providerOrderRef: createdSession.providerOrderRef ?? null,
-              providerPaymentRef: createdSession.providerPaymentRef ?? null,
-              expiresAt,
-              version: lockedAttempt.version + 1,
-              updatedAt: completedAt,
-            })
-            .where(and(eq(paymentAttempts.id, lockedAttempt.id), eq(paymentAttempts.version, lockedAttempt.version)));
-          return true;
-        }
-
-        if (lockedAttempt.status === "created") {
-          await tx
-            .update(paymentAttempts)
-            .set({
-              status: "redirected",
-              providerRef: createdSession.providerRef,
-              providerOrderRef: createdSession.providerOrderRef ?? null,
-              providerPaymentRef: createdSession.providerPaymentRef ?? null,
-              redirectUrlEnc,
-              redirectedAt: completedAt,
-              expiresAt,
-              version: lockedAttempt.version + 1,
-              updatedAt: completedAt,
-            })
-            .where(and(eq(paymentAttempts.id, lockedAttempt.id), eq(paymentAttempts.version, lockedAttempt.version)));
-
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "payments.attempt.redirected",
-              action: "transition",
-              outcome: "completed",
-              actor: opts?.principal
-                ? { userId: opts.principal.userId, role: opts.principal.role }
-                : { role: "system" },
-              resource: { type: "payment_attempt", publicId: preAttempt.attemptPublicId },
-              attributes: {
-                invoice_public_id: invoice.invoicePublicId,
-                order_public_id: invoice.orderPublicId,
-                provider: activeProvider,
-                environment: config.mode,
-                provider_ref: createdSession.providerRef,
-                amount_minor: invoice.balanceDueMinor,
-                currency: invoice.currency.toUpperCase(),
-              },
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "payments.attempt.redirected",
+            action: "transition",
+            outcome: "completed",
+            actor: opts?.principal
+              ? { userId: opts.principal.userId, role: opts.principal.role }
+              : { role: "system" },
+            resource: { type: "payment_attempt", publicId: preAttempt.attemptPublicId },
+            attributes: {
+              invoice_public_id: invoice.invoicePublicId,
+              order_public_id: invoice.orderPublicId,
+              provider: activeProvider,
+              environment: config.mode,
+              provider_ref: createdSession.providerRef,
+              amount_minor: preAttempt.amountMinor,
+              currency: invoice.currency.toUpperCase(),
             },
-            tx,
-          );
-        }
-        return false;
+          },
+          tx,
+        );
       });
-
-      if (wasConcurrentlyCancelled) {
-        throw conflict("PAYMENT_ATTEMPT_CANCELLED", "Payment attempt was cancelled before redirect.");
-      }
 
       return {
         mode: "redirect",
@@ -928,9 +892,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         expiresAt,
       };
     } catch (err) {
-      if (err instanceof DomainError && err.reasonCode === "PAYMENT_ATTEMPT_CANCELLED") {
-        throw err;
-      }
       const failedAt = deps.clock.now();
       const reasonCode = err instanceof DomainError ? err.reasonCode : "PROVIDER_CREATE_ERROR";
       await deps.db.transaction(async (tx) => {
@@ -1696,12 +1657,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       if (verified.outcomeHint === "expired" || verified.outcomeHint === "failed") {
         const nextStatus: PaymentAttemptStatus = verified.outcomeHint === "expired" ? "expired" : "failed";
-        if (
-          (attempt.status === "created" ||
-            attempt.status === "redirected" ||
-            attempt.status === "cancelled") &&
-          attempt.compliancePaymentPublicId === null
-        ) {
+        if (attempt.status === "created" || attempt.status === "redirected") {
           await tx
             .update(paymentAttempts)
             .set({
@@ -2006,6 +1962,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     for (const attempt of candidates) {
       if (opts?.signal?.aborted) break;
+      if (attempt.status === "cancelled" && !attempt.verifiedWebhookEventId) {
+        continue;
+      }
       if (!attempt.providerRef) {
         continue;
       }
@@ -2084,7 +2043,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         continue;
       }
 
-      if (fetched.status === "expired") {
+      const isPastExpiry = Boolean(attempt.expiresAt && attempt.expiresAt.getTime() <= now.getTime());
+      if (fetched.status === "expired" || (fetched.status === "open" && isPastExpiry && !attempt.verifiedWebhookEventId)) {
         await deps.db
           .update(paymentAttempts)
           .set({
@@ -3908,38 +3868,48 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
   }
 
   /**
-   * Authoritative transactional check for G-C3-02 (`compliance.orderPaymentExposureInTx`):
-   * locks `payment_attempts` rows for the given invoices (`ORDER BY id ASC FOR UPDATE`) and returns
-   * `true` if any attempt could still result in provider capture — including `created` (in-flight
-   * provider session creation), `redirected` (active hosted session), `cancelled` (marked locally
-   * without provider-side cancellation until terminal provider `expired`/`failed` proof), `paid`
-   * awaiting ledger booking, or `failed` with a verified paid webhook mismatch.
+   * Authoritative conservative check for G-C3-02 (`compliance.orderPaymentExposureInTx`):
+   * `providerAttemptEver` is `true` if ANY `payment_attempts` row has EVER been created for the order or its invoices,
+   * regardless of status (`created`, `redirected`, `paid`, `failed`, `cancelled`, `expired`).
+   * Uses `FOR SHARE NOWAIT` for a current read that fails closed (`true`) on lock contention without deadlocking.
    */
-  async function hasPendingCaptureForInvoicesInTx(
+  async function getAttemptExposureForOrderInTx(
     tx: Tx,
+    orderPublicId: string,
     invoiceIds: readonly number[],
-  ): Promise<boolean> {
-    if (invoiceIds.length === 0) return false;
-    const rows = await tx
-      .select({
-        id: paymentAttempts.id,
-        status: paymentAttempts.status,
-        compliancePaymentPublicId: paymentAttempts.compliancePaymentPublicId,
-        verifiedWebhookEventId: paymentAttempts.verifiedWebhookEventId,
-      })
-      .from(paymentAttempts)
-      .where(inArray(paymentAttempts.invoiceId, [...invoiceIds]))
-      .orderBy(asc(paymentAttempts.id))
-      .for("update");
-
-    return rows.some(
-      (r) =>
-        r.status === "created" ||
-        r.status === "redirected" ||
-        r.status === "cancelled" ||
-        (r.status === "paid" && r.compliancePaymentPublicId === null) ||
-        (r.status === "failed" && r.verifiedWebhookEventId !== null),
-    );
+  ): Promise<{ providerCapturePending: boolean; providerAttemptEver: boolean }> {
+    try {
+      const whereClause =
+        invoiceIds.length > 0
+          ? or(
+              eq(paymentAttempts.orderPublicId, orderPublicId),
+              inArray(paymentAttempts.invoiceId, [...invoiceIds]),
+            )
+          : eq(paymentAttempts.orderPublicId, orderPublicId);
+      const rows = await tx
+        .select({
+          id: paymentAttempts.id,
+          status: paymentAttempts.status,
+          compliancePaymentPublicId: paymentAttempts.compliancePaymentPublicId,
+          verifiedWebhookEventId: paymentAttempts.verifiedWebhookEventId,
+        })
+        .from(paymentAttempts)
+        .where(whereClause)
+        .orderBy(asc(paymentAttempts.id))
+        .for("share", { noWait: true });
+      const providerAttemptEver = rows.length > 0;
+      const providerCapturePending = rows.some(
+        (r) =>
+          r.status === "created" ||
+          r.status === "redirected" ||
+          r.status === "cancelled" ||
+          (r.status === "paid" && r.compliancePaymentPublicId === null) ||
+          (r.status === "failed" && r.verifiedWebhookEventId !== null),
+      );
+      return { providerCapturePending, providerAttemptEver };
+    } catch {
+      return { providerCapturePending: true, providerAttemptEver: true };
+    }
   }
 
   return {
@@ -3951,7 +3921,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     handleSignedWebhook,
     reconcilePendingAttempts,
     reconcileProviderRefund,
-    hasPendingCaptureForInvoicesInTx,
+    getAttemptExposureForOrderInTx,
     refunds: {
       forOrder: forOrderRefunds,
       create: createOrderRefund,
