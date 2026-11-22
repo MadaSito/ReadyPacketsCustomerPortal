@@ -134,6 +134,12 @@ export interface PromotionsPort {
   releaseForOrderInTx(tx: Tx, input: { orderPublicId: string; reason: "order_cancelled" }): Promise<{ released: boolean }>;
   /** Optional: `feature.promotions`. When present and false, orders refuses codes with the uniform error. */
   isEnabled?(opts?: { tx?: DbOrTx }): Promise<boolean>;
+  /**
+   * Optional (C1, siem_engineer): runs `fn` OUTSIDE any orders transaction — rate limits, lockout check, and durable
+   * recording of a PROMO_NOT_APPLICABLE refusal after `fn`'s transaction has rolled back. Orders wraps quote and
+   * create with it whenever a code is present; never used inside a caller-held tx (checkout).
+   */
+  guardAttempt?<T>(actorUserId: number, fn: () => Promise<T>): Promise<T>;
 }
 
 /** The one message for every refusal that must not reveal whether a code exists (contract D3). */
@@ -147,7 +153,15 @@ export function promotionsPort(services: Services): PromotionsPort | null {
   const releaseForOrderInTx = method<PromotionsPort["releaseForOrderInTx"]>(holder, "releaseForOrderInTx");
   if (!preview || !redeemInTx || !releaseForOrderInTx) return null;
   const isEnabled = method<NonNullable<PromotionsPort["isEnabled"]>>(holder, "isEnabled");
-  return { preview, redeemInTx, releaseForOrderInTx, ...(isEnabled ? { isEnabled } : {}) };
+  const guardAttempt = method<NonNullable<PromotionsPort["guardAttempt"]>>(holder, "guardAttempt");
+  return { preview, redeemInTx, releaseForOrderInTx, ...(isEnabled ? { isEnabled } : {}), ...(guardAttempt ? { guardAttempt } : {}) };
+}
+
+/** Runs `fn` under the promotions attempt guard when a code is present (and the port offers it); otherwise as is. */
+export function withPromoAttemptGuard<T>(services: Services, promoCode: string | undefined, actorUserId: number, fn: () => Promise<T>): Promise<T> {
+  if (promoCode === undefined) return fn();
+  const port = promotionsPort(services);
+  return port?.guardAttempt ? port.guardAttempt(actorUserId, fn) : fn();
 }
 
 /** Port for a code, or the uniform refusal when the module is absent or `feature.promotions` is off. */

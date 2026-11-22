@@ -14,7 +14,7 @@ import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
 import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
-import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, type PromotionContext, type PromotionOutcome } from "./ports.js";
+import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
@@ -287,9 +287,11 @@ export function createOrderService(deps: OrderServiceDeps) {
     return {
       ...pricing,
       discountMinor: outcome.discountMinor,
-      discountLabel: outcome.discountLabel.slice(0, 120),
+      // A code that contributes nothing (bundle won, or the cap left 0) leaves no promo figures or label behind;
+      // promotions likewise writes no redemption for it.
+      discountLabel: outcome.discountMinor > 0 ? outcome.discountLabel.slice(0, 120) : null,
       totalMinor: outcome.totalMinor,
-      promo: { publicId: outcome.promoPublicId, label: outcome.label.slice(0, 120), promoDiscountMinor: outcome.promoDiscountMinor },
+      ...(outcome.promoDiscountMinor > 0 ? { promo: { publicId: outcome.promoPublicId, label: outcome.label.slice(0, 120), promoDiscountMinor: outcome.promoDiscountMinor } } : {}),
     };
   }
 
@@ -495,13 +497,16 @@ export function createOrderService(deps: OrderServiceDeps) {
 
       const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX);
       try {
-        return await deps.db.transaction(async (tx) => {
-          // No existing order row is locked here, so the actor check is the first statement.
-          const actor = await assertActorCurrent(principal, tx, "orders.create");
-          if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
-          const result = await createInTx(tx, principal, input, ownerUserId, prefix);
-          return { publicId: result.publicId, reference: result.reference, created: true };
-        });
+        // C1: with a code, the promotions attempt guard wraps the whole tx (refusals are recorded after rollback).
+        return await withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () =>
+          deps.db.transaction(async (tx) => {
+            // No existing order row is locked here, so the actor check is the first statement.
+            const actor = await assertActorCurrent(principal, tx, "orders.create");
+            if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
+            const result = await createInTx(tx, principal, input, ownerUserId, prefix);
+            return { publicId: result.publicId, reference: result.reference, created: true as const };
+          }),
+        );
       } catch (error) {
         // A concurrent duplicate submit with the same idempotency key resolves to the first order.
         if (isDuplicateKey(error)) {
@@ -1426,7 +1431,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         if (!owner) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
         ownerUserId = owner.id;
       }
-      return snapshot(async (tx) => {
+      return withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () => snapshot(async (tx) => {
         const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
         const base = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
         const currency = lineItems[0]!.currency;
@@ -1444,7 +1449,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           bundle: pricing.bundle,
           promo: pricing.promo ? { label: pricing.promo.label, promoDiscountMinor: pricing.promo.promoDiscountMinor } : null,
         };
-      });
+      }));
     },
 
     /** Trusted (caller already authorised): packet scope for production webhooks. Uses the caller's tx; no locks. */

@@ -145,6 +145,8 @@ export default function NewOrderPage() {
     setPromoNotice(null);
     // Rethrows the server's uniform refusal for the field to show.
     const result = await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: code });
+    // A code that adds nothing (for example the bundle discount is larger) is not applied.
+    if (!result.promo) throw new Error("PROMO_NO_CONTRIBUTION");
     const revision = promoRevision + 1;
     queryClient.setQueryData(["orders", "quoteWithPromo", promoScope, revision, promoInput.items], result);
     setPromoRevision(revision);

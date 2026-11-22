@@ -229,6 +229,44 @@ describe("promotion codes on orders (C3)", () => {
     await expectError(mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" }), "UNAVAILABLE:PROMOTIONS_UNAVAILABLE");
   });
 
+  it("C1 attempt guard wraps quote and create (incl. staff for a customer) outside the tx; refusals reach it after rollback; checkout is not wrapped", async () => {
+    const guarded: { actor: number; outcome: string; ordersAfter?: number }[] = [];
+    const countOrders = async () => (await t.db.select({ id: orders.id }).from(orders)).length;
+    (promos as unknown as { guardAttempt: <T>(actor: number, fn: () => Promise<T>) => Promise<T> }).guardAttempt = async (actor, fn) => {
+      const before = await countOrders();
+      try {
+        const value = await fn();
+        guarded.push({ actor, outcome: "ok" });
+        return value;
+      } catch (error) {
+        // The caller's tx has already rolled back: nothing was written.
+        guarded.push({ actor, outcome: error instanceof DomainError ? error.reasonCode : "other", ordersAfter: (await countOrders()) - before });
+        throw error;
+      }
+    };
+    await mod.orders.quote(alice.principal, { items: items(), promoCode: "SAVE10" });
+    await expectError(mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "WRONG1" }), "VALIDATION:PROMO_NOT_APPLICABLE");
+    await mod.orders.create(staff.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), onBehalfOfCustomerPublicId: alice.publicId, promoCode: "SAVE10" });
+    expect(guarded).toEqual([
+      { actor: alice.id, outcome: "ok" },
+      { actor: alice.id, outcome: "PROMO_NOT_APPLICABLE", ordersAfter: 0 },
+      { actor: staff.id, outcome: "ok" },
+    ]);
+    // No code: not guarded. Checkout (caller-held tx): not guarded.
+    await mod.orders.quote(alice.principal, { items: items() });
+    promos.remaining = 5;
+    await t.db.transaction((tx) => mod.createOrderFromCheckoutInTx(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" }, tx));
+    expect(guarded).toHaveLength(3);
+  });
+
+  it("a code that contributes nothing leaves no promo figures or label on the order", async () => {
+    promos.override = { promoPublicId: "01JD0000000000000000PROMO1", label: "Synthetic zero", promoDiscountMinor: 0, bundleDiscountMinor: 0, discountMinor: 0, discountLabel: "Synthetic zero", totalMinor: 10000 };
+    const q = await mod.orders.quote(alice.principal, { items: items(), promoCode: "SAVE10" });
+    expect(q).toMatchObject({ promo: null, discountMinor: 0, discountLabel: null, totalMinor: 10000 });
+    const created = await mod.orders.create(alice.principal, { projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), promoCode: "SAVE10" });
+    expect(await rowOf(created.publicId)).toMatchObject({ promoDiscountMinor: 0, promoLabel: null, discountMinor: 0, discountLabel: null });
+  });
+
   it("API v1 (system) order creation does not accept codes", async () => {
     await expectError(
       mod.orders.createAsSystem({ ownerPublicId: alice.publicId, projectName: "Synthetic", items: items(), idempotencyKey: idemKey(), correlationId: "corr-c3", ...({ promoCode: "SAVE10" } as object) }),
