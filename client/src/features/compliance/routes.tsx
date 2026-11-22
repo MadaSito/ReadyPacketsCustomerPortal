@@ -2,10 +2,12 @@ import type {
   DashboardWidget,
   FeatureRoutes,
   NavItem,
+  OrderBanner,
   OrderTab,
   RouteDef,
   RouteWrapper,
 } from "@/lib/routes";
+import { acceptanceOrderBanners, acceptanceOrderTabs, acceptanceRoutes } from "./acceptance";
 
 interface ComplianceCustomerModule {
   complianceCustomerRoutes?: RouteDef[];
@@ -35,6 +37,7 @@ const adminMod = Object.values(adminModules)[0];
 export const routes: RouteDef[] = [
   ...(customerMod?.complianceCustomerRoutes ?? []),
   ...(adminMod?.complianceAdminRoutes ?? []),
+  ...acceptanceRoutes,
 ];
 
 function normalizeCustomerNav(items: NavItem[]): NavItem[] {
@@ -57,7 +60,10 @@ export const nav: NavItem[] = [
 
 export const orderTabs: OrderTab[] = [
   ...(customerMod?.complianceOrderTabs ?? []),
+  ...acceptanceOrderTabs,
 ];
+
+export const orderBanners: OrderBanner[] = [...acceptanceOrderBanners];
 
 export const widgets: DashboardWidget[] = [
   ...(customerMod?.complianceWidgets ?? []),
@@ -71,6 +77,7 @@ export const complianceFeature: FeatureRoutes = {
   routes,
   nav,
   orderTabs,
+  orderBanners,
   widgets,
   routeWrappers,
 };
