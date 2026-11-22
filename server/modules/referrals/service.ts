@@ -753,6 +753,11 @@ export function createReferralsService(deps: ModuleDeps) {
       throw validation("INVALID_INVOICE_EVENT", "Invalid invoice paid event payload.");
     }
 
+    const enabled = await isFlagEnabled(deps.settings, REFERRALS_ENABLED_FLAG, tx);
+    if (!enabled) {
+      return { outcome: "program_disabled" };
+    }
+
     const [row] = await tx
       .select()
       .from(referrals)
@@ -783,14 +788,6 @@ export function createReferralsService(deps: ModuleDeps) {
     if (event.isFirstPaidInvoice === false) {
       return {
         outcome: "not_first_invoice",
-        referralPublicId: row.publicId,
-      };
-    }
-
-    const enabled = await isFlagEnabled(deps.settings, REFERRALS_ENABLED_FLAG, tx);
-    if (!enabled) {
-      return {
-        outcome: "program_disabled",
         referralPublicId: row.publicId,
       };
     }
@@ -1113,7 +1110,7 @@ export function createReferralsService(deps: ModuleDeps) {
     }
 
     const recipientEmailIndex = deps.crypto.blindIndex(
-      normalizedRecipient,
+      canonicalEmailIdentity(normalizedRecipient),
       "referrals.invite_recipient",
     );
 

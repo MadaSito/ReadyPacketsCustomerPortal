@@ -4,7 +4,7 @@ import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
-import { users } from "../identity/schema.js";
+import { userSessions, users } from "../identity/schema.js";
 
 export async function denyReferralsAuthz(
   deps: ModuleDeps,
@@ -110,13 +110,41 @@ export async function assertLiveActorInTx(
     );
   }
 
+  const now = deps.clock.now();
+  let liveStepUpAt: Date | null = principal.stepUpAt;
+
+  if (!identitySvc?.sessions?.assertCurrent) {
+    const [sessionRow] = await tx
+      .select({
+        revokedAt: userSessions.revokedAt,
+        absoluteExpiresAt: userSessions.absoluteExpiresAt,
+        stepUpAt: userSessions.stepUpAt,
+      })
+      .from(userSessions)
+      .where(eq(userSessions.publicId, principal.sessionId))
+      .for("update")
+      .limit(1);
+    if (
+      sessionRow &&
+      (sessionRow.revokedAt !== null || sessionRow.absoluteExpiresAt.getTime() <= now.getTime())
+    ) {
+      throw new DomainError(
+        "UNAUTHENTICATED",
+        "SESSION_NOT_CURRENT",
+        "Your session is no longer active. Please sign in again.",
+      );
+    }
+    if (sessionRow) {
+      liveStepUpAt = sessionRow.stepUpAt;
+    }
+  }
+
   if (requiredCapability) {
     if (!roleHasCapability(liveUser.role, requiredCapability)) {
       throw forbidden("CAPABILITY_NOT_GRANTED");
     }
     if (STEP_UP_CAPABILITIES.has(requiredCapability)) {
-      const now = deps.clock.now();
-      let stepUpAt = principal.stepUpAt;
+      let stepUpAt = liveStepUpAt;
       if (identitySvc?.sessions?.getState) {
         const liveSession = await identitySvc.sessions.getState(principal.sessionId, { tx });
         if (!liveSession || !liveSession.live) {
