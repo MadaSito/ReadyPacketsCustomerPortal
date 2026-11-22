@@ -37,6 +37,17 @@ assert_workflow_import_edge() {
         [[ $result == 413 || ($proxy == caddy && $result == 400) ]] ||
             fail "workflow exception does not extend to $path: got $result"
     done
+    for path in "$base.preview?batch=1" "$base.applyImport?%62atch=0"; do
+        result=$(web -D "$work/workflow-batch.headers" -o /dev/null -w '%{http_code}' \
+            "${headers[@]}" --data-binary "@$body" "$origin$path")
+        if [[ $proxy == nginx ]]; then
+            expect "workflow batch query refused at native edge on $path" "$result" 400
+            ! grep -qi '^x-request-id:' "$work/workflow-batch.headers" ||
+                fail "workflow batch query reached the app through Nginx"
+        else
+            [[ $result == 413 || $result == 400 ]] || fail "workflow batch query refused on $path: got $result"
+        fi
+    done
     local other_method=413 encoded_path=413
     if [[ $proxy == nginx ]]; then
         # Nginx returns early rather than forwarding any request to a normalized-only path or method.

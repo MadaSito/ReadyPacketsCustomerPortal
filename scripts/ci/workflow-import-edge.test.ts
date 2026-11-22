@@ -26,6 +26,15 @@ describe("workflow import edge configuration", () => {
         expect(exact.test(`${base}.${ownPath}?other=value`)).toBe(true);
         expect(exact.test(`${base}.${ownPath}/`)).toBe(false);
         expect(exact.test(`${base}.%${ownPath!.charCodeAt(0).toString(16)}${ownPath!.slice(1)}`)).toBe(false);
+        const batchGuard = /^\s+if \(\$args ~ "([^"]+)"\) \{ return 400; \}$/m.exec(body)?.[1];
+        expect(batchGuard).toBeTruthy();
+        const batch = new RegExp(batchGuard!, "u");
+        for (const query of ["batch", "batch=0", "batch=", "limit=1&%62atch=1", "%62%61%74%63%68&batch=1"]) {
+          expect(batch.test(query), query).toBe(true);
+        }
+        for (const query of ["", "notbatch=1", "Batch=1", "batching=1", "filter=batch", "q=foo%26batch=1"]) {
+          expect(batch.test(query), query).toBe(false);
+        }
       }
     },
   );
