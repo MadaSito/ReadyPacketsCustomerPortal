@@ -113,6 +113,21 @@ describe("Webhooks administration", () => {
     });
   }
 
+  it("includes the visible Test delivery label in the subscription action's accessible name", async () => {
+    const user = userEvent.setup();
+    const queue = vi.fn();
+    renderWebhooks(<SubscriptionsPage />, "Webhook subscriptions", WEBHOOK_PATHS.subscriptions, {
+      "settings.get": () => ({ ...settings, enabled: true }),
+      "subscriptions.testDelivery": queue,
+    });
+    const table = await screen.findByRole("table", { name: "Outbound subscriptions" });
+    const action = within(table).getByRole("button", { name: `Test delivery for ${subscription.name}` });
+    expect(action).toHaveTextContent(/^Test delivery$/u);
+    await user.click(action);
+    expect(screen.getByRole("alertdialog", { name: "Send test delivery?" })).toBeVisible();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
   it("creates a paused outbound subscription, with a once-only secret outside the query and mutation caches", async () => {
     const user = userEvent.setup();
     const secret = "synthetic_secret_1234";

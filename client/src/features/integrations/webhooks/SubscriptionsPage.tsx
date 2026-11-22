@@ -160,7 +160,7 @@ export default function SubscriptionsPage() {
           <Button variant="secondary" aria-label={`Edit ${row.name}`} disabled={!catalogue.data?.length} onClick={() => setEditor({ current: row })}>Edit</Button>
           <Button variant="secondary" aria-label={`${row.status === "active" ? "Pause" : "Resume"} ${row.name}`} onClick={() => confirmFor(row, "pause")}>{row.status === "active" ? "Pause" : "Resume"}</Button>
           <Button variant="secondary" aria-label={`Rotate secret for ${row.name}`} onClick={() => confirmFor(row, "rotate")}>Rotate secret</Button>
-          <Button variant="secondary" aria-label={`Queue test for ${row.name}`} disabled={!settings.data?.enabled} onClick={() => confirmFor(row, "test")}>Test delivery</Button>
+          <Button variant="secondary" aria-label={`Test delivery for ${row.name}`} disabled={!settings.data?.enabled} onClick={() => confirmFor(row, "test")}>Test delivery</Button>
           <Button variant="ghost" aria-label={`Remove ${row.name}`} onClick={() => confirmFor(row, "remove")}>Remove</Button>
         </div>} />
       <LoadMore hasMore={list.hasNextPage} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} />
