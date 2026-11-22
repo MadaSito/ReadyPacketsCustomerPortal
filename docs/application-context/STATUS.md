@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-21 (after increment 04, parts A and B). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-22 (after increment 04, parts A and B, and the preview tests of prompt 20). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -232,6 +232,34 @@ passed except the two items the integrator rechecked above. The routes that pass
 not swept again after the fixes. Browser zoom and assistive technology were not exercised. The integrator
 did not exercise the in-browser audio recorder in a browser; it has component tests only.
 
+## Verified after increment 04 — preview tests of 2026-11-22 (integrator's own runs)
+
+Hosted preview (preview profile, in-memory sessions, synthetic data), rebuilt at `main` `b275b59` and
+driven through the deployed client with Chromium. Details and the exact payload are in
+`docs/session-logs/2026-11-22-session-01.md`.
+
+- referral reward end to end: programme enabled with a fixed USD 50.00 account credit and manual approval;
+  a synthetic customer registered through the referrer's link ("Attributed"); first invoice issued and paid
+  by a manual payment ("Pending approval", USD 50.00); approval and "Mark credited" with step-up
+  ("Credited", two reward-ledger entries); the referrer's page shows the masked account and "Credit
+  applied"; the five `referral.*` audit events are present in order
+- referral refund rule: a second synthetic referral whose paid first invoice was then fully refunded
+  ("recorded only") stayed in "Pending approval" with the note "Qualifying invoice refunded" and the audit
+  event `referral.moved_to_manual_review`; nothing was reversed automatically
+- Phase I (P101) dispatch from the order's "Automation" tab for synthetic order `RP-2026-000006`, sent to a
+  **neutral public echo service** (`postman-echo.com`), not to the owner's pipeline: allow-list rule
+  required and matched, dry run `DRY_RUN_ALLOWED`, dispatch "Delivered" with HTTP 200 on attempt 1, the
+  stored body hash equals the hash of the documented ten-field payload (`packet "1"`, `tier "Basic"`,
+  `bundle_scope_manifest` as a JSON string), request and delivery audit events written, Phase II then
+  offered with the three locked fields and not started; the pipeline switch was turned off afterwards
+- e-mail confirmation in the preview after the fix below, with two fresh synthetic accounts: demo link,
+  "Email confirmed", "Continue", authenticator setup
+- type check and ESLint (whole project) clean; `auth.test.tsx` and `consent.test.ts` pass; preview build
+
+Fixed in this pass: the preview's in-app verification link did nothing (token read only at first render);
+a dead "Send a new link" after confirming while signed in; a `SecurityError` when cookies are unavailable
+during analytics clean-up.
+
 ## Not verified
 
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
@@ -244,8 +272,9 @@ did not exercise the in-browser audio recorder in a browser; it has component te
   certificate, one customer and one order, and the unattended `--yes` mode; the typed confirmations of the
   interactive mode and an installation older than `d964a3b` were not exercised.
 
-- production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to any real
-  receiver; TLS to the real host, receiver-side de-duplication across retries, and a full
+- production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to the owner's
+  receiver (one synthetic P101 went to a public echo service on 2026-11-22, which proves the portal side
+  only); TLS to the real host, receiver-side de-duplication across retries, and a full
   P101 → artifacts → P201 run are untested. Keep the pipeline disabled until an operator has tested it
   with a synthetic order.
 
@@ -295,20 +324,27 @@ did not exercise the in-browser audio recorder in a browser; it has component te
   existing orders keep theirs; retention of sent content and the automations engine are off by default.
 - Increment 04 decisions the owner should confirm:
   - **Payments and refunds.** Hosted checkout is by redirect, so no card data reaches the portal. Refunds go to the provider and need the typed `REFUND ORDER` plus administrator step-up. Refunds of manual payments are recorded only and move no money.
-  - **Later phases (an assumption).** Phase III / IV are optional P301 / P401 endpoints with the payload `{customer_id, order_id, run_mode}`. The reference documents define only P101 / P201.
-  - **Redelivery and retry.** Redelivery needs administrator step-up and the typed `REDELIVER`. A staff retry reuses the original Idempotency-Key and is refused when the destination has changed. An administrator re-send authorises the new destination, so duplicates across two different receivers are an operator risk.
-  - **Acceptance.** Acceptance is per acting user. Staff are not gated, and cancellation is never gated. Customers see a generic "Order renamed".
+  - **Redelivery and retry (still open; the owner left this answer blank on 2026-11-22).** Redelivery needs administrator step-up and the typed `REDELIVER`. A staff retry reuses the original Idempotency-Key and is refused when the destination has changed. An administrator re-send authorises the new destination, so duplicates across two different receivers are an operator risk.
+  - **Order rename.** Customers see a generic "Order renamed".
   - **File sync.** The default folder template is `customers/{customer_ref}/orders/{order_ref}/{phase}`.
   - **Protection.** Country blocking needs an operator-supplied MMDB, and the firewall starts in detect mode.
-  - **Referrals.** The reward is account credit on the first paid invoice, with manual approval. A refunded first invoice sends the reward to manual review.
+  - **Referrals.** The reward is account credit on the first paid invoice, with manual approval.
   - **Defaults.** The community forum is off by default. The consent ledger is kept 36 months.
   - **Accessibility.** Accessibility is a WCAG 2.2 AA target, not a certification.
+- Increment 04 decisions confirmed by the owner on 2026-11-22:
+  - **Later phases.** Only P101 and P201 are called today, each through a webhook URL. Later phases may be built in the future; P301 / P401 stay optional and hidden until a URL is configured, and their payload `{customer_id, order_id, run_mode}` is a placeholder until a contract exists.
+  - **Acceptance.** Staff are never gated, and cancelling an order is never blocked by a gate.
+  - **Referrals.** A fully refunded first invoice sends the reward to manual review; it is not reversed automatically.
 - Follow-ups (not blocking):
   - binding-set drift on a same-key automation replay;
   - Graph remote-file reuse is keyed on the QuickXor hash only;
   - no account-erasure path;
   - community search uses `LIKE`;
   - the Activity lane labels a recorded-only refund "Refund issued".
+  - a person who abandons authenticator setup and signs in again in a new session must wait up to ten minutes ("An authenticator setup is already in progress"), and the message does not say how long;
+  - "Order history" shows the pipeline events as "Integration production dispatch requested / delivered";
+  - the `dispatch.requested` audit event does not carry the dispatch correlation reference;
+  - a referral reward is recorded as credited by an administrator; the portal does not apply it to an invoice by itself.
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).
