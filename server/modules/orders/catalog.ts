@@ -218,15 +218,16 @@ const actorOf = (actor: CatalogActor) => (isSystem(actor) ? { userId: null, role
 const actorUserId = (actor: CatalogActor): number | null => (isSystem(actor) ? null : actor.userId);
 
 export function createCatalogService(deps: CatalogDeps) {
-  async function load(db: Db | Tx, onlyActive: boolean): Promise<CatalogGroupView[]> {
-    const groups = await db
+  async function load(db: Db | Tx, onlyActive: boolean, forShare = false): Promise<CatalogGroupView[]> {
+    const groupQuery = db
       .select()
       .from(catalogGroups)
       .where(onlyActive ? eq(catalogGroups.active, true) : undefined)
       .orderBy(asc(catalogGroups.sortOrder), asc(catalogGroups.id))
       .limit(200);
+    const groups = await (forShare ? groupQuery.for("share") : groupQuery);
     if (groups.length === 0) return [];
-    const rows = await db
+    const productQuery = db
       .select({ product: catalogProducts, version: catalogProductVersions })
       .from(catalogProducts)
       .innerJoin(catalogProductVersions, eq(catalogProductVersions.id, catalogProducts.currentVersionId))
@@ -241,6 +242,7 @@ export function createCatalogService(deps: CatalogDeps) {
       )
       .orderBy(asc(catalogProducts.sortOrder), asc(catalogProducts.id))
       .limit(1000);
+    const rows = await (forShare ? productQuery.for("share") : productQuery);
     return groups.map((group) => ({
       publicId: group.publicId,
       groupKey: group.groupKey,
@@ -534,9 +536,14 @@ export function createCatalogService(deps: CatalogDeps) {
   }
 
   return {
-    /** Customer-facing: active groups with active products at their current version. */
-    listActive(): Promise<CatalogGroupView[]> {
-      return load(deps.db, true);
+    /**
+     * Customer-facing: active groups with active products at their current version. Pass `tx` when called inside a
+     * transaction (the read then uses that connection; never a second connection).
+     */
+    listActive(tx?: Tx, opts: { forShare?: boolean } = {}): Promise<CatalogGroupView[]> {
+      // `forShare` (cart checkout/item mutations): current, share-locked read in the caller's tx, so a concurrent
+      // deactivation or repricing waits for it. Only meaningful with a tx.
+      return load(tx ?? deps.db, true, Boolean(tx && opts.forShare));
     },
     listAll(): Promise<CatalogGroupView[]> {
       return load(deps.db, false);
