@@ -27,8 +27,10 @@ B1. **Console order page layout.** Header: order name, then `reference · custom
     `tablist` with roving focus, and wraps into a "More" menu or select below 480 px. Every tab keeps its
     own URL segment.
 B2. **Rename.** `orders.console.rename` changes the order name (1–120 characters, NFC, trimmed, no control
-    characters), with optimistic version check, audit event `order.renamed` (old and new name), a row in
-    the order history, and no change to the reference. Capability `orders.rename` (staff and
+    characters), with optimistic version check, audit event `order.renamed` (order public id and name lengths only:
+    the audit envelope removes name-like values by design), a row in the orders-owned table
+    `order_name_history` (order, old name, new name, actor, time) that the Order history tab shows as
+    "Renamed: old → new", and no change to the reference. Capability `orders.rename` (staff and
     administrators). Customers keep whatever `orders.update` already allows them.
 B3. **Order history tab** (replaces "Activity"). Left: status history — every lifecycle transition with
     from → to, note, time and actor. Right: order activity — order-scoped events retained for audit
@@ -89,6 +91,7 @@ B6. **Policy acceptance gateway** (ADR 0039). An administrator attaches a policy
     ("Signed by <name> using typed signature", accepted time, policy and version; the source address is
     shown only with `sessions.read_all`). Staff are not gated. Transitions made by the system or
     through API v1 are checked against the order owner's acceptance and fail closed when it is missing.
+    Cancellation is never gated (an order whose customer has not accepted can still be cancelled).
     A printable receipt is available to the
     customer and the console.
 B7. **Order file sync and folder routing** (ADR 0040). Every order file that becomes available — an
