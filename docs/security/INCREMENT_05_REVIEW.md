@@ -47,3 +47,5 @@ These references identify the code inspected in `76ad28d`; line numbers may move
 ## Not verified at this checkpoint
 
 The serialized full typecheck was clean after the acceptance client and server fixes. Browser fragment scrubbing and vendor logs, installed-site/proxy logs, live SIEM receipt, and live payment provider behavior remain unverified. The workflow edge configuration test passed 3/3; this is not a running proxy check.
+
+Integrator's addendum (2026-11-22): the pull request's `container` and `native-install` runs at `788c18c` did probe the workflow-import routes through running nginx and Caddy proxies on GitHub-hosted runners (exact limit reaches the application; one byte over, look-alike paths, other methods and batched requests are refused). CodeQL blocked `deploy/check-migration-bundle.mjs` for a check-then-read file race; it now checks and reads through one descriptor opened without following symlinks. The other items above remain unverified.

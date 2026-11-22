@@ -298,11 +298,23 @@ Integrator's own runs on 2026-11-22, on branch `feat/increment-05` (synthetic da
   one 5 px overflow at 320 px on the cart suggestions list was fixed and the page re-run. See
   `docs/accessibility/INCREMENT_05_REVIEW.md`.
 
+Checks on pull request 10 (GitHub-hosted runners), at commit `788c18c`: `ci`, `security`, `container` and
+`native-install` all succeeded. Beyond the usual jobs these runs showed:
+
+- migration `0005_increment_05` applied exactly once on a fresh native install (Ubuntu 26.04, x64 and
+  arm64), on the native upgrade from `89c5cb8` with a pre-existing administrator, customer and order, and
+  in the Docker Compose stack
+- the workflow-import body limit probed through the running proxy (nginx on the native paths, Caddy in
+  the Compose stack): the two import paths accept the larger body and reach the application, one byte more
+  is refused, and look-alike paths, other methods and batched requests keep the 256 KiB limit
+- the first run of this pull request failed in five jobs because the new probe script re-declared a
+  read-only shell variable, and in CodeQL because the migration bundle check read a file after checking it
+  by name; both were fixed (`788c18c`) and the runs repeated
+
 Reported by the engineering team and reviewed, but not re-run individually by the integrator: the
 per-package test notes in each module's `VERIFICATION.md`; the security review
 (`docs/security/INCREMENT_05_REVIEW.md`: no open findings in scope, one accepted residual and three payment
-follow-ups recorded there); the nginx and Caddy configuration checks for the workflow-import body limit;
-the component-level accessibility ledger. The engineering team stopped before the accessibility reviewer
+follow-ups recorded there); the component-level accessibility ledger. The engineering team stopped before the accessibility reviewer
 sent a final report, so that ledger is a working record, not a sign-off.
 
 Not verified for increment 05:
@@ -316,7 +328,8 @@ Not verified for increment 05:
   exercised in the browser run (server tests only)
 - importing a workflow package into a second, separate installation; the import was run against the
   installation that produced the package
-- the workflow-import body limit on a deployed nginx or Caddy; only the configuration files were checked
+- the workflow-import body limit on the owner's own server or behind a separately managed proxy (the
+  runner checks above use a fresh machine and the shipped nginx and Caddy configuration)
 - keyboard-only operation, browser zoom and screen readers for the new pages
 
 ## Not verified
