@@ -23,6 +23,13 @@ ADR 0035 kept refunds and disputes manual. The owner now asks for a Refund butto
 - Referral rewards tied to a fully refunded first invoice go to manual review.
 - Every step writes an audit event (refund prepared / sent / failed). When notice is on, the customer e-mail (system template) is queued only after the refund is confirmed by the provider or a manual refund is recorded; mail delivery status is separate from refund status.
 - No card data is stored or shown.
+- Procedures:
+  - `payments.refunds.forOrder` is the read-only refund view for staff and administrators, scoped to the order.
+  - `payments.refunds.create` (`payments.refund` plus step-up) is a single mutation. It prepares the refund, commits the intent under `SELECT … FOR UPDATE`, then executes it, covering Stripe, Square and manual `recorded_only` refunds.
+- Audit events: `payment.refund.prepared`, `.sent`, `.succeeded`, `.failed` and `.unknown`, each carrying `orderPublicId` for the Order history.
+- Jobs and mail:
+  - The reconcile job `compliance.refund.reconcile` makes up to 8 read-only lookups with backoff and never submits a refund. When the queue is exhausted, the refund has not necessarily failed.
+  - The customer notice template is `compliance.refund_notice`. Its amount and reference variables are redacted from retained and audit mail.
 
 ## Consequences
 - The portal can now move money back to a customer, so the capability is limited to administrators and needs step-up and a typed phrase.

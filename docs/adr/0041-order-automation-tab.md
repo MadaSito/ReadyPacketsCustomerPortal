@@ -14,7 +14,12 @@ The owner asks to see and start the Production Pipeline integrations from each o
 - Optional **Phase III (P301)** and **Phase IV (P401)** endpoints can be added in the pipeline settings.
   - They use the same signing, egress pinning, outbox and reconciliation as P201, with the payload `{customer_id, order_id, run_mode}`.
   - Their start buttons appear only when the endpoint is configured.
+  - Sequencing (assumed): P301 needs P101 and P201 delivered. P401 needs the same, plus P301 when a P301 endpoint is configured.
   - This is an assumption to confirm with the owner: the reference documents define only P101 and P201.
+- Procedures:
+  - `integrations.production.order.{preview,history,requestP101,requestP201,requestP301,requestP401,retry}` need `orders.production.trigger`. A retry is linked to its original through `retryOf`.
+  - `integrations.production.order.redeliver` needs `orders.production.redeliver` plus step-up, and the server checks the reason and the phrase. It writes the audit event `integration.production.dispatch.redelivered`.
+  - The settings procedures gain optional `p301Url` and `p401Url`.
 - "Workflow stage actions" lists, for each step of the order's workflow version, the enabled automations bound to it ("N configured actions").
   - "Run actions" (`orders.automations.run`, staff and administrators) runs them for this order now through the automations engine.
   - The engine must be enabled; otherwise the panel shows a notice with a link.
