@@ -4,6 +4,7 @@ import type { ModuleDeps } from "../../../container.js";
 import { DomainError } from "../../../core/errors.js";
 import { ULID_PATTERN } from "../../../core/ids.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
+import { parseSquareRefundMarker } from "./square-refund.js";
 import type { PaymentProviderAdapter } from "./types.js";
 
 const apiHosts = { live: "connect.squareup.com", test: "connect.squareupsandbox.com" } as const;
@@ -18,6 +19,9 @@ const eventShape = z.object({ event_id: providerId, type: z.string().regex(/^[a-
   created_at: z.iso.datetime({ offset: true }), data: z.unknown().optional() });
 const eventPayment = z.object({ data: z.object({ type: z.literal("payment"), id: providerId,
   object: z.object({ payment: z.object({ id: providerId, order_id: providerId.optional(), status: z.string().max(32) }) }),
+}) });
+const eventRefund = z.object({ data: z.object({ type: z.literal("refund"), id: providerId,
+  object: z.object({ refund: z.object({ id: providerId, payment_id: providerId, reason: z.string().max(192).optional() }) }),
 }) });
 const linkResponse = z.object({ payment_link: z.object({ id: providerId, order_id: providerId, url: z.string().max(512) }) });
 const orderResponse = z.object({ order: z.object({
@@ -84,6 +88,13 @@ function verifyWebhook(input: VerifyInput): ReturnType<PaymentProviderAdapter["v
   const base = { ok: true as const, externalEventId: parsed.event_id, eventType: parsed.type, occurredAt,
     livemode: environment === "production", attemptPublicId: null, invoicePublicId: null, providerRef: null,
     providerOrderRef: null, providerPaymentRef: null, outcomeHint: "ignored" as const };
+  if (parsed.type === "refund.created" || parsed.type === "refund.updated") {
+    const event = eventRefund.safeParse(parsed);
+    if (!event.success || event.data.data.id !== event.data.data.object.refund.id) return refusal("SQUARE_EVENT_INVALID");
+    const refund = event.data.data.object.refund;
+    return { ...base, outcomeHint: "refund_updated", providerPaymentRef: refund.payment_id,
+      providerRefundRef: refund.id, refundPublicIdHint: parseSquareRefundMarker(refund.reason) };
+  }
   if (!["payment.created", "payment.updated"].includes(parsed.type)) return base;
   const outcome = eventPayment.safeParse(parsed);
   if (!outcome.success) return refusal("SQUARE_EVENT_INVALID");

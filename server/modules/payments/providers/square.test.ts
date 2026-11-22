@@ -93,7 +93,20 @@ describe("Square hosted checkout protocol", () => {
       .toEqual({ ok: false, reasonCode: "SQUARE_SIGNATURE_INVALID" });
     expect(adapter.verifyWebhook(signed({ ...event, created_at: new Date(now.getTime() - 301_000).toISOString() })))
       .toEqual({ ok: false, reasonCode: "SQUARE_EVENT_STALE" });
-    expect(adapter.verifyWebhook(signed({ ...event, type: "refund.updated" }))).toMatchObject({ ok: true, outcomeHint: "ignored" });
+    expect(adapter.verifyWebhook(signed({ ...event, type: "refund.updated" }))).toEqual({ ok: false, reasonCode: "SQUARE_EVENT_INVALID" });
+  });
+
+  it("emits refund correlation hints only from a signed, bound Square refund event", () => {
+    const { adapter, wire } = protocolFake();
+    const refund = { id: "REFUND_01", payment_id: payment.id, reason: `ReadyPackets refund ${invoicePublicId}` };
+    const notice = { ...event, type: "refund.updated", data: { type: "refund", id: refund.id, object: { refund } } };
+    expect(adapter.verifyWebhook(signed(notice))).toMatchObject({ ok: true, outcomeHint: "refund_updated",
+      providerRefundRef: refund.id, providerPaymentRef: payment.id, refundPublicIdHint: invoicePublicId, attemptPublicId: null });
+    expect(adapter.verifyWebhook(signed({ ...notice, data: { ...notice.data, id: "OTHER_REFUND" } })))
+      .toEqual({ ok: false, reasonCode: "SQUARE_EVENT_INVALID" });
+    expect(adapter.verifyWebhook({ ...signed(notice), rawBody: Buffer.from(JSON.stringify({ ...notice, type: "refund.created" })) }))
+      .toEqual({ ok: false, reasonCode: "SQUARE_SIGNATURE_INVALID" });
+    expect(wire).not.toHaveBeenCalled();
   });
 
   it("only reports completion after authoritative link, order, location, amount, currency and payment all agree", async () => {
