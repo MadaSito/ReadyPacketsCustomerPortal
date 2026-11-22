@@ -49,6 +49,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Hosted online payments](../../server/modules/payments/ADMIN_GUIDE.md): configure hosted checkout providers and reconcile payment outcomes.
 - [Community forum](../../server/modules/community/ADMIN_GUIDE.md): configure categories, posting rules and moderation.
 - [Knowledge Base and Help Centre](../../server/modules/knowledge/ADMIN_GUIDE.md): draft, publish and organize searchable help articles.
+- [Customer Referral Programme](../../server/modules/referrals/ADMIN_GUIDE.md): configure rewards, review referrals and export records.
 - [Jobs and schedules](../../server/modules/jobs/ADMIN_GUIDE.md): inspect job attempts and manage schedules.
 - [Customer maintenance](./CUSTOMER_MAINTENANCE.md): configure and monitor customer maintenance jobs.
 - [Webhooks console](./WEBHOOKS_CONSOLE.md): configure subscriptions and inbound endpoints, inspect deliveries, and rerun eligible failures.
