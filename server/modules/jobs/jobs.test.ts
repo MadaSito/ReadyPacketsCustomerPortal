@@ -13,7 +13,11 @@ import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
-import { createJobQueue, createMailer, engineFor } from "./queue.js";
+import { createJobQueue, createMailer, engineFor, JOB_TYPE } from "./queue.js";
+import {
+  REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, REFUND_RECONCILE_MAX_ATTEMPTS,
+  registerRefundNotice, registerRefundReconciliation, type RefundReconcileContext,
+} from "./refundSupport.js";
 import { jobsRouter } from "./router.js";
 import { customerMaintenance, jobAttempts, jobMaintenance, jobRuns, mailAttempts, mailAuditVerification, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 import { startWorker } from "./worker.js";
@@ -99,6 +103,77 @@ describe("Outbox generation replacement", () => {
     await expireLease(third.jobId);
     expect(await canReplace(third.jobId)).toBe(false);
     expect(await f.admin.detail(f.operator, third.jobId)).toMatchObject({ state: "running" });
+  });
+});
+
+describe("Refund reconciliation support", () => {
+  const refundPublicId = "01JD0000000000000000000001";
+
+  it("stages one delayed lookup in the refund intent transaction without retaining a provider payload", async () => {
+    const f = fixture();
+    const lookup = vi.fn(async () => "settled" as const);
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    expect(REFUND_RECONCILE_JOB).toMatch(JOB_TYPE);
+    await expect(t.db.transaction(async (tx) => {
+      await enqueue(refundPublicId, tx);
+      throw new Error("intent rollback");
+    })).rejects.toThrow("intent rollback");
+    expect(await f.engine.claim()).toBeNull();
+    const runAt = new Date(f.h.clock.now().getTime() + 120_000);
+    const first = await t.db.transaction((tx) => enqueue(refundPublicId, tx, { runAt, correlationId: "refund-lookup" }));
+    expect(await t.db.transaction((tx) => enqueue(refundPublicId, tx))).toEqual(first);
+    expect(await f.engine.claim()).toBeNull();
+    const [stored] = await t.db.select().from(jobRuns);
+    expect(stored).toMatchObject({ runAt, retrySafe: true, maxAttempts: REFUND_RECONCILE_MAX_ATTEMPTS });
+    expect(stored?.payloadEnc).not.toContain(refundPublicId);
+    f.h.clock.advance(120_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(refundPublicId, expect.objectContaining({
+      jobId: first.jobId, signal: expect.any(AbortSignal), correlationId: "refund-lookup", assertStillOwned: expect.any(Function),
+    }));
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "completed" });
+  });
+
+  it("uses bounded backoff on inconclusive lookups and never exposes a generic retry after exhaustion", async () => {
+    const f = fixture();
+    const lookup = vi.fn(async () => "pending" as const);
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    const { jobId } = await t.db.transaction((tx) => enqueue(refundPublicId, tx));
+    for (let attempt = 1; attempt <= REFUND_RECONCILE_MAX_ATTEMPTS; attempt += 1) {
+      await f.engine.execute((await f.engine.claim())!);
+      const row = await f.admin.detail(f.operator, jobId);
+      expect(row).toMatchObject({ attempt, state: attempt < REFUND_RECONCILE_MAX_ATTEMPTS ? "queued" : "failed" });
+      f.h.clock.advance(3_600_000);
+    }
+    expect(await f.engine.claim()).toBeNull();
+    expect(lookup).toHaveBeenCalledTimes(REFUND_RECONCILE_MAX_ATTEMPTS);
+    expect(await f.admin.detail(f.operator, jobId)).toMatchObject({
+      state: "failed", reasonCode: "REFUND_RECONCILE_EXHAUSTED", allowRetry: false,
+    });
+  });
+
+  it("refuses malformed payloads and supplies a live writer fence for local settlement", async () => {
+    const f = fixture();
+    const publish = vi.fn();
+    const lookup = vi.fn(async (_id: string, context: RefundReconcileContext) => {
+      await expireLease(context.jobId);
+      await t.db.transaction(async (tx) => {
+        await context.assertStillOwned(tx);
+        publish();
+      });
+      return "settled" as const;
+    });
+    const enqueue = registerRefundReconciliation(f.jobs, lookup);
+    const malformed = await f.jobs.enqueue(REFUND_RECONCILE_JOB, { refundPublicId, unexpected: true });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await f.admin.detail(f.operator, malformed.jobId)).toMatchObject({ reasonCode: "REFUND_RECONCILE_INVALID_JOB" });
+    expect(lookup).not.toHaveBeenCalled();
+    await t.db.transaction((tx) => enqueue(refundPublicId, tx));
+    const claim = (await f.engine.claim())!;
+    await f.engine.execute(claim);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(claim.job.signal.aborted).toBe(true);
+    expect(publish).not.toHaveBeenCalled();
   });
 });
 
@@ -613,6 +688,33 @@ describe("MySQL transactional mail outbox", () => {
     return { send, findRecipient };
   }
 
+  it("queues a single refund notice and redacts private refund data from retention and audit", async () => {
+    const f = fixture({}, true);
+    const ports = setDelivery(f, "accepted");
+    registerRefundNotice(f.mailer);
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.h.settings.set(MAIL_RETENTION_DAYS.key, 30);
+    const refundReference = "01JD0000000000000000000001";
+    const notice = {
+      template: REFUND_NOTICE_TEMPLATE_KEY, to: { userId: 22 }, idempotencyKey: `refund-notice:${refundReference}`,
+      vars: { orderReference: "SYNTHETIC-ORDER-123", refundAmount: "$24.00", refundReference },
+    };
+    await t.db.transaction((tx) => f.mailer.enqueue(notice, tx));
+    await t.db.transaction((tx) => f.mailer.enqueue(notice, tx));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(ports.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      to: "current@example.test",
+      subject: "A refund was recorded for your ReadyPackets order",
+      text: expect.stringContaining("A refund of $24.00 was recorded for your ReadyPackets order SYNTHETIC-ORDER-123."),
+    }));
+    const rows = await t.db.select().from(mailOutbox);
+    expect(rows).toHaveLength(1);
+    const kept = await f.admin.mailContent(f.operator, rows[0]!.publicId);
+    expect(kept.text).toContain("A refund of [REDACTED] was recorded for your ReadyPackets order [REDACTED].");
+    expect(kept.text).toContain("Refund reference: [REDACTED]");
+    expect(JSON.stringify(await t.db.select().from(auditEvents))).not.toContain(refundReference);
+  });
+
   it("deduplicates across transactions, encrypts variables, and holds when SMTP is unconfigured", async () => {
     const f = fixture();
     const ports = setDelivery(f, "not_configured");
@@ -650,6 +752,7 @@ describe("MySQL transactional mail outbox", () => {
       },
     } as unknown as typeof f.h.services.integrations;
     const jobs = createJobsModule({ ...f.h.deps, jobs: f.jobs, mailer: f.mailer });
+    expect(jobs.getBuiltinMailTemplates()).toContainEqual(expect.objectContaining({ key: REFUND_NOTICE_TEMPLATE_KEY }));
     await expect(jobs.getMailSenderIdentity()).resolves.toEqual(sender);
     const shared = { fromAddress: "shared@example.test", fromName: "Shared Ops", replyToAddress: "reply@example.test" };
     await f.h.settings.set(MAIL_SENDER.key, shared);
