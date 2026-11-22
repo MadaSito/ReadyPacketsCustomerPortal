@@ -457,6 +457,24 @@ export function createAcceptanceService(deps: ModuleDeps) {
       }));
       return { items, hasMore: rows.length > limit };
     },
+
+    /**
+     * Coverage / policy-updates helper: distinct user ids with order gate evidence per policy version, in one
+     * grouped query (no paging). Same caller rules as `evidencePage`.
+     */
+    async acceptorsByVersion(policyVersionIds: readonly number[], opts: { userIds?: readonly number[]; tx?: DbOrTx } = {}): Promise<Map<number, number[]>> {
+      const out = new Map<number, number[]>();
+      const versions = [...new Set(policyVersionIds)];
+      if (versions.length === 0 || opts.userIds?.length === 0) return out;
+      if (versions.length > EVIDENCE_MAX_IDS || (opts.userIds && opts.userIds.length > EVIDENCE_MAX_IDS)) throw validation("FILTER_TOO_LARGE", "Too many filter values.");
+      const t = orderPolicyAcceptances;
+      const rows = await (opts.tx ?? deps.db)
+        .selectDistinct({ versionId: t.policyVersionId, userId: t.userId })
+        .from(t)
+        .where(and(inArray(t.policyVersionId, versions), opts.userIds ? inArray(t.userId, [...opts.userIds]) : undefined));
+      for (const r of rows) out.set(r.versionId, [...(out.get(r.versionId) ?? []), r.userId]);
+      return out;
+    },
   };
 }
 

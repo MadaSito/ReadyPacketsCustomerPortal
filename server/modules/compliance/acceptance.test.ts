@@ -390,5 +390,12 @@ describe("order acceptance gateway (MySQL)", () => {
     expect(item).toMatchObject({ method: "typed_name", policyVersionNumber: 1, workflowVersionId: 7, userId: a.userId });
     expect(item.textSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(item.correlationId).toBeTruthy();
+
+    // Grouped distinct acceptors per version (coverage counts) — no paging needed.
+    const by = await svc.acceptorsByVersion([v, item.policyVersionId]);
+    expect([...(by.get(v) ?? [])].sort()).toEqual([a.userId, b.userId].sort());
+    expect(by.get(item.policyVersionId)).toEqual([a.userId]);
+    expect((await svc.acceptorsByVersion([v], { userIds: [b.userId] })).get(v)).toEqual([b.userId]);
+    expect((await svc.acceptorsByVersion([])).size).toBe(0);
   });
 });

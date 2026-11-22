@@ -677,6 +677,19 @@ describe("identity module (MySQL)", () => {
       expect((await identity.getUsersByIds([])).size).toBe(0);
       await expect(identity.getUsersByIds(Array.from({ length: 501 }, (_, i) => i + 1))).rejects.toThrow(/at most 500/);
     });
+
+    it("findCustomerIds: e-mail exact, reference prefix, name prefix; customers only; empty query ⇒ none", async () => {
+      const c = await makeUser();
+      const staff = await makeUser({ role: "staff" });
+      const ref = (await identity.getUsersByIds([c.id])).get(c.id)!.customerRef!;
+      expect(await identity.findCustomerIds(c.email)).toEqual([c.id]);
+      expect(await identity.findCustomerIds(staff.email)).toEqual([]);
+      expect(await identity.findCustomerIds(ref.toLowerCase())).toContain(c.id);
+      const name = (await identity.getUsersByIds([c.id])).get(c.id)!.name;
+      expect(await identity.findCustomerIds(name.split(" ")[0]!.toLowerCase())).toContain(c.id);
+      expect(await identity.findCustomerIds("   ")).toEqual([]);
+      expect(await identity.findCustomerIds("zz-nobody-matches")).toEqual([]);
+    });
   });
 
   describe("provisionLocalAccount (ops scripts)", () => {

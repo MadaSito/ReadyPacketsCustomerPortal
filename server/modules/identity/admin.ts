@@ -14,7 +14,7 @@ import { namePrefixes, normalizeEmail, normalizeName } from "./normalize.js";
 import type { ApiCaller, ApiListQuery, ApiPage, CustomerDto } from "../publicApi/ports.js";
 import { customerRefHistory, USER_STATUSES, users, type UserRow, type UserStatus } from "./schema.js";
 import { RESEND_MIN_INTERVAL_MS } from "./settings.js";
-import { emailIndexOf, nameColumns, namePrefixIndex, toView } from "./users.js";
+import { emailIndexOf, nameAad, nameColumns, namePrefixIndex, toView } from "./users.js";
 
 export interface CustomerListItem {
   publicId: string;
@@ -294,6 +294,28 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
 
   return {
     apiCustomers,
+    /**
+     * Internal (read views such as the acceptance log): ids of customers matching `query` with the same
+     * matching as the customer search (exact e-mail, reference prefix, name-token prefix). No capability check
+     * or audit here — the calling view authorizes and audits. At most `limit` (≤500) ids, newest first.
+     */
+    async findCustomerIds(query: string, opts: { status?: UserStatus; limit?: number; tx?: DbOrTx } = {}): Promise<number[]> {
+      const limit = Math.min(Math.max(opts.limit ?? 500, 1), 500);
+      if (!query.trim()) return [];
+      const search = searchCondition(query.slice(0, 100));
+      const conditions: (SQL | undefined)[] = [eq(users.role, "customer"), search.where, opts.status ? eq(users.status, opts.status) : undefined];
+      const rows = await (opts.tx ?? deps.db)
+        .select({ id: users.id, publicId: users.publicId, nameEnc: users.nameEnc, customerRef: users.customerRef })
+        .from(users)
+        .where(and(...conditions))
+        .orderBy(desc(users.id))
+        .limit(limit);
+      const upper = query.trim().toUpperCase();
+      const nameFilter = search.nameFilter;
+      return rows
+        .filter((r) => !nameFilter || (r.customerRef ?? "").startsWith(upper) || nameFilter(deps.crypto.decrypt(r.nameEnc, nameAad(r.publicId))))
+        .map((r) => r.id);
+    },
     /** Internal (SSO service): the same in-tx actor guard as every admin mutation. Not on tRPC. */
     authorizeInTx: authorizeInTx as (tx: Tx, principal: SessionPrincipal, capability: Capability, targetPublicId?: string) => Promise<UserRow | null>,
     async searchCustomers(principal: SessionPrincipal, input: { query?: string; status?: UserStatus; cursor?: string; limit?: number }) {

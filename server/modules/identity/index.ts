@@ -35,6 +35,8 @@ export interface IdentityModule extends ModuleLifecycle {
    * view they render and must not log the values.
    */
   getUsersByIds(userIds: readonly number[], opts?: { tx?: DbOrTx }): Promise<Map<number, UserView>>;
+  /** Customer ids matching a search (e-mail exact, reference prefix, name prefix); ≤500; caller authorizes + audits. */
+  findCustomerIds(query: string, opts?: { status?: UserStatus; limit?: number; tx?: DbOrTx }): Promise<number[]>;
   verifyPassword(userId: number, password: string, opts?: { tx?: Tx }): Promise<boolean>;
   setPassword(
     userId: number,
@@ -180,6 +182,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     findUserIdByEmail: admin.findUserIdByEmail,
     portableCustomers: admin.portableCustomers,
     searchCustomers: admin.searchCustomers,
+    findCustomerIds: admin.findCustomerIds,
     auth,
     admin,
     sso,
