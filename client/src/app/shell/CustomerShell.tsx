@@ -107,7 +107,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
         <div className="flex h-16 items-center gap-2 pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:px-6">
           <IconButton label="Open navigation menu" icon={<Menu />} className="lg:hidden" onClick={() => setMenuOpen(true)} />
-          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex min-w-0 shrink items-center rounded">
+          <Link href="/" aria-label="ReadyPackets home" className="mr-2 inline-flex min-w-0 shrink items-center rounded max-[299px]:hidden">
             <BrandLogo label="" className="hidden w-48 sm:inline-flex" />
             <BrandLogo label="" variant="icon" className="h-9 sm:hidden" />
           </Link>

@@ -99,7 +99,8 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
           <header className="sticky top-0 z-40 border-b border-line bg-surface/95 backdrop-blur supports-[backdrop-filter]:bg-surface/85">
             <div className="flex h-16 items-center gap-2 px-3 sm:px-6">
               <IconButton label="Open console navigation" icon={<Menu />} className="lg:hidden" onClick={() => setDrawerOpen(true)} />
-              <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded lg:hidden">
+              {/* Below 300 px the header logo yields its space so the actions fit (the menu still links home). */}
+              <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex shrink-0 rounded max-[299px]:hidden lg:hidden">
                 <BrandLogo variant="icon" label="" className="h-9" />
               </Link>
               {/* Inline search from md up (min width keeps the placeholder whole); a single icon link below md. */}
