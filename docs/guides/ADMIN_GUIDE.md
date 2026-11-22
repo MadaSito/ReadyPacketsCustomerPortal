@@ -155,6 +155,20 @@ The **Acceptances (n)** tab lists each record, for example "Signed by <name> usi
 
 You add gates in the workflow designer: choose the policy, the gate point, the signature mode (checkbox or typed full name) and whether to ask again when the policy gets a new version. If it asks again, customers must accept the new text. No acceptance e-mail is sent.
 
+## Discount codes
+
+_Draft (increment 05). The full section follows when the promotions owners deliver their guide text._
+
+### When a redemption is released
+
+A discount code counts as used as soon as an order is placed with it. It is given back only when **all** of these are true:
+
+- nothing has been paid for the order, not even part of an invoice;
+- none of the order's invoices can still be paid (issued, open or partially paid);
+- no online payment was ever started for the order, including failed, cancelled or expired ones.
+
+When the order is cancelled and all three hold, ReadyPackets releases the redemption automatically. An administrator can also release it by hand from the redemptions list (`promotions.manage`, step-up and a reason), but only under the same three conditions. In every other case the redemption stays used, even after a refund, and the cancellation still goes ahead. To make it up to the customer, give them a new code.
+
 ## Storage copy log
 
 Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The log tracks attempts to copy order files, off-site backup archives and SharePoint order data. History begins at rollout; it does not reconstruct older attempts.

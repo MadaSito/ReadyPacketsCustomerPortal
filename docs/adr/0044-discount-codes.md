@@ -30,11 +30,13 @@ The owner asks for discount codes for orders: the administrator hands out codes 
 - **Atomic redemption.** Redemption happens inside the order-creation transaction through the promotions port (`preview`, `redeemInTx`, `releaseForOrderInTx`).
   - The code row is locked and the limits are counted again. Then the redemption and the order are written together, or nothing is written.
   - Unique keys on (code, order) and (code, customer, sequence) prevent double use under concurrency.
-  - **Release on cancellation fails closed.** A redemption is released automatically only when compliance gives authoritative evidence inside the cancellation transaction, with the order's invoices locked (`orderPaymentExposureInTx`). The evidence must show both:
-    - nothing was ever paid for the order (gross paid is 0 across all invoices; a partial payment counts as paid);
-    - no payable invoice or provider capture remains possible (no open or issued invoice, no pending provider checkout).
-  - In every other case the redemption stays used and the cancellation still succeeds. That includes a missing port, an error, any payment and an open payable invoice. Cancellation does not void invoices.
-  - **Manual release.** After an invoice has been voided or settled by hand, an administrator can release the redemption with `promotions.admin.releaseRedemption`. It needs `promotions.manage`, step-up and a reason, and is audited as `promotion.released` with the actor.
+  - **Release fails closed.** A redemption can be released, automatically on cancellation or manually, only when all three of the following hold. They are checked under the order lock, in the cancellation transaction or in the manual release transaction, through compliance's exposure read (`orderPaymentExposureInTx`):
+    1. gross paid is 0 across the order's invoices;
+    2. no invoice of the order is payable (issued, open or partially paid);
+    3. no provider payment attempt has ever been created for the order, whatever its status, including failed, cancelled, expired and ambiguous attempts.
+  - In every other case the redemption stays used and the cancellation still succeeds. That includes an error, a missing port, and a lock timeout or deadlock on the exposure read. Release never depends on a provider saying a payment is final.
+  - **Manual release.** `promotions.admin.releaseRedemption` needs `promotions.manage`, step-up and a reason, and is audited as `promotion.released` with the actor. It is subject to the same three conditions.
+  - **Compensation.** To compensate a customer whose redemption cannot be released, an administrator issues a new code.
   - A redemption stays used after a refund.
 - **Abuse controls.**
   - Every code check is rate limited per account and per address. After 5 failed checks in 15 minutes, the account is paused from checking codes for 15 minutes, and the event `promotion.attempts_blocked` is sent to the SIEM as a warning.
@@ -55,9 +57,10 @@ The owner asks for discount codes for orders: the administrator hands out codes 
 ## Assumptions to confirm with the owner
 - When a code cannot be combined with the bundle discount, the larger discount wins by default.
 - The global guard defaults to 50% per order.
-- A redemption stays used after a refund. It is released automatically only on a cancellation with no payment and no payable exposure; otherwise it is released by an administrator.
+- A redemption stays used after a refund. It is released only when nothing was paid, no invoice is payable and no provider payment attempt ever existed. Otherwise the administrator issues a new code.
 - API v1 order creation does not accept codes in this increment.
 
 ## Consequences
 - The uniform refusal message makes customer support harder, by design. Staff can see the exact reason in the console.
 - Session storage means a saved code is lost when the browser session ends.
+- Some customers whose order is cancelled after a payment attempt keep a used redemption. This is deliberate: payment finality is not rebuilt in this increment. Late payments on cancelled orders and the related lock-ordering questions are follow-ups in `docs/security/INCREMENT_05_REVIEW.md`.
