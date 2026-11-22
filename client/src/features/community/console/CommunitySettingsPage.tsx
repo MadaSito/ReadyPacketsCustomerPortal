@@ -160,14 +160,14 @@ export default function CommunitySettingsPage() {
 
         <Section title="Categories" description="Archived categories stay readable but accept no new topics, replies or edits.">
           {categories.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No categories yet.</p>
+            <p className="text-sm text-muted">No categories yet.</p>
           ) : (
-            <ol className="divide-y divide-border rounded-lg border border-border" aria-label="Categories in display order">
+            <ol className="divide-y divide-line rounded-lg border border-line" aria-label="Categories in display order">
               {categories.map((c, i) => (
                 <li key={c.publicId} className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <p className="font-medium break-words">{c.name} {c.archived && <Badge>Archived</Badge>} {c.staffOnlyPosting && <Badge tone="info">Staff posts only</Badge>}</p>
-                    <p className="text-sm text-muted-foreground break-all">/community/c/{c.slug} · {c.topicCount} topics</p>
+                    <p className="text-sm text-muted break-all">/community/c/{c.slug} · {c.topicCount} topics</p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <IconButton icon={<ArrowUp className="size-4" aria-hidden />} label={`Move ${c.name} up`} variant="ghost" disabled={i === 0} onClick={() => void move(i, -1)} />
@@ -179,7 +179,7 @@ export default function CommunitySettingsPage() {
               ))}
             </ol>
           )}
-          <form onSubmit={(e) => void addCategory(e)} noValidate className="mt-6 space-y-4 rounded-lg border border-border p-4" aria-labelledby="add-category-h">
+          <form onSubmit={(e) => void addCategory(e)} noValidate className="mt-6 space-y-4 rounded-lg border border-line p-4" aria-labelledby="add-category-h">
             <h3 id="add-category-h" className="text-base font-semibold">Add a category</h3>
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Name" required>

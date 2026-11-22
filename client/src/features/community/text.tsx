@@ -95,7 +95,7 @@ export function CommunityBody({ text, className }: { text: string; className?: s
     <div className={["space-y-3 break-words text-sm leading-relaxed", className].filter(Boolean).join(" ")}>
       {parseBody(text).map((b, i) =>
         b.kind === "quote" ? (
-          <blockquote key={i} className="border-l-4 border-border pl-3 text-muted-foreground">{lines(b.lines)}</blockquote>
+          <blockquote key={i} className="border-l-4 border-line pl-3 text-muted">{lines(b.lines)}</blockquote>
         ) : b.kind === "list" ? (
           <ul key={i} className="list-disc space-y-1 pl-5">{b.items.map((it, j) => <li key={j}>{renderInline(it)}</li>)}</ul>
         ) : (

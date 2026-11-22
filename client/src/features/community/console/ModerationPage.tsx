@@ -121,7 +121,7 @@ export default function ModerationPage() {
                 <span>{p.author.displayName}</span>
                 {p.author.staff && <Badge tone="info">Staff</Badge>}
                 <Badge tone={p.state === "pending" ? "warning" : "neutral"}>{p.state === "pending" ? "Waiting for review" : "Hidden"}</Badge>
-                {p.heldReason && <span className="text-muted-foreground">{HELD_REASON[p.heldReason] ?? p.heldReason}</span>}
+                {p.heldReason && <span className="text-muted">{HELD_REASON[p.heldReason] ?? p.heldReason}</span>}
                 <DateTime value={p.createdAt} />
               </span>
             }
@@ -138,7 +138,7 @@ export default function ModerationPage() {
               </div>
             }
           >
-            {p.body !== null ? <CommunityBody text={p.body} /> : <p className="text-sm text-muted-foreground">{hiddenBodyLabel(p.state)}</p>}
+            {p.body !== null ? <CommunityBody text={p.body} /> : <p className="text-sm text-muted">{hiddenBodyLabel(p.state)}</p>}
           </Card>
         </li>
       ))}
