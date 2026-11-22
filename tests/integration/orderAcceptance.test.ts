@@ -287,6 +287,16 @@ describe("Order acceptance on assembled customer write paths", () => {
     Browser.ok(await signatures(owner, orderId, "Acceptance Owner"));
     const read = async () => Browser.ok(await owner.browser.query("compliance.acceptance.forOrder", { orderId }));
     expect(await read()).toMatchObject({ blocking: false });
+    const uploadResponse = await upload(owner.browser, orderId, "default");
+    expect(uploadResponse.status).toBe(200);
+    expect(uploadResponse.body.results).toEqual([expect.objectContaining({
+      outcome: "completed", file: expect.objectContaining({ publicId: expect.any(String) }),
+    })]);
+    const previousId = uploadResponse.body.results[0].file.publicId as string;
+    const replace = () => owner.browser.raw("post", `/api/files/upload/${orderId}?versionOf=${previousId}`)
+      .attach("files", exampleWav(8000), "new-version.wav");
+    const listFiles = () => owner.browser.query<{ items: unknown[]; canUpload: boolean }>("files.list", { orderId, includeVersions: true });
+    const before = Browser.ok(await listFiles());
 
     Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
     const updatedText = "Synthetic updated terms requiring a second acceptance.";
@@ -297,21 +307,34 @@ describe("Order acceptance on assembled customer write paths", () => {
     expect(await read()).toMatchObject({
       blocking: true, gates: [expect.objectContaining({ acceptance: null, policy: expect.objectContaining({ text: updatedText }) })],
     });
+    const refusedVersion = await replace();
+    expect(refusedVersion.status).toBe(409);
+    expect(refusedVersion.body.safe).toMatchObject(blocked);
+    expect(Browser.ok(await listFiles())).toMatchObject({ items: before.items, canUpload: false });
     const stale = await signatures(owner, orderId, "Acceptance Owner");
     expect(stale.status).toBe(409);
     expect(stale.error?.safe.reasonCode).toBe("POLICY_TEXT_CHANGED");
-    Browser.ok(await owner.browser.mutate("compliance.acceptance.accept", {
+    const { receipt } = Browser.ok(await owner.browser.mutate<{ receipt: { receiptId: string } }>("compliance.acceptance.accept", {
       orderId, gateKey, policyVersionId: next.versionPublicId, textSha256: next.contentHash, typedName: "Acceptance Owner",
     }));
     expect(await read()).toMatchObject({ blocking: false });
+    const allowedVersion = await replace();
+    expect(allowedVersion.status).toBe(200);
+    expect(allowedVersion.body.results).toEqual([expect.objectContaining({ outcome: "completed" })]);
     const { document } = Browser.ok(await admin.browser.query<{ document: { version: number } }>(`${policyAdmin}.getDocument`, { documentPublicId }));
+    const restrictedTitle = "Synthetic title reserved for staff";
     Browser.ok(await admin.browser.mutate(`${policyAdmin}.updateDocument`, {
-      documentPublicId, expectedVersion: document.version, title: "Synthetic project terms", audience: "staff",
+      documentPublicId, expectedVersion: document.version, title: restrictedTitle, audience: "staff",
       requiresAcceptance: false, requiresTypedSignature: false, active: true,
     }));
     const reclassified = await read();
     expect(reclassified).toMatchObject({ blocking: true, gates: [expect.objectContaining({ policy: null, acceptance: null })] });
     expect(JSON.stringify(reclassified)).not.toContain(updatedText);
+    const customerReceipt = Browser.ok(await owner.browser.query("compliance.acceptance.receipt", { receiptId: receipt.receiptId }));
+    expect(customerReceipt).toMatchObject({ receiptId: receipt.receiptId, textSha256: next.contentHash });
+    expect(JSON.stringify(customerReceipt)).not.toContain(restrictedTitle);
+    const staffReceipt = Browser.ok(await admin.browser.query("compliance.acceptance.receipt", { receiptId: receipt.receiptId }));
+    expect(staffReceipt).toMatchObject({ policy: { title: restrictedTitle }, textSha256: next.contentHash });
   });
 
   it("applies a named gate on leaving its step and retains evidence when reacceptance is disabled", async () => {
