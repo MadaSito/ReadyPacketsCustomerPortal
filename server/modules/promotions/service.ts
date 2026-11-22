@@ -2,7 +2,8 @@
  * Promotions module — business service, atomic redemption port, abuse throttling, and admin console operations.
  * Owner: siem_engineer (Increment 05, Package C1).
  */
-import { and, desc, eq, gte, inArray, lt, lte, notInArray, sql } from "drizzle-orm";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { and, desc, eq, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import { ulid as newPublicId } from "../../core/ids.js";
 import { STEP_UP_CAPABILITIES, roleHasCapability, type Capability } from "../../../shared/capabilities.js";
 import {
@@ -15,9 +16,11 @@ import {
 import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import type { ModuleDeps, Services } from "../../container.js";
+import { rateLimitAddress } from "../../security/rateLimitAddress.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { users, userSessions } from "../identity/schema.js";
-import { orders } from "../orders/schema.js";
+import { orders, orderWorkflowVersions } from "../orders/schema.js";
+import { isCancelState } from "../orders/workflowTypes.js";
 import {
   assertLabelDistinctFromCode,
   computePromoCodeCandidates,
@@ -87,6 +90,7 @@ interface OrderPaymentExposure {
   grossPaidMinor: number;
   payableInvoiceOpen: boolean;
   providerCapturePending: boolean;
+  providerAttemptEver: boolean;
 }
 
 type OrderPaymentExposureFn = (tx: Tx, orderPublicId: string) => Promise<OrderPaymentExposure>;
@@ -103,9 +107,36 @@ function isZeroPaymentExposure(exposure: unknown): exposure is OrderPaymentExpos
   return (
     e.grossPaidMinor === 0 &&
     e.payableInvoiceOpen === false &&
-    e.providerCapturePending === false
+    e.providerCapturePending === false &&
+    e.providerAttemptEver === false
   );
 }
+
+/**
+ * Picks the smallest positive integer `1..maxCap` not present in `occupied`.
+ * Used under row locks so released slots (`1` of `2`) can be reused without colliding with slot `2`.
+ */
+function smallestFreeSlot(
+  occupied: Iterable<number | null | undefined>,
+  maxCap: number | null,
+): number {
+  const used = new Set<number>();
+  for (const val of occupied) {
+    if (typeof val === "number" && Number.isInteger(val) && val > 0) {
+      used.add(val);
+    }
+  }
+  for (let slot = 1; ; slot += 1) {
+    if (maxCap !== null && slot > maxCap) {
+      throw promoNotApplicable();
+    }
+    if (!used.has(slot)) {
+      return slot;
+    }
+  }
+}
+
+const attemptGuardStorage = new AsyncLocalStorage<boolean>();
 
 function isMysqlDuplicateError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
@@ -337,6 +368,7 @@ export interface CheckPromotionInput {
 
 export interface PromotionsService {
   isEnabled(opts?: { tx?: DbOrTx }): Promise<boolean>;
+  guardAttempt<T>(actorUserId: number, fn: () => Promise<T>): Promise<T>;
   preview(ctx: PromotionContext, opts?: { tx?: DbOrTx; recheck?: boolean }): Promise<PromotionOutcome>;
   redeemInTx(
     tx: Tx,
@@ -572,6 +604,33 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     };
   }
 
+  const dummyPublicId = "01J00000000000000000000000";
+  const dummyCodeEnc = encryptPromoCode(deps.crypto, dummyPublicId, "SYNTHETIC00");
+
+  /**
+   * Bounded dummy DB + decryption work so unknown or malformed codes take the same lookup path
+   * as existing codes (§4 timing parity) before returning the uniform `PROMO_NOT_APPLICABLE` refusal.
+   */
+  async function runBoundedDummyLookup(dbOrTx: DbOrTx): Promise<never> {
+    await dbOrTx
+      .select({ id: promoBatches.id })
+      .from(promoBatches)
+      .where(eq(promoBatches.id, 0))
+      .limit(1);
+    await dbOrTx
+      .select({ id: promoCodes.id })
+      .from(promoCodes)
+      .where(eq(promoCodes.id, 0))
+      .limit(1);
+    await dbOrTx
+      .select({ id: promoRedemptions.id })
+      .from(promoRedemptions)
+      .where(and(eq(promoRedemptions.batchId, 0), eq(promoRedemptions.customerUserId, 0)))
+      .limit(1);
+    decryptPromoCode(deps.crypto, dummyPublicId, dummyCodeEnc);
+    throw promoNotApplicable();
+  }
+
   async function assertNotBlocked(userId: number, dbOrTx: DbOrTx): Promise<void> {
     const now = deps.clock.now();
     const [attempt] = await dbOrTx
@@ -591,9 +650,9 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     if (!acctRes.allowed) {
       throw promoAttemptsBlocked(acctRes.retryAfterSeconds);
     }
-    const ip = getRequestContext()?.ipAddress;
-    if (ip) {
-      const ipIndex = deps.crypto.blindIndex(ip, "promo_check.ip");
+    const normalizedIp = rateLimitAddress(getRequestContext()?.ipAddress);
+    if (normalizedIp !== "unknown") {
+      const ipIndex = deps.crypto.blindIndex(normalizedIp, "promo_check.ip");
       const ipRes = await deps.rateLimiter.consume("auth_high_risk", `promo:ip:${ipIndex}`);
       if (!ipRes.allowed) {
         throw promoAttemptsBlocked(ipRes.retryAfterSeconds);
@@ -602,9 +661,9 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
   }
 
   /**
-   * Records a failed interactive code check on `deps.db` so the failure counter persists even though
-   * the check throws `PROMO_NOT_APPLICABLE`. On the 5th failure within 15 minutes, pauses checks for
-   * 15 minutes and emits `promotion.attempts_blocked` (`WARN`, forwarded to SIEM).
+   * Records a failed interactive code check on `deps.db` so the failure counter persists even when
+   * an outer business transaction rolled back. Any 5 failures within 15 minutes (consecutive or not)
+   * pause checks for 15 minutes and emit `promotion.attempts_blocked` (`WARN`, forwarded to SIEM).
    */
   async function recordFailedInteractiveAttempt(actorUserId: number): Promise<void> {
     const now = deps.clock.now();
@@ -618,21 +677,25 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         .limit(1);
       if (!userRow) return;
 
+      // Concurrency-safe first-row initialization before locking (`ON DUPLICATE KEY` no-op).
+      await tx
+        .insert(promoCheckAttempts)
+        .values({
+          userId: actorUserId,
+          failedCount: 0,
+          windowStartedAt: now,
+          blockedUntil: null,
+        })
+        .onDuplicateKeyUpdate({
+          set: { userId: sql`${promoCheckAttempts.userId}` },
+        });
+
       const [existing] = await tx
         .select()
         .from(promoCheckAttempts)
         .where(eq(promoCheckAttempts.userId, actorUserId))
         .for("update");
-
-      if (!existing) {
-        await tx.insert(promoCheckAttempts).values({
-          userId: actorUserId,
-          failedCount: 1,
-          windowStartedAt: now,
-          blockedUntil: null,
-        });
-        return;
-      }
+      if (!existing) return;
 
       if (existing.blockedUntil && existing.blockedUntil.getTime() > now.getTime()) {
         blockedUntilReached = existing.blockedUntil;
@@ -687,20 +750,28 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     }
   }
 
-  async function clearFailedAttemptsIfAny(actorUserId: number): Promise<void> {
-    await deps.db
-      .update(promoCheckAttempts)
-      .set({ failedCount: 0, blockedUntil: null, updatedAt: deps.clock.now() })
-      .where(
-        and(
-          eq(promoCheckAttempts.userId, actorUserId),
-          gtOrZeroFailed(),
-        ),
-      );
-  }
+  /**
+   * Caller-side interactive attempt permit & post-rollback failure accounting.
+   * Must be called OUTSIDE any open business transaction (`orders.quote`, `orders.create`, `cart.applyCode`, `promotions.check`)
+   * so rate-limiter and failure writes never take a second pool connection inside `tx` and survive rollback.
+   */
+  async function guardAttempt<T>(actorUserId: number, fn: () => Promise<T>): Promise<T> {
+    if (attemptGuardStorage.getStore() === true) {
+      return fn();
+    }
+    const enabled = await isEnabled();
+    if (!enabled) throw promoNotApplicable();
+    await consumeCheckRateLimits(actorUserId);
+    await assertNotBlocked(actorUserId, deps.db);
 
-  function gtOrZeroFailed() {
-    return sql`${promoCheckAttempts.failedCount} > 0`;
+    try {
+      return await attemptGuardStorage.run(true, fn);
+    } catch (err) {
+      if (err instanceof DomainError && err.reasonCode === "PROMO_NOT_APPLICABLE") {
+        await recordFailedInteractiveAttempt(actorUserId);
+      }
+      throw err;
+    }
   }
 
   function computePricingOutcome(
@@ -710,9 +781,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     maxDiscountPercent: number,
   ): PromotionOutcome {
     const subtotalMinor = ctx.subtotalMinor;
+    // Hard maximum ceiling per order: floor so e.g. $0.01 at 50% max never rounds up to 100%.
     const guardCapMinor = Math.min(
       subtotalMinor,
-      Math.floor((subtotalMinor * maxDiscountPercent + 50) / 100),
+      Math.floor((subtotalMinor * maxDiscountPercent) / 100),
     );
     const rawBundleMinor = Math.max(0, Math.min(ctx.bundleDiscountMinor, subtotalMinor));
 
@@ -756,8 +828,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         bundleDiscountMinor > 0 && promoDiscountMinor > 0
           ? `${ctx.bundleLabel ?? "Bundle discount"} + ${batch.label}`.slice(0, 120)
           : bundleDiscountMinor > 0
-            ? (ctx.bundleLabel ?? batch.label).slice(0, 120)
-            : batch.label.slice(0, 120);
+            ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120)
+            : promoDiscountMinor > 0
+              ? batch.label.slice(0, 120)
+              : "";
 
       return {
         promoPublicId: batch.publicId,
@@ -772,7 +846,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
     // `combineWithBundle === false`: the larger of bundle and code wins; the other is not applied.
     const rawPromoMinor = calcRawPromo(eligibleSubtotalMinor);
-    if (rawPromoMinor >= rawBundleMinor) {
+    if (rawPromoMinor > rawBundleMinor) {
       const promoDiscountMinor = Math.min(rawPromoMinor, guardCapMinor, subtotalMinor);
       return {
         promoPublicId: batch.publicId,
@@ -780,7 +854,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         promoDiscountMinor,
         bundleDiscountMinor: 0,
         discountMinor: promoDiscountMinor,
-        discountLabel: batch.label.slice(0, 120),
+        discountLabel: promoDiscountMinor > 0 ? batch.label.slice(0, 120) : "",
         totalMinor: subtotalMinor - promoDiscountMinor,
       };
     }
@@ -792,14 +866,16 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       promoDiscountMinor: 0,
       bundleDiscountMinor,
       discountMinor: bundleDiscountMinor,
-      discountLabel: (ctx.bundleLabel ?? batch.label).slice(0, 120),
+      discountLabel: bundleDiscountMinor > 0 ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120) : "",
       totalMinor: subtotalMinor - bundleDiscountMinor,
     };
   }
 
   /**
    * Evaluates customer entitlement, code validity, caps, scope, minimum subtotal, and pricing.
-   * When `lockForRedemption = true`, `dbOrTx` MUST be a `Tx` and locks `promo_batches` then `promo_codes` (`FOR UPDATE`).
+   * When `lockForRedemption = true`, `dbOrTx` MUST be a `Tx` and locks `promo_batches`, `promo_codes`,
+   * and active `promo_redemptions` rows (`FOR UPDATE`) so slot allocation and limit checks are immune
+   * to `REPEATABLE READ` snapshot staleness.
    */
   async function evaluateCode(
     dbOrTx: DbOrTx,
@@ -809,9 +885,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     batch: PromoBatchRow;
     codeRow: PromoCodeRow;
     outcome: PromotionOutcome;
-    activeCodeCustCount: number;
-    activeBatchCustCount: number;
-    historicalCustCount: number;
+    nextCustomerSequence: number;
+    nextActiveCodeSequence: number;
+    nextActiveBatchSequence: number;
+    nextActiveCodeSlot: number;
   }> {
     const now = deps.clock.now();
     const orderCurrency = ctx.currency.trim().toUpperCase();
@@ -843,18 +920,25 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     if (customer.role !== "customer") throw promoNotApplicable();
     if (!customer.emailVerifiedAt) throw promoNotApplicable();
 
-    // 2. Normalise & candidate lookup by keyed blind index.
+    // 2. Normalise & candidate lookup by keyed blind index (with bounded dummy path on miss for §4 timing parity).
     const normalized = normalizePromoCode(ctx.code);
-    if (!isPlausiblePromoCode(normalized)) throw promoNotApplicable();
+    const candidates = computePromoCodeCandidates(
+      deps.crypto,
+      isPlausiblePromoCode(normalized) ? normalized : "INVALID0",
+    );
+    if (!isPlausiblePromoCode(normalized)) {
+      return runBoundedDummyLookup(dbOrTx);
+    }
 
-    const candidates = computePromoCodeCandidates(deps.crypto, normalized);
     const [candidateCode] = await dbOrTx
       .select({ id: promoCodes.id, batchId: promoCodes.batchId })
       .from(promoCodes)
       .where(inArray(promoCodes.codeIndex, candidates))
       .limit(1);
 
-    if (!candidateCode) throw promoNotApplicable();
+    if (!candidateCode) {
+      return runBoundedDummyLookup(dbOrTx);
+    }
 
     // 3. Deterministic lock order when redeeming: `promo_batches` FIRST, then `promo_codes`.
     let batch: PromoBatchRow | undefined;
@@ -912,11 +996,14 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       throw promoNotApplicable();
     }
 
-    // 5. Per-customer active counts (counted inside `dbOrTx` under lock when redeeming).
-    const customerRedemptions = await dbOrTx
+    // 5. Per-customer & per-code active slot checks (current locking reads under `lockForRedemption`).
+    const custQuery = dbOrTx
       .select({
         promoCodeId: promoRedemptions.promoCodeId,
         status: promoRedemptions.status,
+        customerSequence: promoRedemptions.customerSequence,
+        activeCodeSequence: promoRedemptions.activeCodeSequence,
+        activeBatchSequence: promoRedemptions.activeBatchSequence,
       })
       .from(promoRedemptions)
       .where(
@@ -925,18 +1012,55 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           eq(promoRedemptions.customerUserId, ctx.customerUserId),
         ),
       );
+    const customerRedemptions = opts.lockForRedemption
+      ? await custQuery.for("update")
+      : await custQuery;
 
-    const historicalCustCount = customerRedemptions.length;
-    const activeBatchCustCount = customerRedemptions.filter((r) => r.status === "redeemed").length;
-    const activeCodeCustCount = customerRedemptions.filter(
-      (r) => r.status === "redeemed" && r.promoCodeId === codeRow.id,
-    ).length;
+    const activeBatchCustRows = customerRedemptions.filter((r) => r.status === "redeemed");
+    const activeCodeCustRows = activeBatchCustRows.filter((r) => r.promoCodeId === codeRow.id);
 
     if (
-      activeBatchCustCount >= batch.maxPerCustomer ||
-      activeCodeCustCount >= batch.maxPerCustomer
+      activeBatchCustRows.length >= batch.maxPerCustomer ||
+      activeCodeCustRows.length >= batch.maxPerCustomer
     ) {
       throw promoNotApplicable();
+    }
+
+    const nextCustomerSequence =
+      customerRedemptions.reduce((max, r) => Math.max(max, r.customerSequence), 0) + 1;
+    const nextActiveCodeSequence = smallestFreeSlot(
+      activeCodeCustRows.map((r) => r.activeCodeSequence),
+      batch.maxPerCustomer,
+    );
+    const nextActiveBatchSequence = smallestFreeSlot(
+      activeBatchCustRows.map((r) => r.activeBatchSequence),
+      batch.maxPerCustomer,
+    );
+
+    let nextActiveCodeSlot = 1;
+    if (opts.lockForRedemption) {
+      const codeSlotRows = await (dbOrTx as Tx)
+        .select({ activeCodeSlot: promoRedemptions.activeCodeSlot })
+        .from(promoRedemptions)
+        .where(
+          and(
+            eq(promoRedemptions.promoCodeId, codeRow.id),
+            eq(promoRedemptions.status, "redeemed"),
+          ),
+        )
+        .for("update");
+
+      if (codeRow.maxUses !== null && codeSlotRows.length >= codeRow.maxUses) {
+        throw promoNotApplicable();
+      }
+      const effectiveSlotCap =
+        codeRow.maxUses !== null && batch.maxRedemptions !== null
+          ? Math.min(codeRow.maxUses, batch.maxRedemptions)
+          : (codeRow.maxUses ?? batch.maxRedemptions);
+      nextActiveCodeSlot = smallestFreeSlot(
+        codeSlotRows.map((r) => r.activeCodeSlot),
+        effectiveSlotCap,
+      );
     }
 
     // 6. Customer / e-mail domain allow-list.
@@ -958,20 +1082,18 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     }
 
     // 7. First order only (`redeemInTx` runs before the new order row is inserted).
+    // Checks any historical order for this customer (including previously paid orders that were later cancelled).
     if (batch.firstOrderOnly) {
-      const [priorOrder] = await dbOrTx
+      const priorOrderQuery = dbOrTx
         .select({ id: orders.id })
         .from(orders)
-        .where(
-          and(
-            eq(orders.ownerUserId, ctx.customerUserId),
-            notInArray(orders.statusKey, ["canceled", "cancelled"]),
-          ),
-        )
+        .where(eq(orders.ownerUserId, ctx.customerUserId))
         .limit(1);
+      const [priorOrder] = opts.lockForRedemption
+        ? await priorOrderQuery.for("share")
+        : await priorOrderQuery;
       if (priorOrder) throw promoNotApplicable();
 
-      // Also refuse if a prior canceled order still holds an un-released promo redemption (e.g. canceled after payment).
       const [priorUsedRedemption] = await dbOrTx
         .select({ id: promoRedemptions.id })
         .from(promoRedemptions)
@@ -1047,9 +1169,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       batch,
       codeRow,
       outcome,
-      activeCodeCustCount,
-      activeBatchCustCount,
-      historicalCustCount,
+      nextCustomerSequence,
+      nextActiveCodeSequence,
+      nextActiveBatchSequence,
+      nextActiveCodeSlot,
     };
   }
 
@@ -1057,37 +1180,26 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     ctx: PromotionContext,
     opts?: { tx?: DbOrTx; recheck?: boolean },
   ): Promise<PromotionOutcome> {
+    const interactive = !opts?.recheck;
+    const hasAmbientTx = Boolean(opts?.tx);
+
+    if (interactive && !hasAmbientTx && attemptGuardStorage.getStore() !== true) {
+      return guardAttempt(ctx.actorUserId, async () => {
+        const evaluated = await evaluateCode(deps.db, ctx, { lockForRedemption: false });
+        return evaluated.outcome;
+      });
+    }
+
     const dbOrTx = opts?.tx ?? deps.db;
     const enabled = await isEnabled({ tx: dbOrTx });
     if (!enabled) throw promoNotApplicable();
 
-    const interactive = !opts?.recheck;
-    const hasAmbientTx = Boolean(opts?.tx);
-
     if (interactive) {
-      if (!hasAmbientTx) {
-        await consumeCheckRateLimits(ctx.actorUserId);
-      }
       await assertNotBlocked(ctx.actorUserId, dbOrTx);
     }
 
-    try {
-      const evaluated = await evaluateCode(dbOrTx, ctx, { lockForRedemption: false });
-      if (interactive && !hasAmbientTx) {
-        await clearFailedAttemptsIfAny(ctx.actorUserId);
-      }
-      return evaluated.outcome;
-    } catch (err) {
-      if (
-        interactive &&
-        !hasAmbientTx &&
-        err instanceof DomainError &&
-        err.reasonCode === "PROMO_NOT_APPLICABLE"
-      ) {
-        await recordFailedInteractiveAttempt(ctx.actorUserId);
-      }
-      throw err;
-    }
+    const evaluated = await evaluateCode(dbOrTx, ctx, { lockForRedemption: false });
+    return evaluated.outcome;
   }
 
   async function redeemInTx(
@@ -1135,10 +1247,17 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       batch,
       codeRow,
       outcome,
-      activeCodeCustCount,
-      activeBatchCustCount,
-      historicalCustCount,
+      nextCustomerSequence,
+      nextActiveCodeSequence,
+      nextActiveBatchSequence,
+      nextActiveCodeSlot,
     } = await evaluateCode(tx, ctx, { lockForRedemption: true });
+
+    // When bundle wins (`!combineWithBundle`) or the global guard leaves 0 for the code,
+    // the code is not applied: consume zero redemptions and emit no `promotion.redeemed` audit.
+    if (outcome.promoDiscountMinor <= 0) {
+      return outcome;
+    }
 
     const now = deps.clock.now();
     const redemptionPublicId = newPublicId();
@@ -1161,10 +1280,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         actorUserId: ctx.actorUserId,
         orderPublicId: ctx.orderPublicId,
         status: "redeemed",
-        customerSequence: historicalCustCount + 1,
-        activeCodeSequence: activeCodeCustCount + 1,
-        activeBatchSequence: activeBatchCustCount + 1,
-        activeCodeSlot: nextCodeGlobalCount,
+        customerSequence: nextCustomerSequence,
+        activeCodeSequence: nextActiveCodeSequence,
+        activeBatchSequence: nextActiveBatchSequence,
+        activeCodeSlot: nextActiveCodeSlot,
         currency: ctx.currency.trim().toUpperCase(),
         subtotalMinor: ctx.subtotalMinor,
         promoDiscountMinor: outcome.promoDiscountMinor,
@@ -1541,6 +1660,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
   return {
     isEnabled,
+    guardAttempt,
     preview,
     redeemInTx,
     releaseForOrderInTx,
@@ -2268,21 +2388,35 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
               );
             }
 
-            // G-C3-02 lock & evidence order: order FOR UPDATE -> compliance.orderPaymentExposureInTx -> actor -> promo locks.
+            // G-C3-02 lock & evidence order: order FOR UPDATE -> workflow terminal cancel state -> compliance.orderPaymentExposureInTx -> actor -> promo locks.
             const [orderRow] = await tx
               .select({
                 id: orders.id,
                 publicId: orders.publicId,
                 statusKey: orders.statusKey,
+                workflowVersionId: orders.workflowVersionId,
               })
               .from(orders)
               .where(eq(orders.publicId, candidate.orderPublicId))
               .for("update");
 
-            if (
-              !orderRow ||
-              (orderRow.statusKey !== "canceled" && orderRow.statusKey !== "cancelled")
-            ) {
+            if (!orderRow) {
+              throw conflict(
+                "REDEMPTION_RELEASE_NOT_ELIGIBLE",
+                "This redemption can only be released after the order is cancelled.",
+              );
+            }
+
+            const [wfVersion] = await tx
+              .select({ definition: orderWorkflowVersions.definition })
+              .from(orderWorkflowVersions)
+              .where(eq(orderWorkflowVersions.id, orderRow.workflowVersionId))
+              .limit(1);
+
+            const boundState = wfVersion?.definition?.states?.find(
+              (s) => s.key === orderRow.statusKey,
+            );
+            if (!boundState || !isCancelState(boundState)) {
               throw conflict(
                 "REDEMPTION_RELEASE_NOT_ELIGIBLE",
                 "This redemption can only be released after the order is cancelled.",
@@ -2310,7 +2444,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
             if (!isZeroPaymentExposure(exposure)) {
               throw conflict(
                 "REDEMPTION_RELEASE_NOT_ELIGIBLE",
-                "This redemption can only be released when the order is cancelled, unpaid (including never refunded), and has no open invoice or pending payment.",
+                "This redemption can only be released when the order is cancelled, nothing was ever paid, no invoice is open, and no online payment attempt was ever started.",
               );
             }
 
@@ -2437,7 +2571,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
               batch.name,
               batch.label,
               plainCode,
-              `/#promo=${encodeURIComponent(plainCode)}`,
+              `/promo#promo=${encodeURIComponent(plainCode)}`,
               batch.status === "active" ? c.status : batch.status,
               c.redemptionCount,
               c.maxUses ?? batch.maxRedemptions ?? "unlimited",
