@@ -1,6 +1,6 @@
 # 0041 — Order Automation tab: pipeline history, guarded redelivery, optional Phase III / IV and workflow stage actions (extends 0023 and 0026)
 
-Status: Accepted (2026-11-21; owner confirmation requested for Phase III / IV)
+Status: Accepted (2026-11-21; Phase III / IV confirmed as optional and the redelivery and retry rules confirmed by the owner on 2026-11-22)
 
 ## Context
 The owner asks to see and start the Production Pipeline integrations from each order, as on the previous platform (increment 04 part B, decision B4). ADR 0023 defined P101 and P201 as manual, validated, outbox-delivered webhooks that are off by default.

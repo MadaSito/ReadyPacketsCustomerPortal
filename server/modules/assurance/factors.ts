@@ -160,21 +160,28 @@ export function createFactorService(deps: ModuleDeps) {
         authorizeTotpEnrollment(actor, now);
         if (!isFull(actor) && (account.totpSecretEnc || (await getPasskeys(tx, actor.userId)).length > 0))
           throw forbidden("TRANSITION_NOT_PERMITTED");
-        if (account.pendingTotpExpiresAt && +account.pendingTotpExpiresAt > +now && account.pendingTotpSessionId !== actor.sessionId)
-          throw conflict("TOTP_SETUP_IN_PROGRESS", "An authenticator setup is already in progress. Try again after it expires.");
-
-        const secret = account.pendingTotpSecretEnc && account.pendingTotpExpiresAt && +account.pendingTotpExpiresAt > +now
-          ? deps.crypto.decrypt(account.pendingTotpSecretEnc, secretAad(account, true))
+        const pendingLive = Boolean(account.pendingTotpSecretEnc && account.pendingTotpExpiresAt && +account.pendingTotpExpiresAt > +now);
+        // Only the session that started a setup may resume it. A setup started under another sign-in is
+        // replaced: this session receives a new secret and the earlier one stops working at once. The earlier
+        // secret is never shown again, so an abandoned setup neither blocks its owner nor leaks.
+        const resume = pendingLive && account.pendingTotpSessionId === actor.sessionId;
+        const secret = resume
+          ? deps.crypto.decrypt(account.pendingTotpSecretEnc!, secretAad(account, true))
           : new Secret({ size: 20 }).base32;
         const subject = await deps.services.identity.getUser(actor.userId, { tx });
         if (subject?.authSource !== "local") throw forbidden("LOCAL_ACCOUNT_REQUIRED");
         const otpauthUri = totp(secret, subject.email).toString();
         const qrDataUrl = await QRCode.toDataURL(otpauthUri, { errorCorrectionLevel: "M", width: 240 });
-        if (!account.pendingTotpExpiresAt || +account.pendingTotpExpiresAt <= +now || !account.pendingTotpSecretEnc) {
+        if (!resume) {
           await tx.update(assuranceAccounts).set({
             pendingTotpSecretEnc: deps.crypto.encrypt(secret, secretAad(account, true)),
             pendingTotpExpiresAt: new Date(+now + TOTP_TTL_MS), pendingTotpSessionId: actor.sessionId, updatedAt: now,
           }).where(eq(assuranceAccounts.id, account.id));
+          if (pendingLive) {
+            await record("auth.totp.enrollment_superseded", tx, actor, {
+              action: "update", reasonCode: "TOTP_SETUP_SUPERSEDED", severity: "WARN",
+            });
+          }
           await record("auth.totp.enrollment_started", tx, actor, { action: "create" });
         }
         return { secret, otpauthUri, qrDataUrl };
@@ -183,14 +190,25 @@ export function createFactorService(deps: ModuleDeps) {
     async confirmTotpEnrollment(actor: SessionPrincipal, code: string) {
       authorizeTotpEnrollment(actor, deps.clock.now());
       await throttle(deps, actor.userId);
+      const refusal: { stale: "TOTP_SETUP_EXPIRED" | "TOTP_SETUP_REPLACED" | null } = { stale: null };
       const result = await actorTx(actor, async (tx, account, now) => {
         authorizeTotpEnrollment(actor, now);
-        if (account.pendingTotpSessionId !== actor.sessionId || !account.pendingTotpExpiresAt || +account.pendingTotpExpiresAt <= +now
-          || !account.pendingTotpSecretEnc || (!isFull(actor) && account.totpSecretEnc)) {
+        if (!isFull(actor) && account.totpSecretEnc) {
           await denied("auth.totp.enrollment_denied", actor, tx);
           return null;
         }
-        const secret = deps.crypto.decrypt(account.pendingTotpSecretEnc, secretAad(account, true));
+        // A stale setup is refused before the code is looked at, so the distinct answer says nothing about
+        // the code. The page uses it to show a new QR code instead of repeating "that code didn't match".
+        // A setup that was already cleared (the clean-up job removes expired ones) counts as expired.
+        const pendingSecretEnc = account.pendingTotpSecretEnc;
+        const stale = !pendingSecretEnc || !account.pendingTotpExpiresAt || +account.pendingTotpExpiresAt <= +now ? "TOTP_SETUP_EXPIRED"
+          : account.pendingTotpSessionId !== actor.sessionId ? "TOTP_SETUP_REPLACED" : null;
+        if (stale || !pendingSecretEnc) {
+          await record("auth.totp.enrollment_denied", tx, actor, { outcome: "denied", reasonCode: stale ?? "TOTP_SETUP_EXPIRED", severity: "WARN" });
+          refusal.stale = stale ?? "TOTP_SETUP_EXPIRED";
+          return null;
+        }
+        const secret = deps.crypto.decrypt(pendingSecretEnc, secretAad(account, true));
         const step = totpStep(secret, code, now);
         if (step === null) {
           await denied("auth.totp.enrollment_denied", actor, tx);
@@ -207,6 +225,12 @@ export function createFactorService(deps: ModuleDeps) {
         const issued = isFull(actor) ? undefined : await deps.services.identity.sessions.markMfaVerified(actor.sessionId, { tx });
         return { data: recovery, issued };
       });
+      // Thrown after the transaction so the refusal stays in the audit trail.
+      if (refusal.stale) {
+        throw conflict(refusal.stale, refusal.stale === "TOTP_SETUP_EXPIRED"
+          ? "This authenticator setup has expired. Start the setup again and scan the new QR code."
+          : "This authenticator setup was replaced by a newer one. Start the setup again and scan the new QR code.");
+      }
       if (!result) throw badProof();
       return result;
     },

@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-22 (increment 05 documented; verification facts pending from the integrator). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-22 (increment 05 released; authenticator setup fix and the P101 test of prompt 22 recorded). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -340,6 +340,28 @@ Not verified for increment 05:
   runner checks above use a fresh machine and the shipped nginx and Caddy configuration)
 - keyboard-only operation, browser zoom and screen readers for the new pages
 
+## Verified after increment 05 — fix and P101 test of 2026-11-22 (integrator's own runs)
+
+Details are in `docs/session-logs/2026-11-22-session-03.md`.
+
+- authenticator setup no longer locks ([ADR 0046](../adr/0046-authenticator-setup-supersede.md)):
+  - type check and ESLint (whole project) clean; full test suite 181 files, 2,235 tests passed (4 todo);
+  - in Chromium against the QA environment (development profile, synthetic account), with two sign-ins of
+    one account that has no second factor: the second sign-in received a different setup key at once and no
+    refusal; the first sign-in's code was answered with "A newer setup was started from another sign-in, so
+    a new QR code is shown…", a new key, an empty code field and focus on the message; the same at 390 px
+    with no horizontal overflow; the last setup then confirmed and reached "Save your recovery codes";
+  - the expired case (`TOTP_SETUP_EXPIRED`, including a setup already removed by the clean-up job) is
+    covered by the unit tests only, not by a browser run.
+- Phase I (P101) sent to the owner's webhook.site address from the QA environment for synthetic two-packet
+  order `RP-2026-000009`: allow-list rule required and matched, dry run `DRY_RUN_ALLOWED`, dispatch
+  "Delivered" with HTTP 200 on attempt 1; webhook.site shows exactly one `POST` carrying
+  `Idempotency-Key: rp-prod:p101:<dispatch id>`, `X-ReadyPackets-Delivery` and `X-Correlation-Id`, and a
+  ten-field body whose SHA-256 equals the hash stored by the portal (`packet "7"`, `tier "Mixed"`,
+  `bundle_scope_manifest` as a JSON string); a second "Start Phase I" was refused; Phase II was offered and
+  not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
+  proves delivery and format, not the production receiver.
+
 ## Not verified
 
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
@@ -353,8 +375,8 @@ Not verified for increment 05:
   interactive mode and an installation older than `d964a3b` were not exercised.
 
 - production webhooks against the real P101 / P201 endpoints: no HTTP request has been sent to the owner's
-  receiver (one synthetic P101 went to a public echo service on 2026-11-22, which proves the portal side
-  only); TLS to the real host, receiver-side de-duplication across retries, and a full
+  receiver (synthetic P101 requests went to a public echo service and to the owner's webhook.site address
+  on 2026-11-22, which proves the portal side only); TLS to the real host, receiver-side de-duplication across retries, and a full
   P101 → artifacts → P201 run are untested. Keep the pipeline disabled until an operator has tested it
   with a synthetic order.
 
@@ -404,7 +426,6 @@ Not verified for increment 05:
   existing orders keep theirs; retention of sent content and the automations engine are off by default.
 - Increment 04 decisions the owner should confirm:
   - **Payments and refunds.** Hosted checkout is by redirect, so no card data reaches the portal. Refunds go to the provider and need the typed `REFUND ORDER` plus administrator step-up. Refunds of manual payments are recorded only and move no money.
-  - **Redelivery and retry (still open; the owner left this answer blank on 2026-11-22).** Redelivery needs administrator step-up and the typed `REDELIVER`. A staff retry reuses the original Idempotency-Key and is refused when the destination has changed. An administrator re-send authorises the new destination, so duplicates across two different receivers are an operator risk.
   - **Order rename.** Customers see a generic "Order renamed".
   - **File sync.** The default folder template is `customers/{customer_ref}/orders/{order_ref}/{phase}`.
   - **Protection.** Country blocking needs an operator-supplied MMDB, and the firewall starts in detect mode.
@@ -412,6 +433,7 @@ Not verified for increment 05:
   - **Defaults.** The community forum is off by default. The consent ledger is kept 36 months.
   - **Accessibility.** Accessibility is a WCAG 2.2 AA target, not a certification.
 - Increment 04 decisions confirmed by the owner on 2026-11-22:
+  - **Redelivery and retry (confirmed in prompt 22).** Redelivery needs administrator step-up and the typed `REDELIVER`. A staff retry reuses the original Idempotency-Key and is refused when the destination has changed. An administrator re-send authorises the new destination, so duplicates across two different receivers are an operator risk. No code change was needed.
   - **Later phases.** Only P101 and P201 are called today, each through a webhook URL. Later phases may be built in the future; P301 / P401 stay optional and hidden until a URL is configured, and their payload `{customer_id, order_id, run_mode}` is a placeholder until a contract exists.
   - **Acceptance.** Staff are never gated, and cancelling an order is never blocked by a gate.
   - **Referrals.** A fully refunded first invoice sends the reward to manual review; it is not reversed automatically.
@@ -421,7 +443,6 @@ Not verified for increment 05:
   - no account-erasure path;
   - community search uses `LIKE`;
   - the Activity lane labels a recorded-only refund "Refund issued".
-  - a person who abandons authenticator setup and signs in again in a new session must wait up to ten minutes ("An authenticator setup is already in progress"), and the message does not say how long;
   - "Order history" shows the pipeline events as "Integration production dispatch requested / delivered";
   - the `dispatch.requested` audit event does not carry the dispatch correlation reference;
   - a referral reward is recorded as credited by an administrator; the portal does not apply it to an invoice by itself.

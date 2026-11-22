@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { useAuthApi } from "@/lib/authApi";
 import { clearRecoveryBatch, stageRecoveryBatch, useRecoveryBatch } from "@/lib/recoveryBatch";
 import { useSession } from "@/lib/session";
-import { errorMessage } from "@/lib/trpc";
+import { errorMessage, safeError } from "@/lib/trpc";
 import { Button, CopyButton, ErrorState, Field, Input, Skeleton } from "@/ui";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, useFocusOnError } from "../components/bits";
@@ -75,6 +75,22 @@ export default function MfaEnrolPage() {
         await proceed(null, me?.user.role);
       }
     } catch (err) {
+      const reason = safeError(err)?.reasonCode;
+      if (reason === "TOTP_SETUP_EXPIRED" || reason === "TOTP_SETUP_REPLACED") {
+        // The setup key on screen no longer works. Fetch a new one straight away instead of leaving the
+        // person retrying codes that can never match.
+        setCode("");
+        setSetup(null);
+        try {
+          const fresh = await api.beginTotpEnrollment();
+          if (!mounted.current) return;
+          setSetup(fresh);
+          setError(`${reason === "TOTP_SETUP_EXPIRED" ? "That setup expired" : "A newer setup was started from another sign-in"}, so a new QR code is shown. Remove the earlier ReadyPackets entry from your authenticator app, scan the new QR code, then enter the code it shows.`);
+        } catch (beginErr) {
+          if (mounted.current) setBeginError(beginErr);
+        }
+        return;
+      }
       setError(errorMessage(err, "That code didn't match. Wait for a new code and try again."));
     } finally {
       setBusy(false);
@@ -124,6 +140,7 @@ export default function MfaEnrolPage() {
                 <code className="rounded-md bg-surface-sunken px-3 py-2 font-mono text-sm break-all text-ink">{groupKey(setup.secret)}</code>
                 <CopyButton value={setup.secret} label="Copy setup key" />
               </div>
+              <p className="mt-2 text-sm text-body">This QR code and setup key work for 10 minutes. If they expire, a new QR code is shown.</p>
             </div>
             <FormError message={error} focusRef={errorRef} />
             <form onSubmit={confirm} noValidate className="flex flex-col gap-4">

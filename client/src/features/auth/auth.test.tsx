@@ -250,6 +250,40 @@ describe("MFA", () => {
     await waitFor(() => expect(location.history?.at(-1)).toBe("/"));
   });
 
+  it("shows a new QR code and says why when the authenticator setup has expired or was replaced", async () => {
+    clearRecoveryBatch();
+    for (const [reasonCode, opening] of [
+      ["TOTP_SETUP_EXPIRED", /^That setup expired, so a new QR code is shown\./],
+      ["TOTP_SETUP_REPLACED", /^A newer setup was started from another sign-in, so a new QR code is shown\./],
+    ] as const) {
+      const secrets = ["JBSWY3DPEHPK3PXP", "KRSXG5CTMVRXEZLU"];
+      const beginTotpEnrollment = vi.fn(async () => ({ secret: secrets.shift()!, otpauthUri: "otpauth://totp/x", qrDataUrl: "data:image/png;base64,iVBORw0KGgo=" }));
+      const stale = Object.assign(new Error("server text that must not leak"), {
+        data: { safe: { domainCode: "CONFLICT", reasonCode, safeMessage: "Start the setup again." } },
+      });
+      const api = fakeAuthApi({
+        me: async () => remediationMe("enroll_mfa"),
+        beginTotpEnrollment,
+        confirmTotpEnrollment: async () => Promise.reject(stale),
+      });
+      const view = renderUi(<MfaEnrolPage />, { path: "/mfa/enrol", api });
+      await screen.findByText("JBSW Y3DP EHPK 3PXP");
+      expect(screen.getByText(/work for 10 minutes/)).toBeInTheDocument();
+      type(/6-digit code/i, "123456");
+      fireEvent.click(screen.getByRole("button", { name: /verify and continue/i }));
+      expect(await screen.findByText("KRSX G5CT MVRX EZLU")).toBeInTheDocument();
+      expect(screen.queryByText("JBSW Y3DP EHPK 3PXP")).not.toBeInTheDocument();
+      const alert = await screen.findByText(opening);
+      expect(alert).toHaveTextContent("Remove the earlier ReadyPackets entry from your authenticator app");
+      await waitFor(() => expect(alert.closest("[tabindex]") ?? alert).toHaveFocus());
+      expect(screen.getByLabelText(/6-digit code/i)).toHaveValue("");
+      expect(beginTotpEnrollment).toHaveBeenCalledTimes(2);
+      expect(document.body).not.toHaveTextContent("server text that must not leak");
+      await expectNoAxeViolations(view.container);
+      view.unmount();
+    }
+  });
+
   it("never calls beginTotpEnrollment again after confirmation (remount with a staged batch or TOTP already set)", async () => {
     clearRecoveryBatch();
     let step: MeResult["nextStep"] = "enroll_mfa";

@@ -64,7 +64,7 @@ Gaps: I-1 to I-5 below.
 ### assurance (owner: assurance_engineer)
 
 All 15 mutations are covered through `factors.ts record()` (security category, same transaction):
-- TOTP: `auth.totp.enrollment_started|enrolled|replaced|disabled|replay_denied`
+- TOTP: `auth.totp.enrollment_started|enrollment_superseded|enrollment_denied|enrolled|replaced|disabled|replay_denied`
 - Recovery codes: `auth.recovery_codes.acknowledged|reissued|regenerated` and `auth.recovery_code.redeemed`
 - MFA and step-up: `auth.mfa.verified|challenge_denied` and `auth.step_up.verified|denied`
 - Passkeys: `auth.passkey.registered|renamed|removed|manage_denied|counter_regression`

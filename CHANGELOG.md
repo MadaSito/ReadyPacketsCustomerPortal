@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Fixes after increment 05
+
+### Fixed
+
+- **Authenticator setup no longer locks** ([ADR 0046](docs/adr/0046-authenticator-setup-supersede.md)). A person who abandoned authenticator setup and signed in again was refused for up to ten minutes with "An authenticator setup is already in progress".
+  - A new sign-in now gets a new QR code at once. The earlier setup is discarded, is never shown to the new session, and the replacement is audited (`auth.totp.enrollment_superseded`).
+  - A setup that expired or was replaced now says so (`TOTP_SETUP_EXPIRED`, `TOTP_SETUP_REPLACED`), and the setup page shows a new QR code with instructions instead of "the code was not accepted".
+  - The setup page states that the QR code and setup key work for 10 minutes.
+
+### Changed
+
+- The owner confirmed the redelivery and retry rules of ADR 0041 (no code change).
+
 ## Increment 05
 
 ### Added
