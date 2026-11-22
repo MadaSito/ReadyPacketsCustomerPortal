@@ -212,7 +212,7 @@ export function createSessionPolicy(deps: ModuleDeps) {
   /** Current request address (trusted-proxy normalised) and country (protection, offline). Never throws. */
   function requestFacts(): RequestFacts {
     const ip = parseIp(getRequestContext()?.ipAddress)?.normalized ?? null;
-    let country: string | null = null;
+    let country: string | null;
     try {
       const protection = (deps.services as unknown as { protection?: { clientCountry?: () => string | null } }).protection;
       const value = protection?.clientCountry?.() ?? null;
