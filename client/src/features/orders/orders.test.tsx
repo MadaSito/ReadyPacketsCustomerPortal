@@ -498,6 +498,7 @@ describe("console", () => {
     session.role = "admin";
     handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "admin", transitions: [] }));
     handlers.set("orders.admin.referenceHistory", () => [{ reference: "RP-2026-000001", status: "active", reasonCode: "CREATED", assignedAt: now, retiredAt: null }]);
+    handlers.set("orders.admin.customerLookup", () => [{ publicId: "01JTESTUSER00000000000000B", name: "Synthetic Customer B", customerRef: null, emailMasked: "s***@example.test" }]);
     const user = userEvent.setup();
     const { container } = renderUi(
       <Route path="/admin/orders/:orderId">
@@ -512,6 +513,11 @@ describe("console", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeDisabled();
     await user.type(within(dialog).getByLabelText("Type RP-2026-000001 to confirm"), "RP-2026-000001");
+    // Still disabled until a new owner is picked from the customer search (no raw ID field).
+    expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Find new owner/), "Synthetic");
+    await user.click(await within(dialog).findByRole("radio", { name: /Synthetic Customer B/ }));
+    expect(within(dialog).getByText("s***@example.test")).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Reassign order" })).toBeEnabled();
     await expectNoAxeViolations(dialog);
   });
