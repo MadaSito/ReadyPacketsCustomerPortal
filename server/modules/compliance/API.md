@@ -374,10 +374,11 @@ In `compliance.init()`, the module also registers the `invoices` resource provid
 All procedures under `compliance.policies.admin.acceptanceLog` are read-only evidence views (plus `export` mutation). No acceptance evidence row is ever altered or deleted.
 
 **Authorization rule (Contract §4 & D4)**:
-- Unauthenticated -> `UNAUTHENTICATED`
-- `customer` session -> `NOT_FOUND` (never `FORBIDDEN`, no existence oracle; audited `authz.compliance.denied`)
+- Router guard runs **before** `.input()` parsing: `staffProcedure.use(requireCapability("policies.acceptances.read"))` on all read queries and `staffProcedure.use(requireCapability("policies.acceptances.export"))` on `export`.
+- Unauthenticated -> `UNAUTHENTICATED` (`UNAUTHORIZED` in tRPC, before input validation)
+- `customer` session -> `FORBIDDEN` at the `staffProcedure` router guard before input validation (and `NOT_FOUND` + `authz.compliance.denied` at the service defence-in-depth layer if invoked directly or if a staff user was demoted live)
 - `staff` / `admin` lacking the required capability (`policies.acceptances.read` on queries; `policies.acceptances.export` on `export`) -> `FORBIDDEN` (`CAPABILITY_NOT_GRANTED`)
-- `export` additionally requires fresh step-up (`STEP_UP_REQUIRED` when stale/missing) and re-validates the live actor inside `tx`, recording durable audit event `policy.acceptance_log.exported` (`category: "admin"`, attributes `{ filter_summary, row_count, truncated }`).
+- `export` additionally requires fresh step-up (`STEP_UP_REQUIRED` when stale/missing) and re-validates the live actor inside `tx`, recording durable audit event `policy.acceptance_log.exported` (`category: "admin"`, attributes `{ row_count, truncated, max_rows, scan_capped, filters }`).
 - **Typed signer name confidentiality**: `list`, `forCustomer`, and `export` DTOs **never** carry `typedSignerName`. Only `detail` returns `typedSignerName: string | null` + `signerNameRedacted: boolean`, decrypting only when the live caller holds `policies.manage`.
 
 ```ts
@@ -591,14 +592,14 @@ export interface AcceptanceLogExportResult {
 
 | Procedure | Guard | Input -> Output |
 | --- | --- | --- |
-| `policies.admin.acceptanceLog.filterOptions` | `policies.acceptances.read` | `void` -> `AcceptanceFilterOptionsView` |
-| `policies.admin.acceptanceLog.list` | `policies.acceptances.read` | `AcceptanceLogListInput` -> `{ items: AcceptanceLogItem[], nextCursor: string \| null }` |
-| `policies.admin.acceptanceLog.detail` | `policies.acceptances.read` (`policies.manage` for `typedSignerName`) | `{ publicId: string }` -> `AcceptanceLogDetailView` |
-| `policies.admin.acceptanceLog.coverage` | `policies.acceptances.read` | `{ documentPublicId?: string, outstandingLimit?: number /* 1..200, default 100 */ }?` -> `PolicyCoverageView` |
-| `policies.admin.acceptanceLog.updates` | `policies.acceptances.read` | `{ documentPublicId?: string }?` -> `{ items: PolicyUpdateHistoryItem[] }` |
-| `policies.admin.acceptanceLog.forCustomer` | `policies.acceptances.read` | `{ customerPublicId: string, cursor?: string, limit?: number }` -> `CustomerPolicyAcceptanceProfileView` |
-| `policies.admin.acceptanceLog.versionText` | `policies.acceptances.read` | `{ versionPublicId: string }` -> `PolicyVersionReadView` |
-| `policies.admin.acceptanceLog.export` | `policies.acceptances.export` (admin + step-up) | `AcceptanceLogFilterInput` -> `AcceptanceLogExportResult` |
+| `policies.admin.acceptanceLog.filterOptions` | `staffProcedure` + `policies.acceptances.read` | `void` -> `AcceptanceFilterOptionsView` |
+| `policies.admin.acceptanceLog.list` | `staffProcedure` + `policies.acceptances.read` | `AcceptanceLogListInput` -> `{ items: AcceptanceLogItem[], nextCursor: string \| null }` |
+| `policies.admin.acceptanceLog.detail` | `staffProcedure` + `policies.acceptances.read` (`policies.manage` for `typedSignerName`) | `{ publicId: string }` -> `AcceptanceLogDetailView` |
+| `policies.admin.acceptanceLog.coverage` | `staffProcedure` + `policies.acceptances.read` | `{ documentPublicId?: string, outstandingLimit?: number /* 1..200, default 100 */ }?` -> `PolicyCoverageView` |
+| `policies.admin.acceptanceLog.updates` | `staffProcedure` + `policies.acceptances.read` | `{ documentPublicId?: string }?` -> `{ items: PolicyUpdateHistoryItem[] }` |
+| `policies.admin.acceptanceLog.forCustomer` | `staffProcedure` + `policies.acceptances.read` | `{ customerPublicId: string, cursor?: string, limit?: number }` -> `CustomerPolicyAcceptanceProfileView` |
+| `policies.admin.acceptanceLog.versionText` | `staffProcedure` + `policies.acceptances.read` | `{ versionPublicId: string }` -> `PolicyVersionReadView` |
+| `policies.admin.acceptanceLog.export` | `staffProcedure` + `policies.acceptances.export` (admin + step-up) | `AcceptanceLogFilterInput` -> `AcceptanceLogExportResult` |
 
 - **Live session & signer-name confidentiality**:
   - Every `acceptanceLog.*` read verifies a populated live session bound to `(userId, userPublicId, role, authMethod)` alongside live active-user + capability re-validation (`NOT_FOUND` for customers, `FORBIDDEN` + `authz.compliance.denied` for unauthorized staff).

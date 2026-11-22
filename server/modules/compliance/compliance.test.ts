@@ -2852,16 +2852,42 @@ describe("compliance module — policies, intake, invoices, portable evidence & 
     expect(h.audit.recordedInTx[exportAuditIdx]).toBe(true);
 
     // 10. End-to-end tRPC router check (`compliance.policies.admin.acceptanceLog.*`)
-    const makeTrpcCtx = (principal: SessionPrincipal) => ({
+    // Verifies authz middleware runs BEFORE `.input()` parsing: calling every procedure with `{}`
+    // rejects anonymous callers with `UNAUTHORIZED` and customer callers with `FORBIDDEN` (never `BAD_REQUEST`).
+    const makeTrpcCtx = (principal: SessionPrincipal | null) => ({
       services: h.services,
       session: principal,
       request: newRequestContext("http"),
       transport: "cookie" as const,
     });
+
+    const anonCaller = complianceRouter.createCaller(makeTrpcCtx(null) as never);
+    for (const invokeAnon of [
+      () => anonCaller.policies.admin.acceptanceLog.filterOptions({}),
+      () => anonCaller.policies.admin.acceptanceLog.list({}),
+      () => anonCaller.policies.admin.acceptanceLog.detail({} as never),
+      () => anonCaller.policies.admin.acceptanceLog.coverage({}),
+      () => anonCaller.policies.admin.acceptanceLog.updates({}),
+      () => anonCaller.policies.admin.acceptanceLog.forCustomer({} as never),
+      () => anonCaller.policies.admin.acceptanceLog.versionText({} as never),
+      () => anonCaller.policies.admin.acceptanceLog.export({}),
+    ]) {
+      await expect(invokeAnon()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    }
+
     const customerCaller = complianceRouter.createCaller(makeTrpcCtx(d1CustAPrincipal) as never);
-    await expect(
-      customerCaller.policies.admin.acceptanceLog.list({}),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    for (const invokeCustomer of [
+      () => customerCaller.policies.admin.acceptanceLog.filterOptions({}),
+      () => customerCaller.policies.admin.acceptanceLog.list({}),
+      () => customerCaller.policies.admin.acceptanceLog.detail({} as never),
+      () => customerCaller.policies.admin.acceptanceLog.coverage({}),
+      () => customerCaller.policies.admin.acceptanceLog.updates({}),
+      () => customerCaller.policies.admin.acceptanceLog.forCustomer({} as never),
+      () => customerCaller.policies.admin.acceptanceLog.versionText({} as never),
+      () => customerCaller.policies.admin.acceptanceLog.export({}),
+    ]) {
+      await expect(invokeCustomer()).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
 
     const staffCaller = complianceRouter.createCaller(makeTrpcCtx(localStaff) as never);
     const routerList = await staffCaller.policies.admin.acceptanceLog.list({

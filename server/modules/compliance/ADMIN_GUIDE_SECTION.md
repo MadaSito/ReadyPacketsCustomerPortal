@@ -6,7 +6,7 @@ Open **Billing & compliance -> Policy acceptances** (`/admin/policy-acceptances`
 
 ### Capabilities & Privacy Boundaries
 
-- **`policies.acceptances.read`** (`staff` and `admin`): grants read access to `/admin/policy-acceptances` (**Log**, **Coverage**, and **Policy updates** tabs), standalone version text (`/admin/policy-acceptances/versions/:versionId`), and the customer profile **Policies** tab. Customers receive `404 Not Found` on all acceptance-log procedures; staff accounts without the capability receive `403 Forbidden` and an `authz.compliance.denied` security event.
+- **`policies.acceptances.read`** (`staff` and `admin`): grants read access to `/admin/policy-acceptances` (**Log**, **Coverage**, and **Policy updates** tabs), standalone version text (`/admin/policy-acceptances/versions/:versionId`), and the customer profile **Policies** tab. Anonymous callers receive `401 Unauthorized`, customers and unauthorized staff accounts receive `403 Forbidden` at the router guard before input parsing, and the service layer enforces live-session re-validation as defence in depth (`404 Not Found` if a session's persisted role is customer, `403 Forbidden` + `authz.compliance.denied` if lacking the capability).
 - **`policies.manage`** (`admin`): required to decrypt a customer's typed legal signature name inside the **View evidence** detail dialog (`compliance.policies.admin.acceptanceLog.detail`). Raw list, customer-profile, and CSV export responses never include or decrypt typed signer names; decryption runs inside a live-session transaction only when an administrator opens a single evidence record.
 - **`policies.acceptances.export`** (`admin` + fresh step-up MFA): required to export filtered acceptance records as CSV (`compliance.policies.admin.acceptanceLog.export`). Each export is capped at `5,000` rows (with a `10,000`-row / `3,000` ms scan ceiling for sparse post-refinement filters), neutralizes spreadsheet formula prefixes (`=`, `+`, `-`, `@`, tab, carriage return, including leading whitespace before `=`, `+`, `-`, `@`), and records `policy.acceptance_log.exported` (`row_count`, `truncated`, `max_rows`, `scan_capped`, `filters`).
 
@@ -39,9 +39,9 @@ When an order includes a promotional discount code (`order.promoDiscountMinor > 
 
 Invoices display only the promotion's customer-facing label (`Discount (<promoLabel>)`), never the raw secret code. If an administrator creates a supplemental manual invoice on the same order with a custom discount amount unrelated to the checkout breakdown, the invoice displays its custom `Discount` line without misattributing the order's promotional breakdown.
 
-### Zero-Total (`100%` Discount) Invoices
+### Zero-Total Invoices (Full Promotional Discount)
 
-When an issued invoice has `totalMinor === 0` (such as a `100%` promotional discount), the compliance ledger derives `status = "paid"`, `paymentState = "paid"`, `balanceDueMinor = 0`, and `canRecordPayment = false` immediately upon issuance, with no manual or online payment required.
+When an issued invoice has `totalMinor === 0` (for example, when a promotional code covers the entire subtotal), the compliance ledger derives `status = "paid"`, `paymentState = "paid"`, `balanceDueMinor = 0`, and `canRecordPayment = false` immediately upon issuance, with no manual or online payment required.
 
 ### Conservative Redemption Release Exposure (`orderPaymentExposureInTx`)
 
@@ -67,6 +67,6 @@ When your order qualifies for the multi-packet **Bundle discount** or a **Promot
 
 Both lines appear on your online invoice page (`/invoices/:invoiceId`) and on the downloadable PDF receipt.
 
-### Full (`100%`) Discounts and `$0.00` Invoices
+### Full Promotional Discounts and `$0.00` Invoices
 
 If a promotion reduces your invoice total to `$0.00`, your issued invoice is automatically marked **Paid** with a `$0.00` balance due, and you can download the PDF receipt immediately for your records.
