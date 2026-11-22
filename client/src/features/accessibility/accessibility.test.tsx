@@ -1,13 +1,14 @@
 import { screen } from "@testing-library/react";
 import { expect, vi } from "vitest";
 import { AppRoutes } from "@/app/AppRouter";
+import type * as slots from "@/app/slots";
 import type { MeResult } from "@/lib/authApi";
 import { pageA11y } from "@/test/a11y";
 import { fakeAuthApi, renderUi } from "@/ui/testing";
 import { accessibilityFeature } from "./routes";
 
 vi.mock("@/app/slots", async (importOriginal) => ({
-  ...await importOriginal<typeof import("@/app/slots")>(),
+  ...await importOriginal<typeof slots>(),
   NotificationSlot: () => null,
   GlobalSearchSlot: () => null,
   AnalyticsConsentSlot: () => null,
