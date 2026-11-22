@@ -1,8 +1,6 @@
 # Help: Using a discount code
 
-<!-- Combined by platform_engineer from client/src/features/promotions/API.md (audit_engineer) and
-docs/guides/ORDER_DISCOUNT_CODES_HELP.md (orders_engineer). Discount codes are available only when the
-portal administrator has switched them on. -->
+<!-- Discount codes are available only when the portal administrator has switched them on. -->
 
 You can use a discount code in your cart or in the last step of **Create an order**.
 

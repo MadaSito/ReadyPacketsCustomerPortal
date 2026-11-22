@@ -25,7 +25,7 @@ Package H reviews the workflow transfer, cart suggestions, discount codes, and p
 | Order wizard: invalidated discount and later errors | A code described as removed previously remained in wizard state and could reapply when the selection changed back. A stale removal notice also took precedence over later field errors. | Independently rerun at `8e6e123`: 41 passed. Tests verify no reapplication or code in order submission after restoring the selection and verify that a later validation error replaces the removal notice in the live region. The stale-response guard was source-reviewed; overlapping responses were not exercised. |
 | Acceptance evidence dialog: narrow text and scroll focus | The draft redaction explanation used a badge that truncated rather than wrapping. The keyboard-reachable exact-version scroll region lacked an explicit focus indicator style. | Fixed in `118d162`. Independent tests verify Tab reaches the exact-text region and Escape returns focus to the launcher. The wrapping, slug and explicit focus-ring changes were reviewed in source; actual layout and ring visibility remain unverified. |
 | Acceptance log: link purpose, row action names and filtered results | Version links used labels such as `v1` without naming the policy. Multiple records for the same customer and version could have the same `View evidence` name. The result summary was absent when a filter returned zero rows. | Fixed in `118d162`. Test locates an exact-version link by policy and version and verifies a zero-record `role=status`; evidence names include a timestamp in source. |
-| Cart suggestions: visible wording in accessible labels and focus after a delay | The draft Add to cart label does not contain the visible phrase `Add to cart`. Completing a delayed accept or dismiss can move focus even after the user has moved elsewhere. | Reported to Cart UI owner. Include the visible label, specific items and price in the accessible name; only recover focus when the disappearing control owned focus, and test delayed completion. |
+| Cart suggestions: visible wording in accessible labels and focus after a delay | The draft Add to cart label does not contain the visible phrase `Add to cart`. Completing a delayed accept or dismiss can move focus even after the user has moved elsewhere. | Fixed in `4bb0e71`: the accessible names start with the visible wording and name the item and price (confirmed in the integrator's rendered run: `Add to cart: Business Plans — Basic for $910.00`, `Upgrade: Business Foundation — Standard for +$2,000.00`, `Dismiss: …`). Focus is recovered only when the control that disappears owned focus at the start and focus has not left the suggestions section. A move to another control inside the section during the request is not distinguished; recorded as a minor follow-up. |
 
 ## Evidence limits
 
@@ -33,3 +33,24 @@ Package H reviews the workflow transfer, cart suggestions, discount codes, and p
 - Keyboard tests should exercise the action, active element, transition, and destination, not just assert that a focusable element exists. Status messages should be available to assistive technology without moving focus unless the current control is removed or the task moves to a new step.
 - Real browser verification is separate: 320 CSS px, light and dark, keyboard-only interaction, visible focus, target dimensions or sufficient spacing, no color-only meaning, rendered contrast where measured, and reduced motion. Actual browser zoom and manual screen-reader coverage are separate from viewport-based reflow and automated scans.
 - No real customers, policies, discount codes, or credentials are needed for the review. Use synthetic records and report the build, role, route, viewport, theme, and tested state for browser evidence.
+
+## Integrator's rendered run (2026-11-22)
+
+Run by the integrator in Chromium against a disposable development-profile portal (synthetic data) at
+the increment's final build, with all four features switched on.
+
+- axe-core (WCAG 2.0/2.1/2.2 A and AA rule tags plus best practices) and a horizontal-overflow check on 18
+  page states at 320, 768 and 1280 CSS px, light and dark (106 runs; the customer "Policies" tab was
+  not run at 320 px): `/admin/workflows` and the open import dialog; `/admin/carts/suggestions` and the open
+  "New cart suggestion" dialog; `/admin/promotions`, `/new`, a code's page and `/redemptions`;
+  `/admin/policy-acceptances`, `/coverage`, `/updates`, a version text page and the customer profile
+  "Policies" tab; `/cart` with a suggestion, `/cart/checkout`, `/promo`, an order with a discount and its
+  invoice.
+- Result: no axe violations. One reflow defect was found and fixed: at 320 px the cart suggestions list
+  overflowed by 5 px because a long column header widened the label column of the stacked card. The
+  header is now "Activity" with wrapping text; the twelve suggestion-page runs were repeated and passed.
+- Not covered by this run: the import dialog's review and confirmation steps, the evidence dialog, the
+  step-up dialog and error states were exercised functionally but not scanned with axe in the browser;
+  keyboard-only operation, browser zoom, reduced-motion playback and screen readers were not exercised.
+  The ledger entries above without an "independently rerun" note rest on the component tests.
+

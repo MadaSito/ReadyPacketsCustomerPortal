@@ -266,10 +266,58 @@ during analytics clean-up.
 
 ## Verification for increment 05
 
-> **PLACEHOLDER — to be completed by /root.** platform_engineer has not seen any increment 05 check run.
-> Nothing in increment 05 is verified until /root replaces this block with the checks it ran and saw
-> (type check, test files, migration `0005_increment_05`, preview checks, security review outcome).
-> Not-verified items for increment 05: _placeholder — /root to supply._
+Integrator's own runs on 2026-11-22, on branch `feat/increment-05` (synthetic data only):
+
+- type check clean; ESLint on the whole project with `--max-warnings 0` clean
+- full test suite: 181 files, 2233 tests passed, 4 marked to-do; this includes the new suites for workflow
+  transfer, cart suggestions, discount codes and the acceptance log, and the cross-module isolation and
+  authorisation suites
+- migration `0005_increment_05` applied with `pnpm db:migrate` to an existing development database that
+  was at `0004` and held data (tables 164 → 172; `orders.promo_discount_minor` and `promo_label` present);
+  production build succeeds
+- in a real browser (Chromium) against a disposable development-profile portal with all four features
+  switched on:
+  - workflows: "Export all" downloaded an integrity-checked package; importing it back offered create /
+    add as draft / skip, asked for step-up, created the draft `standard_2` without publishing or changing
+    the default; a package edited by hand was refused ("changed or damaged")
+  - cart suggestions: an add-on and a tier-upgrade offer created in `/admin/carts/suggestions` appeared in
+    the customer's cart; accepting the add-on added the item and updated the counters; a tier upgrade is
+    offered only when the lower tier is in the cart
+  - discount codes: a 20 % code with a use limit and end date, and a batch of three single-use fixed-amount
+    codes with CSV export; a wrong code and a second use by the same customer both answered "This code
+    cannot be applied"; the right code reduced a USD 2,410.00 cart to USD 1,928.00; checkout by invoice
+    produced an order and an invoice that show the label ("Spring offer"), never the code; the link
+    `/promo#promo=…` saved the code for the tab, the fragment was removed from the address and no request
+    carried the code in a URL; pause and resume; "Show code and link" behind step-up; a manual release of a
+    redemption on an order that is not cancelled was refused by the server
+  - acceptance log: Log, Coverage, Policy updates, the exact version text page, CSV export behind step-up,
+    and the "Policies" tab on the admin customer profile showed the existing registration and order-gate
+    acceptances
+- accessibility and reflow: axe-core (WCAG 2.0 / 2.1 / 2.2 A and AA rule tags) and a horizontal-overflow
+  check on 18 page states at 320, 768 and 1280 CSS px in light and dark (106 runs): no axe violations;
+  one 5 px overflow at 320 px on the cart suggestions list was fixed and the page re-run. See
+  `docs/accessibility/INCREMENT_05_REVIEW.md`.
+
+Reported by the engineering team and reviewed, but not re-run individually by the integrator: the
+per-package test notes in each module's `VERIFICATION.md`; the security review
+(`docs/security/INCREMENT_05_REVIEW.md`: no open findings in scope, one accepted residual and three payment
+follow-ups recorded there); the nginx and Caddy configuration checks for the workflow-import body limit;
+the component-level accessibility ledger. The engineering team stopped before the accessibility reviewer
+sent a final report, so that ledger is a working record, not a sign-off.
+
+Not verified for increment 05:
+
+- discount codes with online card payment: no Stripe or Square account was used, so the "nothing to pay"
+  path of a 100 % discount at a hosted checkout, a refund, and the automatic release of a redemption after
+  cancelling an unpaid order were not exercised in a browser (module tests only)
+- a discount code entered by staff while ordering for a customer, and the code field in the order wizard
+  with the cart switched off (component and server tests only)
+- a policy update: publishing a new policy version and watching Coverage change to "outstanding" was not
+  exercised in the browser run (server tests only)
+- importing a workflow package into a second, separate installation; the import was run against the
+  installation that produced the package
+- the workflow-import body limit on a deployed nginx or Caddy; only the configuration files were checked
+- keyboard-only operation, browser zoom and screen readers for the new pages
 
 ## Not verified
 

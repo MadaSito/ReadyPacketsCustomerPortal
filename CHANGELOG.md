@@ -7,8 +7,6 @@ procedure.
 
 ## Increment 05
 
-<!-- platform_engineer: drafted from INCREMENT_05_CONTRACT.md; page paths and settings taken from the owners' module docs. Verification facts come from /root. -->
-
 ### Added
 
 - **Workflow export and import** (`/admin/workflows`), per [ADR 0042](docs/adr/0042-workflow-transfer.md). Enable `orders.workflow_transfer.enabled` first.
@@ -31,7 +29,9 @@ procedure.
 
 ### Operations
 
-- **Migration `0005_increment_05`**: additive. Details: _placeholder — /root to supply table and column counts._
+- **Migration `0005_increment_05`**: additive only (8 new tables, 9 new columns on `orders`, `carts` and `policy_acceptances`, plus indexes and constraints). No existing column is changed or dropped. `deploy/upgrade.sh` applies it; see [UPGRADE.md](docs/operations/UPGRADE.md).
+- **Reverse proxy:** the two workflow-import requests accept a body of up to 4,456,448 bytes; every other request keeps the 256 KiB limit. Refresh the nginx or Caddy configuration from `deploy/` when upgrading, otherwise larger workflow packages are refused by the proxy.
+- All four features except the acceptance log are off after the upgrade. Switch them on under **Settings** (`/admin/settings`: "Workflow export and import") and **Features** (`/admin/settings/features`: "Cart suggestions (upsell)", "Discount codes and links").
 
 ## Increment 04
 

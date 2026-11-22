@@ -73,7 +73,7 @@ Packages C1/C2 and B, as reported by the owners (server notes: `server/modules/p
   - `/promo` (public);
   - the code field on `/cart` and `/cart/checkout`.
 - **Procedures:**
-  - `promotions.check` (code check);
+  - no customer-callable code check exists: customers apply codes only through `cart.applyCode` and `orders.quoteWithPromo` (POST), so there is no separate validity oracle;
   - `promotions.admin.{list,get,stats,create,update,pause,resume,revoke,setStatus,generateBatch,reveal,redemptions,releaseRedemption,exportCodes,exportRedemptions,getSettings,updateSettings}`;
   - `cart.applyCode` and `cart.removeCode`.
 - **Release fence as implemented (C1):** automatic release (`releaseForOrderInTx`) and manual release (`promotions.admin.releaseRedemption`) run only inside the transaction. Both need the order to be in a terminal cancel state of its bound workflow version (`isCancelState`). `compliance.orderPaymentExposureInTx` must also return `grossPaidMinor === 0`, `payableInvoiceOpen === false`, `providerCapturePending === false` and `providerAttemptEver === false`. A missing or failing port keeps the redemption used.

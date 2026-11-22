@@ -57,3 +57,11 @@ f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/
 f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2723
 f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2734
 f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/production.test.ts:generic-api-key:2855
+
+# 2026-11-22, increment 05: synthetic idempotency keys in cart and compliance test fixtures (reviewed line by line; none is a credential)
+76cacfbc1bd634a7c73d27d0589891a771bba9b0:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:1109
+7bdce16093608d2d63bd3f828800f8f93e620c95:server/modules/compliance/compliance.test.ts:generic-api-key:1936
+7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:581
+7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:753
+7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:757
+7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:770
