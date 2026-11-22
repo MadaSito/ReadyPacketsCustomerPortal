@@ -252,6 +252,7 @@ const FORBIDDEN_CUSTOM_WEBHOOK_HEADERS = new Set([
   "cookie",
   "idempotency-key",
   "x-readypackets-delivery",
+  "x-readypackets-redelivery-of",
   "x-correlation-id",
 ]);
 
@@ -540,6 +541,36 @@ export const INTEGRATIONS_PRODUCTION_P201_URL = defineSecret({
     .min(10)
     .max(2048)
     .refine(isValidProductionWebhookUrl, "P201 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
+export const INTEGRATIONS_PRODUCTION_P301_URL = defineSecret({
+  key: "integrations.production.p301_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase III (P301) webhook destination URL",
+  description: "Optional encrypted HTTPS webhook destination URL for Phase III (P301) production dispatches.",
+  exportable: false,
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P301 URL must be a valid HTTPS URL without embedded credentials."),
+});
+
+export const INTEGRATIONS_PRODUCTION_P401_URL = defineSecret({
+  key: "integrations.production.p401_url",
+  owner: "integrations",
+  group: "integrations",
+  label: "Phase IV (P401) webhook destination URL",
+  description: "Optional encrypted HTTPS webhook destination URL for Phase IV (P401) production dispatches.",
+  exportable: false,
+  schema: z
+    .string()
+    .trim()
+    .min(10)
+    .max(2048)
+    .refine(isValidProductionWebhookUrl, "P401 URL must be a valid HTTPS URL without embedded credentials."),
 });
 
 export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({

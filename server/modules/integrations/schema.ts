@@ -115,6 +115,10 @@ export const integrationProductionDispatches = mysqlTable(
     isResend: boolean("is_resend").notNull().default(false),
     /** Controlled server-classified resend reason code only; NEVER stores raw operator prose (PW-07). */
     resendReason: varchar("resend_reason", { length: 64 }),
+    /** ULID of a failed/dead dispatch retried via `orders.production.trigger` (Increment 04 Part B T1). */
+    retryOfPublicId: varchar("retry_of_public_id", { length: 26 }),
+    /** ULID of an already-delivered dispatch redelivered via `orders.production.redeliver` step-up (Increment 04 Part B T1). */
+    redeliveryOfPublicId: varchar("redelivery_of_public_id", { length: 26 }),
     phase1ArtifactsConfirmed: boolean("phase1_artifacts_confirmed").notNull().default(false),
     requestedByUserId: refColumn("requested_by_user_id"),
     requestedByPublicId: varchar("requested_by_public_id", { length: 26 }),
@@ -134,6 +138,7 @@ export const integrationProductionDispatches = mysqlTable(
     index("idx_prod_dispatch_state_expiry").on(table.state, table.expiresAt, table.id),
     index("idx_prod_dispatch_job").on(table.jobPublicId),
     index("idx_prod_dispatch_order_ref").on(table.orderReference, table.createdAt),
+    index("idx_prod_dispatch_redelivery_of").on(table.redeliveryOfPublicId),
   ],
 );
 

@@ -233,6 +233,63 @@ export async function assertProductionResendInTx(
   }
 }
 
+export function assertProductionRedeliverPreflight(principal: SessionPrincipal, now: Date): void {
+  if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (principal.role !== "admin" || !roleHasCapability(principal.role, "orders.production.redeliver")) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+  if (!hasFreshStepUp(principal, now)) {
+    throw new DomainError(
+      "STEP_UP_REQUIRED",
+      "STEP_UP_REQUIRED",
+      "Please confirm your password and authentication code to re-deliver an already-delivered production webhook.",
+      { capability: "orders.production.redeliver" },
+    );
+  }
+}
+
+export async function assertProductionRedeliverInTx(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  tx: Tx,
+): Promise<void> {
+  assertProductionRedeliverPreflight(principal, deps.clock.now());
+
+  const { sessions, assertCurrent } = requireAssertCurrent(deps);
+  const current = await assertCurrent.call(sessions, principal, tx);
+  const postLockNow = deps.clock.now();
+
+  if (current.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (
+    current.role !== principal.role ||
+    current.role !== "admin" ||
+    !roleHasCapability(current.role, "orders.production.redeliver")
+  ) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+  const stepUpAge = current.stepUpAt ? postLockNow.getTime() - current.stepUpAt.getTime() : -1;
+  if (!(stepUpAge >= 0 && stepUpAge <= STEP_UP_MAX_AGE_MS)) {
+    throw new DomainError(
+      "STEP_UP_REQUIRED",
+      "STEP_UP_REQUIRED",
+      "Please confirm your password and authentication code to re-deliver an already-delivered production webhook.",
+      { capability: "orders.production.redeliver" },
+    );
+  }
+}
+
 export function assertWebhooksRead(principal: SessionPrincipal): void {
   if (principal.state !== "full" || principal.pendingSteps.length > 0) {
     throw new DomainError(

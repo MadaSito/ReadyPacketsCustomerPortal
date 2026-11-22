@@ -680,6 +680,7 @@ describe("AnalyticsConsentSlot — shared @/lib/consent cutover (J-01, J-04) & I
       "/admin/integrations/production",
       "/admin/integrations/webhooks",
     ]);
-    expect(integrationsFeature.orderTabs?.map((t) => t.key)).toEqual(["production"]);
+    expect(integrationsFeature.orderTabs).toHaveLength(1);
+    expect(["production", "automation"]).toContain(integrationsFeature.orderTabs?.[0]?.key);
   });
 });

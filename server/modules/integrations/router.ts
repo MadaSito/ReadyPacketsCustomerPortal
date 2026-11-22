@@ -11,6 +11,7 @@ const webhooksManageProcedure = adminProcedure.use(requireCapability("webhooks.m
 const apiReplayProcedure = adminProcedure.use(requireCapability("api.replay"));
 const productionTriggerProcedure = staffProcedure.use(requireCapability("orders.production.trigger"));
 const productionResendProcedure = adminProcedure.use(requireCapability("orders.production.trigger"));
+const productionRedeliverProcedure = adminProcedure.use(requireCapability("orders.production.redeliver"));
 
 const ulidParamSchema = z.string().trim().min(10).max(64);
 
@@ -118,13 +119,15 @@ const setEgressPresetSchema = z.strictObject({
     .optional(),
 });
 
-const productionPhaseSchema = z.enum(["P101", "P201"]);
+const productionPhaseSchema = z.enum(["P101", "P201", "P301", "P401"]);
 const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead", "unknown"]);
 
 const updateProductionSettingsSchema = z.strictObject({
   enabled: z.boolean(),
   p101Url: z.string().trim().max(2048).nullable().optional(),
   p201Url: z.string().trim().max(2048).nullable().optional(),
+  p301Url: z.string().trim().max(2048).nullable().optional(),
+  p401Url: z.string().trim().max(2048).nullable().optional(),
   authHeaderName: z.string().trim().max(64).optional(),
   authHeaderValue: z.string().max(1024).nullable().optional(),
   canonVersion: z.string().trim().max(64),
@@ -149,6 +152,22 @@ const requestP101Schema = z.strictObject({
 const requestP201Schema = z.strictObject({
   orderPublicId: ulidParamSchema,
   phase1ArtifactsConfirmed: z.boolean(),
+});
+
+const requestLaterPhaseSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+});
+
+const retryProductionDispatchSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  dispatchPublicId: ulidParamSchema,
+});
+
+const redeliverProductionDispatchSchema = z.strictObject({
+  orderPublicId: ulidParamSchema,
+  dispatchPublicId: ulidParamSchema,
+  reason: z.string().max(500),
+  confirmation: z.string().max(64),
 });
 
 const resendProductionSchema = z.strictObject({
@@ -494,6 +513,19 @@ export const integrationsRouter = router({
       requestP201: productionTriggerProcedure
         .input(requestP201Schema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP201(ctx.session, input)),
+      requestP301: productionTriggerProcedure
+        .input(requestLaterPhaseSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP301(ctx.session, input)),
+      requestP401: productionTriggerProcedure
+        .input(requestLaterPhaseSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.requestP401(ctx.session, input)),
+      retry: productionTriggerProcedure
+        .input(retryProductionDispatchSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.retry(ctx.session, input)),
+      redeliver: productionRedeliverProcedure
+        .meta({ rateLimit: "expensive" })
+        .input(redeliverProductionDispatchSchema)
+        .mutation(({ ctx, input }) => ctx.services.integrations.production.redeliver(ctx.session, input)),
       resend: productionResendProcedure
         .input(resendProductionSchema)
         .mutation(({ ctx, input }) => ctx.services.integrations.production.resend(ctx.session, input)),

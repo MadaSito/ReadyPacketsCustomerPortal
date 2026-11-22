@@ -156,7 +156,142 @@ export type ProviderState = "disabled" | "not_configured" | "configured" | "degr
 ### 1.6 Disabled Scaffolds (`stripe`, `saml`, `sharepoint`) & Production Webhooks (`production`)
 
 - **`stripe`**, **`saml`**, **`sharepoint`** remain backwards-compatible scaffolds (`STRIPE_LEDGER_MUTATION_ENABLED = false`; console links administrators to `/admin/payments` for hosted checkout).
-- **`production`** (`P101` & `P201`) implements fenced outbox webhook delivery per `docs/integrations/PRODUCTION_WEBHOOKS.md`.
+- **`production`** (`P101`, `P201`, and optional `P301` / `P401`) implements fenced outbox webhook delivery per `docs/integrations/PRODUCTION_WEBHOOKS.md` and Increment 04 Part B (Decision B4):
+  ```ts
+  export type ProductionPhase = "P101" | "P201" | "P301" | "P401";
+  export type ProductionDispatchState = "queued" | "sending" | "delivered" | "failed" | "dead" | "unknown";
+
+  export type ProductionDisabledCategory =
+    | "pipeline_off"
+    | "endpoint_missing"
+    | "config_incomplete"
+    | "in_progress"
+    | "already_delivered"
+    | "retry_or_resend_required"
+    | "precondition";
+
+  export interface ProductionDisabledReason {
+    code: string;
+    category: ProductionDisabledCategory;
+    message: string;
+    /** True when an administrator can resolve this in `/admin/integrations/production`. */
+    settingsActionable: boolean;
+  }
+
+  export interface ProductionSettingsView {
+    enabled: boolean;
+    configured: boolean;
+    state: ProviderState;
+    summary: string;
+    p101UrlConfigured: boolean;
+    p101UrlMask: MaskedWebhookUrlView | null;
+    p201UrlConfigured: boolean;
+    p201UrlMask: MaskedWebhookUrlView | null;
+    p301UrlConfigured: boolean;
+    p301UrlMask: MaskedWebhookUrlView | null;
+    p401UrlConfigured: boolean;
+    p401UrlMask: MaskedWebhookUrlView | null;
+    authHeaderName: string;
+    authHeaderValueConfigured: boolean;
+    canonVersion: string;
+    runMode: string;
+    timeoutMs: number;
+  }
+
+  export interface UpdateProductionSettingsInput {
+    enabled: boolean;
+    p101Url?: string | null;
+    p201Url?: string | null;
+    p301Url?: string | null;
+    p401Url?: string | null;
+    authHeaderName?: string;
+    authHeaderValue?: string | null;
+    canonVersion: string;
+    runMode?: string;
+    timeoutMs?: number;
+  }
+
+  export interface ProductionLaterPhasePreview {
+    configured: boolean;
+    eligible: boolean;
+    p101Delivered: boolean;
+    prerequisiteDelivered: boolean;
+    alreadyDelivered: boolean;
+    activeState: ProductionDispatchState | null;
+    validationErrors: ProductionValidationIssue[];
+    disabledReasons: ProductionDisabledReason[];
+    payload: P201Payload | null;
+  }
+
+  export interface ProductionOrderPreview {
+    featureEnabled: boolean;
+    featureConfigured: boolean;
+    settingsHref: "/admin/integrations/production";
+    p101: {
+      configured: boolean;
+      eligible: boolean;
+      alreadyDelivered: boolean;
+      activeState: ProductionDispatchState | null;
+      validationErrors: ProductionValidationIssue[];
+      disabledReasons: ProductionDisabledReason[];
+      payload: P101Payload | null;
+      maskedForViewer: boolean;
+    };
+    p201: {
+      configured: boolean;
+      eligible: boolean;
+      p101Delivered: boolean;
+      alreadyDelivered: boolean;
+      activeState: ProductionDispatchState | null;
+      validationErrors: ProductionValidationIssue[];
+      disabledReasons: ProductionDisabledReason[];
+      payload: P201Payload | null;
+    };
+    p301: ProductionLaterPhasePreview;
+    p401: ProductionLaterPhasePreview;
+  }
+
+  export interface ProductionDispatchItem {
+    publicId: string;
+    orderPublicId: string;
+    orderReference: string;
+    phase: ProductionPhase;
+    state: ProductionDispatchState;
+    attemptCount: number;
+    maxAttempts: number;
+    idempotencyKey: string;
+    payloadSha256: string;
+    identityTriple: { customerId: string; orderId: string; runMode: string };
+    packet: string | null;
+    tier: string | null;
+    bundleScopeManifest: string | null;
+    releaseStatus: string | null;
+    httpStatus: number | null;
+    responseSummary: string | null;
+    lastReasonCode: string | null;
+    resendReason: string | null;
+    retryOf: string | null;
+    redeliveryOf: string | null;
+    requestedByPublicId: string | null;
+    correlationId: string;
+    createdAt: Date;
+    updatedAt: Date;
+    deliveredAt: Date | null;
+    finalizedAt: Date | null;
+  }
+  ```
+  - **tRPC procedures (`trpc.integrations.production.*`)**:
+    - `settings.get` (`adminProcedure`), `settings.update` (`integrations.manage` step-up), `settings.test` (`integrations.manage` step-up, `{ phase: "P101" | "P201" | "P301" | "P401" }`).
+    - `order.preview` (`orders.production.trigger` + `orders.assertCanReadOrder`, `{ orderPublicId, releaseStatus? }`) -> `ProductionOrderPreview` with structured `disabledReasons` for every phase (`P101`–`P401`).
+    - `order.history` (`orders.production.trigger` + `orders.assertCanReadOrder`, `{ orderPublicId }`) -> `{ items: ProductionDispatchItem[] }`.
+    - `order.requestP101` (`orders.production.trigger`, `{ orderPublicId, releaseStatus? }`) -> `ProductionDispatchItem`.
+    - `order.requestP201` (`orders.production.trigger`, `{ orderPublicId, phase1ArtifactsConfirmed }`) -> `ProductionDispatchItem`.
+    - `order.requestP301` (`orders.production.trigger`, `{ orderPublicId }`) -> `ProductionDispatchItem` (refuses with `NOT_CONFIGURED` / `PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED` unless `p301Url` is configured; requires `P101` and `P201` delivered; copies `{ customer_id, order_id, run_mode }` verbatim from delivered `P101`).
+    - `order.requestP401` (`orders.production.trigger`, `{ orderPublicId }`) -> `ProductionDispatchItem` (refuses with `NOT_CONFIGURED` / `PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED` unless `p401Url` is configured; requires `P101`, `P201`, and — when `p301Url` is configured — `P301` delivered; copies `{ customer_id, order_id, run_mode }` verbatim from delivered `P101`).
+    - `order.retry` (`orders.production.trigger`, `{ orderPublicId, dispatchPublicId }`) -> `ProductionDispatchItem` (creates a new queued delivery with `retryOf: dispatchPublicId` ONLY when target dispatch belongs to `orderPublicId`, is in `failed` or `dead` state, is the latest dispatch for its phase, and no dispatch for that phase is `queued`, `sending`, `unknown`, or `delivered`; emits `integration.production.dispatch.retried`).
+    - `order.redeliver` (`orders.production.redeliver` admin step-up, `{ orderPublicId, dispatchPublicId, reason, confirmation }`) -> `ProductionDispatchItem` (server validates `confirmation === "REDELIVER"` and 3–280 char printable `reason`; creates a NEW queued delivery with `redeliveryOf: dispatchPublicId` + outbound `X-ReadyPackets-Redelivery-Of` header ONLY when target dispatch belongs to `orderPublicId` and has `state === "delivered"`; emits `integration.production.dispatch.redelivered`).
+    - `order.resend` (`orders.production.trigger` admin step-up, `{ orderPublicId, phase, reason, releaseStatus?, phase1ArtifactsConfirmed? }`) -> `ProductionDispatchItem` (preserved for backwards compatibility and `unknown` recovery).
+    - `admin.listDispatches` (`adminProcedure`, `{ phase?, state?, orderReference?, fromDate?, toDate?, limit? }`) -> `{ items: ProductionDispatchItem[] }`.
 
 ### 1.7 Outbound Webhook Subscriptions, Inbound Endpoints, Delivery Log & Re-Run (`services.integrations.webhooks`)
 
