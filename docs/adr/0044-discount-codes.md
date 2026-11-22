@@ -30,7 +30,12 @@ The owner asks for discount codes for orders: the administrator hands out codes 
 - **Atomic redemption.** Redemption happens inside the order-creation transaction through the promotions port (`preview`, `redeemInTx`, `releaseForOrderInTx`).
   - The code row is locked and the limits are counted again. Then the redemption and the order are written together, or nothing is written.
   - Unique keys on (code, order) and (code, customer, sequence) prevent double use under concurrency.
-  - Cancelling an order before payment releases the redemption. A redemption stays used after a refund.
+  - **Release on cancellation fails closed.** A redemption is released automatically only when compliance gives authoritative evidence inside the cancellation transaction, with the order's invoices locked (`orderPaymentExposureInTx`). The evidence must show both:
+    - nothing was ever paid for the order (gross paid is 0 across all invoices; a partial payment counts as paid);
+    - no payable invoice or provider capture remains possible (no open or issued invoice, no pending provider checkout).
+  - In every other case the redemption stays used and the cancellation still succeeds. That includes a missing port, an error, any payment and an open payable invoice. Cancellation does not void invoices.
+  - **Manual release.** After an invoice has been voided or settled by hand, an administrator can release the redemption with `promotions.admin.releaseRedemption`. It needs `promotions.manage`, step-up and a reason, and is audited as `promotion.released` with the actor.
+  - A redemption stays used after a refund.
 - **Abuse controls.**
   - Every code check is rate limited per account and per address. After 5 failed checks in 15 minutes, the account is paused from checking codes for 15 minutes, and the event `promotion.attempts_blocked` is sent to the SIEM as a warning.
   - Every reason a code cannot be used gets the same message: "This code cannot be applied." Cart-specific hints, such as the minimum subtotal, appear only for a code the customer is entitled to.
@@ -50,7 +55,7 @@ The owner asks for discount codes for orders: the administrator hands out codes 
 ## Assumptions to confirm with the owner
 - When a code cannot be combined with the bundle discount, the larger discount wins by default.
 - The global guard defaults to 50% per order.
-- A redemption stays used after a refund; only cancellation before payment releases it.
+- A redemption stays used after a refund. It is released automatically only on a cancellation with no payment and no payable exposure; otherwise it is released by an administrator.
 - API v1 order creation does not accept codes in this increment.
 
 ## Consequences
