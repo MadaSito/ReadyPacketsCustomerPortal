@@ -29,6 +29,7 @@ let destinationVersion: number;
 let orderStatus: string;
 let duringView: (() => Promise<void>) | null;
 let enabledListId: string | null;
+let renamedAt: Date | null;
 let listeners: ((e: { orderId: number; orderPublicId: string; kind: string }, tx: Tx) => Promise<void>)[];
 
 const orderView = () => ({
@@ -44,7 +45,7 @@ const orderView = () => ({
   createdAt: new Date("2026-11-01T10:00:00Z"),
   submittedAt: null,
   closedAt: null,
-  updatedAt: new Date("2026-11-02T10:00:00Z"),
+  updatedAt: renamedAt ?? new Date("2026-11-02T10:00:00Z"),
 });
 
 beforeAll(async () => {
@@ -61,6 +62,7 @@ beforeEach(async () => {
   destinationVersion = 1;
   orderStatus = "In progress";
   listeners = [];
+  renamedAt = null;
   duringView = null;
   enabledListId = null;
   const config = { tenantId: TENANT, clientId: CLIENT, siteUrl: "https://contoso.sharepoint.com/sites/Orders", siteId: graph.site.id, driveId: "", driveName: "", rootFolderPath: "" };
@@ -293,6 +295,21 @@ describe("sharepoint order sync (local fakes only)", () => {
     ]);
     expect(log.every((r) => r.startedAt && r.finishedAt && r.errorCode === null)).toBe(true);
     expect(JSON.stringify(log)).not.toMatch(/contoso|Portal orders|RP-2026|item/iu);
+  });
+
+  it("a renamed order (B2: updatedAt bump + \"updated\" event) updates its list row", async () => {
+    await enable();
+    await changeOrder();
+    await h.jobs.runAll(SYNC_JOB);
+    const before = { ...[...items().values()][0]!.fields };
+    // orders.console.rename sets updatedAt and emits { kind: "updated" } in the rename tx (orders_engineer).
+    renamedAt = new Date("2026-11-03T09:30:00Z");
+    await changeOrder();
+    expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "completed", safeCounts: { updated: 1 } }]);
+    expect(items().size).toBe(1);
+    const after = [...items().values()][0]!.fields;
+    expect(after.RpUpdatedAt).not.toBe(before.RpUpdatedAt);
+    expect({ ...after, RpUpdatedAt: null }).toEqual({ ...before, RpUpdatedAt: null }); // reference/Title unchanged
   });
 
   it("finds an existing item by order id when the local remote id was lost (no duplicate)", async () => {
