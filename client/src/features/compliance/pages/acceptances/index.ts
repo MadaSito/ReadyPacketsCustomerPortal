@@ -6,34 +6,38 @@ import { FileCheck2 } from "lucide-react";
 import { lazy } from "react";
 import type { CustomerTab, NavItem, RouteDef } from "@/lib/routes";
 
+const PolicyAcceptancesPage = lazy(() => import("./PolicyAcceptancesPage"));
+const PolicyVersionTextPage = lazy(() => import("./PolicyVersionTextPage"));
+const CustomerPoliciesTab = lazy(() => import("./CustomerPoliciesTab"));
+
 export const acceptanceLogRoutes: RouteDef[] = [
   {
     path: "/admin/policy-acceptances",
     access: "staff",
     capability: "policies.acceptances.read",
     title: "Policy acceptances",
-    component: lazy(() => import("./PolicyAcceptancesPage")),
+    component: PolicyAcceptancesPage,
   },
   {
     path: "/admin/policy-acceptances/coverage",
     access: "staff",
     capability: "policies.acceptances.read",
     title: "Policy acceptances — Coverage",
-    component: lazy(() => import("./PolicyAcceptancesPage")),
+    component: PolicyAcceptancesPage,
   },
   {
     path: "/admin/policy-acceptances/updates",
     access: "staff",
     capability: "policies.acceptances.read",
     title: "Policy acceptances — Policy updates",
-    component: lazy(() => import("./PolicyAcceptancesPage")),
+    component: PolicyAcceptancesPage,
   },
   {
     path: "/admin/policy-acceptances/versions/:versionId",
     access: "staff",
     capability: "policies.acceptances.read",
     title: "Policy version",
-    component: lazy(() => import("./PolicyVersionTextPage")),
+    component: PolicyVersionTextPage,
   },
 ];
 
@@ -56,6 +60,6 @@ export const acceptanceLogCustomerTabs: CustomerTab[] = [
     label: "Policies",
     access: "staff",
     order: 40,
-    component: lazy(() => import("./CustomerPoliciesTab")),
+    component: CustomerPoliciesTab,
   },
 ];

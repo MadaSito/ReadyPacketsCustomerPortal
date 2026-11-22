@@ -3,10 +3,10 @@
  * step-up CSV export, Evidence Detail Dialog (confidentiality + keyboard/focus), Customer Profile
  * `Policies` tab, Exact Version Text page, 320 px responsive layout, and both-theme axe (`pageA11y`).
  */
-import { screen, waitFor, within } from "@testing-library/react";
+import { configure, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { AppRoutes } from "@/app/AppRouter";
 import { pageA11y } from "@/test/a11y";
 import { PageHeader, Tabs } from "@/ui";
@@ -24,6 +24,13 @@ import type {
   PolicyUpdateHistoryItem,
   PolicyVersionReadView,
 } from "./types";
+
+// Under heavy concurrent shared-tree checks, cold lazy route + auth hydration can exceed 1000 ms.
+configure({ asyncUtilTimeout: 5000 });
+
+beforeAll(async () => {
+  await Promise.all([import("./PolicyAcceptancesPage"), import("./PolicyVersionTextPage")]);
+});
 
 const DOC_TERMS = "01JD0000000000000000000101";
 const DOC_PRIVACY = "01JD0000000000000000000102";
