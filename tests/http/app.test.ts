@@ -440,6 +440,21 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(h.sessionResolver).not.toHaveBeenCalled();
   });
 
+  it("passes exact JSON bytes to the default inbound webhook adapter without resolving cookies", async () => {
+    const h = harness();
+    const receiveInboundHttp = vi.fn(async () => ({ httpStatus: 200, body: { ok: true } }));
+    h.services.integrations = { webhooks: { receiveInboundHttp } } as unknown as typeof h.services.integrations;
+    const endpointPublicId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const body = '{\n "event":"synthetic"\n}';
+    const response = await h.http.post(`/api/webhooks/inbound/${endpointPublicId}`).set("Host", HOST)
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("json").send(body).expect(200, { ok: true });
+    expect(receiveInboundHttp).toHaveBeenCalledWith(expect.objectContaining({
+      endpointPublicId, rawBody: Buffer.from(body), correlationId: response.headers["x-correlation-id"],
+    }));
+    expect(response.headers["x-correlation-id"]).toBe(response.headers["x-request-id"]);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
   it("passes only narrow webhook bytes ahead of JSON parsing and enforces request body limits", async () => {
     const signedWebhookRouter = Router();
     signedWebhookRouter.post("/synthetic", (req, res) => {

@@ -24,6 +24,7 @@ import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
 import * as integrationHttp from "../modules/integrations/http.js";
+import { createInboundWebhooksHttpRouter } from "../modules/integrations/webhooks/http.js";
 import { createPublicApiHttpRouter } from "../modules/publicApi/http.js";
 import {
   ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken, isAnonymousCsrfToken,
@@ -234,7 +235,10 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     next();
   });
 
-  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? { publicApi: createPublicApiHttpRouter }, async (_req, _res, next) => {
+  app.use(createIsolatedHttpRouter(services, options.isolatedRouters ?? {
+    publicApi: createPublicApiHttpRouter,
+    inboundWebhooks: createInboundWebhooksHttpRouter,
+  }, async (_req, _res, next) => {
     await applyRateLimit(services, "api", `ip:${currentAddress()}`);
     next();
   }));
@@ -279,7 +283,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       if (calls.length > MAX_BATCH_SIZE) throw validation("BATCH_TOO_LARGE", "This batch includes too many operations.");
       await applyRateLimit(services, tRpcBudget(router, calls), `edge:${subject}`, calls.length);
     } else if (API_PATH.test(req.path)) {
-      const category = pathIn("/api/files", req.path) || pathIn("/api/portable", req.path) || pathIn("/api/backup", req.path)
+      const category = pathIn("/api/files", req.path) || pathIn("/api/knowledge/attachments", req.path.toLowerCase()) ||
+          pathIn("/api/portable", req.path) || pathIn("/api/backup", req.path)
         ? "expensive" : pathIn("/api/identity", req.path) || pathIn("/api/assurance", req.path)
           ? "auth_high_risk" : "api";
       await applyRateLimit(services, category, subject);
