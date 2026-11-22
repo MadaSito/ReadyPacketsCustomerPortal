@@ -77,6 +77,7 @@ export function RouteTabs({ items, value, label, replace = true, idBase: idBaseP
   const listRef = useRef<HTMLDivElement>(null);
   const selectId = `${idBase}-select`;
   const enabled = items.filter((item) => !item.disabled);
+  const tabKey = items.map((item) => item.value).join("\u0000");
   const selected = items.find((item) => item.value === value);
   const [focusValue, setFocusValue] = useState(selected?.value ?? enabled[0]?.value);
   const [edges, setEdges] = useState({ start: false, end: false });
@@ -94,7 +95,9 @@ export function RouteTabs({ items, value, label, replace = true, idBase: idBaseP
     const list = listRef.current;
     if (!list) return;
     const max = list.scrollWidth - list.clientWidth;
-    setEdges({ start: list.scrollLeft > 1, end: max - list.scrollLeft > 1 });
+    const start = list.scrollLeft > 1;
+    const end = max - list.scrollLeft > 1;
+    setEdges((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
   }, []);
 
   useLayoutEffect(() => {
@@ -111,10 +114,20 @@ export function RouteTabs({ items, value, label, replace = true, idBase: idBaseP
   useEffect(() => {
     const list = listRef.current;
     if (!list || typeof ResizeObserver === "undefined") return;
+    // The strip keeps its own width while tab labels grow (counts arriving, web fonts swapping in), so watch the
+    // tabs as well as the strip; otherwise the scroll buttons stay hidden over a clipped last tab.
     const observer = new ResizeObserver(measure);
     observer.observe(list);
-    return () => observer.disconnect();
-  }, [measure]);
+    for (const tab of list.querySelectorAll('[role="tab"]')) observer.observe(tab);
+    let live = true;
+    void document.fonts?.ready.then(() => {
+      if (live) measure();
+    });
+    return () => {
+      live = false;
+      observer.disconnect();
+    };
+  }, [measure, tabKey]);
 
   const focusTab = (next: RouteTabItem) => {
     setFocusValue(next.value);
