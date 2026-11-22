@@ -1,5 +1,6 @@
 /** audit feature — routes and navigation. Owner: audit engineer. Every page is lazy and admin-only; the server re-checks capabilities. */
 import { lazy } from "react";
+import { OrderHistoryTabLabel } from "./OrderHistoryTabLabel";
 import { ScrollText } from "lucide-react";
 import type { FeatureRoutes } from "@/lib/routes";
 
@@ -15,5 +16,7 @@ export const auditFeature: FeatureRoutes = {
     { access: "admin", capability: "audit.retention.manage", path: "/admin/audit/retention", title: "Audit retention", component: lazy(() => import("./RetentionPage")) },
   ],
   widgets: [{ key: "audit.integrity", area: "console", access: "admin", capability: "audit.read", order: 40, span: 4, component: lazy(() => import("./widgets/IntegrityWidget")) }],
+  /** S2: replaces the old Activity tab; customers see it as "History". The server applies the orders read policy. */
+  orderTabs: [{ key: "history", label: "Order history", labelComponent: OrderHistoryTabLabel, component: lazy(() => import("./OrderHistoryTab")), access: "customer", order: 90 }],
   nav: [{ ...admin, label: "Audit center", href: "/admin/audit", icon: ScrollText, area: "console", group: "Security", order: 34 }],
 };
