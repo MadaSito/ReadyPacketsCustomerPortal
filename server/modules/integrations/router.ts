@@ -11,7 +11,7 @@ const webhooksManageProcedure = adminProcedure.use(requireCapability("webhooks.m
 const apiReplayProcedure = adminProcedure.use(requireCapability("api.replay"));
 const productionTriggerProcedure = staffProcedure.use(requireCapability("orders.production.trigger"));
 const productionResendProcedure = adminProcedure.use(requireCapability("orders.production.trigger"));
-const productionRedeliverProcedure = adminProcedure.use(requireCapability("orders.production.redeliver"));
+const productionRedeliverProcedure = staffProcedure.use(requireCapability("orders.production.redeliver"));
 
 const ulidParamSchema = z.string().trim().min(10).max(64);
 

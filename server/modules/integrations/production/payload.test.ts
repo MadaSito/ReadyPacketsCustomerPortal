@@ -9,10 +9,12 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  buildLaterPhaseFromDeliveredP101,
   buildP101Payload,
   buildP201FromDeliveredP101,
   maskP101PayloadForRole,
   maskSecretWebhookUrl,
+  validateLaterPhasePayload,
   validateP101,
   validateP201,
 } from "./payload.js";
@@ -473,5 +475,55 @@ describe("production webhook payloads — row-by-row verification against P101_C
       host: "hooks.make.example",
       last4: "9f3k",
     });
+  });
+
+  it("constructs & validates optional P301 and P401 payloads identically to P201 while preserving P201 parity", () => {
+    const deliveredP101 = {
+      customerId: "RPCUS-9A8B7C6D5",
+      orderId: "ORD-2026-0901",
+      runMode: "production",
+    };
+
+    const p201 = buildP201FromDeliveredP101(deliveredP101);
+    const p301 = buildLaterPhaseFromDeliveredP101("P301", deliveredP101);
+    const p401 = buildLaterPhaseFromDeliveredP101("P401", deliveredP101);
+    expect(p301).toEqual({
+      ok: true,
+      errors: [],
+      payload: {
+        customer_id: "RPCUS-9A8B7C6D5",
+        order_id: "ORD-2026-0901",
+        run_mode: "production",
+      },
+    });
+    expect(p401).toEqual(p301);
+    expect(p201).toEqual(p301);
+
+    const driftedP301 = validateLaterPhasePayload(
+      "P301",
+      { customer_id: "RPCUS-9A8B7C6D5", order_id: "ORD-2026-WRONG", run_mode: "production" },
+      deliveredP101,
+    );
+    expect(driftedP301.ok).toBe(false);
+    expect(driftedP301.errors.map((e) => e.code)).toContain("P301_ORDER_ID_MISMATCH");
+
+    const driftedP401 = validateLaterPhasePayload(
+      "P401",
+      { customer_id: "RPCUS-OTHER", order_id: "ORD-2026-0901", run_mode: "staging" },
+      deliveredP101,
+    );
+    expect(driftedP401.ok).toBe(false);
+    expect(driftedP401.errors.map((e) => e.code)).toEqual(
+      expect.arrayContaining(["P401_CUSTOMER_ID_MISMATCH", "P401_RUN_MODE_MISMATCH"]),
+    );
+
+    const extraKeyP401 = validateLaterPhasePayload("P401", {
+      customer_id: "RPCUS-9A8B7C6D5",
+      order_id: "ORD-2026-0901",
+      run_mode: "production",
+      order_scope_mode: "single",
+    });
+    expect(extraKeyP401.ok).toBe(false);
+    expect(extraKeyP401.errors.map((e) => e.code)).toContain("P401_ORDER_SCOPE_MODE_FORBIDDEN");
   });
 });

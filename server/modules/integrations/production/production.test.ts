@@ -57,6 +57,8 @@ import {
 
 const P101_TEST_URL = "https://hooks.production.example.test/webhooks/p101-secret-9876";
 const P201_TEST_URL = "https://hooks.production.example.test/webhooks/p201-secret-4321";
+const P301_TEST_URL = "https://hooks.production.example.test/webhooks/p301-secret-3301";
+const P401_TEST_URL = "https://hooks.production.example.test/webhooks/p401-secret-4401";
 
 function makeStepUpAdmin(h: TestHarness, overrides: Partial<SessionPrincipal> = {}): SessionPrincipal {
   const now = h.clock.now();
@@ -2047,5 +2049,542 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
           e.reason_code === "PRODUCTION_DELIVERY_EXPIRED",
       ),
     ).toBe(true);
+  });
+
+  it("Part B: supports optional P301/P401 endpoints, preview disabledReasons + settingsHref, verbatim identity parity, destination pinning, and pre-send order revalidation", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    const adminCaller = createCaller(admin);
+    const staffCaller = createCaller(staff);
+
+    const { orderPublicId, ownerUserId } = seedOrderAndCustomer({
+      orderId: 960,
+      orderPublicId: "01JORDER000000000000000960",
+      reference: "ORD-2026-0960",
+      customerRef: "RPCUS-960ABCDEF",
+      packets: [{ packetNumber: 3, tier: "Premium" }],
+    });
+
+    // 1. Pipeline disabled -> disabledReasons reports pipeline_off + endpoint_missing + settingsHref
+    const offPreview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(offPreview.settingsHref).toBe("/admin/integrations/production");
+    expect(offPreview.p301.configured).toBe(false);
+    expect(offPreview.p401.configured).toBe(false);
+    expect(offPreview.p101.disabledReasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "PIPELINE_DISABLED",
+          category: "pipeline_off",
+          settingsActionable: true,
+        }),
+      ]),
+    );
+    expect(offPreview.p301.disabledReasons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "P301_ENDPOINT_NOT_CONFIGURED",
+          category: "endpoint_missing",
+          settingsActionable: true,
+        }),
+      ]),
+    );
+
+    // 2. Enable P101 + P201 ONLY (P301/P401 unconfigured) -> requestP301 & requestP401 refused with NOT_CONFIGURED
+    await configureEnabledProduction(admin);
+    await expect(staffCaller.production.order.requestP301({ orderPublicId })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      cause: expect.objectContaining({
+        code: "NOT_CONFIGURED",
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+      }),
+    });
+    await expect(staffCaller.production.order.requestP401({ orderPublicId })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      cause: expect.objectContaining({
+        code: "NOT_CONFIGURED",
+        reasonCode: "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED",
+      }),
+    });
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.refused" &&
+          e.reasonCode === "PRODUCTION_PHASE_ENDPOINT_NOT_CONFIGURED" &&
+          e.orderPublicId === orderPublicId,
+      ),
+    ).toBe(true);
+
+    // 3. Configure P401 WITHOUT P301 -> verify masking, export exclusion, and direct P201 -> P401 gate
+    const withP401Only = await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p401Url: P401_TEST_URL,
+    });
+    expect(withP401Only.p301UrlConfigured).toBe(false);
+    expect(withP401Only.p301UrlMask).toBeNull();
+    expect(withP401Only.p401UrlConfigured).toBe(true);
+    expect(withP401Only.p401UrlMask).toEqual({
+      host: "hooks.production.example.test",
+      last4: "4401",
+    });
+
+    const platformStore = createSettingsStore({
+      db: tdb.db,
+      crypto: h.deps.crypto,
+      clock: h.clock,
+      audit: h.audit,
+      logger: h.deps.logger,
+    });
+    const transfer = createConfigTransfer({
+      db: tdb.db,
+      clock: h.clock,
+      audit: h.audit,
+      settings: platformStore,
+      installationId: "inst_test_part_b",
+      releaseRef: "2026.11.21",
+    });
+    const exportedBundle = await transfer.exportDocument(
+      { includeSecrets: true, passphrase: "correct-horse-battery-staple-export-key" },
+      async () => {},
+    );
+    expect(exportedBundle.document).not.toContain("p401-secret-4401");
+
+    const preRunPreview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(preRunPreview.p401.configured).toBe(true);
+    expect(preRunPreview.p401.eligible).toBe(false);
+    expect(preRunPreview.p401.disabledReasons.map((r) => r.code)).toContain("P101_NOT_DELIVERED");
+
+    // Deliver P101 first -> P401 now reports P201_NOT_DELIVERED (and NOT P301_NOT_DELIVERED since P301 is unconfigured)
+    await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const afterP101Preview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(afterP101Preview.p401.disabledReasons.map((r) => r.code)).toEqual(["P201_NOT_DELIVERED"]);
+
+    // Deliver P201, mutate upstream identifiers, then dispatch P401
+    await staffCaller.production.order.requestP201({ orderPublicId, phase1ArtifactsConfirmed: true });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    mockUsers.get(ownerUserId)!.customerRef = "RPCUS-MUTATED99";
+    mockOrders.get(orderPublicId)!.scope.reference = "ORD-MUTATED-9999";
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "staging",
+    });
+
+    const readyP401Preview = await staffCaller.production.order.preview({ orderPublicId });
+    expect(readyP401Preview.p401.eligible).toBe(true);
+    expect(readyP401Preview.p401.disabledReasons).toEqual([]);
+
+    const queuedP401 = await staffCaller.production.order.requestP401({ orderPublicId });
+    expect(queuedP401.phase).toBe("P401");
+    expect(queuedP401.idempotencyKey).toBe(`rp-prod:p401:${queuedP401.publicId}`);
+    expect(queuedP401.identityTriple).toEqual({
+      customerId: "RPCUS-960ABCDEF",
+      orderId: "ORD-2026-0960",
+      runMode: "production",
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(3);
+    expect(httpCalls[2]!.url).toBe(P401_TEST_URL);
+    expect(httpCalls[2]!.headers?.["Idempotency-Key"]).toBe(`rp-prod:p401:${queuedP401.publicId}`);
+    expect(JSON.parse(httpCalls[2]!.body)).toEqual({
+      customer_id: "RPCUS-960ABCDEF",
+      order_id: "ORD-2026-0960",
+      run_mode: "production",
+    });
+
+    // 4. Configure P301 as well -> verify dry-run test, P401 blocked on P301, DESTINATION_CHANGED & ORDER_LOCKED pre-send checks
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p301Url: P301_TEST_URL,
+      p401Url: P401_TEST_URL,
+    });
+    const httpCountBeforeDryRun = httpCalls.length;
+    const dryRunP301 = await adminCaller.production.settings.test({ phase: "P301" });
+    const dryRunP401 = await adminCaller.production.settings.test({ phase: "P401" });
+    expect(dryRunP301.allowed).toBe(true);
+    expect(dryRunP401.allowed).toBe(true);
+    expect(httpCalls).toHaveLength(httpCountBeforeDryRun);
+
+    const order2 = seedOrderAndCustomer({
+      orderId: 961,
+      orderPublicId: "01JORDER000000000000000961",
+      reference: "ORD-2026-0961",
+      customerRef: "RPCUS-961ABCDEF",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+    await staffCaller.production.order.requestP101({ orderPublicId: order2.orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    await staffCaller.production.order.requestP201({
+      orderPublicId: order2.orderPublicId,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const previewNeedP301 = await staffCaller.production.order.preview({ orderPublicId: order2.orderPublicId });
+    expect(previewNeedP301.p301.eligible).toBe(true);
+    expect(previewNeedP301.p401.eligible).toBe(false);
+    expect(previewNeedP301.p401.disabledReasons.map((r) => r.code)).toContain("P301_NOT_DELIVERED");
+    await expect(
+      staffCaller.production.order.requestP401({ orderPublicId: order2.orderPublicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_P301_NOT_DELIVERED" }),
+    });
+
+    // Queue P301, rotate P301 URL before worker runs -> worker stops with DESTINATION_CHANGED (zero HTTP calls)
+    const p301Pinned = await staffCaller.production.order.requestP301({ orderPublicId: order2.orderPublicId });
+    await adminCaller.production.settings.update({
+      enabled: true,
+      canonVersion: "v3.0",
+      runMode: "production",
+      p301Url: "https://hooks.production.example.test/webhooks/p301-rotated-7777",
+    });
+    const countBeforeRotatedRun = httpCalls.length;
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(countBeforeRotatedRun);
+    const histAfterRotate = await staffCaller.production.order.history({ orderPublicId: order2.orderPublicId });
+    const failedPinned = histAfterRotate.items.find((i) => i.publicId === p301Pinned.publicId);
+    expect(failedPinned?.state).toBe("failed");
+    expect(failedPinned?.lastReasonCode).toBe("DESTINATION_CHANGED");
+
+    // Retry P301 against the new authorized URL -> delivers! Then queue P401 and place order on legal_hold before worker runs -> ORDER_LOCKED
+    const retriedP301 = await staffCaller.production.order.retry({
+      orderPublicId: order2.orderPublicId,
+      dispatchPublicId: p301Pinned.publicId,
+    });
+    expect(retriedP301.retryOf).toBe(p301Pinned.publicId);
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    const p401Locked = await staffCaller.production.order.requestP401({ orderPublicId: order2.orderPublicId });
+    mockOrders.get(order2.orderPublicId)!.scope.lockState = "legal_hold";
+    const countBeforeLockedRun = httpCalls.length;
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(httpCalls).toHaveLength(countBeforeLockedRun);
+    const histAfterLock = await staffCaller.production.order.history({ orderPublicId: order2.orderPublicId });
+    const lockedRow = histAfterLock.items.find((i) => i.publicId === p401Locked.publicId);
+    expect(lockedRow?.state).toBe("failed");
+    expect(lockedRow?.lastReasonCode).toBe("ORDER_LOCKED");
+  });
+
+  it("Part B: allows staff with orders.production.trigger to retry failed/dead dispatches while blocking retry once delivered or superseded", async () => {
+    const admin = makeStepUpAdmin(h);
+    const staff = makeStaff(h);
+    const customer = makeCustomer(h);
+    await configureEnabledProduction(admin);
+
+    const staffCaller = createCaller(staff);
+    const customerCaller = createCaller(customer);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 962,
+      orderPublicId: "01JORDER000000000000000962",
+      reference: "ORD-2026-0962",
+      packets: [{ packetNumber: 2, tier: "Standard" }],
+    });
+    const otherOrder = seedOrderAndCustomer({
+      orderId: 963,
+      orderPublicId: "01JORDER000000000000000963",
+      reference: "ORD-2026-0963",
+      packets: [{ packetNumber: 1, tier: "Basic" }],
+    });
+
+    // First attempt returns 400 -> terminal `failed`
+    nextHttpHandler = async () => ({
+      status: 400,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"error":"bad_config"}', "utf8"),
+    });
+    const first = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Customer cannot retry or read history
+    await expect(
+      customerCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(customerCaller.production.order.history({ orderPublicId })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+
+    // Cross-order dispatchPublicId refused with NOT_FOUND
+    await expect(
+      staffCaller.production.order.retry({
+        orderPublicId: otherOrder.orderPublicId,
+        dispatchPublicId: first.publicId,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_NOT_FOUND" }),
+    });
+
+    // Staff retries failed dispatch (no step-up required) -> new row with `retryOf`
+    const retry1 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: first.publicId,
+    });
+    expect(retry1.publicId).not.toBe(first.publicId);
+    expect(retry1.retryOf).toBe(first.publicId);
+    expect(retry1.redeliveryOf).toBeNull();
+    expect(retry1.resendReason).toBe("OPERATOR_RETRY_AFTER_FAILURE");
+    expect(
+      h.audit.events.some(
+        (e) =>
+          e.eventName === "integration.production.dispatch.retried" &&
+          e.orderPublicId === orderPublicId &&
+          e.attributes?.retry_of_public_id === first.publicId,
+      ),
+    ).toBe(true);
+
+    // While retry1 is queued, retrying again fails with PRODUCTION_DISPATCH_IN_PROGRESS
+    await expect(
+      staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_IN_PROGRESS" }),
+    });
+
+    // Exhaust retry1 to `dead` (5 x 503)
+    const handler = h.jobs.handlers.get(PRODUCTION_DELIVERY_JOB)!;
+    const retry1JobId = h.jobs.enqueued[h.jobs.enqueued.length - 1]!.jobId;
+    h.jobs.enqueued = [];
+    nextHttpHandler = async () => ({
+      status: 503,
+      headers: {},
+      body: Buffer.from("unavailable", "utf8"),
+    });
+    for (let attempt = 1; attempt <= PRODUCTION_MAX_ATTEMPTS; attempt += 1) {
+      await handler({
+        jobId: retry1JobId,
+        type: PRODUCTION_DELIVERY_JOB,
+        payload: { dispatchId: retry1.publicId } as never,
+        attempt,
+        fencingToken: attempt,
+        correlationId: "corr_partb_retry_dead",
+        signal: new AbortController().signal,
+        assertStillOwned: async () => {},
+      });
+    }
+
+    // Retrying superseded `first` fails with PRODUCTION_DISPATCH_SUPERSEDED
+    await expect(
+      staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: first.publicId }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_SUPERSEDED" }),
+    });
+
+    // Retrying latest `dead` `retry1` succeeds (`OPERATOR_RETRY_AFTER_DEAD_LETTER`) and delivers on 200
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"ok":true}', "utf8"),
+    });
+    const retry2 = await staffCaller.production.order.retry({
+      orderPublicId,
+      dispatchPublicId: retry1.publicId,
+    });
+    expect(retry2.retryOf).toBe(retry1.publicId);
+    expect(retry2.resendReason).toBe("OPERATOR_RETRY_AFTER_DEAD_LETTER");
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Abuse guard: once P101 is delivered, staff CANNOT call `retry` on either `retry1` (old dead) or `retry2` (delivered)
+    for (const targetId of [first.publicId, retry1.publicId, retry2.publicId]) {
+      await expect(
+        staffCaller.production.order.retry({ orderPublicId, dispatchPublicId: targetId }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        cause: expect.objectContaining({ reasonCode: "PRODUCTION_ALREADY_DELIVERED" }),
+      });
+    }
+  });
+
+  it("Part B: enforces orders.production.redeliver step-up, REDELIVER phrase, audit reason hygiene, redeliveryOf linkage, and X-ReadyPackets-Redelivery-Of header", async () => {
+    const stepUpAdmin = makeStepUpAdmin(h);
+    const noStepUpAdmin = makeStepUpAdmin(h, { stepUpAt: null });
+    const staleStepUpAdmin = makeStepUpAdmin(h, {
+      stepUpAt: new Date(h.clock.now().getTime() - STEP_UP_MAX_AGE_MS - 5_000),
+    });
+    const staff = makeStaff(h);
+    const customer = makeCustomer(h);
+    await configureEnabledProduction(stepUpAdmin);
+
+    const adminCaller = createCaller(stepUpAdmin);
+    const noStepUpCaller = createCaller(noStepUpAdmin);
+    const staleStepUpCaller = createCaller(staleStepUpAdmin);
+    const staffCaller = createCaller(staff);
+    const customerCaller = createCaller(customer);
+
+    const { orderPublicId } = seedOrderAndCustomer({
+      orderId: 964,
+      orderPublicId: "01JORDER000000000000000964",
+      reference: "ORD-2026-0964",
+      packets: [{ packetNumber: 5, tier: "Premium" }],
+    });
+
+    // Deliver original P101
+    const original = await staffCaller.production.order.requestP101({ orderPublicId });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // Also create a failed P201 to verify redeliver rejects non-delivered rows
+    nextHttpHandler = async () => ({
+      status: 422,
+      headers: {},
+      body: Buffer.from("invalid", "utf8"),
+    });
+    const failedP201 = await staffCaller.production.order.requestP201({
+      orderPublicId,
+      phase1ArtifactsConfirmed: true,
+    });
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+
+    // 1. Customer & staff denied (`orders.production.redeliver` is admin + step-up only)
+    await expect(
+      customerCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Customer attempt",
+        confirmation: "REDELIVER",
+      }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    await expect(
+      staffCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Staff attempt without capability",
+        confirmation: "REDELIVER",
+      }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      cause: expect.objectContaining({ reasonCode: "CAPABILITY_NOT_GRANTED" }),
+    });
+
+    // 2. Admin without fresh step-up -> STEP_UP_REQUIRED
+    for (const caller of [noStepUpCaller, staleStepUpCaller]) {
+      await expect(
+        caller.production.order.redeliver({
+          orderPublicId,
+          dispatchPublicId: original.publicId,
+          reason: "Valid audit reason",
+          confirmation: "REDELIVER",
+        }),
+      ).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        cause: expect.objectContaining({
+          code: "STEP_UP_REQUIRED",
+          reasonCode: "STEP_UP_REQUIRED",
+        }),
+      });
+    }
+
+    // 3. Server-side validation of typed phrase `REDELIVER` and printable reason (3..280 chars)
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "Valid audit reason",
+        confirmation: "redeliver",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_CONFIRMATION_REQUIRED" }),
+    });
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "  x ",
+        confirmation: "REDELIVER",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_REASON_REQUIRED" }),
+    });
+
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: original.publicId,
+        reason: "bad\r\nheader-injection",
+        confirmation: "REDELIVER",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({ reasonCode: "REDELIVER_REASON_REQUIRED" }),
+    });
+
+    // 4. Non-delivered dispatch rejected (`PRODUCTION_DISPATCH_NOT_DELIVERED`)
+    await expect(
+      adminCaller.production.order.redeliver({
+        orderPublicId,
+        dispatchPublicId: failedP201.publicId,
+        reason: "Trying to redeliver a failed dispatch",
+        confirmation: "REDELIVER",
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      cause: expect.objectContaining({ reasonCode: "PRODUCTION_DISPATCH_NOT_DELIVERED" }),
+    });
+
+    // 5. Valid step-up admin redelivery -> NEW delivery row with `redeliveryOf`, outbound header, and safe audit
+    nextHttpHandler = async () => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: Buffer.from('{"replayed":true}', "utf8"),
+    });
+    const sensitiveProseReason = "SharePoint folder tree purged during maintenance — replay P101";
+    const redelivered = await adminCaller.production.order.redeliver({
+      orderPublicId,
+      dispatchPublicId: original.publicId,
+      reason: sensitiveProseReason,
+      confirmation: "REDELIVER",
+    });
+
+    expect(redelivered.publicId).not.toBe(original.publicId);
+    expect(redelivered.redeliveryOf).toBe(original.publicId);
+    expect(redelivered.retryOf).toBeNull();
+    expect(redelivered.resendReason).toBe("OPERATOR_REPLAY_DELIVERED");
+    expect(redelivered.idempotencyKey).toBe(`rp-prod:p101:${redelivered.publicId}`);
+
+    await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    const lastHttp = httpCalls[httpCalls.length - 1]!;
+    expect(lastHttp.headers?.["X-ReadyPackets-Delivery"]).toBe(redelivered.publicId);
+    expect(lastHttp.headers?.["X-ReadyPackets-Redelivery-Of"]).toBe(original.publicId);
+    expect(lastHttp.headers?.["Idempotency-Key"]).toBe(`rp-prod:p101:${redelivered.publicId}`);
+    // Original P101 did NOT carry X-ReadyPackets-Redelivery-Of
+    expect(httpCalls[0]!.headers?.["X-ReadyPackets-Redelivery-Of"]).toBeUndefined();
+
+    // History preserves BOTH the original delivered row and the new redelivery row
+    const history = await staffCaller.production.order.history({ orderPublicId });
+    const newHistRow = history.items.find((i) => i.publicId === redelivered.publicId);
+    const origHistRow = history.items.find((i) => i.publicId === original.publicId);
+    expect(newHistRow?.state).toBe("delivered");
+    expect(newHistRow?.redeliveryOf).toBe(original.publicId);
+    expect(origHistRow?.state).toBe("delivered");
+    expect(origHistRow?.redeliveryOf).toBeNull();
+
+    // Audit records `integration.production.dispatch.redelivered` with `orderPublicId` and `reason_length` (NEVER raw prose)
+    const redeliverAudit = h.audit.events.find(
+      (e) =>
+        e.eventName === "integration.production.dispatch.redelivered" &&
+        e.resource?.publicId === redelivered.publicId,
+    );
+    expect(redeliverAudit).toBeDefined();
+    expect(redeliverAudit?.severity).toBe("WARN");
+    expect(redeliverAudit?.orderPublicId).toBe(orderPublicId);
+    expect(redeliverAudit?.attributes).toMatchObject({
+      phase: "P101",
+      order_public_id: orderPublicId,
+      redelivery_of_public_id: original.publicId,
+    });
+    expect(redeliverAudit?.safeCounts).toEqual({
+      reason_length: sensitiveProseReason.length,
+    });
+    expect(JSON.stringify(h.audit.events)).not.toContain("SharePoint folder tree purged");
   });
 });

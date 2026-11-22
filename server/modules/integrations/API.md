@@ -430,13 +430,15 @@ All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate se
 ## 4. Audit Events, Health Components & Tables
 
 - **New Increment 04 audit events**:
+  - `integration.production.dispatch.retried`, `integration.production.dispatch.redelivered` (plus `orderPublicId` linkage across all order-scoped `integration.production.dispatch.*` events)
   - `integration.webhooks.settings_updated`
   - `integration.webhook.subscription_created`, `integration.webhook.subscription_updated`, `integration.webhook.subscription_paused`, `integration.webhook.subscription_resumed`, `integration.webhook.subscription_secret_rotated`, `integration.webhook.subscription_deleted`, `integration.webhook.subscription_auto_disabled`, `integration.webhook.subscription_tested`
   - `integration.webhook.delivered`, `integration.webhook.delivery_failed`, `integration.webhook.redelivered`
   - `integration.webhook.inbound_created`, `integration.webhook.inbound_updated`, `integration.webhook.inbound_secret_rotated`, `integration.webhook.inbound_deleted`, `integration.webhook.inbound_received`, `integration.webhook.inbound_rejected`, `integration.webhook.inbound_reprocessed`
 - **Health components**: adds `integrations.webhooks` (`disabled` when off, `healthy` / `degraded` when on).
-- **Additive Increment 04 tables (`server/modules/integrations/schema.ts`)**:
+- **Additive Increment 04 tables & columns (`server/modules/integrations/schema.ts`)**:
   - `integration_webhook_subscriptions`
   - `integration_webhook_inbound_endpoints`
   - `integration_webhook_deliveries`
   - `integration_webhook_delivery_attempts`
+  - `integration_production_dispatches.retry_of_public_id` (`varchar(26)` nullable) and `integration_production_dispatches.redelivery_of_public_id` (`varchar(26)` nullable, indexed via `idx_prod_dispatch_redelivery_of`)
