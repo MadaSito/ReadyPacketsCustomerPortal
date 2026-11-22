@@ -97,11 +97,22 @@ What `deploy/upgrade.sh` does and asks at each gate:
 
 ## Increment 04 and migration `0003`
 
-The upgrade job is configured to install Increment 03 at `89c5cb8`, create an administrator session with MFA and live customer/order data, then upgrade to the candidate and check that migration `0003` is recorded once. For production, rehearse this exact release and migration on a restored copy, keep the verified pre-upgrade archive and keys off-host, and preserve the traffic fence until database, application, and edge readiness checks pass. The migration is additive, but a partially applied set of MySQL DDL statements is still possible; additive does not imply safe binary rollback.
+The native CI job is configured to start from Increment 03 at `89c5cb8`, enroll an administrator in MFA, seed customer and order data, upgrade, and check that migration `0003` is recorded once. This is not acceptance on a live host. Rehearse the reviewed release and migration on an isolated restore before upgrading production. Migration `0003_increment_04` adds 48 tables and 10 nullable columns; MySQL DDL can still be partially applied if the upgrade is interrupted.
+
+1. **Prepare**: In the root-owned `/opt/readypackets-src` checkout, fetch and check out the exact reviewed full Increment 04 commit as in [section 2](#2-prepare-optreadypackets-src-at-the-reviewed-commit). Check that `HEAD` matches and the tracked tree is clean.
+2. **Drain**: Sign in with local administrator MFA, start worker maintenance at `/admin/maintenance`, and wait for zero running jobs and zero unresolved outcomes. Reconcile unknown jobs and stop other writers before proceeding. The new customer maintenance setting is separate; it does not drain jobs.
+3. **Run the same upgrader**: In `/opt/readypackets-src`, run `sudo bash deploy/upgrade.sh <reviewed-full-commit-sha>` without `--yes`. The script installs missing Ubuntu `ffmpeg` and `util-linux` packages before stopping services. At `DRAINED`, verify the displayed counts and confirm that public traffic can be fenced.
+4. **Back up before migration**: Record the verified backup ID; copy its encrypted archive off-host and compare its SHA-256 against the printed digest. Ensure the backup key is in separate off-host custody and that the application keys needed for recovery are available separately. Only then type `BACKUP-VERIFIED`.
+5. **Migrate and reopen**: Let the script apply the migration, switch releases, refresh Nginx and check loopback and HTTPS edge health/readiness while traffic remains fenced. Confirm `REOPEN` only after those checks pass. Sign in with MFA, use **End maintenance** to resume worker claims, and confirm edge readiness, a representative customer order, and normal queue processing.
 
 If migration starts and anything fails, keep writers stopped and ingress fenced. Reconcile the Drizzle journal and actual schema with the reviewed migration; either complete the forward fix under DBA review or restore the verified pre-upgrade backup into clean isolated targets and validate the prior release there. Do not delete the journal entry, drop new columns to undo the upgrade, or just swap the `current` symlink back. If traffic has already reopened, account for writes made after the backup before using any restored database as production.
 
-Leave optional integrations disabled until tested. FFmpeg being present does not enable audio conversion; the default executable is `/usr/bin/ffmpeg`, and missing conversion tooling must not prevent original uploads. Application Protection starts in detect mode without country restrictions. See [Media and country database setup](MEDIA_AND_GEOIP.md) for configuration, local database custody, and the emergency bypass.
+### What to switch on first
+
+- **Baseline**: Verify local administrator MFA, the recovery procedure, the audit trail, and `/admin/storage/copies`. The read-only Copy log needs no switch. New optional features are off by default; Increment 03 settings already in use are not reset.
+- **Protection**: Review events in Detect mode before enforcing rules. There are no country blocks by default and no MMDB is bundled. If needed, configure a local read-only MMDB and confirm address/country behavior and administrator recovery before enabling restrictions. See [Media and country database setup](MEDIA_AND_GEOIP.md).
+- **Customer features**: Enable and exercise one feature at a time with synthetic data in staging. Start with Knowledge or workflow configuration. FFmpeg being installed does not enable recording or conversion; test a conversion and confirm that the original is retained before enabling this for customers.
+- **External services**: Confirm consent behavior before enabling analytics, and use a test receiver for API/webhooks. Leave `payments.config.provider` at `none` until you have verified the hosted redirect, signed callback, provider read-back and invoice result in the provider's test environment.
 
 ---
 

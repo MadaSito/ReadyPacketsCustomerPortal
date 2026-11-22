@@ -266,23 +266,33 @@ exercised against a real external service.
 | INC03-9 | "off system backups to cloud storage … 3-2-1 advance backup strategy" | backup | `server/modules/backup` (off-site copies, 3-2-1 status), `cl/features/backup` | backup module tests [db, local fakes]; [browser] page and "not met" status with no destinations | Verified by automated test — no copy to a real provider |
 | INC03-10 | Customer ID "RPCUS-Unique 9 characters using 0-9 and A-Z … never … incremental" | identity | `generateCustomerRef()` in `server/modules/identity/users.ts` | `server/modules/identity/pure.test.ts` [unit]; seeded database shows the format | Verified by automated test |
 
-## Increment 04 — workflow rules and console order actions (orders)
+## Increment 04
 
-Source: `docs/engineering/INCREMENT_04_CONTRACT.md` package A and item 13. Evidence is the owner's test files, run one at a time; see
-`server/modules/orders/VERIFICATION.md` (increment 04). Both features ship disabled.
+The first 14 rows follow the [owner's requirements](../engineering/INCREMENT_04_CONTRACT.md). The last two track the Copy log and manual resend confirmations. Automated evidence is limited to the scenarios and environments in the linked records. It does not imply full-browser, assistive-technology or live-provider acceptance.
 
-| ID | Requirement (short) | Owner | Implementation | Evidence | Status |
-| --- | --- | --- | --- | --- | --- |
-| INC04-A1 | Workflow phases with locks when an order leaves a phase; staff unlock with a reason | orders | `server/modules/orders/requirements.ts`, `order_phase_locks`; `cl/features/orders/WorkflowRulesPanel.tsx` | `requirements.test.ts` [db, fake Files]; `rules.test.tsx` [jsdom] | Verified by automated test — no browser pass yet |
-| INC04-A2 | Status requirements: upload slots and acknowledgements that block leaving a status | orders | `requirements.ts`, `order_acknowledgements`, files ports; order-page checklist and acknowledgement dialog | `requirements.test.ts` [db]; `rules.test.tsx` [jsdom] | Verified by automated test — real Files counting not exercised |
-| INC04-A3 | Designer steps for phases and requirements (wizard and canvas), API integration actor | orders | `workflowDesign.ts`; `cl/features/orders/pages/workflows/rulesFields.tsx` | `requirements.test.ts` validation cases [db]; `workflows.test.tsx` [jsdom] | Verified by automated test |
-| INC04-13 | Console: new order for a customer, reassign with a customer picker, access for other platform users (one order or all of a customer's orders) | orders | `access.ts`, router `orders.admin.*`; `cl/features/orders/ConsoleOrderTools.tsx`, customer tab | `requirements.test.ts` access cases [db]; `rules.test.tsx`, `orders.test.tsx` [jsdom] | Verified by automated test — real identity step-up not exercised |
-| INC04-A4 | Every new page and central dialog designed and tested against WCAG 2.2 AA in light and dark | orders | as above | `rules.test.tsx` `pageA11y` (6 cases) [jsdom + axe, no contrast] | Partially verified — contrast, 320 px and screen readers need the browser pass |
+| ID | Requirement | Owner evidence and scope | Status |
+| --- | --- | --- | --- |
+| INC04-01 | Workflow phases, locks, required files and acknowledgements; audio upload, recording and conversion | [Orders](../../server/modules/orders/VERIFICATION.md) and [Files](../../server/modules/files/VERIFICATION.md): MySQL workflow and file checks, synthetic audio processed by local FFmpeg and mocked browser media APIs. | implemented; verified by automated tests / not verified in a browser |
+| INC04-02 | Application Protection, rate limits, IP blocking, sign-in logs and session restrictions | [Protection](../../server/modules/protection/VERIFICATION.md) and [Identity](../../server/modules/identity/VERIFICATION.md): local policy, recovery, authorization and session tests; deployed proxy/country behavior is separate. | implemented; verified by automated tests / not verified in a browser |
+| INC04-03 | Customer maintenance with notice and sign-in restriction, separate from worker drain | [Jobs](../../server/modules/jobs/VERIFICATION.md) and [Identity](../../server/modules/identity/VERIFICATION.md): window boundaries, audit, login/registration checks and jsdom UI. | implemented; verified by automated tests / not verified in a browser |
+| INC04-04 | Administrator-published and searchable customer Knowledge Base | [Knowledge](../../server/modules/knowledge/VERIFICATION.md): database, HTTP/attachment and jsdom coverage; no assistive-technology walkthrough. | implemented; verified by automated tests / not verified in a browser |
+| INC04-05 | Administrator-controlled community forum | [Community](../../server/modules/community/VERIFICATION.md): database moderation, access and anti-spam checks plus jsdom; no production-scale search measurement. | implemented; verified by automated tests / not verified in a browser |
+| INC04-06 | Referral rewards, customer history and link sharing/email | [Referrals service tests](../../server/modules/referrals/referrals.test.ts): synthetic attribution and reward paths. | implemented |
+| INC04-07 | Scoped inbound API and signed inbound/outbound webhooks, filterable logs and guarded replay | [Public API](../../server/modules/publicApi/VERIFICATION.md) and [Webhooks](../../client/src/features/integrations/webhooks/VERIFICATION.md): synthetic service/UI checks, not evidence for all domain providers or live receivers. | implemented; verified by automated tests / not verified in a browser / not verified against the real provider |
+| INC04-08 | Light, Dark and System mode | [Application shell](../../client/src/app/VERIFICATION.md): theme, semantic tokens and jsdom checks. | implemented; verified by automated tests / not verified in a browser |
+| INC04-09 | Responsive layouts across screen sizes | [Application shell](../../client/src/app/VERIFICATION.md) and [accessibility coverage](ACCESSIBILITY.md): automated DOM checks cover responsive component variants, not browser reflow or device coverage. | implemented; verified by automated tests / not verified in a browser |
+| INC04-10 | Consent management supporting PostHog and Microsoft Clarity | [Platform](../../server/modules/platform/VERIFICATION.md) and [Integrations](../../server/modules/integrations/VERIFICATION.md): receipt, preferences and loader tests; no cloud ingestion acceptance. | implemented; verified by automated tests / not verified in a browser / not verified against the real provider |
+| INC04-11 | Customer sidebar, drawer and phone navigation | [Application shell](../../client/src/app/VERIFICATION.md) and [shell tests](../../client/src/app/shell.test.tsx): DOM navigation behavior, not real-device layout. | implemented; verified by automated tests / not verified in a browser |
+| INC04-12 | Cart and hosted Stripe/Square checkout | [Cart](../../server/modules/cart/VERIFICATION.md) and [Payments](../../server/modules/payments/VERIFICATION.md): transactional checkout, raw callbacks and synthetic provider checks, not a live hosted round-trip. | implemented; verified by automated tests / not verified in a browser / not verified against the real provider |
+| INC04-13 | Console order creation, reassignment and delegated access | [Orders](../../server/modules/orders/VERIFICATION.md): database and jsdom coverage; real identity step-up not exercised by that owner suite. | implemented; verified by automated tests / not verified in a browser |
+| INC04-14 | Accessibility: designed and tested against WCAG 2.2 AA | [Application shell](../../client/src/app/VERIFICATION.md) and [accessibility evidence](ACCESSIBILITY.md): light/dark DOM checks and separate browser and assistive-technology gaps. | implemented; verified by automated tests / not verified in a browser |
+| INC04-C1 | Administrator Copy log with filters, safe details, CSV and owner-guarded retries | [Storage](../../server/modules/storage/VERIFICATION.md): database and jsdom coverage, with Backup and SharePoint writer evidence. | implemented; verified by automated tests / not verified in a browser / not verified against the real provider |
+| INC04-C2 | Manual resend after unknown mail outcome with fresh verification and duplicate-risk acknowledgment | [Jobs](../../server/modules/jobs/VERIFICATION.md): MySQL, synthetic transport and jsdom; no live mailbox verification. | implemented; verified by automated tests / not verified in a browser / not verified against the real provider |
 
 ## Summary
 
-Counts by primary status across all 144 rows above (PI 17, MP 104, ARCH 9, INC02 4, INC03 10), computed from the
-Status column at refresh:
+Historical counts by primary status through Increment 03 (PI 17, MP 104, ARCH 9, INC02 4, INC03 10), computed from the
+Status column at that refresh. The 16 Increment 04 rows are tracked separately:
 
 | Status | Count |
 | --- | --- |

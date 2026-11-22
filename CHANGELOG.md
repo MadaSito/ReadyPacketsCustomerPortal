@@ -5,6 +5,42 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 04
+
+### Added
+
+- **Workflow phases and requirements** (`/admin/workflows`): enable `orders.workflow_rules.enabled`, then publish a workflow version with phase locks, upload slots and acknowledgements.
+- **Console order tools** (`/admin/orders`, `/admin/customers/:customerId`): create and reassign by capability with no switch; enable `orders.console_access.enabled` to grant or revoke delegated access.
+- **Audio recording and conversion** (`/admin/files`): enable `files.audio_conversion.enabled` for browser recording and local WebM/Opus conversion; the original is retained.
+- **Customer maintenance** (`/admin/maintenance`): enable the customer access notice and set a window separately from worker drain; staff and administrators can still sign in.
+- **Knowledge Base and Help Centre** (`/admin/knowledge`, `/help`): enable `feature.knowledge` and publish customer-facing articles.
+- **Community forum** (`/admin/community/settings`, `/community`): enable `feature.community` and configure categories, posting rules and moderation.
+- **Referrals** (`/admin/referrals`, `/account/referrals`): enable `feature.referrals` and configure `referrals.program` for reward rules and approval.
+- **Inbound API v1** (`/admin/api`, `/admin/api/log`): enable `publicApi.enabled` and issue scoped keys; eligible logged requests can be replayed with fresh verification.
+- **Signed webhooks** (`/admin/integrations/webhooks`): enable `feature.integrations.webhooks`; configure inbound endpoints or outbound subscriptions and review or rerun eligible deliveries.
+- **Cookies and consent** (`/admin/privacy`): enable `feature.privacy.consent` for the preference centre and ledger; `feature.integrations.posthog` and `feature.integrations.clarity` separately gate their vendors.
+- **Cart and checkout** (`/admin/carts`, `/cart`): enable `feature.cart`; server-side pricing, orders and invoices work without an online payment provider.
+- **Hosted online payments** (`/admin/payments`): set `payments.config.provider` to Stripe or Square after testing; `none` keeps invoice payment. [ADR 0035](docs/adr/0035-hosted-checkout-payments.md) partially supersedes ADR 0014.
+- **Storage Copy log** (`/admin/storage/copies`): no separate switch; records attempts when order files, backups or SharePoint order data are copied to enabled destinations.
+
+### Changed
+
+- **Customer navigation** (customer portal): desktop sidebar, smaller-screen drawer and phone shortcuts with More, with no separate switch; feature-dependent links stay hidden while off.
+- **Theme and responsive layout** (portal and console): System, Light and Dark are available without a feature switch; shared controls and layouts adapt to screen size.
+- **Accessibility** (`/accessibility`): public accessibility information and UI designed and tested against WCAG 2.2 AA; see the [verification record](docs/verification/ACCESSIBILITY.md) for coverage and gaps.
+- **Unknown mail outcomes** (`/admin/mail`): no automatic resend or failover; an administrator may queue a separate send after fresh verification and explicit acknowledgment of duplicate risk. No feature switch.
+
+### Security
+
+- **Application Protection** (`/admin/protection`): starts in Detect mode; review events before switching to Enforce or adding IP/country controls. Rate-limit budgets remain bounded.
+- **Session centre and restrictions** (`/admin/sessions`, `/admin/sign-in-log`, `/admin/session-restrictions`): logs and session-ending tools are available by capability; restrictions apply only as configured.
+- **Payment confirmation** (`/admin/payments`): enabled providers require both a valid webhook and matching payment details fetched from the provider; the browser return cannot mark an invoice paid.
+
+### Operations
+
+- **Native upgrade** (`deploy/upgrade.sh`): `0003_increment_04` is additive, with 48 new tables and 10 nullable columns on existing tables. Keep the encrypted backup and keys off-host before migration.
+- **Media and country data**: native install, upgrade and the image include FFmpeg and `prlimit` for optional audio conversion. The operator provides any optional country MMDB locally; no network lookup.
+
 ## [Unreleased]
 
 ### Added

@@ -31,6 +31,7 @@ change. It describes intent and state; it is not a certification or a guarantee.
 - `docs/source-specs/ARCHITECTURE.md` — technical architecture (with diagrams in `docs/source-specs/media/`)
 - `docs/source-specs/increment-02/` — Master Offerings Matrix v3.0 and the P101 / P201 production webhook
   references (the "corrected" P101 logic wins where the two webhook documents differ)
+- [Increment 04 contract](../engineering/INCREMENT_04_CONTRACT.md) and ADRs 0029–0037
 - `docs/brand/` — brand guide and colour tokens; approved assets in `client/public/brand`, fonts in `client/public/fonts`
 - This repository: GitHub `MadaSito/ReadyPacketsCustomerPortal` (private)
 - Previous implementation: GitHub `readypackets/ReadyPackets-SiteSplit` (reference only; its documented defects are not carried over)
@@ -48,12 +49,14 @@ Modular monolith. One codebase runs as `RP_ROLE=web`, `worker` or `all`.
 client/            React application (features/<module>, ui design system, app shells)
 server/core        contracts, errors, request context, ids, clock
 server/config      validated configuration (fails closed on weak or missing secrets)
-server/http        request pipeline: context → host → headers/CSP → session → CSRF → rate limit → routes
+server/http        request pipeline: context → host/edge admission and protection → isolated service routes
+                   or browser path (headers/CSP, bounded body parsing, session and CSRF checks)
 server/security    field encryption, rate limiter
 server/observability structured logger with redaction and correlation
 server/trpc        procedure guards and root router
 server/modules     identity, assurance, orders, files, engagement, compliance, audit, siem, platform,
-                   jobs, portable, backup, integrations
+                   jobs, portable, backup, integrations, mailTemplates, automations, storage, sharepoint,
+                   protection, publicApi, knowledge, community, referrals, cart, payments
 portable/          vendor-neutral portable data contract, verifier CLI, reference importer, adapters
 deploy/            native auto-install and manual kit, Nginx templates, systemd, MySQL; docker/ = evaluation
 migrations/        versioned forward-only SQL migrations
@@ -93,7 +96,7 @@ Contract: `docs/engineering/INCREMENT_03_CONTRACT.md`; decisions: ADRs 0024–00
 
 - **Mail**: one mail engine with SMTP and Microsoft Graph transports and a primary / secondary route. The
   secondary is tried only when the primary definitely did not accept the message; an unknown outcome is
-  never resent. Sender, reply-to and an audit copy mailbox are settings (`/admin/email-delivery`). Sent
+  never resent automatically. Sender, reply-to and an audit copy mailbox are settings (`/admin/email-delivery`). Sent
   content is stored (encrypted, time-limited) only when retention is on; then the Mail page offers "View
   message" to holders of `mail.content.read`.
 - **Templates** (`/admin/email-templates`): system and custom templates, HTML or text, logic-less
@@ -119,6 +122,37 @@ Contract: `docs/engineering/INCREMENT_03_CONTRACT.md`; decisions: ADRs 0024–00
 - **Client API facades**: features that type their own API facade must add it to
   `client/src/features/facadeContracts.typecheck.ts` so drift from the server router fails the type check.
 - **Upgrading an installed server**: `docs/operations/UPGRADE.md` (`deploy/upgrade.sh`).
+
+## Increment 04 components and operating defaults
+
+Migration [`0003_increment_04`](../../migrations/0003_increment_04.sql) adds 48 tables and 10 nullable columns. The release adds new console features without turning on optional customer surfaces or external providers, and leaves existing configuration in place. Application Protection starts in Detect, not Enforce.
+
+| Module | Responsibility and switches |
+| --- | --- |
+| `protection` | Application-level rules, IP/country lists, rate-limit tuning and correlated events at `/admin/protection`. Supplements the network firewall. |
+| `publicApi` | Scoped service keys, optional signing, write idempotency, redacted request log and guarded replay. `publicApi.enabled` defaults off (`/admin/api`, `/admin/api/log`). |
+| `knowledge` | Versioned articles, search and attachment access at `/help`; enable `feature.knowledge` and publish content at `/admin/knowledge`. |
+| `community` | Moderated forum, search, reports and categories. `feature.community` defaults off (`/admin/community/settings`, `/community`). |
+| `referrals` | Registration attribution, link sharing and an auditable reward ledger. `feature.referrals` defaults off; `referrals.program` holds the policy (`/admin/referrals`, `/account/referrals`). |
+| `cart` | Server-priced cart, checkout, order and invoice creation; `feature.cart` defaults off (`/cart`, `/admin/carts`). |
+| `payments` | Hosted Stripe or Square checkout plus signature and provider read-back checks. `payments.config.provider` defaults to `none` (invoice payment). Browser return is read-only. |
+| `orders`, `files` | `orders.workflow_rules.enabled` governs publishing new phase/requirement rules, `orders.console_access.enabled` governs delegated grants, and `files.audio_conversion.enabled` governs recording and conversion. Existing published rules keep applying. Create-for-customer and reassignment are capability-gated without a new switch. |
+| `identity`, `jobs` | Session centre, sign-in log, configurable restrictions and forced session endings; customer maintenance is off by default and separate from worker drain. Unknown mail is never retried automatically; a manual resend needs step-up and explicit duplicate-risk acknowledgement. |
+| `platform`, `integrations` | Cookie consent ledger (`feature.privacy.consent`), opt-in analytics (`feature.integrations.posthog`, `feature.integrations.clarity`), and signed inbound/outbound webhooks (`feature.integrations.webhooks`). Optional features default off. |
+| `storage`, `backup`, `sharepoint` | Copy log at `/admin/storage/copies` projects copy attempts without replacing the owning ledgers. No separate switch; new attempts appear as enabled destinations receive work. |
+
+### Capabilities
+
+- **Protection and sessions**: `security.firewall.read`, `security.firewall.manage`, `sessions.read_all`, `sessions.policy.manage`.
+- **Orders and content**: `orders.phase.unlock`, `orders.access.grant`, `knowledge.manage`, `community.moderate`, `community.manage`, `referrals.read_all`, `referrals.manage`.
+- **API, privacy and payments**: `api.keys.manage`, `api.logs.read`, `api.replay`, `webhooks.manage`, `privacy.consent.read`, `privacy.consent.manage`, `payments.manage`, `carts.read_all`, `storage.copies.read`. The [capability registry](../../shared/capabilities.ts) defines role grants and which mutations need fresh step-up.
+
+### HTTP and deployment changes
+
+- **Isolated raw routes**: `/api/v1` and `/api/v1/openapi.json`; `POST /api/webhooks/inbound/:endpointPublicId`; `POST /api/payments/webhooks/:provider` and `GET /api/payments/return/:provider/:attemptPublicId`. These do not get browser-session authority; raw JSON is bounded to 256 KiB. Use the canonical HTTPS host for provider callbacks.
+- **Browser routes**: `GET`, `POST` and `DELETE /api/referrals/hold` manage first-party attribution; `POST /api/knowledge/attachments/:articlePublicId` uploads and `POST /api/knowledge/attachments/download` redeems an authorized download ticket. Customer maintenance status uses the public `jobs.maintenance.customerAccess` tRPC query; it is not a raw router.
+- **Environment**: `RP_FFMPEG_PATH` defaults to `/usr/bin/ffmpeg`; optional `PROTECTION_MMDB_PATH` names an offline country file; `PROTECTION_COUNTRY_HEADER` allows only `x-readypackets-country` from an explicitly trusted direct proxy that overwrites it (bundled proxies strip it). `PROTECTION_DISABLED=1` temporarily bypasses Application Protection and restores baseline rate limits, not authentication or MFA. See [media and country setup](../operations/MEDIA_AND_GEOIP.md).
+- **Customer navigation**: expanded/collapsible sidebar on large screens, drawer below that, and up to four phone shortcuts plus More. Support and Account have separate groupings; switched-off feature links disappear. System, Light and Dark use the shared theme control; the current theme choice is held in memory. The UI is designed and tested against WCAG 2.2 AA; see [coverage and gaps](../verification/ACCESSIBILITY.md).
 
 ## Deployment profiles
 

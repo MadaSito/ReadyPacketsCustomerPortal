@@ -9,12 +9,21 @@ Status and verification evidence are tracked in `docs/application-context/`, `do
 `VERIFICATION.md`. Nothing in this repository should be read as a certification, a guarantee of security, or a
 WCAG/ADA conformance claim.
 
+## Features
+
+- **Customer portal**: orders, workflow checklists and acknowledgements, private uploads, optional audio recording, invoices and support. A sidebar, a smaller-screen drawer, phone shortcuts and System/Light/Dark themes support different devices.
+- **Staff and administrator console**: order creation and reassignment, delegated order access, session and sign-in tools, customer maintenance, an audit centre, and secure SIEM/syslog forwarding.
+- **Optional customer tools**: searchable Help Centre, moderated community, referral rewards, and a server-priced cart with invoice payment or hosted Stripe/Square checkout. The portal does not collect card details.
+- **Optional integrations**: Microsoft Entra OIDC, outbound mail, scoped API v1, signed webhooks, consent-gated PostHog and Clarity, and cloud copies for files, backups and SharePoint order data. The Copy log distinguishes accepted writes from verified copies.
+- **Self-hosted operations**: encrypted backups and restore drills, forward-only native upgrades, and application-level IP, country and rate-limit controls. Browser interfaces are designed and tested against WCAG 2.2 AA; see the [accessibility evidence](docs/verification/ACCESSIBILITY.md) for coverage and gaps.
+
 ## Quick start
 
 ### Prerequisites
 
 - Node.js `>=22.12 <23` and pnpm `12.21.0` (`packageManager` in `package.json`).
 - MySQL 8.4 and the matching `mysql` and `mysqldump` client tools (needed by backups and the backup tests).
+- FFmpeg and `prlimit` for optional audio conversion. The native installer and packaged image include them.
 - Linux or macOS for development. Native deployment targets Ubuntu 24.04 or 26.04 LTS.
 
 ### Local development
