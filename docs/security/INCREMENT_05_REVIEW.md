@@ -9,7 +9,7 @@ Scope: Package G review against `docs/engineering/INCREMENT_05_CONTRACT.md`, dec
 | Workflow transfer | Bounded and strict parsing (size, depth, key safety, duplicate keys); recomputed digest as integrity only; reference mapping; no secrets or customer data on export; import capability, live step-up, replay safety, and draft-only persistence. | HTTP bounds and batch refusal verified; source confirms strict schema, persisted step-up and draft insertion. A1 regressions passed after fixes below. |
 | Promotions and order pricing | Uniform inaccessible-code errors; IP/account throttling and pause; verified e-mail and staff self-redemption; entitlement before cart tips; atomic redemption limits and cancellation before payment; combined discount guard; fragment-only sharing; log/CSV redaction and formula-safe export. | Shared log redaction and POST transport verified; throttling, redemption, and payment-fence findings below. |
 | Cart upsell | Cart ownership and eligibility under lock; server-priced, active products only; safe retry and atomic changes; separate admin capability and default-off setting. | Catalogue reads and replay findings resolved; focused suite passed with a single-connection pool. |
-| Policy acceptance log | Capability gates on all evidence reads; customer scope and safe projections; signer names only in authorized detail, never list/export; step-up, bounded and formula-safe CSV; no evidence mutation. | Server authorization, privacy, and export regressions passed. Client continuation on an empty capped page needs verification. |
+| Policy acceptance log | Capability gates on all evidence reads; customer scope and safe projections; signer names only in authorized detail, never list/export; step-up, bounded and formula-safe CSV; no evidence mutation. | Server authorization, privacy, and export regressions passed; both client views passed the empty-page continuation regression. |
 
 ## Request telemetry
 
@@ -21,12 +21,6 @@ The scoped redaction suite passed 22/22, including structured JSON, URL query an
 
 The default HTTP JSON limit is 256 KiB. The exact unbatched POST routes `orders.admin.workflows.transfer.preview` and `orders.admin.workflows.transfer.applyImport` have a 4 MiB + 256 KiB envelope limit after origin admission, authoritative session resolution, and CSRF validation. This allows a 2 MiB JSON document as escaped text plus apply decisions. Comma-delimited calls and requests with a `batch` query parameter are refused when they target either procedure. The tRPC dependency reserves `apply`, so the procedure is named `applyImport` with no legacy alias. The direct HTTP suite passed 30/30 against synthetic tRPC routers; deployed proxy parity and semantic package validation are separate checks.
 
-## Open findings
-
-| ID | Severity | Finding and status |
-| --- | --- | --- |
-| G-D4-03 | Medium | `AcceptanceLogTab.tsx:346–361` hides the continuation control if accumulated rows are empty. A bounded server scan can return no items and a non-null cursor even when later records match. Show the control and avoid claiming there are no matching records until the cursor is exhausted. Verify both the log and customer Policies tab. |
-
 ## Resolved findings
 
 - **G-A1-01 and G-A1-02, replay and parse bounds:** `529f4af` checks the supplied digest before replay and bounds traversal before enqueueing, without array spread. Published policy lookups run before the transaction to avoid borrowing a second connection while holding one. Concurrent withdrawal can leave a stale reference on a draft; runtime gate enforcement fails closed. Independently ran `workflowTransfer.test.ts`, 14/14, including the same-key invalid-digest replay and wide-document regressions.
@@ -36,6 +30,7 @@ The default HTTP JSON limit is 256 KiB. The exact unbatched POST routes `orders.
 - **G-C3-02, conservative release fence:** `97f2178`, `210539d`, and `7bdce16` require zero gross paid, no payable invoice, and no provider attempt ever for automatic or manual release; unavailable evidence keeps the redemption used. An administrator can issue a replacement code instead. Independently ran Compliance 13/13, which covers no-invoice/absent Payments and real MariaDB contention where the `NOWAIT` read fails closed and the outer transaction still commits. Orders and Promotions caller tests simulate exposure; the full real-module cancellation-to-redemption chain and real stored rows for every provider attempt status were not exercised together.
 - **G-C2-01, fragment captured after app startup:** `cd7eca6` and `187da97` capture on the exact `/promo` route and remove the fragment synchronously before `createRoot`. Existing analytics paths are limited to exact, fragment-free `/privacy` and `/terms`. These are source checks, not browser or vendor-log verification.
 - **G-D4-01 and G-D4-02, live session binding and bounded export:** `7bdce16` binds reads to the current principal and live session; signed-name detail rechecks persisted authorization before decryption. The row scan caps refinement, reports truncation, and runs outside the final short authorization/audit transaction. The Compliance suite verified role denials, signer privacy, fresh export step-up, formula safety, and scan-limit behavior. Tighten signer access by decrypting inside the short locked authorization callback rather than immediately after commit.
+- **G-D4-03, continuation on a sparse scan:** `67515ce` keeps “Load more” available when an empty page has a continuation cursor and shows the final empty state only when the cursor is exhausted. The focused regression passed independently in both the Acceptance Log and Customer Policies tab. The same client run passed 18/19 overall, with one separate route-heading timeout.
 
 ## Accepted residuals
 
