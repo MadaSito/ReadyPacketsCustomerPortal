@@ -497,6 +497,21 @@ function parseStripeRefundObject(
   const refundId = typeof rawObj.id === "string" ? rawObj.id.trim() : "";
   if (!/^re_[A-Za-z0-9_]{6,120}$/u.test(refundId)) return null;
 
+  const metadata = asRecord(rawObj.metadata);
+  const metaRefundPubId =
+    typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : null;
+  if (expected.requireMetadataMatch && metaRefundPubId !== expected.refundPublicId) {
+    return null;
+  }
+  if (metaRefundPubId && metaRefundPubId !== expected.refundPublicId) {
+    return {
+      status: "unknown",
+      providerRefundRef: refundId,
+      failureReasonCode: "STRIPE_REFUND_METADATA_MISMATCH",
+      settledAt: null,
+    };
+  }
+
   const amount = typeof rawObj.amount === "number" ? rawObj.amount : -1;
   const currency = typeof rawObj.currency === "string" ? rawObj.currency.toUpperCase() : "";
   if (amount !== expected.amountMinor || currency !== expected.currency.toUpperCase()) {
@@ -536,21 +551,6 @@ function parseStripeRefundObject(
       status: "unknown",
       providerRefundRef: refundId,
       failureReasonCode: "STRIPE_REFUND_CHARGE_MISMATCH",
-      settledAt: null,
-    };
-  }
-
-  const metadata = asRecord(rawObj.metadata);
-  const metaRefundPubId =
-    typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : null;
-  if (expected.requireMetadataMatch && metaRefundPubId !== expected.refundPublicId) {
-    return null;
-  }
-  if (metaRefundPubId && metaRefundPubId !== expected.refundPublicId) {
-    return {
-      status: "unknown",
-      providerRefundRef: refundId,
-      failureReasonCode: "STRIPE_REFUND_METADATA_MISMATCH",
       settledAt: null,
     };
   }
