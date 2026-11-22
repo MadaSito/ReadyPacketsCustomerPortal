@@ -77,7 +77,10 @@ export type EgressPresetKey =
   | "amazon_s3"
   | "wasabi_s3"
   | "backblaze_b2"
-  | "azure_blob";
+  | "azure_blob"
+  | "stripe"
+  | "square"
+  | "square_sandbox";
 
 export interface EgressPresetView {
   key: EgressPresetKey;
@@ -130,6 +133,18 @@ const EGRESS_PRESET_CLIENT_META: Record<EgressPresetKey, EgressPresetClientMeta>
   azure_blob: {
     description: "Azure Blob Storage account HTTPS endpoint (<account>.blob.core.windows.net).",
     requiredParams: ["accountName"],
+  },
+  stripe: {
+    description: "Stripe Checkout Sessions and Payment Intents HTTPS API (api.stripe.com).",
+    requiredParams: [],
+  },
+  square: {
+    description: "Square production payment links and payments HTTPS API (connect.squareup.com).",
+    requiredParams: [],
+  },
+  square_sandbox: {
+    description: "Square sandbox payment links and payments HTTPS API (connect.squareupsandbox.com).",
+    requiredParams: [],
   },
 };
 

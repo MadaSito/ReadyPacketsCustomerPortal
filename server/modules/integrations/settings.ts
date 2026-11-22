@@ -552,6 +552,43 @@ export const INTEGRATIONS_PRODUCTION_AUTH_VALUE = defineSecret({
   schema: z.string().min(1).max(1024).refine(hasNoHeaderInjection, "Invalid authentication header characters."),
 });
 
+/* ----------------------------------------------------- Increment 04 Package I: Webhooks settings */
+
+export const webhooksConfigSettingSchema = z.strictObject({
+  /** Retention days for encrypted request/response payloads (0..90; 0 omits/purges bodies and disables replay). */
+  retentionDays: z.number().int().min(0).max(90),
+  /** Consecutive terminal failures before an outbound subscription transitions to `disabled_failing`. */
+  autoDisableThreshold: z.number().int().min(3).max(50),
+  /** Outbound HTTPS request timeout in milliseconds (1_000..30_000). */
+  deliveryTimeoutMs: z.number().int().min(1_000).max(30_000),
+});
+export type WebhooksConfigSetting = z.infer<typeof webhooksConfigSettingSchema>;
+
+export const DEFAULT_WEBHOOKS_CONFIG: WebhooksConfigSetting = {
+  retentionDays: 30,
+  autoDisableThreshold: 10,
+  deliveryTimeoutMs: 10_000,
+};
+
+export const INTEGRATIONS_WEBHOOKS_FLAG = defineFeatureFlag({
+  flag: "integrations.webhooks",
+  owner: "integrations",
+  group: "integrations",
+  label: "Outbound webhook subscriptions and inbound endpoints",
+  description: "Enable signed outbound webhook subscriptions and inbound automation webhook endpoints.",
+});
+
+export const INTEGRATIONS_WEBHOOKS_CONFIG = defineSetting({
+  key: "integrations.webhooks.config",
+  owner: "integrations",
+  group: "integrations",
+  label: "Webhooks delivery and retention policy",
+  description: "Retention period for redacted encrypted webhook bodies, auto-disable threshold, and request timeout.",
+  schema: webhooksConfigSettingSchema,
+  default: DEFAULT_WEBHOOKS_CONFIG,
+  sensitivity: "internal",
+});
+
 /**
  * Reads a declared feature flag consistently across both `PlatformSettingsStore` (which stores
  * `feature.<flag>` in `platform_settings`) and `MemorySettings` test doubles (which may populate

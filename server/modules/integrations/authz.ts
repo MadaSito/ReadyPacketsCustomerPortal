@@ -232,3 +232,44 @@ export async function assertProductionResendInTx(
     );
   }
 }
+
+export function assertWebhooksRead(principal: SessionPrincipal): void {
+  if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+    throw new DomainError(
+      "REMEDIATION_REQUIRED",
+      "ACCOUNT_STEP_PENDING",
+      "Please finish securing your account to continue.",
+    );
+  }
+  if (
+    principal.role !== "admin" ||
+    (!roleHasCapability(principal.role, "webhooks.manage") && !roleHasCapability(principal.role, "api.logs.read"))
+  ) {
+    throw forbidden("CAPABILITY_NOT_GRANTED");
+  }
+}
+
+export function assertWebhooksManagePreflight(principal: SessionPrincipal, now: Date): void {
+  assertAdminStepUpAnyPreflight(principal, now, ["webhooks.manage"]);
+}
+
+export async function assertWebhooksManageInTx(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  tx: Tx,
+): Promise<void> {
+  await assertAdminStepUpAnyInTx(deps, principal, tx, ["webhooks.manage"]);
+}
+
+export function assertApiReplayPreflight(principal: SessionPrincipal, now: Date): void {
+  assertAdminStepUpAnyPreflight(principal, now, ["api.replay"]);
+}
+
+export async function assertApiReplayInTx(
+  deps: ModuleDeps,
+  principal: SessionPrincipal,
+  tx: Tx,
+): Promise<void> {
+  await assertAdminStepUpAnyInTx(deps, principal, tx, ["api.replay"]);
+}
+
