@@ -7,7 +7,12 @@ import { authFeature } from "@/features/auth/routes";
 import { AppRoutes } from "./AppRouter";
 import { RealmTaintBoundary } from "./RealmTaint";
 
-vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null }));
+// Partial mock: keep every real export (new slots stay defined) and silence the network-backed feature slots.
+vi.mock("./slots", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./slots")>();
+  const silent = Object.fromEntries(Object.keys(real).filter((name) => name.endsWith("Slot")).map((name) => [name, () => null]));
+  return { ...real, ...silent };
+});
 
 const unauthError = () => Object.assign(new Error("UNAUTHENTICATED"), { data: { safe: { domainCode: "UNAUTHENTICATED" } } });
 const full: MeResult = {
