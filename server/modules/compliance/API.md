@@ -365,3 +365,254 @@ In `compliance.init()`, the module also registers the `invoices` resource provid
   - `InvoiceSummaryView.paymentState`: `"draft" | "unpaid" | "partially_paid" | "paid" | "partially_refunded" | "refunded" | "void"` alongside `refundedMinor` and `grossPaidMinor`.
   - `compliance.invoices.getOrderPaymentSummaries(orderPublicIds: readonly string[], tx?: DbOrTx)` — batched read port returning `Map<string, { state: "unpaid" | "paid" | "partially_refunded" | "refunded", totalMinor: number, currency: string }>` for `orders` console headers/lists.
   - `compliance.invoices.listOrderPaymentsAndRefunds`, `lockOrderPaymentForRefundInTx`, and `bookSettledRefundInTx` — internal transactional ports consumed by `payments.refunds` to lock captured payments `FOR UPDATE`, book settled provider/manual refunds idempotently, and fire `deps.services.referrals.onInvoiceRefunded(event, { tx })` when an invoice becomes fully refunded.
+
+## 9. Increment 05 Ports & Procedures (`acceptanceLog`, `orderPaymentExposureInTx`, C4 Invoices)
+
+### 9.1 Policy Acceptance Log Centre (`trpc.compliance.policies.admin.acceptanceLog.*` — Package D1)
+
+All procedures under `compliance.policies.admin.acceptanceLog` are read-only evidence views (plus `export` mutation). No acceptance evidence row is ever altered or deleted.
+
+**Authorization rule (Contract §4 & D4)**:
+- Unauthenticated -> `UNAUTHENTICATED`
+- `customer` session -> `NOT_FOUND` (never `FORBIDDEN`, no existence oracle; audited `authz.compliance.denied`)
+- `staff` / `admin` lacking the required capability (`policies.acceptances.read` on queries; `policies.acceptances.export` on `export`) -> `FORBIDDEN` (`CAPABILITY_NOT_GRANTED`)
+- `export` additionally requires fresh step-up (`STEP_UP_REQUIRED` when stale/missing) and re-validates the live actor inside `tx`, recording durable audit event `policy.acceptance_log.exported` (`category: "admin"`, attributes `{ filter_summary, row_count, truncated }`).
+- **Typed signer name confidentiality**: `list`, `forCustomer`, and `export` DTOs **never** carry `typedSignerName`. Only `detail` returns `typedSignerName: string | null` + `signerNameRedacted: boolean`, decrypting only when the live caller holds `policies.manage`.
+
+```ts
+export type AcceptanceLogSource =
+  | "registration"
+  | "portal_acceptance"
+  | "portal_reacceptance"
+  | "checkout"
+  | "order_gate"
+  | "imported_historical";
+
+export type AcceptanceLogMethod = "checkbox" | "typed_signature" | "imported";
+export type AcceptanceFreshness = "current" | "superseded";
+export type AcceptanceEvidenceKind = "account" | "order_gate";
+
+export interface AcceptanceLogCustomerSummary {
+  userPublicId: string;
+  name: string;
+  email: string;
+  customerRef: string | null;
+}
+
+export interface AcceptanceLogFilterInput {
+  /** Free-text customer filter (matches name token prefix, exact e-mail, or customerRef prefix via identity.findCustomerIds). */
+  customerQuery?: string;
+  /** Exact customer filter (26-char ULID). */
+  customerPublicId?: string;
+  policyDocumentPublicId?: string;
+  versionPublicId?: string;
+  /** Inclusive lower bound on acceptedAt. */
+  from?: Date;
+  /** Exclusive upper bound on acceptedAt. */
+  to?: Date;
+  source?: AcceptanceLogSource;
+  method?: AcceptanceLogMethod;
+  freshness?: AcceptanceFreshness;
+  /** Case-insensitive order reference or 26-char orderPublicId filter. */
+  orderReference?: string;
+}
+
+export interface AcceptanceLogListInput extends AcceptanceLogFilterInput {
+  cursor?: string; // opaque keyset cursor encoding (acceptedAt, publicId)
+  limit?: number;  // 1..100, default 50
+}
+
+/** List & customer-history item — never contains typedSignerName. */
+export interface AcceptanceLogItem {
+  publicId: string; // 26-char ULID of the evidence row
+  evidenceKind: AcceptanceEvidenceKind;
+  acceptedAt: Date;
+  customer: AcceptanceLogCustomerSummary | null;
+  policyDocumentPublicId: string;
+  policySlug: string;
+  policyTitle: string;
+  versionPublicId: string;
+  versionNumber: number;
+  versionLabel: string;
+  contentHash: string;      // full 64-hex SHA-256
+  shortContentHash: string; // first 12 hex chars
+  source: AcceptanceLogSource;
+  method: AcceptanceLogMethod;
+  hasTypedSignature: boolean;
+  freshness: AcceptanceFreshness;
+  supersededByVersionPublicId: string | null;
+  supersededByVersionLabel: string | null;
+  orderPublicId: string | null;
+  orderReference: string | null;
+  gateKey: string | null;
+  addressPseudonym: string | null;
+  correlationId: string | null;
+  origin: "portal" | "import";
+}
+
+export interface AcceptanceLogDetailView extends AcceptanceLogItem {
+  contentFormat: PolicyContentFormat;
+  bodyText: string;
+  effectiveAt: Date;
+  publishedAt: Date | null;
+  /** Non-null ONLY when `hasTypedSignature === true` AND live caller holds `policies.manage`. */
+  typedSignerName: string | null;
+  /** True when `hasTypedSignature === true` and caller lacks `policies.manage`. */
+  signerNameRedacted: boolean;
+}
+
+export interface AcceptanceFilterOptionsView {
+  policies: Array<{
+    documentPublicId: string;
+    slug: string;
+    title: string;
+    audience: PolicyAudience;
+    active: boolean;
+    requiresAcceptance: boolean;
+    versions: Array<{
+      versionPublicId: string;
+      versionNumber: number;
+      versionLabel: string;
+      publishedAt: Date | null;
+      isCurrent: boolean;
+    }>;
+  }>;
+}
+
+export interface PolicyCoverageOutstandingCustomer {
+  customer: AcceptanceLogCustomerSummary;
+  lastAcceptedVersionPublicId: string | null;
+  lastAcceptedVersionNumber: number | null;
+  lastAcceptedVersionLabel: string | null;
+  lastAcceptedAt: Date | null;
+}
+
+export interface PolicyCoverageDocumentView {
+  documentPublicId: string;
+  slug: string;
+  title: string;
+  audience: PolicyAudience;
+  currentVersionPublicId: string;
+  currentVersionNumber: number;
+  currentVersionLabel: string;
+  publishedAt: Date | null;
+  effectiveAt: Date;
+  activeCustomerCount: number;
+  acceptedCurrentCount: number;
+  outstandingCount: number;
+  outstandingCustomers: PolicyCoverageOutstandingCustomer[];
+  outstandingTruncated: boolean;
+}
+
+export interface PolicyCoverageView {
+  activeCustomerCount: number;
+  policies: PolicyCoverageDocumentView[];
+}
+
+export interface PolicyUpdateHistoryItem {
+  documentPublicId: string;
+  policySlug: string;
+  policyTitle: string;
+  audience: PolicyAudience;
+  versionPublicId: string;
+  versionNumber: number;
+  versionLabel: string;
+  contentHash: string;
+  shortContentHash: string;
+  changeSummary: string | null;
+  publishedAt: Date | null;
+  effectiveAt: Date;
+  publishedBy: { userPublicId: string; name: string; email: string } | null;
+  isCurrent: boolean;
+  acceptedCustomerCount: number;
+}
+
+export type CustomerPolicyRequirementState =
+  | "accepted_current"
+  | "update_pending"
+  | "not_accepted"
+  | "not_required";
+
+export interface CustomerPolicyStatusRow {
+  documentPublicId: string;
+  slug: string;
+  title: string;
+  requiresAcceptance: boolean;
+  requiresTypedSignature: boolean;
+  currentVersionPublicId: string;
+  currentVersionNumber: number;
+  currentVersionLabel: string;
+  currentPublishedAt: Date | null;
+  currentEffectiveAt: Date;
+  state: CustomerPolicyRequirementState;
+  acceptedVersionPublicId: string | null;
+  acceptedVersionNumber: number | null;
+  acceptedVersionLabel: string | null;
+  acceptedAt: Date | null;
+}
+
+export interface CustomerPolicyAcceptanceProfileView {
+  customer: AcceptanceLogCustomerSummary;
+  policies: CustomerPolicyStatusRow[];
+  history: AcceptanceLogItem[];
+  nextCursor: string | null;
+}
+
+export interface PolicyVersionReadView {
+  documentPublicId: string;
+  policySlug: string;
+  policyTitle: string;
+  audience: PolicyAudience;
+  requiresAcceptance: boolean;
+  requiresTypedSignature: boolean;
+  versionPublicId: string;
+  versionNumber: number;
+  versionLabel: string;
+  contentFormat: PolicyContentFormat;
+  bodyText: string;
+  contentHash: string;
+  shortContentHash: string;
+  changeSummary: string | null;
+  effectiveAt: Date;
+  publishedAt: Date | null;
+  isCurrent: boolean;
+}
+
+export interface AcceptanceLogExportResult {
+  filename: string;
+  contentType: "text/csv; charset=utf-8";
+  csv: string;
+  rowCount: number;
+  truncated: boolean;
+  maxRows: number;
+}
+```
+
+| Procedure | Guard | Input -> Output |
+| --- | --- | --- |
+| `policies.admin.acceptanceLog.filterOptions` | `policies.acceptances.read` | `void` -> `AcceptanceFilterOptionsView` |
+| `policies.admin.acceptanceLog.list` | `policies.acceptances.read` | `AcceptanceLogListInput` -> `{ items: AcceptanceLogItem[], nextCursor: string \| null }` |
+| `policies.admin.acceptanceLog.detail` | `policies.acceptances.read` (`policies.manage` for `typedSignerName`) | `{ publicId: string }` -> `AcceptanceLogDetailView` |
+| `policies.admin.acceptanceLog.coverage` | `policies.acceptances.read` | `{ documentPublicId?: string, outstandingLimit?: number /* 1..200, default 100 */ }?` -> `PolicyCoverageView` |
+| `policies.admin.acceptanceLog.updates` | `policies.acceptances.read` | `{ documentPublicId?: string }?` -> `{ items: PolicyUpdateHistoryItem[] }` |
+| `policies.admin.acceptanceLog.forCustomer` | `policies.acceptances.read` | `{ customerPublicId: string, cursor?: string, limit?: number }` -> `CustomerPolicyAcceptanceProfileView` |
+| `policies.admin.acceptanceLog.versionText` | `policies.acceptances.read` | `{ versionPublicId: string }` -> `PolicyVersionReadView` |
+| `policies.admin.acceptanceLog.export` | `policies.acceptances.export` (admin + step-up) | `AcceptanceLogFilterInput` -> `AcceptanceLogExportResult` |
+
+### 9.2 Order Payment Exposure Port (`compliance.orderPaymentExposureInTx` — G-C3-02)
+
+- `compliance.orderPaymentExposureInTx(tx: Tx, orderPublicId: string): Promise<{ grossPaidMinor: number; payableInvoiceOpen: boolean; providerCapturePending: boolean }>`
+- Locks the order row (`FOR UPDATE` via `orders.getOrderRefByPublicId`) -> `compliance_invoices` (`ORDER BY id ASC FOR UPDATE`) -> `compliance_invoice_payments` (`ORDER BY id ASC FOR UPDATE`) -> `payment_attempts` (`ORDER BY id ASC FOR UPDATE`). All compliance/payments invoice writers follow the same canonical `order -> compliance_invoices -> compliance_invoice_payments -> payment_attempts` lock order.
+- `grossPaidMinor`: sum of `amountMinor` across `succeeded` payment rows across all invoices of the order (partial payments and later-refunded payments keep `grossPaidMinor > 0`).
+- `payableInvoiceOpen`: `true` if any non-voided, issued invoice on the order has `balanceDueMinor > 0`. (Zero-total `$0.00` issued invoices derive `status = "paid"`, `balanceDueMinor = 0`, so `payableInvoiceOpen = false`.)
+- `providerCapturePending`: `true` if any payment row is `pending` OR any `payment_attempts` row on the order's invoices is in `created`, `redirected`, or `paid` with `compliancePaymentPublicId === null` (`awaiting_webhook`). `payments.startCheckout` also locks the order row inside `tx` and refuses initiation when `order.statusKey === "cancelled"`.
+
+### 9.3 Invoice Promo Discount Breakdown (Package C4)
+
+- `InvoiceDetailView` (returned by `compliance.invoices.get`) adds:
+  - `bundleDiscountMinor: number` (`discountMinor - promoDiscountMinor` when aligned with the order's discount breakdown; `0` when promo replaced bundle or no bundle applied)
+  - `discountLabel: string | null` (order discount label when no promo applied, or `"Bundle discount"` when both bundle and promo applied)
+  - `promoDiscountMinor: number` (`0` when no promo code applied)
+  - `promoLabel: string | null` (customer-facing promo label from `order.promoLabel`; never the raw code)
+- Rendered as separate labelled rows on customer `/invoices/:invoiceId`, console `/admin/invoices/:invoiceId`, and `GET /api/compliance/invoices/:invoicePublicId/pdf`.
+
