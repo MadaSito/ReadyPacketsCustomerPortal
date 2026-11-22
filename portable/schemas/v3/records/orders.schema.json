@@ -113,6 +113,37 @@
         }
       ]
     },
+    "promoDiscount": {
+      "type": "object",
+      "properties": {
+        "amountMinor": {
+          "type": "integer",
+          "minimum": -9000000000000,
+          "maximum": 9000000000000
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        }
+      },
+      "required": [
+        "amountMinor",
+        "currency"
+      ],
+      "additionalProperties": false
+    },
+    "promoLabel": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 120
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "total": {
       "type": "object",
       "properties": {

@@ -33,7 +33,10 @@ const OFFERING_SNAPSHOT = {
   packetNumber: 2, tier: "Standard" as const, outcome: "Documented findings",
   timeline: "Five business days", deliverables: [{ title: "Summary", detail: "Reviewed findings and next steps" }],
 };
-const OFFERING_PRICE = { subtotalMinor: 2500, discountMinor: 375, discountLabel: "Fixture bundle discount", totalMinor: 2125 };
+const OFFERING_PRICE = {
+  subtotalMinor: 2500, discountMinor: 375, discountLabel: "Fixture bundle discount", totalMinor: 2125,
+  promoDiscountMinor: 125, promoLabel: "Fixture promo",
+};
 
 async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const result: T[] = [];
@@ -157,7 +160,9 @@ describe("portable transfer across isolated MySQL installations", () => {
           subtotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
           discount: { amountMinor: OFFERING_PRICE.discountMinor, currency: "USD" },
           discountLabel: OFFERING_PRICE.discountLabel, total: { amountMinor: OFFERING_PRICE.totalMinor, currency: "USD" },
+          promoDiscount: { amountMinor: OFFERING_PRICE.promoDiscountMinor, currency: "USD" }, promoLabel: OFFERING_PRICE.promoLabel,
         });
+        expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers"]));
         expect(records.find((entry) => entry.type === "order-items")?.record).toMatchObject({
           ...OFFERING_SNAPSHOT, tier: "standard", lineTotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
         });
@@ -366,7 +371,16 @@ describe("portable transfer across isolated MySQL installations", () => {
     const line = { publicId: ulid(), name: "Legacy item", sku: "legacy-item", quantity: 1, unitPrice: money, lineTotal: money,
       tier: "standard" };
     const projected = projectedOrder(order, [line], []);
-    expect(projected).toMatchObject({ discountLabel: null, lineItems: [{ tier: null }] });
+    expect(projected).toMatchObject({ discountLabel: null, promoDiscountMinor: 0, promoLabel: null, lineItems: [{ tier: null }] });
+    const discounted = { ...order, discount: { ...money, amountMinor: 300 }, total: { ...money, amountMinor: 2200 } };
+    expect(projectedOrder({ ...discounted, promoDiscount: { ...money, amountMinor: 300 }, promoLabel: "Spring code" }, [line], []))
+      .toMatchObject({ discountMinor: 300, promoDiscountMinor: 300, promoLabel: "Spring code" });
+    expect(() => projectedOrder({ ...discounted, promoDiscount: { ...money, amountMinor: 301 } }, [line], []))
+      .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
+    expect(() => projectedOrder({ ...discounted, promoDiscount: { amountMinor: 100, currency: "EUR" } }, [line], []))
+      .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
+    expect(() => projectedOrder({ ...discounted, promoDiscount: { ...money, amountMinor: 100 }, promoLabel: "x".repeat(121) }, [line], []))
+      .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
     expect(projected.lineItems[0]?.packetNumber).toBeUndefined();
     expect(() => projectedOrder(order, [{ ...line, packetNumber: 2, tier: "unrecognized" }], []))
       .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");

@@ -15,6 +15,12 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Controlled faults**: The service suite uses fake session resolution, an in-memory object store, a simulated fence, fake audit and the test job registry. Its interrupted move case writes the private destination object before failing the simulated worker, then verifies that the next run uses receipts and exact bytes instead of making a duplicate. This does not validate actual queue lease loss, production audit durability, physical storage permissions, or proxy/TLS settings.
 - **Admin UI**: jsdom/axe checks representative histories, upload availability, both wizard screens, focus transition, and held-content/reconciliation states. It excludes computed contrast and is not a browser, mobile, screen-reader or ADA compliance certification.
 
+## Increment 05 (package E)
+
+- **Tested (real MySQL source and target, one file):** an order with a promo discount and label exports `promoDiscount`/`promoLabel`, imports into `promo_discount_minor`/`promo_label`, and lists the `promotions` and `cart-upsell-offers` exclusions in the manifest. A 3.0 record without the fields projects to 0/null. A promo amount larger than the discount, or in another currency, is refused.
+- **Checked by schema test only:** the regenerated `orders.schema.json` and RECORDS.md rows.
+- **Not verified:** a backup restore of the new tables (owned by the backup module), restore with different keys (unsupported by design), and promotion or upsell transfer (excluded by decision).
+
 ## Release limits and proposed decisions
 
 - **Historical modules**: This portal export does not collect engagement, support, billing, or compliance evidence; permissions/grants, internal notes and historical file revisions are excluded. When verified input contains historical evidence, inactive file versions, or optional unknown extensions, retain them inert rather than inserting live module rows or replaying side effects. Decide which historical evidence must be portable and which parts may be shown to authorized target users.
