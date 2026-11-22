@@ -11,7 +11,7 @@ import { createAuditEmitter } from "../../server/modules/audit/emitter.js";
 import { auditEvents } from "../../server/modules/audit/schema.js";
 import { createIdentityModule } from "../../server/modules/identity/index.js";
 import { identityRouter } from "../../server/modules/identity/router.js";
-import { identityTokens, ssoIdentities, userSessions, users } from "../../server/modules/identity/schema.js";
+import { identityTokens, sessionRestrictions, signInEvents, ssoIdentities, userSessions, users } from "../../server/modules/identity/schema.js";
 import { createCallerFactory, router } from "../../server/trpc/trpc.js";
 import { createTestDeps, FakeAudit } from "../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../tests/helpers/testDb.js";
@@ -23,7 +23,7 @@ const { assuranceAccounts, assuranceChallenges, assurancePasskeys, assuranceReco
 describe("host administrator recovery", () => {
   let testDb: TestDb;
   beforeAll(async () => {
-    testDb = await createTestDb({ schema: { users, userSessions, identityTokens, ssoIdentities, auditEvents, ...assuranceSchema } });
+    testDb = await createTestDb({ schema: { users, userSessions, identityTokens, ssoIdentities, signInEvents, sessionRestrictions, auditEvents, ...assuranceSchema } });
   });
   afterAll(() => testDb?.cleanup());
 
