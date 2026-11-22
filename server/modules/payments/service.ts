@@ -14,7 +14,7 @@
  *    hardcoded reviewed same-origin paths.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, lt, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lt, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -669,12 +669,54 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await assertLiveActorInTx(deps, opts.principal, tx);
       }
 
+      // Canonical lock order (order -> compliance_invoices -> payment_attempts) + fence against
+      // starting a provider checkout after order cancellation or concurrent invoice void/payment.
+      const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+      if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+        const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+        if (!lockedOrder) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
+        const orderCancelled =
+          typeof ordersSvc.getOrderSyncView === "function"
+            ? await ordersSvc.getOrderSyncView(lockedOrder.publicId, tx).then((view) =>
+                view ? view.status.kind === "terminal" && /cancel/.test(view.status.key) : /cancel/.test(lockedOrder.statusKey),
+              )
+            : /cancel/.test(lockedOrder.statusKey);
+        if (orderCancelled) {
+          throw conflict("ORDER_CANCELLED", "Cannot start payment for a cancelled order.");
+        }
+        if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+          throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against online checkout.", {
+            lockState: lockedOrder.lockState,
+          });
+        }
+      }
+
+      const lockedInvoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+        ...(opts?.principal ? { principal: opts.principal } : {}),
+        tx,
+        forUpdate: true,
+      });
+      if (lockedInvoice.origin !== "portal") {
+        throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported historical invoices cannot be paid online.");
+      }
+      if (lockedInvoice.voidedAt !== null || lockedInvoice.status === "void") {
+        throw conflict("INVOICE_VOIDED", "Voided invoices cannot be paid.");
+      }
+      if (lockedInvoice.issuedAt === null || lockedInvoice.status === "draft") {
+        throw conflict("INVOICE_NOT_ISSUED", "Draft invoices must be issued before starting checkout.");
+      }
+      if (lockedInvoice.status === "paid" || lockedInvoice.balanceDueMinor <= 0) {
+        throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
+      }
+
       const [existing] = await tx
         .select()
         .from(paymentAttempts)
         .where(
           and(
-            eq(paymentAttempts.invoiceId, invoice.invoiceId),
+            eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId),
             eq(paymentAttempts.idempotencyKey, idempotencyKey),
           ),
         )
@@ -688,7 +730,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           stillUnexpired &&
           existing.provider === activeProvider &&
           existing.environment === config.mode &&
-          existing.amountMinor === invoice.balanceDueMinor &&
+          existing.amountMinor === lockedInvoice.balanceDueMinor &&
           existing.redirectUrlEnc
         ) {
           const redirectUrl = deps.crypto.decrypt(
@@ -711,16 +753,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const attemptPublicId = ulid(now.getTime());
       const [ins] = await tx.insert(paymentAttempts).values({
         publicId: attemptPublicId,
-        invoiceId: invoice.invoiceId,
-        invoicePublicId: invoice.invoicePublicId,
-        orderPublicId: invoice.orderPublicId,
+        invoiceId: lockedInvoice.invoiceId,
+        invoicePublicId: lockedInvoice.invoicePublicId,
+        orderPublicId: lockedInvoice.orderPublicId,
         cartPublicId: opts?.cartPublicId ?? null,
-        customerUserId: invoice.ownerUserId,
+        customerUserId: lockedInvoice.ownerUserId,
         provider: activeProvider,
         environment: config.mode,
         status: "created",
-        amountMinor: invoice.balanceDueMinor,
-        currency: invoice.currency.toUpperCase(),
+        amountMinor: lockedInvoice.balanceDueMinor,
+        currency: lockedInvoice.currency.toUpperCase(),
         idempotencyKey: effectiveIdem,
         successPath,
         cancelPath,
@@ -740,12 +782,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             : { role: "system" },
           resource: { type: "payment_attempt", publicId: attemptPublicId },
           attributes: {
-            invoice_public_id: invoice.invoicePublicId,
-            order_public_id: invoice.orderPublicId,
+            invoice_public_id: lockedInvoice.invoicePublicId,
+            order_public_id: lockedInvoice.orderPublicId,
             provider: activeProvider,
             environment: config.mode,
-            amount_minor: invoice.balanceDueMinor,
-            currency: invoice.currency.toUpperCase(),
+            amount_minor: lockedInvoice.balanceDueMinor,
+            currency: lockedInvoice.currency.toUpperCase(),
           },
         },
         tx,
@@ -755,6 +797,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         reused: false as const,
         attemptId: ins.insertId,
         attemptPublicId,
+        amountMinor: lockedInvoice.balanceDueMinor,
       };
     });
 
@@ -784,7 +827,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         invoiceNumber: invoice.invoiceNumber ?? invoice.invoicePublicId,
         orderPublicId: invoice.orderPublicId,
         orderReference: invoice.orderReference,
-        amountMinor: invoice.balanceDueMinor,
+        amountMinor: preAttempt.amountMinor,
         currency: invoice.currency.toUpperCase(),
         idempotencyKey,
         returnUrl,
@@ -799,45 +842,81 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         `payment_attempts.redirect_url:${preAttempt.attemptPublicId}`,
       );
 
-      await deps.db.transaction(async (tx) => {
-        await tx
-          .update(paymentAttempts)
-          .set({
-            status: "redirected",
-            providerRef: createdSession.providerRef,
-            providerOrderRef: createdSession.providerOrderRef ?? null,
-            providerPaymentRef: createdSession.providerPaymentRef ?? null,
-            redirectUrlEnc,
-            redirectedAt: completedAt,
-            expiresAt,
-            version: 2,
-            updatedAt: completedAt,
-          })
-          .where(and(eq(paymentAttempts.id, preAttempt.attemptId), eq(paymentAttempts.version, 1)));
+      const wasConcurrentlyCancelled = await deps.db.transaction(async (tx) => {
+        const [lockedAttempt] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.id, preAttempt.attemptId))
+          .for("update")
+          .limit(1);
 
-        await deps.audit.record(
-          {
-            category: "business",
-            eventName: "payments.attempt.redirected",
-            action: "transition",
-            outcome: "completed",
-            actor: opts?.principal
-              ? { userId: opts.principal.userId, role: opts.principal.role }
-              : { role: "system" },
-            resource: { type: "payment_attempt", publicId: preAttempt.attemptPublicId },
-            attributes: {
-              invoice_public_id: invoice.invoicePublicId,
-              order_public_id: invoice.orderPublicId,
-              provider: activeProvider,
-              environment: config.mode,
-              provider_ref: createdSession.providerRef,
-              amount_minor: invoice.balanceDueMinor,
-              currency: invoice.currency.toUpperCase(),
+        if (!lockedAttempt) {
+          return false;
+        }
+
+        if (lockedAttempt.status === "cancelled") {
+          // Locally cancelled while provider createCheckout was in flight: still persist providerRef
+          // so webhooks/reconciliation can track the external session to terminal provider proof,
+          // and refuse handing out the redirect URL.
+          await tx
+            .update(paymentAttempts)
+            .set({
+              providerRef: createdSession.providerRef,
+              providerOrderRef: createdSession.providerOrderRef ?? null,
+              providerPaymentRef: createdSession.providerPaymentRef ?? null,
+              expiresAt,
+              version: lockedAttempt.version + 1,
+              updatedAt: completedAt,
+            })
+            .where(and(eq(paymentAttempts.id, lockedAttempt.id), eq(paymentAttempts.version, lockedAttempt.version)));
+          return true;
+        }
+
+        if (lockedAttempt.status === "created") {
+          await tx
+            .update(paymentAttempts)
+            .set({
+              status: "redirected",
+              providerRef: createdSession.providerRef,
+              providerOrderRef: createdSession.providerOrderRef ?? null,
+              providerPaymentRef: createdSession.providerPaymentRef ?? null,
+              redirectUrlEnc,
+              redirectedAt: completedAt,
+              expiresAt,
+              version: lockedAttempt.version + 1,
+              updatedAt: completedAt,
+            })
+            .where(and(eq(paymentAttempts.id, lockedAttempt.id), eq(paymentAttempts.version, lockedAttempt.version)));
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "payments.attempt.redirected",
+              action: "transition",
+              outcome: "completed",
+              actor: opts?.principal
+                ? { userId: opts.principal.userId, role: opts.principal.role }
+                : { role: "system" },
+              resource: { type: "payment_attempt", publicId: preAttempt.attemptPublicId },
+              attributes: {
+                invoice_public_id: invoice.invoicePublicId,
+                order_public_id: invoice.orderPublicId,
+                provider: activeProvider,
+                environment: config.mode,
+                provider_ref: createdSession.providerRef,
+                amount_minor: invoice.balanceDueMinor,
+                currency: invoice.currency.toUpperCase(),
+              },
             },
-          },
-          tx,
-        );
+            tx,
+          );
+        }
+        return false;
       });
+
+      if (wasConcurrentlyCancelled) {
+        throw conflict("PAYMENT_ATTEMPT_CANCELLED", "Payment attempt was cancelled before redirect.");
+      }
 
       return {
         mode: "redirect",
@@ -849,6 +928,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         expiresAt,
       };
     } catch (err) {
+      if (err instanceof DomainError && err.reasonCode === "PAYMENT_ATTEMPT_CANCELLED") {
+        throw err;
+      }
       const failedAt = deps.clock.now();
       const reasonCode = err instanceof DomainError ? err.reasonCode : "PROVIDER_CREATE_ERROR";
       await deps.db.transaction(async (tx) => {
@@ -1614,7 +1696,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
       if (verified.outcomeHint === "expired" || verified.outcomeHint === "failed") {
         const nextStatus: PaymentAttemptStatus = verified.outcomeHint === "expired" ? "expired" : "failed";
-        if (attempt.status === "created" || attempt.status === "redirected") {
+        if (
+          (attempt.status === "created" ||
+            attempt.status === "redirected" ||
+            attempt.status === "cancelled") &&
+          attempt.compliancePaymentPublicId === null
+        ) {
           await tx
             .update(paymentAttempts)
             .set({
@@ -1919,9 +2006,6 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     for (const attempt of candidates) {
       if (opts?.signal?.aborted) break;
-      if (attempt.status === "cancelled" && !attempt.verifiedWebhookEventId) {
-        continue;
-      }
       if (!attempt.providerRef) {
         continue;
       }
@@ -2000,8 +2084,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         continue;
       }
 
-      const isPastExpiry = Boolean(attempt.expiresAt && attempt.expiresAt.getTime() <= now.getTime());
-      if (fetched.status === "expired" || (fetched.status === "open" && isPastExpiry && !attempt.verifiedWebhookEventId)) {
+      if (fetched.status === "expired") {
         await deps.db
           .update(paymentAttempts)
           .set({
@@ -3824,6 +3907,41 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  /**
+   * Authoritative transactional check for G-C3-02 (`compliance.orderPaymentExposureInTx`):
+   * locks `payment_attempts` rows for the given invoices (`ORDER BY id ASC FOR UPDATE`) and returns
+   * `true` if any attempt could still result in provider capture — including `created` (in-flight
+   * provider session creation), `redirected` (active hosted session), `cancelled` (marked locally
+   * without provider-side cancellation until terminal provider `expired`/`failed` proof), `paid`
+   * awaiting ledger booking, or `failed` with a verified paid webhook mismatch.
+   */
+  async function hasPendingCaptureForInvoicesInTx(
+    tx: Tx,
+    invoiceIds: readonly number[],
+  ): Promise<boolean> {
+    if (invoiceIds.length === 0) return false;
+    const rows = await tx
+      .select({
+        id: paymentAttempts.id,
+        status: paymentAttempts.status,
+        compliancePaymentPublicId: paymentAttempts.compliancePaymentPublicId,
+        verifiedWebhookEventId: paymentAttempts.verifiedWebhookEventId,
+      })
+      .from(paymentAttempts)
+      .where(inArray(paymentAttempts.invoiceId, [...invoiceIds]))
+      .orderBy(asc(paymentAttempts.id))
+      .for("update");
+
+    return rows.some(
+      (r) =>
+        r.status === "created" ||
+        r.status === "redirected" ||
+        r.status === "cancelled" ||
+        (r.status === "paid" && r.compliancePaymentPublicId === null) ||
+        (r.status === "failed" && r.verifiedWebhookEventId !== null),
+    );
+  }
+
   return {
     isOnlineCheckoutEnabled,
     getPublicCheckoutConfig,
@@ -3833,6 +3951,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     handleSignedWebhook,
     reconcilePendingAttempts,
     reconcileProviderRefund,
+    hasPendingCaptureForInvoicesInTx,
     refunds: {
       forOrder: forOrderRefunds,
       create: createOrderRefund,

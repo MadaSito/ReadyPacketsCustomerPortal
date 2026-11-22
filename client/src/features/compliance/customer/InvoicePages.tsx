@@ -149,7 +149,22 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
           { label: "Issued on", value: invoice.issuedAt && <DateTime value={invoice.issuedAt} format="date" /> },
           { label: "Due date", value: <DueDate date={invoice.dueAt} /> },
           { label: "Subtotal", value: amount(invoice.subtotalMinor) },
-          { label: "Discount", value: amount(invoice.discountMinor) },
+          ...((invoice.promoDiscountMinor ?? 0) > 0
+            ? [
+                ...((invoice.bundleDiscountMinor ?? 0) > 0
+                  ? [{ label: invoice.discountLabel ?? "Bundle discount", value: amount(invoice.bundleDiscountMinor) }]
+                  : []),
+                {
+                  label: invoice.promoLabel ? `Discount (${invoice.promoLabel})` : "Code discount",
+                  value: amount(invoice.promoDiscountMinor),
+                },
+              ]
+            : [
+                {
+                  label: invoice.discountLabel ? `Discount (${invoice.discountLabel})` : "Discount",
+                  value: amount(invoice.discountMinor),
+                },
+              ]),
           { label: "Tax", value: amount(invoice.taxMinor) },
           { label: "Total", value: amount(invoice.totalMinor) },
           { label: "Net paid", value: amount(invoice.netPaidMinor) },
