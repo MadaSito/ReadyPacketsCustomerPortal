@@ -8,6 +8,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { FakeGraph } from "../storage/adapters/graphDriveFake.js";
+import { storageCopyAttempts } from "../storage/schema.js";
 import { LIST_COLUMNS, ORDER_ID_COLUMN, buildOrderFields, fieldsHash, isCompatible, packetsSummary, safeText, toMajor, validListName } from "./fields.js";
 import { createSharepointModule, type SharepointModule } from "./index.js";
 import { sharepointOrderSync, sharepointSyncConfig } from "./schema.js";
@@ -47,12 +48,12 @@ const orderView = () => ({
 });
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { sharepointSyncConfig, sharepointOrderSync } });
+  db = await createTestDb({ schema: { sharepointSyncConfig, sharepointOrderSync, storageCopyAttempts } });
 });
 afterAll(() => db?.cleanup());
 
 beforeEach(async () => {
-  for (const t of [sharepointOrderSync, sharepointSyncConfig]) await db.db.delete(t);
+  for (const t of [sharepointOrderSync, sharepointSyncConfig, storageCopyAttempts]) await db.db.delete(t);
   h = createTestDeps({ db: db.db });
   graph = new FakeGraph();
   admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
@@ -92,6 +93,7 @@ beforeEach(async () => {
 });
 
 const changeOrder = () => db.db.transaction((tx) => listeners[0]!({ orderId: 1, orderPublicId: ORDER, kind: "updated" }, tx));
+const copyRows = async () => (await db.db.select().from(storageCopyAttempts)).sort((a, b) => a.id - b.id);
 const items = () => (enabledListId ? graph.site.lists.get(enabledListId)?.items : undefined) ?? new Map();
 
 async function enable() {
@@ -281,6 +283,16 @@ describe("sharepoint order sync (local fakes only)", () => {
     expect(graph.calls.filter((c) => c.method !== "GET").length).toBe(writesBefore);
     const [row] = await db.db.select().from(sharepointOrderSync);
     expect(row).toMatchObject({ state: "synced", desiredVersion: 3, syncedVersion: 3 });
+
+    // Copy log (package R): one row per job attempt, marker-only readback is "written", never "verified".
+    const log = await copyRows();
+    expect(log.map((r) => [r.kind, r.sourcePublicId, r.connectionPublicId, r.attempt, r.state, r.verification])).toEqual([
+      ["sharepoint_order", ORDER, CONN, 1, "written", null],
+      ["sharepoint_order", ORDER, CONN, 1, "written", null],
+      ["sharepoint_order", ORDER, CONN, 1, "not_written", null],
+    ]);
+    expect(log.every((r) => r.startedAt && r.finishedAt && r.errorCode === null)).toBe(true);
+    expect(JSON.stringify(log)).not.toMatch(/contoso|Portal orders|RP-2026|item/iu);
   });
 
   it("finds an existing item by order id when the local remote id was lost (no duplicate)", async () => {
@@ -404,6 +416,22 @@ describe("sharepoint order sync (local fakes only)", () => {
     graph.intercept(({ method }) => (method === "POST" ? { status: 503, headers: {}, body: { error: { message: "secret" } } } : undefined));
     expect(await h.jobs.runAll(SYNC_JOB)).toEqual([{ outcome: "failed", reasonCode: "SHAREPOINT_PROVIDER_UNAVAILABLE", retryable: true }]);
     expect((await mod.orderSync.get(admin)).lastError?.reasonCode).toBe("SHAREPOINT_PROVIDER_UNAVAILABLE");
+    const log = await copyRows();
+    expect(log).toHaveLength(1);
+    expect(log[0]).toMatchObject({ kind: "sharepoint_order", connectionPublicId: CONN, state: "failed", errorCode: "SHAREPOINT_PROVIDER_UNAVAILABLE" });
+    expect(JSON.stringify(log)).not.toMatch(/secret/iu);
+  });
+
+  it("queues a copy-log row at staging and records nothing when no destination is assigned", async () => {
+    await enable();
+    await changeOrder();
+    const [queued] = await copyRows();
+    expect(queued).toMatchObject({ state: "queued", startedAt: null, attempt: 1, jobPublicId: h.jobs.enqueued[0]!.jobId });
+    await db.db.delete(storageCopyAttempts);
+    assigned = false;
+    await changeOrder();
+    await h.jobs.runAll(SYNC_JOB);
+    expect(await copyRows()).toEqual([]);
   });
 
   it("refuses non-step-up administrators and audits the denial", async () => {

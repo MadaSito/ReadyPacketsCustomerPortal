@@ -47,6 +47,16 @@ Every procedure requires admin, `storage.manage` and a fresh step-up. Each call 
 
 A job that is refused because another job holds the order's claim (BUSY) retries with backoff and can run out of attempts. To cover that, the job holding the claim enqueues a fresh follow-up (`sharepoint:order:<id>:v<latest>:after:<jobId>`) when it releases the claim, whether it completed or failed permanently, if a newer version was staged in the meantime. This happens on every release, including a retryable failure on the last attempt. A follow-up that turns out to be redundant ends as caught up.
 
+### Copy log (storage package R)
+
+Order sync records one `storage_copy_attempts` row per job attempt (kind `sharepoint_order`) through `recordCopyAttempt`, always inside a fenced owner transaction:
+
+- queued: when a sync job is staged and a SharePoint destination is assigned (idempotent on deduplicated jobs);
+- started: after the destination is resolved, in its own `assertStillOwned` transaction;
+- finished: `written` for created/updated items (the readback checks only the RpOrderId marker, so never `verified`), `not_written` for unchanged or caught-up runs, `failed` with the fixed reason code (including unknown outcomes).
+
+No remote IDs, list names, paths or provider text are stored. The Copy log has no direct retry for SharePoint; the job queue's own retries (up to 6, safe because items are looked up by RpOrderId) apply. Runs with no assigned destination record nothing.
+
 ## Least privilege (administrator guidance)
 - For SharePoint, use an Entra app with `Sites.Selected`, granted `write` on the single chosen site only.
 - For OneDrive for Business, application permissions are tenant-wide (`Files.ReadWrite.All`). Prefer SharePoint, or restrict the app with an application access policy or RBAC for Applications.

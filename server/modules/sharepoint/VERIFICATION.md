@@ -57,3 +57,13 @@ The tests use a fake of the orders module's `listOrderPublicIdsForSync` (commit 
 - Real `GraphApiError.reasonCode` values map to EGRESS_DENIED, TIMEOUT, RESPONSE_TOO_LARGE and AUTH_FAILED.
 
 `graphDrive.test.ts` checks that no cleanup DELETE is sent after a lost fence.
+
+## Copy log hooks (increment 04, package R)
+
+`sharepoint.test.ts` (22/22, local fakes and the dev test MySQL) checks that:
+- created, updated and unchanged syncs give `written`, `written` and `not_written` rows, each with started and finished times and no verification claim;
+- a provider 503 gives a `failed` row with `SHAREPOINT_PROVIDER_UNAVAILABLE` and no provider text;
+- staging writes a `queued` row bound to the job ID;
+- nothing is recorded without an assigned destination.
+
+Not verified: the Copy log UI projection of these rows (owned by storage), and real tenants.
