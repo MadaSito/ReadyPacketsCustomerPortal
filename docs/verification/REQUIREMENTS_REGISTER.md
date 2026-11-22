@@ -266,6 +266,19 @@ exercised against a real external service.
 | INC03-9 | "off system backups to cloud storage … 3-2-1 advance backup strategy" | backup | `server/modules/backup` (off-site copies, 3-2-1 status), `cl/features/backup` | backup module tests [db, local fakes]; [browser] page and "not met" status with no destinations | Verified by automated test — no copy to a real provider |
 | INC03-10 | Customer ID "RPCUS-Unique 9 characters using 0-9 and A-Z … never … incremental" | identity | `generateCustomerRef()` in `server/modules/identity/users.ts` | `server/modules/identity/pure.test.ts` [unit]; seeded database shows the format | Verified by automated test |
 
+## Increment 04 — workflow rules and console order actions (orders)
+
+Source: `docs/engineering/INCREMENT_04_CONTRACT.md` package A and item 13. Evidence is the owner's test files, run one at a time; see
+`server/modules/orders/VERIFICATION.md` (increment 04). Both features ship disabled.
+
+| ID | Requirement (short) | Owner | Implementation | Evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| INC04-A1 | Workflow phases with locks when an order leaves a phase; staff unlock with a reason | orders | `server/modules/orders/requirements.ts`, `order_phase_locks`; `cl/features/orders/WorkflowRulesPanel.tsx` | `requirements.test.ts` [db, fake Files]; `rules.test.tsx` [jsdom] | Verified by automated test — no browser pass yet |
+| INC04-A2 | Status requirements: upload slots and acknowledgements that block leaving a status | orders | `requirements.ts`, `order_acknowledgements`, files ports; order-page checklist and acknowledgement dialog | `requirements.test.ts` [db]; `rules.test.tsx` [jsdom] | Verified by automated test — real Files counting not exercised |
+| INC04-A3 | Designer steps for phases and requirements (wizard and canvas), API integration actor | orders | `workflowDesign.ts`; `cl/features/orders/pages/workflows/rulesFields.tsx` | `requirements.test.ts` validation cases [db]; `workflows.test.tsx` [jsdom] | Verified by automated test |
+| INC04-13 | Console: new order for a customer, reassign with a customer picker, access for other platform users (one order or all of a customer's orders) | orders | `access.ts`, router `orders.admin.*`; `cl/features/orders/ConsoleOrderTools.tsx`, customer tab | `requirements.test.ts` access cases [db]; `rules.test.tsx`, `orders.test.tsx` [jsdom] | Verified by automated test — real identity step-up not exercised |
+| INC04-A4 | Every new page and central dialog designed and tested against WCAG 2.2 AA in light and dark | orders | as above | `rules.test.tsx` `pageA11y` (6 cases) [jsdom + axe, no contrast] | Partially verified — contrast, 320 px and screen readers need the browser pass |
+
 ## Summary
 
 Counts by primary status across all 144 rows above (PI 17, MP 104, ARCH 9, INC02 4, INC03 10), computed from the
@@ -334,3 +347,4 @@ so.
 - 2026-11-21 — increment 03 rows INC03-1 to INC03-10 added by the integrator; MP-3.21, MP-5.9 and MP-8.2 moved
   from "Not implemented" to "Partially implemented". Other rows were not re-examined at this refresh (several
   notes above, such as "CI never run" and "no remote configured", predate the GitHub push and are stale).
+- 2026-11-21 — increment 04 rows INC04-A1 to INC04-A4 and INC04-13 added by orders_engineer.

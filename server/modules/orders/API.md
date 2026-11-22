@@ -208,7 +208,7 @@ states[n].requirements?: {
   uploads: { key: Key; label: string; hint?: string /* ≤200 */; kind: "document" | "audio";
              minCount: number /* 0–20 */; maxCount: number /* 1–20, ≥ minCount */;
              allowedTypes: string[] /* canonical extensions without dot, lowercase, ≤20; [] = any Files-approved format of the kind */;
-             uploadedBy: ("customer" | "staff" | "admin")[] /* ≥1 */ }[];            // ≤10 per status
+             uploadedBy: ("customer" | "staff" | "admin" | "api")[] /* ≥1 */ }[];            // ≤10 per status
   acknowledgements: { key: Key; title: string /* ≤120 */; body: string /* plain text, ≤8000, no markup */;
                       acceptedBy: "customer" | "staff"; requireTypedName: boolean }[]; // ≤5 per status
 }
@@ -227,9 +227,9 @@ Setting `orders.workflow_rules.enabled` (default **false**, audited by the setti
 | `orders.requirements.forOrder` (query) | anyone with read access to the order | `{ orderId }` | `{ phases: { key, label, position: "done"\|"current"\|"upcoming", locked, lockedAt }[], status: { key, label, phaseKey }, uploads: { key, label, hint, kind, minCount, maxCount, allowedTypes, count, met, canUpload }[], acknowledgements: { key, title, body, textSha256, acceptedBy, requireTypedName, met, acceptedAt, canAccept }[], unmet: number, readOnly, readOnlyReason: "order_locked"\|"phase_locked"\|null, canUnlock }` |
 | `orders.requirements.acknowledge` (mutation) | required side with write access | `{ orderId, statusKey, ackKey, textSha256, typedName? (≤120) }` | `{ acknowledgementId, acceptedAt }`; `ACK_TEXT_CHANGED` if the hash differs, `ACK_ALREADY_RECORDED`, `PHASE_LOCKED`, `ORDER_LOCKED` |
 | `orders.phases.unlock` (mutation) | staff/admin + `orders.phase.unlock` | `{ orderId, phaseKey, reason (10–500), notifyCustomer }` | `{ unlocked: true }`; reason stored as a staff-only encrypted note; audit `order.phase.unlocked` |
-| `orders.admin.customerLookup` (query) | staff + `customers.read_all` | `{ query (2–120) }` | `{ publicId, name, customerRef }[]` (≤20, active customers only; e-mail never returned) |
-| `orders.admin.createForCustomer` (mutation) | admin + `orders.manage` | `{ customerPublicId, projectName, items, idempotencyKey }` | same as `orders.create`; owner = the customer; audit `order.created` with `created_for_customer: true` |
-| `orders.admin.access.list` (query) | staff + `orders.read_all` | `{ orderId } \| { customerPublicId }` | grants with role, scope `order`\|`customer`, grantee name, granted by/at |
+| `orders.admin.customerLookup` (query) | staff + `customers.read_all` | `{ query (2–120) }` | `{ publicId, name, customerRef, emailMasked }[]` (≤20, active customers only; the full e-mail is never returned, only a masked form such as `s***@example.com`) |
+| `orders.admin.createForCustomer` (mutation) | staff + `orders.manage` | `{ customerPublicId, projectName, items, note?, idempotencyKey }` | same as `orders.create`; owner = the customer; audit `order.created` with `created_for_customer: true` |
+| `orders.admin.access.list` (query) | staff + `orders.read_all` | `{ orderId } \| { customerPublicId }` | `{ items: { grantId, scope: "order"\|"customer", role, status, granteeName, granteeEmailMasked, grantedAt }[] }` |
 | `orders.admin.access.grant` (mutation, step-up) | admin + `orders.access.grant` | `{ scope: { orderId } \| { customerPublicId }, email, role: "viewer"\|"contributor" }` | grantee must be an existing active customer account other than the owner (`GRANTEE_NOT_FOUND` is the same answer for unknown and ineligible); a customer-scope grant covers all current and future orders of that customer; both parties notified; audit `order.access.granted` |
 | `orders.admin.access.revoke` (mutation, step-up) | admin + `orders.access.grant` | `{ grantId }` | revokes the grant (customer scope: and every order grant derived from it); audit `order.access.revoked` |
 Setting `orders.console_access.enabled` (default **false**) gates `access.grant`; `createForCustomer` and reassign follow their capabilities.
@@ -238,3 +238,11 @@ Setting `orders.console_access.enabled` (default **false**) gates `access.grant`
 - `getFileUploadSlots(principal, orderPublicId, tx?) → { statusKey, slots: { key, label, kind, maxCount, allowedTypes }[] }` — current status of the order's pinned version; only slots whose `uploadedBy` includes the actor's side; empty when the order is locked, the phase is locked or the actor lacks write access.
 - `assertFileStatusWritable(principal, orderPublicId, statusKey, tx?) → void` — throws `FORBIDDEN:PHASE_LOCKED` when `statusKey` belongs to a locked phase, `FORBIDDEN:ORDER_LOCKED` for an order lock; otherwise resolves (Files still applies its own rules).
 - Both re-read the order under the caller's tx; call them after locking the order row for final mutations.
+- `getFileSlotForCustody(orderPublicId, statusKey, slotKey, tx) → FileUploadSlot | null` — slot definition from the order's pinned version regardless of the caller (custody/retention checks); `null` for unknown order, status or slot.
+- `isStatusPhaseLocked(orderId, workflowVersionId, statusKey, tx) → boolean` — internal ids; true when the status's phase has a `locked` row.
+- `OrderRef.workflowVersionId` — the pinned version id (internal), for the call above.
+- `createOrderFromCheckoutInTx(principal, { projectName, items, note?, idempotencyKey }, tx)` — checkout (cart) creates the order inside ITS transaction; customer + `orders.create`; same pricing, policy gate, requirements and audit as `orders.create`; no second connection.
+
+### Workflow actor `api` and the public API provider
+- `WORKFLOW_ACTORS = ["customer", "staff", "admin", "api"]`. `api` may appear in `allowedBy` and `uploadedBy`; the designer labels it "API integration". Only the public API (`/api/v1`, API-key callers) acts as `api`; no session ever does.
+- `OrdersModule.init()` registers the `orders` provider with the public API module (`publicApiProvider.ts`): `list` (keyset, newest first, ≤100, filters `customerId`, `status`, `updatedSince`), `get`, `create` (`createAsSystem`, owner = the given customer, item `tierKey` = the product tier in lowercase or `default`, mismatch refused) and `transition` (`transitionAsSystem`, allowed only where the pinned workflow lists `api`; requirements and phase locks apply). Writes audit as `system` with the API request id as correlation id; scopes are checked by the public API module before the provider runs.
