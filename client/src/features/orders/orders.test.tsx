@@ -40,13 +40,15 @@ function proxy(path: string[]): unknown {
       ...opts,
     }),
     mutationOptions: (opts: Record<string, unknown> = {}) => ({ mutationFn: run, ...opts }),
+    mutate: run,
+    query: run,
     queryKey: (input?: unknown) => [key, input],
     pathKey: () => [key],
   };
   return new Proxy(api, { get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : proxy([...path, prop])) });
 }
 
-vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
+vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]), useTRPCClient: () => proxy([]) }));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
 vi.mock("@/app/registry", () => ({
   FEATURES: [
@@ -287,6 +289,47 @@ describe("new order wizard", () => {
     const keys = calls.filter((c) => c.path === "orders.create").map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("C3 discount code: Apply and Enter only quote (never submit the order), total is announced, code is sent on create", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    handlers.set("platform.bootstrap", () => ({ features: { promotions: true }, consent: { enabled: false, policyVersion: 1, renewMonths: 12 } }));
+    handlers.set("orders.quoteWithPromo", (input) => {
+      const { promoCode } = input as { promoCode: string };
+      if (promoCode !== "SAVE10") throw Object.assign(new Error("promo"), { data: { safe: { domainCode: "VALIDATION", reasonCode: "PROMO_NOT_APPLICABLE", safeMessage: "This code cannot be applied.", requestId: "r1" } } });
+      const base = fakeQuote(input);
+      return { ...base, discountMinor: base.discountMinor + 100, discountLabel: "Synthetic promo", totalMinor: base.totalMinor - 100, promo: { label: "Synthetic promo", promoDiscountMinor: 100 } };
+    });
+    handlers.set("orders.create", () => ({ publicId: ORDER_ID, reference: "RP-2026-000001", created: true }));
+    const user = userEvent.setup();
+    const { container, location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByText("Synthetic A");
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Promo project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
+    // No nested forms: the discount field's form is outside the wizard form.
+    expect(container.querySelectorAll("form form")).toHaveLength(0);
+    const codeInput = await screen.findByLabelText("Discount code");
+    // Enter with a wrong code: quote only, uniform refusal, no order.
+    await user.type(codeInput, "WRONG1{Enter}");
+    await waitFor(() => expect(calls.filter((c) => c.path === "orders.quoteWithPromo")).toHaveLength(1));
+    expect(await screen.findAllByText("This code cannot be applied.")).not.toHaveLength(0);
+    expect(calls.filter((c) => c.path === "orders.create")).toHaveLength(0);
+    // Apply button with the right code: quote only, then the new total is announced in the always-mounted region.
+    await user.clear(screen.getByLabelText("Discount code"));
+    await user.type(screen.getByLabelText("Discount code"), "SAVE10");
+    await user.click(screen.getByRole("button", { name: /^Apply/ }));
+    await waitFor(() => expect(screen.getByText(/Discount Synthetic promo applied\. New total/)).toBeInTheDocument());
+    expect(calls.filter((c) => c.path === "orders.create")).toHaveLength(0);
+    expect(location.history?.at(-1)).toBe("/orders/new");
+    await expectNoAxeViolations(container);
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const create = calls.filter((c) => c.path === "orders.create");
+    expect(create).toHaveLength(1);
+    expect(create[0]!.input).toMatchObject({ promoCode: "SAVE10" });
   });
 
   it("packet catalog: picker + server quote, bundle discount on review, one tier per packet sent as quantity 1", async () => {

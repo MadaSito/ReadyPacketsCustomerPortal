@@ -5,19 +5,33 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PackageOpen } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { useFeatureEnabled } from "@/lib/features";
-import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
+import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
+// Increment 05 (C3): shared discount code field, imported here by /root's direction (audit_engineer owns it).
+import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import { Breadcrumbs, Button, Callout, Card, EmptyState, ErrorState, Field, Input, KeyValueList, Money, PageHeader, Skeleton, Textarea, useToast } from "@/ui";
 import { isPacketCatalog, nonPacketGroups, PacketPicker, packetItems, PacketSummary, useOrderQuote } from "../customer/packets";
 import { money, newIdempotencyKey } from "../shared";
+import type { OrderQuote } from "../customer/packets";
+
+/** Plain-text amount for the screen-reader announcement (the visible amounts use <Money>). */
+function formatMinor(minor: number, currency: string): string {
+  try {
+    const digits = new Intl.NumberFormat("en-US", { style: "currency", currency }).resolvedOptions().maximumFractionDigits ?? 2;
+    return new Intl.NumberFormat("en-US", { style: "currency", currency }).format(minor / 10 ** digits);
+  } catch {
+    return `${minor} ${currency}`;
+  }
+}
 
 const REASON_MESSAGES: Record<string, string> = {
   PRODUCT_UNAVAILABLE: "An item is no longer available. Go back and review your choices.",
   PACKET_TIER_CONFLICT: "Choose one tier per packet.",
   PACKET_QUANTITY_ONE: "Each packet can be ordered once.",
   MIXED_CURRENCY: "Items priced in different currencies must be ordered separately.",
+  PROMO_NOT_APPLICABLE: "This code cannot be applied. Remove the discount code or try another one.",
 };
 
 const STEPS = ["Choose items", "Details", "Review"] as const;
@@ -25,6 +39,8 @@ const MAX_QUANTITY = 1000;
 
 export default function NewOrderPage() {
   const trpc = useTRPC();
+  const trpcClient = useTRPCClient();
+  const wizardFormId = useId();
   const queryClient = useQueryClient();
   const toast = useToast();
   const [, navigate] = useLocation();
@@ -33,6 +49,9 @@ export default function NewOrderPage() {
   // Increment 04: with the cart feature on, the wizard fills the cart and checkout creates the order.
   const cartEnabled = useFeatureEnabled("cart");
   const addToCart = useMutation(trpc.cart.addItems.mutationOptions());
+  // Increment 05 (C3): discount codes on the direct order path (with the cart on, the cart owns codes).
+  const promotionsEnabled = useFeatureEnabled("promotions");
+  const [promoCode, setPromoCode] = useState<string | null>(null);
   const [step, setStep] = useState(0);
   const [quantities, setQuantities] = useState<Record<string, string>>({});
   const [selection, setSelection] = useState<Record<number, string | null>>({});
@@ -74,7 +93,51 @@ export default function NewOrderPage() {
     return product ? [{ product, quantity: item.quantity }] : [];
   });
   const mixedCurrency = new Set(chosen.map((line) => line.product.currency)).size > 1;
-  const quote = useOrderQuote(mixedCurrency ? [] : items);
+  const baseQuote = useOrderQuote(mixedCurrency ? [] : items);
+  // With a code the quote comes from `orders.quoteWithPromo` (POST: the code never travels in a URL).
+  const promoRequested = promoCode !== null && promotionsEnabled && !cartEnabled && items.length > 0 && !mixedCurrency;
+  const promoInput = { items: items.map((item) => ({ productPublicId: item.productPublicId, quantity: item.quantity })) };
+  const promoQuery = useQuery({
+    queryKey: ["orders", "quoteWithPromo", promoInput.items, promoCode],
+    queryFn: () => trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: promoCode ?? "" }),
+    enabled: promoRequested,
+    staleTime: 30_000,
+    retry: false,
+    gcTime: 0,
+  });
+  // A selection change can make the code inapplicable: it is then treated as removed (never sent on create) and
+  // the plain quote is shown. Derived, not stored, so it re-applies if the selection goes back.
+  const promoRejected = promoRequested && promoQuery.error !== null && safeError(promoQuery.error)?.reasonCode === "PROMO_NOT_APPLICABLE";
+  const usePromo = promoRequested && !promoRejected;
+  const quote: { quote: (OrderQuote & { promo?: { label: string; promoDiscountMinor: number } | null }) | null; pending: boolean; error: unknown } = usePromo
+    ? { quote: promoQuery.error ? null : (promoQuery.data ?? null), pending: promoQuery.isFetching, error: promoQuery.error }
+    : baseQuote;
+  const promoNotice = promoRejected ? "The discount code does not apply to this selection and was removed." : null;
+  const appliedPromo =
+    usePromo && quote.quote?.promo ? { label: quote.quote.promo.label, discountMinor: quote.quote.promo.promoDiscountMinor, currency: quote.quote.currency } : null;
+  const applyPromo = async (code: string) => {
+    // Rethrows the server's uniform refusal for the field to show.
+    const result = await trpcClient.orders.quoteWithPromo.mutate({ ...promoInput, promoCode: code });
+    queryClient.setQueryData(["orders", "quoteWithPromo", promoInput.items, code], result);
+    setPromoCode(code);
+  };
+  // One always-mounted polite region for discount-code changes (the step-1 estimate has its own live line).
+  const [promoMessage, setPromoMessage] = useState("");
+  const promoTotalText =
+    usePromo && quote.quote && !quote.pending ? `Discount ${quote.quote.promo?.label ?? ""} applied. New total ${formatMinor(quote.quote.totalMinor, quote.quote.currency)}.` : null;
+  const promoAnnouncement = promoNotice ?? promoTotalText ?? promoMessage;
+  // The field's own messages go to that region; "applied" is replaced by the new-total line.
+  const announcePromo = (message: string) => {
+    if (message === "Discount code applied.") return;
+    if (message === "Discount code removed." && baseQuote.quote) {
+      setPromoMessage(`Discount code removed. Total ${formatMinor(baseQuote.quote.totalMinor, baseQuote.quote.currency)}.`);
+      return;
+    }
+    setPromoMessage(message);
+  };
+  const removePromo = async () => {
+    setPromoCode(null);
+  };
   const quoteReason = quote.error ? safeError(quote.error)?.reasonCode : undefined;
   const quoteProblem = quote.error ? (quoteReason && REASON_MESSAGES[quoteReason]) || "The total could not be calculated. Please try again." : null;
 
@@ -156,6 +219,7 @@ export default function NewOrderPage() {
         items,
         note: note.trim() ? note.trim() : undefined,
         idempotencyKey,
+        ...(usePromo && promoCode ? { promoCode } : {}),
       });
       await queryClient.invalidateQueries({ queryKey: trpc.orders.list.pathKey() });
       toast.show({ tone: "success", title: "Order submitted", description: `Reference ${result.reference}` });
@@ -205,7 +269,10 @@ export default function NewOrderPage() {
           </Callout>
         </div>
       ) : null}
-      <form onSubmit={step === STEPS.length - 1 ? (e) => (e.preventDefault(), void submit()) : next} noValidate className={`flex flex-col gap-5 ${packetCatalog && step === 0 ? "max-w-6xl" : "max-w-3xl"}`}>
+      <div className={`flex flex-col gap-5 ${packetCatalog && step === 0 ? "max-w-6xl" : "max-w-3xl"}`}>
+      {/* The discount code field renders its own <form>, so it sits OUTSIDE the wizard form (no nested forms: its
+          Apply/Enter can never submit the order). The wizard's buttons are associated via the form attribute. */}
+      <form id={wizardFormId} onSubmit={step === STEPS.length - 1 ? (e) => (e.preventDefault(), void submit()) : next} noValidate className="flex flex-col gap-5">
         <h2 ref={headingRef} tabIndex={-1} className="text-xl font-semibold text-ink outline-none">
           {STEPS[step]}
         </h2>
@@ -320,6 +387,17 @@ export default function NewOrderPage() {
             <p className="mt-4 text-sm text-muted">Prices are fixed when you submit. Later catalog changes do not affect this order.</p>
           </Card>
         ) : null}
+      </form>
+        {step === 2 && promotionsEnabled && !cartEnabled ? (
+          <Card title="Discount code" headingLevel={3}>
+            <PromoCodeField applied={appliedPromo} onApply={applyPromo} onRemove={removePromo} onAnnounce={announcePromo} disabled={items.length === 0 || mixedCurrency || create.isPending} />
+            {promoNotice ? <p className="mt-2 text-sm text-muted">{promoNotice}</p> : null}
+          </Card>
+        ) : null}
+        {/* Always mounted (every step) so changes to the discount or total are announced politely. */}
+        <p className="sr-only" role="status" aria-live="polite">
+          {promoAnnouncement}
+        </p>
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
           {step === 0 ? (
             <Button variant="secondary" asChild>
@@ -330,11 +408,11 @@ export default function NewOrderPage() {
               Back
             </Button>
           )}
-          <Button type="submit" loading={create.isPending || addToCart.isPending}>
+          <Button type="submit" form={wizardFormId} loading={create.isPending || addToCart.isPending}>
             {step === STEPS.length - 1 ? (cartEnabled ? "Add to cart" : "Submit order") : "Continue"}
           </Button>
         </div>
-      </form>
+      </div>
     </>
   );
 }
