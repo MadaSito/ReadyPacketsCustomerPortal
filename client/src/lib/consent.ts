@@ -182,9 +182,14 @@ function expireCookie(name: string): void {
 export function removeVendorData(category: "analytics" | "session_replay"): void {
   if (typeof document === "undefined") return;
   const pattern = VENDOR_COOKIES[category];
-  for (const pair of document.cookie ? document.cookie.split(";") : []) {
-    const name = pair.split("=")[0]?.trim();
-    if (name && pattern.test(name)) expireCookie(name);
+  try {
+    for (const pair of document.cookie ? document.cookie.split(";") : []) {
+      const name = pair.split("=")[0]?.trim();
+      if (name && pattern.test(name)) expireCookie(name);
+    }
+  } catch {
+    // A sandboxed document (the preview profile's embedded frame) refuses cookie access with a
+    // SecurityError. There are then no cookies this origin can reach, so there is nothing to remove.
   }
   for (const store of [storageAvailable(), RUNTIME.preview ? null : safeSession()]) {
     if (!store) continue;

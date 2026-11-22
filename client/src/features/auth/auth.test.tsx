@@ -183,6 +183,31 @@ describe("account recovery flows", () => {
     expect(await screen.findByRole("heading", { name: /email confirmed/i })).toBeInTheDocument();
     expect(verifyEmail).toHaveBeenCalledTimes(1);
   });
+
+  it("verify-email verifies a token that arrives after mount (in-app link to the same route)", async () => {
+    const verifyEmail = vi.fn(async (_: { token: string }) => ({ accepted: true as const }));
+    const view = renderUi(<VerifyEmailPage />, { path: "/verify-email", api: fakeAuthApi({ verifyEmail }) });
+    expect(await screen.findByRole("heading", { name: /confirm your email/i })).toBeInTheDocument();
+    expect(verifyEmail).not.toHaveBeenCalled();
+    act(() => view.location.navigate("/verify-email?token=late-token"));
+    expect(await screen.findByRole("heading", { name: /email confirmed/i })).toBeInTheDocument();
+    expect(verifyEmail).toHaveBeenCalledTimes(1);
+    expect(verifyEmail).toHaveBeenCalledWith({ token: "late-token" });
+  });
+
+  it("verify-email offers Continue, not another link, once the signed-in account no longer needs confirming", async () => {
+    const resendVerification = vi.fn(async () => ({ accepted: true as const }));
+    renderUi(<VerifyEmailPage />, { path: "/verify-email", api: fakeAuthApi({ me: async () => remediationMe("enroll_mfa"), resendVerification }) });
+    expect(await screen.findByRole("heading", { name: /email confirmed/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /send a new link/i })).not.toBeInTheDocument();
+  });
+
+  it("verify-email keeps the resend action while the signed-in account still needs confirming", async () => {
+    renderUi(<VerifyEmailPage />, { path: "/verify-email", api: fakeAuthApi({ me: async () => remediationMe("verify_email") }) });
+    expect(await screen.findByRole("button", { name: /send a new link/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /confirm your email/i })).toBeInTheDocument();
+  });
 });
 
 describe("MFA", () => {
