@@ -27,6 +27,7 @@ export { Badge, StatusBadge, OPERATION_STATE_META, type BadgeProps, type StatusB
 export { Callout, Skeleton, EmptyState, ErrorState, LoadMore, type CalloutProps, type CalloutTone, type EmptyStateProps, type EmptyStateVariant, type ErrorStateProps, type LoadMoreProps } from "./Feedback";
 export { Dialog, DialogClose, ConfirmDialog, Drawer, DropdownMenu, Tooltip, type DialogProps, type ConfirmDialogProps, type DrawerProps, type DropdownMenuProps, type MenuItem, type TooltipProps } from "./Overlay";
 export { Tabs, Breadcrumbs, type TabsProps, type TabItem, type Crumb } from "./Navigation";
+export { RouteTabs, RouteTabPanel, routeTabId, routeTabPanelId, type RouteTabsProps, type RouteTabItem, type RouteTabPanelProps } from "./RouteTabs";
 export { ToastProvider, useToast, type ToastApi, type ToastInput, type ToastTone } from "./Toast";
 export { DataTable, type Column, type DataTableProps, type SortState } from "./DataTable";
 export { FilterBar, type FilterBarProps } from "./FilterBar";

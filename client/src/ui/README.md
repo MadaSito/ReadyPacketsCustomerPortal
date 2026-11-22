@@ -378,3 +378,22 @@ Missing module or a thrown error renders nothing.
   buttons are hidden in print; `rp-print-avoid-break` keeps a block together.
 - `scripts/qa/responsive-check.mjs` checks every route at 240, 320, 390, 768, 1024, 1440, 1920 and 2560 px in
   both themes for horizontal overflow, clipped text and targets under 24 px.
+
+## Increment 04 part B: `RouteTabs` (order workspace tab strip)
+
+`RouteTabs` + `RouteTabPanel` (from `@/ui`) are the console order page's tab strip (decision B1): one `tablist` whose
+tabs are links (`href` per tab, so every tab keeps its own URL segment), roving focus (Tab enters on the selected tab;
+←/→ wrap and skip disabled tabs; Home/End; Enter or Space opens — arrowing never navigates), visible "Scroll tabs
+left/right" buttons on the overflowing side (named, out of the Tab order; the arrow keys are the keyboard
+equivalent and scroll the focused tab into view), and below 480 px a labelled native select with the same tabs
+(counts as "(n)", disabled tabs disabled). Pass a stable `idBase` to both components; if the page remounts the strip
+on a URL change, focus returns to the opened tab. `labelContent` renders live text (a `labelComponent`) in the strip;
+the select uses the static `label`. Counts above 99 show "99+".
+
+```tsx
+const tabs = ORDER_TABS.filter(visible).map((t) => ({ value: t.key, label: t.label, href: `${base}/${t.key}`,
+  labelContent: t.labelComponent ? <t.labelComponent orderId={id} area="console" /> : undefined }));
+<RouteTabs idBase="order-tabs" items={[{ value: "overview", label: "Overview", href: base }, ...tabs]} value={active} label="Order sections" />
+<RouteTabPanel idBase="order-tabs" value={active}>{panel}</RouteTabPanel>
+```
+Tests: `client/src/ui/routeTabs.test.tsx`.
