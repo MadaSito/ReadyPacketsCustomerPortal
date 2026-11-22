@@ -266,12 +266,24 @@ endAllCustomers(actor: SessionPrincipal, input: { reasonCode: string /* ^[A-Z][A
 Opens its own transaction: `authorizeInTx(actor, "sessions.revoke_any")` (fresh step-up) → actor `users` row →
 customer `user_sessions` rows (bounded batches). Never touches staff/admin sessions. Audited
 `auth.session.ended_all_customers`; one sign-in-log `forced_end` row per session. Callers must NOT hold other
-module locks (call after your own transaction commits).
+module locks (call after your own transaction commits). Every forced end (one / user / all customers) records the
+acting admin explicitly on the sign-in-log row and the audit event.
+
+```ts
+// deps.services.publicApi.registerProvider("customers", …) — registered in IdentityModule.init()
+list(query: ApiListQuery, caller: ApiCaller): Promise<ApiPage<CustomerDto>>; // role=customer only
+get(publicId: string, caller: ApiCaller): Promise<CustomerDto | null>;      // staff/admin ⇒ null
+```
+Filters `status` (unknown ⇒ `VALIDATION / FILTER_INVALID`), `search` (≤ 100 chars; exact e-mail via blind index,
+reference prefix, name-token prefix — same strategy as the admin customer search), `updatedSince`, cursor (id
+desc). Each call is durably audited (`api.customer.listed` / `api.customer.read`, actor system, correlationId =
+`caller.requestId`, key public id; never e-mail).
 
 ### Ports consumed
 - `jobAdmin.maintenance.customerAccess(tx?)` (package E) — local sign-in, registration and SSO refuse customers
   with `FORBIDDEN / CUSTOMER_MAINTENANCE`; SSO refusal code `SSO_MAINTENANCE`. Authoritative call inside the
   session-creating transaction after the users row lock.
+- SSO refusal codes `SSO_MAINTENANCE` / `SSO_RESTRICTED` (client messages in `sso/messages.ts`).
 - `protection.clientCountry()` (package C) — stored on the session and the sign-in log; `null` = unknown.
 - `referrals.attributeRegistration(code, newUserId, tx)` (package G) — optional; called only when a NEW customer
   row is created with `referralCode`. Missing module ⇒ ignored.
@@ -280,12 +292,12 @@ module locks (call after your own transaction commits).
 | Procedure | Guard | Notes |
 |---|---|---|
 | `identity.security.overview` | protected | Own live sessions (device, method, country, IP, current) + last 20 own sign-in-log rows. |
-| `identity.admin.sessions.list` | staff/admin + `sessions.read_all` | Live sessions of all users; filters `role, authMethod, country, userId, query` (name prefix); cursor, limit ≤ 100. |
+| `identity.admin.sessions.list` | admin + `sessions.read_all` (not granted to staff) | Live sessions of all users; filters `role, authMethod, country, userId`; cursor, limit ≤ 100. |
 | `identity.admin.sessions.end` | admin + `sessions.revoke_any` (step-up) | `{ sessionId, reasonCode }`. Own current session refused (`OWN_SESSION`). |
 | `identity.admin.sessions.endForUser` | admin + `sessions.revoke_any` (step-up) | `{ userId, reasonCode }`; keeps the actor's current session. |
 | `identity.admin.sessions.endAllCustomers` | admin + `sessions.revoke_any` (step-up) | `{ reasonCode }` → `{ ended }`. |
-| `identity.admin.signInLog.list` | staff/admin + `sessions.read_all` | Filters `kind, userId, role, authMethod, country, ip, from, to`; cursor, limit ≤ 100; newest first. |
-| `identity.admin.signInLog.export` | admin + `sessions.read_all` | Same filters, ≤ 5 000 rows CSV text; durably audited. |
+| `identity.admin.signInLog.list` | admin + `sessions.read_all` | Filters `kind, userId, role, authMethod, country, ip, from, to`; cursor, limit ≤ 100; newest first. |
+| `identity.admin.signInLog.export` (mutation) | admin + `sessions.read_all` + fresh step-up | Same filters, ≤ 5 000 rows CSV text (formula cells prefixed `'`); durably audited. |
 | `identity.admin.restrictions.get` / `update` | admin + `sessions.policy.manage` (+ fresh step-up for update) | Versioned (`expectedVersion`). Update refused with `WOULD_LOCK_OUT` when the candidate would refuse the acting admin's current IP/country. |
 
 Sign-in log kinds: `success | failure | lock | sign_out | forced_end | expiry | refused`. Rows hold user (when
