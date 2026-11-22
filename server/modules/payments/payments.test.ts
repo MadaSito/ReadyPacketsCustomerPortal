@@ -588,15 +588,19 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     });
     (servicesObj as unknown as Record<string, unknown>).payments = payments;
 
-    async function createIssuedInvoiceForCustomerA(amountMinor = 25_000, currency = "USD") {
+    async function createIssuedInvoiceForPrincipal(
+      owner: SessionPrincipal,
+      amountMinor = 25_000,
+      currency = "USD",
+    ) {
       const ordId = ++orderSeq;
       const ordPub = ulid(t.clock.now().getTime() + ordId);
       const ord: FakeOrderRecord = {
         id: ordId,
         publicId: ordPub,
         reference: `RP-2026-00${ordId}`,
-        ownerUserId: customerAPrincipal.userId,
-        ownerPublicId: customerAPrincipal.userPublicId,
+        ownerUserId: owner.userId,
+        ownerPublicId: owner.userPublicId,
         lockState: "none",
         origin: "portal",
       };
@@ -605,7 +609,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       const issued = await tdb.db.transaction((tx) =>
         compliance.issueCheckoutInvoiceInTx(
           {
-            principal: customerAPrincipal,
+            principal: owner,
             orderPublicId: ord.publicId,
             currency,
             discountMinor: 0,
@@ -623,6 +627,10 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       return { order: ord, invoice: issued };
     }
 
+    async function createIssuedInvoiceForCustomerA(amountMinor = 25_000, currency = "USD") {
+      return createIssuedInvoiceForPrincipal(customerAPrincipal, amountMinor, currency);
+    }
+
     return {
       deps: moduleDeps,
       audit: t.audit,
@@ -634,6 +642,7 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
       squareFake,
       referralEvents,
       paidListenerEvents,
+      createIssuedInvoiceForPrincipal,
       createIssuedInvoiceForCustomerA,
     };
   }
@@ -824,6 +833,68 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     await expect(
       h.payments.cancelAttemptIfUnpaid(customerBPrincipal, { attemptPublicId: first.attemptPublicId }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    // Cross-reference isolation regression:
+    // 1) Customer A supplying their OWN invoicePublicId alongside Customer B's attemptPublicId MUST return NOT_FOUND
+    //    and leave Customer B's attempt untouched.
+    const { invoice: invB } = await h.createIssuedInvoiceForPrincipal(customerBPrincipal, 21_000);
+    const startedB = await h.payments.startCheckout(
+      invB.invoicePublicId,
+      { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+      { principal: customerBPrincipal, idempotencyKey: "idem-custb-1" },
+    );
+    if (startedB.mode !== "redirect") throw new Error("expected redirect");
+
+    await expect(
+      h.payments.cancelAttemptIfUnpaid(customerAPrincipal, {
+        invoicePublicId: invoice.invoicePublicId,
+        attemptPublicId: startedB.attemptPublicId,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      h.payments.getCheckoutStatus(customerAPrincipal, {
+        invoicePublicId: invoice.invoicePublicId,
+        attemptPublicId: startedB.attemptPublicId,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const statusB = await h.payments.getCheckoutStatus(customerBPrincipal, {
+      attemptPublicId: startedB.attemptPublicId,
+    });
+    expect(statusB.attempt?.status).toBe("redirected");
+
+    // 2) Customer A supplying their OWN second invoicePublicId alongside their OWN attemptPublicId from invoice #1
+    //    MUST return NOT_FOUND and leave attempt #1 untouched.
+    const { invoice: invA2 } = await h.createIssuedInvoiceForCustomerA(19_000);
+    await expect(
+      h.payments.cancelAttemptIfUnpaid(customerAPrincipal, {
+        invoicePublicId: invA2.invoicePublicId,
+        attemptPublicId: first.attemptPublicId,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      h.payments.getCheckoutStatus(customerAPrincipal, {
+        invoicePublicId: invA2.invoicePublicId,
+        attemptPublicId: first.attemptPublicId,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const statusA1StillRedirected = await h.payments.getCheckoutStatus(customerAPrincipal, {
+      invoicePublicId: invoice.invoicePublicId,
+      attemptPublicId: first.attemptPublicId,
+    });
+    expect(statusA1StillRedirected.attempt?.status).toBe("redirected");
+
+    // 3) Matching (invoicePublicId, attemptPublicId, owner) succeeds cleanly.
+    const cancelledOk = await h.payments.cancelAttemptIfUnpaid(customerAPrincipal, {
+      invoicePublicId: invoice.invoicePublicId,
+      attemptPublicId: first.attemptPublicId,
+    });
+    expect(cancelledOk).toEqual({
+      cancelled: true,
+      attemptPublicId: first.attemptPublicId,
+      status: "cancelled",
+    });
   });
 
   it("enforces Decision 12 double verification: return URL & reconcile alone never mark paid; mismatched fetch refuses; valid webhook + fetch books once and fires invoice.paid", async () => {

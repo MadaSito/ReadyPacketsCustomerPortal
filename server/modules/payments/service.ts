@@ -719,30 +719,50 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
 
     const complianceSvc = requireComplianceService();
     const config = await loadConfig();
-    let attemptRow: PaymentAttemptRow | null = null;
 
+    let targetInvoicePublicId = query.invoicePublicId;
+    if (!targetInvoicePublicId) {
+      const [attRef] = await deps.db
+        .select({ invoicePublicId: paymentAttempts.invoicePublicId })
+        .from(paymentAttempts)
+        .where(eq(paymentAttempts.publicId, query.attemptPublicId!))
+        .limit(1);
+      if (!attRef) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      targetInvoicePublicId = attRef.invoicePublicId;
+    }
+
+    // Enforces resource-level read authorization (throws NOT_FOUND for other customers; no existence oracle).
+    const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { principal });
+
+    let attemptRow: PaymentAttemptRow | null;
     if (query.attemptPublicId) {
       const [found] = await deps.db
         .select()
         .from(paymentAttempts)
-        .where(eq(paymentAttempts.publicId, query.attemptPublicId))
+        .where(
+          and(
+            eq(paymentAttempts.publicId, query.attemptPublicId),
+            eq(paymentAttempts.invoiceId, invoice.invoiceId),
+            eq(paymentAttempts.invoicePublicId, invoice.invoicePublicId),
+            eq(paymentAttempts.customerUserId, invoice.ownerUserId),
+          ),
+        )
         .limit(1);
-      if (!found) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
-      attemptRow = found;
-      if (query.invoicePublicId && found.invoicePublicId !== query.invoicePublicId) {
+      if (!found) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
       }
-    }
-
-    const targetInvoicePublicId = query.invoicePublicId ?? attemptRow!.invoicePublicId;
-    // Enforces resource-level read authorization (throws NOT_FOUND for other customers; no existence oracle).
-    const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, { principal });
-
-    if (!attemptRow) {
+      attemptRow = found;
+    } else {
       const [latest] = await deps.db
         .select()
         .from(paymentAttempts)
-        .where(eq(paymentAttempts.invoiceId, invoice.invoiceId))
+        .where(
+          and(
+            eq(paymentAttempts.invoiceId, invoice.invoiceId),
+            eq(paymentAttempts.invoicePublicId, invoice.invoicePublicId),
+            eq(paymentAttempts.customerUserId, invoice.ownerUserId),
+          ),
+        )
         .orderBy(desc(paymentAttempts.id))
         .limit(1);
       attemptRow = latest ?? null;
@@ -792,38 +812,57 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
       const complianceSvc = requireComplianceService();
 
-      let attemptRow: PaymentAttemptRow | undefined;
-      if (target.attemptPublicId) {
-        const [found] = await tx
-          .select()
+      let targetInvoicePublicId = target.invoicePublicId;
+      if (!targetInvoicePublicId) {
+        const [attRef] = await tx
+          .select({ invoicePublicId: paymentAttempts.invoicePublicId })
           .from(paymentAttempts)
-          .where(eq(paymentAttempts.publicId, target.attemptPublicId))
-          .for("update")
+          .where(eq(paymentAttempts.publicId, target.attemptPublicId!))
           .limit(1);
-        if (!found) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
-        attemptRow = found;
-      } else if (target.invoicePublicId) {
-        const [found] = await tx
-          .select()
-          .from(paymentAttempts)
-          .where(eq(paymentAttempts.invoicePublicId, target.invoicePublicId))
-          .orderBy(desc(paymentAttempts.id))
-          .for("update")
-          .limit(1);
-        attemptRow = found;
+        if (!attRef) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        targetInvoicePublicId = attRef.invoicePublicId;
       }
 
-      const invoiceIdToCheck = target.invoicePublicId ?? attemptRow?.invoicePublicId;
-      if (!invoiceIdToCheck) {
-        return { cancelled: false, attemptPublicId: null, status: null };
-      }
-
-      const invoice = await complianceSvc.getInvoiceForCheckout(invoiceIdToCheck, {
+      const invoice = await complianceSvc.getInvoiceForCheckout(targetInvoicePublicId, {
         principal: livePrincipal,
         tx,
       });
       if (livePrincipal.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
         throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+      }
+
+      let attemptRow: PaymentAttemptRow | undefined;
+      if (target.attemptPublicId) {
+        const [found] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(
+            and(
+              eq(paymentAttempts.publicId, target.attemptPublicId),
+              eq(paymentAttempts.invoiceId, invoice.invoiceId),
+              eq(paymentAttempts.invoicePublicId, invoice.invoicePublicId),
+              eq(paymentAttempts.customerUserId, invoice.ownerUserId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!found) throw notFound("PAYMENT_ATTEMPT_NOT_FOUND");
+        attemptRow = found;
+      } else {
+        const [found] = await tx
+          .select()
+          .from(paymentAttempts)
+          .where(
+            and(
+              eq(paymentAttempts.invoiceId, invoice.invoiceId),
+              eq(paymentAttempts.invoicePublicId, invoice.invoicePublicId),
+              eq(paymentAttempts.customerUserId, invoice.ownerUserId),
+            ),
+          )
+          .orderBy(desc(paymentAttempts.id))
+          .for("update")
+          .limit(1);
+        attemptRow = found;
       }
 
       if (!attemptRow) {
@@ -840,7 +879,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       const now = deps.clock.now();
-      await tx
+      const [cas] = await tx
         .update(paymentAttempts)
         .set({
           status: "cancelled",
@@ -848,7 +887,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           version: attemptRow.version + 1,
           updatedAt: now,
         })
-        .where(and(eq(paymentAttempts.id, attemptRow.id), eq(paymentAttempts.version, attemptRow.version)));
+        .where(
+          and(
+            eq(paymentAttempts.id, attemptRow.id),
+            eq(paymentAttempts.invoiceId, invoice.invoiceId),
+            eq(paymentAttempts.customerUserId, invoice.ownerUserId),
+            eq(paymentAttempts.version, attemptRow.version),
+          ),
+        );
+      if (cas.affectedRows !== 1) {
+        throw conflict("PAYMENT_ATTEMPT_STALE", "Payment attempt state changed concurrently; retry.");
+      }
 
       await deps.audit.record(
         {
