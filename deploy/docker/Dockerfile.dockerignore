@@ -14,9 +14,10 @@ docs
 .vite
 /var
 /tmp
-# Only the two files the image needs come from deploy/. Everything else there (and any stray secret
+# Only the files the image needs come from deploy/. Everything else there (and any stray secret
 # file left in the checkout) stays out of the build context and the build cache.
 deploy/**
+!deploy/check-migration-bundle.mjs
 !deploy/docker/init-secrets.sh
 !deploy/docker/healthcheck.mjs
 **/*.pem

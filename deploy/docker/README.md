@@ -113,6 +113,20 @@ Treat that file like the keys themselves. A copy of the database volume is only 
 the three secret volumes goes missing, the stack refuses to start and names the incomplete volume rather
 than creating new keys. If all administrators lose their password or second factors, run `./rp-docker.sh recover-admin --email <admin-email>` on an interactive host terminal (see [`docs/operations/ADMIN-RECOVERY.md`](../../docs/operations/ADMIN-RECOVERY.md)).
 
+## Upgrading an existing stack
+
+Before updating to Increment 05 or a later release, stop application writes and take a consistent backup
+of the database and portal storage. Verify the backup and keep the secret-volume copies in separate,
+secure custody. The Compose wrapper does not take a backup for you. Check out the reviewed release,
+then run `rp-docker.sh up`; the one-shot migrator applies pending entries from the packaged journal
+before starting the web and worker services. Do not run migration SQL by hand. If migration fails,
+leave the portal stopped and inspect the journal and schema before retrying. See the
+[Increment 05 upgrade notes](../../docs/operations/UPGRADE.md#increment-05-and-migration-0005).
+
+Updating also restarts Caddy with the reviewed, bind-mounted `Caddyfile`. If you run Compose manually,
+recreate `caddy` after changing that file. Workflow imports above 256 KiB need the two scoped POST
+exceptions; do not raise the global body limit.
+
 ## Optional country database
 
 FFmpeg and `prlimit` are packaged in the image; audio conversion remains off until enabled in the portal. For database sourcing, refresh and emergency bypass, follow [Media and country database setup](../../docs/operations/MEDIA_AND_GEOIP.md). The image does not include or download an MMDB.

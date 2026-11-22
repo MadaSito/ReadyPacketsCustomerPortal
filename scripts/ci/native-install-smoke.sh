@@ -13,6 +13,11 @@ set -euo pipefail
 readonly host=$1 alias=${2:-}
 readonly origin=https://$host conf=/etc/readypackets credentials=/root/readypackets-initial-admin.txt
 readonly install_log=/var/log/readypackets-install.log
+ci_scripts_dir=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=scripts/ci/assert-release-migrations.sh
+source "$ci_scripts_dir/assert-release-migrations.sh"
+# shellcheck source=scripts/ci/assert-workflow-import-edge.sh
+source "$ci_scripts_dir/assert-workflow-import-edge.sh"
 umask 077
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -157,6 +162,9 @@ upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: app
     --data-binary "@$work/large" "$origin/api/files/upload/probe")
 [[ $upload_status =~ ^40[13]$ ]] || fail "upload route: expected the application to refuse (401/403), got $upload_status"
 
+step 'workflow import body limit is scoped to the two canonical POST paths'
+assert_workflow_import_edge nginx "$origin" "$work"
+
 step 'only Nginx is reachable from outside'
 listeners=$(ss -Hltn | awk '{print $4}' | sort -u)
 grep -qx '127.0.0.1:5000' <<<"$listeners" || fail 'the application does not listen on 127.0.0.1:5000'
@@ -164,6 +172,8 @@ grep -qx '127.0.0.1:5000' <<<"$listeners" || fail 'the application does not list
 ! grep -E ':(5000|3306|33060)$' <<<"$listeners" | grep -qv '^127\.0\.0\.1:' || fail 'the application or the database listens beyond 127.0.0.1'
 grep -qx '127.0.0.1:3306' <<<"$listeners" || fail 'MySQL does not listen on 127.0.0.1:3306'
 expect 'MySQL settings' "$(sql "SELECT CONCAT_WS(' ', @@bind_address, @@skip_name_resolve, @@local_infile)")" '127.0.0.1 1 0'
+step 'release migration 0005 is applied exactly once'
+assert_release_migrations /opt/readypackets/current/migrations sql 0005_increment_05
 
 step 'service sandbox and secrets'
 for unit in readypackets-portal.service readypackets-worker.service; do

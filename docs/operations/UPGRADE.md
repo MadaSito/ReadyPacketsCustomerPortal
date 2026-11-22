@@ -74,7 +74,7 @@ What `deploy/upgrade.sh` does and asks at each gate:
      scp user@my.readypackets.com:/var/lib/readypackets/storage/backups/<32hex> ./
      ```
      (If the file is `0600 readypackets:readypackets`, copy it as root on the server to a root-only staging path or stream over SSH with `sudo cat /var/lib/readypackets/storage/backups/<32hex>`.)
-   - Type **`BACKUP-VERIFIED`** to proceed.
+   - Compare the off-host archive's SHA-256 to the printed digest and confirm the backup and application keys are recoverable from separate off-host custody. Only then type **`BACKUP-VERIFIED`**. `--yes` skips confirmation, not the local verified backup; automation must arrange and verify off-host custody separately.
 
 3. **Forward database migration, atomic release switch, Nginx render, and health verification**:
    - Runs `dist/ops/migrate.js` under the scoped `rp_migrator` MySQL account.
@@ -114,6 +114,16 @@ If migration starts and anything fails, keep writers stopped and ingress fenced.
 - **Customer features**: Enable and exercise one feature at a time with synthetic data in staging. Start with Knowledge or workflow configuration. FFmpeg being installed does not enable recording or conversion; test a conversion and confirm that the original is retained before enabling this for customers.
 - **Order file sync**: Review existing order-file assignments. For new copies, a slot folder overrides the workflow folder, and the default is `customers/{customer_ref}/orders/{order_ref}/{phase}`. Test a synthetic file end to end and compare the path in the order’s File sync tab and the Copy log. An optional path in a workflow does not turn on a storage destination or move a previously copied file.
 - **External services**: Confirm consent behavior before enabling analytics, and use a test receiver for API/webhooks. Leave `payments.config.provider` at `none` until you have verified the hosted redirect, signed callback, provider read-back and invoice result in the provider's test environment.
+
+## Increment 05 and migration `0005`
+
+Migration `0005_increment_05` is additive. It adds eight tables: one workflow import ledger, three for cart upsell offers and activity, and four for promotion batches, codes, redemptions, and check attempts. It adds nine columns and their supporting indexes: six promotion fields on `carts`, two on `orders`, and nullable source context on `policy_acceptances`. The order promotion discount defaults to zero; the other new columns on existing tables are nullable. Imported workflows are drafts stored in the existing workflow tables. The upgrade does not rewrite previous acceptance evidence.
+
+- **Native upgrade**: Use the reviewed Increment 05 commit and follow sections 2–5. Rehearse on an isolated restore first. Keep writers stopped and public traffic fenced while the verified `pre_upgrade` backup is copied and checked off-host, then let the upgrader apply all pending journal entries in order. If upgrading from Increment 04 Part B, only `0005` should be pending. Never run its SQL separately or mark it applied by hand.
+- **Docker Compose**: The image ships the same SQL and journal, but its wrapper has no automatic backup or rollback. Before updating an existing stack, stop writes, take a consistent database and storage backup, and confirm that the required secret volumes can be restored from separate custody. Follow the [Compose upgrade and backup notes](../../deploy/docker/README.md) rather than running the native upgrader.
+- **Refresh the proxy**: Workflow import needs the reviewed proxy config for its two exact POST endpoints, `/api/trpc/orders.admin.workflows.transfer.preview` and `/api/trpc/orders.admin.workflows.transfer.applyImport`. Their body limit is 4,456,448 bytes (4 MiB plus 256 KiB for JSON overhead). Do not raise the general 256 KiB limit. The native upgrader renders the new Nginx templates, runs `nginx -t` and reloads Nginx before reopening traffic; the native upgrade smoke job checks those routes after promotion. The Compose wrapper stops and restarts Caddy with the checked-out `Caddyfile`. If you manage a proxy separately, install the equivalent rules, validate the configuration, and reload or recreate the proxy while ingress is still fenced, before enabling workflow import.
+- **After upgrade**: Confirm readiness, local administrator MFA, and a pre-existing customer and order. Check that the policy acceptance log still shows representative existing evidence. Cart upsell and promotions remain off until enabled; verify optional changes with synthetic data before exposing them to customers.
+- **If migration fails**: MySQL may have applied only some statements. Keep writers stopped and ingress fenced. Follow [section 6](#6-recovery-if-an-upgrade-stops-mid-way): reconcile the journal and schema, then complete a reviewed forward fix or restore the verified backup to isolated clean targets. Do not drop new columns, delete journal entries, or switch binaries as a substitute for database recovery.
 
 ---
 

@@ -100,6 +100,19 @@
 		import rp_upstream
 	}
 
+	# Compare the escaped path literally; encoded spellings stay under the default limit.
+	@workflow_import {
+		method POST
+		expression {orig_uri}.matches('^/api/trpc/orders[.]admin[.]workflows[.]transfer[.](preview|applyImport)([?]|$)')
+		not query batch=*
+	}
+	handle @workflow_import {
+		request_body {
+			max_size 4352KiB
+		}
+		import rp_upstream
+	}
+
 	handle {
 		request_body {
 			max_size 256KiB

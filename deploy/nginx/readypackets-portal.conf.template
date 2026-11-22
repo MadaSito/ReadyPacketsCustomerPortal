@@ -149,6 +149,19 @@ server {
         client_max_body_size 2m;
         proxy_pass http://127.0.0.1:5000;
     }
+    # Workflow import uses single, canonical POST requests with JSON escaping overhead.
+    location = /api/trpc/orders.admin.workflows.transfer.preview {
+        if ($request_method != POST) { return 405; }
+        if ($request_uri !~ "^/api/trpc/orders[.]admin[.]workflows[.]transfer[.]preview([?]|$)") { return 404; }
+        client_max_body_size 4352k;
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location = /api/trpc/orders.admin.workflows.transfer.applyImport {
+        if ($request_method != POST) { return 405; }
+        if ($request_uri !~ "^/api/trpc/orders[.]admin[.]workflows[.]transfer[.]applyImport([?]|$)") { return 404; }
+        client_max_body_size 4352k;
+        proxy_pass http://127.0.0.1:5000;
+    }
     location / {
         proxy_pass http://127.0.0.1:5000;
     }
