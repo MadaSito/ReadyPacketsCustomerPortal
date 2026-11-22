@@ -38,13 +38,15 @@ function proxy(path: string[]): unknown {
       ...opts,
     }),
     mutationOptions: (opts: Record<string, unknown> = {}) => ({ mutationFn: run, ...opts }),
+    mutate: run,
+    query: run,
     queryKey: (input?: unknown) => [key, input],
     pathKey: () => [key],
   };
   return new Proxy(api, { get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : proxy([...path, prop])) });
 }
 
-vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
+vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]), useTRPCClient: () => proxy([]) }));
 vi.mock("@/lib/features", async (original) => ({ ...(await original<typeof featuresModule>()), useFeatureEnabled: (flag: string) => flags.has(flag) }));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
 vi.mock("@/app/registry", () => ({ ORDER_TABS: [], FEATURES: [] }));

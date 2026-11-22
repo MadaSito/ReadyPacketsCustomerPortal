@@ -1,0 +1,56 @@
+# Increment 05 accessibility review
+
+Package H reviews the workflow transfer, cart suggestions, discount codes, and policy acceptance log interfaces against the Increment 05 contract. This is a record of scoped checks against specific states, not a declaration of accessibility conformance. `Pending` means no independent result has been recorded.
+
+## Coverage and acceptance criteria
+
+| Interface | Page and dialog states to scan in light and dark | Keyboard, semantics, and announcements | Status |
+| --- | --- | --- | --- |
+| Workflow transfer | Workflow list with empty and populated selections; import file, preview, reference mapping and blocking-error states; final review and confirmation, where shown | Name row checkboxes and per-workflow controls; announce selection, export completion and preview results; identify input errors in text; maintain a predictable focus destination after advancing a step or dismissing a dialog; keep unsupported or unresolved references visible | Independent rerun: 19 passed at `429d31d`; 10 axe checks cover export, file, mapping, confirm and step-up in both themes. Browser reflow pending. |
+| Cart suggestions | Cart with offers, including add-on, upgrade and bundle examples; offer admin list, editor and destructive confirmation | Name each action for its specific item and price; announce accepted or dismissed suggestions without moving focus unnecessarily; restore focus if the active control disappears; verify labels, counters, headers, keyboard navigation, and explicit action without automatic cart changes | Initial customer component source reviewed; findings below. Host, admin, checkout confirmation and browser evidence pending. |
+| Discount codes | Admin list, editor, batch, redemption and action-dialog states; PromoCodeField in cart and wizard; link landing for saved and invalid links | Associate apply errors with the field; announce saved, copied, applied, removed or repriced states without reading a sensitive value unnecessarily; preserve input where appropriate; name row-scoped controls; confirm focus on open and return; verify filters and table headers | Independent runs: 30 field and landing tests, 36 admin tests including 16 light/dark scans, and 41 Orders UI tests including the wizard host. Cart host and rendered reflow pending. |
+| Policy acceptances | Log, Coverage and Policy updates tabs; open evidence dialog; customer Policies tab with history and version links | Exercise tablist arrow, Home and End keys and route or panel relationships; verify filters, table headers, pagination focus and text status; distinguish exact policy versions and local versus UTC time; check evidence dialog Escape and focus restoration to the launcher | Independent rerun at `118d162`: 18 passed including 12 light/dark axe checks across six states. ArrowRight/Space, final-page pagination focus, and focus on exact evidence text and back to the launcher verified. Home/End source reviewed but not exercised in this run; rendered reflow pending. |
+
+## Findings and verification
+
+| Area | Observed behavior | Disposition |
+| --- | --- | --- |
+| Shared DataTable: checkbox target and selection semantics | Initial checkbox target was 20 CSS px; its 44 px outer wrapper was not interactive. Row state also used a redundant selection attribute on the ordinary table row. | Foundation changed the Radix root to the 44 px interactive target with a 20 px visual, and row styling uses a data attribute. Independent `increment05.test.tsx`: 1 passed, including named checkboxes, mixed state and live selection count. Actual browser target dimensions were not independently measured. |
+| Workflow import: identifying incomplete fields | The initial review step reported a global missing-choice or missing-mapping message but did not associate it with individual invalid controls or focus the first one. | Fixed and independently rerun. Tests assert focus and accessible descriptions on the first incomplete action and missing-policy select. The export status announces the selected count without confusing it with the maximum. |
+| PromoCodeField: blank submission and saved-code action | Blank submission did not update the live region. The saved-code action included the entire code in nonwrapping button text, which could expand past its container with a maximum-length code. | Fixed in `2a78d3d` and independently rerun. Empty Enter announces the linked error without calling the server; `Use saved code` no longer renders the raw code. The component also avoids taking focus from another control after a delayed apply or removal. |
+| Promotion link: forgetting a code | The action unmounted the active button without a stable focus destination and the replacement callout was not live. | Fixed in `2a78d3d` and independently rerun. Clearing storage changes the result to `No code saved` and focuses the replacement result. |
+| Promotions admin: controls that disappear after a mutation | The initial create and code-reveal views removed their focused launchers; Pause, Resume, Revoke, and Release could replace their trigger or remove the entire filtered row after refetch. | Fixed in `6f41f58`; independent `promotionsAdmin.test.tsx`: 36 passed. Regressions exercise creation focus, reveal-to-copy and Hide-to-launcher, a Pause that actually replaces the row action, a row that leaves the filtered list, and Release-to-results-heading. |
+| Promotions admin: input errors following button activation | Settings, batch generation and redemption release previously rendered associated errors while leaving focus on the submit button. | Fixed in `6f41f58`. Tests verify focus moves to invalid controls and the settings error is announced on Enter when focus is already in the input. Error-summary controls have a 24 px minimum-height class; actual target geometry was not measured. |
+| Order wizard: discount form boundary and final total | The initial wizard integration nested the discount form inside the order submission form, so applying a code could also trigger the order submission handler. Only the earlier selection step exposed a persistent live total. | Fixed in `fbbb126`; independent `orders.test.tsx` run: 40 passed. The regression checks for no nested forms, no create or navigation on discount Enter/Apply, the new total in a persistent status region, and exactly one create on deliberate order submission. |
+| Order wizard: invalidated discount and later errors | A code described as removed previously remained in wizard state and could reapply when the selection changed back. A stale removal notice also took precedence over later field errors. | Independently rerun at `8e6e123`: 41 passed. Tests verify no reapplication or code in order submission after restoring the selection and verify that a later validation error replaces the removal notice in the live region. The stale-response guard was source-reviewed; overlapping responses were not exercised. |
+| Acceptance evidence dialog: narrow text and scroll focus | The draft redaction explanation used a badge that truncated rather than wrapping. The keyboard-reachable exact-version scroll region lacked an explicit focus indicator style. | Fixed in `118d162`. Independent tests verify Tab reaches the exact-text region and Escape returns focus to the launcher. The wrapping, slug and explicit focus-ring changes were reviewed in source; actual layout and ring visibility remain unverified. |
+| Acceptance log: link purpose, row action names and filtered results | Version links used labels such as `v1` without naming the policy. Multiple records for the same customer and version could have the same `View evidence` name. The result summary was absent when a filter returned zero rows. | Fixed in `118d162`. Test locates an exact-version link by policy and version and verifies a zero-record `role=status`; evidence names include a timestamp in source. |
+| Cart suggestions: visible wording in accessible labels and focus after a delay | The draft Add to cart label does not contain the visible phrase `Add to cart`. Completing a delayed accept or dismiss can move focus even after the user has moved elsewhere. | Fixed in `4bb0e71`: the accessible names start with the visible wording and name the item and price (confirmed in the integrator's rendered run: `Add to cart: Business Plans — Basic for $910.00`, `Upgrade: Business Foundation — Standard for +$2,000.00`, `Dismiss: …`). Focus is recovered only when the control that disappears owned focus at the start and focus has not left the suggestions section. A move to another control inside the section during the request is not distinguished; recorded as a minor follow-up. |
+
+## Evidence limits
+
+- Component scans use the shared `pageA11y` harness for light and dark. Its jsdom environment cannot verify geometry, actual color contrast, reduced-motion playback, or a screen reader's spoken output.
+- Keyboard tests should exercise the action, active element, transition, and destination, not just assert that a focusable element exists. Status messages should be available to assistive technology without moving focus unless the current control is removed or the task moves to a new step.
+- Real browser verification is separate: 320 CSS px, light and dark, keyboard-only interaction, visible focus, target dimensions or sufficient spacing, no color-only meaning, rendered contrast where measured, and reduced motion. Actual browser zoom and manual screen-reader coverage are separate from viewport-based reflow and automated scans.
+- No real customers, policies, discount codes, or credentials are needed for the review. Use synthetic records and report the build, role, route, viewport, theme, and tested state for browser evidence.
+
+## Integrator's rendered run (2026-11-22)
+
+Run by the integrator in Chromium against a disposable development-profile portal (synthetic data) at
+the increment's final build, with all four features switched on.
+
+- axe-core (WCAG 2.0/2.1/2.2 A and AA rule tags plus best practices) and a horizontal-overflow check on 18
+  page states at 320, 768 and 1280 CSS px, light and dark (106 runs; the customer "Policies" tab was
+  not run at 320 px): `/admin/workflows` and the open import dialog; `/admin/carts/suggestions` and the open
+  "New cart suggestion" dialog; `/admin/promotions`, `/new`, a code's page and `/redemptions`;
+  `/admin/policy-acceptances`, `/coverage`, `/updates`, a version text page and the customer profile
+  "Policies" tab; `/cart` with a suggestion, `/cart/checkout`, `/promo`, an order with a discount and its
+  invoice.
+- Result: no axe violations. One reflow defect was found and fixed: at 320 px the cart suggestions list
+  overflowed by 5 px because a long column header widened the label column of the stacked card. The
+  header is now "Activity" with wrapping text; the twelve suggestion-page runs were repeated and passed.
+- Not covered by this run: the import dialog's review and confirmation steps, the evidence dialog, the
+  step-up dialog and error states were exercised functionally but not scanned with axe in the browser;
+  keyboard-only operation, browser zoom, reduced-motion playback and screen readers were not exercised.
+  The ledger entries above without an "independently rerun" note rest on the component tests.
+

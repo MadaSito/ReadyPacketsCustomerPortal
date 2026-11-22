@@ -1,4 +1,5 @@
 import type {
+  CustomerTab,
   DashboardWidget,
   FeatureRoutes,
   NavItem,
@@ -22,6 +23,12 @@ interface ComplianceAdminModule {
   complianceAdminNav?: NavItem[];
 }
 
+interface ComplianceAcceptanceLogModule {
+  acceptanceLogRoutes?: RouteDef[];
+  acceptanceLogNav?: NavItem[];
+  acceptanceLogCustomerTabs?: CustomerTab[];
+}
+
 const customerModules = import.meta.glob<ComplianceCustomerModule>(
   "./customer/index.{ts,tsx}",
   { eager: true },
@@ -30,13 +37,19 @@ const adminModules = import.meta.glob<ComplianceAdminModule>(
   "./admin/index.{ts,tsx}",
   { eager: true },
 );
+const acceptanceLogModules = import.meta.glob<ComplianceAcceptanceLogModule>(
+  "./pages/acceptances/index.{ts,tsx}",
+  { eager: true },
+);
 
 const customerMod = Object.values(customerModules)[0];
 const adminMod = Object.values(adminModules)[0];
+const acceptanceLogMod = Object.values(acceptanceLogModules)[0];
 
 export const routes: RouteDef[] = [
   ...(customerMod?.complianceCustomerRoutes ?? []),
   ...(adminMod?.complianceAdminRoutes ?? []),
+  ...(acceptanceLogMod?.acceptanceLogRoutes ?? []),
   ...acceptanceRoutes,
 ];
 
@@ -56,6 +69,7 @@ function normalizeCustomerNav(items: NavItem[]): NavItem[] {
 export const nav: NavItem[] = [
   ...normalizeCustomerNav(customerMod?.complianceCustomerNav ?? []),
   ...(adminMod?.complianceAdminNav ?? []),
+  ...(acceptanceLogMod?.acceptanceLogNav ?? []),
 ];
 
 export const orderTabs: OrderTab[] = [
@@ -64,6 +78,10 @@ export const orderTabs: OrderTab[] = [
 ];
 
 export const orderBanners: OrderBanner[] = [...acceptanceOrderBanners];
+
+export const customerTabs: CustomerTab[] = [
+  ...(acceptanceLogMod?.acceptanceLogCustomerTabs ?? []),
+];
 
 export const widgets: DashboardWidget[] = [
   ...(customerMod?.complianceWidgets ?? []),
@@ -78,6 +96,7 @@ export const complianceFeature: FeatureRoutes = {
   nav,
   orderTabs,
   orderBanners,
+  customerTabs,
   widgets,
   routeWrappers,
 };

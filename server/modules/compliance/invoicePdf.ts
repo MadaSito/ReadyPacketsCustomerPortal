@@ -25,6 +25,10 @@ export interface InvoicePdfInput {
   }[];
   subtotalMinor: number;
   discountMinor: number;
+  bundleDiscountMinor?: number | undefined;
+  discountLabel?: string | null | undefined;
+  promoDiscountMinor?: number | undefined;
+  promoLabel?: string | null | undefined;
   taxMinor: number;
   totalMinor: number;
   grossPaidMinor: number;
@@ -259,8 +263,15 @@ export function renderInvoicePdf(input: InvoicePdfInput): Buffer {
   };
 
   drawSummaryRow("Subtotal", input.subtotalMinor);
-  if (input.discountMinor > 0) {
-    drawSummaryRow("Discount", -input.discountMinor);
+  const promoMinor = Math.max(0, input.promoDiscountMinor ?? 0);
+  if (promoMinor > 0) {
+    const bundleMinor = Math.max(0, input.bundleDiscountMinor ?? input.discountMinor - promoMinor);
+    if (bundleMinor > 0) {
+      drawSummaryRow(input.discountLabel ?? "Bundle discount", -bundleMinor);
+    }
+    drawSummaryRow(input.promoLabel ? `Discount (${input.promoLabel})` : "Code discount", -promoMinor);
+  } else if (input.discountMinor > 0) {
+    drawSummaryRow(input.discountLabel ? `Discount (${input.discountLabel})` : "Discount", -input.discountMinor);
   }
   if (input.taxMinor > 0) {
     drawSummaryRow("Tax", input.taxMinor);

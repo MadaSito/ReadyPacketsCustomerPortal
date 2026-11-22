@@ -14,12 +14,13 @@ import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
 import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
-import { compliancePort, engagementPort, filesPort, identityPort } from "./ports.js";
+import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
+import { getRequestContext } from "../../core/requestContext.js";
 import { allocateReference, normalizeReference, reserveReference } from "./references.js";
 import { ORDER_NOTIFY_MAIL, ORDER_REFERENCE_PREFIX } from "./settings.js";
 import type { OrderAccessRole, OrderAccessView, OrderLockState, OrderProductionScope, OrderQuote, OrderSummary, NoteVisibility } from "./types.js";
 import type { PacketTier } from "./schema.js";
-import { priceOrder } from "./pricing.js";
+import { priceOrder, type OrderPricing } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import type { RequirementsService } from "./requirements.js";
 import type { OrderGatesService } from "./gates.js";
@@ -229,11 +230,77 @@ export function createOrderService(deps: OrderServiceDeps) {
     }
   }
 
+  /**
+   * Increment 05 (C3): an order with a code that is cancelled BEFORE payment releases its redemption (promotions
+   * restores the counters; idempotent). Paid or refunded orders keep it used. When the payment state is not
+   * definitively unpaid/void the redemption is kept (fail closed); a release failure aborts the cancellation's transaction.
+   */
+  async function releasePromotionOnCancel(tx: Tx, orderId: number) {
+    const [row] = await tx.select({ publicId: orders.publicId, promoLabel: orders.promoLabel, promoDiscountMinor: orders.promoDiscountMinor }).from(orders).where(eq(orders.id, orderId)).limit(1);
+    if (!row || (row.promoLabel === null && row.promoDiscountMinor === 0)) return;
+    const port = promotionsPort(deps.services);
+    if (!port) return;
+    // Fail closed (/root G-C3-02): release only on compliance's authoritative exposure read in THIS transaction:
+    // nothing ever paid (partial payments count), no open payable invoice, no pending provider capture, and no
+    // provider payment attempt ever created (any status). Port absent, error (incl. compliance's NOWAIT lock
+    // contention) or any exposure ⇒ the redemption stays used; the cancellation itself still succeeds.
+    const exposure = paymentExposurePort(deps.services);
+    if (!exposure) return;
+    try {
+      if (!releaseIsSafe(await exposure(tx, row.publicId))) return;
+    } catch {
+      deps.logger.warn("order payment exposure unavailable; promotion kept", { orderPublicId: row.publicId });
+      return;
+    }
+    await port.releaseForOrderInTx(tx, { orderPublicId: row.publicId, reason: "order_cancelled" });
+  }
+
+  /** Increment 05 (C3): the promotion context for priced lines; eligibility is judged for the order OWNER. */
+  function promotionContext(
+    code: string,
+    owner: number,
+    actor: number,
+    currency: string,
+    lineItems: readonly { productPublicId: string; packetNumber: number | null; tier: PacketTier | null; lineTotalMinor: number }[],
+    pricing: OrderPricing,
+  ): PromotionContext {
+    return {
+      code,
+      customerUserId: owner,
+      actorUserId: actor,
+      currency,
+      lines: lineItems.map((line) => ({ productPublicId: line.productPublicId, packetNumber: line.packetNumber, tierKey: line.tier ? line.tier.toLowerCase() : null, lineTotalMinor: line.lineTotalMinor })),
+      subtotalMinor: pricing.subtotalMinor,
+      bundleDiscountMinor: pricing.discountMinor,
+      bundleLabel: pricing.discountLabel,
+    };
+  }
+
+  /** Final figures after a promotion outcome; refuses anything inconsistent (fail closed, never a negative total). */
+  function applyOutcome(pricing: OrderPricing, outcome: PromotionOutcome) {
+    const ok =
+      [outcome.discountMinor, outcome.promoDiscountMinor, outcome.bundleDiscountMinor, outcome.totalMinor].every((n) => Number.isSafeInteger(n) && n >= 0) &&
+      outcome.discountMinor <= pricing.subtotalMinor &&
+      outcome.promoDiscountMinor <= outcome.discountMinor &&
+      outcome.totalMinor === pricing.subtotalMinor - outcome.discountMinor &&
+      outcome.label.trim().length > 0;
+    if (!ok) throw new DomainError("UNAVAILABLE", "PROMOTIONS_UNAVAILABLE", "This action is temporarily unavailable. Please try again later.");
+    return {
+      ...pricing,
+      discountMinor: outcome.discountMinor,
+      // A code that contributes nothing (bundle won, or the cap left 0) leaves no promo figures or label behind;
+      // promotions likewise writes no redemption for it.
+      discountLabel: outcome.discountMinor > 0 ? outcome.discountLabel.slice(0, 120) : null,
+      totalMinor: outcome.totalMinor,
+      ...(outcome.promoDiscountMinor > 0 ? { promo: { publicId: outcome.promoPublicId, label: outcome.label.slice(0, 120), promoDiscountMinor: outcome.promoDiscountMinor } } : {}),
+    };
+  }
+
   /** Creates the order rows inside `tx` (actor already re-validated by the caller). */
   async function createInTx(
     tx: Tx,
     principal: SessionPrincipal | null,
-    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+    input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string },
     ownerUserId: number,
     prefix: string,
     system?: { correlationId: string; channel: string },
@@ -242,10 +309,23 @@ export function createOrderService(deps: OrderServiceDeps) {
     const workflow = await workflows.ensureDefault(tx);
     const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
     const currency = lineItems[0]!.currency;
-    const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+    const basePricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+    const publicId = ulid(now.getTime());
+    // Increment 05 (C3): redeem inside this transaction BEFORE the order row; any refusal rolls everything back.
+    let pricing: OrderPricing & { promo?: { publicId: string; label: string; promoDiscountMinor: number } } = basePricing;
+    if (input.promoCode !== undefined) {
+      // Codes are for portal orders only (API v1 does not accept codes in this increment), and need a person.
+      if (system || !principal) throw promoNotApplicable();
+      const port = await requirePromotions(deps.services, tx);
+      const outcome = await port.redeemInTx(tx, {
+        ...promotionContext(input.promoCode, ownerUserId, principal.userId, currency, lineItems, basePricing),
+        orderPublicId: publicId,
+        correlationId: getRequestContext()?.correlationId ?? getRequestContext()?.requestId ?? publicId,
+      });
+      pricing = applyOutcome(basePricing, outcome);
+    }
     const totalMinor = pricing.totalMinor;
     const reference = await allocateReference(tx, prefix, now);
-    const publicId = ulid(now.getTime());
     const initial = initialState(workflow.definition);
     await tx.insert(orders).values({
       publicId,
@@ -257,6 +337,8 @@ export function createOrderService(deps: OrderServiceDeps) {
       subtotalMinor: pricing.subtotalMinor,
       discountMinor: pricing.discountMinor,
       discountLabel: pricing.discountLabel,
+      promoDiscountMinor: pricing.promo?.promoDiscountMinor ?? 0,
+      promoLabel: pricing.promo?.label ?? null,
       totalMinor,
       currency,
       origin: "portal",
@@ -319,6 +401,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           currency,
           total_minor: totalMinor,
           discount_minor: pricing.discountMinor,
+          ...(pricing.promo ? { promo_public_id: pricing.promo.publicId, promo_discount_minor: pricing.promo.promoDiscountMinor } : {}),
           on_behalf: ownerUserId !== principal?.userId,
           ...(system ? { channel: system.channel } : {}),
           workflow_version: workflow.versionNumber,
@@ -393,6 +476,7 @@ export function createOrderService(deps: OrderServiceDeps) {
         note?: string;
         idempotencyKey: string;
         onBehalfOfCustomerPublicId?: string;
+        promoCode?: string;
       },
     ): Promise<{ publicId: string; reference: string; created: boolean }> {
       if (principal.state !== "full") throw ORDER_NOT_FOUND();
@@ -414,13 +498,16 @@ export function createOrderService(deps: OrderServiceDeps) {
 
       const prefix = await readSetting(deps.settings, ORDER_REFERENCE_PREFIX);
       try {
-        return await deps.db.transaction(async (tx) => {
-          // No existing order row is locked here, so the actor check is the first statement.
-          const actor = await assertActorCurrent(principal, tx, "orders.create");
-          if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
-          const result = await createInTx(tx, principal, input, ownerUserId, prefix);
-          return { publicId: result.publicId, reference: result.reference, created: true };
-        });
+        // C1: with a code, the promotions attempt guard wraps the whole tx (refusals are recorded after rollback).
+        return await withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () =>
+          deps.db.transaction(async (tx) => {
+            // No existing order row is locked here, so the actor check is the first statement.
+            const actor = await assertActorCurrent(principal, tx, "orders.create");
+            if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
+            const result = await createInTx(tx, principal, input, ownerUserId, prefix);
+            return { publicId: result.publicId, reference: result.reference, created: true as const };
+          }),
+        );
       } catch (error) {
         // A concurrent duplicate submit with the same idempotency key resolves to the first order.
         if (isDuplicateKey(error)) {
@@ -441,7 +528,7 @@ export function createOrderService(deps: OrderServiceDeps) {
      */
     async createOrderFromCheckoutInTx(
       principal: SessionPrincipal,
-      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string },
+      input: { projectName: string; items: { productPublicId: string; quantity: number }[]; note?: string; idempotencyKey: string; promoCode?: string },
       tx: Tx,
     ) {
       if (principal.state !== "full" || principal.pendingSteps.length > 0) throw ORDER_NOT_FOUND();
@@ -449,7 +536,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       await assertActorCurrent(principal, tx, "orders.create");
       await compliancePort(deps.services)?.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
       const [existing] = await tx
-        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, totalMinor: orders.totalMinor })
+        .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, promoDiscountMinor: orders.promoDiscountMinor, promoLabel: orders.promoLabel, totalMinor: orders.totalMinor })
         .from(orders)
         .where(and(eq(orders.ownerUserId, principal.userId), eq(orders.createKey, input.idempotencyKey)))
         .limit(1);
@@ -474,6 +561,8 @@ export function createOrderService(deps: OrderServiceDeps) {
         subtotalMinor: result.pricing.subtotalMinor,
         discountMinor: result.pricing.discountMinor,
         discountLabel: result.pricing.discountLabel,
+        promoDiscountMinor: result.pricing.promo?.promoDiscountMinor ?? 0,
+        promoLabel: result.pricing.promo?.label ?? null,
         totalMinor: result.pricing.totalMinor,
         lineItems: result.lineItems.map((line) => ({ productPublicId: line.productPublicId, name: line.name, quantity: line.quantity, unitPriceMinor: line.unitPriceMinor, lineTotalMinor: line.lineTotalMinor, currency: line.currency })),
         afterCommit,
@@ -597,6 +686,8 @@ export function createOrderService(deps: OrderServiceDeps) {
         subtotalMinor: order.subtotalMinor,
         discountMinor: order.discountMinor,
         discountLabel: order.discountLabel,
+        promoDiscountMinor: order.promoDiscountMinor,
+        promoLabel: order.promoLabel,
         totalMinor: order.totalMinor,
         currency: order.currency,
         version: order.version,
@@ -900,6 +991,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             .set({ statusKey: transition.to, version: view.version + 1, updatedAt: now })
             .where(and(eq(orders.id, view.id), eq(orders.version, view.version)));
           if (affectedRows(result) !== 1) throw staleVersion();
+          if (isCancelTarget(bound, transition.to)) await releasePromotionOnCancel(tx, view.id);
           await tx.insert(orderStatusHistory).values({
             publicId: ulid(now.getTime()),
             orderId: view.id,
@@ -992,6 +1084,11 @@ export function createOrderService(deps: OrderServiceDeps) {
           origin: row.origin,
           version: row.version,
           workflowVersionId: row.workflowVersionId,
+          discountMinor: row.discountMinor,
+          discountLabel: row.discountLabel,
+          promoDiscountMinor: row.promoDiscountMinor,
+          promoLabel: row.promoLabel,
+          bundleDiscountMinor: Math.max(0, row.discountMinor - row.promoDiscountMinor),
         };
         await deps.requirements.onTransition(tx, null, view, bound, transition.to);
         const now = deps.clock.now();
@@ -1001,6 +1098,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           .set({ statusKey: transition.to, version: row.version + 1, updatedAt: now })
           .where(and(eq(orders.id, row.id), eq(orders.version, row.version)));
         if (affectedRows(result) !== 1) throw staleVersion();
+        if (isCancelTarget(bound, transition.to)) await releasePromotionOnCancel(tx, row.id);
         await tx.insert(orderStatusHistory).values({
           publicId: ulid(now.getTime()),
           orderId: row.id,
@@ -1324,20 +1422,35 @@ export function createOrderService(deps: OrderServiceDeps) {
     },
 
     /** Server price of a selection (same validation and figures as create); writes nothing. */
-    async quote(principal: SessionPrincipal, input: { items: { productPublicId: string; quantity: number }[] }): Promise<OrderQuote> {
+    async quote(principal: SessionPrincipal, input: { items: { productPublicId: string; quantity: number }[]; promoCode?: string; forCustomerPublicId?: string }): Promise<OrderQuote> {
       if (principal.state !== "full") throw ORDER_NOT_FOUND();
-      return snapshot(async (tx) => {
+      // Eligibility is judged for the order owner: the caller, or (staff with orders.manage) the chosen customer.
+      let ownerUserId = principal.userId;
+      if (input.forCustomerPublicId !== undefined) {
+        if (principal.role === "customer" || !roleHasCapability(principal.role, "orders.manage")) throw forbidden("CAPABILITY_NOT_GRANTED");
+        const owner = await ownerUser(input.forCustomerPublicId);
+        if (!owner) throw validation("CUSTOMER_NOT_ELIGIBLE", "Choose an active customer account.");
+        ownerUserId = owner.id;
+      }
+      return withPromoAttemptGuard(deps.services, input.promoCode, principal.userId, () => snapshot(async (tx) => {
         const lineItems = await deps.catalog.resolveForOrder(tx, input.items);
-        const pricing = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+        const base = priceOrder(lineItems, await deps.catalog.getBundleRule(tx));
+        const currency = lineItems[0]!.currency;
+        let pricing: OrderPricing & { promo?: { publicId: string; label: string; promoDiscountMinor: number } } = base;
+        if (input.promoCode !== undefined) {
+          const port = await requirePromotions(deps.services, tx);
+          pricing = applyOutcome(base, await port.preview(promotionContext(input.promoCode, ownerUserId, principal.userId, currency, lineItems, base), { tx }));
+        }
         return {
-          currency: lineItems[0]!.currency,
+          currency,
           subtotalMinor: pricing.subtotalMinor,
           discountMinor: pricing.discountMinor,
           discountLabel: pricing.discountLabel,
           totalMinor: pricing.totalMinor,
           bundle: pricing.bundle,
+          promo: pricing.promo ? { label: pricing.promo.label, promoDiscountMinor: pricing.promo.promoDiscountMinor } : null,
         };
-      });
+      }));
     },
 
     /** Trusted (caller already authorised): packet scope for production webhooks. Uses the caller's tx; no locks. */

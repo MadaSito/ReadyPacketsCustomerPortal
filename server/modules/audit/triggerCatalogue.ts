@@ -40,7 +40,7 @@ export interface TriggerCatalogueEntry {
   label: string;
   description: string;
   group: "Accounts" | "Orders" | "Files and messages" | "Support" | "Billing" | "Operations";
-  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup" | "integrations" | "community" | "payments" | "referrals" | "knowledge";
+  owner: "identity" | "orders" | "files" | "engagement" | "compliance" | "jobs" | "backup" | "integrations" | "community" | "payments" | "referrals" | "knowledge" | "promotions";
   eventName: string;
   outcomes: readonly AuditTapEvent["outcome"][];
   match?: Readonly<Record<string, string | boolean>>;
@@ -201,6 +201,23 @@ const ENTRIES: TriggerCatalogueEntry[] = [
       f("derived_invoice_status", "Invoice status after payment", "enum", "event", { enumValues: INVOICE_STATUSES }),
       ...orderContext, f("invoice_number", "Invoice number", "string", "context"), recipientName],
     recipients: [ORDER_OWNER, ADMINS],
+  },
+  /* Increment 05 (D3). Attributes from server/modules/promotions/API.md (camelCase → snake_case by the envelope).
+     Staff-only: the code itself is never an attribute, and customers are told about discounts on their order. */
+  {
+    key: "promotion.redeemed", label: "Discount code used on an order", group: "Billing", owner: "promotions", staffOnly: true,
+    description: "An order was placed with a discount code. Only the label and amounts are available, never the code.",
+    eventName: "promotion.redeemed", outcomes: ["completed"], resourceType: "promotion",
+    fields: [f("promo_public_id", "Discount code id", "public_id"), f("label", "Discount label", "string"), f("promo_discount_minor", "Code discount", "money_minor"),
+      f("discount_minor", "Total discount", "money_minor"), f("currency", "Currency", "string"), f("order_public_id", "Order id", "public_id")],
+    recipients: [STAFF, ADMINS],
+  },
+  {
+    key: "promotion.attempts_blocked", label: "Discount code attempts blocked", group: "Operations", owner: "promotions", staffOnly: true,
+    description: "Too many unsuccessful discount code attempts from one account; code checks are paused for it. May indicate code guessing.",
+    eventName: "promotion.attempts_blocked", outcomes: ["refused"], resourceType: "user",
+    fields: [f("failed_count", "Failed attempts", "number"), f("window_minutes", "Within minutes", "number"), f("pause_minutes", "Paused for minutes", "number")],
+    recipients: [ADMINS, STAFF],
   },
   {
     key: "maintenance.enabled", label: "Maintenance mode switched on", group: "Operations", owner: "jobs",

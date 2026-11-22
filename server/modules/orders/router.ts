@@ -94,7 +94,42 @@ const catalogAdmin = router({
     .mutation(({ ctx, input }) => ctx.services.orders.catalog.updateBundleRule(ctx.session, input.rule)),
 });
 
+/* ---- increment 05 (A1): workflow export / import. Bodies travel in POST (http caps these two paths). ---- */
+const transferPackageText = z.string().min(1).max(2_097_152);
+const workflowTransfer = router({
+  status: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflowTransfer.status(ctx.session)),
+  export: adminProcedure
+    .use(requireCapability("workflows.export"))
+    .input(z.strictObject({ selection: z.union([z.strictObject({ all: z.literal(true) }), z.strictObject({ workflowKeys: z.array(statusKey).min(1).max(50) })]) }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.exportPackage(ctx.session, input)),
+  preview: adminProcedure
+    .use(requireCapability("workflows.import"))
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject({ packageText: transferPackageText }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.preview(ctx.session, input)),
+  // `apply` is a reserved word in tRPC routers.
+  applyImport: adminProcedure
+    .use(requireCapability("workflows.import"))
+    .meta({ rateLimit: "form_submission" })
+    .input(
+      z.strictObject({
+        packageText: transferPackageText,
+        idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+        decisions: z.array(z.strictObject({ key: z.string().max(48), action: z.enum(["create", "draft", "skip"]) })).max(50),
+        policyMappings: z
+          .array(
+            z
+              .strictObject({ ref: z.string().regex(/^[a-z][a-z0-9_]{0,31}$/), localPolicyPublicId: id.optional(), removeGates: z.literal(true).optional() })
+              .refine((mapping) => (mapping.localPolicyPublicId === undefined) !== (mapping.removeGates === undefined), { message: "Map to a policy or remove the gates." }),
+          )
+          .max(100),
+      }),
+    )
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.applyImport(ctx.session, input)),
+});
+
 const workflowsAdmin = router({
+  transfer: workflowTransfer,
   list: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflows.list()),
   // Increment 03: the direct create/publish procedures are no longer mounted. Every new version goes through a draft
   // (drafts.publish), which requires a fresh step-up and passes the designer's validation.
@@ -164,12 +199,22 @@ const sharing = router({
     .mutation(({ ctx, input }) => ctx.services.orders.sharing.respond(ctx.session, input)),
 });
 
+/** Increment 05: raw code text; promotions normalises it. Bounded and printable only; never logged. */
+const promoCode = z.string().trim().min(1).max(64).regex(/^[\x21-\x7E ]+$/);
+
 export const ordersRouter = router({
   catalog: router({
     list: protectedProcedure.query(({ ctx }) => ctx.services.orders.catalog.listActive()),
   }),
   /** Server price of a selection (packet rules + bundle discount); same validation as create, writes nothing. */
-  quote: protectedProcedure.input(z.strictObject({ items: orderItems })).query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
+  quote: protectedProcedure
+    .input(z.strictObject({ items: orderItems, forCustomerPublicId: id.optional() }))
+    .query(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
+  /** Increment 05 (C3): quote with a discount code. A mutation so the code travels in the POST body, never a URL. */
+  quoteWithPromo: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject({ items: orderItems, promoCode, forCustomerPublicId: id.optional() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.orders.quote(ctx.session, input)),
   list: protectedProcedure
     .input(z.strictObject({ cursor, limit, status: statusKey.optional() }))
     .query(({ ctx, input }) => ctx.services.orders.orders.list(ctx.session, input)),
@@ -184,6 +229,7 @@ export const ordersRouter = router({
         items: orderItems,
         note: nfc(1, 5000).optional(),
         idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+        promoCode: promoCode.optional(),
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.orders.create(ctx.session, input)),
@@ -249,6 +295,7 @@ export const ordersRouter = router({
             .max(50),
           note: nfc(1, 5000).optional(),
           idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{16,80}$/),
+          promoCode: promoCode.optional(),
         }),
       )
       .mutation(({ ctx, input }) => {

@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See `docs/engineering/SDLC.md` for the release
 procedure.
 
+## Increment 05
+
+### Added
+
+- **Workflow export and import** (`/admin/workflows`), per [ADR 0042](docs/adr/0042-workflow-transfer.md). Enable `orders.workflow_transfer.enabled` first.
+  - Export one workflow, a selection or all of them as an integrity-checked JSON package (`workflows.export`).
+  - Import with a preview, then choose for each workflow to create it, add it as a draft or skip it (`workflows.import`, administrators, step-up).
+  - Imports are always drafts. Automations are not transferred.
+- **Cart suggestions** (`/admin/carts/suggestions`, `/cart`; [ADR 0043](docs/adr/0043-cart-upsell.md)): enable `feature.cart.upsell` (needs `feature.cart`). Up to three server-priced add-on, tier-upgrade or bundle-completion suggestions appear in the cart. Nothing is added without the customer's action. Administrators manage offers with `carts.upsells.manage`. `cart.abandoned_ttl_hours` (default 72) sets when inactive carts expire.
+- **Discount codes and links** (`/admin/promotions`, `/promo`; [ADR 0044](docs/adr/0044-discount-codes.md)): enable `feature.promotions`.
+  - Percent or fixed codes with scope, dates, limits, allow-lists and single-use batches of up to 5,000 codes.
+  - Links (`/promo#promo=<CODE>`) carry the code in the URL fragment, and it is kept only in the browser tab.
+  - Redemption is atomic at order creation. The "Largest discount per order" guard (setting `promotions.policy`, field `maxDiscountPercent`) defaults to 50%.
+  - Codes work in the cart, at checkout and in the order wizard, not in API v1.
+  - A redemption is released only when nothing was paid, no invoice is payable, no provider capture is pending and no online payment was ever started, and only once the order is in a cancel state; administrators can release one by hand under the same rule.
+- **Policy acceptance log centre** (`/admin/policy-acceptances`; [ADR 0045](docs/adr/0045-policy-acceptance-log-centre.md)): Log, Coverage and Policy updates tabs, and a **Policies** tab on the admin customer profile. It is always on and read-only. Reading needs `policies.acceptances.read`; CSV export needs `policies.acceptances.export` and step-up, and is limited to 5,000 rows.
+
+### Security
+
+- **Discount code abuse controls:** each code check is rate limited per account and per address. After 5 failed checks in 15 minutes, checking is paused for 15 minutes, and `promotion.attempts_blocked` is sent to the SIEM. Every refusal uses the same message, a verified e-mail is required, staff cannot redeem for themselves, and codes are never logged.
+- **Import package handling:** size, depth and count limits, strict schema, digest check (not a signature), and no rendering of imported text as HTML.
+
+### Operations
+
+- **Migration `0005_increment_05`**: additive only (8 new tables, 9 new columns on `orders`, `carts` and `policy_acceptances`, plus indexes and constraints). No existing column is changed or dropped. `deploy/upgrade.sh` applies it; see [UPGRADE.md](docs/operations/UPGRADE.md).
+- **Reverse proxy:** the two workflow-import requests accept a body of up to 4,456,448 bytes; every other request keeps the 256 KiB limit. Refresh the nginx or Caddy configuration from `deploy/` when upgrading, otherwise larger workflow packages are refused by the proxy.
+- All four features except the acceptance log are off after the upgrade. Switch them on under **Settings** (`/admin/settings`: "Workflow export and import") and **Features** (`/admin/settings/features`: "Cart suggestions (upsell)", "Discount codes and links").
+
 ## Increment 04
 
 ### Added

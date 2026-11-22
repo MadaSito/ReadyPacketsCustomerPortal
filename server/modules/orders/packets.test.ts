@@ -184,6 +184,10 @@ describe("offerings import, packet rules, bundle discount, quote, production sco
     expect(systemEvents.every((e) => e.actor?.role === "system")).toBe(true);
     await expectError(mod.catalog.upsertFromOfferings(system, { currency: "USD", packets: [] } as unknown as OfferingsImportInput), "VALIDATION:OFFERINGS_INVALID");
     const groups = await mod.catalog.listActive();
+    // Inside a caller's tx (cart): same result on that connection, plain and share-locked.
+    const inTx = await t.db.transaction(async (tx) => [await mod.catalog.listActive(tx), await mod.catalog.listActive(tx, { forShare: true })]);
+    expect(inTx[0]).toEqual(groups);
+    expect(inTx[1]).toEqual(groups);
     ids = Object.fromEntries(groups.flatMap((g) => g.products.map((p) => [p.productKey, p.publicId])));
     extra = (
       await mod.catalog.createProduct(admin.principal, {
@@ -225,6 +229,7 @@ describe("offerings import, packet rules, bundle discount, quote, production sco
     const one = await call(alice.principal).quote({ items: [{ productPublicId: ids["synthetic-41-basic"]!, quantity: 1 }] });
     expect(one).toEqual({
       currency: "USD",
+      promo: null,
       subtotalMinor: 1005,
       discountMinor: 0,
       discountLabel: null,

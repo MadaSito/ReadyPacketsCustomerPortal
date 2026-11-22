@@ -18,7 +18,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 RUN npm install --global "pnpm@$(node -p 'require("./package.json").packageManager.replace(/^pnpm@/, "").split("+")[0]')"
 RUN pnpm install --frozen-lockfile --prod=false --config.node-linker=hoisted
 COPY . .
-RUN pnpm build \
+RUN node deploy/check-migration-bundle.mjs migrations \
+    && pnpm build \
     && pnpm prune --prod --config.node-linker=hoisted \
     && rm -rf node_modules/.bin \
     && rm -f dist/ops/seed-demo.js dist/ops/seed-demo.js.map \

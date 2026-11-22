@@ -35,6 +35,7 @@ import {
   type LockedOrderPaymentForRefund,
   type OrderInvoicePaymentLedgerEntry,
   type OrderInvoiceRefundLedgerEntry,
+  type OrderPaymentExposure,
   type OrderPaymentSummary,
   type OrderRefundLedgerSnapshot,
   type RecordProviderPaymentInput,
@@ -57,6 +58,28 @@ import {
   type PortableEvidenceOptions,
 } from "./portableService.js";
 import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
+export type {
+  AcceptanceEvidenceKind,
+  AcceptanceFilterOptionsView,
+  AcceptanceFreshness,
+  AcceptanceLogCustomerSummary,
+  AcceptanceLogDetailView,
+  AcceptanceLogExportResult,
+  AcceptanceLogFilterInput,
+  AcceptanceLogItem,
+  AcceptanceLogListInput,
+  AcceptanceLogMethod,
+  AcceptanceLogService,
+  AcceptanceLogSource,
+  CustomerPolicyAcceptanceProfileView,
+  CustomerPolicyRequirementState,
+  CustomerPolicyStatusRow,
+  PolicyCoverageDocumentView,
+  PolicyCoverageOutstandingCustomer,
+  PolicyCoverageView,
+  PolicyUpdateHistoryItem,
+  PolicyVersionReadView,
+} from "./acceptanceLogService.js";
 
 export type {
   BookSettledRefundInput,
@@ -77,6 +100,7 @@ export type {
   OrderHeaderPaymentState,
   OrderInvoicePaymentLedgerEntry,
   OrderInvoiceRefundLedgerEntry,
+  OrderPaymentExposure,
   OrderPaymentSummary,
   OrderRefundLedgerSnapshot,
   PoliciesService,
@@ -151,13 +175,15 @@ export interface ComplianceModule extends ModuleLifecycle {
   ): Promise<{ recorded: number }>;
   getInvoiceForCheckout(
     invoicePublicId: string,
-    opts?: { principal?: SessionPrincipal; tx?: DbOrTx },
+    opts?: { principal?: SessionPrincipal; tx?: DbOrTx; forUpdate?: boolean },
   ): Promise<CheckoutInvoiceSnapshot>;
   bookVerifiedProviderPayment(
     input: BookVerifiedProviderPaymentInput,
     tx: Tx,
   ): Promise<BookVerifiedProviderPaymentResult>;
   onInvoicePaid(listener: InvoicePaidListener): void;
+  /** Increment 05 (G-C3-02): authoritative transactional payment exposure for order cancel / promo release. */
+  orderPaymentExposureInTx(tx: Tx, orderPublicId: string): Promise<OrderPaymentExposure>;
 
   /* ---- sub-services consumed by router & http ---- */
   policies: PoliciesService;
@@ -188,6 +214,7 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     getInvoiceForCheckout: invoices.getInvoiceForCheckout,
     bookVerifiedProviderPayment: invoices.bookVerifiedProviderPayment,
     onInvoicePaid: invoices.onInvoicePaid,
+    orderPaymentExposureInTx: invoices.orderPaymentExposureInTx,
     policies,
     intake,
     invoices,

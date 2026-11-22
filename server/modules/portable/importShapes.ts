@@ -7,6 +7,7 @@ import type { ImportOrderInput } from "../orders/index.js";
 import type { JsonRecord, PortableInputRecord } from "./importPlanning.js";
 
 const discountLabelSchema = OrderRecord.shape.discountLabel;
+const promoLabelSchema = OrderRecord.shape.promoLabel;
 const itemSnapshotSchema = OrderItemRecord.pick({ packetNumber: true, outcome: true, timeline: true, deliverables: true });
 
 export function customerName(record: JsonRecord) {
@@ -78,10 +79,15 @@ export function projectedOrder(order: JsonRecord, items: JsonRecord[], history: 
     items.length > 200 || history.length > 500) throw invalidTarget();
   const discountLabel = discountLabelSchema.safeParse(order.discountLabel);
   if (!discountLabel.success) throw invalidTarget();
+  const promoLabel = promoLabelSchema.safeParse(order.promoLabel);
+  const discountMinor = targetMoney(order.discount, currency);
+  // Older 3.0 records carry no promo fields: no promotion. A promo share above the discount is refused.
+  const promoDiscountMinor = order.promoDiscount === undefined ? 0 : targetMoney(order.promoDiscount, currency);
+  if (!promoLabel.success || promoDiscountMinor < 0 || promoDiscountMinor > discountMinor) throw invalidTarget();
   return {
     projectName, statusKey: stringField(order.status), totalMinor: targetMoney(order.total, currency), currency,
-    subtotalMinor: targetMoney(order.subtotal, currency), discountMinor: targetMoney(order.discount, currency),
-    discountLabel: discountLabel.data ?? null,
+    subtotalMinor: targetMoney(order.subtotal, currency), discountMinor,
+    discountLabel: discountLabel.data ?? null, promoDiscountMinor, promoLabel: promoLabel.data ?? null,
     sourceReference: stringField(order.orderNumber), createdAt: targetDate(order.createdAt),
     // heldUnknown must not control application state, amounts, access, or execution. It remains inert.
     submittedAt: order.submittedAt ? targetDate(order.submittedAt) : null,
@@ -111,7 +117,7 @@ export function projectedOrder(order: JsonRecord, items: JsonRecord[], history: 
       };
     }),
   } satisfies Pick<ImportOrderInput, "projectName" | "statusKey" | "totalMinor" | "currency" | "subtotalMinor" |
-    "discountMinor" | "discountLabel" | "sourceReference" | "createdAt" | "submittedAt" | "lineItems" | "statusHistory">;
+    "discountMinor" | "discountLabel" | "promoDiscountMinor" | "promoLabel" | "sourceReference" | "createdAt" | "submittedAt" | "lineItems" | "statusHistory">;
 }
 
 export function selectLiveVersions(records: PortableInputRecord[]) {

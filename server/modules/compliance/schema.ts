@@ -54,6 +54,9 @@ export const POLICY_ACCEPTANCE_METHODS = [
 ] as const;
 export type PolicyAcceptanceMethod = (typeof POLICY_ACCEPTANCE_METHODS)[number];
 
+export const POLICY_ACCEPTANCE_CONTEXTS = ["registration", "portal", "checkout"] as const;
+export type PolicyAcceptanceContext = (typeof POLICY_ACCEPTANCE_CONTEXTS)[number];
+
 export const RECORD_ORIGINS = ["portal", "import"] as const;
 export type RecordOrigin = (typeof RECORD_ORIGINS)[number];
 
@@ -120,6 +123,7 @@ export const policyVersions = mysqlTable(
     uniqueIndex("cmp_pol_ver_doc_lbl_uq").on(t.documentId, t.versionLabel),
     uniqueIndex("cmp_pol_ver_imp_uq").on(t.sourceInstallationId, t.sourcePublicId),
     index("cmp_pol_ver_doc_st_eff_idx").on(t.documentId, t.status, t.effectiveAt),
+    index("cmp_pol_ver_st_pub_idx").on(t.status, t.publishedAt),
   ],
 );
 
@@ -138,6 +142,8 @@ export const policyAcceptances = mysqlTable(
     /** HMAC pseudonym of client IP (`deps.crypto.pseudonym(ip, "compliance.policy_acceptance.ip")`); never raw IP. */
     sourceAddressPseudonym: varchar("source_address_pseudonym", { length: 64 }),
     method: mysqlEnum("method", POLICY_ACCEPTANCE_METHODS).notNull(),
+    /** Increment 05: flow context recorded at acceptance time (`registration | portal | checkout`); nullable for pre-05/imported rows. */
+    context: mysqlEnum("context", POLICY_ACCEPTANCE_CONTEXTS),
     /** Optional AES-256-GCM encrypted typed signature (`policy_acceptances.signer_name:<publicId>`). */
     signerNameEnc: text("signer_name_enc"),
     /** Optional internal order id when accepted in an order context (no cross-module FK). */
@@ -169,6 +175,7 @@ export const policyAcceptances = mysqlTable(
     uniqueIndex("cmp_pol_acc_imp_uq").on(t.sourceInstallationId, t.sourcePublicId),
     index("cmp_pol_acc_doc_ver_idx").on(t.documentId, t.policyVersionId),
     index("cmp_pol_acc_order_idx").on(t.orderPublicId),
+    index("cmp_pol_acc_accepted_pub_idx").on(t.acceptedAt, t.publicId),
   ],
 );
 

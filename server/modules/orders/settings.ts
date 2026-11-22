@@ -88,3 +88,15 @@ export const ORDER_CONSOLE_ACCESS_ENABLED = defineSetting({
   default: false,
   sensitivity: "internal",
 });
+
+/** Increment 05 (A1, ADR 0042) — workflow export and import. Off by default; the settings registry audits changes. */
+export const ORDER_WORKFLOW_TRANSFER_ENABLED = defineSetting({
+  key: "orders.workflow_transfer.enabled",
+  owner: "orders",
+  group: "orders",
+  label: "Workflow export and import",
+  description: "Lets administrators export workflows to a file and import them as drafts. Imports never publish, change the default or touch existing orders.",
+  schema: z.boolean(),
+  default: false,
+  sensitivity: "internal",
+});

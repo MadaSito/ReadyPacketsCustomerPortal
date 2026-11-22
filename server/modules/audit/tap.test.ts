@@ -275,6 +275,12 @@ describe("trigger catalogue", () => {
     expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: { visibility: "internal", attachment_count: 1 } })).map((e) => e.key)).toEqual(["message.internal_note"]);
     expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: { visibility: "customer" } })).map((e) => e.key)).toEqual(["message.posted"]);
     expect(entriesForEvent(tapEvent({ eventName: "engagement.message.sent", resource: message, attributes: {} }))).toEqual([]);
+    for (const key of ["promotion.redeemed", "promotion.attempts_blocked"]) {
+      const entry = TRIGGER_CATALOGUE.find((e) => e.key === key)!;
+      expect(entry.staffOnly).toBe(true);
+      expect(entry.recipients.every((r) => r.kind === "role")).toBe(true);
+      expect(entry.fields.map((x) => x.key).join(",")).not.toMatch(/code(?!_)|email/u);
+    }
     const internal = TRIGGER_CATALOGUE.find((e) => e.key === "message.internal_note")!;
     expect(internal.staffOnly).toBe(true);
     expect(internal.recipients.map((r) => r.key)).not.toContain("order_owner");

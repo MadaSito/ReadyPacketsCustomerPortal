@@ -46,6 +46,10 @@ async function loadOrder(db: DbOrTx, key: OrderKey, forUpdate: boolean) {
       origin: orders.origin,
       version: orders.version,
       workflowVersionId: orders.workflowVersionId,
+      discountMinor: orders.discountMinor,
+      discountLabel: orders.discountLabel,
+      promoDiscountMinor: orders.promoDiscountMinor,
+      promoLabel: orders.promoLabel,
     })
     .from(orders)
     .where("publicId" in key ? eq(orders.publicId, key.publicId) : eq(orders.id, key.id))
@@ -180,6 +184,11 @@ export function createOrderPolicy(deps: PolicyDeps) {
       origin: row.origin,
       version: row.version,
       workflowVersionId: row.workflowVersionId,
+      discountMinor: row.discountMinor,
+      discountLabel: row.discountLabel,
+      promoDiscountMinor: row.promoDiscountMinor,
+      promoLabel: row.promoLabel,
+      bundleDiscountMinor: Math.max(0, row.discountMinor - row.promoDiscountMinor),
     };
   }
 

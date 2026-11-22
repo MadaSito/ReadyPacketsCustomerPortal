@@ -97,6 +97,10 @@ export interface InvoiceSummaryView {
 }
 
 export interface InvoiceDetailView extends InvoiceSummaryView {
+  bundleDiscountMinor: number;
+  discountLabel: string | null;
+  promoDiscountMinor: number;
+  promoLabel: string | null;
   issuerName: string;
   issuerAddress: string;
   memo: string | null;
@@ -109,6 +113,13 @@ export interface InvoiceDetailView extends InvoiceSummaryView {
   refunds: InvoiceRefundView[];
   canManage: boolean;
   canRecordPayment: boolean;
+}
+
+export interface OrderPaymentExposure {
+  grossPaidMinor: number;
+  payableInvoiceOpen: boolean;
+  providerCapturePending: boolean;
+  providerAttemptEver: boolean;
 }
 
 export interface RecordProviderPaymentInput {
@@ -372,6 +383,29 @@ export function createInvoicesService(deps: ModuleDeps) {
       throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order service is temporarily unavailable.");
     }
     return ordersSvc;
+  }
+
+  /**
+   * Workflow-aware check matching `orders/workflowTypes.ts:isCancelState` (`kind === "terminal" && /cancel/.test(key)`),
+   * resolved directly against the `FOR UPDATE`-locked `(workflowVersionId, statusKey)` so `REPEATABLE READ`
+   * snapshots never re-read stale order rows.
+   */
+  async function isOrderCancelledInTx(
+    workflowVersionId: number | undefined,
+    statusKey: string,
+    tx: Tx,
+  ): Promise<boolean> {
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (
+      workflowVersionId !== undefined &&
+      ordersSvc?.workflows &&
+      typeof ordersSvc.workflows.byVersionId === "function"
+    ) {
+      const bound = await ordersSvc.workflows.byVersionId(tx, workflowVersionId);
+      const state = bound.definition.states.find((s) => s.key === statusKey);
+      return Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
+    }
+    return /cancel/.test(statusKey);
   }
 
   async function isOnlinePaymentConfigured(tx?: DbOrTx): Promise<boolean> {
@@ -814,6 +848,35 @@ export function createInvoicesService(deps: ModuleDeps) {
       sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 },
     );
 
+    const orderDiscountMinor = Math.max(0, orderView.discountMinor ?? 0);
+    const orderPromoMinor = Math.max(0, orderView.promoDiscountMinor ?? 0);
+    const orderBundleMinor = Math.max(
+      0,
+      orderView.bundleDiscountMinor ?? orderDiscountMinor - orderPromoMinor,
+    );
+
+    let bundleDiscountMinor = 0;
+    let discountLabel: string | null = null;
+    let promoDiscountMinor = 0;
+    let promoLabel: string | null = null;
+
+    if (inv.discountMinor > 0) {
+      if (orderPromoMinor > 0 && inv.discountMinor === orderDiscountMinor) {
+        promoDiscountMinor = Math.min(inv.discountMinor, orderPromoMinor);
+        promoLabel = orderView.promoLabel ?? "Promotion";
+        bundleDiscountMinor = Math.max(0, inv.discountMinor - promoDiscountMinor);
+        discountLabel = bundleDiscountMinor > 0 ? "Bundle discount" : null;
+      } else if (orderPromoMinor > 0 && orderBundleMinor === 0 && inv.discountMinor <= orderPromoMinor) {
+        promoDiscountMinor = inv.discountMinor;
+        promoLabel = orderView.promoLabel ?? "Promotion";
+        bundleDiscountMinor = 0;
+        discountLabel = null;
+      } else {
+        bundleDiscountMinor = inv.discountMinor;
+        discountLabel = inv.discountMinor === orderDiscountMinor ? (orderView.discountLabel ?? null) : null;
+      }
+    }
+
     const orderAllowsInvoiceWrite =
       orderView.lockState !== "legal_hold" &&
       orderView.lockState !== "imported_read_only" &&
@@ -822,6 +885,10 @@ export function createInvoicesService(deps: ModuleDeps) {
 
     return {
       ...summary,
+      bundleDiscountMinor,
+      discountLabel,
+      promoDiscountMinor,
+      promoLabel,
       issuerName: inv.issuerNameSnapshot ?? issuerNameFallback,
       issuerAddress: inv.issuerAddressSnapshot ?? issuerAddrFallback,
       memo: inv.memo,
@@ -874,6 +941,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         orderAllowsInvoiceWrite &&
         summary.status !== "draft" &&
         summary.status !== "void" &&
+        summary.balanceDueMinor > 0 &&
         roleHasCapability(principal.role, "invoices.manage"),
     };
   }
@@ -961,6 +1029,9 @@ export function createInvoicesService(deps: ModuleDeps) {
         tx,
         forUpdate: true,
       });
+      if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
+        throw conflict("ORDER_CANCELLED", "Cannot create an invoice for a cancelled order.");
+      }
 
       const invoicePublicId = ulid(now.getTime());
       const [ins] = await tx.insert(complianceInvoices).values({
@@ -1044,23 +1115,34 @@ export function createInvoicesService(deps: ModuleDeps) {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
-      const [inv] = await tx
-        .select()
+      const [invRef] = await tx
+        .select({
+          id: complianceInvoices.id,
+          orderPublicId: complianceInvoices.orderPublicId,
+          origin: complianceInvoices.origin,
+        })
         .from(complianceInvoices)
         .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
         .limit(1);
-      if (!inv) throw notFound("INVOICE_NOT_FOUND");
-      if (inv.origin !== "portal") {
+      if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+      if (invRef.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot be modified.");
       }
 
       const ordersSvc = requireOrdersService();
-      await ordersSvc.assertCanWriteOrder(livePrincipal, inv.orderPublicId, {
+      await ordersSvc.assertCanWriteOrder(livePrincipal, invRef.orderPublicId, {
         kind: "invoice",
         tx,
         forUpdate: true,
       });
+
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.id, invRef.id))
+        .for("update")
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
       if (inv.issuedAt !== null || inv.voidedAt !== null || inv.status !== "draft") {
         throw conflict("INVOICE_NOT_DRAFT", "Only draft invoices can be edited. Void and reissue if needed.");
@@ -1130,23 +1212,37 @@ export function createInvoicesService(deps: ModuleDeps) {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
-      const [inv] = await tx
-        .select()
+      const [invRef] = await tx
+        .select({
+          id: complianceInvoices.id,
+          orderPublicId: complianceInvoices.orderPublicId,
+          origin: complianceInvoices.origin,
+        })
         .from(complianceInvoices)
         .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
         .limit(1);
-      if (!inv) throw notFound("INVOICE_NOT_FOUND");
-      if (inv.origin !== "portal") {
+      if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+      if (invRef.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot be issued.");
       }
 
       const ordersSvc = requireOrdersService();
-      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, inv.orderPublicId, {
+      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, invRef.orderPublicId, {
         kind: "invoice",
         tx,
         forUpdate: true,
       });
+      if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
+        throw conflict("ORDER_CANCELLED", "Cannot issue an invoice for a cancelled order.");
+      }
+
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.id, invRef.id))
+        .for("update")
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
       if (inv.voidedAt !== null) {
         throw conflict("INVOICE_VOIDED", "Voided invoices cannot be issued.");
@@ -1262,23 +1358,34 @@ export function createInvoicesService(deps: ModuleDeps) {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
-      const [inv] = await tx
-        .select()
+      const [invRef] = await tx
+        .select({
+          id: complianceInvoices.id,
+          orderPublicId: complianceInvoices.orderPublicId,
+          origin: complianceInvoices.origin,
+        })
         .from(complianceInvoices)
         .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
         .limit(1);
-      if (!inv) throw notFound("INVOICE_NOT_FOUND");
-      if (inv.origin !== "portal") {
+      if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+      if (invRef.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot be voided.");
       }
 
       const ordersSvc = requireOrdersService();
-      await ordersSvc.assertCanWriteOrder(livePrincipal, inv.orderPublicId, {
+      await ordersSvc.assertCanWriteOrder(livePrincipal, invRef.orderPublicId, {
         kind: "invoice",
         tx,
         forUpdate: true,
       });
+
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.id, invRef.id))
+        .for("update")
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
       if (inv.voidedAt !== null) {
         return { invoicePublicId: inv.publicId, status: "void", voidedAt: inv.voidedAt };
@@ -1380,23 +1487,34 @@ export function createInvoicesService(deps: ModuleDeps) {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
-      const [inv] = await tx
-        .select()
+      const [invRef] = await tx
+        .select({
+          id: complianceInvoices.id,
+          orderPublicId: complianceInvoices.orderPublicId,
+          origin: complianceInvoices.origin,
+        })
         .from(complianceInvoices)
         .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
         .limit(1);
-      if (!inv) throw notFound("INVOICE_NOT_FOUND");
-      if (inv.origin !== "portal") {
+      if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+      if (invRef.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices are historical and cannot accept new payments.");
       }
 
       const ordersSvc = requireOrdersService();
-      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, inv.orderPublicId, {
+      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, invRef.orderPublicId, {
         kind: "invoice",
         tx,
         forUpdate: true,
       });
+
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.id, invRef.id))
+        .for("update")
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
       const [existingIdem] = await tx
         .select()
@@ -1655,23 +1773,34 @@ export function createInvoicesService(deps: ModuleDeps) {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.refund");
       const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
 
-      const [inv] = await tx
-        .select()
+      const [invRef] = await tx
+        .select({
+          id: complianceInvoices.id,
+          orderPublicId: complianceInvoices.orderPublicId,
+          origin: complianceInvoices.origin,
+        })
         .from(complianceInvoices)
         .where(eq(complianceInvoices.publicId, input.invoicePublicId))
-        .for("update")
         .limit(1);
-      if (!inv) throw notFound("INVOICE_NOT_FOUND");
-      if (inv.origin !== "portal") {
+      if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+      if (invRef.origin !== "portal") {
         throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
       }
 
       const ordersSvc = requireOrdersService();
-      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, inv.orderPublicId, {
+      const orderView = await ordersSvc.assertCanWriteOrder(livePrincipal, invRef.orderPublicId, {
         kind: "invoice",
         tx,
         forUpdate: true,
       });
+
+      const [inv] = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(eq(complianceInvoices.id, invRef.id))
+        .for("update")
+        .limit(1);
+      if (!inv) throw notFound("INVOICE_NOT_FOUND");
 
       const [existingIdem] = await tx
         .select()
@@ -1984,6 +2113,10 @@ export function createInvoicesService(deps: ModuleDeps) {
       lines: detail.lines,
       subtotalMinor: detail.subtotalMinor,
       discountMinor: detail.discountMinor,
+      bundleDiscountMinor: detail.bundleDiscountMinor,
+      discountLabel: detail.discountLabel,
+      promoDiscountMinor: detail.promoDiscountMinor,
+      promoLabel: detail.promoLabel,
       taxMinor: detail.taxMinor,
       totalMinor: detail.totalMinor,
       grossPaidMinor: detail.grossPaidMinor,
@@ -2088,6 +2221,9 @@ export function createInvoicesService(deps: ModuleDeps) {
       throw new DomainError("LOCKED", "ORDER_LOCKED", "This order cannot accept new checkout invoices.", {
         lockState: orderView.lockState,
       });
+    }
+    if (await isOrderCancelledInTx(orderView.workflowVersionId, orderView.statusKey, tx)) {
+      throw conflict("ORDER_CANCELLED", "Cannot issue a checkout invoice for a cancelled order.");
     }
 
     const preliminary = computeInvoiceTotals({
@@ -2250,36 +2386,61 @@ export function createInvoicesService(deps: ModuleDeps) {
 
   async function getInvoiceForCheckout(
     invoicePublicId: string,
-    opts?: { principal?: SessionPrincipal | undefined; tx?: DbOrTx | undefined },
+    opts?: { principal?: SessionPrincipal | undefined; tx?: DbOrTx | undefined; forUpdate?: boolean | undefined },
   ): Promise<CheckoutInvoiceSnapshot> {
     const dbOrTx = opts?.tx ?? deps.db;
-    const [inv] = await dbOrTx
-      .select()
+    const [invRef] = await dbOrTx
+      .select({
+        id: complianceInvoices.id,
+        orderId: complianceInvoices.orderId,
+        orderPublicId: complianceInvoices.orderPublicId,
+      })
       .from(complianceInvoices)
       .where(eq(complianceInvoices.publicId, invoicePublicId))
       .limit(1);
-    if (!inv) throw notFound("INVOICE_NOT_FOUND");
+    if (!invRef) throw notFound("INVOICE_NOT_FOUND");
 
     const ordersSvc = requireOrdersService();
-    let orderReference = inv.orderPublicId;
+    let orderReference = invRef.orderPublicId;
     let ownerUserId = 0;
 
     if (opts?.principal) {
       const orderView = await ordersSvc.assertCanReadOrder(
         opts.principal,
-        inv.orderPublicId,
-        opts.tx ? { tx: opts.tx as Tx } : undefined,
+        invRef.orderPublicId,
+        opts.tx
+          ? { tx: opts.tx as Tx, ...(opts.forUpdate ? { forUpdate: true } : {}) }
+          : undefined,
       );
-      if (!isStaffOrAdmin(opts.principal) && inv.issuedAt === null) {
-        throw notFound("INVOICE_NOT_FOUND");
-      }
       orderReference = orderView.reference;
       ownerUserId = orderView.ownerUserId;
     } else if (typeof ordersSvc.getOrderRefById === "function") {
-      const ref = await ordersSvc.getOrderRefById(inv.orderId, opts?.tx as Tx | undefined);
+      const ref = await ordersSvc.getOrderRefById(
+        invRef.orderId,
+        opts?.tx as Tx | undefined,
+        opts?.tx && opts?.forUpdate ? { forUpdate: true } : undefined,
+      );
       if (!ref) throw notFound("INVOICE_NOT_FOUND");
       orderReference = ref.reference;
       ownerUserId = ref.ownerUserId;
+    }
+
+    const [inv] =
+      opts?.tx && opts?.forUpdate
+        ? await (opts.tx as Tx)
+            .select()
+            .from(complianceInvoices)
+            .where(eq(complianceInvoices.id, invRef.id))
+            .for("update")
+            .limit(1)
+        : await dbOrTx
+            .select()
+            .from(complianceInvoices)
+            .where(eq(complianceInvoices.id, invRef.id))
+            .limit(1);
+    if (!inv) throw notFound("INVOICE_NOT_FOUND");
+    if (opts?.principal && !isStaffOrAdmin(opts.principal) && inv.issuedAt === null) {
+      throw notFound("INVOICE_NOT_FOUND");
     }
 
     const sumsMap = await computeLedgerSums(dbOrTx, [inv.id]);
@@ -2328,16 +2489,37 @@ export function createInvoicesService(deps: ModuleDeps) {
       throw validation("INVALID_PROVIDER_PAYMENT_REF", "Provider payment reference is required.");
     }
 
+    const [invRef] = await tx
+      .select({
+        id: complianceInvoices.id,
+        orderId: complianceInvoices.orderId,
+        origin: complianceInvoices.origin,
+      })
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.publicId, input.invoicePublicId))
+      .limit(1);
+    if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+    if (invRef.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept online provider payments.");
+    }
+
+    // Canonical lock order: order FOR UPDATE first, then compliance_invoices FOR UPDATE.
+    const ordersSvc = requireOrdersService();
+    const orderRef =
+      typeof ordersSvc.getOrderRefById === "function"
+        ? await ordersSvc.getOrderRefById(invRef.orderId, tx, { forUpdate: true })
+        : null;
+    if (!orderRef) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+
     const [inv] = await tx
       .select()
       .from(complianceInvoices)
-      .where(eq(complianceInvoices.publicId, input.invoicePublicId))
+      .where(eq(complianceInvoices.id, invRef.id))
       .for("update")
       .limit(1);
     if (!inv) throw notFound("INVOICE_NOT_FOUND");
-    if (inv.origin !== "portal") {
-      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept online provider payments.");
-    }
 
     const [existingIdem] = await tx
       .select()
@@ -2385,14 +2567,6 @@ export function createInvoicesService(deps: ModuleDeps) {
       );
     }
 
-    const ordersSvc = requireOrdersService();
-    const orderRef =
-      typeof ordersSvc.getOrderRefById === "function"
-        ? await ordersSvc.getOrderRefById(inv.orderId, tx, { forUpdate: true })
-        : null;
-    if (!orderRef) {
-      throw notFound("ORDER_NOT_FOUND");
-    }
     if (orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only") {
       throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against invoice ledger changes.", {
         lockState: orderRef.lockState,
@@ -2770,8 +2944,12 @@ export function createInvoicesService(deps: ModuleDeps) {
       throw notFound("PAYMENT_NOT_FOUND");
     }
 
-    const [inv] = await tx
-      .select()
+    const [invRef] = await tx
+      .select({
+        id: complianceInvoices.id,
+        orderId: complianceInvoices.orderId,
+        origin: complianceInvoices.origin,
+      })
       .from(complianceInvoices)
       .where(
         and(
@@ -2779,13 +2957,36 @@ export function createInvoicesService(deps: ModuleDeps) {
           eq(complianceInvoices.orderPublicId, input.orderPublicId),
         ),
       )
+      .limit(1);
+    if (!invRef) {
+      throw notFound("PAYMENT_NOT_FOUND");
+    }
+    if (invRef.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
+    }
+
+    const ordersSvc = requireOrdersService();
+    const orderRef =
+      typeof ordersSvc.getOrderRefById === "function"
+        ? await ordersSvc.getOrderRefById(invRef.orderId, tx, { forUpdate: true })
+        : null;
+    if (!orderRef || orderRef.publicId !== input.orderPublicId) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+    if (orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only") {
+      throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against invoice ledger changes.", {
+        lockState: orderRef.lockState,
+      });
+    }
+
+    const [inv] = await tx
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.id, invRef.id))
       .for("update")
       .limit(1);
     if (!inv) {
       throw notFound("PAYMENT_NOT_FOUND");
-    }
-    if (inv.origin !== "portal") {
-      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
     }
 
     const [pmt] = await tx
@@ -2802,20 +3003,6 @@ export function createInvoicesService(deps: ModuleDeps) {
       .limit(1);
     if (!pmt) {
       throw notFound("PAYMENT_NOT_FOUND");
-    }
-
-    const ordersSvc = requireOrdersService();
-    const orderRef =
-      typeof ordersSvc.getOrderRefById === "function"
-        ? await ordersSvc.getOrderRefById(inv.orderId, tx, { forUpdate: true })
-        : null;
-    if (!orderRef || orderRef.publicId !== input.orderPublicId) {
-      throw notFound("ORDER_NOT_FOUND");
-    }
-    if (orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only") {
-      throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against invoice ledger changes.", {
-        lockState: orderRef.lockState,
-      });
     }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
@@ -2873,17 +3060,35 @@ export function createInvoicesService(deps: ModuleDeps) {
     const now = deps.clock.now();
     const currency = input.currency.toUpperCase();
 
+    const [invRef] = await tx
+      .select({
+        id: complianceInvoices.id,
+        orderId: complianceInvoices.orderId,
+        origin: complianceInvoices.origin,
+      })
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.id, input.invoiceId))
+      .limit(1);
+    if (!invRef) {
+      throw notFound("INVOICE_NOT_FOUND");
+    }
+    if (invRef.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
+    }
+
+    const ordersSvc = requireOrdersService();
+    if (typeof ordersSvc.getOrderRefById === "function") {
+      await ordersSvc.getOrderRefById(invRef.orderId, tx, { forUpdate: true });
+    }
+
     const [inv] = await tx
       .select()
       .from(complianceInvoices)
-      .where(eq(complianceInvoices.id, input.invoiceId))
+      .where(eq(complianceInvoices.id, invRef.id))
       .for("update")
       .limit(1);
     if (!inv) {
       throw notFound("INVOICE_NOT_FOUND");
-    }
-    if (inv.origin !== "portal") {
-      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported invoices cannot accept new refund records.");
     }
 
     const [pmt] = await tx
@@ -3080,6 +3285,136 @@ export function createInvoicesService(deps: ModuleDeps) {
     };
   }
 
+  /**
+   * Increment 05 (G-C3-02): Authoritative transactional payment exposure for an order.
+   * Acquires locks in canonical order (`order` -> `compliance_invoices` -> `compliance_invoice_payments` -> `payment_attempts`).
+   * Used by `orders.cancel` and `promotions.admin.releaseRedemption` to fail-closed when any payment was ever made,
+   * any payable invoice remains open, or any provider checkout attempt is pending capture / webhook booking.
+   */
+  async function orderPaymentExposureInTx(
+    tx: Tx,
+    orderPublicId: string,
+  ): Promise<OrderPaymentExposure> {
+    const ordersSvc = requireOrdersService();
+    let orderId: number | null = null;
+    if (typeof ordersSvc.getOrderRefByPublicId === "function") {
+      const orderRef = await ordersSvc.getOrderRefByPublicId(orderPublicId, tx, { forUpdate: true });
+      if (!orderRef) {
+        throw notFound("ORDER_NOT_FOUND");
+      }
+      orderId = orderRef.id;
+    }
+
+    let invoices;
+    try {
+      invoices = await tx
+        .select()
+        .from(complianceInvoices)
+        .where(
+          orderId !== null
+            ? eq(complianceInvoices.orderId, orderId)
+            : eq(complianceInvoices.orderPublicId, orderPublicId),
+        )
+        .orderBy(asc(complianceInvoices.id))
+        .for("share", { noWait: true });
+    } catch {
+      return {
+        grossPaidMinor: 1,
+        payableInvoiceOpen: true,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      };
+    }
+
+    const paymentsSvc = (deps.services as Partial<typeof deps.services>).payments;
+
+    if (invoices.length === 0) {
+      let attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+      if (paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function") {
+        try {
+          attemptExp = await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, []);
+        } catch {
+          attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+        }
+      }
+      return {
+        grossPaidMinor: 0,
+        payableInvoiceOpen: false,
+        providerCapturePending: attemptExp.providerCapturePending,
+        providerAttemptEver: attemptExp.providerAttemptEver,
+      };
+    }
+
+    const invoiceIds = invoices.map((inv) => inv.id);
+    let paymentRows;
+    let refundRows;
+    try {
+      paymentRows = await tx
+        .select()
+        .from(complianceInvoicePayments)
+        .where(inArray(complianceInvoicePayments.invoiceId, invoiceIds))
+        .orderBy(asc(complianceInvoicePayments.id))
+        .for("share", { noWait: true });
+      refundRows = await tx
+        .select({
+          invoiceId: complianceInvoiceRefunds.invoiceId,
+          amountMinor: complianceInvoiceRefunds.amountMinor,
+        })
+        .from(complianceInvoiceRefunds)
+        .where(inArray(complianceInvoiceRefunds.invoiceId, invoiceIds))
+        .for("share", { noWait: true });
+    } catch {
+      return {
+        grossPaidMinor: 1,
+        payableInvoiceOpen: true,
+        providerCapturePending: true,
+        providerAttemptEver: true,
+      };
+    }
+
+    let grossPaidMinor = 0;
+    const grossByInvoice = new Map<number, number>();
+    for (const pmt of paymentRows) {
+      if (pmt.status === "succeeded") {
+        grossPaidMinor += pmt.amountMinor;
+        grossByInvoice.set(pmt.invoiceId, (grossByInvoice.get(pmt.invoiceId) ?? 0) + pmt.amountMinor);
+      }
+    }
+
+    const refundedByInvoice = new Map<number, number>();
+    for (const rfd of refundRows) {
+      refundedByInvoice.set(rfd.invoiceId, (refundedByInvoice.get(rfd.invoiceId) ?? 0) + rfd.amountMinor);
+    }
+
+    const payableInvoiceOpen = invoices.some((inv) => {
+      if (inv.voidedAt !== null || inv.issuedAt === null || inv.totalMinor <= 0) {
+        return false;
+      }
+      const invGross = grossByInvoice.get(inv.id) ?? 0;
+      const invRefunded = refundedByInvoice.get(inv.id) ?? 0;
+      const invNetPaid = Math.max(0, invGross - invRefunded);
+      return inv.totalMinor - invNetPaid > 0;
+    });
+
+    // Fail closed if the payments evidence port is unavailable, throws, or if ANY payment_attempts
+    // row has EVER been created for this order/invoices (regardless of status).
+    let attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+    if (paymentsSvc && typeof paymentsSvc.getAttemptExposureForOrderInTx === "function") {
+      try {
+        attemptExp = await paymentsSvc.getAttemptExposureForOrderInTx(tx, orderPublicId, invoiceIds);
+      } catch {
+        attemptExp = { providerCapturePending: true, providerAttemptEver: true };
+      }
+    }
+
+    return {
+      grossPaidMinor,
+      payableInvoiceOpen,
+      providerCapturePending: attemptExp.providerCapturePending,
+      providerAttemptEver: attemptExp.providerAttemptEver,
+    };
+  }
+
   return {
     listForOrder,
     listMine,
@@ -3095,6 +3430,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     listOrderPaymentsAndRefunds,
     lockOrderPaymentForRefundInTx,
     bookSettledRefundInTx,
+    orderPaymentExposureInTx,
     admin: {
       list: adminList,
       createDraft: adminCreateDraft,

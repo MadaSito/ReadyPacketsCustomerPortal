@@ -228,6 +228,7 @@ build_release() (
             tar --no-same-owner --no-same-permissions -xf - -C "$reviewed"
         [[ -f "$reviewed/migrations/meta/_journal.json" && -f "$reviewed/package.json" ]] ||
             die 'reviewed release archive is incomplete'
+        "$node" "$deploy_src/check-migration-bundle.mjs" "$reviewed/migrations"
         if [[ -e "$release" || -L "$release" ]]; then
             "$node" "$deploy_src/prepare-release.mjs" check "$commit" "$release"
             if ! { cmp -s -- "$reviewed/package.json" "$release/package.json" &&

@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Shell scripts (ShellCheck)
-        run: shellcheck -x deploy/docker/*.sh scripts/ci/container-smoke.sh
+        run: shellcheck -x deploy/docker/*.sh scripts/ci/container-smoke.sh scripts/ci/assert-release-migrations.sh scripts/ci/assert-workflow-import-edge.sh
       - name: Compose file is valid
         env:
           RP_DOMAIN: localhost

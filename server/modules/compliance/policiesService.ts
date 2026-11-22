@@ -7,6 +7,7 @@ import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { users } from "../identity/schema.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
+import { createAcceptanceLogService } from "./acceptanceLogService.js";
 import {
   decodeIdCursor,
   encodeIdCursor,
@@ -382,7 +383,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       resolvedOrderPublicId: string | null;
       versionPublicId: string;
       contentHash: string;
-      flow: "portal" | "registration";
+      flow: "portal" | "registration" | "checkout";
       signerName?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
@@ -504,6 +505,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       requestId,
       sourceAddressPseudonym,
       method: effectiveMethod,
+      context: input.flow,
       signerNameEnc,
       orderId: input.resolvedOrderId,
       orderPublicId: input.resolvedOrderPublicId,
@@ -629,7 +631,7 @@ export function createPoliciesService(deps: ModuleDeps) {
         resolvedOrderPublicId,
         versionPublicId: item.versionPublicId,
         contentHash: item.contentHash,
-        flow: "portal",
+        flow: "checkout",
         signerName: item.signerName,
       });
       if (!res.duplicate) recorded += 1;
@@ -1356,6 +1358,8 @@ export function createPoliciesService(deps: ModuleDeps) {
     };
   }
 
+  const acceptanceLog = createAcceptanceLogService(deps);
+
   return {
     listPublished,
     requiredAcceptancesFor,
@@ -1376,6 +1380,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       deleteDraftVersion: adminDeleteDraftVersion,
       publishVersion: adminPublishVersion,
       listAcceptances: adminListAcceptances,
+      acceptanceLog,
     },
     healthCounts,
   };

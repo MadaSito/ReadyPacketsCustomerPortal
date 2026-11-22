@@ -3,7 +3,8 @@
  * sortable headers (aria-sort). <md: the same rows as a list of stacked, labelled cards (<dl>), so nothing
  * scrolls horizontally at 320 px. Both renderings are in the DOM; CSS shows one (screen readers see one).
  */
-import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Check, Minus } from "lucide-react";
+import { Checkbox as RCheckbox } from "radix-ui";
 import type { ReactNode } from "react";
 import { cn } from "./cn";
 import { EmptyState, ErrorState, Skeleton } from "./Feedback";
@@ -29,6 +30,39 @@ export interface SortState {
   direction: "asc" | "desc";
 }
 
+/**
+ * Optional row selection (e.g. "Export selected"). Keys are the same strings as `rowKey`. The table renders a
+ * labelled checkbox per row (first column / card header), a "select all on this page" checkbox with the mixed
+ * state, and a polite status "n of m selected". Selection of rows that are no longer listed is the owner's call.
+ */
+export interface DataTableSelection<Row> {
+  selectedKeys: ReadonlySet<string>;
+  onSelectedKeysChange: (next: Set<string>) => void;
+  /** Accessible name per row checkbox, e.g. `Select workflow ${row.name}`. */
+  rowLabel: (row: Row) => string;
+  /** Rows that cannot be selected get a disabled checkbox. */
+  isSelectable?: (row: Row) => boolean;
+  /** Name of the items in the status text (default "rows"). */
+  noun?: string;
+}
+
+function SelectBox({ label, checked, disabled, onChange }: { label: string; checked: boolean | "indeterminate"; disabled?: boolean; onChange: (next: boolean) => void }) {
+  // The Radix root itself is the 44 x 44 CSS px hit area (WCAG 2.5.8 / 2.5.5); the 20 px box is only visual.
+  return (
+    <RCheckbox.Root
+      aria-label={label}
+      checked={checked}
+      disabled={disabled}
+      onCheckedChange={(value) => onChange(value === true)}
+      className="group -m-2.5 inline-flex size-11 shrink-0 items-center justify-center rounded-[var(--radius-control)] disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      <span className="inline-flex size-5 items-center justify-center rounded border-2 border-control-border bg-surface group-data-[state=checked]:border-action group-data-[state=checked]:bg-action group-data-[state=checked]:text-on-action group-data-[state=indeterminate]:border-action group-data-[state=indeterminate]:bg-action group-data-[state=indeterminate]:text-on-action">
+        <RCheckbox.Indicator>{checked === "indeterminate" ? <Minus aria-hidden="true" className="size-3.5" strokeWidth={3} /> : <Check aria-hidden="true" className="size-3.5" strokeWidth={3} />}</RCheckbox.Indicator>
+      </span>
+    </RCheckbox.Root>
+  );
+}
+
 export interface DataTableProps<Row> {
   /** Visible or sr-only caption naming the table (required for AT). */
   caption: string;
@@ -45,6 +79,7 @@ export interface DataTableProps<Row> {
   onSortChange?: (sort: SortState) => void;
   /** Per-row actions (buttons/menus) shown in the last column / card footer. */
   rowActions?: (row: Row) => ReactNode;
+  selection?: DataTableSelection<Row>;
   /** Optional link-like primary action rendered by the primary column cell; keep cells focusable via <Link>. */
   className?: string;
 }
@@ -54,7 +89,7 @@ function SortIcon({ active, direction }: { active: boolean; direction?: "asc" | 
   return direction === "asc" ? <ArrowUp aria-hidden="true" className="size-3.5" /> : <ArrowDown aria-hidden="true" className="size-3.5" />;
 }
 
-export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, loading, error, onRetry, empty, sort, onSortChange, rowActions, className }: DataTableProps<Row>) {
+export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, loading, error, onRetry, empty, sort, onSortChange, rowActions, selection, className }: DataTableProps<Row>) {
   if (error) return <ErrorState error={error} onRetry={onRetry} />;
   if (loading && !rows) {
     return (
@@ -70,6 +105,30 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
   const list = rows ?? [];
   const primary = columns.find((c) => c.primary) ?? columns[0];
   const sortable = onSortChange ? columns.filter((c) => c.sortable) : [];
+  const selectableKeys = selection ? list.filter((r) => selection.isSelectable?.(r) ?? true).map(rowKey) : [];
+  const selectedHere = selection ? selectableKeys.filter((k) => selection.selectedKeys.has(k)).length : 0;
+  const allState: boolean | "indeterminate" = selectedHere === 0 ? false : selectedHere === selectableKeys.length ? true : "indeterminate";
+  const toggleAll = (on: boolean) => {
+    if (!selection) return;
+    const next = new Set(selection.selectedKeys);
+    for (const k of selectableKeys) {
+      if (on) next.add(k);
+      else next.delete(k);
+    }
+    selection.onSelectedKeysChange(next);
+  };
+  const toggleRow = (key: string, on: boolean) => {
+    if (!selection) return;
+    const next = new Set(selection.selectedKeys);
+    if (on) next.add(key);
+    else next.delete(key);
+    selection.onSelectedKeysChange(next);
+  };
+  const allLabel = `Select all ${selection?.noun ?? "rows"} on this page`;
+  const rowBox = (row: Row) =>
+    selection ? (
+      <SelectBox label={selection.rowLabel(row)} checked={selection.selectedKeys.has(rowKey(row))} disabled={!(selection.isSelectable?.(row) ?? true)} onChange={(on) => toggleRow(rowKey(row), on)} />
+    ) : null;
 
   return (
     <div className={cn("min-w-0", className)} aria-busy={loading || undefined}>
@@ -81,6 +140,11 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
           <caption className={cn(showCaption ? "px-4 py-3 text-left text-sm font-semibold text-ink" : "sr-only")}>{caption}</caption>
           <thead className="bg-surface-soft">
             <tr>
+              {selection ? (
+                <th scope="col" className="w-12 border-b border-line py-2.5 pr-2 pl-4">
+                  <SelectBox label={allLabel} checked={allState} disabled={selectableKeys.length === 0} onChange={toggleAll} />
+                </th>
+              ) : null}
               {columns.map((col) => {
                 const active = sort?.key === col.key;
                 const ariaSort = active ? (sort?.direction === "asc" ? "ascending" : "descending") : col.sortable ? "none" : undefined;
@@ -111,7 +175,8 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
           </thead>
           <tbody>
             {list.map((row) => (
-              <tr key={rowKey(row)} className="border-b border-line last:border-b-0 hover:bg-surface-soft">
+              <tr key={rowKey(row)} data-selected={selection?.selectedKeys.has(rowKey(row)) ? "" : undefined} className="border-b border-line last:border-b-0 hover:bg-surface-soft data-selected:bg-surface-soft">
+                {selection ? <td className="py-3 pr-2 pl-4 align-middle">{rowBox(row)}</td> : null}
                 {columns.map((col) => (
                   <td key={col.key} className={cn("px-4 py-3 align-middle text-ink", col.align === "end" && "text-right tabular-nums")}>
                     {col.cell(row)}
@@ -155,11 +220,30 @@ export function DataTable<Row>({ caption, showCaption, columns, rows, rowKey, lo
         </div>
       ) : null}
 
+      {selection ? (
+        <>
+          <div className="mb-3 flex min-h-11 items-center gap-3 px-1 md:hidden">
+            <SelectBox label={allLabel} checked={allState} disabled={selectableKeys.length === 0} onChange={toggleAll} />
+            <span aria-hidden="true" className="text-sm text-muted">
+              Select all
+            </span>
+          </div>
+          <p role="status" className="sr-only">
+            {`${selectedHere} of ${selectableKeys.length} ${selection.noun ?? "rows"} selected`}
+          </p>
+        </>
+      ) : null}
+
       {/* Mobile stacked cards */}
       <ul aria-label={caption} className="flex flex-col gap-3 md:hidden">
         {list.map((row) => (
           <li key={rowKey(row)} className="rounded-[var(--radius-card)] border border-line bg-surface p-4 shadow-[var(--shadow-card)] rp-forced-border">
-            {primary ? <div className="mb-2 text-[0.9375rem] font-semibold break-words text-ink">{primary.cell(row)}</div> : null}
+            {primary || selection ? (
+              <div className="mb-2 flex min-w-0 items-start gap-3">
+                {selection ? <span className="shrink-0">{rowBox(row)}</span> : null}
+                {primary ? <div className="min-w-0 flex-1 text-[0.9375rem] font-semibold break-words text-ink">{primary.cell(row)}</div> : null}
+              </div>
+            ) : null}
             <dl className="grid grid-cols-[minmax(6rem,auto)_1fr] gap-x-3 gap-y-1.5 text-sm">
               {columns
                 .filter((col) => col !== primary && !col.hideOnMobile)

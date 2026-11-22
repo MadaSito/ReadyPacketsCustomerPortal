@@ -71,6 +71,10 @@ export const OrderRecord = z.strictObject({
   discount: Money,
   /** Customer-visible reason for `discount` (e.g. the bundle label); null = none / unknown. Optional in 3.0. */
   discountLabel: text(120).nullable().optional(),
+  /** The part of `discount` due to a promotion code (0 = none), and its customer-facing label. Historical fact only:
+   *  promotions, codes and redemptions are not transferred (manifest exclusion `promotions`). Optional in 3.0. */
+  promoDiscount: Money.optional(),
+  promoLabel: text(120).nullable().optional(),
   total: Money,
   isTestOrder: z.boolean(),
   /** Read-only lock state; null = unknown (legacy). Importers default to read-only regardless. */

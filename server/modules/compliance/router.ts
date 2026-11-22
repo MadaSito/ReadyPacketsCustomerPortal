@@ -11,6 +11,11 @@ import {
   staffProcedure,
 } from "../../trpc/trpc.js";
 import {
+  acceptanceLogCoverageSchema,
+  acceptanceLogFilterSchema,
+  acceptanceLogForCustomerSchema,
+  acceptanceLogListSchema,
+  acceptanceLogUpdatesSchema,
   acceptPolicySchema,
   createInvoiceDraftSchema,
   createPolicyDocumentSchema,
@@ -31,6 +36,10 @@ import {
 import { acceptanceRouter } from "./acceptanceRouter.js";
 
 const policiesManageProc = protectedProcedure.use(requireCapability("policies.manage"));
+const acceptanceLogReadProc = staffProcedure.use(requireCapability("policies.acceptances.read"));
+const acceptanceLogExportProc = staffProcedure.use(
+  requireCapability("policies.acceptances.export"),
+);
 const intakeManageProc = protectedProcedure.use(requireCapability("intake.manage"));
 const intakeReviewProc = staffProcedure.use(requireCapability("intake.review"));
 const invoicesManageProc = staffProcedure.use(requireCapability("invoices.manage"));
@@ -145,6 +154,88 @@ export const complianceRouter = router({
         .query(async ({ ctx, input }) => {
           return ctx.services.compliance.policies.admin.listAcceptances(ctx.session, input ?? {});
         }),
+
+      /**
+       * Policy Acceptance Log Centre (Increment 05 Package D1 / Decision D4).
+       * Guarded before `.input()` with `staffProcedure.use(requireCapability("policies.acceptances.read"))`
+       * (and `policies.acceptances.export` for CSV export); service-side live-session + capability checks
+       * remain as defence in depth.
+       */
+      acceptanceLog: router({
+        filterOptions: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({}).optional())
+          .query(async ({ ctx }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.filterOptions(ctx.session);
+          }),
+
+        list: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogListSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.list(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        detail: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({ publicId: publicIdSchema }))
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.detail(ctx.session, input);
+          }),
+
+        coverage: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogCoverageSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.coverage(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        updates: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogUpdatesSchema.optional())
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.updates(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+
+        forCustomer: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(acceptanceLogForCustomerSchema)
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.forCustomer(
+              ctx.session,
+              input,
+            );
+          }),
+
+        versionText: acceptanceLogReadProc
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({ versionPublicId: publicIdSchema }))
+          .query(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.versionText(
+              ctx.session,
+              input,
+            );
+          }),
+
+        export: acceptanceLogExportProc
+          .meta({ rateLimit: "form_submission" })
+          .input(acceptanceLogFilterSchema.optional())
+          .mutation(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.acceptanceLog.export(
+              ctx.session,
+              input ?? {},
+            );
+          }),
+      }),
     }),
   }),
 

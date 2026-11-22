@@ -331,4 +331,71 @@ describe("order acceptance gateway (MySQL)", () => {
     expect(again.duplicate).toBe(false);
     await mayWork(order, owner);
   });
+  it("evidencePage (acceptance log read port): filters, newest-first keyset across equal times, pseudonymised address, encrypted names", async () => {
+    const a = await makeUser();
+    const b = await makeUser();
+    const terms = await makePolicy("Log terms.");
+    const typed = await makePolicy("Log signature policy.");
+    const o1 = makeOrder(a, [gate(terms.documentPublicId), gate(typed.documentPublicId, { key: "sign", signatureMode: "typed_name" })]);
+    const o2 = makeOrder(b, [gate(terms.documentPublicId)]);
+    const o3 = makeOrder(a, [gate(terms.documentPublicId)]);
+    await acceptCurrent(a, o1); // t0
+    await acceptCurrent(a, o1, "sign", "Synthetic Signer"); // t0 (same timestamp: publicId breaks the tie)
+    h.clock.advance(60_000);
+    await acceptCurrent(b, o2); // t1
+    h.clock.advance(60_000);
+    await acceptCurrent(a, o3); // t2
+    const mine = { userIds: [a.userId, b.userId] };
+
+    // Newest first, stable keyset paging of size 1 visits every row exactly once.
+    const seen: string[] = [];
+    let before: { acceptedAt: Date; publicId: string } | undefined;
+    for (let i = 0; i < 10; i += 1) {
+      const page = await svc.evidencePage({ ...mine, before, limit: 1 });
+      if (page.items.length === 0) break;
+      const item = page.items[0]!;
+      seen.push(item.publicId);
+      before = { acceptedAt: item.acceptedAt, publicId: item.publicId };
+      if (!page.hasMore) break;
+    }
+    const all = await svc.evidencePage({ ...mine, limit: 50 });
+    expect(all.hasMore).toBe(false);
+    expect(seen).toEqual(all.items.map((i) => i.publicId));
+    expect(all.items.map((i) => i.orderId)).toEqual([o3.id, o2.id, o1.id, o1.id]);
+    for (let i = 1; i < all.items.length; i += 1) {
+      const [p, c] = [all.items[i - 1]!, all.items[i]!];
+      expect(p.acceptedAt.getTime() > c.acceptedAt.getTime() || (p.acceptedAt.getTime() === c.acceptedAt.getTime() && p.publicId > c.publicId)).toBe(true);
+    }
+
+    // Filters.
+    expect((await svc.evidencePage({ userIds: [b.userId], limit: 50 })).items.map((i) => i.orderPublicId)).toEqual([o2.publicId]);
+    expect((await svc.evidencePage({ ...mine, policyDocumentIds: [typed.documentId], limit: 50 })).items.map((i) => i.gateKey)).toEqual(["sign"]);
+    expect((await svc.evidencePage({ ...mine, method: "typed_name", limit: 50 })).items).toHaveLength(1);
+    expect((await svc.evidencePage({ ...mine, orderIds: [o1.id], limit: 50 })).items).toHaveLength(2);
+    const t1 = all.items[1]!.acceptedAt;
+    expect((await svc.evidencePage({ ...mine, from: t1, to: new Date(t1.getTime() + 1), limit: 50 })).items.map((i) => i.orderId)).toEqual([o2.id]);
+    const v = all.items[0]!.policyVersionId;
+    expect((await svc.evidencePage({ ...mine, policyVersionIds: [v], limit: 50 })).items.every((i) => i.policyVersionId === v)).toBe(true);
+    expect(await svc.evidencePage({ userIds: [], limit: 50 })).toEqual({ items: [], hasMore: false });
+    await rejects(svc.evidencePage({ userIds: Array.from({ length: 501 }, (_, i) => i + 1), limit: 5 }), "VALIDATION", "FILTER_TOO_LARGE");
+    expect((await svc.evidencePage({ ...mine, limit: 10_000 })).items.length).toBeLessThanOrEqual(200);
+
+    // Fields: the same pseudonym policy_acceptances stores, never the raw address; typed names stay encrypted.
+    const item = all.items.find((i) => i.gateKey === "sign")!;
+    expect(item.addressPseudonym).toBe(h.deps.crypto.pseudonym(IP, "compliance.policy_acceptance.ip"));
+    expect(JSON.stringify(all)).not.toContain(IP);
+    expect(JSON.stringify(all)).not.toContain("Synthetic Signer");
+    expect(h.deps.crypto.decrypt(item.signerNameEnc!, item.signerNameAad!)).toBe("Synthetic Signer");
+    expect(all.items.find((i) => i.gateKey === "terms")!.signerNameEnc).toBeNull();
+    expect(item).toMatchObject({ method: "typed_name", policyVersionNumber: 1, workflowVersionId: 7, userId: a.userId });
+    expect(item.textSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(item.correlationId).toBeTruthy();
+
+    // Grouped distinct acceptors per version (coverage counts) — no paging needed.
+    const by = await svc.acceptorsByVersion([v, item.policyVersionId]);
+    expect([...(by.get(v) ?? [])].sort()).toEqual([a.userId, b.userId].sort());
+    expect(by.get(item.policyVersionId)).toEqual([a.userId]);
+    expect((await svc.acceptorsByVersion([v], { userIds: [b.userId] })).get(v)).toEqual([b.userId]);
+    expect((await svc.acceptorsByVersion([])).size).toBe(0);
+  });
 });

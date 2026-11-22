@@ -63,3 +63,16 @@
 - `scripts/dev/test.sh client/src/features/compliance/admin/complianceAdmin.test.tsx` — **15/15 passed**.
 - `scripts/dev/tc.sh` — **0 diagnostics**.
 - `./node_modules/.bin/eslint` on owned `compliance` paths — **0 errors, 0 warnings**.
+
+## 5. Increment 05 — Packages D1, C4 & G-C3-02 Verification
+
+- `scripts/dev/test.sh server/modules/compliance/compliance.test.ts` — **13/13 passed**:
+  - **Test 12 (`Increment 05 (C4 + G-C3-02)`)**: verifies separate `Bundle discount` and `Discount (<promoLabel>)` lines on `invoices.get` and `invoices.downloadPdf`, non-misattribution on supplemental manual invoices, `$0.00` (`100%` discount) issued invoice status (`status = "paid"`, `paymentState = "paid"`, `balanceDueMinor = 0`, `canRecordPayment = false`, `payableInvoiceOpen = false`), conservative `orderPaymentExposureInTx` across payable/paid/provider-attempt/absent-port states (including `0` invoices + absent `payments` port -> `providerAttemptEver: true`), real 2-connection MariaDB `FOR UPDATE` vs `FOR SHARE NOWAIT` contention proving fail-closed exposure without aborting the outer transaction commit, and `ORDER_CANCELLED` refusal on `createDraft` and `issueCheckoutInvoiceInTx`.
+  - **Test 13 (`Increment 05 (D1)`)**: verifies unified `policy_acceptances` + `order_policy_acceptances` stream (`registration`, `checkout`, `re_acceptance`, `order_gate`, `imported_historical`), current vs `superseded` freshness, cursor pagination, customer `NOT_FOUND` + unauthorized staff `FORBIDDEN` (`authz.compliance.denied`), live session identity/role/port binding, raw `typedSignerName` absence in `list`/`forCustomer`/`export`, transactional `sessions.assertCurrent` lock around `typedSignerName` decryption on `detail`, `coverage` (with `outstandingLimit` truncation and last-accepted version), `updates` acceptance counts, `forCustomer` requirement states (`accepted_current`, `update_pending`, `not_accepted`, `not_required`), bounded unified scan (`MAX_UNIFIED_SCAN_ROWS` / `maxScannedRows` frontier continuation cursor + export `scan_capped`), formula-safe CSV export (`=`, `+`, `-`, `@`, `\t`, `\r`, leading whitespace + `=`), and in-tx `policy.acceptance_log.exported` audit.
+- `scripts/dev/test.sh server/modules/payments/payments.test.ts` — **7/7 passed** (including real MariaDB `getAttemptExposureForOrderInTx` + `orderPaymentExposureInTx` across stored `expired`, `failed`, and `cancelled` `payment_attempts` rows).
+- `scripts/dev/test.sh client/src/features/compliance/customer/complianceCustomer.test.tsx` — **12/12 passed** (designed and tested against WCAG 2.2 AA via `axe-core`, including C4 separate bundle + promo discount lines).
+- `scripts/dev/test.sh client/src/features/compliance/admin/complianceAdmin.test.tsx` — **16/16 passed** (including C4 separate bundle + promo discount lines on admin invoice detail).
+- `scripts/dev/test.sh client/src/features/compliance/pages/acceptances/acceptances.test.tsx` — **18/18 passed** (D2 client wired against D1 contract shapes).
+- `scripts/dev/tc.sh` — **0 diagnostics**.
+- `pnpm exec eslint` on owned `compliance` and `payments` paths — **0 errors, 0 warnings**.
+

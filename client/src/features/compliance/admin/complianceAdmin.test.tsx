@@ -341,6 +341,10 @@ describe("invoices", () => {
   };
   const detail = {
     ...summary,
+    bundleDiscountMinor: 0,
+    discountLabel: null,
+    promoDiscountMinor: 0,
+    promoLabel: null,
     issuerName: "Synthetic issuer",
     issuerAddress: "",
     memo: null,

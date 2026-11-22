@@ -226,9 +226,11 @@ printf '  SHA-256        : %s\n' "$backup_sha"
 printf '  Backup key     : %s/secrets/rp_backup_key (keep a separate off-host copy; never stored inside the archive)\n\n' "$conf"
 
 if ((!assume_yes)); then
-    confirm 'Have you recorded the verified backup ID and copied the encrypted file (plus rp_backup_key if needed) off-host?' BACKUP-VERIFIED
+    confirm 'Before applying pending migrations: have you recorded the verified backup ID, checked the off-host archive SHA-256, and confirmed separate off-host custody of the recovery keys?' BACKUP-VERIFIED
 fi
 
+# Native release preparation validated the reviewed journal and SQL before the
+# drain. Apply all pending entries from that release only after the backup gate.
 phase=migration_started
 record_phase
 migrate_release "$release"

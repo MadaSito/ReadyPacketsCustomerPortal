@@ -9,7 +9,7 @@
  * Session transport is handled in `sessionTransport.ts`; feature code never touches tokens.
  */
 import { QueryClient } from "@tanstack/react-query";
-import { createTRPCClient, httpBatchLink, type TRPCClientErrorLike, type TRPCLink } from "@trpc/client";
+import { createTRPCClient, httpBatchLink, httpLink, splitLink, type TRPCClientErrorLike, type TRPCLink } from "@trpc/client";
 import { createTRPCContext } from "@trpc/tanstack-react-query";
 import superjson from "superjson";
 import type { AppRouter } from "@server/trpc/root";
@@ -52,8 +52,15 @@ export const dropInfiniteDirectionLink: TRPCLink<AppRouter> = () => ({ op, next 
 };
 
 export function createApiClient() {
+  const transport = { url: apiUrl("/api/trpc"), transformer: superjson, fetch: sessionFetch };
   return createTRPCClient<AppRouter>({
-    links: [dropInfiniteDirectionLink, httpBatchLink({ url: apiUrl("/api/trpc"), transformer: superjson, maxItems: TRPC_MAX_BATCH_SIZE, maxURLLength: TRPC_CLIENT_MAX_URL_LENGTH, fetch: sessionFetch })],
+    links: [dropInfiniteDirectionLink, splitLink({
+      // These two mutations have a dedicated, non-batch HTTP body budget for workflow packages.
+      condition: ({ type, path }) => type === "mutation" &&
+        (path === "orders.admin.workflows.transfer.preview" || path === "orders.admin.workflows.transfer.applyImport"),
+      true: httpLink(transport),
+      false: httpBatchLink({ ...transport, maxItems: TRPC_MAX_BATCH_SIZE, maxURLLength: TRPC_CLIENT_MAX_URL_LENGTH }),
+    })],
   });
 }
 

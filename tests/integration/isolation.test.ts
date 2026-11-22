@@ -42,6 +42,7 @@ const owned = {
   ackHash: "", categoryId: "", staffCategoryId: "", topicId: "", postId: "", sharedTopicId: "",
   cartId: "", cartItemId: "", checkedOutCartId: "", paymentInvoiceId: "", attemptId: "", staffArticleId: "", staffAttachmentId: "",
   policyVersionId: "", policyHash: "", receiptId: "", copyAttemptId: "", refundPaymentId: "", dispatchId: "",
+  customerPublicId: "", productId: "",
 };
 let cartVersion = 0;
 const transcript = "Synthetic private audio transcript";
@@ -76,7 +77,9 @@ function customerProcedures(): [string, AnyTRPCProcedure][] {
 
 const RESOURCE_KEY = /(Id|PublicId|Ids)$/;
 /** Id-shaped keys that do not name another customer's resource (own-scoped or optional cursors). */
-const NOT_A_FOREIGN_RESOURCE = new Set(["recoverySetId", "challengeId", "upToMessageId", "productPublicId"]);
+// `offerPublicId` names an administrator-defined cart suggestion (catalogue-like, not owned by a customer);
+// accepting or dismissing one only ever touches the caller's own cart.
+const NOT_A_FOREIGN_RESOURCE = new Set(["recoverySetId", "challengeId", "upToMessageId", "productPublicId", "offerPublicId"]);
 
 /** Every probe customer B runs, keyed by procedure path. Inputs are otherwise valid so only ownership decides. */
 type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "FILTERED" }; alternateInputs?: () => unknown[] };
@@ -88,6 +91,15 @@ function probes(): Record<string, Probe> {
   const productionOrder = "integrations.production.order";
   return {
     "orders.get": { kind: "query", input: () => ({ orderId: o.orderId }) },
+    // Pricing "for a customer" is a console action: a customer naming another customer is refused before any lookup.
+    "orders.quote": {
+      kind: "query", input: () => ({ items: [{ productPublicId: o.productId, quantity: 1 }], forCustomerPublicId: o.customerPublicId }),
+      denial: { code: "FORBIDDEN", reason: "CAPABILITY_NOT_GRANTED" },
+    },
+    "orders.quoteWithPromo": {
+      kind: "mutation", input: () => ({ items: [{ productPublicId: o.productId, quantity: 1 }], promoCode: "ISOLATION-PROBE", forCustomerPublicId: o.customerPublicId }),
+      denial: { code: "FORBIDDEN", reason: "CAPABILITY_NOT_GRANTED" },
+    },
     "orders.console.rename": {
       kind: "mutation", input: () => ({ orderId: o.orderId, expectedVersion: aOrderVersion, name: "Not my order" }),
       denial: { code: "FORBIDDEN", reason: "ROLE_NOT_PERMITTED" },
@@ -376,8 +388,10 @@ beforeAll(async () => {
   Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
   await installRequirementsWorkflow(await publishGatePolicy());
   const productId = await seedProduct(admin);
+  owned.productId = productId;
   a = await registerCustomer(sys, "alice.isolation@example.test", "Alice Isolation");
   b = await registerCustomer(sys, "bob.isolation@example.test", "Bob Isolation");
+  owned.customerPublicId = Browser.ok(await a.browser.query<{ user: { publicId: string } }>("identity.me")).user.publicId;
 
   const order = Browser.ok(await a.browser.mutate<{ publicId: string }>("orders.create", {
     projectName: owned.projectName, items: [{ productPublicId: productId, quantity: 1 }], idempotencyKey: "isolation-order-a-0001",

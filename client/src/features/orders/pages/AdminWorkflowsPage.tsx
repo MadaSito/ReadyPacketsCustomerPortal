@@ -11,6 +11,7 @@ import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, Input, PageHeader, RadioGroup, Select, Skeleton, StepUpCancelledError, useStepUp, useToast } from "@/ui";
 import { OrderStatusBadge } from "../shared";
 import { keyFromLabel, type DraftListRow, type WorkflowListRow } from "./workflows/model";
+import { useWorkflowTransfer } from "./workflows/useWorkflowTransfer";
 
 export default function AdminWorkflowsPage() {
   const trpc = useTRPC();
@@ -31,6 +32,7 @@ export default function AdminWorkflowsPage() {
       queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.list.queryKey() }),
       queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.drafts.list.queryKey() }),
     ]);
+  const transfer = useWorkflowTransfer(workflows.data ?? [], drafts.data ?? [], () => void refresh());
 
   const installStandard = async () => {
     setProblem(null);
@@ -62,7 +64,7 @@ export default function AdminWorkflowsPage() {
     <PageHeader
       title="Workflows"
       description="Order statuses and who may move an order between them. Publishing creates a new version; existing orders keep theirs."
-      actions={workflows.data ? <Button onClick={() => setCreating(true)}>New workflow</Button> : null}
+      actions={workflows.data ? <><Button onClick={() => setCreating(true)}>New workflow</Button>{transfer.importAction}</> : null}
     />
   );
   if (workflows.isPending)
@@ -85,6 +87,7 @@ export default function AdminWorkflowsPage() {
     <>
       {header}
       <div className="flex flex-col gap-6">
+        {transfer.toolbar}
         {problem ? (
           <Callout tone="danger" live="assertive">
             {problem}
@@ -118,20 +121,24 @@ export default function AdminWorkflowsPage() {
                     <Link href={`/admin/workflows/${wf.publicId}/versions`} aria-label={`Versions of ${wf.name}`} className="text-sm font-semibold text-link underline-offset-2 hover:underline">
                       Versions
                     </Link>
+                    {transfer.exportAction(wf.workflowKey, wf.name)}
                   </div>
                 }
               >
-                {wf.definition ? (
-                  <ul aria-label={`Statuses in ${wf.name}`} className="flex flex-wrap gap-2">
-                    {wf.definition.states.map((state) => (
-                      <li key={state.key}>
-                        <OrderStatusBadge label={state.label} tone={state.tone} />
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-body">No published version.</p>
-                )}
+                <div className="grid min-w-0 gap-3">
+                  {transfer.selectionControl(wf.workflowKey, wf.name)}
+                  {wf.definition ? (
+                    <ul aria-label={`Statuses in ${wf.name}`} className="flex flex-wrap gap-2">
+                      {wf.definition.states.map((state) => (
+                        <li key={state.key}>
+                          <OrderStatusBadge label={state.label} tone={state.tone} />
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-body">No published version.</p>
+                  )}
+                </div>
               </Card>
             ))}
           </div>
@@ -148,9 +155,12 @@ export default function AdminWorkflowsPage() {
               header: "Draft",
               primary: true,
               cell: (draft) => (
-                <Link href={`/admin/workflows/drafts/${draft.publicId}`} className="font-semibold text-link underline-offset-2 hover:underline">
-                  {draft.name}
-                </Link>
+                <div className="grid min-w-0 gap-2">
+                  <Link href={`/admin/workflows/drafts/${draft.publicId}`} className="font-semibold text-link underline-offset-2 hover:underline">
+                    {draft.name}
+                  </Link>
+                  {draft.workflowPublicId === null ? transfer.selectionControl(draft.workflowKey, draft.name) : null}
+                </div>
               ),
             },
             { key: "kind", header: "For", cell: (draft) => (draft.workflowPublicId ? `New version of ${draft.workflowKey}` : `New workflow ${draft.workflowKey}`) },
@@ -163,14 +173,18 @@ export default function AdminWorkflowsPage() {
             { key: "updated", header: "Last saved", hideOnMobile: true, cell: (draft) => <DateTime value={draft.updatedAt} /> },
           ]}
           rowActions={(draft) => (
-            <Button size="sm" variant="ghost" aria-label={`Discard draft ${draft.name}`} onClick={() => setDiscarding(draft)}>
-              Discard
-            </Button>
+            <div className="flex flex-wrap gap-2 md:justify-end">
+              {draft.workflowPublicId === null ? transfer.exportAction(draft.workflowKey, draft.name) : null}
+              <Button size="sm" variant="ghost" aria-label={`Discard draft ${draft.name}`} onClick={() => setDiscarding(draft)}>
+                Discard
+              </Button>
+            </div>
           )}
         />
       </div>
       {creating ? <NewWorkflowDialog workflows={rows} onClose={() => setCreating(false)} onCreated={(id) => void refresh().then(() => navigate(`/admin/workflows/drafts/${id}`))} /> : null}
       {discarding ? <DiscardDialog draft={discarding} onClose={() => setDiscarding(null)} onDone={() => void refresh()} /> : null}
+      {transfer.dialog}
     </>
   );
 }

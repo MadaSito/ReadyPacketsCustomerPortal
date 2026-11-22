@@ -121,7 +121,22 @@ export default function InvoiceDetailPage() {
                 <KeyValueList
                   items={[
                     { label: "Subtotal", value: m(invoice.subtotalMinor) },
-                    { label: "Discount", value: m(invoice.discountMinor) },
+                    ...((invoice.promoDiscountMinor ?? 0) > 0
+                      ? [
+                          ...((invoice.bundleDiscountMinor ?? 0) > 0
+                            ? [{ label: invoice.discountLabel ?? "Bundle discount", value: m(invoice.bundleDiscountMinor) }]
+                            : []),
+                          {
+                            label: invoice.promoLabel ? `Discount (${invoice.promoLabel})` : "Code discount",
+                            value: m(invoice.promoDiscountMinor),
+                          },
+                        ]
+                      : [
+                          {
+                            label: invoice.discountLabel ? `Discount (${invoice.discountLabel})` : "Discount",
+                            value: m(invoice.discountMinor),
+                          },
+                        ]),
                     { label: "Tax", value: m(invoice.taxMinor) },
                     { label: "Total", value: m(invoice.totalMinor) },
                     { label: "Paid", value: m(invoice.grossPaidMinor) },

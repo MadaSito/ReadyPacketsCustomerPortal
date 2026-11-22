@@ -11,8 +11,13 @@
  */
 
 /** Key names whose values are never emitted. `sessionId`/`sessionRef` (public identifiers) are allowed. */
-export const SENSITIVE_KEY =
-  /pass(word|phrase|wd)?|secret|token|cookie|authori[sz]ation|^auth$|otp|totp|mfa_?code|recovery|credential|private|signature|api_?key|apikey|session(?!_?(id|ref|count)s?$)|csrf|bearer|salt|seed|dsn|connection_?string|database_?url|iban|card_?number|ssn/i;
+const PROMOTION_CODE_FIELD = String.raw`(?:promo(?:tion(?:al)?)?|discount|coupon|voucher)[ _-]*codes?(?:[ _-]*(?:raw|value|plaintext|ciphertext|enc|encrypted))?`;
+// Keep public IDs and labels searchable, and leave generic `code` available for diagnostic codes.
+const PROMOTION_CODE_KEY = new RegExp(`^promo$|${PROMOTION_CODE_FIELD}$`, "i");
+export const SENSITIVE_KEY = new RegExp(
+  String.raw`pass(word|phrase|wd)?|secret|token|cookie|authori[sz]ation|^auth$|otp|totp|mfa_?code|recovery|credential|private|signature|api_?key|apikey|session(?!_?(id|ref|count)s?$)|csrf|bearer|salt|seed|dsn|connection_?string|database_?url|iban|card_?number|ssn|${PROMOTION_CODE_KEY.source}`,
+  "i",
+);
 
 const PATTERNS: readonly { name: string; re: RegExp }[] = [
   { name: "pem", re: /-----BEGIN [A-Z ]+-----[\s\S]*?(-----END [A-Z ]+-----|$)/g },
@@ -20,6 +25,7 @@ const PATTERNS: readonly { name: string; re: RegExp }[] = [
   { name: "bearer", re: /\b(Bearer|Basic|Digest)\s+[A-Za-z0-9._~+/=-]{6,}/gi },
   { name: "url-credentials", re: /\b([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s:/@]+:[^\s@/]+@/gi },
   { name: "kv-secret", re: /\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)\s*[=:]\s*[^\s&;,]+/gi },
+  { name: "promotion-code", re: new RegExp(String.raw`\b(?:promo|(?:raw[ _-]*)?${PROMOTION_CODE_FIELD})["']?\s*[=:]\s*["']?[A-Z0-9%_-]+`, "gi") },
   { name: "encrypted-envelope", re: /\brpenc:v\d+:[A-Za-z0-9:_+/=-]+/g },
   { name: "email", re: /\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,24}\b/g },
   { name: "card", re: /\b(?:\d[ -]?){13,19}\b/g },

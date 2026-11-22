@@ -1,6 +1,7 @@
 // Invoked as root from the trusted deploy checkout. Never execute artifact code.
 import fs from "node:fs";
 import path from "node:path";
+import { checkMigrationBundle } from "./check-migration-bundle.mjs";
 
 const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK, O_DIRECTORY, O_CREAT, O_EXCL, O_WRONLY } = fs.constants;
 const read = O_RDONLY | O_NOFOLLOW | O_NONBLOCK;
@@ -67,6 +68,7 @@ function validateRelease(dir, commit) {
     if (!fs.lstatSync(path.join(dir, tree)).isDirectory()) throw new Error("missing release directory");
   }
   if (fs.existsSync(path.join(dir, "dist/ops/seed-demo.js"))) throw new Error("demo operation in production");
+  checkMigrationBundle(path.join(dir, "migrations"));
   if (fs.readFileSync(path.join(dir, "release.env"), "utf8") !== `RP_RELEASE_REF=${commit}\n`) {
     throw new Error("release metadata does not match reviewed commit");
   }

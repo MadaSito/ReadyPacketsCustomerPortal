@@ -1,4 +1,13 @@
-# Native Ubuntu deployment verification
+# Deployment verification
+
+## Increment 05 migration packaging
+
+- **Offline fixtures**: All nine cases in `scripts/ci/release-migrations.test.ts` passed. They check a complete SQL bundle; missing journal entries or SQL; unjournaled SQL; and replacement of SQL or the journal with a symlink. A fake database query accepts one matching SHA-256 journal row and refuses zero or two rows. These checks do not start a server or run a migration.
+- **Proxy fixtures**: All three cases in `scripts/ci/workflow-import-edge.test.ts` passed. They check exact method and path guards and the 256 KiB default in both Nginx profiles and Caddy. Nginx 1.28.3 accepted both profiles with `nginx -t`, using temporary paths, a synthetic certificate and high ports. Caddy 2.10.2 accepted the file with `adapt --validate` and emitted the 4,456,448-byte limit. CI smoke probes check whether an exact-limit request reaches the application and whether unrelated paths and non-POST requests are rejected. The Nginx probe additionally verifies an over-limit `413`; Compose verifies the adapted cap because Caddy can defer checking until the body is read. The offline fixtures do not run those HTTP probes.
+- **CI gates**: Native fresh-install smoke verifies `0005` from the promoted release. Native upgrade smoke starts at `89c5cb8` and requires exactly one matching journal row for each of `0003`, `0004`, and `0005`. Compose smoke checks `0005` after initial startup and after an in-place restart with the same release. The Compose check is not a cross-version upgrade or a restore drill.
+- **Not verified locally**: The actual native installer, migration, Docker image build, Compose stack, and backup/restore need their own runtime checks. Use [the upgrade runbook](../docs/operations/UPGRADE.md#increment-05-and-migration-0005) for operator rehearsal.
+
+## Native Ubuntu kit: earlier verification
 
 Scope: the native single-node install, upgrade, and deactivation for `my.readypackets.com`. The earlier Docker draft and duplicate archive installer were removed; the alternate legacy Nginx example is not covered. The evaluation Docker Compose stack in `deploy/docker/` is verified separately by `.github/workflows/container.yml` (see `deploy/docker/README.md`, "How it is verified") and is outside this document.
 

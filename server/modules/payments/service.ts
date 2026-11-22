@@ -14,7 +14,7 @@
  *    hardcoded reviewed same-origin paths.
  */
 import { createHash } from "node:crypto";
-import { and, asc, count, desc, eq, lt, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, lt, or } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -669,12 +669,54 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await assertLiveActorInTx(deps, opts.principal, tx);
       }
 
+      // Canonical lock order (order -> compliance_invoices -> payment_attempts) + fence against
+      // starting a provider checkout after order cancellation or concurrent invoice void/payment.
+      const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+      if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+        const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+        if (!lockedOrder) {
+          throw notFound("INVOICE_NOT_FOUND");
+        }
+        let orderCancelled = /cancel/.test(lockedOrder.statusKey);
+        if (ordersSvc.workflows && typeof ordersSvc.workflows.byVersionId === "function") {
+          const bound = await ordersSvc.workflows.byVersionId(tx, lockedOrder.workflowVersionId);
+          const state = bound.definition.states.find((s) => s.key === lockedOrder.statusKey);
+          orderCancelled = Boolean(state && state.kind === "terminal" && /cancel/.test(state.key));
+        }
+        if (orderCancelled) {
+          throw conflict("ORDER_CANCELLED", "Cannot start payment for a cancelled order.");
+        }
+        if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+          throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against online checkout.", {
+            lockState: lockedOrder.lockState,
+          });
+        }
+      }
+
+      const lockedInvoice = await complianceSvc.getInvoiceForCheckout(invoicePublicId, {
+        ...(opts?.principal ? { principal: opts.principal } : {}),
+        tx,
+        forUpdate: true,
+      });
+      if (lockedInvoice.origin !== "portal") {
+        throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported historical invoices cannot be paid online.");
+      }
+      if (lockedInvoice.voidedAt !== null || lockedInvoice.status === "void") {
+        throw conflict("INVOICE_VOIDED", "Voided invoices cannot be paid.");
+      }
+      if (lockedInvoice.issuedAt === null || lockedInvoice.status === "draft") {
+        throw conflict("INVOICE_NOT_ISSUED", "Draft invoices must be issued before starting checkout.");
+      }
+      if (lockedInvoice.status === "paid" || lockedInvoice.balanceDueMinor <= 0) {
+        throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
+      }
+
       const [existing] = await tx
         .select()
         .from(paymentAttempts)
         .where(
           and(
-            eq(paymentAttempts.invoiceId, invoice.invoiceId),
+            eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId),
             eq(paymentAttempts.idempotencyKey, idempotencyKey),
           ),
         )
@@ -688,7 +730,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
           stillUnexpired &&
           existing.provider === activeProvider &&
           existing.environment === config.mode &&
-          existing.amountMinor === invoice.balanceDueMinor &&
+          existing.amountMinor === lockedInvoice.balanceDueMinor &&
           existing.redirectUrlEnc
         ) {
           const redirectUrl = deps.crypto.decrypt(
@@ -711,16 +753,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       const attemptPublicId = ulid(now.getTime());
       const [ins] = await tx.insert(paymentAttempts).values({
         publicId: attemptPublicId,
-        invoiceId: invoice.invoiceId,
-        invoicePublicId: invoice.invoicePublicId,
-        orderPublicId: invoice.orderPublicId,
+        invoiceId: lockedInvoice.invoiceId,
+        invoicePublicId: lockedInvoice.invoicePublicId,
+        orderPublicId: lockedInvoice.orderPublicId,
         cartPublicId: opts?.cartPublicId ?? null,
-        customerUserId: invoice.ownerUserId,
+        customerUserId: lockedInvoice.ownerUserId,
         provider: activeProvider,
         environment: config.mode,
         status: "created",
-        amountMinor: invoice.balanceDueMinor,
-        currency: invoice.currency.toUpperCase(),
+        amountMinor: lockedInvoice.balanceDueMinor,
+        currency: lockedInvoice.currency.toUpperCase(),
         idempotencyKey: effectiveIdem,
         successPath,
         cancelPath,
@@ -740,12 +782,12 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             : { role: "system" },
           resource: { type: "payment_attempt", publicId: attemptPublicId },
           attributes: {
-            invoice_public_id: invoice.invoicePublicId,
-            order_public_id: invoice.orderPublicId,
+            invoice_public_id: lockedInvoice.invoicePublicId,
+            order_public_id: lockedInvoice.orderPublicId,
             provider: activeProvider,
             environment: config.mode,
-            amount_minor: invoice.balanceDueMinor,
-            currency: invoice.currency.toUpperCase(),
+            amount_minor: lockedInvoice.balanceDueMinor,
+            currency: lockedInvoice.currency.toUpperCase(),
           },
         },
         tx,
@@ -755,6 +797,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         reused: false as const,
         attemptId: ins.insertId,
         attemptPublicId,
+        amountMinor: lockedInvoice.balanceDueMinor,
       };
     });
 
@@ -784,7 +827,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         invoiceNumber: invoice.invoiceNumber ?? invoice.invoicePublicId,
         orderPublicId: invoice.orderPublicId,
         orderReference: invoice.orderReference,
-        amountMinor: invoice.balanceDueMinor,
+        amountMinor: preAttempt.amountMinor,
         currency: invoice.currency.toUpperCase(),
         idempotencyKey,
         returnUrl,
@@ -831,7 +874,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
               provider: activeProvider,
               environment: config.mode,
               provider_ref: createdSession.providerRef,
-              amount_minor: invoice.balanceDueMinor,
+              amount_minor: preAttempt.amountMinor,
               currency: invoice.currency.toUpperCase(),
             },
           },
@@ -3824,6 +3867,51 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  /**
+   * Authoritative conservative check for G-C3-02 (`compliance.orderPaymentExposureInTx`):
+   * `providerAttemptEver` is `true` if ANY `payment_attempts` row has EVER been created for the order or its invoices,
+   * regardless of status (`created`, `redirected`, `paid`, `failed`, `cancelled`, `expired`).
+   * Uses `FOR SHARE NOWAIT` for a current read that fails closed (`true`) on lock contention without deadlocking.
+   */
+  async function getAttemptExposureForOrderInTx(
+    tx: Tx,
+    orderPublicId: string,
+    invoiceIds: readonly number[],
+  ): Promise<{ providerCapturePending: boolean; providerAttemptEver: boolean }> {
+    try {
+      const whereClause =
+        invoiceIds.length > 0
+          ? or(
+              eq(paymentAttempts.orderPublicId, orderPublicId),
+              inArray(paymentAttempts.invoiceId, [...invoiceIds]),
+            )
+          : eq(paymentAttempts.orderPublicId, orderPublicId);
+      const rows = await tx
+        .select({
+          id: paymentAttempts.id,
+          status: paymentAttempts.status,
+          compliancePaymentPublicId: paymentAttempts.compliancePaymentPublicId,
+          verifiedWebhookEventId: paymentAttempts.verifiedWebhookEventId,
+        })
+        .from(paymentAttempts)
+        .where(whereClause)
+        .orderBy(asc(paymentAttempts.id))
+        .for("share", { noWait: true });
+      const providerAttemptEver = rows.length > 0;
+      const providerCapturePending = rows.some(
+        (r) =>
+          r.status === "created" ||
+          r.status === "redirected" ||
+          r.status === "cancelled" ||
+          (r.status === "paid" && r.compliancePaymentPublicId === null) ||
+          (r.status === "failed" && r.verifiedWebhookEventId !== null),
+      );
+      return { providerCapturePending, providerAttemptEver };
+    } catch {
+      return { providerCapturePending: true, providerAttemptEver: true };
+    }
+  }
+
   return {
     isOnlineCheckoutEnabled,
     getPublicCheckoutConfig,
@@ -3833,6 +3921,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     handleSignedWebhook,
     reconcilePendingAttempts,
     reconcileProviderRefund,
+    getAttemptExposureForOrderInTx,
     refunds: {
       forOrder: forOrderRefunds,
       create: createOrderRefund,

@@ -8,7 +8,10 @@ import { useEffect, useId, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
-import { errorMessage, useTRPC } from "@/lib/trpc";
+import { useFeatureEnabled } from "@/lib/features";
+import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
+// Increment 05 (C3): shared discount code field (audit_engineer), imported by /root's direction.
+import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import {
   Badge, Button, Callout, DataTable, DateTime, Dialog, Field, Input, Money, RadioGroup, Select, StepUpCancelledError, Textarea, useStepUp, useToast,
 } from "@/ui";
@@ -104,6 +107,19 @@ function NewOrderDialogBody({ onClose, customer: fixed }: { onClose: () => void;
   const items = Object.entries(quantities)
     .map(([productPublicId, quantity]) => ({ productPublicId, quantity: Number.parseInt(quantity, 10) }))
     .filter((item) => Number.isInteger(item.quantity) && item.quantity > 0);
+  // Increment 05 (C3): a code is judged for the CUSTOMER (forCustomerPublicId) and re-validated at create. Any change
+  // of customer or items after applying it un-applies it, so the dialog never sends a code it has not priced.
+  const trpcClient = useTRPCClient();
+  const promotionsEnabled = useFeatureEnabled("promotions");
+  const promoScope = JSON.stringify([customer?.publicId ?? null, items]);
+  const [promo, setPromo] = useState<{ code: string; scope: string; label: string; discountMinor: number; currency: string } | null>(null);
+  const activePromo = promo && promo.scope === promoScope ? promo : null;
+  const applyPromo = async (code: string) => {
+    if (!customer || items.length === 0) throw new Error("Choose a customer and at least one item first.");
+    const quote = await trpcClient.orders.quoteWithPromo.mutate({ items, promoCode: code, forCustomerPublicId: customer.publicId });
+    if (!quote.promo) throw new Error("This code cannot be applied.");
+    setPromo({ code, scope: promoScope, label: quote.promo.label, discountMinor: quote.promo.promoDiscountMinor, currency: quote.currency });
+  };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
@@ -111,7 +127,7 @@ function NewOrderDialogBody({ onClose, customer: fixed }: { onClose: () => void;
     if (!projectName.trim()) return setError("Enter a project name.");
     if (items.length === 0) return setError("Add at least one item.");
     try {
-      const order = await create.mutateAsync({ customerPublicId: customer.publicId, projectName: projectName.trim(), items, note: note.trim() || undefined, idempotencyKey });
+      const order = await create.mutateAsync({ customerPublicId: customer.publicId, projectName: projectName.trim(), items, note: note.trim() || undefined, idempotencyKey, ...(activePromo ? { promoCode: activePromo.code } : {}) });
       await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
       toast.show({ tone: "success", title: "Order created" });
       onClose();
@@ -183,6 +199,14 @@ function NewOrderDialogBody({ onClose, customer: fixed }: { onClose: () => void;
             </ul>
           </fieldset>
         )}
+        {promotionsEnabled ? (
+          <PromoCodeField
+            applied={activePromo ? { label: activePromo.label, discountMinor: activePromo.discountMinor, currency: activePromo.currency } : null}
+            onApply={applyPromo}
+            onRemove={async () => setPromo(null)}
+            disabled={!customer || items.length === 0 || create.isPending}
+          />
+        ) : null}
         <Field label="Note for the customer" hint="Optional.">
           <Textarea value={note} onChange={(event) => setNote(event.target.value)} maxLength={5000} rows={3} />
         </Field>

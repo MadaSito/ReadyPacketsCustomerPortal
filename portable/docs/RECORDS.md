@@ -46,6 +46,8 @@ File `records/orders.jsonl` · schema `schemas/v3/records/orders.schema.json`
 | `subtotal` | yes | money |
 | `discount` | yes | money |
 | `discountLabel` | no | string ≤120 \| null |
+| `promoDiscount` | no | money |
+| `promoLabel` | no | string ≤120 \| null |
 | `total` | yes | money |
 | `isTestOrder` | yes | boolean |
 | `lock` | yes | object \| null |

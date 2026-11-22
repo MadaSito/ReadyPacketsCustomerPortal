@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Router } from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { AppConfig, DeploymentProfile } from "../../server/config/env.js";
 import { DomainError } from "../../server/core/errors.js";
 import { getRequestContext } from "../../server/core/requestContext.js";
@@ -51,6 +52,10 @@ function harness(options: AppOptions = {}, config: Partial<AppConfig> = {}) {
   const access = vi.fn();
   h.services.logger = { ...silentLogger, info: access };
   const effect = vi.fn();
+  const workflowImport = protectedProcedure.input(z.object({ packageText: z.string() })).mutation(({ input }) => {
+    effect();
+    return { bytes: Buffer.byteLength(input.packageText) };
+  });
   const trpcRouter = router({
     open: publicProcedure.query(({ ctx }) => ({
       authenticated: ctx.session !== null,
@@ -78,6 +83,10 @@ function harness(options: AppOptions = {}, config: Partial<AppConfig> = {}) {
       throw new DomainError("CONFLICT", "SYNTHETIC_CONFLICT", "That example is already in use.");
     }),
     failure: publicProcedure.query(() => { throw new Error("SELECT synthetic_internal_only FROM settings"); }),
+    orders: router({ admin: router({ workflows: router({ transfer: router({
+      preview: workflowImport,
+      applyImport: workflowImport,
+    }) }) }) }),
   });
   const moduleRouter = Router();
   moduleRouter.get("/check", (req, res) => { res.json({ actor: getHttpState(req).session?.sessionId ?? null }); });
@@ -358,6 +367,62 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     const big = await h.http.get(`/api/trpc/${Array(9).fill("open").join(",")}?batch=1`).set("Host", HOST).expect(400);
     expect(big.body.error.json.data.safe.reasonCode).toBe("BATCH_TOO_LARGE");
     await h.http.get("/api/trpc/open,scarce").set("Host", HOST).expect(400);
+  });
+
+  it("expands JSON limits only for the two exact non-batched workflow import POST paths", async () => {
+    const h = harness();
+    const base = "/api/trpc/orders.admin.workflows.transfer";
+    const cookie = requestCookies(h.config, TOKEN_A, csrfA);
+    const packageText = `{${"\t".repeat(2 * 1024 * 1024 - 2)}}`;
+    const envelope = { json: { packageText } };
+    expect(Buffer.byteLength(JSON.stringify(envelope))).toBeGreaterThan(4 * 1024 * 1024);
+    for (const path of [`${base}.preview`, `${base}.applyImport`]) {
+      const result = await h.http.post(path).set("Host", HOST).set("Origin", ORIGIN)
+        .set("Cookie", cookie).set(HEADER_CSRF, csrfA).send(envelope).expect(200);
+      expect(result.body.result.data.json.bytes).toBe(2 * 1024 * 1024);
+    }
+    const smaller = { json: { packageText: "x".repeat(256 * 1024) } };
+    for (const path of ["/api/trpc/update", "/api/mutate", `${base}.%70review`]) {
+      await h.http.post(path).set("Host", HOST).set("Origin", ORIGIN)
+        .set("Cookie", cookie).set(HEADER_CSRF, csrfA).send(smaller).expect(413);
+    }
+    await h.http.put(`${base}.applyImport`).set("Host", HOST).set("Origin", ORIGIN)
+      .set("Cookie", cookie).set(HEADER_CSRF, csrfA).send(smaller).expect(413);
+    const oversized = await h.http.post(`${base}.applyImport`).set("Host", HOST).set("Origin", ORIGIN)
+      .set("Cookie", cookie).set(HEADER_CSRF, csrfA)
+      .send({ json: { packageText: "x".repeat(4 * 1024 * 1024 + 256 * 1024) } }).expect(413);
+    expect(oversized.body.error.json.data.safe.reasonCode).toBe("BODY_TOO_LARGE");
+    expect(h.effect).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses workflow batches and validates origin, session and CSRF before expanded parsing", async () => {
+    const h = harness();
+    const path = "/api/trpc/orders.admin.workflows.transfer.preview";
+    const malformed = () => `{"json":"${"x".repeat(256 * 1024)}`;
+    const cookie = requestCookies(h.config, TOKEN_A, csrfA);
+    for (const [target, count] of [[`${path}?batch=1`, 1], [`${path}%2Cupdate?batch=1`, 2], [`${path}?%62atch=1&batch=0`, 0]] as const) {
+      const result = await h.http.post(target).set("Host", HOST).set("Origin", ORIGIN)
+        .set("Cookie", cookie).set(HEADER_CSRF, csrfA).type("application/json").send(malformed()).expect(400);
+      if (count > 0) expect(result.body).toHaveLength(count);
+      const item = count > 0 ? result.body[0] : result.body;
+      expect(item.error.json.data.safe.reasonCode).toBe("WORKFLOW_IMPORT_BATCH_NOT_ALLOWED");
+    }
+    await h.http.post(path).set("Host", HOST).set("Origin", "https://outside.example.test")
+      .set("Cookie", cookie).set(HEADER_CSRF, csrfA).type("application/json").send(malformed()).expect(403);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    const invalidCsrf = await h.http.post(path).set("Host", HOST).set("Origin", ORIGIN)
+      .set("Cookie", cookie).set(HEADER_CSRF, csrfB).type("application/json").send(malformed()).expect(403);
+    expect(invalidCsrf.body.error.json.data.safe.reasonCode).toBe("CSRF_INVALID");
+    const bootstrap = await h.http.get("/api/csrf").set("Host", HOST).expect(204);
+    const token = extractCsrf(bootstrap, h.config);
+    const anonymous = await h.http.post(path).set("Host", HOST).set("Origin", ORIGIN)
+      .set("Cookie", requestCookies(h.config, undefined, token)).set(HEADER_CSRF, token)
+      .type("application/json").send(malformed()).expect(401);
+    expect(anonymous.body.error.json.data.safe.reasonCode).toBe("NO_SESSION");
+    const invalidJson = await h.http.post(path).set("Host", HOST).set("Origin", ORIGIN)
+      .set("Cookie", cookie).set(HEADER_CSRF, csrfA).type("application/json").send(malformed()).expect(400);
+    expect(invalidJson.body.error.json.data.safe.reasonCode).toBe("INVALID_JSON");
+    expect(h.effect).not.toHaveBeenCalled();
   });
 
   it("samples procedure rate denials even when the HTTP batch contains a success", async () => {

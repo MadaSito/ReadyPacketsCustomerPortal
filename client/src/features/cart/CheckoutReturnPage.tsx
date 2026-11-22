@@ -23,6 +23,7 @@ export function readCheckoutTarget(search: string): CheckoutTarget | null {
 const stateCopy = {
   pending_confirmation: { title: "Waiting for payment confirmation", text: "Returning from checkout does not confirm payment. This page checks for confirmation automatically for a short time. Avoid submitting another payment while you wait.", tone: "info" },
   paid: { title: "Payment confirmed", text: "Your payment is recorded on your ReadyPackets invoice.", tone: "success" },
+  no_payment_due: { title: "Nothing to pay - your discount covers this order", text: "Your order is placed and your zero-balance invoice is settled. No payment was needed.", tone: "success" },
   invoice_issued: { title: "Order placed and invoice issued", text: "No online payment was collected. Open your invoice for the balance and payment instructions.", tone: "success" },
   cancelled: { title: "Checkout cancelled", text: "No payment is confirmed for this checkout. If you believe a charge was made, verify it before paying again.", tone: "warning" },
   failed: { title: "Payment could not be confirmed", text: "Check your invoice and verify any charge with the provider before trying again.", tone: "warning" },

@@ -6,6 +6,11 @@ set -euo pipefail
 
 readonly rp=deploy/docker/rp-docker.sh
 readonly origin=https://localhost
+ci_scripts_dir=$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")
+# shellcheck source=scripts/ci/assert-release-migrations.sh
+source "$ci_scripts_dir/assert-release-migrations.sh"
+# shellcheck source=scripts/ci/assert-workflow-import-edge.sh
+source "$ci_scripts_dir/assert-workflow-import-edge.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -76,6 +81,12 @@ upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: app
 # unauthenticated request itself.
 [[ $upload_status =~ ^40[13]$ ]] || fail "upload route: expected the application to refuse (401/403), got $upload_status"
 
+step "workflow import body limit is scoped to the two canonical POST paths"
+docker exec readypackets-caddy-1 caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile |
+    jq -e '[.. | objects | select(.handler? == "request_body" and .max_size? == 4456448)] | length == 1' >/dev/null ||
+    fail "Caddy did not configure the workflow body limit exactly once"
+assert_workflow_import_edge caddy "$origin" "$work"
+
 step "the application answers only the proxy"
 expect "web networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-web-1)" "readypackets_data readypackets_edge "
 expect "worker networks" "$(docker inspect -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' readypackets-worker-1)" "readypackets_data readypackets_egress "
@@ -118,6 +129,12 @@ expect "accounts" "$accounts" $'root@localhost \nrp_app@172.30.251.0/24 ANY\nrp_
 grants=$(docker exec readypackets-db-1 sh -c 'MYSQL_PWD="$(cat /run/rp-db-secrets/root_password)" mysql --protocol=socket -uroot -N -B -e "SHOW GRANTS FOR \"rp_app\"@\"172.30.251.0/24\""')
 expect "runtime grants" "$grants" $'GRANT USAGE ON *.* TO `rp_app`@`172.30.251.0/24`\nGRANT SELECT, INSERT, UPDATE, DELETE ON `readypackets`.* TO `rp_app`@`172.30.251.0/24`'
 expect "transport policy" "$(docker exec readypackets-db-1 sh -c 'MYSQL_PWD="$(cat /run/rp-db-secrets/root_password)" mysql --protocol=socket -uroot -N -B -e "SELECT @@require_secure_transport, @@local_infile, @@skip_name_resolve"')" $'1\t0\t1'
+query_release_journal() {
+    docker exec readypackets-db-1 sh -c \
+        'MYSQL_PWD="$(cat /run/rp-db-secrets/root_password)" mysql --protocol=socket -uroot -N -B --execute="$1"' sh "$1"
+}
+step "migration 0005 is applied exactly once"
+assert_release_migrations migrations query_release_journal 0005_increment_05
 
 step "first administrator (non-interactive), refused the second time"
 ( umask 077; printf 'Ci-%s-Aa1\n' "$(openssl rand -hex 16)" > "$work/password" )
@@ -166,6 +183,7 @@ step "update in place: the portal is stopped, migrated and started again"
 wait_for_proxy
 expect "readyz after update" "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 expect "web restarted cleanly" "$(docker inspect -f '{{.State.Status}}' readypackets-web-1)" running
+assert_release_migrations migrations query_release_journal 0005_increment_05
 
 step "restart keeps data, keys and settings"
 "$rp" down

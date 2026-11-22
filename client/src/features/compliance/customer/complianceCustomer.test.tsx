@@ -77,7 +77,8 @@ const intake: OrderIntakeItemView = {
 };
 const invoice: InvoiceDetailView = {
   invoicePublicId: publicId("6"), orderPublicId: orderId, orderReference: "RP-123", invoiceNumber: "RP-INV-123",
-  status: "issued", paymentState: "partially_refunded", currency: "USD", subtotalMinor: 10000, discountMinor: 0, taxMinor: 0, totalMinor: 10000,
+  status: "issued", paymentState: "partially_refunded", currency: "USD", subtotalMinor: 10000, discountMinor: 0,
+  bundleDiscountMinor: 0, discountLabel: null, promoDiscountMinor: 0, promoLabel: null, taxMinor: 0, totalMinor: 10000,
   grossPaidMinor: 4000, refundedMinor: 1000, netPaidMinor: 3000, balanceDueMinor: 7000, issuedAt: date,
   dueAt: date, voidedAt: null, origin: "portal", version: 1, createdAt: date, issuerName: "ReadyPackets",
   issuerAddress: "", memo: null, voidReason: null, paymentInstructions: "", onlinePaymentConfigured: false,

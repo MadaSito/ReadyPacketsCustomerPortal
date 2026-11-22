@@ -146,6 +146,8 @@ You cannot change your own email address or customer reference in the portal; co
   - **Notes** — add a note. Notes you add are visible to you and ReadyPackets staff.
   - **Sharing** — see [Sharing an order](#sharing-an-order).
   - **Files** — see [Files](#files).
+- **Discount codes and cart suggestions** (when your portal has them switched on): see
+  [Using a discount code](./DISCOUNT_CODES_HELP.md) and [Suggestions in your cart](./CART_SUGGESTIONS_HELP.md).
 - Orders may be **locked** (for example, on legal hold or after an import). A lock blocks changes but not reading.
 - Whether you can move an order to another status depends on its workflow; the order shows only the actions allowed
   for you.

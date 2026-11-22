@@ -88,6 +88,14 @@ export const CAPABILITIES = [
   "orders.production.redeliver",
   "orders.automations.run",
   "payments.refund",
+  // increment 05: workflow transfer, cart upsell, discount codes, policy acceptance log centre
+  "workflows.export",
+  "workflows.import",
+  "carts.upsells.manage",
+  "promotions.read",
+  "promotions.manage",
+  "policies.acceptances.read",
+  "policies.acceptances.export",
   // portable / backup
   "portable.export",
   "portable.import",
@@ -125,6 +133,8 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "carts.read_all",
   "orders.rename",
   "orders.automations.run",
+  "promotions.read",
+  "policies.acceptances.read",
 ];
 
 /** Default role grants. Staff least-privilege by assignment is a recorded ADR target, not yet implemented. */
@@ -173,6 +183,9 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "payments.manage",
   "orders.production.redeliver",
   "payments.refund",
+  "workflows.import",
+  "promotions.manage",
+  "policies.acceptances.export",
   "portable.export",
   "portable.import",
   "backup.run",

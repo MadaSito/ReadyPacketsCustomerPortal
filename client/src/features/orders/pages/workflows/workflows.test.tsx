@@ -32,7 +32,7 @@ function proxy(path: string[]): unknown {
   };
   return new Proxy(api, { get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : proxy([...path, prop])) });
 }
-vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]) }));
+vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]), useTRPCClient: () => proxy([]) }));
 
 const WF = "01JTESTWF0000000000000000A";
 const VERSION = "01JTESTWFV000000000000000A";
@@ -95,6 +95,7 @@ beforeEach(() => {
   handlers.clear();
   calls.length = 0;
   handlers.set("compliance.policies.listPublished", () => policyDocs);
+  handlers.set("orders.admin.workflows.transfer.status", () => ({ enabled: false, canExport: true, canImport: true, maxBytes: 2_097_152, maxWorkflows: 50 }));
 });
 
 const designer = () => renderUi(<Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route>, { path: `/admin/workflows/drafts/${DRAFT}` });

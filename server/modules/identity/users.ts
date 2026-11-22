@@ -1,7 +1,7 @@
 /**
  * User repository + decrypted server-side view. Internal to the identity module.
  */
-import { and, count, eq, isNull } from "drizzle-orm";
+import { and, count, eq, inArray, isNull } from "drizzle-orm";
 import type { ModuleDeps } from "../../container.js";
 import type { DbOrTx, FieldCrypto, Tx } from "../../core/types.js";
 import { conflict } from "../../core/errors.js";
@@ -70,6 +70,8 @@ export function toView(crypto: FieldCrypto, row: UserRow): UserView {
   };
 }
 
+export const MAX_BATCH_USERS = 500;
+
 export interface LoadOptions {
   tx?: DbOrTx;
   forUpdate?: boolean;
@@ -87,6 +89,13 @@ export function createUserRepo(deps: ModuleDeps) {
     byId: (id: number, options?: LoadOptions) => one(eq(users.id, id), options),
     byPublicId: (publicId: string, options?: LoadOptions) => one(eq(users.publicId, publicId), options),
     byEmail: (email: string, options?: LoadOptions) => one(eq(users.emailIndex, emailIndexOf(deps.crypto, email)), options),
+    /** One IN query for up to MAX_BATCH_USERS distinct ids (callers resolve a page of rows without N+1). */
+    async byIds(ids: readonly number[], options: { tx?: DbOrTx } = {}): Promise<UserRow[]> {
+      const unique = [...new Set(ids)];
+      if (unique.length === 0) return [];
+      if (unique.length > MAX_BATCH_USERS) throw new Error(`byIds accepts at most ${MAX_BATCH_USERS} ids`);
+      return db(options.tx).select().from(users).where(inArray(users.id, unique));
+    },
 
     async countActiveAdmins(tx: Tx, excludeUserId?: number): Promise<number> {
       const rows = await tx

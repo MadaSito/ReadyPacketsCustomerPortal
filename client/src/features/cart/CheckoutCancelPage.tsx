@@ -28,7 +28,7 @@ function RestoreActions({ data, target, onChanged }: { data: CheckoutStatus; tar
     }
   }
 
-  if (data.confirmationState === "paid" || data.confirmationState === "invoice_issued") return null;
+  if (data.confirmationState === "paid" || data.confirmationState === "no_payment_due" || data.confirmationState === "invoice_issued") return null;
   if (restored || data.alreadyRestored) return <Card title="Items restored">
     <p className="mb-4 text-sm text-muted">Review current prices and availability in your cart before you check out again.</p>
     <Button asChild><Link href="/cart">Open restored cart</Link></Button>

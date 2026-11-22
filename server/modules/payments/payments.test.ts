@@ -1287,5 +1287,118 @@ describe("payments module — Stripe Checkout, signed webhooks, double verificat
     expect(h.referralEvents).toHaveLength(1);
     expect(h.referralEvents[0]?.totalMinor).toBe(32_500);
   });
+
+  it("Increment 05 (G-C3-02): getAttemptExposureForOrderInTx & orderPaymentExposureInTx report providerAttemptEver: true across stored failed, cancelled, and expired payment_attempts rows", async () => {
+    const h = createHarness();
+    const now = h.clock.now();
+
+    // 1. Clean voided-invoice order with ZERO payment_attempts rows -> providerAttemptEver: false
+    const clean = await h.createIssuedInvoiceForCustomerA(18_000);
+    await h.compliance.invoices.admin.void(adminPrincipal, {
+      invoicePublicId: clean.invoice.invoicePublicId,
+      reason: "Order cancelled before any checkout attempt",
+    });
+    const cleanExposure = await tdb.db.transaction((tx) =>
+      h.compliance.orderPaymentExposureInTx(tx, clean.order.publicId),
+    );
+    expect(cleanExposure).toEqual({
+      grossPaidMinor: 0,
+      payableInvoiceOpen: false,
+      providerCapturePending: false,
+      providerAttemptEver: false,
+    });
+
+    // 2. Stored `expired`, `failed` (unverified + webhook-verified), and `cancelled` rows each force `providerAttemptEver: true`
+    const terminalCases: Array<{
+      label: string;
+      status: "expired" | "failed" | "cancelled";
+      verifiedWebhookEventId: string | null;
+      expectedCapturePending: boolean;
+    }> = [
+      {
+        label: "expired",
+        status: "expired",
+        verifiedWebhookEventId: null,
+        expectedCapturePending: false,
+      },
+      {
+        label: "failed_without_webhook",
+        status: "failed",
+        verifiedWebhookEventId: null,
+        expectedCapturePending: false,
+      },
+      {
+        label: "failed_with_verified_webhook",
+        status: "failed",
+        verifiedWebhookEventId: "evt_failed_real_row_1",
+        expectedCapturePending: true,
+      },
+      {
+        label: "cancelled",
+        status: "cancelled",
+        verifiedWebhookEventId: null,
+        expectedCapturePending: true,
+      },
+    ];
+
+    for (const [idx, tc] of terminalCases.entries()) {
+      const created = await h.createIssuedInvoiceForCustomerA(20_000 + idx * 100);
+      await h.compliance.invoices.admin.void(adminPrincipal, {
+        invoicePublicId: created.invoice.invoicePublicId,
+        reason: `Voided after ${tc.label} provider attempt`,
+      });
+      const [invRow] = await tdb.db
+        .select({ id: complianceSchema.complianceInvoices.id })
+        .from(complianceSchema.complianceInvoices)
+        .where(eq(complianceSchema.complianceInvoices.publicId, created.invoice.invoicePublicId));
+
+      await tdb.db.insert(paymentAttempts).values({
+        publicId: ulid(now.getTime() + 9_100 + idx),
+        invoiceId: invRow!.id,
+        invoicePublicId: created.invoice.invoicePublicId,
+        orderPublicId: created.order.publicId,
+        customerUserId: customerAPrincipal.userId,
+        provider: "stripe",
+        environment: "test",
+        status: tc.status,
+        amountMinor: 20_000 + idx * 100,
+        currency: "USD",
+        idempotencyKey: `idem-gc302-${tc.label}`,
+        successPath: `/orders/${created.order.publicId}`,
+        cancelPath: `/orders/${created.order.publicId}`,
+        providerRef: `cs_test_gc302_${tc.label}`,
+        verifiedWebhookEventId: tc.verifiedWebhookEventId,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const directExposure = await tdb.db.transaction((tx) =>
+        h.payments.getAttemptExposureForOrderInTx(tx, created.order.publicId, [invRow!.id]),
+      );
+      expect(directExposure).toEqual({
+        providerCapturePending: tc.expectedCapturePending,
+        providerAttemptEver: true,
+      });
+
+      // Match by `orderPublicId` alone (even when `invoiceIds` is empty) also reports `providerAttemptEver: true`
+      const orderOnlyExposure = await tdb.db.transaction((tx) =>
+        h.payments.getAttemptExposureForOrderInTx(tx, created.order.publicId, []),
+      );
+      expect(orderOnlyExposure).toEqual({
+        providerCapturePending: tc.expectedCapturePending,
+        providerAttemptEver: true,
+      });
+
+      const fullExposure = await tdb.db.transaction((tx) =>
+        h.compliance.orderPaymentExposureInTx(tx, created.order.publicId),
+      );
+      expect(fullExposure).toEqual({
+        grossPaidMinor: 0,
+        payableInvoiceOpen: false,
+        providerCapturePending: tc.expectedCapturePending,
+        providerAttemptEver: true,
+      });
+    }
+  });
 });
 
