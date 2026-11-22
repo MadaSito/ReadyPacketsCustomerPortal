@@ -29,6 +29,12 @@ export interface IdentityModule extends ModuleLifecycle {
   sessionResolver: SessionResolver;
   getUser(userId: number, opts?: LoadOptions): Promise<UserView | null>;
   getUserByPublicId(publicId: string, opts?: LoadOptions): Promise<UserView | null>;
+  /**
+   * Batch lookup by internal id for read views (e.g. the acceptance log): one query, at most 500 distinct ids,
+   * missing ids are simply absent. Returns decrypted name/e-mail — callers must hold the capability for the
+   * view they render and must not log the values.
+   */
+  getUsersByIds(userIds: readonly number[], opts?: { tx?: DbOrTx }): Promise<Map<number, UserView>>;
   verifyPassword(userId: number, password: string, opts?: { tx?: Tx }): Promise<boolean>;
   setPassword(
     userId: number,
@@ -138,6 +144,10 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     sessionResolver: sessions.resolver,
     getUser: async (userId, opts) => view(await repo.byId(userId, opts)),
     getUserByPublicId: async (publicId, opts) => view(await repo.byPublicId(publicId, opts)),
+    async getUsersByIds(userIds, opts) {
+      const rows = await repo.byIds(userIds, opts);
+      return new Map(rows.map((row) => [row.id, toView(deps.crypto, row)]));
+    },
     verifyPassword: credentials.verifyPassword,
     setPassword: credentials.setPassword,
     generateTemporaryPassword: credentials.generateTemporaryPassword,

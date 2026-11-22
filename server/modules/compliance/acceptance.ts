@@ -7,7 +7,7 @@
  * Staff and administrators are never gated. Evidence rows are append-only and bound to (order, user, policy
  * version, gate, SHA-256 of the exact text shown) — they can't be replayed for another order or another text.
  */
-import { and, count, desc, eq, inArray, lt, lte } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, lt, lte, or, type SQL } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, forbidden, notFound, validation } from "../../core/errors.js";
@@ -408,7 +408,97 @@ export function createAcceptanceService(deps: ModuleDeps) {
       }
       return { total, items, nextCursor: rows.length > limit ? encodeCursor(page[page.length - 1]!.id) : null };
     },
+
+    /**
+     * Internal read port for the policy acceptance log centre (Increment 05 D4; caller: compliance log service,
+     * which authorizes `policies.acceptances.read` first and audits). Not on tRPC. Newest first by
+     * (acceptedAt DESC, publicId DESC) — the same keyset as `policy_acceptances`, so the caller can merge both
+     * streams with one `before` cursor. The raw source address never leaves: it is returned as the same HMAC
+     * pseudonym `policy_acceptances` stores. Typed names stay encrypted (AAD returned for the detail dialog).
+     */
+    async evidencePage(filter: EvidenceFilter, opts: { tx?: DbOrTx } = {}): Promise<{ items: OrderGateEvidence[]; hasMore: boolean }> {
+      const limit = Math.min(Math.max(Math.trunc(filter.limit), 1), EVIDENCE_MAX_LIMIT);
+      const lists = [filter.userIds, filter.policyDocumentIds, filter.policyVersionIds, filter.orderIds];
+      if (lists.some((l) => l !== undefined && l.length > EVIDENCE_MAX_IDS)) throw validation("FILTER_TOO_LARGE", "Too many filter values.");
+      // An explicitly empty id list means "matches nothing" (e.g. a customer search that found no one).
+      if (lists.some((l) => l !== undefined && l.length === 0)) return { items: [], hasMore: false };
+      const t = orderPolicyAcceptances;
+      const conditions: (SQL | undefined)[] = [
+        filter.userIds ? inArray(t.userId, [...filter.userIds]) : undefined,
+        filter.policyDocumentIds ? inArray(t.policyDocumentId, [...filter.policyDocumentIds]) : undefined,
+        filter.policyVersionIds ? inArray(t.policyVersionId, [...filter.policyVersionIds]) : undefined,
+        filter.orderIds ? inArray(t.orderId, [...filter.orderIds]) : undefined,
+        filter.method ? eq(t.signatureMode, filter.method) : undefined,
+        filter.from ? gte(t.acceptedAt, filter.from) : undefined,
+        filter.to ? lt(t.acceptedAt, filter.to) : undefined,
+        filter.before
+          ? or(lt(t.acceptedAt, filter.before.acceptedAt), and(eq(t.acceptedAt, filter.before.acceptedAt), lt(t.publicId, filter.before.publicId)))
+          : undefined,
+      ];
+      const rows = await (opts.tx ?? deps.db)
+        .select({
+          publicId: t.publicId, acceptedAt: t.acceptedAt, userId: t.userId, policyDocumentId: t.policyDocumentId, policyPublicId: t.policyPublicId,
+          policyVersionId: t.policyVersionId, policyVersionNumber: t.policyVersionNumber, textSha256: t.textSha256, method: t.signatureMode,
+          orderId: t.orderId, orderPublicId: t.orderPublicId, gateKey: t.gateKey, workflowVersionId: t.workflowVersionId,
+          sourceAddressEnc: t.sourceAddressEnc, requestId: t.requestId, typedNameEnc: t.typedNameEnc,
+        })
+        .from(t)
+        .where(and(...conditions))
+        .orderBy(desc(t.acceptedAt), desc(t.publicId))
+        .limit(limit + 1);
+      const items = rows.slice(0, limit).map(({ sourceAddressEnc, requestId, typedNameEnc, ...row }): OrderGateEvidence => ({
+        ...row,
+        addressPseudonym: sourceAddressEnc
+          ? deps.crypto.pseudonym(deps.crypto.decrypt(sourceAddressEnc, sourceAddressAad(row.publicId)), ADDRESS_PSEUDONYM_PURPOSE)
+          : null,
+        correlationId: requestId,
+        signerNameEnc: typedNameEnc,
+        signerNameAad: typedNameEnc ? typedNameAad(row.publicId) : null,
+      }));
+      return { items, hasMore: rows.length > limit };
+    },
   };
+}
+
+export const EVIDENCE_MAX_LIMIT = 200;
+export const EVIDENCE_MAX_IDS = 500;
+/** Same purpose string as `policy_acceptances.source_address_pseudonym`, so one address correlates across both. */
+export const ADDRESS_PSEUDONYM_PURPOSE = "compliance.policy_acceptance.ip";
+
+export interface EvidenceFilter {
+  userIds?: readonly number[] | undefined;
+  policyDocumentIds?: readonly number[] | undefined;
+  policyVersionIds?: readonly number[] | undefined;
+  orderIds?: readonly number[] | undefined;
+  method?: AcceptanceSignatureMode | undefined;
+  /** Inclusive. */
+  from?: Date | undefined;
+  /** Exclusive. */
+  to?: Date | undefined;
+  /** Keyset cursor: rows strictly older than this (acceptedAt, publicId). */
+  before?: { acceptedAt: Date; publicId: string } | undefined;
+  /** 1..200. */
+  limit: number;
+}
+
+export interface OrderGateEvidence {
+  publicId: string;
+  acceptedAt: Date;
+  userId: number;
+  policyDocumentId: number;
+  policyPublicId: string;
+  policyVersionId: number;
+  policyVersionNumber: number;
+  textSha256: string;
+  method: AcceptanceSignatureMode;
+  orderId: number;
+  orderPublicId: string;
+  gateKey: string;
+  workflowVersionId: number;
+  addressPseudonym: string | null;
+  correlationId: string;
+  signerNameEnc: string | null;
+  signerNameAad: string | null;
 }
 
 export type AcceptanceService = ReturnType<typeof createAcceptanceService>;

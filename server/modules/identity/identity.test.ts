@@ -666,6 +666,19 @@ describe("identity module (MySQL)", () => {
     });
   });
 
+  describe("getUsersByIds (batch read port)", () => {
+    it("resolves a page of users in one query with decrypted name/e-mail and customer reference; caps the batch", async () => {
+      const a = await makeUser();
+      const b = await makeUser({ role: "staff" });
+      const map = await identity.getUsersByIds([a.id, b.id, a.id, 987_654_321]);
+      expect([...map.keys()].sort()).toEqual([a.id, b.id].sort());
+      expect(map.get(a.id)).toMatchObject({ publicId: a.publicId, email: a.email, name: expect.stringMatching(/^Synthetic Person/), role: "customer" });
+      expect(map.get(a.id)!.customerRef).toMatch(/^RPCUS-/);
+      expect((await identity.getUsersByIds([])).size).toBe(0);
+      await expect(identity.getUsersByIds(Array.from({ length: 501 }, (_, i) => i + 1))).rejects.toThrow(/at most 500/);
+    });
+  });
+
   describe("provisionLocalAccount (ops scripts)", () => {
     const provision = (role: "admin" | "customer", reason: "bootstrap_admin" | "demo_seed", email = `ops${++seq}.${Date.now()}@example.test`) =>
       db.db.transaction((tx) => identity.provisionLocalAccount({ email, name: "Ops Person", role, password: PW, mustChangePassword: true }, { tx: tx as Tx, reason }));

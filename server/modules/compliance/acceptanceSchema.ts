@@ -48,6 +48,8 @@ export const orderPolicyAcceptances = mysqlTable(
     uniqueIndex("cmp_ord_acc_once_uq").on(t.orderId, t.userId, t.policyVersionId, t.gateKey, t.workflowVersionId),
     index("cmp_ord_acc_order_idx").on(t.orderId, t.acceptedAt),
     index("cmp_ord_acc_user_idx").on(t.userId),
+    /** Increment 05 acceptance log centre: newest-first keyset scan (acceptedAt DESC, publicId DESC). */
+    index("cmp_ord_acc_time_idx").on(t.acceptedAt, t.publicId),
   ],
 );
 export type OrderPolicyAcceptanceRow = typeof orderPolicyAcceptances.$inferSelect;
