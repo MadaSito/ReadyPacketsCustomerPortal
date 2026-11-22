@@ -409,6 +409,8 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
   );
 
   const lastCapturedPathRef = useRef<string | null>(null);
+  const mountedClarityIdRef = useRef<string | null>(null);
+  const activePostHogSigRef = useRef<string | null>(null);
   const prevGrantedRef = useRef<{ analytics: boolean; session_replay: boolean }>({
     analytics: false,
     session_replay: false,
@@ -416,6 +418,10 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
 
   // Subscribe directly to `@/lib/consent` so cross-tab storage revocations, renewal expiry, policy-version
   // bumps, or disabling `privacy.consent` tear down vendor state synchronously and replace any tainted realm.
+  // NOTE on unload vs ledger call: `CookieConsent` / `useConsentDecision` persists removals synchronously to
+  // `localStorage` (`rp.consent.v1`) via `applyConsentDecision` BEFORE invoking `emit()` (and before the async
+  // server ledger RPC), so even when `requestCleanRealm` reloads the document immediately, local denial is
+  // already durable in `rp.consent.v1` and wins on reload regardless of ledger network completion.
   useEffect(() => {
     const handleTransition = (next: ConsentState): void => {
       const nextAnalytics = next.enabled && next.decided && next.choices.analytics;
@@ -428,9 +434,11 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
 
       if (!nextAnalytics) {
         lastCapturedPathRef.current = null;
+        activePostHogSigRef.current = null;
         optOutPostHogCapturing();
       }
       if (!nextReplay) {
+        mountedClarityIdRef.current = null;
         teardownClarityGlobalsAndScript();
       }
       if ((analyticsRevoked || replayRevoked) && isRealmTainted() && !realmLeavingPending) {
@@ -449,26 +457,71 @@ export function AnalyticsConsentSlot({ configOverride }: AnalyticsConsentSlotPro
   }, []);
 
   useEffect(() => {
-    if (!cleanEligibleRoute || !isAnonymousVisitor || !anyCategoryConsented) {
+    const requestReloadIfTainted = (): void => {
+      if (isRealmTainted() && !realmLeavingPending) {
+        realmLeavingPending = true;
+        teardownAllVendors();
+        const targetPath = typeof window !== "undefined" ? cleanRealmPath(window.location.pathname) : "/privacy";
+        requestCleanRealm(isEligibleAnalyticsPath(targetPath) ? "replace" : "assign", targetPath);
+      }
+    };
+
+    // Route exit or any non-anonymous session state (`loading`, `remediation`, `full`, etc.) immediately
+    // tears down all vendors and replaces a tainted realm without depending on shell navigation alone.
+    if (!cleanEligibleRoute || !isAnonymousVisitor) {
       lastCapturedPathRef.current = null;
-      if (!analyticsConsented) optOutPostHogCapturing();
-      if (!sessionReplayConsented) teardownClarityGlobalsAndScript();
+      mountedClarityIdRef.current = null;
+      activePostHogSigRef.current = null;
+      teardownAllVendors();
+      requestReloadIfTainted();
       return;
     }
 
-    if (sessionReplayConsented && clarityReady && cfg?.clarity.projectId) {
-      mountClarityTag(cfg.clarity.projectId, pathname);
-    } else if (!sessionReplayConsented) {
+    if (!anyCategoryConsented) {
+      lastCapturedPathRef.current = null;
+      mountedClarityIdRef.current = null;
+      activePostHogSigRef.current = null;
+      teardownAllVendors();
+      requestReloadIfTainted();
+      return;
+    }
+
+    // Detect runtime provider disable or projectId/key rotation on query refetch while still consented.
+    const nextClarityId = sessionReplayConsented && clarityReady && cfg?.clarity.projectId ? cfg.clarity.projectId : null;
+    if (mountedClarityIdRef.current !== null && mountedClarityIdRef.current !== nextClarityId) {
+      mountedClarityIdRef.current = null;
+      teardownClarityGlobalsAndScript();
+      requestReloadIfTainted();
+      return;
+    }
+
+    const nextPostHogSig =
+      analyticsConsented && posthogReady && cfg?.posthog.host && cfg?.posthog.key
+        ? `${cfg.posthog.host}|${cfg.posthog.key}`
+        : null;
+    if (activePostHogSigRef.current !== null && activePostHogSigRef.current !== nextPostHogSig) {
+      lastCapturedPathRef.current = null;
+      activePostHogSigRef.current = null;
+      optOutPostHogCapturing();
+      requestReloadIfTainted();
+      return;
+    }
+
+    if (nextClarityId) {
+      mountClarityTag(nextClarityId, pathname);
+      mountedClarityIdRef.current = nextClarityId;
+    } else {
       teardownClarityGlobalsAndScript();
     }
 
-    if (analyticsConsented && posthogReady && cfg?.posthog.host && cfg?.posthog.key) {
+    if (nextPostHogSig && cfg?.posthog.host && cfg?.posthog.key) {
+      activePostHogSigRef.current = nextPostHogSig;
       optInPostHogCapturing();
       if (lastCapturedPathRef.current !== pathname) {
         lastCapturedPathRef.current = pathname;
         sendMinimalPostHogPageview(cfg.posthog.host, cfg.posthog.key, pathname);
       }
-    } else if (!analyticsConsented) {
+    } else {
       lastCapturedPathRef.current = null;
       optOutPostHogCapturing();
     }

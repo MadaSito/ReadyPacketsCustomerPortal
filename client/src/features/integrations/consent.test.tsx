@@ -13,6 +13,8 @@ import {
   CONSENT_STORAGE_KEY,
   __setConsentForTests,
   __storageForTests,
+  applyConsentDecision,
+  consent,
 } from "@/lib/consent";
 import {
   __resetRealmTaintForTests,
@@ -552,6 +554,114 @@ describe("AnalyticsConsentSlot — shared @/lib/consent cutover (J-01, J-04) & I
       sessionObserver.disconnect();
       second.unmount();
     }
+  });
+
+  it("tears down and reloads tainted realm on runtime provider disable/ID rotation, standalone non-anonymous session transition, and keeps local denial durable before reload", async () => {
+    const hardNavCalls: Array<[string, string]> = [];
+    __setHardNavigateForTests((mode, url) => {
+      hardNavCalls.push([mode, url]);
+    });
+
+    // 1. Runtime Clarity disable or projectId rotation observed on refetch while visitor stays consented
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const first = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    first.rerender(
+      <ThemeProvider>
+        <QueryClientProvider client={first.queryClient}>
+          <TRPCProvider trpcClient={createApiClient()} queryClient={first.queryClient}>
+            <AuthApiProvider api={fakeAuthApi({ me: () => Promise.reject(unauthError()) })}>
+              <ToastProvider>
+                <StepUpProvider>
+                  <Router>
+                    <AnalyticsConsentSlot
+                      configOverride={{
+                        clarity: { enabled: true, projectId: "rotatedProj88" },
+                        posthog: ACTIVE_CONFIG.posthog,
+                      }}
+                    />
+                  </Router>
+                </StepUpProvider>
+              </ToastProvider>
+            </AuthApiProvider>
+          </TRPCProvider>
+        </QueryClientProvider>
+      </ThemeProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull());
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    first.unmount();
+
+    // 2. Standalone slot (even without RealmTaintBoundary) tears down & reloads when session becomes non-anonymous
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const second = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      second.queryClient.setQueryData(ME_QUERY_KEY, signedInCustomer);
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).toBeNull());
+    expect(isPostHogCapturingEnabled()).toBe(false);
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    second.unmount();
+
+    // 3. Local denial via `applyConsentDecision` is already written to `rp.consent.v1` at the exact instant
+    //    `requestCleanRealm` fires (so reload preempting the async ledger RPC never resurrects consent)
+    resetAnalyticsConsentForTests();
+    __resetRealmTaintForTests();
+    hardNavCalls.length = 0;
+
+    let storedAtReloadMoment: string | null = null;
+    __setHardNavigateForTests((mode, url) => {
+      storedAtReloadMoment = __storageForTests().getItem(CONSENT_STORAGE_KEY);
+      hardNavCalls.push([mode, url]);
+    });
+
+    __setConsentForTests({
+      enabled: true,
+      policyVersion: 1,
+      choices: { preferences: false, analytics: true, session_replay: true },
+    });
+    const third = renderWithBrowserRouter(<AnalyticsConsentSlot configOverride={ACTIVE_CONFIG} />, {
+      initialUrl: "/privacy",
+    });
+    await waitFor(() => expect(document.querySelector('script[data-rp-clarity="true"]')).not.toBeNull());
+
+    act(() => {
+      applyConsentDecision(
+        { preferences: false, analytics: false, session_replay: false },
+        { policyVersion: 1 },
+      );
+    });
+
+    expect(hardNavCalls).toEqual([["replace", "/privacy"]]);
+    expect(storedAtReloadMoment).not.toBeNull();
+    expect(JSON.parse(storedAtReloadMoment!).choices).toEqual({
+      preferences: false,
+      analytics: false,
+      session_replay: false,
+    });
+    expect(consent.has("analytics")).toBe(false);
+    expect(consent.has("session_replay")).toBe(false);
+    third.unmount();
   });
 
   it("spreads integrationsAdminRoutes, productionAdminRoutes, webhookRoutes, nav, and orderTabs into integrationsFeature", () => {
