@@ -62,19 +62,21 @@ The owner asks for discount codes for orders: the administrator hands out codes 
 
 ## As implemented
 
-Packages C1/C2 and B, as reported by the owners:
+Packages C1/C2 and B, as reported by the owners (server notes: `server/modules/promotions/{ADMIN_GUIDE,API,VERIFICATION}.md`):
 
 - **Link format:** `https://<portal>/promo#promo=<CODE>`. The client keeps the code in `sessionStorage` under `rp.promotions.savedCode` and strips the fragment before routing.
 - **Settings:**
   - `feature.promotions` (default off);
-  - `promotions.policy.maxDiscountPercent` (default 50).
+  - `promotions.policy`, an object `{ maxDiscountPercent }` (default `{ maxDiscountPercent: 50 }`, floored, with a hard ceiling). Both settings are written with `promotions.manage`.
 - **Pages:**
   - `/admin/promotions` (with `/new`, `/redemptions`, `/:promotionId` and `/:promotionId/edit`), under Operations → Discount codes;
   - `/promo` (public);
   - the code field on `/cart` and `/cart/checkout`.
 - **Procedures:**
-  - `promotions.admin.{list,get,stats,create,update,pause,resume,revoke,generateBatch,reveal,redemptions,releaseRedemption,exportCodes,exportRedemptions,getSettings,updateSettings}`;
+  - `promotions.check` (code check);
+  - `promotions.admin.{list,get,stats,create,update,pause,resume,revoke,setStatus,generateBatch,reveal,redemptions,releaseRedemption,exportCodes,exportRedemptions,getSettings,updateSettings}`;
   - `cart.applyCode` and `cart.removeCode`.
+- **Release fence as implemented (C1):** automatic release (`releaseForOrderInTx`) and manual release (`promotions.admin.releaseRedemption`) run only inside the transaction. Both need the order to be in a terminal cancel state of its bound workflow version (`isCancelState`). `compliance.orderPaymentExposureInTx` must also return `grossPaidMinor === 0`, `payableInvoiceOpen === false`, `providerCapturePending === false` and `providerAttemptEver === false`. A missing or failing port keeps the redemption used.
 - **Manual release:** needs a reason of at least 5 characters, and the client shows the server's refusal as returned.
 - **Stale code at checkout:** returns `PROMO_RECONFIRM_TOTAL`, and the order is not placed.
 - **Cart code storage:** the code is stored encrypted on the cart (`promo_code_enc`).

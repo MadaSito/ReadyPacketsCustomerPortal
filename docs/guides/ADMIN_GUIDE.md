@@ -232,7 +232,7 @@ After creating it, copy the code or its link (`/promo#promo=<CODE>`). The code i
 
 ### Largest discount per order
 
-The setting `promotions.policy.maxDiscountPercent` (default 50%) caps the bundle and code discounts together as a share of the subtotal, and a total is never negative. Changing it needs step-up.
+The **Largest discount per order** setting (`promotions.policy`, field `maxDiscountPercent`, default 50%) caps the bundle and code discounts together as a share of the subtotal, and a total is never negative. Changing it needs step-up.
 
 ### Pause, resume and revoke
 
@@ -249,10 +249,11 @@ Pause and resume can be undone. Revoke is permanent. Orders already placed alway
 
 ### When a redemption is released
 
-A code counts as used as soon as an order is placed with it. It is given back only when **all** of these are true:
+A code counts as used as soon as an order is placed with it. It is given back only when the order has been cancelled (it is in a cancel state of its workflow) and **all** of these are true:
 
 - nothing has been paid for the order, not even part of an invoice;
 - none of the order's invoices can still be paid (issued, open or partially paid);
+- no online payment is waiting to be captured;
 - no online payment was ever started for the order, including failed, cancelled or expired ones.
 
 When an order is cancelled and all three hold, ReadyPackets releases the redemption automatically. After you have voided or settled the invoice by hand, an administrator can choose **Release** on the redemptions list. Release needs a reason of at least 5 characters, and the server checks the same rule and refuses otherwise. In every other case the redemption stays used, even after a refund, and the cancellation still goes ahead. To make it up to the customer, give them a new code.

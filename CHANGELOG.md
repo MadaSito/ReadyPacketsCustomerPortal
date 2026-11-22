@@ -19,9 +19,9 @@ procedure.
 - **Discount codes and links** (`/admin/promotions`, `/promo`; [ADR 0044](docs/adr/0044-discount-codes.md)): enable `feature.promotions`.
   - Percent or fixed codes with scope, dates, limits, allow-lists and single-use batches of up to 5,000 codes.
   - Links (`/promo#promo=<CODE>`) carry the code in the URL fragment, and it is kept only in the browser tab.
-  - Redemption is atomic at order creation. The "Largest discount per order" guard (`promotions.policy.maxDiscountPercent`) defaults to 50%.
+  - Redemption is atomic at order creation. The "Largest discount per order" guard (setting `promotions.policy`, field `maxDiscountPercent`) defaults to 50%.
   - Codes work in the cart, at checkout and in the order wizard, not in API v1.
-  - A redemption is released only when nothing was paid, no invoice is payable and no online payment was ever started; administrators can release one by hand under the same rule.
+  - A redemption is released only when nothing was paid, no invoice is payable, no provider capture is pending and no online payment was ever started, and only once the order is in a cancel state; administrators can release one by hand under the same rule.
 - **Policy acceptance log centre** (`/admin/policy-acceptances`; [ADR 0045](docs/adr/0045-policy-acceptance-log-centre.md)): Log, Coverage and Policy updates tabs, and a **Policies** tab on the admin customer profile. It is always on and read-only. Reading needs `policies.acceptances.read`; CSV export needs `policies.acceptances.export` and step-up, and is limited to 5,000 rows.
 
 ### Security
