@@ -609,3 +609,5 @@ export const complianceProviderEvents = mysqlTable(
 
 /* Order policy acceptance evidence (package V, owner identity_engineer). */
 export * from "./acceptanceSchema.js";
+export * from "./policyNoticesSchema.js";
+export * from "./policyEnforcementSchema.js";
