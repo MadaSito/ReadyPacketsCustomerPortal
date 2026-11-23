@@ -750,7 +750,7 @@ describe("MySQL transactional mail outbox", () => {
   };
   function setDelivery(f: ReturnType<typeof fixture>, outcome: SmtpDeliveryResult["outcome"], retryable?: boolean) {
     const send = vi.fn(async (_message: MailTransportMessage): Promise<SmtpDeliveryResult> => ({ outcome, retryable }));
-    const findRecipient = vi.fn(async () => ({ email: "current@example.test", status: "active" }));
+    const findRecipient = vi.fn(async () => ({ email: "current@example.test", status: "active", emailVerified: true }));
     f.mail.registerDelivery({ findRecipient, getLegacySender: async () => sender });
     f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });
     f.mailer.registerTemplate({
@@ -866,6 +866,27 @@ describe("MySQL transactional mail outbox", () => {
       html: expect.stringContaining(`<a href="${url}">Open Receipts in ReadyPackets</a>`),
     }));
     expect(send.mock.calls[0]?.[0].attachments).toBeUndefined();
+  });
+
+  it.each([
+    { status: "active", emailVerified: false, portalOnly: false },
+    { status: "pending_activation", emailVerified: true, portalOnly: false },
+    { status: "active", emailVerified: false, portalOnly: true },
+  ])("refuses receipt delivery for $status with verification=$emailVerified (portal-only=$portalOnly) but still sends other mail", async ({ status, emailVerified, portalOnly }) => {
+    const f = fixture();
+    const { findRecipient, send } = setDelivery(f, "accepted");
+    const pdf = portalOnly ? Buffer.alloc(RECEIPT_PDF_MAX_BYTES + 1) : receiptInput.pdf;
+    if (portalOnly) receiptInput.pdf.copy(pdf);
+    await enqueuePaymentReceipt(f.mailer, { ...receiptInput, pdf });
+    expect(findRecipient).not.toHaveBeenCalled();
+    findRecipient.mockResolvedValue({ email: "changed@example.test", status, emailVerified });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).not.toHaveBeenCalled();
+    const [receipt] = await t.db.select().from(mailOutbox);
+    expect(receipt).toMatchObject({ state: "failed", reasonCode: "MAIL_RECIPIENT_UNAVAILABLE", payloadEnc: null, contentEnc: null });
+    await f.mailer.enqueue(input);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ to: "changed@example.test" }));
   });
 
   it("queues a single refund notice and redacts private refund data from retention and audit", async () => {
@@ -1037,7 +1058,7 @@ describe("MySQL transactional mail outbox", () => {
     const entered = latch();
     const release = latch();
     f.mail.registerDelivery({
-      findRecipient: async () => ({ email: "current@example.test", status: "active" }),
+      findRecipient: async () => ({ email: "current@example.test", status: "active", emailVerified: true }),
       getLegacySender: async () => sender,
     });
     f.mail.registerMailTransport({
@@ -1143,7 +1164,7 @@ describe("MySQL transactional mail outbox", () => {
       return { outcome: "accepted" as const };
     });
     f.mail.registerDelivery({
-      findRecipient: async () => ({ email: "current@example.test", status: "active" }),
+      findRecipient: async () => ({ email: "current@example.test", status: "active", emailVerified: true }),
       getLegacySender: async () => sender,
     });
     f.mail.registerMailTransport({ key: "smtp", isConfigured: async () => true, send });

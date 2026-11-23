@@ -44,7 +44,7 @@ type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?
 export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
 type DeliveryDeps = {
-  findRecipient(userId: number): Promise<{ email: string; status: string } | null>;
+  findRecipient(userId: number): Promise<{ email: string; status: string; emailVerified: boolean } | null>;
   getLegacySender(): Promise<MailSenderIdentity | null>;
 };
 
@@ -430,13 +430,18 @@ export class MailEngine implements Mailer {
       if (!row.payloadEnc || !template) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
       const payload = payloadSchema.parse(JSON.parse(deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
       if (Object.keys(payload.vars).some((name) => !template.vars.includes(name))) throw new Error("MAIL_TEMPLATE_VARS_CHANGED");
-      const recipient = "userId" in payload.to ? await delivery.findRecipient(payload.to.userId) : { email: payload.to.address, status: "active" };
-      if (!recipient || !["active", "pending_activation"].includes(recipient.status)) {
+      const recipient = "userId" in payload.to
+        ? await delivery.findRecipient(payload.to.userId)
+        : { email: payload.to.address, status: "active", emailVerified: false };
+      const isReceipt = row.template === PAYMENT_RECEIPT_TEMPLATE;
+      if (!recipient || (isReceipt
+        ? recipient.status !== "active" || recipient.emailVerified !== true
+        : !["active", "pending_activation"].includes(recipient.status))) {
         return this.#preSendFailure(job, ids, "MAIL_RECIPIENT_UNAVAILABLE", true);
       }
       data = { ...this.#content(template, payload.vars), to: address.parse(recipient.email) };
       const attachments = decodeMailAttachments(row.template, payload.vars, payload.to, payload.attachments);
-      if (!mode && row.template === PAYMENT_RECEIPT_TEMPLATE) data = this.#customerReceiptLink(data, Boolean(attachments));
+      if (!mode && isReceipt) data = this.#customerReceiptLink(data, Boolean(attachments));
       if (!mode && attachments) data.attachments = attachments;
       if (!mode) {
         [sender, routing, retainDays] = await Promise.all([
