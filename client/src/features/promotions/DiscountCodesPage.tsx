@@ -1,13 +1,13 @@
 /** /admin/promotions — "Discount codes": totals, filters, list, status changes, largest-discount guard. Owner: audit engineer. */
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, Ticket } from "lucide-react";
-import { useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { Link } from "wouter";
 import { formatMoney } from "@shared/domain";
 import { errorMessage } from "@/lib/trpc";
-import { Breadcrumbs, Button, Card, ConfirmDialog, DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select, StatCard, StatGrid, StepUpCancelledError, Switch, useStepUp, useToast } from "@/ui";
+import { Badge, Breadcrumbs, Button, Card, Checkbox, ConfirmDialog, DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, PageHeader, Select, StatCard, StatGrid, StepUpCancelledError, Switch, useStepUp, useToast } from "@/ui";
 import { usePromotionsApi, type ListFilters } from "./api";
-import { discountSummary, statusActions, type PromoDerivedStatus, type PromoDiscountType, type PromotionStats, type PromotionView } from "./model";
+import { canReachZero, discountSummary, formatPercentInput, LIMITS_ANCHOR, parseMoney, parsePercent, statusActions, type PromoDerivedStatus, type PromoDiscountType, type PromotionStats, type PromotionView } from "./model";
 import { BASE, PromotionStatusBadge, restoreFocusAfterAction, useCanManage, useInvalidFocus } from "./parts";
 
 const STATUS_OPTIONS = [
@@ -23,6 +23,7 @@ const TYPE_OPTIONS = [
   { value: "", label: "Any type" },
   { value: "percent", label: "Percentage" },
   { value: "fixed", label: "Fixed amount" },
+  { value: "set_total", label: "Set order total to" },
 ];
 const ENDING_OPTIONS = [
   { value: "", label: "Any end date" },
@@ -114,62 +115,133 @@ export function StatsGrid({ stats, loading }: { stats: PromotionStats | undefine
   );
 }
 
-function SettingsCard() {
+type SettingsPatch = { enabled?: boolean; maxDiscountPercent?: number; maxFixedAmountMinor?: number | null; allowZeroTotal?: boolean; minOrderTotalAfterDiscountMinor?: number };
+
+function useSaveSettings() {
   const api = usePromotionsApi();
   const qc = useQueryClient();
   const stepUp = useStepUp();
   const toast = useToast();
-  const canManage = useCanManage();
-  const settings = useQuery(api.getSettings.queryOptions(undefined));
   const update = useMutation(api.updateSettings.mutationOptions());
-  const [draft, setDraft] = useState<string | null>(null);
-  const [error, setError] = useState<string | undefined>();
-  const inputRef = useRef<HTMLInputElement>(null);
-  const invalid = useInvalidFocus();
-  const value = draft ?? (settings.data ? String(settings.data.maxDiscountPercent) : "");
-  const save = async (patch: { enabled?: boolean; maxDiscountPercent?: number }, done: string) => {
+  const save = async (patch: SettingsPatch, done: string): Promise<boolean> => {
     try {
       await stepUp.run(() => update.mutateAsync(patch), { reason: "Changing discount code settings requires a fresh confirmation." });
       toast.show({ tone: "success", title: done });
-      setDraft(null);
+      return true;
     } catch (e) {
-      if (e instanceof StepUpCancelledError) return;
-      toast.show({ tone: "danger", title: "Not saved", description: errorMessage(e) });
+      if (!(e instanceof StepUpCancelledError)) toast.show({ tone: "danger", title: "Not saved", description: errorMessage(e) });
+      return false;
     } finally {
       await qc.invalidateQueries(api.getSettings.pathFilter());
     }
   };
-  const submit = () => {
-    const n = Number(value);
-    if (!/^\d{1,3}$/u.test(value) || n < 1 || n > 100) {
-      const message = "Enter a whole percentage from 1 to 100.";
-      setError(message);
-      invalid.report(inputRef.current, message);
-      return;
-    }
-    setError(undefined);
-    void save({ maxDiscountPercent: n }, "Largest discount per order saved");
-  };
+  return { save, pending: update.isPending };
+}
+
+function SettingsCard() {
+  const api = usePromotionsApi();
+  const canManage = useCanManage();
+  const settings = useQuery(api.getSettings.queryOptions(undefined));
+  const { save, pending } = useSaveSettings();
   if (!settings.data) return null;
   return (
-    <Card title="Settings" headingLevel={2} description="Applies to every order, together with any bundle discount.">
-      <div className="space-y-4">
-        <Switch
-          label="Discount codes"
-          description={settings.data.enabled ? "On: customers can apply codes in the cart and staff in the order wizard." : "Off: codes cannot be applied anywhere. Existing orders keep their discount."}
-          checked={settings.data.enabled}
-          disabled={!canManage || update.isPending}
-          onCheckedChange={(enabled) => void save({ enabled }, enabled ? "Discount codes turned on" : "Discount codes turned off")}
-        />
-        <form className="flex flex-wrap items-end gap-3" onSubmit={(e) => { e.preventDefault(); submit(); }}>
-          <Field label="Largest discount per order (%)" hint="Bundle and code discounts together never exceed this share of the subtotal." error={error}>
-            <Input ref={inputRef} inputMode="numeric" value={value} disabled={!canManage} onChange={(e) => setDraft(e.target.value)} className="w-28" maxLength={3} />
-          </Field>
-          {canManage ? <Button type="submit" variant="secondary" loading={update.isPending}>Save</Button> : null}
+    <Card title="Settings" headingLevel={2}>
+      <Switch
+        label="Discount codes"
+        description={settings.data.enabled ? "On: customers can apply codes in the cart and staff in the order wizard." : "Off: codes cannot be applied anywhere. Existing orders keep their discount."}
+        checked={settings.data.enabled}
+        disabled={!canManage || pending}
+        onCheckedChange={(enabled) => void save({ enabled }, enabled ? "Discount codes turned on" : "Discount codes turned off")}
+      />
+    </Card>
+  );
+}
+
+type LimitsDraft = { percent: string; maxFixed: string; allowZero: boolean; minTotal: string };
+type LimitsErrors = Partial<Record<"percent" | "maxFixed" | "minTotal", string>>;
+const minorText = (minor: number) => (minor / 100).toFixed(2);
+
+/** Pure check of the Limits form; returns errors, or the patch to save. */
+export function validateLimits(d: LimitsDraft): { errors: LimitsErrors; patch: Required<Omit<SettingsPatch, "enabled">> | null } {
+  const errors: LimitsErrors = {};
+  const percent = parsePercent(d.percent);
+  if (percent === null) errors.percent = "Enter a percentage from 0.01 to 100, with up to two decimals.";
+  const maxFixed = parseMoney(d.maxFixed);
+  if (maxFixed !== null && (Number.isNaN(maxFixed) || maxFixed <= 0)) errors.maxFixed = "Enter an amount above 0.00, such as 100.00, or leave it empty for no limit.";
+  const minTotal = parseMoney(d.minTotal) ?? 0;
+  if (Number.isNaN(minTotal) || minTotal < 0) errors.minTotal = "Enter an amount such as 0.00 or 5.00.";
+  if (Object.keys(errors).length > 0 || percent === null) return { errors, patch: null };
+  return { errors, patch: { maxDiscountPercent: percent, maxFixedAmountMinor: maxFixed, allowZeroTotal: d.allowZero, minOrderTotalAfterDiscountMinor: minTotal } };
+}
+
+/** D5 "Limits" card (anchor #limits): store-wide limits every code must respect, edited in place. */
+export function LimitsCard() {
+  const api = usePromotionsApi();
+  const canManage = useCanManage();
+  const settings = useQuery(api.getSettings.queryOptions(undefined));
+  const { save, pending } = useSaveSettings();
+  const [draft, setDraft] = useState<LimitsDraft | null>(null);
+  const [errors, setErrors] = useState<LimitsErrors>({});
+  const percentRef = useRef<HTMLInputElement>(null);
+  const fixedRef = useRef<HTMLInputElement>(null);
+  const minRef = useRef<HTMLInputElement>(null);
+  const invalid = useInvalidFocus();
+  const sectionRef = useRef<HTMLElement>(null);
+  const data = settings.data;
+  const loaded = data !== undefined;
+  useEffect(() => {
+    // Rejection messages link staff to /admin/promotions#limits: bring the card into view once it renders.
+    if (loaded && window.location.hash === `#${LIMITS_ANCHOR}`) {
+      sectionRef.current?.scrollIntoView?.({ block: "start" });
+      sectionRef.current?.focus({ preventScroll: true });
+    }
+  }, [loaded]);
+  if (!data) return null;
+  const current: LimitsDraft = draft ?? {
+    percent: formatPercentInput(Math.round(data.maxDiscountPercent * 100)),
+    // Tolerates an older server view without the D5 fields (defaults: no fixed cap, zero totals allowed, minimum 0.00).
+    maxFixed: typeof data.maxFixedAmountMinor === "number" ? minorText(data.maxFixedAmountMinor) : "",
+    allowZero: data.allowZeroTotal ?? true,
+    minTotal: minorText(data.minOrderTotalAfterDiscountMinor ?? 0),
+  };
+  const set = <K extends keyof LimitsDraft>(k: K, v: LimitsDraft[K]) => setDraft({ ...current, [k]: v });
+  const submit = async () => {
+    const { errors: found, patch } = validateLimits(current);
+    setErrors(found);
+    if (!patch) {
+      const first = found.percent ? percentRef.current : found.maxFixed ? fixedRef.current : minRef.current;
+      invalid.report(first, Object.values(found)[0] ?? "Check the limits.");
+      return;
+    }
+    if (await save(patch, "Limits saved")) setDraft(null);
+  };
+  return (
+    <section ref={sectionRef} id={LIMITS_ANCHOR} tabIndex={-1} aria-labelledby="promo-limits-heading" className="scroll-mt-24 outline-none">
+      <Card title={<span id="promo-limits-heading">Limits</span>} headingLevel={2} description="Store-wide limits every discount code must respect, together with any bundle discount. A code that breaks a limit is refused and the message names the limit.">
+        <form noValidate className="space-y-4" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
+          <div className="grid gap-4 md:grid-cols-3">
+            <Field label="Largest discount per order (%)" hint="0.01 to 100, up to two decimals, e.g. 99.99." error={errors.percent}>
+              <Input ref={percentRef} inputMode="decimal" value={current.percent} disabled={!canManage} onChange={(e) => set("percent", e.target.value)} maxLength={6} />
+            </Field>
+            <Field label="Maximum fixed discount" hint="Largest amount off for fixed-amount codes. Leave empty for no limit." error={errors.maxFixed}>
+              <Input ref={fixedRef} inputMode="decimal" value={current.maxFixed} disabled={!canManage} onChange={(e) => set("maxFixed", e.target.value)} maxLength={12} />
+            </Field>
+            <Field label="Minimum order total after discount" hint="Orders never go below this amount; 0.00 for no minimum." error={errors.minTotal}>
+              <Input ref={minRef} inputMode="decimal" value={current.minTotal} disabled={!canManage} onChange={(e) => set("minTotal", e.target.value)} maxLength={12} />
+            </Field>
+          </div>
+          <Checkbox
+            label="Allow zero-total orders"
+            description="When off, no code can bring an order total to 0.00, including “Set order total to” codes."
+            checked={current.allowZero}
+            disabled={!canManage}
+            onCheckedChange={(v) => set("allowZero", v)}
+          />
+          {canManage ? <Button type="submit" variant="secondary" loading={pending}>Save limits</Button> : <p className="text-sm text-muted">An administrator can change these limits.</p>}
         </form>
         {invalid.region}
-      </div>
-    </Card>
+      </Card>
+    </section>
   );
 }
 
@@ -224,7 +296,7 @@ export default function DiscountCodesPage() {
               columns={[
                 { key: "name", header: "Name", primary: true, cell: (r) => <span className="flex min-w-0 flex-col"><Link className="font-medium text-brand underline-offset-2 hover:underline" href={`${BASE}/${r.publicId}`}>{r.name}</Link><span className="text-sm text-muted break-words">Customers see: {r.label}</span></span> },
                 { key: "code", header: "Code", cell: (r) => r.isBatch ? <span>{r.batchSize.toLocaleString("en-US")} single-use codes</span> : <span className="font-mono text-sm">{r.codeMasked ?? "—"}</span> },
-                { key: "discount", header: "Discount", cell: (r) => discountSummary(r) },
+                { key: "discount", header: "Discount", cell: (r) => <span className="flex min-w-0 flex-col items-start gap-1"><span>{discountSummary(r)}</span>{canReachZero(r) ? <Badge tone="warning">Can make an order free</Badge> : null}</span> },
                 { key: "status", header: "Status", cell: (r) => <PromotionStatusBadge status={r.derivedStatus} /> },
                 { key: "used", header: "Used", align: "end", cell: (r) => <span className="tabular-nums">{r.redemptionCount.toLocaleString("en-US")}{r.maxRedemptions !== null ? ` of ${r.maxRedemptions.toLocaleString("en-US")}` : ""}</span> },
                 { key: "ends", header: "Ends", hideOnMobile: true, cell: (r) => r.endsAt ? <DateTime value={r.endsAt} format="date" /> : <span className="text-muted">No end date</span> },
@@ -235,6 +307,7 @@ export default function DiscountCodesPage() {
           </div>
         </section>
         <SettingsCard />
+        <LimitsCard />
       </div>
       {actions.dialog}
     </>

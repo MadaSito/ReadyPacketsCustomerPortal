@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { renderUi } from "@/ui/testing";
-import DiscountCodesPage from "./DiscountCodesPage";
+import DiscountCodesPage, { validateLimits } from "./DiscountCodesPage";
 import {
-  discountSummary, emptyForm, formFromView, parseMoney, toUpdateInput, validateForm, type PromotionStats, type PromotionView, type RedemptionView,
+  canReachZero, discountSummary, emptyForm, formFromView, parseMoney, toUpdateInput, validateForm, type PromotionStats, type PromotionView, type RedemptionView,
 } from "./model";
 import PromotionDetailPage from "./PromotionDetailPage";
 import PromotionEditorPage from "./PromotionEditorPage";
@@ -69,7 +69,7 @@ function defaults() {
   handlers[`${P}.list`] = () => ({ items: [single, batch], nextCursor: null });
   handlers[`${P}.get`] = (input) => ((input as { publicId: string }).publicId === batch.publicId ? batch : single);
   handlers[`${P}.stats`] = () => stats;
-  handlers[`${P}.getSettings`] = () => ({ enabled: true, maxDiscountPercent: 50 });
+  handlers[`${P}.getSettings`] = () => ({ enabled: true, maxDiscountPercent: 50, maxDiscountBps: 5000, maxFixedAmountMinor: null, allowZeroTotal: true, minOrderTotalAfterDiscountMinor: 0 });
   handlers[`${P}.redemptions`] = () => ({ items: [redemption], nextCursor: null });
   handlers[`${P}.pause`] = () => ({ ...single, status: "paused", derivedStatus: "paused", version: 5 });
   handlers[`${P}.revoke`] = () => ({ ...single, status: "revoked", derivedStatus: "revoked", version: 5 });
@@ -103,6 +103,30 @@ describe("model", () => {
     const ok = validateForm({ ...f, percent: "15", maxDiscount: "25.00", minSubtotal: "50", code: "SPRING-24", allowDomains: ["example.com"], scopeKind: "packets", scopePackets: ["25", "50"] }, { creating: true, maxDiscountPercent: 50 });
     expect(ok.errors).toEqual({});
     expect(ok.input).toMatchObject({ type: "percent", percentBps: 1500, maxDiscountMinor: 2500, minSubtotalMinor: 5000, code: "SPRING-24", scope: { kind: "packets", packetNumbers: [25, 50] }, maxPerCustomer: 1 });
+  });
+  it("D5: two-decimal percent, set order total, zero fixed amount and the store-wide limits", () => {
+    const base = { ...emptyForm(), name: "N", label: "L", code: "SPRING-24" };
+    expect(validateForm({ ...base, percent: "99.99" }, { creating: true }).input).toMatchObject({ type: "percent", percentBps: 9999 });
+    expect(validateForm({ ...base, percent: "99.999" }, { creating: true }).errors.percent).toMatch(/two decimals/u);
+    expect(validateForm({ ...base, percent: "0.01" }, { creating: true, maxDiscountPercent: 0.01 }).errors).toEqual({});
+    expect(validateForm({ ...base, percent: "12.5" }, { creating: true, maxDiscountPercent: 12.49 }).errors.percent).toMatch(/12\.49 %/u);
+    const fixed = { ...base, discountType: "fixed" as const };
+    expect(validateForm({ ...fixed, fixedAmount: "0.00" }, { creating: true }).errors.fixedAmount).toMatch(/Set order total to/u);
+    expect(validateForm({ ...fixed, fixedAmount: "150.00" }, { creating: true, maxFixedAmountMinor: 10000 }).errors.fixedAmount).toMatch(/maximum fixed discount/u);
+    const total = { ...base, discountType: "set_total" as const };
+    for (const [text, minor] of [["0.00", 0], ["0.01", 1], ["49.00", 4900]] as const) {
+      const r = validateForm({ ...total, setTotal: text }, { creating: true });
+      expect(r.errors).toEqual({});
+      expect(r.input).toMatchObject({ type: "set_total", setTotalMinor: minor, amountMinor: null, percentBps: null });
+    }
+    expect(validateForm({ ...total, setTotal: "" }, { creating: true }).errors.setTotal).toBeTruthy();
+    expect(validateForm({ ...total, setTotal: "0.00" }, { creating: true, allowZeroTotal: false }).errors.setTotal).toMatch(/Zero-total orders are turned off/u);
+    expect(validateForm({ ...total, setTotal: "1.00" }, { creating: true, minOrderTotalAfterDiscountMinor: 500 }).errors.setTotal).toMatch(/minimum order total/u);
+    expect(discountSummary({ type: "set_total", percentBps: null, amountMinor: null, maxDiscountMinor: null, currency: "USD", setTotalMinor: 0 })).toBe("Order total set to $0.00");
+    expect(canReachZero({ type: "set_total", percentBps: null, setTotalMinor: 0 })).toBe(true);
+    expect(canReachZero({ type: "fixed", percentBps: null, setTotalMinor: null, canReachZero: true })).toBe(true);
+    expect(validateLimits({ percent: "99.99", maxFixed: "", allowZero: true, minTotal: "0.00" }).patch).toEqual({ maxDiscountPercent: 99.99, maxFixedAmountMinor: null, allowZeroTotal: true, minOrderTotalAfterDiscountMinor: 0 });
+    expect(Object.keys(validateLimits({ percent: "0", maxFixed: "0.00", allowZero: true, minTotal: "-1" }).errors).sort()).toEqual(["maxFixed", "minTotal", "percent"]);
   });
   it("refuses a label equal to the code, bad domains, end before start, and batch bounds", () => {
     const base = { ...emptyForm(), name: "N", label: "SPRING-24", percent: "10", code: "SPRING-24" };
@@ -212,23 +236,42 @@ describe("Discount codes list", () => {
     expect(callsTo("revoke")).toEqual([]);
   });
 
-  it("largest discount per order: validated, then saved", async () => {
+  it("Limits card: validated in place, two-decimal percent, then saved with every limit", async () => {
     const user = userEvent.setup();
     handlers[`${P}.updateSettings`] = (i) => ({ enabled: true, ...(i as object) });
     page("/admin/promotions", "Discount codes");
+    expect(await screen.findByRole("heading", { name: "Limits" })).toBeInTheDocument();
     const input = await screen.findByLabelText("Largest discount per order (%)");
+    expect(input).toHaveValue("50");
     await user.clear(input);
     await user.type(input, "150{Enter}");
     // Enter inside the focused field: the error is linked and also announced politely.
-    await waitFor(() => expect(screen.getAllByRole("status").some((r) => r.textContent === "Enter a whole percentage from 1 to 100.")).toBe(true));
+    await waitFor(() => expect(screen.getAllByRole("status").some((r) => r.textContent === "Enter a percentage from 0.01 to 100, with up to two decimals.")).toBe(true));
     expect(input.getAttribute("aria-invalid")).toBe("true");
-    // Button activation: focus moves to the invalid field.
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save limits" }));
     await waitFor(() => expect(document.activeElement).toBe(input));
     expect(callsTo("updateSettings")).toEqual([]);
     await user.clear(input);
-    await user.type(input, "40{Enter}");
-    await waitFor(() => expect(callsTo("updateSettings")).toEqual([{ maxDiscountPercent: 40 }]));
+    await user.type(input, "99.99");
+    await user.type(screen.getByLabelText("Maximum fixed discount"), "100.00");
+    const min = screen.getByLabelText("Minimum order total after discount");
+    await user.clear(min);
+    await user.type(min, "0.50");
+    await user.click(screen.getByRole("checkbox", { name: /Allow zero-total orders/ }));
+    await user.click(screen.getByRole("button", { name: "Save limits" }));
+    await waitFor(() => expect(callsTo("updateSettings")).toEqual([{ maxDiscountPercent: 99.99, maxFixedAmountMinor: 10000, allowZeroTotal: false, minOrderTotalAfterDiscountMinor: 50 }]));
+  });
+
+  it("flags codes that can make an order free", async () => {
+    const free: PromotionView = { ...single, publicId: "pr_synthetic_0003", name: "Free order", type: "set_total", percentBps: null, maxDiscountMinor: null, amountMinor: null, setTotalMinor: 0, canReachZero: true };
+    handlers[`${P}.list`] = () => ({ items: [single, free], nextCursor: null });
+    page("/admin/promotions", "Discount codes");
+    await screen.findAllByText("Free order");
+    expect(screen.getAllByText("Order total set to $0.00").length).toBeGreaterThan(0);
+    // DataTable renders a table and a narrow-screen list; the flag appears once per rendering, only for the free code.
+    const flags = screen.getAllByText("Can make an order free");
+    expect(flags.length).toBeGreaterThan(0);
+    for (const flag of flags) expect(flag.closest("tr, li")?.textContent).toContain("Free order");
   });
 
   pageA11y("/admin/promotions", async () => {

@@ -37,7 +37,13 @@ export interface PromoCodeFieldProps {
 
 export const PROMO_UNIFORM_ERROR = "This code cannot be applied.";
 /** Reasons whose server message may be shown (only sent for a code the customer is entitled to). */
-const SPECIFIC_REASONS = new Set(["PROMO_MIN_SUBTOTAL", "PROMO_NOT_ELIGIBLE_ITEMS"]);
+const SPECIFIC_REASONS = new Set([
+  "PROMO_MIN_SUBTOTAL", "PROMO_NOT_ELIGIBLE_ITEMS",
+  // D5: a store-wide limit refused the code; the message names the limit (no detail about the code itself).
+  "PROMO_LIMIT_MAX_PERCENT", "PROMO_LIMIT_MAX_FIXED", "PROMO_LIMIT_ZERO_TOTAL", "PROMO_LIMIT_MIN_TOTAL",
+]);
+/** The only link target accepted from `details.limitsHref` (sent to staff and administrators only). */
+export const PROMO_LIMITS_HREF = "/admin/promotions#limits";
 const BLOCKED_REASONS = new Set(["PROMO_ATTEMPTS_BLOCKED", "RATE_LIMITED"]);
 
 export function promoErrorText(error: unknown): string {
@@ -45,6 +51,16 @@ export function promoErrorText(error: unknown): string {
   if (safe && SPECIFIC_REASONS.has(safe.reasonCode) && safe.safeMessage) return safe.safeMessage;
   if (safe && BLOCKED_REASONS.has(safe.reasonCode)) return "Too many attempts. Please wait a few minutes before trying another code.";
   return PROMO_UNIFORM_ERROR;
+}
+
+/** Staff/admin only: the server adds `details.limitsHref` to limit refusals; accept only the known Limits card link. */
+export function promoLimitsLink(error: unknown): { href: string; label: string } | null {
+  const safe = safeError(error);
+  if (!safe || !safe.reasonCode.startsWith("PROMO_LIMIT_")) return null;
+  const details = (safe.details ?? {}) as Record<string, unknown>;
+  if (details.limitsHref !== PROMO_LIMITS_HREF) return null;
+  const name = typeof details.limitLabel === "string" && details.limitLabel.length <= 80 ? details.limitLabel : "discount code limits";
+  return { href: PROMO_LIMITS_HREF, label: `Review “${name}” in the Limits card` };
 }
 
 export function formatDiscount(minor: number, currency: string): string {
@@ -64,6 +80,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
   const removeRef = useRef<HTMLButtonElement>(null);
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [limitsLink, setLimitsLink] = useState<{ href: string; label: string } | null>(null);
   const [busy, setBusy] = useState<"apply" | "remove" | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [saved, setSaved] = useState<string | null>(() => readSavedPromoCode());
@@ -96,6 +113,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
     }
     setBusy("apply");
     setError(null);
+    setLimitsLink(null);
     try {
       await onApply(code);
       if (saved === code) {
@@ -108,6 +126,7 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
     } catch (e) {
       const text = promoErrorText(e);
       setError(text);
+      setLimitsLink(promoLimitsLink(e));
       announce(text);
       focusIfOurs(() => inputRef.current);
     } finally {
@@ -187,6 +206,11 @@ export function PromoCodeField({ applied, onApply, onRemove, disabled, label = "
             <p id={errorId} className="flex items-start gap-1 text-sm text-danger">
               <span aria-hidden="true">!</span>
               <span>{error}</span>
+            </p>
+          ) : null}
+          {error && limitsLink ? (
+            <p className="text-sm">
+              <a href={limitsLink.href} className="inline-flex min-h-6 items-center font-medium text-brand underline underline-offset-2">{limitsLink.label}</a>
             </p>
           ) : null}
           {saved ? (

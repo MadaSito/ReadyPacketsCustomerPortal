@@ -23,12 +23,12 @@ export const PROMO_TIER_KEYS: readonly PromoTierKey[] = ["Basic", "Standard", "P
 
 /** Rule fields shared by the create input and the view (server/modules/promotions/API.md). */
 export type PromotionRules = Pick<PromotionView,
-  "name" | "label" | "type" | "percentBps" | "maxDiscountMinor" | "amountMinor" | "currency" | "scope" | "minSubtotalMinor" | "startsAt" | "endsAt"
+  "name" | "label" | "type" | "percentBps" | "maxDiscountMinor" | "amountMinor" | "setTotalMinor" | "currency" | "scope" | "minSubtotalMinor" | "startsAt" | "endsAt"
   | "maxRedemptions" | "maxPerCustomer" | "firstOrderOnly" | "allowCustomerPublicIds" | "allowEmailDomains" | "combineWithBundle" | "note">;
 
 export type CreatePromotionInput = PromotionRules & { isBatch?: boolean; code?: string; codePrefix?: string | null; initialBatchCount?: number; idempotencyKey?: string };
 /** Type, percentage, amount and currency are fixed once created (create a new code instead). */
-export type UpdatePromotionInput = Omit<PromotionRules, "type" | "percentBps" | "amountMinor" | "currency"> & { publicId: string; expectedVersion: number };
+export type UpdatePromotionInput = Omit<PromotionRules, "type" | "percentBps" | "amountMinor" | "setTotalMinor" | "currency"> & { publicId: string; expectedVersion: number };
 
 /* ---------- display ---------- */
 
@@ -53,7 +53,16 @@ export function formatPercentBps(bps: number): string {
   return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(2).replace(/0$/u, "")} %`;
 }
 
-export function discountSummary(p: Pick<PromotionView, "type" | "percentBps" | "amountMinor" | "maxDiscountMinor" | "currency">, money: (m: MoneyValue) => string = formatMoney): string {
+export const DISCOUNT_TYPE_LABEL: Record<PromoDiscountType, string> = { percent: "Percentage", fixed: "Fixed amount", set_total: "Set order total to" };
+
+/** D5: true when the code can bring an order total to 0.00 (server flag; a local fallback for older views). */
+export function canReachZero(p: Pick<PromotionView, "type" | "percentBps" | "setTotalMinor" | "canReachZero">): boolean {
+  if (typeof p.canReachZero === "boolean") return p.canReachZero;
+  return (p.type === "set_total" && p.setTotalMinor === 0) || (p.type === "percent" && p.percentBps === 10_000);
+}
+
+export function discountSummary(p: Pick<PromotionView, "type" | "percentBps" | "amountMinor" | "maxDiscountMinor" | "currency" | "setTotalMinor">, money: (m: MoneyValue) => string = formatMoney): string {
+  if (p.type === "set_total") return typeof p.setTotalMinor === "number" && p.currency ? `Order total set to ${money({ amountMinor: p.setTotalMinor, currency: p.currency })}` : "—";
   if (p.type === "percent" && p.percentBps !== null) {
     const cap = p.maxDiscountMinor !== null && p.currency ? `, up to ${money({ amountMinor: p.maxDiscountMinor, currency: p.currency })}` : "";
     return `${formatPercentBps(p.percentBps)} off${cap}`;
@@ -69,6 +78,19 @@ export function statusActions(status: PromoStatus): Array<"pause" | "resume" | "
   return [];
 }
 
+/** Percent input text from basis points: 9999 → "99.99", 1000 → "10". */
+export function formatPercentInput(bps: number): string {
+  return bps % 100 === 0 ? String(bps / 100) : (bps / 100).toFixed(2).replace(/0$/u, "");
+}
+
+/** Parses a 0.01–100 percentage with at most two decimals; null when invalid. */
+export function parsePercent(text: string): number | null {
+  const t = text.trim();
+  if (!/^\d{1,3}(?:\.\d{1,2})?$/u.test(t)) return null;
+  const bps = Math.round(Number(t) * 100);
+  return bps >= 1 && bps <= 10_000 ? bps / 100 : null;
+}
+
 /* ---------- form ---------- */
 
 export interface PromotionFormState {
@@ -78,6 +100,8 @@ export interface PromotionFormState {
   percent: string;
   maxDiscount: string;
   fixedAmount: string;
+  /** D5 `set_total`: the order total the code sets (0.00 allowed). */
+  setTotal: string;
   currency: string;
   scopeKind: PromoScopeKind;
   scopeProducts: string[];
@@ -100,7 +124,7 @@ export interface PromotionFormState {
 }
 
 export const emptyForm = (currency = "USD"): PromotionFormState => ({
-  name: "", label: "", discountType: "percent", percent: "", maxDiscount: "", fixedAmount: "", currency,
+  name: "", label: "", discountType: "percent", percent: "", maxDiscount: "", fixedAmount: "", setTotal: "", currency,
   scopeKind: "all", scopeProducts: [], scopeTiers: [], scopePackets: [], minSubtotal: "", startsAt: "", endsAt: "",
   maxRedemptions: "", maxPerCustomer: "1", firstOrderOnly: false, allowCustomers: [], allowDomains: [],
   combineWithBundle: false, note: "", codeMode: "chosen", code: "", batchCount: "", batchPrefix: "",
@@ -124,8 +148,9 @@ export function localInputToIso(value: string): string | null {
 export function formFromView(p: PromotionView): PromotionFormState {
   return {
     name: p.name, label: p.label, discountType: p.type,
-    percent: p.percentBps === null ? "" : String(p.percentBps / 100),
-    maxDiscount: minorToText(p.maxDiscountMinor, p.currency), fixedAmount: minorToText(p.amountMinor, p.currency), currency: p.currency ?? "USD",
+    percent: p.percentBps === null ? "" : formatPercentInput(p.percentBps),
+    maxDiscount: minorToText(p.maxDiscountMinor, p.currency), fixedAmount: minorToText(p.amountMinor, p.currency),
+    setTotal: minorToText(p.setTotalMinor ?? null, p.currency), currency: p.currency ?? "USD",
     scopeKind: p.scope.kind,
     scopeProducts: p.scope.kind === "products" ? p.scope.productPublicIds : [],
     scopeTiers: p.scope.kind === "tiers" ? p.scope.tierKeys : [],
@@ -157,24 +182,42 @@ const DOMAIN = /^(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2
 export type FormErrors = Partial<Record<keyof PromotionFormState, string>>;
 
 /** Client checks give fast, specific feedback; the server re-validates everything and has the final word. */
-export function validateForm(f: PromotionFormState, opts: { creating: boolean; maxDiscountPercent?: number }): { errors: FormErrors; input: CreatePromotionInput | null } {
+/** Store-wide limits from the Limits card (D5); any omitted limit is not checked here (the server always checks). */
+export interface PolicyLimits {
+  maxDiscountPercent?: number;
+  maxFixedAmountMinor?: number | null;
+  allowZeroTotal?: boolean;
+  minOrderTotalAfterDiscountMinor?: number;
+}
+export const LIMITS_ANCHOR = "limits";
+export const ZERO_FIXED_MESSAGE = "A fixed amount must be more than 0.00. To make orders free or set an exact price, choose “Set order total to”.";
+
+export function validateForm(f: PromotionFormState, opts: { creating: boolean } & PolicyLimits): { errors: FormErrors; input: CreatePromotionInput | null } {
   const e: FormErrors = {};
   if (!f.name.trim()) e.name = "Enter an internal name.";
   if (!f.label.trim()) e.label = "Enter the label customers see.";
   let percentBps: number | null = null;
   let fixedAmountMinor: number | null = null;
+  let setTotalMinor: number | null = null;
   const maxDiscountMinor = f.discountType === "percent" ? parseMoney(f.maxDiscount, f.currency) : null;
   if (f.discountType === "percent") {
     const pct = f.percent.trim();
-    if (!/^\d{1,3}(?:\.\d{1,2})?$/u.test(pct) || Number(pct) <= 0 || Number(pct) > 100) e.percent = "Enter a percentage greater than 0 and at most 100.";
+    if (!/^\d{1,3}(?:\.\d{1,2})?$/u.test(pct) || Number(pct) <= 0 || Number(pct) > 100) e.percent = "Enter a percentage from 0.01 to 100, with up to two decimals (for example 99.99).";
     else {
       percentBps = Math.round(Number(pct) * 100);
-      if (opts.maxDiscountPercent !== undefined && percentBps > opts.maxDiscountPercent * 100) e.percent = `The largest discount per order is ${opts.maxDiscountPercent} %. Lower the percentage or change that setting.`;
+      if (opts.maxDiscountPercent !== undefined && percentBps > Math.round(opts.maxDiscountPercent * 100)) e.percent = `The largest discount per order is ${formatPercentBps(Math.round(opts.maxDiscountPercent * 100))} (Limits card). Lower the percentage or change that limit.`;
     }
     if (Number.isNaN(maxDiscountMinor) || maxDiscountMinor === 0) e.maxDiscount = "Enter an amount such as 25.00, or leave it empty.";
-  } else {
+  } else if (f.discountType === "fixed") {
     fixedAmountMinor = parseMoney(f.fixedAmount, f.currency);
-    if (fixedAmountMinor === null || Number.isNaN(fixedAmountMinor) || fixedAmountMinor <= 0) e.fixedAmount = "Enter an amount such as 10.00.";
+    if (fixedAmountMinor === 0) e.fixedAmount = ZERO_FIXED_MESSAGE;
+    else if (fixedAmountMinor === null || Number.isNaN(fixedAmountMinor) || fixedAmountMinor < 0) e.fixedAmount = "Enter an amount such as 10.00.";
+    else if (typeof opts.maxFixedAmountMinor === "number" && fixedAmountMinor > opts.maxFixedAmountMinor) e.fixedAmount = `The maximum fixed discount is ${formatMoney({ amountMinor: opts.maxFixedAmountMinor, currency: /^[A-Z]{3}$/u.test(f.currency) ? f.currency : "USD" })} (Limits card). Lower the amount or change that limit.`;
+  } else {
+    setTotalMinor = parseMoney(f.setTotal, f.currency);
+    if (setTotalMinor === null || Number.isNaN(setTotalMinor) || setTotalMinor < 0) e.setTotal = "Enter the order total, such as 0.00, 0.01 or 49.00.";
+    else if (setTotalMinor === 0 && opts.allowZeroTotal === false) e.setTotal = "Zero-total orders are turned off in the Limits card. Enter an amount above 0.00 or change that limit.";
+    else if (opts.minOrderTotalAfterDiscountMinor !== undefined && setTotalMinor < opts.minOrderTotalAfterDiscountMinor) e.setTotal = `The minimum order total after discount is ${formatMoney({ amountMinor: opts.minOrderTotalAfterDiscountMinor, currency: /^[A-Z]{3}$/u.test(f.currency) ? f.currency : "USD" })} (Limits card).`;
   }
   if (!/^[A-Z]{3}$/u.test(f.currency)) e.currency = "Choose a currency.";
   const minSubtotalMinor = parseMoney(f.minSubtotal, f.currency);
@@ -205,7 +248,7 @@ export function validateForm(f: PromotionFormState, opts: { creating: boolean; m
     errors: e,
     input: {
       name: f.name.trim(), label: f.label.trim(), type: f.discountType, percentBps,
-      maxDiscountMinor: f.discountType === "percent" ? maxDiscountMinor : null, amountMinor: fixedAmountMinor, currency: f.currency,
+      maxDiscountMinor: f.discountType === "percent" ? maxDiscountMinor : null, amountMinor: fixedAmountMinor, setTotalMinor, currency: f.currency,
       scope: f.scopeKind === "products" ? { kind: "products", productPublicIds: f.scopeProducts }
         : f.scopeKind === "tiers" ? { kind: "tiers", tierKeys: f.scopeTiers }
         : f.scopeKind === "packets" ? { kind: "packets", packetNumbers: packets }
@@ -221,7 +264,7 @@ export function validateForm(f: PromotionFormState, opts: { creating: boolean; m
 
 /** The editable subset for `update` (type, percentage, amount and currency are fixed). */
 export function toUpdateInput(input: CreatePromotionInput, view: Pick<PromotionView, "publicId" | "version">): UpdatePromotionInput {
-  const { type: _t, percentBps: _p, amountMinor: _a, currency: _c, isBatch: _b, code: _code, codePrefix: _cp, initialBatchCount: _n, idempotencyKey: _k, ...rest } = input;
+  const { type: _t, percentBps: _p, amountMinor: _a, setTotalMinor: _s, currency: _c, isBatch: _b, code: _code, codePrefix: _cp, initialBatchCount: _n, idempotencyKey: _k, ...rest } = input;
   return { ...rest, publicId: view.publicId, expectedVersion: view.version };
 }
 

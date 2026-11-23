@@ -9,12 +9,12 @@ import { Link, useLocation, useParams } from "wouter";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, Checkbox, CopyButton, CopyField, ErrorState, Field, Input, PageHeader, RadioGroup, Select, Skeleton, StepUpCancelledError, TagInput, Textarea, useStepUp } from "@/ui";
 import { usePromotionsApi } from "./api";
-import { BATCH_MAX, PROMO_TIER_KEYS, emptyForm, formFromView, toUpdateInput, validateForm, type FormErrors, type PromotionFormState, type PromotionView } from "./model";
+import { BATCH_MAX, LIMITS_ANCHOR, ZERO_FIXED_MESSAGE, PROMO_TIER_KEYS, emptyForm, formatPercentBps, formFromView, toUpdateInput, validateForm, type FormErrors, type PolicyLimits, type PromotionFormState, type PromotionView } from "./model";
 import { BASE } from "./parts";
 import { promoLink } from "./savedCode";
 
 const CURRENCIES = ["USD", "CAD", "EUR", "GBP", "AUD"].map((c) => ({ value: c, label: c }));
-const ERROR_ORDER: Array<keyof PromotionFormState> = ["name", "label", "percent", "maxDiscount", "fixedAmount", "currency", "scopeProducts", "scopeTiers", "scopePackets", "minSubtotal", "startsAt", "endsAt", "maxRedemptions", "maxPerCustomer", "allowDomains", "note", "code", "batchCount", "batchPrefix"];
+const ERROR_ORDER: Array<keyof PromotionFormState> = ["name", "label", "percent", "maxDiscount", "fixedAmount", "setTotal", "currency", "scopeProducts", "scopeTiers", "scopePackets", "minSubtotal", "startsAt", "endsAt", "maxRedemptions", "maxPerCustomer", "allowDomains", "note", "code", "batchCount", "batchPrefix"];
 const fieldId = (k: keyof PromotionFormState) => `promo-${k}`;
 /** Focus the control itself when the id sits on a wrapper (tag inputs). */
 function focusField(k: keyof PromotionFormState) {
@@ -42,12 +42,13 @@ export default function PromotionEditorPage() {
   return (
     <>
       {header}
-      <PromotionForm key={existing.data?.publicId ?? "new"} existing={existing.data} maxDiscountPercent={settings.data?.maxDiscountPercent} />
+      <PromotionForm key={existing.data?.publicId ?? "new"} existing={existing.data} limits={settings.data} />
     </>
   );
 }
 
-function PromotionForm({ existing, maxDiscountPercent }: { existing: PromotionView | undefined; maxDiscountPercent: number | undefined }) {
+function PromotionForm({ existing, limits }: { existing: PromotionView | undefined; limits: PolicyLimits | undefined }) {
+  const maxDiscountPercent = limits?.maxDiscountPercent;
   const api = usePromotionsApi();
   const qc = useQueryClient();
   const stepUp = useStepUp();
@@ -65,7 +66,7 @@ function PromotionForm({ existing, maxDiscountPercent }: { existing: PromotionVi
   const focusSummary = () => requestAnimationFrame(() => summaryRef.current?.focus());
 
   const submit = async () => {
-    const { errors: found, input } = validateForm(f, { creating, ...(maxDiscountPercent !== undefined ? { maxDiscountPercent } : {}) });
+    const { errors: found, input } = validateForm(f, { creating, ...(limits ?? {}) });
     setErrors(found);
     setServerError(null);
     if (!input) { focusSummary(); return; }
@@ -84,6 +85,7 @@ function PromotionForm({ existing, maxDiscountPercent }: { existing: PromotionVi
       if (e instanceof StepUpCancelledError) return;
       const reason = safeError(e)?.reasonCode;
       if (reason === "LABEL_MATCHES_CODE") setErrors({ label: "The label customers see must not be the code itself." });
+      if (reason === "PROMO_ZERO_FIXED_USE_SET_TOTAL") setErrors({ fixedAmount: ZERO_FIXED_MESSAGE });
       setServerError(errorMessage(e));
       focusSummary();
     }
@@ -132,21 +134,31 @@ function PromotionForm({ existing, maxDiscountPercent }: { existing: PromotionVi
             options={[
               { value: "percent", label: "Percentage", disabled: percentLocked },
               { value: "fixed", label: "Fixed amount", disabled: percentLocked },
+              { value: "set_total", label: "Set order total to", disabled: percentLocked },
             ]}
           />
+          {f.discountType === "set_total" && !percentLocked ? (
+            <Callout tone="info" title="Codes that can make an order free">
+              A total of 0.00 makes eligible orders free. Creating such a code asks you to confirm your identity, and the store-wide <Link href={`${BASE}#${LIMITS_ANCHOR}`} className="font-medium underline underline-offset-2">Limits</Link> still apply.
+            </Callout>
+          ) : null}
           <div className="grid gap-4 md:grid-cols-3">
             {f.discountType === "percent" ? (
               <>
-                <Field label="Percentage off" hint={maxDiscountPercent !== undefined ? `At most ${maxDiscountPercent} % (largest discount per order).` : "Greater than 0 and at most 100."} error={err("percent")} required id={fieldId("percent")}>
+                <Field label="Percentage off" hint={maxDiscountPercent !== undefined ? `0.01 to ${formatPercentBps(Math.round(maxDiscountPercent * 100))}, up to two decimals (largest discount per order).` : "0.01 to 100, up to two decimals, e.g. 99.99."} error={err("percent")} required id={fieldId("percent")}>
                   <Input inputMode="decimal" value={f.percent} onChange={(e) => set("percent", e.target.value)} maxLength={6} disabled={percentLocked} />
                 </Field>
                 <Field label="Largest amount off" hint="Optional cap, e.g. 25.00." error={err("maxDiscount")} id={fieldId("maxDiscount")}>
                   <Input inputMode="decimal" value={f.maxDiscount} onChange={(e) => set("maxDiscount", e.target.value)} maxLength={12} />
                 </Field>
               </>
-            ) : (
-              <Field label="Amount off" hint="For example 10.00." error={err("fixedAmount")} required id={fieldId("fixedAmount")}>
+            ) : f.discountType === "fixed" ? (
+              <Field label="Amount off" hint="More than 0.00, e.g. 10.00. To make orders free, choose “Set order total to”." error={err("fixedAmount")} required id={fieldId("fixedAmount")}>
                 <Input inputMode="decimal" value={f.fixedAmount} onChange={(e) => set("fixedAmount", e.target.value)} maxLength={12} disabled={percentLocked} />
+              </Field>
+            ) : (
+              <Field label="Order total" hint="The eligible order total becomes this amount: 0.00 (free), 0.01, or any amount up to the cart total." error={err("setTotal")} required id={fieldId("setTotal")}>
+                <Input inputMode="decimal" value={f.setTotal} onChange={(e) => set("setTotal", e.target.value)} maxLength={12} disabled={percentLocked} />
               </Field>
             )}
             <Field label="Currency" error={err("currency")} id={fieldId("currency")}>
