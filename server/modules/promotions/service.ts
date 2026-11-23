@@ -40,10 +40,12 @@ import type {
   CursorPage,
   PromoDerivedStatus,
   PromoDiscountType,
+  PromoLimitKey,
   PromoRedemptionStatus,
   PromoStatus,
   PromotionContext,
   PromotionCsvExportView,
+  PromotionLineAllocation,
   PromotionOutcome,
   PromotionRedemptionView,
   PromotionScope,
@@ -64,7 +66,8 @@ import {
   DEFAULT_PROMOTIONS_POLICY,
   PROMOTIONS_ENABLED_FLAG,
   PROMOTIONS_POLICY_SETTING,
-  promotionsPolicySchema,
+  parsePromotionsPolicy,
+  percentToBps,
   type PromotionsPolicyConfig,
 } from "./settings.js";
 
@@ -290,6 +293,329 @@ export function computeDerivedStatus(row: PromoBatchRow, now: Date): PromoDerive
   return "active";
 }
 
+export function computeCanReachZero(row: {
+  discountType: PromoDiscountType;
+  percentBps: number | null;
+  maxDiscountMinor: number | null;
+  fixedAmountMinor: number | null;
+  setTotalMinor?: number | null;
+  minSubtotalMinor: number;
+}): boolean {
+  if (row.discountType === "percent") {
+    return (
+      (row.percentBps ?? 0) >= 10_000 &&
+      (row.maxDiscountMinor === null || row.minSubtotalMinor <= row.maxDiscountMinor)
+    );
+  }
+  if (row.discountType === "set_total") {
+    return row.setTotalMinor === 0;
+  }
+  const fixed = row.fixedAmountMinor ?? 0;
+  return fixed > 0 && row.minSubtotalMinor <= fixed;
+}
+
+/** Single half-up basis-point rounding on an integer minor-unit amount (`10_000` bps = `100.00%`). */
+export function roundHalfUpBps(amountMinor: number, bps: number): number {
+  if (amountMinor <= 0 || bps <= 0) return 0;
+  if (bps >= 10_000) return amountMinor;
+  return Number((BigInt(amountMinor) * BigInt(bps) + 5_000n) / 10_000n);
+}
+
+/** Floor of `subtotalMinor * maxDiscountBps / 10_000` (hard ceiling so tiny subtotals never round above the cap). */
+export function floorPercentCapMinor(subtotalMinor: number, maxDiscountBps: number): number {
+  if (subtotalMinor <= 0 || maxDiscountBps <= 0) return 0;
+  if (maxDiscountBps >= 10_000) return subtotalMinor;
+  return Number((BigInt(subtotalMinor) * BigInt(maxDiscountBps)) / 10_000n);
+}
+
+/**
+ * Allocates an already-rounded integer `totalToAllocate` (`0 <= totalToAllocate <= sum(capacities)`)
+ * proportionally across non-negative integer line capacities without per-line rounding drift:
+ * each line receives `floor(total * cap_i / sum(cap))` and any remainder is placed on the last
+ * participating line (spilling backward only if the remainder exceeds that line's remaining capacity,
+ * guaranteeing `0 <= alloc[i] <= capacities[i]` and `sum(alloc) === totalToAllocate`).
+ */
+export function allocateMinorAcrossCapacities(
+  totalToAllocate: number,
+  capacities: readonly number[],
+): number[] {
+  const n = capacities.length;
+  if (n === 0 || totalToAllocate <= 0) return capacities.map(() => 0);
+  const safeCaps = capacities.map((c) => (Number.isSafeInteger(c) && c > 0 ? c : 0));
+  const base = safeCaps.reduce((acc, c) => acc + c, 0);
+  if (base <= 0) return safeCaps.map(() => 0);
+  if (totalToAllocate >= base) return [...safeCaps];
+
+  const totalBig = BigInt(totalToAllocate);
+  const baseBig = BigInt(base);
+  const alloc = safeCaps.map((cap) => (cap > 0 ? Number((totalBig * BigInt(cap)) / baseBig) : 0));
+  let remainder = totalToAllocate - alloc.reduce((acc, v) => acc + v, 0);
+
+  for (let i = n - 1; i >= 0 && remainder > 0; i -= 1) {
+    const room = safeCaps[i]! - alloc[i]!;
+    if (room <= 0) continue;
+    const take = Math.min(remainder, room);
+    alloc[i]! += take;
+    remainder -= take;
+  }
+
+  return alloc;
+}
+
+export const PROMO_LIMITS_HREF = "/admin/promotions#limits";
+
+export function limitRejectedError(
+  limit: PromoLimitKey,
+  policy: PromotionsPolicyConfig,
+  isStaffOrAdmin: boolean,
+  currency: string | null,
+): DomainError {
+  const hrefDetail: Record<string, string | number | boolean | readonly string[]> = isStaffOrAdmin
+    ? { limitsHref: PROMO_LIMITS_HREF }
+    : {};
+  const currencyDetail: Record<string, string | number | boolean | readonly string[]> = currency
+    ? { currency }
+    : {};
+  switch (limit) {
+    case "maxDiscountPercent": {
+      const maxDiscountBps = percentToBps(policy.maxDiscountPercent);
+      const msg = isStaffOrAdmin
+        ? `This code exceeds the Largest discount per order limit (${policy.maxDiscountPercent}%). Adjust the limit in Limits on the Discount codes page if needed.`
+        : `This code exceeds the largest discount per order limit (${policy.maxDiscountPercent}%).`;
+      return validation("PROMO_LIMIT_MAX_PERCENT", msg, {
+        limit: "maxDiscountPercent",
+        limitLabel: "Largest discount per order",
+        maxDiscountPercent: policy.maxDiscountPercent,
+        maxDiscountBps,
+        ...hrefDetail,
+      });
+    }
+    case "maxFixedAmountMinor": {
+      const capMinor = policy.maxFixedAmountMinor ?? 0;
+      const amt = formatMoneyMinor(capMinor, currency ?? "USD");
+      const msg = isStaffOrAdmin
+        ? `This code exceeds the Maximum fixed discount limit (${amt}). Adjust the limit in Limits on the Discount codes page if needed.`
+        : `This code exceeds the maximum fixed discount limit (${amt}).`;
+      return validation("PROMO_LIMIT_MAX_FIXED", msg, {
+        limit: "maxFixedAmountMinor",
+        limitLabel: "Maximum fixed discount",
+        maxFixedAmountMinor: capMinor,
+        ...currencyDetail,
+        ...hrefDetail,
+      });
+    }
+    case "allowZeroTotal": {
+      const msg = isStaffOrAdmin
+        ? "Zero-total orders are disabled in Limits. Enable Allow zero-total orders on the Discount codes page if needed."
+        : "Zero-total orders are disabled by the discount policy.";
+      return validation("PROMO_LIMIT_ZERO_TOTAL", msg, {
+        limit: "allowZeroTotal",
+        limitLabel: "Allow zero-total orders",
+        allowZeroTotal: false,
+        ...hrefDetail,
+      });
+    }
+    case "minOrderTotalAfterDiscountMinor": {
+      const minMinor = policy.minOrderTotalAfterDiscountMinor;
+      const amt = formatMoneyMinor(minMinor, currency ?? "USD");
+      const msg = isStaffOrAdmin
+        ? `Order total after discount would fall below the Minimum order total after discount limit (${amt}). Adjust the limit in Limits on the Discount codes page if needed.`
+        : `Orders using a discount must keep a minimum total after discount of ${amt}.`;
+      return validation("PROMO_LIMIT_MIN_TOTAL", msg, {
+        limit: "minOrderTotalAfterDiscountMinor",
+        limitLabel: "Minimum order total after discount",
+        minOrderTotalAfterDiscountMinor: minMinor,
+        ...currencyDetail,
+        ...hrefDetail,
+      });
+    }
+  }
+}
+
+export interface PromotionPricingBatchSpec {
+  publicId: string;
+  label: string;
+  discountType: PromoDiscountType;
+  percentBps: number | null;
+  maxDiscountMinor: number | null;
+  fixedAmountMinor: number | null;
+  setTotalMinor: number | null;
+  combineWithBundle: boolean;
+  scopeKind: PromoBatchRow["scopeKind"];
+}
+
+/**
+ * Pure single-round integer minor-unit pricing + per-line allocation.
+ * Rounds half-up ONCE on the order-level discount and allocates across lines without per-line drift,
+ * placing remainders on the last participating line while guaranteeing every `netMinor >= 0`,
+ * `sum(discountMinor_i) === discountMinor`, and `sum(netMinor_i) === totalMinor`.
+ */
+export function computePromotionPricing(
+  batch: PromotionPricingBatchSpec,
+  ctx: Pick<PromotionContext, "lines" | "subtotalMinor" | "bundleDiscountMinor" | "bundleLabel">,
+  eligibleMask: readonly boolean[],
+): PromotionOutcome {
+  const subtotalMinor = Math.max(0, ctx.subtotalMinor);
+  const rawBundleMinor = Math.max(0, Math.min(ctx.bundleDiscountMinor, subtotalMinor));
+
+  const lineGross = ctx.lines.map((l) =>
+    Number.isSafeInteger(l.lineTotalMinor) && l.lineTotalMinor > 0 ? l.lineTotalMinor : 0,
+  );
+  const linesSum = lineGross.reduce((acc, v) => acc + v, 0);
+  // Synthesise a single line if a caller provided subtotalMinor without matching line breakdown.
+  const useSyntheticSingleLine = lineGross.length === 0 || linesSum !== subtotalMinor;
+  const effectiveGross = useSyntheticSingleLine
+    ? subtotalMinor > 0
+      ? [subtotalMinor]
+      : []
+    : lineGross;
+  const effectiveEligible = useSyntheticSingleLine
+    ? effectiveGross.map(() => true)
+    : eligibleMask.map((v, idx) => Boolean(v) && effectiveGross[idx]! > 0);
+
+  const calcRawPromo = (eligibleBaseMinor: number, remainingOrderSubtotalMinor: number): number => {
+    if (batch.discountType === "set_total") {
+      const target = Math.max(0, batch.setTotalMinor ?? 0);
+      return Math.max(0, Math.min(eligibleBaseMinor, remainingOrderSubtotalMinor - target));
+    }
+    if (eligibleBaseMinor <= 0) return 0;
+    if (batch.discountType === "percent") {
+      const bps = batch.percentBps ?? 0;
+      let raw = roundHalfUpBps(eligibleBaseMinor, bps);
+      if (batch.maxDiscountMinor !== null && batch.maxDiscountMinor !== undefined) {
+        raw = Math.min(raw, batch.maxDiscountMinor);
+      }
+      return Math.min(raw, eligibleBaseMinor);
+    }
+    return Math.min(batch.fixedAmountMinor ?? 0, eligibleBaseMinor);
+  };
+
+  if (batch.combineWithBundle) {
+    const bundleDiscountMinor = rawBundleMinor;
+    const bundleLineAlloc = allocateMinorAcrossCapacities(bundleDiscountMinor, effectiveGross);
+    const remainingAfterBundle = effectiveGross.map((g, i) => g - bundleLineAlloc[i]!);
+    const eligibleAfterBundle = remainingAfterBundle.reduce(
+      (acc, rem, i) => (effectiveEligible[i] ? acc + rem : acc),
+      0,
+    );
+    const orderRemainingAfterBundle = subtotalMinor - bundleDiscountMinor;
+    const promoDiscountMinor = Math.min(
+      orderRemainingAfterBundle,
+      calcRawPromo(eligibleAfterBundle, orderRemainingAfterBundle),
+    );
+    const eligibleCapacities = remainingAfterBundle.map((rem, i) => (effectiveEligible[i] ? rem : 0));
+    const promoLineAlloc = allocateMinorAcrossCapacities(promoDiscountMinor, eligibleCapacities);
+
+    const discountMinor = bundleDiscountMinor + promoDiscountMinor;
+    const totalMinor = subtotalMinor - discountMinor;
+    const discountLabel =
+      bundleDiscountMinor > 0 && promoDiscountMinor > 0
+        ? `${ctx.bundleLabel ?? "Bundle discount"} + ${batch.label}`.slice(0, 120)
+        : bundleDiscountMinor > 0
+          ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120)
+          : batch.label.slice(0, 120);
+
+    const lineAllocations: PromotionLineAllocation[] = effectiveGross.map((gross, idx) => {
+      const bMin = bundleLineAlloc[idx]!;
+      const pMin = promoLineAlloc[idx]!;
+      const dMin = bMin + pMin;
+      return {
+        lineIndex: idx,
+        productPublicId: useSyntheticSingleLine
+          ? (ctx.lines[0]?.productPublicId ?? batch.publicId)
+          : (ctx.lines[idx]?.productPublicId ?? ""),
+        grossMinor: gross,
+        bundleDiscountMinor: bMin,
+        promoDiscountMinor: pMin,
+        discountMinor: dMin,
+        netMinor: gross - dMin,
+      };
+    });
+
+    return {
+      promoPublicId: batch.publicId,
+      label: batch.label,
+      promoDiscountMinor,
+      bundleDiscountMinor,
+      discountMinor,
+      discountLabel,
+      totalMinor,
+      lineAllocations,
+    };
+  }
+
+  // `combineWithBundle === false`: the larger of bundle and code wins; the other is not applied.
+  const eligibleSubtotalMinor = effectiveGross.reduce(
+    (acc, g, i) => (effectiveEligible[i] ? acc + g : acc),
+    0,
+  );
+  const rawPromoMinor = calcRawPromo(eligibleSubtotalMinor, subtotalMinor);
+
+  const promoWins =
+    rawPromoMinor > rawBundleMinor ||
+    (batch.discountType === "set_total" && rawBundleMinor === 0 && rawPromoMinor === 0);
+
+  if (promoWins) {
+    const promoDiscountMinor = Math.min(rawPromoMinor, subtotalMinor);
+    const eligibleCapacities = effectiveGross.map((g, i) => (effectiveEligible[i] ? g : 0));
+    const promoLineAlloc = allocateMinorAcrossCapacities(promoDiscountMinor, eligibleCapacities);
+    const lineAllocations: PromotionLineAllocation[] = effectiveGross.map((gross, idx) => {
+      const pMin = promoLineAlloc[idx]!;
+      return {
+        lineIndex: idx,
+        productPublicId: useSyntheticSingleLine
+          ? (ctx.lines[0]?.productPublicId ?? batch.publicId)
+          : (ctx.lines[idx]?.productPublicId ?? ""),
+        grossMinor: gross,
+        bundleDiscountMinor: 0,
+        promoDiscountMinor: pMin,
+        discountMinor: pMin,
+        netMinor: gross - pMin,
+      };
+    });
+    return {
+      promoPublicId: batch.publicId,
+      label: batch.label,
+      promoDiscountMinor,
+      bundleDiscountMinor: 0,
+      discountMinor: promoDiscountMinor,
+      discountLabel: batch.label.slice(0, 120),
+      totalMinor: subtotalMinor - promoDiscountMinor,
+      lineAllocations,
+    };
+  }
+
+  const bundleDiscountMinor = Math.min(rawBundleMinor, subtotalMinor);
+  const bundleLineAlloc = allocateMinorAcrossCapacities(bundleDiscountMinor, effectiveGross);
+  const lineAllocations: PromotionLineAllocation[] = effectiveGross.map((gross, idx) => {
+    const bMin = bundleLineAlloc[idx]!;
+    return {
+      lineIndex: idx,
+      productPublicId: useSyntheticSingleLine
+        ? (ctx.lines[0]?.productPublicId ?? batch.publicId)
+        : (ctx.lines[idx]?.productPublicId ?? ""),
+      grossMinor: gross,
+      bundleDiscountMinor: bMin,
+      promoDiscountMinor: 0,
+      discountMinor: bMin,
+      netMinor: gross - bMin,
+    };
+  });
+  return {
+    promoPublicId: batch.publicId,
+    label: batch.label,
+    promoDiscountMinor: 0,
+    bundleDiscountMinor,
+    discountMinor: bundleDiscountMinor,
+    discountLabel:
+      bundleDiscountMinor > 0
+        ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120)
+        : batch.label.slice(0, 120),
+    totalMinor: subtotalMinor - bundleDiscountMinor,
+    lineAllocations,
+  };
+}
+
 export interface CreatePromotionInput {
   name: string;
   label: string;
@@ -297,6 +623,7 @@ export interface CreatePromotionInput {
   percentBps?: number | null;
   maxDiscountMinor?: number | null;
   amountMinor?: number | null;
+  setTotalMinor?: number | null;
   currency?: string | null;
   scope: PromotionScope;
   minSubtotalMinor?: number;
@@ -403,7 +730,14 @@ export interface PromotionsService {
     getSettings(actor: SessionPrincipal): Promise<PromotionsSettingsView>;
     updateSettings(
       actor: SessionPrincipal,
-      input: { enabled?: boolean; maxDiscountPercent?: number },
+      input: {
+        enabled?: boolean;
+        maxDiscountPercent?: number;
+        maxDiscountBps?: number;
+        maxFixedAmountMinor?: number | null;
+        allowZeroTotal?: boolean;
+        minOrderTotalAfterDiscountMinor?: number;
+      },
     ): Promise<PromotionsSettingsView>;
   };
   healthCounts(): Promise<{ enabled: boolean; activePromotions: number }>;
@@ -484,6 +818,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
     const [sessionRow] = await tx
       .select({
+        userId: userSessions.userId,
         revokedAt: userSessions.revokedAt,
         absoluteExpiresAt: userSessions.absoluteExpiresAt,
         stepUpAt: userSessions.stepUpAt,
@@ -492,22 +827,16 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       .where(eq(userSessions.publicId, actor.sessionId))
       .for("update");
 
-    if (sessionRow) {
-      if (sessionRow.revokedAt !== null || sessionRow.absoluteExpiresAt.getTime() <= now.getTime()) {
-        throw new DomainError("UNAUTHENTICATED", "SESSION_REVOKED", "Your session is no longer active.");
-      }
-      if (STEP_UP_CAPABILITIES.has(capability)) {
-        const at = sessionRow.stepUpAt?.getTime();
-        if (at === undefined || now.getTime() - at > STEP_UP_MAX_AGE_MS) {
-          throw new DomainError(
-            "STEP_UP_REQUIRED",
-            "STEP_UP_REQUIRED",
-            "Please confirm your password and authentication code to continue.",
-          );
-        }
-      }
-    } else if (STEP_UP_CAPABILITIES.has(capability)) {
-      const at = actor.stepUpAt?.getTime();
+    if (
+      !sessionRow ||
+      sessionRow.userId !== actor.userId ||
+      sessionRow.revokedAt !== null ||
+      sessionRow.absoluteExpiresAt.getTime() <= now.getTime()
+    ) {
+      throw new DomainError("UNAUTHENTICATED", "SESSION_REVOKED", "Your session is no longer active.");
+    }
+    if (STEP_UP_CAPABILITIES.has(capability)) {
+      const at = sessionRow.stepUpAt?.getTime();
       if (at === undefined || now.getTime() - at > STEP_UP_MAX_AGE_MS) {
         throw new DomainError(
           "STEP_UP_REQUIRED",
@@ -530,7 +859,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
   async function readPolicy(dbOrTx?: DbOrTx): Promise<PromotionsPolicyConfig> {
     return deps.settings.get(
       PROMOTIONS_POLICY_SETTING.key,
-      (raw) => promotionsPolicySchema.parse(raw),
+      (raw) => parsePromotionsPolicy(raw),
       DEFAULT_PROMOTIONS_POLICY,
       asAmbientTx(dbOrTx),
     );
@@ -563,6 +892,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       percentBps: row.percentBps ?? null,
       maxDiscountMinor: row.maxDiscountMinor ?? null,
       amountMinor: row.fixedAmountMinor ?? null,
+      setTotalMinor: row.setTotalMinor ?? null,
       currency: row.currency ?? null,
       scope: buildScopeView(row),
       minSubtotalMinor: row.minSubtotalMinor,
@@ -582,6 +912,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       codePrefix: row.codePrefix ?? null,
       batchSize: row.batchSize,
       redemptionCount: row.redemptionCount,
+      canReachZero: computeCanReachZero(row),
       version: row.version,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
@@ -758,105 +1089,51 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     }
   }
 
-  function computePricingOutcome(
+  function enforcePolicyLimitsOnOutcome(
     batch: PromoBatchRow,
     ctx: PromotionContext,
-    eligibleSubtotalMinor: number,
-    maxDiscountPercent: number,
-  ): PromotionOutcome {
-    const subtotalMinor = ctx.subtotalMinor;
-    // Hard maximum ceiling per order: floor so e.g. $0.01 at 50% max never rounds up to 100%.
-    const guardCapMinor = Math.min(
-      subtotalMinor,
-      Math.floor((subtotalMinor * maxDiscountPercent) / 100),
-    );
-    const rawBundleMinor = Math.max(0, Math.min(ctx.bundleDiscountMinor, subtotalMinor));
+    outcome: PromotionOutcome,
+    policy: PromotionsPolicyConfig,
+    isStaffOrAdmin: boolean,
+    orderCurrency: string,
+  ): void {
+    if (
+      policy.maxFixedAmountMinor !== null &&
+      batch.discountType === "fixed" &&
+      ((batch.fixedAmountMinor ?? 0) > policy.maxFixedAmountMinor ||
+        outcome.promoDiscountMinor > policy.maxFixedAmountMinor)
+    ) {
+      throw limitRejectedError("maxFixedAmountMinor", policy, isStaffOrAdmin, orderCurrency);
+    }
 
-    const calcRawPromo = (baseMinor: number): number => {
-      if (baseMinor <= 0) return 0;
-      if (batch.discountType === "percent") {
-        const bps = batch.percentBps ?? 0;
-        let raw = Math.floor((baseMinor * bps + 5_000) / 10_000);
-        if (batch.maxDiscountMinor !== null && batch.maxDiscountMinor !== undefined) {
-          raw = Math.min(raw, batch.maxDiscountMinor);
-        }
-        return Math.min(raw, baseMinor);
-      }
-      return Math.min(batch.fixedAmountMinor ?? 0, baseMinor);
-    };
+    const maxDiscountBps = percentToBps(policy.maxDiscountPercent);
+    const maxAllowedDiscountMinor = floorPercentCapMinor(ctx.subtotalMinor, maxDiscountBps);
+    if (
+      (batch.discountType === "percent" && (batch.percentBps ?? 0) > maxDiscountBps) ||
+      outcome.discountMinor > maxAllowedDiscountMinor
+    ) {
+      throw limitRejectedError("maxDiscountPercent", policy, isStaffOrAdmin, orderCurrency);
+    }
 
-    if (batch.combineWithBundle) {
-      let eligibleAfterBundle = eligibleSubtotalMinor;
-      if (rawBundleMinor > 0 && subtotalMinor > 0) {
-        if (batch.scopeKind === "all" || eligibleSubtotalMinor >= subtotalMinor) {
-          eligibleAfterBundle = Math.max(0, subtotalMinor - rawBundleMinor);
-        } else {
-          const proratedBundle = Math.floor(
-            (rawBundleMinor * eligibleSubtotalMinor + Math.floor(subtotalMinor / 2)) / subtotalMinor,
-          );
-          eligibleAfterBundle = Math.max(
-            0,
-            Math.min(eligibleSubtotalMinor - proratedBundle, subtotalMinor - rawBundleMinor),
-          );
-        }
-      }
-      const rawPromoMinor = calcRawPromo(eligibleAfterBundle);
-      const discountMinor = Math.min(
-        subtotalMinor,
-        guardCapMinor,
-        rawBundleMinor + rawPromoMinor,
+    if (!policy.allowZeroTotal && ctx.subtotalMinor > 0 && outcome.totalMinor === 0) {
+      throw limitRejectedError("allowZeroTotal", policy, isStaffOrAdmin, orderCurrency);
+    }
+
+    if (
+      policy.minOrderTotalAfterDiscountMinor > 0 &&
+      outcome.totalMinor < policy.minOrderTotalAfterDiscountMinor
+    ) {
+      throw limitRejectedError(
+        "minOrderTotalAfterDiscountMinor",
+        policy,
+        isStaffOrAdmin,
+        orderCurrency,
       );
-      const bundleDiscountMinor = Math.min(rawBundleMinor, discountMinor);
-      const promoDiscountMinor = discountMinor - bundleDiscountMinor;
-      const discountLabel =
-        bundleDiscountMinor > 0 && promoDiscountMinor > 0
-          ? `${ctx.bundleLabel ?? "Bundle discount"} + ${batch.label}`.slice(0, 120)
-          : bundleDiscountMinor > 0
-            ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120)
-            : promoDiscountMinor > 0
-              ? batch.label.slice(0, 120)
-              : "";
-
-      return {
-        promoPublicId: batch.publicId,
-        label: batch.label,
-        promoDiscountMinor,
-        bundleDiscountMinor,
-        discountMinor,
-        discountLabel,
-        totalMinor: subtotalMinor - discountMinor,
-      };
     }
-
-    // `combineWithBundle === false`: the larger of bundle and code wins; the other is not applied.
-    const rawPromoMinor = calcRawPromo(eligibleSubtotalMinor);
-    if (rawPromoMinor > rawBundleMinor) {
-      const promoDiscountMinor = Math.min(rawPromoMinor, guardCapMinor, subtotalMinor);
-      return {
-        promoPublicId: batch.publicId,
-        label: batch.label,
-        promoDiscountMinor,
-        bundleDiscountMinor: 0,
-        discountMinor: promoDiscountMinor,
-        discountLabel: promoDiscountMinor > 0 ? batch.label.slice(0, 120) : "",
-        totalMinor: subtotalMinor - promoDiscountMinor,
-      };
-    }
-
-    const bundleDiscountMinor = Math.min(rawBundleMinor, guardCapMinor, subtotalMinor);
-    return {
-      promoPublicId: batch.publicId,
-      label: batch.label,
-      promoDiscountMinor: 0,
-      bundleDiscountMinor,
-      discountMinor: bundleDiscountMinor,
-      discountLabel: bundleDiscountMinor > 0 ? (ctx.bundleLabel ?? "Bundle discount").slice(0, 120) : "",
-      totalMinor: subtotalMinor - bundleDiscountMinor,
-    };
   }
 
   /**
-   * Evaluates customer entitlement, code validity, caps, scope, minimum subtotal, and pricing.
+   * Evaluates customer entitlement, code validity, caps, scope, minimum subtotal, policy limits, and pricing.
    * When `lockForRedemption = true`, `dbOrTx` MUST be a `Tx` and locks `promo_batches`, `promo_codes`,
    * and active `promo_redemptions` rows (`FOR UPDATE`) so slot allocation and limit checks are immune
    * to `REPEATABLE READ` snapshot staleness.
@@ -887,6 +1164,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
     }
 
     // 1. Cross-customer actor check (`orders.manage` required when `actorUserId !== customerUserId`) + customer verification.
+    let actorIsStaffOrAdmin = false;
     if (ctx.actorUserId !== ctx.customerUserId) {
       const [actorRow] = await dbOrTx
         .select({ id: users.id, role: users.role, status: users.status })
@@ -896,6 +1174,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       if (!actorRow || actorRow.status !== "active" || !roleHasCapability(actorRow.role, "orders.manage")) {
         throw forbidden("CAPABILITY_NOT_GRANTED");
       }
+      actorIsStaffOrAdmin = actorRow.role === "staff" || actorRow.role === "admin";
     }
 
     const [customer] = await dbOrTx
@@ -980,7 +1259,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       throw promoNotApplicable();
     }
 
-    if (batch.discountType === "fixed" && batch.currency !== orderCurrency) {
+    if (
+      (batch.discountType === "fixed" || batch.discountType === "set_total") &&
+      batch.currency !== orderCurrency
+    ) {
       throw promoNotApplicable();
     }
     if (
@@ -1102,10 +1384,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       if (priorUsedRedemption) throw promoNotApplicable();
     }
 
-    // --- Entitlement succeeded! Only now may cart-specific hints (`PROMO_NOT_ELIGIBLE_ITEMS`, `PROMO_MIN_SUBTOTAL`) be shown. ---
+    // --- Entitlement succeeded! Only now may cart-specific / limit hints be shown. ---
 
     // 8. Scope / eligible lines filter.
-    const eligibleLines = ctx.lines.filter((line) => {
+    const eligibleMask = ctx.lines.map((line) => {
       if (!Number.isSafeInteger(line.lineTotalMinor) || line.lineTotalMinor <= 0) return false;
       switch (batch.scopeKind) {
         case "all":
@@ -1129,35 +1411,65 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
       }
     });
 
-    const eligibleSubtotalMinor = eligibleLines.reduce((acc, l) => acc + l.lineTotalMinor, 0);
+    const eligibleSubtotalMinor = ctx.lines.reduce(
+      (acc, l, idx) => (eligibleMask[idx] ? acc + l.lineTotalMinor : acc),
+      0,
+    );
     if (eligibleSubtotalMinor <= 0) {
       throw validation(
         "PROMO_NOT_ELIGIBLE_ITEMS",
         "None of the items in your order are eligible for this code.",
       );
     }
+    if (batch.discountType === "set_total" && eligibleSubtotalMinor < ctx.subtotalMinor) {
+      throw validation(
+        "PROMO_NOT_ELIGIBLE_ITEMS",
+        "All items in your order must be covered by this code to set the order total.",
+      );
+    }
 
-    // 9. Minimum subtotal check.
-    if (ctx.subtotalMinor < batch.minSubtotalMinor) {
-      const shortfallMinor = batch.minSubtotalMinor - ctx.subtotalMinor;
+    // 9. Minimum subtotal check (for `set_total`, cart total must also be at least `setTotalMinor`).
+    const requiredSubtotalMinor =
+      batch.discountType === "set_total"
+        ? Math.max(batch.minSubtotalMinor, batch.setTotalMinor ?? 0)
+        : batch.minSubtotalMinor;
+    if (ctx.subtotalMinor < requiredSubtotalMinor) {
+      const shortfallMinor = requiredSubtotalMinor - ctx.subtotalMinor;
       throw validation(
         "PROMO_MIN_SUBTOTAL",
         `Add ${formatMoneyMinor(shortfallMinor, orderCurrency)} more to use this code.`,
         {
-          minSubtotalMinor: batch.minSubtotalMinor,
+          minSubtotalMinor: requiredSubtotalMinor,
           shortfallMinor,
           currency: orderCurrency,
         },
       );
     }
 
-    // 10. Global discount guard & pricing outcome.
+    // 10. Pricing outcome + `promotions.policy` limit enforcement.
     const policy = await readPolicy(dbOrTx);
-    const outcome = computePricingOutcome(
+    const outcome = computePromotionPricing(
+      {
+        publicId: batch.publicId,
+        label: batch.label,
+        discountType: batch.discountType,
+        percentBps: batch.percentBps ?? null,
+        maxDiscountMinor: batch.maxDiscountMinor ?? null,
+        fixedAmountMinor: batch.fixedAmountMinor ?? null,
+        setTotalMinor: batch.setTotalMinor ?? null,
+        combineWithBundle: batch.combineWithBundle,
+        scopeKind: batch.scopeKind,
+      },
+      ctx,
+      eligibleMask,
+    );
+    enforcePolicyLimitsOnOutcome(
       batch,
       ctx,
-      eligibleSubtotalMinor,
-      policy.maxDiscountPercent,
+      outcome,
+      policy,
+      actorIsStaffOrAdmin,
+      orderCurrency,
     );
 
     return {
@@ -1728,6 +2040,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         let percentBps: number | null = null;
         let maxDiscountMinor: number | null = null;
         let fixedAmountMinor: number | null = null;
+        let setTotalMinor: number | null = null;
         let currency = input.currency ? input.currency.trim().toUpperCase() : null;
         if (currency && !/^[A-Z]{3}$/.test(currency)) {
           throw validation("INVALID_CURRENCY", "Enter a 3-letter uppercase ISO currency code.");
@@ -1764,7 +2077,13 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           if (minSubtotalMinor > 0 && !currency) {
             currency = "USD";
           }
-        } else {
+        } else if (input.type === "fixed") {
+          if (input.amountMinor === 0) {
+            throw validation(
+              "PROMO_ZERO_FIXED_USE_SET_TOTAL",
+              "A fixed discount must be greater than 0.00. Use 'Set order total to' for 0.00 test orders.",
+            );
+          }
           if (
             input.amountMinor === null ||
             input.amountMinor === undefined ||
@@ -1777,6 +2096,24 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
             throw validation("CURRENCY_REQUIRED", "Fixed-amount codes require a 3-letter currency code.");
           }
           fixedAmountMinor = input.amountMinor;
+        } else if (input.type === "set_total") {
+          if (
+            input.setTotalMinor === null ||
+            input.setTotalMinor === undefined ||
+            !Number.isSafeInteger(input.setTotalMinor) ||
+            input.setTotalMinor < 0
+          ) {
+            throw validation(
+              "INVALID_SET_TOTAL_MINOR",
+              "Target order total must be 0 or a positive amount in minor units.",
+            );
+          }
+          if (!currency) {
+            throw validation("CURRENCY_REQUIRED", "'Set order total to' codes require a 3-letter currency code.");
+          }
+          setTotalMinor = input.setTotalMinor;
+        } else {
+          throw validation("INVALID_DISCOUNT_TYPE", "Unsupported promotion type.");
         }
 
         const maxPerCustomer = input.maxPerCustomer ?? 1;
@@ -1807,6 +2144,36 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         return deps.db.transaction(async (tx) => {
           await revalidateActorInTx(actor, tx, "promotions.manage");
 
+          const policy = await readPolicy(tx);
+          if (input.type === "percent" && percentBps! > percentToBps(policy.maxDiscountPercent)) {
+            throw limitRejectedError("maxDiscountPercent", policy, true, currency);
+          }
+          if (
+            input.type === "fixed" &&
+            policy.maxFixedAmountMinor !== null &&
+            fixedAmountMinor! > policy.maxFixedAmountMinor
+          ) {
+            throw limitRejectedError("maxFixedAmountMinor", policy, true, currency);
+          }
+          const canReachZero = computeCanReachZero({
+            discountType: input.type,
+            percentBps,
+            maxDiscountMinor,
+            fixedAmountMinor,
+            setTotalMinor,
+            minSubtotalMinor,
+          });
+          if (!policy.allowZeroTotal && canReachZero) {
+            throw limitRejectedError("allowZeroTotal", policy, true, currency);
+          }
+          if (
+            input.type === "set_total" &&
+            policy.minOrderTotalAfterDiscountMinor > 0 &&
+            setTotalMinor! < policy.minOrderTotalAfterDiscountMinor
+          ) {
+            throw limitRejectedError("minOrderTotalAfterDiscountMinor", policy, true, currency);
+          }
+
           const promoPublicId = newPublicId();
           const initialBatchCount = isBatch ? (input.initialBatchCount ?? 0) : 0;
           if (isBatch && initialBatchCount > MAX_BATCH_SIZE_PER_CALL) {
@@ -1821,6 +2188,7 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
             percentBps,
             maxDiscountMinor,
             fixedAmountMinor,
+            setTotalMinor,
             currency,
             ...scopeCols,
             minSubtotalMinor,
@@ -1986,6 +2354,23 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
             input.maxRedemptions !== undefined ? input.maxRedemptions : existing.maxRedemptions;
           const nextMaxPerCustomer =
             input.maxPerCustomer !== undefined ? input.maxPerCustomer : existing.maxPerCustomer;
+
+          const policy = await readPolicy(tx);
+          const effectiveMaxDiscountMinor =
+            existing.discountType === "percent" ? nextMaxDiscountMinor : null;
+          const prevCanReachZero = computeCanReachZero(existing);
+          const nextCanReachZero = computeCanReachZero({
+            discountType: existing.discountType,
+            percentBps: existing.percentBps,
+            maxDiscountMinor: effectiveMaxDiscountMinor,
+            fixedAmountMinor: existing.fixedAmountMinor,
+            setTotalMinor: existing.setTotalMinor,
+            minSubtotalMinor: nextMinSubtotal,
+          });
+          if (!policy.allowZeroTotal && nextCanReachZero && !prevCanReachZero) {
+            throw limitRejectedError("allowZeroTotal", policy, true, existing.currency);
+          }
+
           const now = deps.clock.now();
 
           await tx
@@ -2702,6 +3087,10 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
         return {
           enabled,
           maxDiscountPercent: policy.maxDiscountPercent,
+          maxDiscountBps: percentToBps(policy.maxDiscountPercent),
+          maxFixedAmountMinor: policy.maxFixedAmountMinor,
+          allowZeroTotal: policy.allowZeroTotal,
+          minOrderTotalAfterDiscountMinor: policy.minOrderTotalAfterDiscountMinor,
         };
       },
 
@@ -2715,33 +3104,86 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
           const currentPolicy = await readPolicy(tx);
 
           const nextEnabled = input.enabled !== undefined ? input.enabled : currentEnabled;
-          const nextMaxDiscountPercent =
-            input.maxDiscountPercent !== undefined
-              ? input.maxDiscountPercent
-              : currentPolicy.maxDiscountPercent;
 
+          let candidateMaxDiscountPercent = currentPolicy.maxDiscountPercent;
+          if (input.maxDiscountPercent !== undefined) {
+            candidateMaxDiscountPercent = input.maxDiscountPercent;
+          } else if (input.maxDiscountBps !== undefined) {
+            if (
+              !Number.isInteger(input.maxDiscountBps) ||
+              input.maxDiscountBps < 1 ||
+              input.maxDiscountBps > 10_000
+            ) {
+              throw validation(
+                "INVALID_MAX_DISCOUNT_PERCENT",
+                "Largest discount per order must be between 0.01% and 100%.",
+              );
+            }
+            candidateMaxDiscountPercent = Number((input.maxDiscountBps / 100).toFixed(2));
+          }
+
+          const candidateBps = Math.round(candidateMaxDiscountPercent * 100);
           if (
-            !Number.isInteger(nextMaxDiscountPercent) ||
-            nextMaxDiscountPercent < 1 ||
-            nextMaxDiscountPercent > 100
+            !Number.isFinite(candidateMaxDiscountPercent) ||
+            candidateMaxDiscountPercent < 0.01 ||
+            candidateMaxDiscountPercent > 100 ||
+            Math.abs(candidateMaxDiscountPercent * 100 - candidateBps) > 1e-6
           ) {
             throw validation(
               "INVALID_MAX_DISCOUNT_PERCENT",
-              "Largest discount per order must be an integer between 1% and 100%.",
+              "Largest discount per order must be between 0.01% and 100% with at most 2 decimal places.",
             );
           }
+
+          const candidateMaxFixed =
+            input.maxFixedAmountMinor !== undefined
+              ? input.maxFixedAmountMinor
+              : currentPolicy.maxFixedAmountMinor;
+          if (
+            candidateMaxFixed !== null &&
+            (!Number.isSafeInteger(candidateMaxFixed) || candidateMaxFixed < 1)
+          ) {
+            throw validation(
+              "INVALID_MAX_FIXED_AMOUNT",
+              "Maximum fixed discount must be empty (no limit) or at least 1 minor unit.",
+            );
+          }
+
+          const candidateAllowZeroTotal =
+            input.allowZeroTotal !== undefined ? input.allowZeroTotal : currentPolicy.allowZeroTotal;
+          const candidateMinTotal =
+            input.minOrderTotalAfterDiscountMinor !== undefined
+              ? input.minOrderTotalAfterDiscountMinor
+              : currentPolicy.minOrderTotalAfterDiscountMinor;
+          if (!Number.isSafeInteger(candidateMinTotal) || candidateMinTotal < 0) {
+            throw validation(
+              "INVALID_MIN_ORDER_TOTAL_AFTER_DISCOUNT",
+              "Minimum order total after discount must be 0 or a positive amount in minor units.",
+            );
+          }
+
+          const nextPolicy: PromotionsPolicyConfig = {
+            maxDiscountPercent: Number((candidateBps / 100).toFixed(2)),
+            maxFixedAmountMinor: candidateMaxFixed,
+            allowZeroTotal: candidateAllowZeroTotal,
+            minOrderTotalAfterDiscountMinor: candidateMinTotal,
+          };
+
+          const policyChanged =
+            nextPolicy.maxDiscountPercent !== currentPolicy.maxDiscountPercent ||
+            nextPolicy.maxFixedAmountMinor !== currentPolicy.maxFixedAmountMinor ||
+            nextPolicy.allowZeroTotal !== currentPolicy.allowZeroTotal ||
+            nextPolicy.minOrderTotalAfterDiscountMinor !==
+              currentPolicy.minOrderTotalAfterDiscountMinor;
 
           if (nextEnabled !== currentEnabled) {
             await deps.settings.set(PROMOTIONS_ENABLED_FLAG.key, nextEnabled, tx);
           }
-          if (nextMaxDiscountPercent !== currentPolicy.maxDiscountPercent) {
-            await deps.settings.set(
-              PROMOTIONS_POLICY_SETTING.key,
-              { maxDiscountPercent: nextMaxDiscountPercent },
-              tx,
-            );
+          if (policyChanged) {
+            await deps.settings.set(PROMOTIONS_POLICY_SETTING.key, nextPolicy, tx);
           }
 
+          const maxDiscountBps = percentToBps(nextPolicy.maxDiscountPercent);
           await deps.audit.record(
             {
               category: "admin",
@@ -2753,7 +3195,11 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
               resource: { type: "setting", id: "promotions.policy" },
               attributes: {
                 enabled: nextEnabled,
-                maxDiscountPercent: nextMaxDiscountPercent,
+                maxDiscountPercent: nextPolicy.maxDiscountPercent,
+                maxDiscountBps,
+                maxFixedAmountMinor: nextPolicy.maxFixedAmountMinor,
+                allowZeroTotal: nextPolicy.allowZeroTotal,
+                minOrderTotalAfterDiscountMinor: nextPolicy.minOrderTotalAfterDiscountMinor,
               },
             },
             tx,
@@ -2761,7 +3207,11 @@ export function createPromotionsService(deps: ModuleDeps): PromotionsService {
 
           return {
             enabled: nextEnabled,
-            maxDiscountPercent: nextMaxDiscountPercent,
+            maxDiscountPercent: nextPolicy.maxDiscountPercent,
+            maxDiscountBps,
+            maxFixedAmountMinor: nextPolicy.maxFixedAmountMinor,
+            allowZeroTotal: nextPolicy.allowZeroTotal,
+            minOrderTotalAfterDiscountMinor: nextPolicy.minOrderTotalAfterDiscountMinor,
           };
         });
       },

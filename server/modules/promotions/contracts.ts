@@ -1,9 +1,9 @@
 /**
  * Promotions module — shared TypeScript view and port types (types only, zero runtime imports).
- * Owner: siem_engineer (Increment 05, Package C1). Safe for client `import type`.
+ * Owner: siem_engineer (Increment 05 C1, Increment 06 D5). Safe for client `import type`.
  */
 
-export type PromoDiscountType = "percent" | "fixed";
+export type PromoDiscountType = "percent" | "fixed" | "set_total";
 export type PromoScopeKind = "all" | "products" | "tiers" | "packets";
 export type PromoTierKey = "Basic" | "Standard" | "Premium";
 export type PromoStatus = "active" | "paused" | "revoked";
@@ -15,6 +15,18 @@ export type PromoDerivedStatus =
   | "expired"
   | "exhausted";
 export type PromoRedemptionStatus = "redeemed" | "released";
+
+export type PromoLimitKey =
+  | "maxDiscountPercent"
+  | "maxFixedAmountMinor"
+  | "allowZeroTotal"
+  | "minOrderTotalAfterDiscountMinor";
+
+export type PromoLimitReasonCode =
+  | "PROMO_LIMIT_MAX_PERCENT"
+  | "PROMO_LIMIT_MAX_FIXED"
+  | "PROMO_LIMIT_ZERO_TOTAL"
+  | "PROMO_LIMIT_MIN_TOTAL";
 
 export type PromotionScope =
   | { kind: "all" }
@@ -42,6 +54,16 @@ export interface PromotionContext {
   bundleLabel: string | null;
 }
 
+export interface PromotionLineAllocation {
+  lineIndex: number;
+  productPublicId: string;
+  grossMinor: number;
+  bundleDiscountMinor: number;
+  promoDiscountMinor: number;
+  discountMinor: number;
+  netMinor: number;
+}
+
 export interface PromotionOutcome {
   promoPublicId: string;
   /** Customer-facing label. */
@@ -50,12 +72,18 @@ export interface PromotionOutcome {
   promoDiscountMinor: number;
   /** 0 when `combineWithBundle = false` and the code replaced the bundle discount. */
   bundleDiscountMinor: number;
-  /** Combined capped discount (`promoDiscountMinor + bundleDiscountMinor`) to store on the order. */
+  /** Combined discount (`promoDiscountMinor + bundleDiscountMinor`) to store on the order. */
   discountMinor: number;
   /** Combined label for order and invoice. */
   discountLabel: string;
   /** `subtotalMinor - discountMinor` (>= 0). */
   totalMinor: number;
+  /**
+   * Per-line minor-unit allocation (`sum(discountMinor) === outcome.discountMinor`,
+   * `sum(netMinor) === outcome.totalMinor`, every `netMinor >= 0`, remainder on last line).
+   * Always populated by `promotions.preview` / `promotions.redeemInTx`.
+   */
+  lineAllocations?: PromotionLineAllocation[];
 }
 
 export interface PromotionView {
@@ -66,6 +94,8 @@ export interface PromotionView {
   percentBps: number | null;
   maxDiscountMinor: number | null;
   amountMinor: number | null;
+  /** Target order total in minor units (`>= 0`) when `type === "set_total"`, `null` otherwise. Always returned by server. */
+  setTotalMinor?: number | null;
   currency: string | null;
   scope: PromotionScope;
   minSubtotalMinor: number;
@@ -85,6 +115,8 @@ export interface PromotionView {
   codePrefix: string | null;
   batchSize: number;
   redemptionCount: number;
+  /** True when this promotion can bring an order total to 0 minor units. Always returned by server. */
+  canReachZero?: boolean;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -126,6 +158,10 @@ export interface PromotionStatsView {
 export interface PromotionsSettingsView {
   enabled: boolean;
   maxDiscountPercent: number;
+  maxDiscountBps: number;
+  maxFixedAmountMinor: number | null;
+  allowZeroTotal: boolean;
+  minOrderTotalAfterDiscountMinor: number;
 }
 
 export interface PromotionCsvExportView {
