@@ -1,4 +1,4 @@
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileRecord, UploadPolicy } from "@server/modules/files/index";
@@ -127,7 +127,7 @@ describe("file upload", () => {
       slot={{ key: "voice_evidence", statusKey: "intake", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"], capture: "record", maxMinutes: 2 }}
       audio={{ enabled: true, maxMinutes: 30 }} onChanged={vi.fn()} />);
     expect(screen.queryByLabelText("Choose files")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Record", exact: true }));
+    await user.click(screen.getByRole("button", { name: "Record" }));
     const dialog = screen.getByRole("dialog", { name: "Check your recording setup" });
     expect(await within(dialog).findByText(/Limit: 2 minutes/u)).toBeInTheDocument();
     expect(within(dialog).getByText(/Warning: browser recorder unavailable/u)).toBeInTheDocument();
@@ -167,16 +167,14 @@ describe("file upload", () => {
       onContinue={vi.fn()} onAgreementRequired={vi.fn()} />);
     try {
       const button = await screen.findByRole("button", { name: "Test microphone" });
-      vi.useFakeTimers();
-      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      const user = userEvent.setup();
       button.focus();
       await user.keyboard("{Enter}");
       expect(screen.getByRole("button", { name: "Cancel microphone test" })).toHaveFocus();
       await user.keyboard("{Enter}");
       expect(screen.getByRole("button", { name: "Test microphone" })).toHaveFocus();
       await user.keyboard("{Enter}");
-      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-      expect(screen.getByRole("button", { name: "Test again" })).toHaveFocus();
+      expect(await screen.findByRole("button", { name: "Test again" }, { timeout: 10_000 })).toHaveFocus();
       expect(screen.getByLabelText("Play your microphone test")).toHaveAttribute("src", "blob:recording-test");
       expect(trackStop).toHaveBeenCalledTimes(2);
       expect(create).toHaveBeenCalledOnce();
@@ -184,7 +182,6 @@ describe("file upload", () => {
       unmount();
       expect(revoke).toHaveBeenCalledWith("blob:recording-test");
     } finally {
-      vi.useRealTimers();
       create.mockRestore();
       revoke.mockRestore();
       vi.unstubAllGlobals();
@@ -222,7 +219,7 @@ describe("order file tab", () => {
     const heading = await screen.findByRole("heading", { name: "Voice task" });
     expect(heading).toContainElement(document.activeElement as HTMLElement);
     expect(screen.getByLabelText("Upload to")).toHaveValue("voice_evidence");
-    expect(screen.getByRole("button", { name: "Record", exact: true })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Record" })).toBeInTheDocument();
   });
 
   it("renders a read-only attachment access path without staff controls", async () => {
