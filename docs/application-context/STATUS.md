@@ -407,6 +407,7 @@ Defects found in lead QA and fixed before merge:
 - **Tick box shown for a typed-name gate:** `/accept-policy` and the policy prompt showed only a tick box when the gate required a typed name, so the customer could not accept (compliance_engineer, `672e900`; UI feedback `7a39164` and `4810201`; rechecked live by the lead).
 - **Prompt re-opening:** the policy prompt re-opened on every navigation after "Later" (`39fb16e`).
 - **Notice copy:** singular and plural in the notice dialog (`7a39164`).
+- **CodeQL on PR #13:** two findings at or above the gate were fixed before merge: table-cell escaping in the document importer and a check-then-read race on the brand logo file (`a10cc50`, with an escape-aware table reader shared by the policy renderer and the Markdown importer). Policy links now also refuse backslash-prefixed paths (`d14a34c`). All four workflows (ci, security, container, native-install) passed at `d14a34c`.
 - **Test timeouts:** hardened (`0e63c94`, `4614c02`).
 - **Layout and focus:** the PageHeader wrap and the install dialog focus (`751fccc`, `80af96e`).
 
