@@ -500,8 +500,12 @@ export function createAdminService(i: AuthInternals, auth: AuthService) {
         const row = await repo.byId(principal.userId, { tx, forUpdate: true });
         if (!row) throw notFound("USER_NOT_FOUND");
         await tx.update(users).set({ ...nameColumns(deps.crypto, row.publicId, input.name), version: row.version + 1 }).where(eq(users.id, row.id));
+        // D11 (increment 06): signature-name checks link here; the audit says THAT the name changed, never the name.
         await deps.audit.record(
-          { category: "business", eventName: "identity.profile.updated", action: "update", outcome: "completed", resource: { type: "user", publicId: row.publicId } },
+          {
+            category: "business", eventName: "identity.profile.updated", action: "update", outcome: "completed",
+            resource: { type: "user", publicId: row.publicId }, attributes: { name_changed: true },
+          },
           tx,
         );
       });

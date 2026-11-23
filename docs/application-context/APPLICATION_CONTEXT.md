@@ -180,6 +180,34 @@ Requested by the owner on 2026-11-22 (prompt 21). The contract is [INCREMENT_05_
 | Discount codes (`promotions`, `orders`, `cart`, `compliance`) | Codes, batches and fragment links. Redemption is atomic inside order creation through `services.promotions` (`preview`, `redeemInTx`, `releaseForOrderInTx`). A global guard caps the discount, refusals are uniform, and there is a rate limit and pause. The invoice shows the discount label ([ADR 0044](../adr/0044-discount-codes.md)). | `feature.promotions`, off; `promotions.policy` (`maxDiscountPercent`, default 50). Pages `/admin/promotions` and `/promo` (link `/promo#promo=<CODE>`, kept in sessionStorage `rp.promotions.savedCode`). Procedures `promotions.admin.*`, `cart.applyCode`, `cart.removeCode` and `orders.quoteWithPromo` (POST; there is no separate customer code-check endpoint). Needs `promotions.read` (staff) or `promotions.manage` (administrators, step-up). A redemption is released only for a cancelled order with nothing paid, no payable invoice, no pending capture and no payment attempt ever created. |
 | Acceptance log centre (`compliance`) | A read view over `policy_acceptances` and `order_policy_acceptances`: Log, Coverage and Policy updates tabs, and a customer profile Policies tab ([ADR 0045](../adr/0045-policy-acceptance-log-centre.md)). | Always on. Pages `/admin/policy-acceptances` (`/coverage`, `/updates`, `/versions/:versionId`) and the customer tab "policies". Procedures `compliance.policies.admin.acceptanceLog.*`. Reading needs `policies.acceptances.read`; export needs `policies.acceptances.export` (step-up, at most 5,000 rows). Typed names are shown only with `policies.manage`. |
 
+## Increment 06: recording, phase tasks, reports, protection, policies, receipts, PWA
+
+The owner requested this on 2026-11-23 (prompt 23, fifteen items). The contract is [INCREMENT_06_CONTRACT.md](../engineering/INCREMENT_06_CONTRACT.md), decisions D1–D15. Migration `0006_increment_06` is additive (17 new tables, 13 added columns on 8 tables, one enum widening). It needs Node ≥ 22.13 < 23.
+
+Defaults rule: features that are safe and need no configuration are on after upgrade. Features that can lock people out, or that need the owner's choice, are off until configured: policy enforcement, the MNDA gate and cart suggestions. The admin guide's "Where to switch things on" table lists every switch.
+
+Verification status:
+
+- **Checked in the lead's QA run.** All fifteen items (D1–D15) were checked live by the lead in a real Chromium browser against a QA build with synthetic data. See [STATUS.md](STATUS.md#verified-for-increment-06-integrators-own-runs).
+- **Not verified:**
+  - real Stripe or Square;
+  - receipt e-mail delivery;
+  - physical Apple, Android and Windows devices;
+  - live automatic bans.
+- **Gates:** type check clean, lint clean (zero warnings), full suite 203 of 203 files and 2,599 tests passed (4 todo) at `8243000`, `pnpm audit --prod` clean, gitleaks clean at `84f7379`. Merged through PR #13.
+
+| Area | What it does | Switch and guard |
+| --- | --- | --- |
+| Recording (`files`) | The format is chosen at runtime, with a device fallback. A preflight runs before recording, and the server converts to WebM/Opus (a re-encode; the original is kept) ([ADR 0047](../adr/0047-recording-and-preflight.md)). | `files.audio_conversion`, on (128 kbps, 30 min). `files.recording.preflight`. |
+| PWA (client, `deploy`) | Manifest, install entry for each platform, and a service worker limited to an allowlisted public static precache, network-only otherwise. Native apps later reuse API v1 ([ADR 0048](../adr/0048-pwa.md)). | Always on. No `assetlinks.json` or `apple-app-site-association` until an app exists. |
+| Reports (`reports`) | Built-in reports, plus custom reports compiled from whitelisted datasets to parameterised queries ([ADR 0049](../adr/0049-reports.md)). | `reports.read` (staff and administrators), `reports.manage`, `reports.export` (step-up). `report_definitions`. |
+| Sign-in bans and incidents (`protection`, `identity`, `audit`, `siem`) | Escalating IP bans with lock-out guards, rate-limit back-off and correlated incidents forwarded to the SIEM ([ADR 0050](../adr/0050-signin-bans-backoff-correlation.md)). | `protection.signin_bans`, on. `security.incidents.read`. |
+| Phase tasks (`orders`, `files`) | Upload, acknowledge, record and respond to a document, with per-task type restrictions enforced on the server ([ADR 0051](../adr/0051-phase-tasks.md)). | Workflow designer. Waivers need `orders.phase.unlock`. Package `formatVersion` 2. |
+| Word editing (client `docedit`/`docconvert`, `files`) | Browser-only conversion. Every save is a new version linked to its source, with stated limits ([ADR 0052](../adr/0052-word-editing-in-portal.md)). | `files.document_editing`, on. |
+| Policies (`compliance`, `identity`, `jobs`, `orders`) | Import, timed update notices, enforcement with session end and an `accept_policy` remediation step, a typed-name check, and the order agreement gate ([ADR 0053](../adr/0053-policy-notices-and-enforcement.md)). | `compliance.signature_name_check`, `require`. Enforcement `none`. `orders.agreement_gate`, off. `policies.notices.send` (step-up). |
+| Receipts and small totals (`compliance`, `payments`, `jobs`) | One receipt per confirmed payment, with a PDF snapshot, e-mail and portal list. Amounts below the provider minimum are waived or blocked ([ADR 0054](../adr/0054-receipts.md)). | `payments.receipts`, on. `payments.small_totals`, `waive`. |
+| Discount limits (`promotions`, `cart`) | Percentages with two decimals up to 100 %, a fixed cap, zero totals and the new `set_total` kind. | `promotions.policy` (old values still parse). |
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

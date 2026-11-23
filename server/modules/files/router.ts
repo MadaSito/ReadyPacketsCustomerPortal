@@ -6,19 +6,29 @@ import { z } from "zod";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { fileVisibilities } from "./schema.js";
-import { audioRulesSchema, fileRulesSchema } from "./settings.js";
+import { audioRulesSchema, documentEditingRulesSchema, fileRulesSchema, slotKeySchema } from "./settings.js";
 
 const id = z.string().length(26).regex(ULID_PATTERN);
 const file = z.strictObject({ fileId: id });
+const document = z.strictObject({ orderPublicId: id, filePublicId: id, taskKey: slotKeySchema.optional() });
 
 export const filesRouter = router({
+  recording: router({
+    preflight: protectedProcedure
+      .input(z.strictObject({ orderPublicId: id, slotKey: slotKeySchema.optional() }))
+      .query(({ ctx, input }) => ctx.services.files.recordingPreflight(ctx.session, input.orderPublicId, input.slotKey)),
+  }),
+  document: router({
+    status: protectedProcedure.input(document).query(({ ctx, input }) => ctx.services.files.documentStatus(ctx.session, input)),
+    versions: protectedProcedure.input(document).query(({ ctx, input }) => ctx.services.files.listDocumentVersions(ctx.session, input)),
+  }),
   list: protectedProcedure.input(z.strictObject({
     orderId: id,
     cursor: z.string().length(35).optional(),
     limit: z.number().int().min(1).max(100).optional(),
     includeVersions: z.boolean().optional(),
     includeDeleted: z.boolean().optional(),
-  })).query(({ ctx, input }) => ctx.services.files.list(ctx.session, input.orderId, input)),
+  })).query(({ ctx, input }) => ctx.services.files.list(ctx.session, input.orderId, { ...input, preferConvertedAudio: true })),
   issueDownloadTicket: protectedProcedure.meta({ rateLimit: "expensive" }).input(file)
     .mutation(({ ctx, input }) => ctx.services.files.issueDownloadTicket(ctx.session, input.fileId)),
   readTranscript: protectedProcedure.meta({ rateLimit: "expensive" }).input(file)
@@ -36,5 +46,7 @@ export const filesRouter = router({
       .mutation(({ ctx, input }) => ctx.services.files.setTypeRules(ctx.session, input)),
     setAudioRules: adminProcedure.use(requireCapability("platform.settings.manage")).input(audioRulesSchema)
       .mutation(({ ctx, input }) => ctx.services.files.setAudioRules(ctx.session, input)),
+    setDocumentEditingRules: adminProcedure.use(requireCapability("platform.settings.manage")).input(documentEditingRulesSchema)
+      .mutation(({ ctx, input }) => ctx.services.files.setDocumentEditingRules(ctx.session, input)),
   }),
 });

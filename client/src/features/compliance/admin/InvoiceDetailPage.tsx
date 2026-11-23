@@ -139,6 +139,7 @@ export default function InvoiceDetailPage() {
                         ]),
                     { label: "Tax", value: m(invoice.taxMinor) },
                     { label: "Total", value: m(invoice.totalMinor) },
+                    ...((invoice.waivedMinor ?? 0) > 0 ? [{ label: "Amount waived", value: m(invoice.waivedMinor) }] : []),
                     { label: "Paid", value: m(invoice.grossPaidMinor) },
                     { label: "Refunded", value: m(invoice.refundedMinor) },
                     { label: "Net paid", value: m(invoice.netPaidMinor) },

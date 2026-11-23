@@ -7,7 +7,7 @@ export const EDGE_STATIC_PER_WINDOW = 900;
 const WINDOW_MS = 10_000;
 const NOTE_WINDOW_MS = 60_000;
 export type AdmissionBucket = "edge_requests" | "edge_static";
-export type RateLimitBucket = AdmissionBucket | RateLimitCategory | "unclassified";
+export type RateLimitBucket = AdmissionBucket | RateLimitCategory | "signin_ban" | "unclassified";
 
 /** Only canonical, flat, read-only build/static paths get the separate budget. */
 export function edgeAdmissionBucket(method: string, path: string): AdmissionBucket {

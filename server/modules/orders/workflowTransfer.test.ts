@@ -15,6 +15,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { createOrdersModule, type OrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
 import { orderWorkflowDrafts, orderWorkflows, orderWorkflowVersions } from "./schema.js";
+import { ORDER_WORKFLOW_TRANSFER_ENABLED } from "./settings.js";
 import { toDraft } from "./workflowDesign.js";
 import { DEFAULT_WORKFLOW } from "./workflowTypes.js";
 import { canonicalJson, jsonDepth, packageDigest } from "./workflowTransfer.js";
@@ -114,12 +115,30 @@ describe("workflow transfer: authorisation and switch", () => {
     // The service re-checks persisted step-up in the transaction (zero trust), not just the session snapshot.
     await expectError(transfer().preview(adminNoStepUp.principal, { packageText: "{}" }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
     await expectError(transfer().exportPackage(staff.principal, { selection: { all: true } }), "FORBIDDEN:ACTOR_NOT_AUTHORIZED");
-    expect(await call(admin).admin.workflows.transfer.status()).toEqual({ enabled: true, canExport: true, canImport: true, maxBytes: 2_097_152, maxWorkflows: 50 });
+    expect(await call(admin).admin.workflows.transfer.status()).toEqual({ enabled: true, canToggle: true, canExport: true, canImport: true, maxBytes: 2_097_152, maxWorkflows: 50 });
     // A body over 2 MiB is refused by the input schema before the service.
     await expect(call(admin).admin.workflows.transfer.preview({ packageText: "x".repeat(2_097_153) })).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
-  it("off by default: every step is refused and status says so", async () => {
+  it("D10: on by default; the on-page switch is admin-only, audited and needs no other setting", async () => {
+    expect(ORDER_WORKFLOW_TRANSFER_ENABLED.default).toBe(true);
+    await h.settings.set("orders.workflow_transfer.enabled", false);
+    await expect(call(null).admin.workflows.transfer.setEnabled({ enabled: true })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    for (const user of [alice, staff]) await expect(call(user).admin.workflows.transfer.setEnabled({ enabled: true })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    // Zero trust: the service re-checks persisted authority even when the router is bypassed.
+    await expect(transfer().setEnabled(staff.principal, { enabled: true })).rejects.toBeInstanceOf(DomainError);
+    await expect(transfer().setEnabled(alice.principal, { enabled: true })).rejects.toBeInstanceOf(DomainError);
+    expect((await transfer().status(admin.principal)).enabled).toBe(false);
+    await expect(call(admin).admin.workflows.transfer.setEnabled({ enabled: true, extra: 1 } as never)).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    h.audit.events.length = 0;
+    expect(await call(admin).admin.workflows.transfer.setEnabled({ enabled: true })).toEqual({ enabled: true, changed: true });
+    const event = h.audit.events.find((candidate) => candidate.eventName === "workflow.transfer_setting_changed");
+    expect(event?.attributes).toMatchObject({ setting_key: "orders.workflow_transfer.enabled", from_value: "false", to_value: "true", via: "workflows_page" });
+    expect((await transfer().status(admin.principal)).enabled).toBe(true);
+    expect(await transfer().setEnabled(admin.principal, { enabled: true })).toEqual({ enabled: true, changed: false });
+  });
+
+  it("when switched off: every step is refused and status says so", async () => {
     await h.settings.set("orders.workflow_transfer.enabled", false);
     expect((await transfer().status(admin.principal)).enabled).toBe(false);
     await expectError(transfer().exportPackage(admin.principal, { selection: { all: true } }), "FORBIDDEN:WORKFLOW_TRANSFER_DISABLED");
@@ -142,7 +161,7 @@ describe("workflow transfer: export", () => {
     const { fileName, packageText } = await transfer().exportPackage(admin.principal, { selection: { all: true } });
     expect(fileName).toMatch(/^readypackets-workflows-\d{8}-\d{4}\.json$/);
     const pkg = JSON.parse(packageText) as Pkg;
-    expect(pkg).toMatchObject({ format: "readypackets.workflows", formatVersion: 1, source: { release: expect.any(String), label: expect.any(String) }, integrity: { algorithm: "sha256" } });
+    expect(pkg).toMatchObject({ format: "readypackets.workflows", formatVersion: 2, source: { release: expect.any(String), label: expect.any(String) }, integrity: { algorithm: "sha256" } });
     expect(pkg.integrity.digest).toBe(packageDigest(pkg.workflows, pkg.references));
     expect(pkg.workflows.map((workflow) => [workflow.key, workflow.unpublished])).toEqual([
       ["intake", false],
@@ -254,7 +273,7 @@ describe("workflow transfer: import abuse cases (§4)", () => {
     await structural(`[${"0,".repeat(600_000)}0]`, "VALIDATION:PACKAGE_TOO_LARGE");
     await structural(`{${Array.from({ length: 210_000 }, (_, i) => `"${i.toString(36)}":0`).join(",")}}`, "VALIDATION:PACKAGE_TOO_LARGE");
     const pkg = await exportAll();
-    await structural(JSON.stringify({ ...pkg, formatVersion: 2 }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
+    await structural(JSON.stringify({ ...pkg, formatVersion: 3 }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
     await structural(JSON.stringify({ ...pkg, format: "something.else" }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
   });
 
@@ -349,5 +368,39 @@ describe("workflow transfer: import abuse cases (§4)", () => {
     const removedDraft = await mod.workflows.getDraft(removed.results[0]!.draftPublicId!);
     expect(removedDraft.definition.acceptanceGates ?? []).toEqual([]);
     expect(h.audit.events.filter((e) => e.eventName === "workflow.imported").at(-1)).toMatchObject({ attributes: { gates_removed: true } });
+  });
+});
+
+describe("workflow transfer: format version 2 (increment 06, D8)", () => {
+  const tasks = {
+    uploads: [{ key: "voice", label: "Voice note", kind: "audio" as const, minCount: 1, maxCount: 1, allowedTypes: ["mp3", "m4a"], uploadedBy: ["customer" as const], capture: "record" as const, maxMinutes: 5 }],
+    acknowledgements: [{ key: "brief_note", title: "Your brief", body: "Please confirm the brief below.", acceptedBy: "customer" as const, requireTypedName: false, source: "order_note" as const }],
+    documents: [{ key: "contract", label: "Contract", responseModes: ["edit_in_portal" as const, "acknowledge" as const], required: true, allowedTypes: ["docx"] }],
+  };
+
+  it("exports version 2 and round-trips customer tasks", async () => {
+    await clearDrafts();
+    const pkg = await exportAll();
+    expect(pkg.formatVersion).toBe(2);
+    const workflow = pkg.workflows[0] as { definition: { states: { requirements?: unknown }[] } };
+    workflow.definition.states[1]!.requirements = tasks;
+    const preview = await transfer().preview(admin.principal, { packageText: seal(pkg) });
+    expect(preview.blocking).toEqual([]);
+    expect(preview.workflows.every((entry) => entry.valid)).toBe(true);
+  });
+
+  it("still imports version 1 files; refuses unknown task fields", async () => {
+    await clearDrafts();
+    const v1 = await exportAll();
+    v1.formatVersion = 1;
+    const preview = await transfer().preview(admin.principal, { packageText: seal(v1) });
+    expect(preview.formatVersion).toBe(1);
+    expect(preview.blocking).toEqual([]);
+    const bad = await exportAll();
+    (bad.workflows[0] as { definition: { states: { requirements?: unknown }[] } }).definition.states[1]!.requirements = {
+      ...tasks,
+      documents: [{ ...tasks.documents[0], script: "x" }],
+    };
+    await expectError(transfer().preview(admin.principal, { packageText: seal(bad) }), "VALIDATION:PACKAGE_INVALID");
   });
 });

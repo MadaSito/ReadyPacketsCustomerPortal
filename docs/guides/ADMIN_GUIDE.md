@@ -12,6 +12,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 
 ## Contents
 
+- [Where to switch things on](#where-to-switch-things-on)
 - [Step-up verification](#step-up-verification)
 - [First administrator and setup](#first-administrator-and-setup)
 - [Customers](#customers)
@@ -40,6 +41,9 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Cart suggestions](#cart-suggestions)
 - [Discount codes](#discount-codes)
 - [Policy acceptances](#policy-acceptances)
+- [Reports](#reports)
+- [Security incidents](#security-incidents)
+- [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
 
@@ -48,6 +52,9 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Upgrade to increment 06 and migration `0006`](../operations/UPGRADE.md#increment-06-and-migration-0006): new headers for the installable app, and larger upload limits for recordings.
+- [Customer tasks and the order agreement (MNDA)](./WORKFLOW_CUSTOMER_TASKS.md) (increment 06): tasks per status, designer findings, the export/import switch and the agreement gate.
+- [Security incidents help](./SECURITY_INCIDENTS_HELP.md) (increment 06).
 - [Cart suggestions](#cart-suggestions), [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
 - [Workflow export and import](./WORKFLOW_TRANSFER.md) (increment 05): move workflows between portals as drafts; enable `orders.workflow_transfer.enabled` first.
 - [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md): configure order phases, requirements and staff actions.
@@ -310,6 +317,71 @@ On a customer's page (`/admin/customers/:customerId`), the **Policies** tab show
 - the status of each active policy: **Accepted — Current version**, **Update pending**, **Pending — Not yet accepted** or **Not required**;
 - the customer's full acceptance history, with **View evidence** and links to the exact text of each version.
 
+## Reports
+
+Open **Overview → Reports** (`/admin/reports`). Reports are on by default ([ADR 0049](../adr/0049-reports.md)). Full notes are in the [reports console notes](../../client/src/features/reports/ADMIN_GUIDE_SECTION.md).
+
+### Built-in reports
+
+Staff and administrators with `reports.read` can run eight built-in reports: Orders, Customers, Referrals, Support tickets, Payments and discounts, Carts, Files and recordings, and Sign-ins and security.
+
+- **Range.** Choose a preset (last 7, 30, 90 or 365 days) or UTC dates up to 732 days apart, and a time bucket (hour, day, week or month).
+- **Comparison.** You can compare with the previous period.
+- **Display.** Each panel has a plain-language summary, a chart and a **Chart / Table** switch, so every figure can be read as a table.
+- **Personal fields.** Staff never see personal fields such as customer names, e-mails or countries; a note says when columns are hidden.
+
+### Custom reports
+
+Custom reports are for administrators with `reports.manage`. Choose **New custom report**.
+
+1. **Dataset.** Pick one dataset from a fixed list; there is no free-form query.
+2. **Mode.** Choose **Detail rows** (up to 20 columns) or **Group & aggregate** (up to 4 groupings and 6 totals: count, count distinct, sum, average, minimum, maximum).
+3. **Filters.** Add up to 16 typed filters. Money is entered in minor units: `1250` is $12.50.
+4. **Sort and display.** Add up to 4 sort rules and a screen row limit of up to 5,000. Then choose a table, bar, line or donut chart.
+5. **Preview and save.** **Run preview**, then save as **Private** or **Shared**.
+   - Every administrator can run and duplicate a shared report, but only its owner can edit or delete it.
+   - A report that uses a field removed in a later release is marked **Needs update**.
+
+### Export and limits
+
+- **CSV export** needs `reports.export` (administrators) and step-up. It holds at most 100,000 rows or 16 MiB and is marked truncated when a cap is hit. Values that look like spreadsheet formulas are neutralised.
+- **Run limits.** Each person can run one report at a time and up to 10 a minute. A run stops after 15 seconds; if that happens, narrow the range or add filters.
+- **Audit.** Runs and exports are recorded as `report.run` and `report.exported`, with the report and filter fields but never the values. Changes to saved reports are recorded as `report.definition.*`. Run history is kept for 90 days.
+
+## Security incidents
+
+Open **Audit centre → Incidents** (`/admin/audit/incidents`). You need `security.incidents.read`. The design is in [ADR 0050](../adr/0050-signin-bans-backoff-correlation.md), and step-by-step help is in [Security incidents help](./SECURITY_INCIDENTS_HELP.md).
+
+The portal correlates security events every minute and opens an incident when a rule's threshold is crossed. The rules cover:
+
+- many failed sign-ins for one account;
+- password spraying across accounts;
+- credential stuffing;
+- a successful sign-in after failures;
+- repeated MFA denials;
+- repeated rate limiting;
+- ban evasion;
+- a role change followed by an export.
+
+### Working an incident
+
+- **Open** an incident to see its severity, status, the number of accounts and addresses, the correlated events and a timeline.
+- **Acknowledge** it. New evidence still joins it.
+- **Close** it with a reason: resolved, false positive, duplicate or accepted risk. Later activity opens a new incident.
+- **Ban IP address** (15 minutes, 1 hour, 1 day, 7 days or permanent, with a reason) or **End sessions** for the affected person.
+  - Both need step-up and are audited.
+  - The address is never shown; the server takes it from the events.
+  - Release bans on **Protection → Bans** (`/admin/protection/bans`).
+- **Ban this IP** is also offered in an audit event's details when the event recorded an address. This needs the firewall-manage permission.
+
+### Correlation rules and bans
+
+- **Correlation rules.** The **Correlation rules** card switches rules on or off and sets each rule's severity, threshold and window. This needs the firewall-manage permission and step-up. Severity rises one level at three times the threshold.
+- **Automatic sign-in bans.** These are set on **Protection → Bans** (`/admin/protection/bans`). Back-off is set on **Protection → Rate limits** (`/admin/protection/rate-limits`).
+- **Proxy warning.** If client addresses cannot be determined behind your proxy, a warning appears, and banning pauses until the trusted-proxy settings are fixed.
+- **Break-glass.** A server command lists and clears bans without the web UI ([ADR 0050](../adr/0050-signin-bans-backoff-correlation.md)).
+- **SIEM.** Incidents and bans are audit events (`security.incident.*`, `security.ban.*`), so SIEM and syslog receivers get them.
+
 ## Storage copy log
 
 Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The log tracks attempts to copy order files, off-site backup archives and SharePoint order data. History begins at rollout; it does not reconstruct older attempts.
@@ -318,6 +390,52 @@ Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The
 - **Read the result**: **Written** means the provider accepted the write, not that a separate check confirmed it. **Verified** means a checksum matched or the provider read-back confirmed the result recorded by that integration. SharePoint checks the order identifier, not the full record, so its writes are recorded as **Written**, not **Verified**. **Not written** can mean canceled or no change was needed. An interrupted job without a confirmed outcome is shown as **Failed**; check the provider before assuming nothing was written.
 - **Investigate and retry**: A **Copies failing** signal in System health flags recent recorded failures or unconfirmed outcomes. Select **View audit trail** in **Details** to search the Audit centre by correlation ID. For an eligible failed backup copy, **Retry backup copy** requires step-up verification and queues a new job; the original remains in the history. For other failed attempts, use the source module's recovery process.
 - **Export**: **Export CSV** downloads up to the 1,000 newest matching attempts and records an audit event. Narrow the date range or other filters if the export is truncated. Handle the file as an operational log; it contains customer-resource and destination identifiers.
+
+## Where to switch things on
+
+<!-- platform_engineer: paths checked against the client route definitions on feat/increment-06. -->
+
+Each feature's switch is on the page where you use it and in **Platform → Settings** (`/admin/settings`). Every switch needs step-up and is audited. Turning a feature off breaks nothing; existing records stay.
+
+### On after upgrade
+
+These features are on after the increment 06 upgrade, because they need no configuration.
+
+| Feature | Setting | Where to switch it |
+| --- | --- | --- |
+| Audio recording and conversion to WebM | `files.audio_conversion` (`enabled`) | Files (`/admin/files`) |
+| Editing Word documents in the portal | `files.document_editing` (`enabled`) | Files (`/admin/files`) |
+| Workflow export and import | `orders.workflow_transfer.enabled` | Workflows (`/admin/workflows`); see [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md) |
+| Receipts and receipt e-mail | `payments.receipts` | Payments (`/admin/payments`) |
+| Totals below the card minimum (waive or block) | `payments.small_totals` (`waive`) | Payments (`/admin/payments`) |
+| Reports | none needed; access through `reports.read` | Reports (`/admin/reports`) |
+| Install app prompt | none needed | Account menu |
+| Typed-name check on signatures | `compliance.signature_name_check` (`require`) | Policies (`/admin/policies`) |
+| Relaxed discount limits | `promotions.policy` (`maxDiscountPercent` 100, `allowZeroTotal` true) | Discount codes (`/admin/promotions`) → Limits |
+| Automatic sign-in bans | `protection.signin_bans` (`enabled`) | Protection → Bans (`/admin/protection/bans`) |
+| Rate-limit back-off | rate-limit back-off settings | Protection → Rate limits (`/admin/protection/rate-limits`) |
+
+### Off until you configure them
+
+These features are off until you configure them, because they can lock people out or need your choice.
+
+| Feature | Setting | Where to switch it |
+| --- | --- | --- |
+| Cart | `feature.cart` | Platform → Feature flags (`/admin/settings/features`), or offered on Cart suggestions |
+| Cart suggestions | `feature.cart.upsell` | Cart suggestions (`/admin/carts/suggestions`) → "Show suggestions in the cart"; seeded offers start disabled |
+| Discount codes | `feature.promotions` | Discount codes (`/admin/promotions`) |
+| Policy enforcement (end sessions) | per policy `enforcement.mode` | Policies (`/admin/policies`), on each policy |
+| Order agreement (MNDA) | `orders.agreement_gate` | Policies (`/admin/policies`) → "Order agreement (MNDA)", or workflow settings; see [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md) |
+| Workflow phases and requirements | `orders.workflow_rules.enabled` | Platform → Settings (`/admin/settings`) |
+| Delegated console access | `orders.console_access.enabled` | Platform → Settings (`/admin/settings`) |
+| Knowledge Base and Help Centre | `feature.knowledge` | Platform → Feature flags (`/admin/settings/features`); content in `/admin/knowledge` |
+| Community forum | `feature.community` | Platform → Feature flags (`/admin/settings/features`); rules in `/admin/community/settings` |
+| Referrals | `feature.referrals` | Platform → Feature flags (`/admin/settings/features`); programme in `/admin/referrals` |
+| Inbound API v1 | `publicApi.enabled` | Platform → Settings, or API (`/admin/api`) |
+| Signed webhooks | `feature.integrations.webhooks` | Platform → Feature flags (`/admin/settings/features`); endpoints in `/admin/integrations/webhooks` |
+| Cookies and consent | `feature.privacy.consent` | Privacy (`/admin/privacy`) |
+| PostHog / Microsoft Clarity | `feature.integrations.posthog` / `feature.integrations.clarity` | Integrations → Analytics (`/admin/integrations/analytics`), after consent is configured |
+| Online payments | `payments.config.provider` (`none`) | Payments (`/admin/payments`) |
 
 ## Step-up verification
 
@@ -559,6 +677,7 @@ This is a business-data transfer between ReadyPackets installations, **not a bac
 - Checkpoints, held content and uncertain outcomes (`held-unknown`) are shown on the import page.
 - **Not transferred**: promotions (codes, batches, redemptions), cart upsell offers and carts. Recreate promotions
   on the target. Imported orders keep their promo discount amount and label as history.
+- **Not transferred (increment 06)**: the business export leaves out payment receipts and receipt refund notes, policy notices and enforcement records, security incidents, order task notes and waivers, and saved reports. The package manifest lists each exclusion. Backups include all of them.
 - **Workflows** are moved separately with workflow export/import (drafts only). Portable transfer carries the
   workflow key only as inert history.
 - **Backups** cover every table, but encrypted promo codes and keyed hashes restore correctly only with the same
@@ -663,6 +782,23 @@ automations:
 - **Inert preview & Send test to me:** Preview renders sample variables inside a sandboxed structure-only frame with no
   scripts, outbound links, or external image requests. **Send test to me** queues a `[TEST]`-prefixed message addressed
   solely to the signed-in administrator's own account.
+
+### Receipts and policy notices (increment 06)
+
+Payment receipts, policy update notices and policy enforcement warnings are editable system templates, each with HTML and plain text.
+
+**Receipt PDF:**
+
+- A receipt PDF of up to 690 KiB is attached to the customer's copy only.
+- A larger PDF is not attached. The customer still gets the e-mail, with a secure link to Invoices where they can download it.
+- Attachment bytes are never put in the audit copy, retained mail, development capture or logs.
+- A retry of the receipt reuses the same send intent, so the customer gets one receipt.
+- An authorised **Send again** creates its own audited resend.
+
+**Policy notice counts:**
+
+- **Sent** means the mail provider accepted the message. It does not mean the message was delivered or that the policy was accepted.
+- **Failed** includes messages whose outcome was not confirmed or is unknown. A failure never triggers an automatic resend.
 
 ## Installing as an app (PWA)
 

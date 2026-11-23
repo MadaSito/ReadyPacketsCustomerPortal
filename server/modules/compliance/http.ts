@@ -32,4 +32,36 @@ export function registerComplianceHttpRoutes(router: Router, services: Services)
       size: pdf.buffer.byteLength,
     });
   });
+
+  router.get("/receipts/:receiptId/pdf", async (req, res) => {
+    const principal = requireFullSession(req);
+    const receiptId = req.params.receiptId;
+    if (!receiptId || receiptId.length !== 26 || !ULID_PATTERN.test(receiptId)) {
+      throw notFound("RECEIPT_NOT_FOUND");
+    }
+
+    const pdf = await services.compliance.receipts.downloadReceiptPdf(principal, receiptId);
+    await sendPrivateDownload(res, {
+      stream: Readable.from(pdf.buffer),
+      filename: pdf.filename,
+      contentType: pdf.contentType,
+      size: pdf.buffer.byteLength,
+    });
+  });
+
+  router.get("/refund-notes/:noteId/pdf", async (req, res) => {
+    const principal = requireFullSession(req);
+    const noteId = req.params.noteId;
+    if (!noteId || noteId.length !== 26 || !ULID_PATTERN.test(noteId)) {
+      throw notFound("REFUND_NOTE_NOT_FOUND");
+    }
+
+    const pdf = await services.compliance.receipts.downloadRefundNotePdf(principal, noteId);
+    await sendPrivateDownload(res, {
+      stream: Readable.from(pdf.buffer),
+      filename: pdf.filename,
+      contentType: pdf.contentType,
+      size: pdf.buffer.byteLength,
+    });
+  });
 }

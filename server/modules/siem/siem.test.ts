@@ -1748,4 +1748,237 @@ describe("SIEM forwarding module (RFC 5425 TLS, mTLS, OTLP, outbox, authz, regre
 
     await siem.close!();
   });
+
+  it("delivers D7 security.incident.* and security.ban.* events over TLS JSONL with safe correlation attributes and zero address_ref/account_ref leakage", async () => {
+    const { h, siem, auditStream } = setupModule();
+    const admin = steppedUpAdmin(h.clock.now());
+
+    const serverCert = pki.issueServerCert({
+      commonName: "d7-jsonl.siem.test",
+      dnsNames: ["d7-jsonl.siem.test"],
+    });
+    const receiver = await startTlsReceiver({
+      certPem: serverCert.certPem,
+      keyPem: serverCert.keyPem,
+      mode: "lines",
+    });
+    activeServers.push(receiver);
+
+    const dest = await siem.createDestination(admin, {
+      name: "D7 Security Incidents & Bans",
+      enabled: true,
+      format: "jsonl_tls",
+      host: "d7-jsonl.siem.test",
+      port: receiver.port,
+      allowPrivateNetwork: true,
+      minSeverity: "INFO",
+      categories: ["security"],
+      secrets: { customCaPem: pki.ca.certPem },
+    });
+
+    const incidentPublicId = "01JEINCIDENT00000000000077";
+    auditStream.append({
+      event_name: "security.incident.opened",
+      action: "open",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "system",
+      resource_type: "security_incident",
+      resource_ref: "aabbccddeeff00112233445566778899",
+      correlation_id: incidentPublicId,
+      attributes: {
+        incident_public_id: incidentPublicId,
+        rule_key: "brute_force_account",
+        severity: "high",
+        status: "open",
+        event_count: 10,
+        account_count: 1,
+        address_count: 2,
+      },
+    });
+    auditStream.append({
+      event_name: "security.incident.updated",
+      action: "update",
+      severity_text: "ERROR",
+      severity_number: 17,
+      category: "security",
+      actor_role: "system",
+      resource_type: "security_incident",
+      resource_ref: "aabbccddeeff00112233445566778899",
+      correlation_id: incidentPublicId,
+      safe_counts: { events_added: 5 },
+      attributes: {
+        incident_public_id: incidentPublicId,
+        rule_key: "brute_force_account",
+        severity: "critical",
+        status: "open",
+        event_count: 15,
+        account_count: 1,
+        address_count: 3,
+        escalated: true,
+      },
+    });
+    auditStream.append({
+      event_name: "security.incident.acknowledged",
+      action: "acknowledge",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "admin",
+      resource_type: "security_incident",
+      resource_ref: "aabbccddeeff00112233445566778899",
+      correlation_id: incidentPublicId,
+      attributes: {
+        incident_public_id: incidentPublicId,
+        rule_key: "brute_force_account",
+        severity: "critical",
+        status: "acknowledged",
+        event_count: 15,
+        account_count: 1,
+        address_count: 3,
+      },
+    });
+    auditStream.append({
+      event_name: "security.incident.action",
+      action: "ban",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "admin",
+      resource_type: "security_incident",
+      resource_ref: "aabbccddeeff00112233445566778899",
+      correlation_id: incidentPublicId,
+      attributes: {
+        incident_public_id: incidentPublicId,
+        ban_public_id: "01JEBAN0000000000000000088",
+        rule_key: "brute_force_account",
+        severity: "critical",
+        status: "acknowledged",
+        event_count: 15,
+        account_count: 1,
+        address_count: 3,
+        action_kind: "ban_ip",
+        permanent: true,
+      },
+    });
+    auditStream.append({
+      event_name: "security.incident.closed",
+      action: "close",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "admin",
+      resource_type: "security_incident",
+      resource_ref: "aabbccddeeff00112233445566778899",
+      correlation_id: incidentPublicId,
+      attributes: {
+        incident_public_id: incidentPublicId,
+        rule_key: "brute_force_account",
+        severity: "critical",
+        status: "closed",
+        event_count: 15,
+        account_count: 1,
+        address_count: 3,
+        close_reason: "resolved",
+      },
+    });
+    auditStream.append({
+      event_name: "security.ban.created",
+      action: "create",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "system",
+      resource_type: "signin_ban",
+      resource_ref: "ffeeddccbbaa99887766554433221100",
+      attributes: {
+        ban_public_id: "01JEBAN0000000000000000088",
+        automatic: true,
+        address_ref: "0123456789abcdef0123456789abcdef",
+      },
+    });
+    auditStream.append({
+      event_name: "security.ban.released",
+      action: "release",
+      severity_text: "WARN",
+      severity_number: 13,
+      category: "security",
+      actor_role: "admin",
+      resource_type: "signin_ban",
+      resource_ref: "ffeeddccbbaa99887766554433221100",
+      attributes: {
+        ban_public_id: "01JEBAN0000000000000000088",
+        automatic: true,
+        address_ref: "0123456789abcdef0123456789abcdef",
+      },
+    });
+    auditStream.append({
+      event_name: "security.ban.policy_updated",
+      action: "update",
+      severity_text: "INFO",
+      severity_number: 9,
+      category: "security",
+      actor_role: "admin",
+      attributes: {
+        enabled: true,
+        threshold: 8,
+      },
+    });
+
+    const cycle = await siem.runDeliveryCycle({ destinationPublicId: dest.publicId });
+    expect(cycle.delivered).toBe(8);
+    await waitForCount(() => receiver.lines.length, 8);
+
+    const rawWire = receiver.lines.join("\n");
+    expect(rawWire).not.toContain("0123456789abcdef0123456789abcdef");
+    expect(rawWire).not.toContain("01JEBAN0000000000000000088");
+    expect(rawWire).not.toContain("203.0.113.77");
+    expect(rawWire).not.toContain("address_ref");
+    expect(rawWire).not.toContain("account_ref");
+
+    const parsed = receiver.lines.map((line) => JSON.parse(line) as ExternalAuditEvent);
+    expect(parsed.map((e) => e.event_name)).toEqual([
+      "security.incident.opened",
+      "security.incident.updated",
+      "security.incident.acknowledged",
+      "security.incident.action",
+      "security.incident.closed",
+      "security.ban.created",
+      "security.ban.released",
+      "security.ban.policy_updated",
+    ]);
+
+    const updatedEv = parsed[1]!;
+    expect(updatedEv.safe_counts).toEqual({ events_added: 5 });
+    expect(updatedEv.attributes).toMatchObject({
+      rule_key: "brute_force_account",
+      severity: "critical",
+      status: "open",
+      event_count: 15,
+      account_count: 1,
+      address_count: 3,
+      escalated: true,
+    });
+    expect("incident_public_id" in updatedEv.attributes).toBe(false);
+
+    const actionEv = parsed[3]!;
+    expect(actionEv.attributes).toMatchObject({
+      action_kind: "ban_ip",
+      permanent: true,
+    });
+    expect("ban_public_id" in actionEv.attributes).toBe(false);
+
+    const closedEv = parsed[4]!;
+    expect(closedEv.attributes.close_reason).toBe("resolved");
+
+    const banCreatedEv = parsed[5]!;
+    expect(banCreatedEv.attributes).toEqual({ automatic: true });
+    expect(banCreatedEv.dropped_attributes).toBe(2);
+
+    const banPolicyEv = parsed[7]!;
+    expect(banPolicyEv.attributes).toEqual({ enabled: true, threshold: 8 });
+
+    await siem.close!();
+  });
 });

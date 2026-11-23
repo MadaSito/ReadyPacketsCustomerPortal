@@ -131,6 +131,19 @@ export function createFactorService(deps: ModuleDeps) {
     return result === "valid";
   }
 
+  /**
+   * Increment 06 D7 (identity_engineer): after the transaction decided the outcome, publish the step signal to
+   * the protection module. Never inside the tx; a signal failure never changes the verification result.
+   */
+  async function signInSignal(actor: SessionPrincipal, factor: SecondFactorInput, outcome: "success" | "failure"): Promise<void> {
+    const kind = factor.method === "totp" ? "mfa" : factor.method === "recovery_code" ? "recovery_code" : "passkey";
+    try {
+      await deps.services.identity.signInSignals?.publish({ kind, outcome, userId: actor.userId });
+    } catch {
+      /* best effort: the verification result stands */
+    }
+  }
+
   async function denied(eventName: string, actor: SessionPrincipal, tx?: Tx) {
     await record(eventName, tx, actor, { outcome: "denied", reasonCode: "AUTHENTICATION_PROOF_INVALID", severity: "WARN" });
   }
@@ -289,6 +302,7 @@ export function createFactorService(deps: ModuleDeps) {
         await record("auth.mfa.verified", tx, actor);
         return deps.services.identity.sessions.markMfaVerified(actor.sessionId, { tx });
       }, actor.role === "admin" && factor.method === "totp");
+      await signInSignal(actor, factor, issued ? "success" : "failure");
       if (!issued) throw badProof();
       return issued;
     },
@@ -309,6 +323,7 @@ export function createFactorService(deps: ModuleDeps) {
         await record("auth.step_up.verified", tx, actor);
         return deps.services.identity.sessions.markStepUp(actor.sessionId, { tx });
       }, actor.role === "admin" && factor.method === "totp");
+      await signInSignal(actor, factor, issued ? "success" : "failure");
       if (!issued) throw badProof();
       return issued;
     },

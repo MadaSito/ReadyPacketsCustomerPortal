@@ -23,16 +23,19 @@ export interface BrandLogoProps {
 export function BrandLogo({ appearance = "auto", variant = "full", label = BRAND_LOGO_LABEL, className }: BrandLogoProps) {
   const { resolved } = useTheme();
   const set = BRAND_ASSETS[appearance === "auto" ? resolved : appearance];
+  // Artwork for dark backgrounds keeps its navy backdrop in forced-colours mode (where panel backgrounds
+  // become Canvas and the white wordmark would vanish). See .rp-brand-on-dark in styles/index.css.
+  const onDark = appearance === "dark" && "rp-brand-on-dark";
   const groupProps = label ? { role: "img" as const, "aria-label": label } : { "aria-hidden": true as const };
   if (variant === "icon") {
     return (
-      <span {...groupProps} className={cn("inline-flex", className)}>
+      <span {...groupProps} className={cn("inline-flex", onDark, className)}>
         <img src={assetUrl(set.icon)} alt="" className="h-full w-auto object-contain" draggable={false} />
       </span>
     );
   }
   return (
-    <span {...groupProps} className={cn("inline-flex items-center gap-2", className)}>
+    <span {...groupProps} className={cn("inline-flex items-center gap-2", onDark, className)}>
       <img src={assetUrl(set.icon)} alt="" className="h-auto w-[18%] shrink-0" draggable={false} />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <img src={assetUrl(set.wordmark)} alt="" className="h-auto w-full" draggable={false} />

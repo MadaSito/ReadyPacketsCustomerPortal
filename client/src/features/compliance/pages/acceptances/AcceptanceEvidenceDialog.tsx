@@ -10,6 +10,7 @@ import {
   formatAcceptanceSource,
 } from "./shared";
 import { useAcceptanceLogProcedures } from "./types";
+import { SignatureMatchBadge } from "./AcceptanceLogTab";
 
 export interface AcceptanceEvidenceDialogProps {
   publicId: string | null;
@@ -152,6 +153,16 @@ export function AcceptanceEvidenceDialog({ publicId, onClose }: AcceptanceEviden
                   </span>
                 ) : (
                   <span className="text-muted">—</span>
+                ),
+              },
+              {
+                label: "Signature name check",
+                value: !data.hasTypedSignature ? (
+                  <span className="text-muted">Not applicable (tick box)</span>
+                ) : data.signatureMatch ? (
+                  <SignatureMatchBadge match={data.signatureMatch} />
+                ) : (
+                  <span className="text-muted">Not recorded</span>
                 ),
               },
               {

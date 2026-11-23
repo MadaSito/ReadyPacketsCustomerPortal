@@ -15,6 +15,7 @@ import {
   PROMO_REDEMPTION_STATUSES,
   PROMO_STATUSES,
 } from "./schema.js";
+import { twoDecimalPercentField } from "./settings.js";
 
 function promotionsSvc(services: Services): PromotionsModule {
   const svc = (services as Services & { promotions?: PromotionsModule }).promotions;
@@ -104,7 +105,8 @@ export const promotionsRouter = router({
           type: z.enum(PROMO_DISCOUNT_TYPES),
           percentBps: z.number().int().min(1).max(10_000).nullable().optional(),
           maxDiscountMinor: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
-          amountMinor: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
+          amountMinor: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
+          setTotalMinor: z.number().int().min(0).max(1_000_000_000).nullable().optional(),
           currency: z.string().length(3).nullable().optional(),
           scope: promotionScopeSchema,
           minSubtotalMinor: z.number().int().min(0).max(1_000_000_000).optional(),
@@ -290,7 +292,11 @@ export const promotionsRouter = router({
       .input(
         z.strictObject({
           enabled: z.boolean().optional(),
-          maxDiscountPercent: z.number().int().min(1).max(100).optional(),
+          maxDiscountPercent: twoDecimalPercentField.optional(),
+          maxDiscountBps: z.number().int().min(1).max(10_000).optional(),
+          maxFixedAmountMinor: z.number().int().min(1).max(1_000_000_000).nullable().optional(),
+          allowZeroTotal: z.boolean().optional(),
+          minOrderTotalAfterDiscountMinor: z.number().int().min(0).max(1_000_000_000).optional(),
         }),
       )
       .mutation(({ ctx, input }) =>

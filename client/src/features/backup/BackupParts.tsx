@@ -157,7 +157,7 @@ export function ArchivesTable({
               loading={copyingBackupId === r.publicId}
               disabled={Boolean(copyingBackupId)}
               onClick={() => onCopyNow(r)}
-              aria-label={`Copy verified backup ${r.publicId} off-site now`}
+              aria-label={`Copy now: verified backup ${r.publicId} off-site`}
             >
               Copy now
             </Button>

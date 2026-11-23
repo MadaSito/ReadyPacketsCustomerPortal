@@ -48,6 +48,7 @@ import { createPublicApiModule, type PublicApiModule } from "./modules/publicApi
 import { createCommunityModule, type CommunityModule } from "./modules/community/index.js";
 import { createReferralsModule, type ReferralsModule } from "./modules/referrals/index.js";
 import { createPromotionsModule, type PromotionsModule } from "./modules/promotions/index.js";
+import { createReportsModule, type ReportsModule } from "./modules/reports/index.js";
 import { createCartModule, type CartModule } from "./modules/cart/index.js";
 import { createKnowledgeModule, type KnowledgeModule } from "./modules/knowledge/index.js";
 import { createPaymentsModule, type PaymentsModule } from "./modules/payments/index.js";
@@ -77,6 +78,7 @@ export interface ModuleRegistry {
   community: CommunityModule;
   referrals: ReferralsModule;
   promotions: PromotionsModule;
+  reports: ReportsModule;
   cart: CartModule;
   knowledge: KnowledgeModule;
   payments: PaymentsModule;
@@ -154,6 +156,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
   services.community = createCommunityModule(deps);
   services.referrals = createReferralsModule(deps);
   services.promotions = createPromotionsModule(deps);
+  services.reports = createReportsModule(deps);
   services.cart = createCartModule(deps);
   services.knowledge = createKnowledgeModule(deps);
   services.payments = createPaymentsModule(deps);
@@ -186,6 +189,7 @@ export function createContainer(config: AppConfig, overrides: ContainerOverrides
     services.community,
     services.referrals,
     services.promotions,
+    services.reports,
     services.cart,
     services.knowledge,
     services.payments,

@@ -1,17 +1,18 @@
 /**
  * Administrator "Cart suggestions" management console (/admin/carts/suggestions, capability `carts.upsells.manage`).
- * Owner: recovery_ops_engineer (Increment 05, Package B, Decision D2 / ADR 0043).
+ * Owner: recovery_ops_engineer (Increments 05 & 06, Decisions D2 & D3 / ADR 0043).
  */
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Eye, Plus, Sparkles, XCircle } from "lucide-react";
+import { CheckCircle2, Copy, Eye, Plus, Sparkles, Wand2, XCircle } from "lucide-react";
 import { useId, useMemo, useState, type FormEvent } from "react";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import {
   Badge,
   Button,
   Callout,
+  Card,
   Checkbox,
   ConfirmDialog,
   DataTable,
@@ -27,6 +28,7 @@ import {
   Select,
   StatCard,
   StatGrid,
+  Switch,
   Textarea,
   useToast,
   type Column,
@@ -72,7 +74,7 @@ const DEFAULT_FORM: OfferFormState = {
   triggerProductPublicIds: [],
   targetProductPublicId: "",
   priority: "100",
-  active: true,
+  active: false,
   startsAtLocal: "",
   endsAtLocal: "",
 };
@@ -90,6 +92,19 @@ function formFromOffer(offer: AdminUpsellOfferRow): OfferFormState {
     startsAtLocal: toDatetimeLocalValue(offer.startsAt),
     endsAtLocal: toDatetimeLocalValue(offer.endsAt),
   };
+}
+
+function offerCategoryBadge(row: AdminUpsellOfferRow) {
+  if (row.ruleType === "bundle_completion") {
+    return <Badge tone="info">Complete the bundle</Badge>;
+  }
+  if (row.ruleType === "next_packet") {
+    return <Badge tone="info">Next packet</Badge>;
+  }
+  if (row.kind === "tier_upgrade") {
+    return <Badge tone="info">Tier upgrade</Badge>;
+  }
+  return <Badge tone="info">Add-on</Badge>;
 }
 
 export function AdminCartUpsellsPage() {
@@ -111,15 +126,25 @@ export function AdminCartUpsellsPage() {
   const [form, setForm] = useState<OfferFormState>(DEFAULT_FORM);
   const [formError, setFormError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AdminUpsellOfferRow | null>(null);
+  const [enableCartPromptOpen, setEnableCartPromptOpen] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
 
   const createMutation = useMutation(trpc.cart.admin.upsells.create.mutationOptions());
   const updateMutation = useMutation(trpc.cart.admin.upsells.update.mutationOptions());
   const setActiveMutation = useMutation(trpc.cart.admin.upsells.setActive.mutationOptions());
+  const setFeatureMutation = useMutation(trpc.cart.admin.upsells.setFeature.mutationOptions());
+  const setAllActiveMutation = useMutation(trpc.cart.admin.upsells.setAllActive.mutationOptions());
+  const seedSuggestedMutation = useMutation(trpc.cart.admin.upsells.seedSuggested.mutationOptions());
+  const duplicateMutation = useMutation(trpc.cart.admin.upsells.duplicate.mutationOptions());
   const deleteMutation = useMutation(trpc.cart.admin.upsells.delete.mutationOptions());
 
   const saving = createMutation.isPending || updateMutation.isPending;
-  const rowBusy = setActiveMutation.isPending || deleteMutation.isPending;
+  const rowBusy =
+    setActiveMutation.isPending ||
+    deleteMutation.isPending ||
+    duplicateMutation.isPending ||
+    setAllActiveMutation.isPending ||
+    seedSuggestedMutation.isPending;
 
   const data = listQuery.data;
   const offers = useMemo(() => data?.offers ?? [], [data?.offers]);
@@ -129,12 +154,14 @@ export function AdminCartUpsellsPage() {
     let shown = 0;
     let accepted = 0;
     let dismissed = 0;
+    let activeCount = 0;
     for (const o of offers) {
       shown += o.shownCount;
       accepted += o.acceptedCount;
       dismissed += o.dismissedCount;
+      if (o.active) activeCount += 1;
     }
-    return { shown, accepted, dismissed };
+    return { shown, accepted, dismissed, activeCount };
   }, [offers]);
 
   const filteredOffers = useMemo(() => {
@@ -208,6 +235,79 @@ export function AdminCartUpsellsPage() {
     });
   };
 
+  const applyFeatureToggle = async (enabled: boolean, alsoEnableCart: boolean) => {
+    setPageError(null);
+    try {
+      await setFeatureMutation.mutateAsync({ enabled, alsoEnableCart });
+      await queryClient.invalidateQueries({ queryKey: listKey });
+      setEnableCartPromptOpen(false);
+      toast.show({
+        tone: "success",
+        title: enabled
+          ? alsoEnableCart
+            ? "Shopping cart and cart suggestions enabled"
+            : "Cart suggestions enabled"
+          : "Cart suggestions turned off",
+      });
+    } catch (err) {
+      setPageError(errorMessage(err, "Could not update cart suggestions feature state."));
+    }
+  };
+
+  const handleFeatureSwitchChange = (nextChecked: boolean) => {
+    if (nextChecked && data && !data.featureCartEnabled) {
+      setEnableCartPromptOpen(true);
+      return;
+    }
+    void applyFeatureToggle(nextChecked, false);
+  };
+
+  const handleSetAllActive = async (active: boolean) => {
+    setPageError(null);
+    try {
+      const result = await setAllActiveMutation.mutateAsync({ active });
+      await queryClient.invalidateQueries({ queryKey: listKey });
+      toast.show({
+        tone: "success",
+        title: active
+          ? `Enabled ${result.updatedCount} suggestion${result.updatedCount === 1 ? "" : "s"}`
+          : `Disabled ${result.updatedCount} suggestion${result.updatedCount === 1 ? "" : "s"}`,
+      });
+    } catch (err) {
+      setPageError(errorMessage(err, "Could not update suggestion statuses."));
+    }
+  };
+
+  const handleSeedSuggested = async () => {
+    setPageError(null);
+    try {
+      const result = await seedSuggestedMutation.mutateAsync();
+      await queryClient.invalidateQueries({ queryKey: listKey });
+      toast.show({
+        tone: "success",
+        title:
+          result.addedCount > 0
+            ? `Added ${result.addedCount} starter suggestion${result.addedCount === 1 ? "" : "s"} (disabled by default)`
+            : "All starter suggestions from the catalogue are already present",
+      });
+    } catch (err) {
+      setPageError(errorMessage(err, "Could not add suggested offers."));
+    }
+  };
+
+  const handleDuplicate = async (offer: AdminUpsellOfferRow) => {
+    setPageError(null);
+    try {
+      await duplicateMutation.mutateAsync({ offerPublicId: offer.offerPublicId });
+      await queryClient.invalidateQueries({ queryKey: listKey });
+      toast.show({ tone: "success", title: "Suggestion duplicated (disabled)" });
+    } catch (err) {
+      setPageError(errorMessage(err, "Could not duplicate this suggestion."));
+    }
+  };
+
+  const editingIsBundleCompletion = editingOffer?.ruleType === "bundle_completion";
+
   const submitForm = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setFormError(null);
@@ -224,7 +324,7 @@ export function AdminCartUpsellsPage() {
       setFormError("Enter plain-text suggestion copy up to 200 characters.");
       return;
     }
-    if (!form.targetProductPublicId) {
+    if (!editingIsBundleCompletion && !form.targetProductPublicId) {
       setFormError("Select a target product from the active catalogue.");
       return;
     }
@@ -257,12 +357,14 @@ export function AdminCartUpsellsPage() {
         await updateMutation.mutateAsync({
           offerPublicId: editingOffer.offerPublicId,
           expectedVersion: editingOffer.version,
-          kind: form.kind,
+          kind: editingIsBundleCompletion ? "add_on" : form.kind,
           title,
           shortText,
           triggerMode: form.triggerMode,
           triggerProductPublicIds: form.triggerMode === "products" ? form.triggerProductPublicIds : [],
-          targetProductPublicId: form.targetProductPublicId,
+          targetProductPublicId: editingIsBundleCompletion
+            ? editingOffer.targetProductPublicId
+            : form.targetProductPublicId,
           priority: priorityNum,
           active: form.active,
           startsAt,
@@ -340,7 +442,7 @@ export function AdminCartUpsellsPage() {
         <div className="flex min-w-0 flex-col gap-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="font-semibold break-words text-ink">{row.title}</span>
-            <Badge tone="info">{row.kind === "tier_upgrade" ? "Tier upgrade" : "Add-on"}</Badge>
+            {offerCategoryBadge(row)}
             <Badge tone={row.active ? "success" : "neutral"}>{row.active ? "Active" : "Inactive"}</Badge>
           </div>
           <p className="text-sm break-words text-body">{row.shortText}</p>
@@ -360,11 +462,13 @@ export function AdminCartUpsellsPage() {
       header: "Target & trigger",
       cell: (row) => {
         const triggerNames =
-          row.triggerMode === "any_cart"
-            ? "Any non-empty cart"
-            : row.triggerProductPublicIds
-                .map((id) => productById.get(id)?.name ?? id)
-                .join(", ");
+          row.ruleType === "bundle_completion" && row.triggerMode === "any_cart"
+            ? "Carts with 2 or more bundle packets and at least 1 missing packet"
+            : row.triggerMode === "any_cart"
+              ? "Any non-empty cart"
+              : row.triggerProductPublicIds
+                  .map((id) => productById.get(id)?.name ?? id)
+                  .join(", ");
         return (
           <div className="flex min-w-0 flex-col gap-1 text-sm">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5">
@@ -407,29 +511,76 @@ export function AdminCartUpsellsPage() {
     <div className="min-w-0 space-y-6">
       <PageHeader
         title="Cart suggestions"
-        description="Configure optional add-ons and higher packet tier upgrades shown on the customer cart page. Eligibility and prices are always evaluated on the server."
+        description="Starter suggestions are seeded from your catalogue disabled by default. Turn on individual rows or create custom add-on and tier upgrade offers."
         actions={
-          <Button leadingIcon={<Plus aria-hidden="true" />} onClick={openCreate}>
-            New suggestion
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              leadingIcon={<Wand2 aria-hidden="true" />}
+              loading={seedSuggestedMutation.isPending}
+              disabled={rowBusy}
+              onClick={() => void handleSeedSuggested()}
+            >
+              Add suggested offers
+            </Button>
+            <Button leadingIcon={<Plus aria-hidden="true" />} onClick={openCreate}>
+              New suggestion
+            </Button>
+          </div>
         }
       />
 
       {pageError ? <Callout tone="danger" title="Action could not be completed">{pageError}</Callout> : null}
 
-      {data && !data.featureUpsellEnabled ? (
-        <Callout tone="info" title="Cart suggestions are currently turned off">
-          Customers will not see cart suggestions until the <code>feature.cart.upsell</code> setting is enabled in
-          Platform Settings. You can configure and review offers here before enabling the feature.
-        </Callout>
-      ) : null}
+      <Card>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0 flex-1">
+            <Switch
+              label="Show suggestions in the cart"
+              description="Controls feature.cart.upsell. Customers only see suggestions that are enabled below (up to 3 per cart)."
+              checked={Boolean(data?.featureUpsellEnabled)}
+              onCheckedChange={handleFeatureSwitchChange}
+              disabled={listQuery.isPending || setFeatureMutation.isPending}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={listQuery.isPending || rowBusy || offers.length === 0}
+              onClick={() => void handleSetAllActive(true)}
+            >
+              Enable all
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={listQuery.isPending || rowBusy || totals.activeCount === 0}
+              onClick={() => void handleSetAllActive(false)}
+            >
+              Disable all
+            </Button>
+          </div>
+        </div>
 
-      {data?.bundleRuleEnabled ? (
-        <Callout tone="info" title="Automatic bundle-completion suggestion">
-          When a cart is 1 or 2 packets short of {data.bundleRuleLabel ?? "the bundle rule"}, ReadyPackets automatically
-          suggests the missing packet(s) at priority 50 alongside configured offers (up to 3 suggestions per cart).
-        </Callout>
-      ) : null}
+        {data && data.featureUpsellEnabled && !data.featureCartEnabled ? (
+          <Callout tone="warning" className="mt-4" title="Shopping cart is currently turned off">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <p>
+                Cart suggestions are enabled, but customers cannot open the cart until <code>feature.cart</code> is turned on.
+              </p>
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={setFeatureMutation.isPending}
+                onClick={() => void applyFeatureToggle(true, true)}
+              >
+                Enable shopping cart
+              </Button>
+            </div>
+          </Callout>
+        ) : null}
+      </Card>
 
       <StatGrid label="Cart suggestion totals">
         <StatCard
@@ -502,6 +653,12 @@ export function AdminCartUpsellsPage() {
           loading={listQuery.isPending}
           rowActions={(row) => (
             <div className="flex flex-wrap items-center justify-end gap-2">
+              <Switch
+                label={<span className="sr-only">{`${row.active ? "Disable" : "Enable"}: ${row.title}`}</span>}
+                checked={row.active}
+                disabled={rowBusy || (!row.active && !row.targetProductAvailable)}
+                onCheckedChange={() => void handleToggleActive(row)}
+              />
               <Button
                 variant="secondary"
                 size="sm"
@@ -515,10 +672,11 @@ export function AdminCartUpsellsPage() {
                 variant="ghost"
                 size="sm"
                 disabled={rowBusy}
-                aria-label={`${row.active ? "Deactivate" : "Activate"}: ${row.title}`}
-                onClick={() => void handleToggleActive(row)}
+                leadingIcon={<Copy aria-hidden="true" />}
+                aria-label={`Duplicate: ${row.title}`}
+                onClick={() => void handleDuplicate(row)}
               >
-                {row.active ? "Deactivate" : "Activate"}
+                Duplicate
               </Button>
               <Button
                 variant="danger"
@@ -540,17 +698,61 @@ export function AdminCartUpsellsPage() {
               description={
                 activeFilterCount > 0
                   ? "No offer matched your current filters. Clear filters to view all configured offers."
-                  : "Create an add-on or packet tier upgrade offer to suggest relevant options in customer carts."
+                  : "Add starter suggestions from your active catalogue or create a custom suggestion."
               }
               action={
                 activeFilterCount === 0 ? (
-                  <Button onClick={openCreate}>New suggestion</Button>
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <Button variant="secondary" onClick={() => void handleSeedSuggested()}>
+                      Add suggested offers
+                    </Button>
+                    <Button onClick={openCreate}>New suggestion</Button>
+                  </div>
                 ) : undefined
               }
             />
           }
         />
       )}
+
+      <Dialog
+        open={enableCartPromptOpen}
+        onOpenChange={(open) => {
+          if (!setFeatureMutation.isPending) setEnableCartPromptOpen(open);
+        }}
+        title="Turn on shopping cart as well?"
+        description="Cart suggestions appear inside the customer shopping cart, which is currently turned off (feature.cart)."
+        dismissible={!setFeatureMutation.isPending}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              disabled={setFeatureMutation.isPending}
+              onClick={() => setEnableCartPromptOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="secondary"
+              loading={setFeatureMutation.isPending}
+              onClick={() => void applyFeatureToggle(true, false)}
+            >
+              Enable suggestions only
+            </Button>
+            <Button
+              loading={setFeatureMutation.isPending}
+              onClick={() => void applyFeatureToggle(true, true)}
+            >
+              Enable cart and suggestions
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-body">
+          Enable both <code>feature.cart</code> and <code>feature.cart.upsell</code> now so customers can use the cart
+          and see enabled suggestions immediately, or enable suggestions only while you finish configuring offers.
+        </p>
+      </Dialog>
 
       <Dialog
         open={dialogOpen}
@@ -576,19 +778,25 @@ export function AdminCartUpsellsPage() {
           {formError ? <Callout tone="danger" title="Check suggestion details">{formError}</Callout> : null}
 
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Suggestion kind" required>
-              <Select
-                value={form.kind}
-                options={[
-                  { value: "add_on", label: "Add-on product" },
-                  { value: "tier_upgrade", label: "Packet tier upgrade" },
-                ]}
-                onChange={(e) => handleKindChange(e.target.value as "add_on" | "tier_upgrade")}
-                disabled={saving}
-              />
-            </Field>
+            {editingIsBundleCompletion ? (
+              <Field label="Rule type">
+                <Input value="Complete the bundle" disabled />
+              </Field>
+            ) : (
+              <Field label="Suggestion kind" required>
+                <Select
+                  value={form.kind}
+                  options={[
+                    { value: "add_on", label: "Add-on product" },
+                    { value: "tier_upgrade", label: "Packet tier upgrade" },
+                  ]}
+                  onChange={(e) => handleKindChange(e.target.value as "add_on" | "tier_upgrade")}
+                  disabled={saving}
+                />
+              </Field>
+            )}
 
-            <Field label="Priority" hint="1–1000 (lower numbers show first; bundle completion is 50)" required>
+            <Field label="Priority" hint="1–1000 (lower numbers show first)" required>
               <Input
                 type="number"
                 inputMode="numeric"
@@ -628,26 +836,33 @@ export function AdminCartUpsellsPage() {
             />
           </Field>
 
-          <Field
-            label="Target product"
-            hint={
-              form.kind === "tier_upgrade"
-                ? "Only higher-priced packet tiers can be selected as tier upgrade targets."
-                : "Active catalogue product added when the customer accepts."
-            }
-            required
-          >
-            <Select
-              value={form.targetProductPublicId}
-              placeholder="Choose a target product…"
-              options={targetProductOptions.map((p) => ({
-                value: p.productPublicId,
-                label: `${p.groupName}: ${p.name}`,
-              }))}
-              onChange={(e) => setForm((prev) => ({ ...prev, targetProductPublicId: e.target.value }))}
-              disabled={saving}
-            />
-          </Field>
+          {editingIsBundleCompletion ? (
+            <Callout tone="info" title="Dynamic bundle targets">
+              This rule automatically calculates the customer’s missing bundle packets and net bundle savings from your
+              active catalogue bundle rule.
+            </Callout>
+          ) : (
+            <Field
+              label="Target product"
+              hint={
+                form.kind === "tier_upgrade"
+                  ? "Only higher-priced packet tiers can be selected as tier upgrade targets."
+                  : "Active catalogue product added when the customer accepts."
+              }
+              required
+            >
+              <Select
+                value={form.targetProductPublicId}
+                placeholder="Choose a target product…"
+                options={targetProductOptions.map((p) => ({
+                  value: p.productPublicId,
+                  label: `${p.groupName}: ${p.name}`,
+                }))}
+                onChange={(e) => setForm((prev) => ({ ...prev, targetProductPublicId: e.target.value }))}
+                disabled={saving}
+              />
+            </Field>
+          )}
 
           <Field label="Trigger condition" required>
             <Select
@@ -721,8 +936,8 @@ export function AdminCartUpsellsPage() {
         title="Delete cart suggestion?"
         description={
           deleteTarget
-            ? `Delete "${deleteTarget.title}" permanently? Impression and acceptance counters for this offer will be removed.`
-            : undefined
+            ? `"${deleteTarget.title}" will be permanently removed and will no longer appear in customer carts.`
+            : ""
         }
         confirmLabel="Delete suggestion"
         destructive

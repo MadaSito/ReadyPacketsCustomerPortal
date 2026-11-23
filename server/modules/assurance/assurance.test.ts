@@ -496,6 +496,20 @@ describe("assurance: isolated transactional model", () => {
     expect(issue).toHaveBeenCalledTimes(3);
   });
 
+  it("D7: publishes sign-in step signals after the outcome; a failing publisher never changes the result", async () => {
+    const { account, recovery } = await enroll();
+    const challenge = { ...account, pendingSteps: ["mfa_challenge"] as const };
+    const publish = vi.fn().mockRejectedValueOnce(new Error("protection down")).mockResolvedValue(undefined);
+    (h.services.identity as unknown as { signInSignals: unknown }).signInSignals = { publish };
+    const used = recovery.recoveryCodes![0]!;
+    await expect(caller(challenge).challenge({ method: "recovery_code", code: used })).resolves.toEqual({ ok: true });
+    await expect(caller(challenge).challenge({ method: "recovery_code", code: used })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    expect(publish.mock.calls.map(([x]) => x)).toEqual([
+      { kind: "recovery_code", outcome: "success", userId: account.userId },
+      { kind: "recovery_code", outcome: "failure", userId: account.userId },
+    ]);
+  });
+
   it("rejects remediation, stale, future, wrong-role, self and unknown-target management", async () => {
     const target = await fixture();
     const now = h.clock.now();

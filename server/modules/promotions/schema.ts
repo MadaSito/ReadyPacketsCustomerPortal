@@ -34,7 +34,7 @@ import {
 } from "../../db/columns.js";
 import { users } from "../identity/schema.js";
 
-export const PROMO_DISCOUNT_TYPES = ["percent", "fixed"] as const;
+export const PROMO_DISCOUNT_TYPES = ["percent", "fixed", "set_total"] as const;
 export type PromoDiscountType = (typeof PROMO_DISCOUNT_TYPES)[number];
 
 export const PROMO_SCOPE_KINDS = ["all", "products", "tiers", "packets"] as const;
@@ -70,13 +70,15 @@ export const promoBatches = mysqlTable(
     /** Customer-facing label displayed on cart, order, and invoice instead of the secret code. */
     label: varchar("label", { length: 120 }).notNull(),
     discountType: mysqlEnum("discount_type", PROMO_DISCOUNT_TYPES).notNull(),
-    /** Basis points 1..10000 (0.01%..100.00%) when `discountType = "percent"`; null for `"fixed"`. */
+    /** Basis points 1..10000 (0.01%..100.00%) when `discountType = "percent"`; null otherwise. */
     percentBps: int("percent_bps", { unsigned: true }),
     /** Optional maximum promo discount cap in minor units when `discountType = "percent"`. */
     maxDiscountMinor: amountMinorColumn("max_discount_minor"),
-    /** Fixed discount amount in minor units when `discountType = "fixed"`; null for `"percent"`. */
+    /** Fixed discount amount in minor units (> 0) when `discountType = "fixed"`; null otherwise. */
     fixedAmountMinor: amountMinorColumn("fixed_amount_minor"),
-    /** ISO-4217 currency required when `discountType = "fixed"` or when monetary caps/minimums apply. */
+    /** Target order total in minor units (>= 0) when `discountType = "set_total"`; null otherwise. */
+    setTotalMinor: amountMinorColumn("set_total_minor"),
+    /** ISO-4217 currency required when `discountType = "fixed" | "set_total"` or when monetary caps/minimums apply. */
     currency: currencyColumn(),
     scopeKind: mysqlEnum("scope_kind", PROMO_SCOPE_KINDS).notNull().default("all"),
     scopeProductPublicIds: json("scope_product_public_ids").$type<string[]>().notNull(),

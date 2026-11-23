@@ -38,3 +38,8 @@ third-party service at runtime unless an administrator explicitly configured tha
 | vitest, @vitest/coverage-v8, supertest, @testing-library/*, jsdom, axe-core | dev | tests | |
 | playwright-core (Apache-2.0) | dev | Shared Chromium driver for local accessibility and responsive QA | Uses an operator-provided executable; does not download browsers on install or ship in the portal |
 | eslint, typescript-eslint, eslint-plugin-react-hooks, eslint-plugin-jsx-a11y | dev | lint | |
+| mammoth 1.13 (BSD-2-Clause) | client | read `.docx` into HTML for the in-portal document editor and policy import | browser only, lazy chunk; never imported by `server/`; output is sanitised before use |
+| docx 9 (MIT) | client | build a `.docx` from the editor content ("Save as new version") | browser only, lazy chunk; no network |
+| pdfjs-dist 6 (Apache-2.0) | client | extract text from a PDF for policy import | browser only, lazy chunk; worker from the same origin; `isEvalSupported: false`; no remote fonts or cmaps |
+| @tiptap/extension-table, @tiptap/extension-text-align 3.35.0 (MIT) | client | tables and alignment in the document editor | same version as the other tiptap packages |
+| @napi-rs/canvas 1.2.0 (MIT) | dev | lets jsdom measure text so axe evaluates text-in-name rules in tests | devDependency only; `pnpm-workspace.yaml` ignores it as an optional dependency of pdfjs-dist, so the native binary is not in production installs and the server never loads it |

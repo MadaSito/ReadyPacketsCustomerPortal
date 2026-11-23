@@ -10,6 +10,7 @@ export const protectionPages = [
   { path: "/admin/protection/countries", title: "Protection countries", navigation: "Countries", component: lazy(() => import("./pages").then((m) => ({ default: m.CountriesPage }))) },
   { path: "/admin/protection/rate-limits", title: "Protection rate limits", navigation: "Rate limits", component: lazy(() => import("./pages").then((m) => ({ default: m.RateLimitsPage }))) },
   { path: "/admin/protection/events", title: "Protection events", navigation: "Events", component: lazy(() => import("./pages").then((m) => ({ default: m.EventsPage }))) },
+  { path: "/admin/protection/bans", title: "Sign-in bans", navigation: "Sign-in bans", component: lazy(() => import("./pages").then((m) => ({ default: m.SignInBansPage }))) },
 ] as const;
 
 export const protectionFeature: FeatureRoutes = {

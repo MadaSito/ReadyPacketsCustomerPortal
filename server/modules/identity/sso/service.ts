@@ -27,6 +27,7 @@ import type { IssuedSession, SessionService } from "../sessions.js";
 import type { TransitionService } from "../transitions.js";
 import type { UserRepo } from "../users.js";
 import { toView } from "../users.js";
+import { createSignInSignals } from "../signals.js";
 import {
   SSO_JIT_MODES,
   ssoAuthRequests,
@@ -216,6 +217,7 @@ export interface SsoInternals {
 
 export function createSsoService(i: SsoInternals) {
   const { deps, repo, sessions, transitions, auth } = i;
+  const signInSignals = createSignInSignals(deps);
   const jwksCache = new Map<string, { keys: Jwk[]; fetchedAt: number; lastForcedAt: number }>();
   const redirectUri = () => `${deps.config.canonicalOrigin.replace(/\/$/, "")}${SSO_CALLBACK_PATH}`;
   const availableInDeployment = () => deps.config.deploymentProfile !== "preview";
@@ -261,11 +263,13 @@ export function createSsoService(i: SsoInternals) {
     try {
       await deps.audit.record({
         category: "security", eventName, action: "authenticate", outcome: "denied", severity: "WARN", reasonCode,
-        actor: { role: "anonymous" }, resource: { type: "sso_request" }, provider: "entra", attributes: extra,
+        actor: { role: "anonymous" }, resource: { type: "sso_request" }, provider: "entra", attributes: { ...extra, step: "sso" },
       });
     } catch {
       /* refusal stands regardless */
     }
+    // D7: SSO callback/completion failures count towards automatic IP bans (no account reference is known).
+    await signInSignals.publish({ kind: "sso_callback", outcome: "failure" });
   }
 
   function validateConfigInput(input: SsoConfigInput): void {

@@ -11,6 +11,13 @@ import { z } from "zod";
 import { isOrderFileFolderTemplate } from "../../../shared/orderFileFolder.js";
 import {
   ACK_BODY_MAX,
+  ACK_SOURCES,
+  CAPTURE_MODES,
+  DOCUMENT_RESPONSE_MODES,
+  DOCUMENT_TASK_KEY_MAX,
+  MAX_DOCUMENT_TASKS,
+  MAX_RECORD_MINUTES,
+  documentReplySlotKey,
   FOLDER_TEMPLATE_MAX,
   GATE_SIGNATURE_MODES,
   MAX_ACCEPTANCE_GATES,
@@ -43,6 +50,19 @@ export const draftUploadSchema = z.strictObject({
   allowedTypes: z.array(z.string().max(10)).max(20),
   uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).max(4),
   storageFolder: draftText(FOLDER_TEMPLATE_MAX).optional(),
+  /** Increment 06 (D8): record task options (audio only). */
+  capture: z.enum(CAPTURE_MODES).optional(),
+  maxMinutes: z.number().int().min(0).max(MAX_RECORD_MINUTES).optional(),
+});
+
+/** Increment 06 (D8): respond_document task draft. */
+export const draftDocumentTaskSchema = z.strictObject({
+  key: draftText(48),
+  label: draftText(60),
+  hint: draftText(200).optional(),
+  responseModes: z.array(z.enum(DOCUMENT_RESPONSE_MODES)).max(3),
+  required: z.boolean(),
+  allowedTypes: z.array(z.string().max(10)).max(20),
 });
 
 export const draftGateSchema = z.strictObject({
@@ -59,6 +79,7 @@ export const draftAcknowledgementSchema = z.strictObject({
   body: draftText(ACK_BODY_MAX),
   acceptedBy: z.enum(ACK_SIDES),
   requireTypedName: z.boolean(),
+  source: z.enum(ACK_SOURCES).optional(),
 });
 
 export const draftStateSchema = z.strictObject({
@@ -72,6 +93,7 @@ export const draftStateSchema = z.strictObject({
     .strictObject({
       uploads: z.array(draftUploadSchema).max(MAX_UPLOAD_SLOTS),
       acknowledgements: z.array(draftAcknowledgementSchema).max(MAX_ACKNOWLEDGEMENTS),
+      documents: z.array(draftDocumentTaskSchema).max(MAX_DOCUMENT_TASKS).optional(),
     })
     .optional(),
 });
@@ -265,6 +287,10 @@ function validateRules(definition: WorkflowDraftDefinition, stateIndex: Map<stri
       if (slot.hint !== undefined && /<\s*[a-z!/?]/i.test(slot.hint)) error("UPLOAD_HINT_MARKUP", `${path}.hint`, `${slotName}: use plain text without markup.`);
       if (slot.storageFolder?.trim() && !isOrderFileFolderTemplate(slot.storageFolder.trim()))
         error("UPLOAD_FOLDER_INVALID", `${path}.storageFolder`, `${slotName}: ${FOLDER_RULE}`);
+      if (slot.kind !== "audio" && (slot.capture !== undefined || slot.maxMinutes !== undefined))
+        error("RECORD_NOT_AUDIO", `${path}.capture`, `${slotName}: recording options apply to audio tasks only. Change the kind to audio or remove them.`);
+      if (slot.maxMinutes !== undefined && (slot.maxMinutes < 1 || slot.maxMinutes > MAX_RECORD_MINUTES))
+        error("RECORD_MINUTES_RANGE", `${path}.maxMinutes`, `${slotName}: the longest recording must be 1 to ${MAX_RECORD_MINUTES} minutes.`);
     });
     const ackKeys = new Map<string, number>();
     req.acknowledgements.forEach((ack, ackIndex) => {
@@ -278,8 +304,34 @@ function validateRules(definition: WorkflowDraftDefinition, stateIndex: Map<stri
       if (!ack.title.trim()) error("ACK_TITLE_REQUIRED", `${path}.title`, `${ackName} needs a title.`);
       if (!ack.body.trim()) error("ACK_BODY_REQUIRED", `${path}.body`, `${ackName} needs the text people must read and accept.`);
       if (/<\s*[a-z!/?]/i.test(ack.title) || /<\s*[a-z!/?]/i.test(ack.body)) error("ACK_MARKUP", `${path}.body`, `${ackName}: use plain text without markup.`);
+      if (ack.source === "order_note" && ack.acceptedBy !== "customer")
+        error("ACK_NOTE_SIDE", `${path}.acceptedBy`, `${ackName}: a note written per order is acknowledged by the customer.`);
     });
-    if (state.kind === "terminal" && (req.uploads.some((slot) => slot.minCount > 0) || req.acknowledgements.length > 0))
+    const taskKeys = new Set<string>([...slotKeys.keys(), ...ackKeys.keys()]);
+    (req.documents ?? []).forEach((doc, docIndex) => {
+      const path = `states.${index}.requirements.documents.${docIndex}`;
+      const docName = `${name}, document ${docIndex + 1}${doc.label.trim() ? ` (“${doc.label.trim()}”)` : ""}`;
+      const key = doc.key.trim();
+      if (!key || key.length < 2 || key.length > DOCUMENT_TASK_KEY_MAX || !KEY_PATTERN.test(key))
+        error("DOC_KEY_FORMAT", `${path}.key`, `${docName}: the key must be 2 to ${DOCUMENT_TASK_KEY_MAX} characters, start with a lowercase letter and use only lowercase letters, digits and underscores.`);
+      else if (taskKeys.has(key) || taskKeys.has(documentReplySlotKey(key)))
+        error("DOC_KEY_DUPLICATE", `${path}.key`, `${docName}: the key “${key}” (or “${documentReplySlotKey(key)}”) is already used by another task in this status.`);
+      else {
+        taskKeys.add(key);
+        taskKeys.add(documentReplySlotKey(key));
+      }
+      if (!doc.label.trim()) error("DOC_LABEL_REQUIRED", `${path}.label`, `${docName} needs a label.`);
+      if (doc.responseModes.length === 0)
+        error("DOC_RESPONSE_REQUIRED", `${path}.responseModes`, `${docName}: choose how the customer responds (edit in the portal, upload a reply or acknowledge).`);
+      if (new Set(doc.responseModes).size !== doc.responseModes.length) error("DOC_RESPONSE_DUPLICATE", `${path}.responseModes`, `${docName}: each response can be listed only once.`);
+      const bad = doc.allowedTypes.find((type) => !/^[a-z0-9]{1,10}$/.test(type));
+      if (bad !== undefined) error("DOC_TYPE_FORMAT", `${path}.allowedTypes`, `${docName}: “${bad}” is not a file extension. Use lowercase letters and digits without a dot, e.g. docx.`);
+      if (new Set(doc.allowedTypes).size !== doc.allowedTypes.length) error("DOC_TYPE_DUPLICATE", `${path}.allowedTypes`, `${docName}: each file type can be listed only once.`);
+      if (doc.responseModes.includes("edit_in_portal") && doc.allowedTypes.length > 0 && !doc.allowedTypes.includes("docx"))
+        error("DOC_EDIT_NEEDS_DOCX", `${path}.allowedTypes`, `${docName}: editing in the portal works on Word (.docx) files; add docx or remove “Edit in the portal”.`);
+      if (doc.hint !== undefined && /<\s*[a-z!/?]/i.test(doc.hint)) error("DOC_HINT_MARKUP", `${path}.hint`, `${docName}: use plain text without markup.`);
+    });
+    if (state.kind === "terminal" && (req.uploads.some((slot) => slot.minCount > 0) || req.acknowledgements.length > 0 || (req.documents ?? []).some((doc) => doc.required)))
       warn("TERMINAL_REQUIREMENTS", `states.${index}.requirements`, `${name} is final, so its requirements never block anything.`);
   });
   phases.forEach((phase, index) => {
@@ -338,14 +390,28 @@ export function toPublishable(definition: WorkflowDraftDefinition): WorkflowDefi
         ...(hint?.trim() ? { hint: hint.trim() } : {}),
         ...(storageFolder?.trim() ? { storageFolder: storageFolder.trim() } : {}),
       }));
-      const acknowledgements = (requirements?.acknowledgements ?? []).map((ack) => ({ ...ack, key: ack.key.trim(), title: ack.title.trim(), body: ack.body.trim() }));
+      const acknowledgements = (requirements?.acknowledgements ?? []).map(({ source, ...ack }) => ({
+        ...ack,
+        key: ack.key.trim(),
+        title: ack.title.trim(),
+        body: ack.body.trim(),
+        ...(source === "order_note" ? { source } : {}),
+      }));
+      const documents = (requirements?.documents ?? []).map(({ hint, ...doc }) => ({
+        ...doc,
+        key: doc.key.trim(),
+        label: doc.label.trim(),
+        ...(hint?.trim() ? { hint: hint.trim() } : {}),
+      }));
       return {
         ...state,
         key: state.key.trim(),
         label: state.label.trim(),
         customerLabel: state.customerLabel.trim(),
         ...(phase?.trim() ? { phase: phase.trim() } : {}),
-        ...(uploads.length || acknowledgements.length ? { requirements: { uploads, acknowledgements } } : {}),
+        ...(uploads.length || acknowledgements.length || documents.length
+          ? { requirements: { uploads, acknowledgements, ...(documents.length ? { documents } : {}) } }
+          : {}),
       };
     }),
     ...(phases.length ? { phases } : {}),

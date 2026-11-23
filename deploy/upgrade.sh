@@ -70,6 +70,7 @@ lock_deploy
 if ((!assume_yes)); then
     [[ -r /dev/tty && -w /dev/tty ]] || die 'no interactive terminal; pass --yes only after completing docs/operations/UPGRADE.md pre-checks'
 fi
+# Reject an unsupported Node.js runtime before resolving/staging a release or draining traffic.
 check_host
 resolve_release "$target_ref"
 

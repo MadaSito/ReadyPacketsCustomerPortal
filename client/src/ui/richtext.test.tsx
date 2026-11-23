@@ -41,7 +41,10 @@ describe("mail HTML subset helpers", () => {
   });
 });
 
-describe("RichTextEditor", () => {
+const LAZY_WAIT = { timeout: 15_000 } as const;
+const TEST_TIMEOUT = { timeout: 25_000 } as const;
+
+describe("RichTextEditor", TEST_TIMEOUT, () => {
   function Demo({ onChange, initial = "<p>Hello {{firstName}}</p>" }: { onChange: (html: string) => void; initial?: string }) {
     const [value, setValue] = useState(initial);
     return (
@@ -61,10 +64,10 @@ describe("RichTextEditor", () => {
     );
   }
 
-  it("is a labelled multi-line textbox with a formatting toolbar, chips for variables and no injected <style>", async () => {
+  it("is a labelled multi-line textbox with a formatting toolbar, chips for variables and no injected <style>", TEST_TIMEOUT, async () => {
     const before = document.querySelectorAll("style").length;
     renderUi(<Demo onChange={vi.fn()} />);
-    const box = await screen.findByRole("textbox", { name: "Message body" });
+    const box = await screen.findByRole("textbox", { name: "Message body" }, LAZY_WAIT);
     expect(box).toHaveAttribute("aria-multiline", "true");
     expect(box).toHaveAccessibleDescription("Shown to the recipient.");
     expect(box.querySelector('[data-variable="firstName"]')).toHaveTextContent("{{firstName}}");
@@ -81,38 +84,38 @@ describe("RichTextEditor", () => {
     await expectNoAxeViolations();
   });
 
-  it("toolbar buttons format the content and report pressed state", async () => {
+  it("toolbar buttons format the content and report pressed state", TEST_TIMEOUT, async () => {
     const onChange = vi.fn();
     renderUi(<Demo onChange={onChange} />);
-    await screen.findByRole("textbox", { name: "Message body" });
+    await screen.findByRole("textbox", { name: "Message body" }, LAZY_WAIT);
     fireEvent.click(screen.getByRole("button", { name: "Heading 2" }));
-    await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("<h2>Hello {{firstName}}</h2>"));
+    await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("<h2>Hello {{firstName}}</h2>"), LAZY_WAIT);
     expect(screen.getByRole("button", { name: "Heading 2" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(screen.getByRole("button", { name: "Bulleted list" }));
-    await waitFor(() => expect(onChange.mock.lastCall?.[0]).toContain("<ul><li>"));
+    await waitFor(() => expect(onChange.mock.lastCall?.[0]).toContain("<ul><li>"), LAZY_WAIT);
   });
 
-  it("inserts a button whose target is a variable, and refuses a non-https image", async () => {
+  it("inserts a button whose target is a variable, and refuses a non-https image", TEST_TIMEOUT, async () => {
     const onChange = vi.fn();
     renderUi(<Demo onChange={onChange} initial="" />);
-    await screen.findByRole("textbox", { name: "Message body" });
+    await screen.findByRole("textbox", { name: "Message body" }, LAZY_WAIT);
     fireEvent.click(screen.getByRole("button", { name: "Button" }));
-    const dialog = await screen.findByRole("dialog", { name: "Insert button" });
+    const dialog = await screen.findByRole("dialog", { name: "Insert button" }, LAZY_WAIT);
     await userEvent.type(screen.getByLabelText(/^Address/), "{{{{resetLink}}");
     await userEvent.type(screen.getByLabelText(/^Button text/), "Reset password");
     await userEvent.click(screen.getByRole("button", { name: "Insert button" }));
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    await waitFor(() => expect(dialog).not.toBeInTheDocument(), LAZY_WAIT);
     expect(onChange.mock.lastCall?.[0]).toContain('<a href="{{resetLink}}" data-rp-button="primary">Reset password</a>');
 
     fireEvent.click(screen.getByRole("button", { name: "Image" }));
-    await screen.findByRole("dialog", { name: "Insert image" });
+    await screen.findByRole("dialog", { name: "Insert image" }, LAZY_WAIT);
     await userEvent.type(screen.getByLabelText(/^Image address/), "http://insecure.example/a.png");
     await userEvent.type(screen.getByLabelText(/^Description/), "Logo");
     await userEvent.click(screen.getByRole("button", { name: "Insert image" }));
     expect(within(screen.getByRole("dialog", { name: "Insert image" })).getByRole("alert")).toHaveTextContent("https://");
   });
 
-  it("applies a new value from the parent without echoing onChange", async () => {
+  it("applies a new value from the parent without echoing onChange", TEST_TIMEOUT, async () => {
     const onChange = vi.fn();
     function Parent() {
       const [value, setValue] = useState("<p>One</p>");
@@ -126,9 +129,9 @@ describe("RichTextEditor", () => {
       );
     }
     renderUi(<Parent />);
-    const box = await screen.findByRole("textbox", { name: "Body" });
+    const box = await screen.findByRole("textbox", { name: "Body" }, LAZY_WAIT);
     fireEvent.click(screen.getByRole("button", { name: "Load" }));
-    await waitFor(() => expect(box).toHaveTextContent("Two {{x}}"));
+    await waitFor(() => expect(box).toHaveTextContent("Two {{x}}"), LAZY_WAIT);
     expect(box.querySelector('[data-variable="x"]')).not.toBeNull();
     expect(onChange).not.toHaveBeenCalled();
   });

@@ -21,7 +21,7 @@ WCAG/ADA conformance claim.
 
 ### Prerequisites
 
-- Node.js `>=22.12 <23` and pnpm `12.21.0` (`packageManager` in `package.json`).
+- Node.js `>=22.13.0 <23` and pnpm `12.21.0` (`packageManager` in `package.json`).
 - MySQL 8.4 and the matching `mysql` and `mysqldump` client tools (needed by backups and the backup tests).
 - FFmpeg and `prlimit` for optional audio conversion. The native installer and packaged image include them.
 - Linux or macOS for development. Native deployment targets Ubuntu 24.04 or 26.04 LTS.

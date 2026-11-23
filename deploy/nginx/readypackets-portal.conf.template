@@ -141,8 +141,14 @@ server {
         client_max_body_size 192m;
         proxy_pass http://127.0.0.1:5000;
     }
-    location ^~ /api/files/upload/ {
+    location ~ "^/api/files/upload/[0-9A-HJKMNP-TV-Z]{26}$" {
+        if ($request_method != POST) { return 405; }
         client_max_body_size 256m;
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location ~ "^/api/files/orders/[0-9A-HJKMNP-TV-Z]{26}/[0-9A-HJKMNP-TV-Z]{26}/document$" {
+        if ($request_method !~ "^(GET|HEAD|POST)$") { return 405; }
+        client_max_body_size 10256k;
         proxy_pass http://127.0.0.1:5000;
     }
     location = /api/platform/presentation/images {
@@ -163,6 +169,17 @@ server {
         if ($request_uri !~ "^/api/trpc/orders[.]admin[.]workflows[.]transfer[.]applyImport([?]|$)") { return 404; }
         if ($args ~ "(^|&)(b|%62)(a|%61)(t|%74)(c|%63)(h|%68)(=|&|$)") { return 400; }
         client_max_body_size 4352k;
+        proxy_pass http://127.0.0.1:5000;
+    }
+    # Keep the origin's no-cache/no-store policy and Service-Worker-Allowed header.
+    location = /sw.js {
+        expires off;
+        proxy_cache off;
+        proxy_pass http://127.0.0.1:5000;
+    }
+    location = /manifest.webmanifest {
+        expires off;
+        proxy_cache off;
         proxy_pass http://127.0.0.1:5000;
     }
     location / {

@@ -47,6 +47,15 @@ for header in server via x-powered-by; do
 done
 grep -qi '<div id="root"' "$work/shell.html" || fail "the shell does not look like the portal"
 web "$origin/api/trpc/identity.passwordPolicy" | grep -q '"minLength"' || fail "the public API did not answer"
+for asset in sw.js manifest.webmanifest offline.html; do
+    expect "$asset status" "$(web -D "$work/pwa.headers" -o "$work/pwa.body" -w '%{http_code}' "$origin/$asset")" 200
+    grep -Eqi '^cache-control: (no-cache|no-store)[[:space:]]*$' "$work/pwa.headers" || fail "$asset is not revalidated"
+    case $asset in
+        sw.js) grep -Eqi '^service-worker-allowed: /[[:space:]]*$' "$work/pwa.headers" || fail 'service worker scope missing' ;;
+        manifest.webmanifest) jq -e '.display == "standalone" and (.shortcuts | length) == 4' "$work/pwa.body" >/dev/null ;;
+        offline.html) grep -q "You're offline" "$work/pwa.body" || fail 'offline document missing' ;;
+    esac
+done
 
 step "plain HTTP is redirected, callback paths are refused, unknown names are refused"
 expect "redirect" "$(plain -o /dev/null -w '%{http_code} %{redirect_url}' http://localhost/sign-in)" "308 https://localhost/sign-in"
@@ -74,9 +83,9 @@ step "proxy rules: other ports in Host, upload allowances only on the exact rout
 docker exec readypackets-caddy-1 caddy version
 expect "Host with another port" "$(web -o /dev/null -w '%{http_code}' -H 'Host: localhost:8443' "$origin/readyz")" 421
 expect "mixed-case upload path keeps the default limit" "$(web -o /dev/null -w '%{http_code}' -X POST \
-    -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/probe")" 413
+    -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/01J00000000000000000000001")" 413
 upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/octet-stream' \
-    --data-binary "@$work/large" "$origin/api/files/upload/probe")
+    --data-binary "@$work/large" "$origin/api/files/upload/01J00000000000000000000001")
 # The proxy lets the larger body through on the real upload route; the application then refuses the
 # unauthenticated request itself.
 [[ $upload_status =~ ^40[13]$ ]] || fail "upload route: expected the application to refuse (401/403), got $upload_status"
@@ -134,7 +143,7 @@ query_release_journal() {
         'MYSQL_PWD="$(cat /run/rp-db-secrets/root_password)" mysql --protocol=socket -uroot -N -B --execute="$1"' sh "$1"
 }
 step "migration 0005 is applied exactly once"
-assert_release_migrations migrations query_release_journal 0005_increment_05
+assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06
 
 step "first administrator (non-interactive), refused the second time"
 ( umask 077; printf 'Ci-%s-Aa1\n' "$(openssl rand -hex 16)" > "$work/password" )
@@ -183,7 +192,7 @@ step "update in place: the portal is stopped, migrated and started again"
 wait_for_proxy
 expect "readyz after update" "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 expect "web restarted cleanly" "$(docker inspect -f '{{.State.Status}}' readypackets-web-1)" running
-assert_release_migrations migrations query_release_journal 0005_increment_05
+assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06
 
 step "restart keeps data, keys and settings"
 "$rp" down

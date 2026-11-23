@@ -18,8 +18,18 @@ import type { UserRole } from "../../../shared/domain.js";
 import { users } from "../identity/schema.js";
 import { nameAad } from "../identity/users.js";
 import { assertLiveActorInTx } from "./actorAuth.js";
-import { orderPolicyAcceptances, type AcceptanceSignatureMode, type OrderPolicyAcceptanceRow } from "./acceptanceSchema.js";
-import { policyDocuments, policyVersions } from "./schema.js";
+import {
+  orderPolicyAcceptances,
+  type AcceptanceSignatureMode,
+  type OrderPolicyAcceptanceRow,
+  type SignatureNameMatchResult,
+} from "./acceptanceSchema.js";
+import { policyAcceptances, policyDocuments, policyVersions } from "./schema.js";
+import {
+  loadAccountDisplayName,
+  recordSignatureMismatchAuditIfNeeded,
+  verifyTypedSignatureInTx,
+} from "./signatureNameCheck.js";
 
 /* ------------------------------------------------------------------ ports (orders.gates, agreed with orders_engineer) */
 
@@ -54,7 +64,13 @@ export interface AssertMetInput {
 
 interface OrderGatesPort {
   context(orderPublicId: string, actor: SessionPrincipal, tx?: Tx): Promise<OrderGateContext | null>;
-  registerProvider(key: "acceptance", provider: { assertMet(input: AssertMetInput): Promise<void> }): void;
+  registerProvider(
+    key: "acceptance",
+    provider: {
+      assertMet(input: AssertMetInput): Promise<void>;
+      agreementStatus?(input: { tx: DbOrTx; userId: number; gate: AcceptanceGate }): Promise<{ met: boolean }>;
+    },
+  ): void;
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -202,6 +218,7 @@ export function createAcceptanceService(deps: ModuleDeps) {
       textSha256: row.textSha256,
       signatureMode: row.signatureMode,
       typedName: row.typedNameEnc ? deps.crypto.decrypt(row.typedNameEnc, typedNameAad(row.publicId)) : null,
+      typedNameMatch: row.typedNameMatch ?? null,
       signerName: extra.signerName,
       acceptedAt: row.acceptedAt.toISOString(),
     };
@@ -246,6 +263,51 @@ export function createAcceptanceService(deps: ModuleDeps) {
         if (!gateMet(gate, policies.get(gate.policyPublicId), rows, input.workflowVersionId)) throw acceptanceRequired();
       }
     },
+
+    /**
+     * Increment 06 D14: Read-only account-level agreement check for `orders.agreement_gate`.
+     * Met when the acting user has a portal acceptance of the gate's active customer/all published policy
+     * (current published version when `gate.askAgainOnNewVersion`, otherwise any portal-accepted version).
+     */
+    async agreementStatus(input: { tx: DbOrTx; userId: number; gate: AcceptanceGate }): Promise<{ met: boolean }> {
+      const policy = (await currentPolicies(input.tx, [input.gate.policyPublicId])).get(input.gate.policyPublicId);
+      if (!policy) return { met: false };
+
+      const baseConds = [
+        eq(policyAcceptances.userId, input.userId),
+        eq(policyAcceptances.origin, "portal"),
+      ];
+      if (input.gate.signatureMode === "typed_name") {
+        baseConds.push(eq(policyAcceptances.method, "typed_signature"));
+      }
+
+      if (input.gate.askAgainOnNewVersion) {
+        const [row] = await input.tx
+          .select({ id: policyAcceptances.id })
+          .from(policyAcceptances)
+          .where(
+            and(
+              ...baseConds,
+              eq(policyAcceptances.policyVersionId, policy.versionId),
+              eq(policyAcceptances.versionContentHash, policy.contentHash),
+            ),
+          )
+          .limit(1);
+        return { met: row !== undefined };
+      }
+
+      const [row] = await input.tx
+        .select({ id: policyAcceptances.id })
+        .from(policyAcceptances)
+        .where(
+          and(
+            ...baseConds,
+            eq(policyAcceptances.documentId, policy.documentId),
+          ),
+        )
+        .limit(1);
+      return { met: row !== undefined };
+    },
   };
 
   return {
@@ -262,7 +324,10 @@ export function createAcceptanceService(deps: ModuleDeps) {
       const ctx = await contextOrNotFound(input.orderId, principal);
       const policies = await currentPolicies(deps.db, ctx.gates.map((g) => g.policyPublicId));
       const staff = isStaffRole(principal.role);
-      const rows = staff ? [] : await acceptancesOf(deps.db, ctx.orderId, principal.userId);
+      const [rows, expectedSignerName] = await Promise.all([
+        staff ? Promise.resolve([]) : acceptancesOf(deps.db, ctx.orderId, principal.userId),
+        staff ? Promise.resolve(null) : loadAccountDisplayName(deps, principal.userId, deps.db),
+      ]);
       const gates = ctx.gates.map((gate) => {
         const policy = policies.get(gate.policyPublicId);
         const met = gateMet(gate, policy, rows, ctx.workflowVersionId);
@@ -281,80 +346,108 @@ export function createAcceptanceService(deps: ModuleDeps) {
             : null,
         };
       });
-      return { orderId: ctx.orderPublicId, blocking: gates.some((g) => g.required && g.applies && !g.met), gates };
+      return { orderId: ctx.orderPublicId, expectedSignerName, blocking: gates.some((g) => g.required && g.applies && !g.met), gates };
     },
 
     /** Customer (owner or grantee) records their own acceptance. Idempotent per (order, user, version, gate). */
     async accept(principal: SessionPrincipal, input: { orderId: string; gateKey: string; policyVersionId: string; textSha256: string; typedName?: string | undefined }) {
       if (isStaffRole(principal.role)) throw forbidden("STAFF_NOT_GATED");
       const request = getRequestContext();
-      return deps.db.transaction(async (tx) => {
-        const actor = await assertLiveActorInTx(deps, principal, tx);
-        if (isStaffRole(actor.role)) throw forbidden("STAFF_NOT_GATED");
-        const ctx = await contextOrNotFound(input.orderId, principal, tx);
-        if (ctx.actorAccess === "staff") throw forbidden("STAFF_NOT_GATED");
-        const gate = ctx.gates.find((g) => g.key === input.gateKey);
-        if (!gate) throw notFound("GATE_NOT_FOUND");
-        const policy = (await currentPolicies(tx, [gate.policyPublicId], { lockShared: true })).get(gate.policyPublicId);
-        if (!policy) throw conflict("POLICY_UNAVAILABLE", "This policy isn't available right now. Please contact support.");
-        if (input.policyVersionId !== policy.versionPublicId || input.textSha256 !== policy.contentHash) {
-          throw conflict("POLICY_TEXT_CHANGED", "The policy was updated. Please read the current text and accept again.");
-        }
-        let typedName: string | null = null;
-        if (gate.signatureMode === "typed_name") {
-          typedName = input.typedName === undefined ? null : normalizeTypedName(input.typedName);
-          if (!typedName) throw validation("TYPED_NAME_REQUIRED", "Type your full name to sign.", { field: "typedName" });
-        }
-
-        const [existing] = await tx
-          .select()
-          .from(orderPolicyAcceptances)
-          .where(and(
-            eq(orderPolicyAcceptances.orderId, ctx.orderId), eq(orderPolicyAcceptances.userId, actor.userId),
-            eq(orderPolicyAcceptances.policyVersionId, policy.versionId), eq(orderPolicyAcceptances.gateKey, gate.key),
-            eq(orderPolicyAcceptances.workflowVersionId, ctx.workflowVersionId),
-          ))
-          .limit(1);
-        let row = existing;
-        let duplicate = true;
-        if (!row) {
-          duplicate = false;
-          const publicId = ulid();
-          const now = deps.clock.now();
-          const ip = request?.ipAddress ?? null;
-          const userAgent = request?.userAgent ? request.userAgent.replace(/[\p{Cc}]/gu, "").slice(0, 512) : null;
-          await tx.insert(orderPolicyAcceptances).values({
-            publicId, orderId: ctx.orderId, orderPublicId: ctx.orderPublicId, userId: actor.userId, gateKey: gate.key,
-            workflowVersionId: ctx.workflowVersionId, policyDocumentId: policy.documentId, policyVersionId: policy.versionId,
-            policyPublicId: policy.documentPublicId, policyVersionNumber: policy.versionNumber, textSha256: policy.contentHash,
-            signatureMode: gate.signatureMode, typedNameEnc: typedName ? deps.crypto.encrypt(typedName, typedNameAad(publicId)) : null,
-            acceptedAt: now, sourceAddressEnc: ip ? deps.crypto.encrypt(ip, sourceAddressAad(publicId)) : null,
-            userAgent, requestId: request?.requestId ?? ulid(), createdAt: now,
-          });
-          [row] = await tx.select().from(orderPolicyAcceptances).where(eq(orderPolicyAcceptances.publicId, publicId)).limit(1);
-          await deps.audit.record(
-            {
-              category: "business",
-              eventName: "order.acceptance.recorded",
-              action: "accept",
-              outcome: "completed",
-              actor: { userId: actor.userId, role: actor.role },
+      const resource = { type: "order", publicId: input.orderId };
+      try {
+        return await deps.db.transaction(async (tx) => {
+          const actor = await assertLiveActorInTx(deps, principal, tx);
+          if (isStaffRole(actor.role)) throw forbidden("STAFF_NOT_GATED");
+          const ctx = await contextOrNotFound(input.orderId, principal, tx);
+          if (ctx.actorAccess === "staff") throw forbidden("STAFF_NOT_GATED");
+          const gate = ctx.gates.find((g) => g.key === input.gateKey);
+          if (!gate) throw notFound("GATE_NOT_FOUND");
+          const policy = (await currentPolicies(tx, [gate.policyPublicId], { lockShared: true })).get(gate.policyPublicId);
+          if (!policy) throw conflict("POLICY_UNAVAILABLE", "This policy isn't available right now. Please contact support.");
+          if (input.policyVersionId !== policy.versionPublicId || input.textSha256 !== policy.contentHash) {
+            throw conflict("POLICY_TEXT_CHANGED", "The policy was updated. Please read the current text and accept again.");
+          }
+          let typedName: string | null = null;
+          let typedNameMatch: SignatureNameMatchResult | null = null;
+          if (gate.signatureMode === "typed_name") {
+            const candidate = input.typedName === undefined ? null : normalizeTypedName(input.typedName);
+            if (!candidate) throw validation("TYPED_NAME_REQUIRED", "Type your full name to sign.", { field: "typedName" });
+            const verified = await verifyTypedSignatureInTx(deps, {
+              tx,
+              userId: actor.userId,
+              actorRole: actor.role,
+              typedName: candidate,
+              requiredErrorCode: "TYPED_NAME_REQUIRED",
+              requiredErrorMessage: "Type your full name to sign.",
+              requiredField: "typedName",
               resource: { type: "order", publicId: ctx.orderPublicId },
-              attributes: {
-                acceptance_public_id: publicId, gate_key: gate.key, policy_public_id: policy.documentPublicId,
-                policy_version: policy.versionNumber, text_sha256: policy.contentHash, signature_mode: gate.signatureMode,
-                access: ctx.actorAccess ?? "none",
+            });
+            typedName = verified.cleanedTypedName;
+            typedNameMatch = verified.matchResult;
+          }
+
+          const [existing] = await tx
+            .select()
+            .from(orderPolicyAcceptances)
+            .where(and(
+              eq(orderPolicyAcceptances.orderId, ctx.orderId), eq(orderPolicyAcceptances.userId, actor.userId),
+              eq(orderPolicyAcceptances.policyVersionId, policy.versionId), eq(orderPolicyAcceptances.gateKey, gate.key),
+              eq(orderPolicyAcceptances.workflowVersionId, ctx.workflowVersionId),
+            ))
+            .limit(1);
+          let row = existing;
+          let duplicate = true;
+          if (!row) {
+            duplicate = false;
+            const publicId = ulid();
+            const now = deps.clock.now();
+            const ip = request?.ipAddress ?? null;
+            const userAgent = request?.userAgent ? request.userAgent.replace(/[\p{Cc}]/gu, "").slice(0, 512) : null;
+            await tx.insert(orderPolicyAcceptances).values({
+              publicId, orderId: ctx.orderId, orderPublicId: ctx.orderPublicId, userId: actor.userId, gateKey: gate.key,
+              workflowVersionId: ctx.workflowVersionId, policyDocumentId: policy.documentId, policyVersionId: policy.versionId,
+              policyPublicId: policy.documentPublicId, policyVersionNumber: policy.versionNumber, textSha256: policy.contentHash,
+              signatureMode: gate.signatureMode, typedNameEnc: typedName ? deps.crypto.encrypt(typedName, typedNameAad(publicId)) : null,
+              typedNameMatch,
+              acceptedAt: now, sourceAddressEnc: ip ? deps.crypto.encrypt(ip, sourceAddressAad(publicId)) : null,
+              userAgent, requestId: request?.requestId ?? ulid(), createdAt: now,
+            });
+            [row] = await tx.select().from(orderPolicyAcceptances).where(eq(orderPolicyAcceptances.publicId, publicId)).limit(1);
+            await deps.audit.record(
+              {
+                category: "business",
+                eventName: "order.acceptance.recorded",
+                action: "accept",
+                outcome: "completed",
+                actor: { userId: actor.userId, role: actor.role },
+                resource: { type: "order", publicId: ctx.orderPublicId },
+                attributes: {
+                  acceptance_public_id: publicId, gate_key: gate.key, policy_public_id: policy.documentPublicId,
+                  policy_version: policy.versionNumber, text_sha256: policy.contentHash, signature_mode: gate.signatureMode,
+                  ...(typedNameMatch ? { signature_match: typedNameMatch } : {}),
+                  access: ctx.actorAccess ?? "none",
+                },
               },
-            },
-            tx,
+              tx,
+            );
+          }
+          const names = await userNames(tx, [actor.userId]);
+          return {
+            duplicate,
+            receipt: receiptView(row!, { orderReference: ctx.reference, orderName: ctx.name, policyTitle: policy.title, versionLabel: policy.versionLabel, signerName: names.get(actor.userId) ?? "" }),
+          };
+        });
+      } catch (err) {
+        if (err instanceof DomainError) {
+          await recordSignatureMismatchAuditIfNeeded(
+            deps,
+            { userId: principal.userId, role: principal.role },
+            resource,
+            err,
           );
         }
-        const names = await userNames(tx, [actor.userId]);
-        return {
-          duplicate,
-          receipt: receiptView(row!, { orderReference: ctx.reference, orderName: ctx.name, policyTitle: policy.title, versionLabel: policy.versionLabel, signerName: names.get(actor.userId) ?? "" }),
-        };
-      });
+        throw err;
+      }
     },
 
     /** Printable receipt: the signer themselves, or staff/admin who can read the order. */
@@ -440,13 +533,13 @@ export function createAcceptanceService(deps: ModuleDeps) {
           publicId: t.publicId, acceptedAt: t.acceptedAt, userId: t.userId, policyDocumentId: t.policyDocumentId, policyPublicId: t.policyPublicId,
           policyVersionId: t.policyVersionId, policyVersionNumber: t.policyVersionNumber, textSha256: t.textSha256, method: t.signatureMode,
           orderId: t.orderId, orderPublicId: t.orderPublicId, gateKey: t.gateKey, workflowVersionId: t.workflowVersionId,
-          sourceAddressEnc: t.sourceAddressEnc, requestId: t.requestId, typedNameEnc: t.typedNameEnc,
+          sourceAddressEnc: t.sourceAddressEnc, requestId: t.requestId, typedNameEnc: t.typedNameEnc, typedNameMatch: t.typedNameMatch,
         })
         .from(t)
         .where(and(...conditions))
         .orderBy(desc(t.acceptedAt), desc(t.publicId))
         .limit(limit + 1);
-      const items = rows.slice(0, limit).map(({ sourceAddressEnc, requestId, typedNameEnc, ...row }): OrderGateEvidence => ({
+      const items = rows.slice(0, limit).map(({ sourceAddressEnc, requestId, typedNameEnc, typedNameMatch, ...row }): OrderGateEvidence => ({
         ...row,
         addressPseudonym: sourceAddressEnc
           ? deps.crypto.pseudonym(deps.crypto.decrypt(sourceAddressEnc, sourceAddressAad(row.publicId)), ADDRESS_PSEUDONYM_PURPOSE)
@@ -454,6 +547,7 @@ export function createAcceptanceService(deps: ModuleDeps) {
         correlationId: requestId,
         signerNameEnc: typedNameEnc,
         signerNameAad: typedNameEnc ? typedNameAad(row.publicId) : null,
+        typedNameMatch: typedNameMatch ?? null,
       }));
       return { items, hasMore: rows.length > limit };
     },
@@ -517,6 +611,7 @@ export interface OrderGateEvidence {
   correlationId: string;
   signerNameEnc: string | null;
   signerNameAad: string | null;
+  typedNameMatch?: SignatureNameMatchResult | null;
 }
 
 export type AcceptanceService = ReturnType<typeof createAcceptanceService>;

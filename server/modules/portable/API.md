@@ -38,3 +38,17 @@ Private administrative transfer; not a system backup. All IDs exposed to callers
   - Carts are not collected, so their applied promo fields (including the encrypted `applied_promo_code_enc`) and upsell cart state are not transferred either.
 - **Workflows (D1) do not overlap.** The workflow transfer (`orders.admin.workflows.transfer.*`, ADR 0042) moves workflow definitions, which are configuration, as draft-only JSON packages. This module moves business records for a whole or selected installation and has no workflow collector. Orders carry the source workflow key only as inert `heldUnknown.sourceWorkflow`. The two features share no format, tables, jobs or settings. Move workflows first if the target needs them.
 - **Backups.** Backups (`server/modules/backup`) dump every base table, including the new promotion, upsell and order columns. They do not use this format. Restored encrypted columns (including promotion code values) and keyed hashes are valid only with the same field-encryption and blind-index keys, so restoring to an installation with different keys is unsupported. Use this transfer for moves between installations, and recreate promotions on the target.
+
+## Increment 06 coverage
+
+Every table added in increment 06 is either collected under an existing record or listed in the manifest exclusions. None of them adds a record type or changes contract 3.0.
+
+- **`historical-evidence`** now names billing explicitly: invoices, payments, payment receipts (`compliance_payment_receipts`) and receipt refund notes (`compliance_receipt_refund_notes`). Receipts and their documents are issued once at the source and are not re-issued at the target. New payment columns (waived amount, card brand and last four digits) are not exported either.
+- **`internal-order-notes`** now also covers order task notes and waivers (`order_task_notes`, `order_task_waivers`).
+- **`security-operations`** (new): `security_incidents`, `security_incident_events`, `security_incident_timeline` and `security_correlation_state`.
+- **`policy-notices`** (new): policy notice and enforcement preferences, notices, recipients and actions.
+- **`report-definitions`** (new): saved report definitions and the report run log (`report_definitions`, `report_runs`).
+- **Carts.** Carts are still not collected, so the new cart and upsell columns (`checked_out_waived_minor`, `seed_key`, `rule_type`) are not transferred.
+- **New acceptance columns** (signer and typed-name match results) belong to compliance evidence, which this export does not collect.
+- **Backups** dump every base table, including all of the above. The increment 05 note about field-encryption and blind-index keys still applies.
+

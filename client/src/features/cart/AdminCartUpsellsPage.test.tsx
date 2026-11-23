@@ -86,6 +86,8 @@ function sampleOffer(
   const now = new Date("2026-11-22T12:00:00Z");
   return {
     offerPublicId,
+    seedKey: null,
+    ruleType: "standard",
     version: 2,
     kind: "add_on",
     title: "Add priority onboarding",
@@ -111,31 +113,42 @@ function sampleOffer(
   };
 }
 
-function makeListResponse(offers: AdminUpsellOfferRow[] = [
-  sampleOffer("01JQAUPSELL000000000000001"),
-  sampleOffer("01JQAUPSELL000000000000002", {
-    kind: "tier_upgrade",
-    title: "Step up to Packet 01 Premium",
-    shortText: "Includes board-ready executive summary and custom mapping.",
-    triggerMode: "products",
-    triggerProductPublicIds: ["01JQAPROD00000000000000001"],
-    triggerProductNames: ["Packet 01 - Basic"],
-    targetProductPublicId: "01JQAPROD00000000000000002",
-    targetProductName: "Packet 01 - Premium",
-    targetProductPriceMinor: 45000,
-    priority: 40,
-    active: false,
-    shownCount: 18,
-    acceptedCount: 4,
-    dismissedCount: 2,
-  }),
-]) {
+function makeListResponse(
+  offers: AdminUpsellOfferRow[] = [
+    sampleOffer("01JQAUPSELL000000000000001"),
+    sampleOffer("01JQAUPSELL000000000000002", {
+      seedKey: "seed:v1:tier_upgrade:p1:Basic:Premium",
+      kind: "tier_upgrade",
+      title: "Step up to Packet 01 Premium",
+      shortText: "Includes board-ready executive summary and custom mapping.",
+      triggerMode: "products",
+      triggerProductPublicIds: ["01JQAPROD00000000000000001"],
+      triggerProductNames: ["Packet 01 - Basic"],
+      targetProductPublicId: "01JQAPROD00000000000000002",
+      targetProductName: "Packet 01 - Premium",
+      targetProductPriceMinor: 45000,
+      priority: 40,
+      active: false,
+      shownCount: 18,
+      acceptedCount: 4,
+      dismissedCount: 2,
+    }),
+  ],
+  overrides: Partial<ReturnType<typeof baseMeta>> = {},
+) {
+  return {
+    ...baseMeta(),
+    ...overrides,
+    offers,
+  };
+}
+
+function baseMeta() {
   return {
     featureCartEnabled: true,
     featureUpsellEnabled: false,
     bundleRuleEnabled: true,
     bundleRuleLabel: "Full Governance Suite (15% off)",
-    offers,
     catalogProducts: sampleCatalogProducts,
   };
 }
@@ -150,15 +163,18 @@ beforeEach(() => {
 });
 
 describe("AdminCartUpsellsPage (/admin/carts/suggestions)", () => {
-  it("renders aggregated counters, feature-off and bundle callouts, and filters offers cleanly", async () => {
+  it("renders aggregated counters, page-level switch, and filters offers cleanly", async () => {
     handlers.set("cart.admin.upsells.list", () => makeListResponse());
 
     const user = userEvent.setup();
     renderUi(<AdminCartUpsellsPage />, { path: "/admin/carts/suggestions" });
 
     expect(await screen.findByRole("heading", { level: 1, name: "Cart suggestions" })).toBeInTheDocument();
-    expect(await screen.findByText("Cart suggestions are currently turned off")).toBeInTheDocument();
-    expect(screen.getByText("Automatic bundle-completion suggestion")).toBeInTheDocument();
+    const pageSwitch = await screen.findByRole("switch", { name: "Show suggestions in the cart" });
+    expect(pageSwitch).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("button", { name: "Add suggested offers" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable all" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Disable all" })).toBeInTheDocument();
 
     // Aggregated StatCard counters: Shown 42+18=60, Accepted 9+4=13, Dismissed 5+2=7
     expect(screen.getByText("60")).toBeInTheDocument();
@@ -172,6 +188,81 @@ describe("AdminCartUpsellsPage (/admin/carts/suggestions)", () => {
 
     await user.click(screen.getAllByRole("button", { name: /Clear filters/i })[0]!);
     expect((await screen.findAllByText("Add priority onboarding")).length).toBeGreaterThan(0);
+  });
+
+  it("supports D3 page-level switch (offering feature.cart when off), Enable all, Disable all, Add suggested offers, and Duplicate", async () => {
+    let featureCartEnabled = false;
+    let featureUpsellEnabled = false;
+    let offers = makeListResponse().offers;
+
+    handlers.set("cart.admin.upsells.list", () =>
+      makeListResponse(offers, { featureCartEnabled, featureUpsellEnabled }),
+    );
+    handlers.set("cart.admin.upsells.setFeature", (raw) => {
+      const input = raw as { enabled: boolean; alsoEnableCart?: boolean };
+      featureUpsellEnabled = input.enabled;
+      if (input.alsoEnableCart) featureCartEnabled = true;
+      return { featureUpsellEnabled, featureCartEnabled };
+    });
+    handlers.set("cart.admin.upsells.setAllActive", (raw) => {
+      const input = raw as { active: boolean };
+      offers = offers.map((o) => ({ ...o, active: input.active, version: o.version + 1 }));
+      return { updatedCount: offers.length };
+    });
+    handlers.set("cart.admin.upsells.seedSuggested", () => {
+      const seededBundle = sampleOffer("01JQAUPSELL000000000000099", {
+        seedKey: "seed:v1:bundle_completion:default",
+        ruleType: "bundle_completion",
+        title: "Complete the Full Governance Suite (save 15%)",
+        shortText: "Add your remaining packets to unlock the automatic 15% bundle discount.",
+        targetProductName: "Missing bundle packets (dynamic)",
+        active: false,
+      });
+      offers = [...offers, seededBundle];
+      return { addedCount: 1, skippedExistingCount: 2, totalOffers: offers.length };
+    });
+    handlers.set("cart.admin.upsells.duplicate", (raw) => {
+      const input = raw as { offerPublicId: string };
+      const src = offers.find((o) => o.offerPublicId === input.offerPublicId)!;
+      const dup = sampleOffer("01JQAUPSELL000000000000088", {
+        ...src,
+        offerPublicId: "01JQAUPSELL000000000000088",
+        seedKey: null,
+        title: `${src.title} (copy)`,
+        active: false,
+        version: 1,
+      });
+      offers = [...offers, dup];
+      return dup;
+    });
+
+    const user = userEvent.setup();
+    renderUi(<AdminCartUpsellsPage />, { path: "/admin/carts/suggestions" });
+
+    const pageSwitch = await screen.findByRole("switch", { name: "Show suggestions in the cart" });
+    await user.click(pageSwitch);
+
+    // Since featureCartEnabled is false, dialog offers enabling shopping cart as well
+    expect(await screen.findByRole("dialog", { name: "Turn on shopping cart as well?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Enable cart and suggestions" }));
+
+    await waitFor(() => {
+      expect(calls.find((c) => c.path === "cart.admin.upsells.setFeature")?.input).toEqual({
+        enabled: true,
+        alsoEnableCart: true,
+      });
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add suggested offers" }));
+    expect((await screen.findAllByText("Complete the Full Governance Suite (save 15%)")).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Enable all" }));
+    await waitFor(() => {
+      expect(calls.some((c) => c.path === "cart.admin.upsells.setAllActive")).toBe(true);
+    });
+
+    await user.click(screen.getAllByRole("button", { name: "Duplicate: Add priority onboarding" })[0]!);
+    expect((await screen.findAllByText("Add priority onboarding (copy)")).length).toBeGreaterThan(0);
   });
 
   it("filters tier_upgrade target products to higher packet tiers only and creates/edits/toggles/deletes offers", async () => {
@@ -270,11 +361,11 @@ describe("AdminCartUpsellsPage (/admin/carts/suggestions)", () => {
       expect(calls.some((c) => c.path === "cart.admin.upsells.update")).toBe(true);
     });
 
-    // Deactivate first offer (now version 3)
-    const deactivateBtn = await screen.findAllByRole("button", {
-      name: "Deactivate: Add priority onboarding — updated",
+    // Deactivate first offer via per-row Switch (now version 3)
+    const rowSwitches = await screen.findAllByRole("switch", {
+      name: "Disable: Add priority onboarding — updated",
     });
-    await user.click(deactivateBtn[0]!);
+    await user.click(rowSwitches[0]!);
     await waitFor(() => {
       expect(calls.some((c) => c.path === "cart.admin.upsells.setActive")).toBe(true);
     });
@@ -301,6 +392,20 @@ describe("AdminCartUpsellsPage (/admin/carts/suggestions)", () => {
     );
     await screen.findByRole("heading", { level: 1, name: "Cart suggestions" });
     await screen.findAllByText("Add priority onboarding");
+  });
+
+  pageA11y("admin cart suggestions enable-cart prompt dialog open", async () => {
+    document.title = "Cart suggestions · ReadyPackets";
+    handlers.set("cart.admin.upsells.list", () => makeListResponse(undefined, { featureCartEnabled: false }));
+    const user = userEvent.setup();
+    renderUi(
+      <main>
+        <AdminCartUpsellsPage />
+      </main>,
+      { path: "/admin/carts/suggestions" },
+    );
+    await user.click(await screen.findByRole("switch", { name: "Show suggestions in the cart" }));
+    await screen.findByRole("dialog", { name: "Turn on shopping cart as well?" });
   });
 
   pageA11y("admin cart suggestions create dialog open with trigger products fieldset", async () => {

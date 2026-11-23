@@ -2,7 +2,7 @@
  * Database-backed, restart-safe rate limiter with distinct budgets per category. Owner: http_security engineer.
  */
 import { createHmac, hkdfSync } from "node:crypto";
-import { and, asc, eq, gt, isNotNull, lte } from "drizzle-orm";
+import { and, asc, eq, gt, isNotNull, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import { RATE_LIMIT_CATEGORIES } from "../core/types.js";
 import type { Clock, Db, Logger, MaintainableRateLimiter, RateLimitCategory, SettingsStore, Tx } from "../core/types.js";
@@ -29,7 +29,19 @@ export interface DbRateLimiter extends MaintainableRateLimiter {
 export interface RateLimitBudget {
   maxRequests: number;
   windowSeconds: number;
+  backoff?: RateLimitBackoff | undefined;
 }
+
+export const rateLimitBackoffSchema = z.strictObject({
+  enabled: z.boolean(),
+  factor: z.number().int().min(2).max(8),
+  maxSeconds: z.number().int().min(30).max(3_600),
+  resetAfterMinutes: z.number().int().min(1).max(1_440),
+});
+export type RateLimitBackoff = z.infer<typeof rateLimitBackoffSchema>;
+export const DEFAULT_BACKOFF: RateLimitBackoff = {
+  enabled: true, factor: 2, maxSeconds: 900, resetAfterMinutes: 30,
+};
 
 export const DEFAULT_BUDGETS = {
   auth_high_risk: { maxRequests: 30, windowSeconds: 300 },
@@ -52,6 +64,7 @@ export const RATE_LIMIT_BOUNDS = {
 const budgetSchema = z.strictObject({
   maxRequests: z.number().int().min(1).max(100_000),
   windowSeconds: z.number().int().min(1).max(86_400),
+  backoff: rateLimitBackoffSchema.default(DEFAULT_BACKOFF),
 });
 
 export const rateLimitSettings = Object.fromEntries(RATE_LIMIT_CATEGORIES.map((category) => [
@@ -71,11 +84,12 @@ export const rateLimitSettings = Object.fromEntries(RATE_LIMIT_CATEGORIES.map((c
   }),
 ])) as Record<RateLimitCategory, ValueSettingDefinition<RateLimitBudget>>;
 
-export function boundedBudget(category: RateLimitCategory, budget: RateLimitBudget): RateLimitBudget {
+export function boundedBudget(category: RateLimitCategory, budget: RateLimitBudget): RateLimitBudget & { backoff: RateLimitBackoff } {
   const { min, max, maxWindow } = RATE_LIMIT_BOUNDS[category];
   return {
     maxRequests: Math.max(min, Math.min(max, budget.maxRequests)),
     windowSeconds: Math.max(1, Math.min(maxWindow, budget.windowSeconds)),
+    backoff: rateLimitBackoffSchema.parse(budget.backoff ?? DEFAULT_BACKOFF),
   };
 }
 
@@ -96,8 +110,8 @@ export function createRateLimiter(deps: RateLimiterDeps): DbRateLimiter {
       }
       try {
         // Override changes take effect without dropping active windows (new durations apply upon reset).
-        const budget = deps.protectionDisabled ? DEFAULT_BUDGETS[category] :
-          boundedBudget(category, await readSetting(deps.settings, rateLimitSettings[category]));
+        const budget = boundedBudget(category, deps.protectionDisabled ? DEFAULT_BUDGETS[category] :
+          await readSetting(deps.settings, rateLimitSettings[category]));
         const slot = createHmac("sha256", slotKey).update(category).update("\0")
           .update(normalizeRateLimitKey(key)).digest().readUInt32BE(0) & SLOT_MASK;
         const where = and(eq(counters.category, category), eq(counters.slot, slot));
@@ -105,24 +119,44 @@ export function createRateLimiter(deps: RateLimiterDeps): DbRateLimiter {
           // The upsert takes the same exclusive row lock across processes, even when hits is unchanged.
           await tx.insert(counters).values({ category, slot, hits: 0, resetAt: deps.clock.now() })
             .onDuplicateKeyUpdate({ set: { slot } });
-          const [row] = await tx.select({ hits: counters.hits, resetAt: counters.resetAt, blockPublicId: counters.blockPublicId })
+          const [row] = await tx.select({
+            hits: counters.hits, resetAt: counters.resetAt, blockPublicId: counters.blockPublicId,
+            backoffLevel: counters.backoffLevel, lastExceededAt: counters.lastExceededAt,
+          })
             .from(counters).where(where).for("update");
           if (!row) throw new Error("RATE_LIMIT_COUNTER_UNAVAILABLE");
           const now = deps.clock.now().getTime();
           const fresh = row.resetAt.getTime() <= now;
+          if (!fresh && row.blockPublicId && row.backoffLevel > 1) {
+            return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((row.resetAt.getTime() - now) / 1000)) };
+          }
           const resetAt = fresh ? new Date(now + budget.windowSeconds * 1000) : row.resetAt;
           const hits = (fresh ? 0 : row.hits) + cost;
+          const backoff = budget.backoff;
+          // Start the decay clock after a wait ends, not while a denied client is still waiting.
+          const recent = backoff.enabled && row.lastExceededAt !== null &&
+            now - row.lastExceededAt.getTime() < backoff.resetAfterMinutes * 60_000;
           if (hits > budget.maxRequests) {
-            if (fresh || !row.blockPublicId) {
-              await tx.update(counters).set({
-                hits: fresh ? 0 : row.hits,
-                resetAt,
-                blockPublicId: ulid(now),
-              }).where(where);
-            }
-            return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((resetAt.getTime() - now) / 1000)) };
+            if (!fresh && row.blockPublicId) return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((resetAt.getTime() - now) / 1000)) };
+            const level = backoff.enabled ? Math.min(16, (recent ? row.backoffLevel : 0) + 1) : 0;
+            const baseSeconds = Math.max(1, Math.ceil((resetAt.getTime() - now) / 1000));
+            const seconds = level > 1
+              ? Math.max(baseSeconds, Math.min(backoff.maxSeconds, budget.windowSeconds * backoff.factor ** (level - 1)))
+              : baseSeconds;
+            const until = level > 1 ? new Date(Math.max(resetAt.getTime(), now + seconds * 1000)) : resetAt;
+            await tx.update(counters).set({
+              hits: fresh ? 0 : row.hits,
+              resetAt: until,
+              blockPublicId: ulid(now),
+              backoffLevel: level,
+              lastExceededAt: level > 0 ? until : null,
+            }).where(where);
+            return { allowed: false, retryAfterSeconds: seconds };
           }
-          await tx.update(counters).set({ hits, resetAt, blockPublicId: fresh ? null : row.blockPublicId }).where(where);
+          await tx.update(counters).set({
+            hits, resetAt, blockPublicId: fresh ? null : row.blockPublicId,
+            ...(!recent ? { backoffLevel: 0, lastExceededAt: null } : {}),
+          }).where(where);
           return { allowed: true, retryAfterSeconds: 0 };
         });
       } catch {
@@ -149,9 +183,11 @@ export function createRateLimiter(deps: RateLimiterDeps): DbRateLimiter {
     },
     async cleanup() {
       const cutoff = deps.clock.now();
+      const maxMemoryAgo = new Date(cutoff.getTime() - 1_440 * 60_000);
       let deleted = 0;
       for (let i = 0; i < 4; i++) {
-        const [result] = await deps.db.delete(counters).where(lte(counters.resetAt, cutoff)).limit(5_000);
+        const [result] = await deps.db.delete(counters).where(and(lte(counters.resetAt, cutoff),
+          or(eq(counters.backoffLevel, 0), lte(counters.lastExceededAt, maxMemoryAgo)))).limit(5_000);
         deleted += result.affectedRows;
         if (result.affectedRows < 5_000) break;
       }

@@ -11,6 +11,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, NotificationSlot } from "../slots";
+import { PolicyPromptSlot } from "../policyPromptSlot";
 import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
@@ -28,7 +29,7 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
     <nav aria-label="Console" className="flex flex-col gap-5">
       {groups.map(({ group, items }) => (
         <div key={group}>
-          <h2 className={cn("mb-1 px-3 text-xs font-semibold tracking-wide text-on-navy-muted uppercase", collapsed && "sr-only")}>{group}</h2>
+          <h2 className={cn("rp-nav-section mb-1 px-3 text-xs font-semibold tracking-wide uppercase", collapsed && "sr-only")}>{group}</h2>
           <ul className="flex flex-col gap-0.5">
             {items.map((item) => {
               const isActive = active(item.href);
@@ -39,8 +40,7 @@ function SideNav({ groups, collapsed, onNavigate }: { groups: ReturnType<typeof 
                   aria-current={isActive ? "page" : undefined}
                   aria-label={collapsed ? item.label : undefined}
                   className={cn(
-                    "flex min-h-11 items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm font-medium text-on-navy-muted hover:bg-navy-elevated hover:text-on-navy",
-                    isActive && "bg-navy-elevated text-on-navy shadow-[inset_3px_0_0_var(--color-teal-light)]",
+                    "rp-nav-item flex min-h-11 items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm",
                     collapsed && "justify-center px-0",
                   )}
                 >
@@ -67,9 +67,10 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       {/* The consent banner sits above the sidebar row, never as a flex sibling that squeezes the content column. */}
       <CookieConsentSlot />
       <SkipLink />
+      <PolicyPromptSlot />
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
-        <aside aria-label="Console navigation" className={cn("sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-navy-border bg-navy rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
+        <aside aria-label="Console navigation" className={cn("rp-nav-panel rp-nav-edge sticky top-0 hidden h-dvh shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>
           <div className={cn("flex h-16 items-center px-4", collapsed && "justify-center px-2")}>
             <Link href="/admin" aria-label="ReadyPackets console home" className="inline-flex rounded">
               {collapsed ? <BrandLogo appearance="dark" variant="icon" label="" className="h-9" /> : <BrandLogo appearance="dark" label="" className="w-44" />}
@@ -84,7 +85,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
               onClick={() => setCollapsed((c) => !c)}
               aria-expanded={!collapsed}
               aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-              className={cn("flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm text-on-navy-muted hover:bg-navy-elevated hover:text-on-navy", collapsed && "justify-center px-0")}
+              className={cn("rp-nav-item flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm", collapsed && "justify-center px-0")}
             >
               {collapsed ? <ChevronsRight aria-hidden="true" className="size-5" /> : <ChevronsLeft aria-hidden="true" className="size-5" />}
               {collapsed ? null : "Collapse"}
@@ -129,7 +130,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       </div>
 
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">
-        <div className="-m-4 min-h-full bg-navy p-4 rp-on-navy">
+        <div className="rp-nav-panel -m-4 min-h-full p-4 rp-on-navy">
           <SideNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
         </div>
       </Drawer>

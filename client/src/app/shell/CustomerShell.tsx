@@ -14,6 +14,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, ThemeControl, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CartBadgeSlot, CookieConsentSlot, NotificationSlot } from "../slots";
+import { PolicyPromptSlot } from "../policyPromptSlot";
 import {
   AccountMenu,
   CUSTOMER_SECTIONS,
@@ -48,7 +49,7 @@ function SectionNav({ sections, label, collapsed, onNavigate, isCurrent }: { sec
         if (!items.length) return null;
         return (
           <div key={key}>
-            {heading ? <h2 className={cn("mb-1 px-3 text-xs font-semibold tracking-wide text-muted uppercase", collapsed && "sr-only")}>{heading}</h2> : <h2 className="sr-only">Main</h2>}
+            {heading ? <h2 className={cn("rp-nav-section mb-1 px-3 text-xs font-semibold tracking-wide uppercase", collapsed && "sr-only")}>{heading}</h2> : <h2 className="sr-only">Main</h2>}
             <ul className="flex flex-col gap-0.5">
               {items.map((item) => {
                 const current = isCurrent(item.href);
@@ -59,8 +60,7 @@ function SectionNav({ sections, label, collapsed, onNavigate, isCurrent }: { sec
                     aria-current={current ? "page" : undefined}
                     aria-label={collapsed ? item.label : undefined}
                     className={cn(
-                      "flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm font-medium text-body hover:bg-surface-sunken hover:text-ink",
-                      current && "bg-action-soft text-action shadow-[inset_3px_0_0_var(--color-action)] hover:bg-action-soft hover:text-action",
+                      "rp-nav-item flex min-h-11 min-w-0 items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm",
                       collapsed && "justify-center px-0",
                     )}
                   >
@@ -102,6 +102,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
     <div className="flex min-h-dvh flex-col bg-surface-soft">
       <CookieConsentSlot />
       <SkipLink />
+      <PolicyPromptSlot />
       <PreviewBanner />
       <MaintenanceBanner />
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
@@ -123,18 +124,18 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       <div className="flex min-w-0 flex-1">
         <aside
           aria-label="Customer navigation"
-          className={cn("sticky top-16 hidden h-[calc(100dvh-4rem)] shrink-0 flex-col border-r border-line bg-surface lg:flex", collapsed ? "w-20" : "w-64")}
+          className={cn("rp-nav-panel rp-nav-edge sticky top-16 hidden h-[calc(100dvh-4rem)] shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}
         >
           <div className="min-h-0 flex-1 overflow-y-auto px-3 py-4">
             <SectionNav sections={sections} label="Customer" collapsed={collapsed} isCurrent={isCurrent} />
           </div>
-          <div className="border-t border-line p-3">
+          <div className="border-t border-navy-border p-3">
             <button
               type="button"
               onClick={() => setCollapsed((c) => !c)}
               aria-expanded={!collapsed}
               aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-              className={cn("flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm text-muted hover:bg-surface-sunken hover:text-ink", collapsed && "justify-center px-0")}
+              className={cn("rp-nav-item flex min-h-11 w-full items-center gap-3 rounded-[var(--radius-control)] px-3 text-sm", collapsed && "justify-center px-0")}
             >
               {collapsed ? <ChevronsRight aria-hidden="true" className="size-5" /> : <ChevronsLeft aria-hidden="true" className="size-5" />}
               {collapsed ? null : "Collapse"}
@@ -151,14 +152,14 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       </div>
 
       {phone.length > 0 ? (
-        <nav aria-label="Quick navigation" className="fixed inset-x-0 bottom-0 z-40 border-t border-line bg-surface pb-[env(safe-area-inset-bottom)] md:hidden">
+        <nav aria-label="Quick navigation" className="rp-nav-panel rp-nav-bar-top fixed inset-x-0 bottom-0 z-40 pb-[env(safe-area-inset-bottom)] rp-on-navy shadow-[0_-4px_16px_-8px_rgb(0_0_0/0.35)] md:hidden">
           <ul className={cn("grid", GRID_COLS[phone.length + 1])}>
             {phone.map((item) => (
               <li key={item.href} className="min-w-0">
                 <Link
                   href={item.href}
                   aria-current={isCurrent(item.href) ? "page" : undefined}
-                  className={cn("flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 text-[0.6875rem] font-medium text-muted", isCurrent(item.href) && "text-action")}
+                  className="rp-nav-tab flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 text-[0.6875rem]"
                 >
                   <item.icon aria-hidden={true} className="size-5" />
                   <span className="max-w-full truncate">{item.label}</span>
@@ -170,7 +171,8 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
                 type="button"
                 onClick={() => setMenuOpen(true)}
                 aria-haspopup="dialog"
-                className={cn("flex min-h-14 w-full flex-col items-center justify-center gap-0.5 text-[0.6875rem] font-medium text-muted", moreCurrent && "text-action")}
+                data-current={moreCurrent ? "" : undefined}
+                className="rp-nav-tab flex min-h-14 w-full flex-col items-center justify-center gap-0.5 text-[0.6875rem]"
               >
                 <Menu aria-hidden="true" className="size-5" />
                 More
@@ -181,7 +183,9 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
       ) : null}
 
       <Drawer open={menuOpen} onOpenChange={setMenuOpen} title="Menu" side="left" width="sm">
-        <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
+        <div className="rp-nav-panel -mx-4 -mt-4 p-4 rp-on-navy">
+          <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
+        </div>
         <div className="mt-6 border-t border-line pt-4 sm:hidden">
           <ThemeControl showLabel />
         </div>

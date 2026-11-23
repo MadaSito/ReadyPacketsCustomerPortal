@@ -4,7 +4,7 @@ Use this to copy order workflows between installations, for example from a test 
 
 ## Turning it on
 
-- It is off by default. Turn on **Settings → Orders → Workflow export and import** (`orders.workflow_transfer.enabled`, env `ORDER_WORKFLOW_TRANSFER_ENABLED`).
+- It is on by default from increment 06. The switch **Workflow export and import** is on the **Workflows** page (`/admin/workflows`), next to the export and import buttons (`orders.workflow_transfer.enabled`, env `ORDER_WORKFLOW_TRANSFER_ENABLED`). Turning it off asks you to confirm, and every change is recorded as `workflow.transfer_setting_changed`. An installation that had already turned it off stays off.
 - Only administrators can use it:
   - exporting needs `workflows.export`;
   - previewing and importing need `workflows.import` and a fresh step-up (MFA).
@@ -42,4 +42,4 @@ Exports, previews and imports are written to the audit log as `workflow.exported
 
 - Up to 50 workflows and 2 MiB per package.
 - Nesting depth is capped at 24.
-- Format version 1 only.
+- Exports use format version 2 (customer tasks). Imports accept versions 1 and 2.

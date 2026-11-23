@@ -512,6 +512,7 @@ describe("integrations module — DB-backed integration suite", () => {
 
     // Configure with custom transport spy to inspect TLS options and simulate post-DATA network drop
     let capturedTlsOpts: Record<string, unknown> | null = null;
+    const inspectSmtpMessage = vi.fn();
     let mode: "ok" | "550" | "connreset" = "ok";
 
     const customMod = createIntegrationsModule(h.deps, {
@@ -521,7 +522,8 @@ describe("integrations module — DB-backed integration suite", () => {
       smtpTransportFactory: (opts) => {
         capturedTlsOpts = opts as unknown as Record<string, unknown>;
         return {
-          sendMail: async () => {
+          sendMail: async (message) => {
+            inspectSmtpMessage(message);
             if (mode === "550") {
               throw Object.assign(new Error("Mailbox unavailable"), { responseCode: 550 });
             }
@@ -566,9 +568,13 @@ describe("integrations module — DB-backed integration suite", () => {
       subject: "Order ready",
       text: "Your order is ready.",
       html: "<p>Your order is ready.</p>",
+      attachments: [{ filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: Buffer.from("%PDF-1.7\n") }],
       signal: new AbortController().signal,
     });
     expect(okRes).toEqual({ outcome: "accepted" });
+    expect(inspectSmtpMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      attachments: [{ filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: Buffer.from("%PDF-1.7\n") }],
+    }));
     expect(capturedTlsOpts).toMatchObject({
       host: "93.184.216.34",
       port: 587,

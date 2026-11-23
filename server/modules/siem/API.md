@@ -304,3 +304,27 @@ Per-destination credentials are stored directly in `siem_destinations.{ca_enc,cl
   - `degraded`: retry backlog, half-open circuit, approaching cert expiry (<= 14 days), oldest pending age >= threshold, or cursor overdue vs `headSeq`
   - `failing`: open circuit, dead letters > 0, missing audit gaps > 0 (`AUDIT_EVENTS_MISSING`), expired client/CA cert, unreadable/tampered secret AAD, or spool at capacity
   - `metrics`: `{ configuredDestinations, enabledDestinations, queueDepth, deadLetters, oldestPendingAgeSeconds, maxLagSeq, maxCursorLagAgeSeconds, missingAuditGaps }`
+
+---
+
+## 9. SIEM Forwarding Catalogue & Privacy Boundary (`server/modules/siem/catalogue.ts`, `projection.ts`)
+
+`SIEM_EVENT_CATALOGUE` (`findSiemCatalogueEntry(eventName)`) documents and enforces outbound forwarding rules across baseline, Increment 05, and Increment 06 audit events:
+
+- **D7 Security Incidents (`audit` correlation -> `security` category, `resource_type: "security_incident"`, `correlation_id = incident publicId`):**
+  - `security.incident.opened` (`INFO` for `low`, `WARN` for `medium`/`high`, `ERROR` for `critical`): forwards `rule_key` (closed 9-rule vocabulary), `severity`, `status`, `event_count`, `account_count`, `address_count`.
+  - `security.incident.updated`: adds boolean `escalated` and `safe_counts.events_added`.
+  - `security.incident.acknowledged` (`WARN`): forwards base incident attributes.
+  - `security.incident.closed` (`WARN`): adds closed-vocabulary `close_reason` (`resolved | false_positive | duplicate | accepted_risk`).
+  - `security.incident.action` (`WARN`): adds `action_kind` (`ban_ip | end_sessions`) and boolean `permanent`.
+  - Installation-local `incident_public_id` and `ban_public_id` are withheld from `attributes` (`resource_ref` and `correlation_id` carry external correlation).
+- **D7 Sign-In Bans & Rate-Limit Back-Off (`protection` -> `security` category):**
+  - `security.ban.created` / `security.ban.released` (`WARN`, `resource_type: "signin_ban"`): forwards `automatic` boolean only; local-only `address_ref`, `ban_public_id`, raw IPs/CIDRs, and free-text `reason` are **never** forwarded (`SIEM_NEVER_FORWARDED_ATTRIBUTE_KEYS`).
+  - `security.ban.policy_updated` (`INFO`): forwards `enabled` and `threshold`.
+  - `protection.rate_limit_updated` (`INFO`): forwards `category` and `enabled`.
+- **Increment 06 Business, Admin & Compliance Events:**
+  - Promotions (`promotion.*`): forwards `discount_type` (`percent | fixed | set_total`), `scope_kind`, `is_batch`, `batch_size`, `can_reach_zero`, `allow_zero_total`, `max_discount_percent`, `max_discount_bps`, `export_kind`, `row_count`, `release_reason`, `failed_count`, `window_minutes`, `pause_minutes`; withholds local ULIDs, labels, and monetary amounts.
+  - Reports (`report.run`, `report.exported`, `report.denied`, `report.definition.*`): forwards `report_key`, `dataset`, `panel`, `kind`, `visibility`, `compare`, `truncated`, `spec_hash` (64-hex SHA-256), and `safe_counts.rows`; withholds `definition_public_id` and filter payloads.
+  - Orders & Workflows (`order.task_note.saved`, `order.task.waived`, `order.agreement_gate.updated`, `workflow.*`): forwards `status_key`, `ack_key`, `task_key`, `task_kind`, `note_version`, `text_sha256`, `digest`, `digest_matches`, `gates_removed`, `selection`, and workflow transfer `safe_counts`; withholds free-text notes/waiver reasons and source labels.
+  - Compliance, Files, Cart & Sessions (`compliance.signature_name.mismatch`, `policy.notice.*`, `policy.enforcement.*`, `compliance.receipt.*`, `file.audio.conversion`, `file.access.denied`, `cart.*`, `auth.session.revoked_all`): forwards bounded modes, counts, and triggers while withholding customer text, receipt numbers, and local user IDs.
+- **Self-event recursion guard (`forwardable: false`):** `siem.delivery.*`, `siem.spool.*`, and `siem.cursor.*` are never re-spooled into outbound SIEM destinations.

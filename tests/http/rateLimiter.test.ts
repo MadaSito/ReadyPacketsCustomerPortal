@@ -50,6 +50,27 @@ describe("database rate limiter", () => {
     expect(await limiter.consume("expensive", "ip:198.51.100.43", 6)).toMatchObject({ allowed: false });
   });
 
+  it("backs off repeated exceeded windows across instances without extending delays on retries, caps, and decays", async () => {
+    const h = createTestDeps({ db: database.db });
+    await h.settings.set("http.rate_limit.user_login", {
+      maxRequests: 6, windowSeconds: 10, backoff: { enabled: true, factor: 3, maxSeconds: 40, resetAfterMinutes: 1 },
+    });
+    const make = () => createRateLimiter({ ...h.deps, tokenHashKey: h.config.tokenHashKey });
+    const key = "ip:203.0.113.199";
+    for (const expected of [10, 30, 40, 40]) {
+      const limiter = make();
+      await expect(limiter.consume("user_login", key, 6)).resolves.toMatchObject({ allowed: true });
+      await expect(limiter.consume("user_login", key)).resolves.toEqual({ allowed: false, retryAfterSeconds: expected });
+      h.clock.advance(1000);
+      await expect(make().consume("user_login", key)).resolves.toEqual({ allowed: false, retryAfterSeconds: expected - 1 });
+      h.clock.advance((expected - 1) * 1000 + 1);
+    }
+    h.clock.advance(60_001);
+    const limiter = make();
+    await limiter.consume("user_login", key, 6);
+    await expect(limiter.consume("user_login", key)).resolves.toEqual({ allowed: false, retryAfterSeconds: 10 });
+  });
+
   it("shares normalized address counters for replicas with the same root and separates a different root", async () => {
     const h = createTestDeps({ db: database.db });
     await h.settings.set("http.rate_limit.form_submission", { maxRequests: 8, windowSeconds: 60 });

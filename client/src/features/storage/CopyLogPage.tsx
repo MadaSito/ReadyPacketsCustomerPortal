@@ -207,7 +207,7 @@ export function CopyLogPage() {
               <span className="mt-1 block text-xs text-muted">Attempt {row.attempt.toLocaleString()}</span>
             </div> },
           ]}
-          rowActions={(row) => <Button variant="ghost" aria-label={`View ${kinds[row.kind]} copy attempt ${row.publicId}`}
+          rowActions={(row) => <Button variant="ghost" aria-label={`Details for ${kinds[row.kind]} copy attempt ${row.publicId}`}
             onClick={() => setSelected(row.publicId)}>Details</Button>} />}
         {list.isFetchNextPageError && <ErrorState error={list.error} onRetry={() => void list.fetchNextPage()} />}
         <LoadMore loading={list.isFetchingNextPage} hasMore={list.hasNextPage} onLoadMore={() => void list.fetchNextPage()} />

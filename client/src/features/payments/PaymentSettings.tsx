@@ -1,8 +1,8 @@
-import { KeyRound, ShieldCheck } from "lucide-react";
+import { KeyRound, ReceiptText, ShieldCheck } from "lucide-react";
 import { useState, type FormEvent } from "react";
-import type { PaymentsConfigValue } from "@server/modules/payments/settings";
+import type { PaymentsConfigValue, PaymentsReceiptsValue, PaymentsSmallTotalsValue } from "@server/modules/payments/settings";
 import type { PaymentsAdminSettingsView } from "@server/modules/payments/service";
-import { Badge, Button, Callout, Card, ConfirmDialog, CopyField, Field, Input, Select } from "@/ui";
+import { Badge, Button, Callout, Card, Checkbox, ConfirmDialog, CopyField, Field, Input, Money, Select, Textarea } from "@/ui";
 import { errorMessage } from "@/lib/trpc";
 
 export const providerLabels = {
@@ -12,12 +12,26 @@ export const providerLabels = {
 } as const;
 export const providerOptions = Object.entries(providerLabels).map(([value, label]) => ({ value, label }));
 const modeOptions = [{ value: "test", label: "Test / sandbox" }, { value: "live", label: "Live payments" }];
+const smallTotalOptions = [
+  { value: "waive", label: "Waive remaining small balance (default)" },
+  { value: "block", label: "Block checkout when total is below provider minimum" },
+];
 type SecretKey = "stripeSecretKey" | "stripeWebhookSecret" | "squareAccessToken" | "squareWebhookSignatureKey";
 const emptySecrets: Record<SecretKey, string> = { stripeSecretKey: "", stripeWebhookSecret: "", squareAccessToken: "", squareWebhookSignatureKey: "" };
 type PaymentConfig = Pick<PaymentsConfigValue, "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "squareLocationId">;
-export type PaymentSettingsInput = PaymentConfig & Partial<Record<SecretKey, string>>;
-export type PaymentSettingsView = Pick<PaymentsAdminSettingsView, "provider" | "mode" | "currency" | "successPath" | "cancelPath" |
-  "webhookToleranceSeconds" | "onlineEnabled" | "stripe" | "square">;
+export type PaymentSettingsInput = PaymentConfig &
+  Partial<Record<SecretKey, string>> & {
+    smallTotals?: PaymentsSmallTotalsValue;
+    receipts?: PaymentsReceiptsValue;
+  };
+export type PaymentSettingsView = Pick<
+  PaymentsAdminSettingsView,
+  "provider" | "mode" | "currency" | "successPath" | "cancelPath" | "webhookToleranceSeconds" | "onlineEnabled" | "stripe" | "square"
+> & {
+  smallTotals?: PaymentsSmallTotalsValue;
+  defaultProviderMinimumsMinor?: PaymentsAdminSettingsView["defaultProviderMinimumsMinor"];
+  receipts?: PaymentsReceiptsValue;
+};
 
 function safePath(value: string) {
   return /^\/(?:checkout|invoices|orders)(?:\/[A-Za-z0-9_-]{1,64}){0,4}$/u.test(value) && value.length <= 200;
@@ -37,9 +51,22 @@ export function PaymentSettings({ settings, saving, onSave }: {
   const [tolerance, setTolerance] = useState(String(settings.webhookToleranceSeconds));
   const [locationId, setLocationId] = useState(settings.square.locationId ?? "");
   const [secrets, setSecrets] = useState(emptySecrets);
+  const [belowMinimum, setBelowMinimum] = useState<"waive" | "block">(
+    settings.smallTotals?.belowProviderMinimum ?? "waive",
+  );
+  const [receiptsEnabled, setReceiptsEnabled] = useState<boolean>(settings.receipts?.enabled ?? true);
+  const [receiptsEmail, setReceiptsEmail] = useState<boolean>(settings.receipts?.emailCustomer ?? true);
+  const [receiptsFooter, setReceiptsFooter] = useState<string>(settings.receipts?.footerText ?? "");
   const [notice, setNotice] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<PaymentSettingsInput | null>(null);
   const activeSettings = provider === "none" ? undefined : settings[provider];
+  const normalizedUpperCurrency = currency.trim().toUpperCase() || settings.currency;
+  const activeMinMinor =
+    provider === "none"
+      ? null
+      : (settings.smallTotals?.minimumOverrides?.[provider]?.[normalizedUpperCurrency] ??
+          settings.defaultProviderMinimumsMinor?.[provider]?.[normalizedUpperCurrency] ??
+          (provider === "stripe" ? 50 : 100));
   const egressHost = provider === "square" && mode !== settings.mode ?
     (mode === "live" ? "connect.squareup.com" : "connect.squareupsandbox.com") : activeSettings?.egressHost;
   const egressConfirmed = provider !== "square" || mode === settings.mode;
@@ -72,6 +99,15 @@ export function PaymentSettings({ settings, saving, onSave }: {
     const input: PaymentSettingsInput = {
       provider, mode, currency: normalizedCurrency, successPath, cancelPath, webhookToleranceSeconds: seconds,
       squareLocationId: provider === "square" ? locationId.trim() : settings.square.locationId,
+      smallTotals: {
+        belowProviderMinimum: belowMinimum,
+        ...(settings.smallTotals?.minimumOverrides ? { minimumOverrides: settings.smallTotals.minimumOverrides } : {}),
+      },
+      receipts: {
+        enabled: receiptsEnabled,
+        emailCustomer: receiptsEnabled && receiptsEmail,
+        footerText: receiptsFooter.trim(),
+      },
     };
     for (const name of activeSecrets) {
       const value = secrets[name].trim();
@@ -135,6 +171,60 @@ export function PaymentSettings({ settings, saving, onSave }: {
             {keyInput("squareWebhookSignatureKey", "Square webhook signature key", settings.square.webhookSignatureKeyLast4)}
           </>}
         </fieldset> : null}
+        <fieldset className="grid min-w-0 gap-4 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 sm:p-4">
+          <legend className="px-1 font-semibold text-ink">Small totals &amp; provider minimums</legend>
+          <Field
+            label="Totals below provider minimum"
+            hint={
+              activeMinMinor !== null && /^[A-Z]{3}$/u.test(normalizedUpperCurrency) ? (
+                <span>
+                  Current {providerLabels[provider]} minimum for {normalizedUpperCurrency}:{" "}
+                  <Money value={{ amountMinor: activeMinMinor, currency: normalizedUpperCurrency }} />. Totals of $0.00 settle without calling the payment provider.
+                </span>
+              ) : (
+                "Totals of $0.00 settle without calling a payment provider. Choose how positive balances below an online provider's minimum charge are handled."
+              )
+            }
+          >
+            <Select
+              value={belowMinimum}
+              options={smallTotalOptions}
+              disabled={saving}
+              onChange={(event) => setBelowMinimum(event.target.value as "waive" | "block")}
+            />
+          </Field>
+        </fieldset>
+        <fieldset className="grid min-w-0 gap-4 rounded-[var(--radius-card)] border border-line bg-surface-sunken p-3 sm:p-4">
+          <legend className="px-1 font-semibold text-ink">
+            <span className="inline-flex items-center gap-2">
+              <ReceiptText className="size-4" aria-hidden />
+              Payment receipts
+            </span>
+          </legend>
+          <Checkbox
+            label="Generate numbered payment receipts"
+            description="Creates an immutable RPR-YYYY-NNNNNN receipt and PDF snapshot for every confirmed payment."
+            checked={receiptsEnabled}
+            disabled={saving}
+            onCheckedChange={setReceiptsEnabled}
+          />
+          <Checkbox
+            label="Email PDF receipt to customer automatically"
+            description="Queues the branded PDF receipt to the buyer when payment is confirmed."
+            checked={receiptsEnabled && receiptsEmail}
+            disabled={saving || !receiptsEnabled}
+            onCheckedChange={setReceiptsEmail}
+          />
+          <Field label="Receipt footer note" hint="Optional text included on newly generated receipt PDFs (up to 500 characters).">
+            <Textarea
+              value={receiptsFooter}
+              disabled={saving || !receiptsEnabled}
+              rows={2}
+              maxLength={500}
+              onChange={(event) => setReceiptsFooter(event.target.value)}
+            />
+          </Field>
+        </fieldset>
         {notice ? <Callout title="Payment settings not saved" tone="danger" live="assertive">{notice}</Callout> : null}
         <div><Button type="submit" loading={saving} disabled={saving}>Save payment settings</Button></div>
       </form>

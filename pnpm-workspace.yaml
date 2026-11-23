@@ -2,3 +2,9 @@
 allowBuilds:
   argon2: true
   esbuild: true
+
+# pdfjs-dist lists a native canvas as an optional dependency for server-side rendering. The portal only
+# uses pdfjs-dist in the browser, so the native binary is kept out of production installs. It is a
+# devDependency instead, where jsdom uses it so axe can evaluate text-in-name rules in tests.
+ignoredOptionalDependencies:
+  - "@napi-rs/canvas"

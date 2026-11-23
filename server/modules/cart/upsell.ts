@@ -11,12 +11,14 @@ import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import type { CatalogGroupView, CatalogProductView } from "../orders/catalog.js";
 import type { BundleRule } from "../orders/settings.js";
+import { readSetting, writeSetting } from "../platform/index.js";
 import {
   cartOrdersPort,
   roundHalfUpPercent,
   type CartActorCheck,
 } from "./ports.js";
 import {
+  CART_UPSELL_RULE_TYPES,
   cartItems,
   cartUpsellAcceptances,
   cartUpsellCartStates,
@@ -24,8 +26,13 @@ import {
   carts,
   type CartRow,
   type CartUpsellOfferRow,
+  type CartUpsellRuleType,
 } from "./schema.js";
-import { CART_FEATURE_FLAG, CART_UPSELL_FEATURE_FLAG } from "./settings.js";
+import {
+  CART_FEATURE_FLAG,
+  CART_UPSELL_FEATURE_FLAG,
+  CART_UPSELL_SEEDED_KEYS,
+} from "./settings.js";
 import {
   BUNDLE_COMPLETION_OFFER_KEY,
   type AdminCartUpsellCatalogProductView,
@@ -40,10 +47,14 @@ import {
   type acceptUpsellInputSchema,
   type adminUpsellCreateInputSchema,
   type adminUpsellDeleteInputSchema,
+  type adminUpsellDuplicateInputSchema,
   type adminUpsellSetActiveInputSchema,
+  type adminUpsellSetAllActiveInputSchema,
+  type adminUpsellSetFeatureInputSchema,
   type adminUpsellUpdateInputSchema,
   type dismissUpsellInputSchema,
 } from "./types.js";
+import { buildCatalogStarterSuggestions } from "./upsellSeed.js";
 import type { z } from "zod";
 
 export const MAX_CART_UPSELLS = 3;
@@ -65,8 +76,143 @@ const offerNotFound = () =>
 const staleOfferVersion = () =>
   conflict("UPSELL_OFFER_VERSION_CONFLICT", "This suggestion was updated in another session. Refresh and try again.");
 
+function normalizeRuleType(raw: string | null | undefined): CartUpsellRuleType {
+  if (raw && (CART_UPSELL_RULE_TYPES as readonly string[]).includes(raw)) {
+    return raw as CartUpsellRuleType;
+  }
+  return "standard";
+}
+
+function buildBundleCompletionCandidate(params: {
+  availableLines: readonly CartLineView[];
+  lineByPacket: ReadonlyMap<number, CartLineView>;
+  catalogGroups: readonly CatalogGroupView[];
+  bundleRule: BundleRule;
+  currency: string;
+  offerPublicId: string;
+  priority: number;
+  tieBreak: number;
+  customTitle?: string;
+  customShortText?: string;
+  requireMultiplePacketsForLargeBundle: boolean;
+}): {
+  priority: number;
+  tieBreak: number;
+  claimedProductIds: string[];
+  claimedPackets: number[];
+  suggestion: CartUpsellSuggestionView;
+} | null {
+  const {
+    availableLines,
+    lineByPacket,
+    catalogGroups,
+    bundleRule,
+    currency,
+    offerPublicId,
+    priority,
+    tieBreak,
+    customTitle,
+    customShortText,
+    requireMultiplePacketsForLargeBundle,
+  } = params;
+
+  if (!bundleRule.enabled || bundleRule.discountPercent <= 0 || bundleRule.requiredPacketNumbers.length === 0) {
+    return null;
+  }
+
+  const required = [...bundleRule.requiredPacketNumbers].sort((a, b) => a - b);
+  const presentRequiredCount = required.filter((n) => lineByPacket.has(n)).length;
+  const missingPacketNumbers = required.filter((n) => !lineByPacket.has(n));
+  if (missingPacketNumbers.length < 1) return null;
+
+  if (requireMultiplePacketsForLargeBundle && required.length >= 4) {
+    // D3(b): complete-the-bundle when several packets (>= 2) are in the cart.
+    if (presentRequiredCount < 2) return null;
+  } else if (missingPacketNumbers.length > 2) {
+    return null;
+  }
+
+  // Match the customer's existing tier when uniform across cart packets; otherwise pick lowest-priced active tier.
+  const existingTiers = new Set(
+    [...lineByPacket.values()].map((l) => l.tier).filter((t): t is PacketTierName => t !== null),
+  );
+  const preferredTier = existingTiers.size === 1 ? [...existingTiers][0]! : null;
+
+  const missingTargets: CartUpsellTargetProductView[] = [];
+  for (const pktNum of missingPacketNumbers) {
+    const groupMatches: { product: CatalogProductView; groupName: string }[] = [];
+    for (const group of catalogGroups) {
+      for (const p of group.products) {
+        if (p.active && p.packetNumber === pktNum && p.currency === currency) {
+          groupMatches.push({ product: p, groupName: group.name });
+        }
+      }
+    }
+    if (groupMatches.length === 0) {
+      return null;
+    }
+    groupMatches.sort((a, b) => a.product.priceMinor - b.product.priceMinor);
+    const chosen =
+      (preferredTier ? groupMatches.find((m) => m.product.tier === preferredTier) : undefined) ??
+      groupMatches[0]!;
+    missingTargets.push({
+      productPublicId: chosen.product.publicId,
+      name: chosen.product.name,
+      groupName: chosen.groupName,
+      packetNumber: chosen.product.packetNumber,
+      tier: chosen.product.tier as PacketTierName | null,
+      unitPriceMinor: chosen.product.priceMinor,
+      currency: chosen.product.currency,
+    });
+  }
+
+  if (missingTargets.length === 0) return null;
+
+  const currentSubtotalMinor = availableLines.reduce((sum, l) => sum + l.lineTotalMinor, 0);
+  const addedSubtotalMinor = missingTargets.reduce((sum, t) => sum + t.unitPriceMinor, 0);
+  const combinedSubtotalMinor = currentSubtotalMinor + addedSubtotalMinor;
+
+  if (!Number.isSafeInteger(combinedSubtotalMinor) || !Number.isSafeInteger(combinedSubtotalMinor * 100)) {
+    return null;
+  }
+  const bundleSavingMinor = Math.min(
+    combinedSubtotalMinor,
+    roundHalfUpPercent(combinedSubtotalMinor, bundleRule.discountPercent),
+  );
+  if (bundleSavingMinor <= 0) return null;
+
+  const netDeltaMinor = Math.max(0, addedSubtotalMinor - bundleSavingMinor);
+  const namesText = missingTargets.map((t) => t.name).join(" and ");
+  const defaultTitle =
+    missingTargets.length === 1
+      ? `Complete ${bundleRule.label}`
+      : `Add ${missingTargets.length} packets to complete ${bundleRule.label}`;
+  const defaultShortText = `Add ${namesText} to complete ${bundleRule.label} (${bundleRule.discountPercent}% off your bundle subtotal).`;
+  const title = customTitle?.trim() ? customTitle.trim() : defaultTitle;
+  const rawShortText = customShortText?.trim() ? customShortText.trim() : defaultShortText;
+
+  return {
+    priority,
+    tieBreak,
+    claimedProductIds: missingTargets.map((t) => t.productPublicId),
+    claimedPackets: missingPacketNumbers,
+    suggestion: {
+      offerPublicId,
+      kind: "bundle_completion",
+      title: title.length <= 120 ? title : `${title.slice(0, 119)}…`,
+      shortText: rawShortText.length <= 200 ? rawShortText : `${rawShortText.slice(0, 199)}…`,
+      currency,
+      priceMinor: netDeltaMinor,
+      fullTargetPriceMinor: addedSubtotalMinor,
+      savingMinor: bundleSavingMinor,
+      targetProducts: missingTargets,
+      currentProduct: null,
+    },
+  };
+}
+
 /**
- * Pure server-side upsell suggestion evaluator (Decision D2).
+ * Pure server-side upsell suggestion evaluator (Decisions D2 & D3).
  * Never suggests inactive products, items already in the cart, lower/equal-priced packet tiers,
  * mixed-currency products, or offers dismissed on this cart. Capped at 3 suggestions.
  */
@@ -78,8 +224,18 @@ export function computeEligibleUpsells(input: {
   activeOffers: readonly CartUpsellOfferRow[];
   dismissedOfferKeys: ReadonlySet<string>;
   now: Date;
+  hasConfiguredBundleOffer?: boolean;
 }): CartUpsellSuggestionView[] {
-  const { availableLines, catalogGroups, catalogMap, bundleRule, activeOffers, dismissedOfferKeys, now } = input;
+  const {
+    availableLines,
+    catalogGroups,
+    catalogMap,
+    bundleRule,
+    activeOffers,
+    dismissedOfferKeys,
+    now,
+    hasConfiguredBundleOffer = false,
+  } = input;
   if (availableLines.length === 0) return [];
 
   const currencies = new Set(availableLines.map((l) => l.currency));
@@ -104,6 +260,7 @@ export function computeEligibleUpsells(input: {
 
   const candidates: Candidate[] = [];
   const nowMs = now.getTime();
+  let evaluatedBundleRow = false;
 
   for (const offer of activeOffers) {
     if (!offer.active) continue;
@@ -114,6 +271,28 @@ export function computeEligibleUpsells(input: {
     if (offer.triggerMode === "products") {
       const triggers = Array.isArray(offer.triggerProductPublicIds) ? offer.triggerProductPublicIds : [];
       if (!triggers.some((pid) => cartProductIds.has(pid))) continue;
+    }
+
+    const ruleType = normalizeRuleType(offer.ruleType);
+    if (ruleType === "bundle_completion") {
+      evaluatedBundleRow = true;
+      const bundleCand = buildBundleCompletionCandidate({
+        availableLines,
+        lineByPacket,
+        catalogGroups,
+        bundleRule,
+        currency,
+        offerPublicId: offer.publicId,
+        priority: offer.priority,
+        tieBreak: offer.id,
+        customTitle: offer.title,
+        customShortText: offer.shortText,
+        requireMultiplePacketsForLargeBundle: true,
+      });
+      if (bundleCand) {
+        candidates.push(bundleCand);
+      }
+      continue;
     }
 
     const targetEntry = catalogMap.get(offer.targetProductPublicId);
@@ -189,92 +368,21 @@ export function computeEligibleUpsells(input: {
     }
   }
 
-  // Automatic bundle-completion suggestion from the catalogue bundle rule (D2 item 3).
-  if (
-    !dismissedOfferKeys.has(BUNDLE_COMPLETION_OFFER_KEY) &&
-    bundleRule.enabled &&
-    bundleRule.discountPercent > 0 &&
-    bundleRule.requiredPacketNumbers.length > 0
-  ) {
-    const required = [...bundleRule.requiredPacketNumbers].sort((a, b) => a - b);
-    const missingPacketNumbers = required.filter((n) => !lineByPacket.has(n));
-
-    if (missingPacketNumbers.length >= 1 && missingPacketNumbers.length <= 2) {
-      // Match the customer's existing tier when uniform across cart packets; otherwise pick lowest-priced active tier.
-      const existingTiers = new Set(
-        [...lineByPacket.values()].map((l) => l.tier).filter((t): t is PacketTierName => t !== null),
-      );
-      const preferredTier = existingTiers.size === 1 ? [...existingTiers][0]! : null;
-
-      const missingTargets: CartUpsellTargetProductView[] = [];
-      let allMissingAvailable = true;
-
-      for (const pktNum of missingPacketNumbers) {
-        const groupMatches: { product: CatalogProductView; groupName: string }[] = [];
-        for (const group of catalogGroups) {
-          for (const p of group.products) {
-            if (p.active && p.packetNumber === pktNum && p.currency === currency) {
-              groupMatches.push({ product: p, groupName: group.name });
-            }
-          }
-        }
-        if (groupMatches.length === 0) {
-          allMissingAvailable = false;
-          break;
-        }
-        groupMatches.sort((a, b) => a.product.priceMinor - b.product.priceMinor);
-        const chosen =
-          (preferredTier ? groupMatches.find((m) => m.product.tier === preferredTier) : undefined) ??
-          groupMatches[0]!;
-        missingTargets.push({
-          productPublicId: chosen.product.publicId,
-          name: chosen.product.name,
-          groupName: chosen.groupName,
-          packetNumber: chosen.product.packetNumber,
-          tier: chosen.product.tier as PacketTierName | null,
-          unitPriceMinor: chosen.product.priceMinor,
-          currency: chosen.product.currency,
-        });
-      }
-
-      if (allMissingAvailable && missingTargets.length > 0) {
-        const currentSubtotalMinor = availableLines.reduce((sum, l) => sum + l.lineTotalMinor, 0);
-        const addedSubtotalMinor = missingTargets.reduce((sum, t) => sum + t.unitPriceMinor, 0);
-        const combinedSubtotalMinor = currentSubtotalMinor + addedSubtotalMinor;
-
-        if (Number.isSafeInteger(combinedSubtotalMinor) && Number.isSafeInteger(combinedSubtotalMinor * 100)) {
-          const bundleSavingMinor = Math.min(
-            combinedSubtotalMinor,
-            roundHalfUpPercent(combinedSubtotalMinor, bundleRule.discountPercent),
-          );
-          if (bundleSavingMinor > 0) {
-            const netDeltaMinor = Math.max(0, addedSubtotalMinor - bundleSavingMinor);
-            const namesText = missingTargets.map((t) => t.name).join(" and ");
-            const rawShortText = `Add ${namesText} to complete ${bundleRule.label} (${bundleRule.discountPercent}% off your bundle subtotal).`;
-            candidates.push({
-              priority: BUNDLE_COMPLETION_PRIORITY,
-              tieBreak: 0,
-              claimedProductIds: missingTargets.map((t) => t.productPublicId),
-              claimedPackets: missingPacketNumbers,
-              suggestion: {
-                offerPublicId: BUNDLE_COMPLETION_OFFER_KEY,
-                kind: "bundle_completion",
-                title:
-                  missingTargets.length === 1
-                    ? `Complete ${bundleRule.label}`
-                    : `Add ${missingTargets.length} packets to complete ${bundleRule.label}`,
-                shortText: rawShortText.length <= 200 ? rawShortText : `${rawShortText.slice(0, 199)}…`,
-                currency,
-                priceMinor: netDeltaMinor,
-                fullTargetPriceMinor: addedSubtotalMinor,
-                savingMinor: bundleSavingMinor,
-                targetProducts: missingTargets,
-                currentProduct: null,
-              },
-            });
-          }
-        }
-      }
+  // Automatic bundle-completion fallback ONLY when no `bundle_completion` row is configured in `cart_upsell_offers`.
+  if (!hasConfiguredBundleOffer && !evaluatedBundleRow && !dismissedOfferKeys.has(BUNDLE_COMPLETION_OFFER_KEY)) {
+    const fallbackCand = buildBundleCompletionCandidate({
+      availableLines,
+      lineByPacket,
+      catalogGroups,
+      bundleRule,
+      currency,
+      offerPublicId: BUNDLE_COMPLETION_OFFER_KEY,
+      priority: BUNDLE_COMPLETION_PRIORITY,
+      tieBreak: 0,
+      requireMultiplePacketsForLargeBundle: false,
+    });
+    if (fallbackCand) {
+      candidates.push(fallbackCand);
     }
   }
 
@@ -314,7 +422,7 @@ export interface CartUpsellServiceDeps {
     now: Date,
     extra?: Partial<typeof carts.$inferInsert>,
   ) => Promise<number>;
-  hydrateOpenCartForUser: (userId: number, tx?: Tx, opts?: { recordImpressions?: boolean }) => Promise<CartView>;
+  hydrateOpenCartForUser: (principal: SessionPrincipal, tx?: Tx, opts?: { recordImpressions?: boolean }) => Promise<CartView>;
   computeLiveLines: (
     cartId: number,
     catalogMap: ReadonlyMap<string, IndexedCatalogEntry>,
@@ -447,12 +555,18 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
   function toAdminOfferView(
     row: CartUpsellOfferRow,
     catalogMap: ReadonlyMap<string, IndexedCatalogEntry>,
+    bundleRule?: BundleRule,
   ): AdminCartUpsellOfferView {
     const triggerIds = Array.isArray(row.triggerProductPublicIds) ? row.triggerProductPublicIds : [];
+    const ruleType = normalizeRuleType(row.ruleType);
     const targetEntry = catalogMap.get(row.targetProductPublicId);
+    const isBundleRuleRow = ruleType === "bundle_completion";
+    const bundleActive = Boolean(bundleRule ? bundleRule.enabled && bundleRule.discountPercent > 0 : true);
     return {
       offerPublicId: row.publicId,
       version: row.version,
+      seedKey: row.seedKey ?? null,
+      ruleType,
       kind: row.kind,
       title: row.title,
       shortText: row.shortText,
@@ -460,9 +574,13 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
       triggerProductPublicIds: triggerIds,
       triggerProductNames: triggerIds.map((pid) => catalogMap.get(pid)?.product.name ?? pid),
       targetProductPublicId: row.targetProductPublicId,
-      targetProductName: targetEntry?.product.name ?? "Inactive or removed item",
-      targetProductAvailable: Boolean(targetEntry?.product.active),
-      targetProductPriceMinor: targetEntry?.product.priceMinor ?? null,
+      targetProductName: isBundleRuleRow
+        ? (bundleRule?.label ?? "Complete bundle")
+        : (targetEntry?.product.name ?? "Inactive or removed item"),
+      targetProductAvailable: isBundleRuleRow
+        ? Boolean(bundleActive && catalogMap.size > 0)
+        : Boolean(targetEntry?.product.active),
+      targetProductPriceMinor: isBundleRuleRow ? null : (targetEntry?.product.priceMinor ?? null),
       targetProductCurrency: targetEntry?.product.currency ?? null,
       priority: row.priority,
       active: row.active,
@@ -476,7 +594,141 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
     };
   }
 
+  async function writeFeatureFlagInTx(flag: string, enabled: boolean, tx: Tx): Promise<void> {
+    await deps.settings.set(`feature.${flag}`, enabled, tx);
+    const maybeMemoryFlags = (deps.settings as { flags?: unknown }).flags;
+    if (maybeMemoryFlags instanceof Set) {
+      if (enabled) maybeMemoryFlags.add(flag);
+      else maybeMemoryFlags.delete(flag);
+    }
+  }
+
+  async function seedStarterOffersInternal(opts: {
+    mode: "startup" | "manual";
+    principal?: SessionPrincipal;
+  }): Promise<{ addedCount: number; skippedExistingCount: number }> {
+    let ordersSvc: ReturnType<typeof cartOrdersPort>;
+    try {
+      ordersSvc = cartOrdersPort(deps.services);
+    } catch {
+      return { addedCount: 0, skippedExistingCount: 0 };
+    }
+
+    const [catalogGroups, bundleRule] = await Promise.all([
+      ordersSvc.listActiveCatalog(),
+      ordersSvc.getBundleRule(),
+    ]);
+    const candidates = buildCatalogStarterSuggestions(catalogGroups, bundleRule);
+    if (candidates.length === 0) {
+      return { addedCount: 0, skippedExistingCount: 0 };
+    }
+
+    return deps.db.transaction(async (tx) => {
+      let liveRole: SessionPrincipal["role"] | "system" = "system";
+      if (opts.principal) {
+        const liveActor = await assertAdminUpsellActorInTx(opts.principal, tx);
+        liveRole = liveActor.role;
+      }
+
+      const [existingRows, previouslySeededKeys] = await Promise.all([
+        tx.select({ seedKey: cartUpsellOffers.seedKey }).from(cartUpsellOffers).for("update"),
+        readSetting(deps.settings, CART_UPSELL_SEEDED_KEYS, tx),
+      ]);
+
+      const existingKeySet = new Set(
+        existingRows.map((r) => r.seedKey).filter((k): k is string => typeof k === "string" && k.length > 0),
+      );
+      const historyKeySet = new Set(previouslySeededKeys);
+
+      const now = deps.clock.now();
+      let baseMs = now.getTime();
+      let addedCount = 0;
+      let skippedExistingCount = 0;
+
+      for (const candidate of candidates) {
+        // Never overwrite existing rows; on automatic startup also respect previously-seeded keys so admin deletions stay deleted.
+        const alreadyPresent =
+          existingKeySet.has(candidate.seedKey) ||
+          (opts.mode === "startup" && historyKeySet.has(candidate.seedKey));
+        if (alreadyPresent) {
+          skippedExistingCount += 1;
+          continue;
+        }
+
+        const publicId = ulid(baseMs++);
+        await tx
+          .insert(cartUpsellOffers)
+          .ignore()
+          .values({
+            publicId,
+            seedKey: candidate.seedKey,
+            kind: candidate.kind,
+            ruleType: candidate.ruleType,
+            title: candidate.title,
+            shortText: candidate.shortText,
+            triggerMode: candidate.triggerMode,
+            triggerProductPublicIds: candidate.triggerProductPublicIds,
+            targetProductPublicId: candidate.targetProductPublicId,
+            priority: candidate.priority,
+            active: false, // D3: sets every seeded row disabled (`active = false`).
+            startsAt: null,
+            endsAt: null,
+            createdByUserId: opts.principal?.userId ?? null,
+            version: 1,
+            createdAt: now,
+            updatedAt: now,
+          });
+
+        const [verifyInserted] = await tx
+          .select({ id: cartUpsellOffers.id })
+          .from(cartUpsellOffers)
+          .where(eq(cartUpsellOffers.publicId, publicId))
+          .limit(1);
+        if (verifyInserted) {
+          addedCount += 1;
+          existingKeySet.add(candidate.seedKey);
+        } else {
+          skippedExistingCount += 1;
+        }
+        historyKeySet.add(candidate.seedKey);
+      }
+
+      const mergedHistory = [...historyKeySet].sort();
+      if (mergedHistory.length !== previouslySeededKeys.length || addedCount > 0) {
+        await writeSetting(deps.settings, CART_UPSELL_SEEDED_KEYS, mergedHistory, tx);
+      }
+
+      if (addedCount > 0 || opts.mode === "manual") {
+        await deps.audit.record(
+          {
+            category: opts.principal ? "admin" : "system",
+            eventName: "cart.upsell_offers.seeded",
+            action: "create",
+            outcome: "completed",
+            actor: opts.principal
+              ? { userId: opts.principal.userId, role: liveRole }
+              : { userId: null, role: "system" },
+            resource: { type: "cart_upsell_offer" },
+            attributes: {
+              mode: opts.mode,
+              added_count: addedCount,
+              skipped_existing_count: skippedExistingCount,
+              candidate_count: candidates.length,
+            },
+          },
+          tx,
+        );
+      }
+
+      return { addedCount, skippedExistingCount };
+    });
+  }
+
   return {
+    async seedOnStartup(): Promise<{ addedCount: number; skippedExistingCount: number }> {
+      return seedStarterOffersInternal({ mode: "startup" });
+    },
+
     async computeForOpenCart(input: {
       openCart: CartRow | undefined;
       availableLines: readonly CartLineView[];
@@ -492,12 +744,17 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
       const enabled = await isUpsellEnabled(dbOrTx);
       if (!enabled) return [];
 
-      const [activeOffers, stateRows] = await Promise.all([
+      const [activeOffers, configuredBundleRows, stateRows] = await Promise.all([
         dbOrTx
           .select()
           .from(cartUpsellOffers)
           .where(eq(cartUpsellOffers.active, true))
           .orderBy(asc(cartUpsellOffers.priority), asc(cartUpsellOffers.id)),
+        dbOrTx
+          .select({ id: cartUpsellOffers.id })
+          .from(cartUpsellOffers)
+          .where(eq(cartUpsellOffers.ruleType, "bundle_completion"))
+          .limit(1),
         dbOrTx
           .select()
           .from(cartUpsellCartStates)
@@ -518,6 +775,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         activeOffers,
         dismissedOfferKeys,
         now,
+        hasConfiguredBundleOffer: configuredBundleRows.length > 0,
       });
 
       if (recordImpressions && suggestions.length > 0) {
@@ -660,12 +918,19 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
           .for("update");
 
         // 3. Lock active upsell offers in canonical `id ASC` order.
-        const lockedActiveOffers = await tx
-          .select()
-          .from(cartUpsellOffers)
-          .where(eq(cartUpsellOffers.active, true))
-          .orderBy(asc(cartUpsellOffers.id))
-          .for("update");
+        const [lockedActiveOffers, configuredBundleRows] = await Promise.all([
+          tx
+            .select()
+            .from(cartUpsellOffers)
+            .where(eq(cartUpsellOffers.active, true))
+            .orderBy(asc(cartUpsellOffers.id))
+            .for("update"),
+          tx
+            .select({ id: cartUpsellOffers.id })
+            .from(cartUpsellOffers)
+            .where(eq(cartUpsellOffers.ruleType, "bundle_completion"))
+            .limit(1),
+        ]);
         const activeOffers = [...lockedActiveOffers].sort(
           (a, b) => a.priority - b.priority || a.id - b.id,
         );
@@ -703,6 +968,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
           activeOffers,
           dismissedOfferKeys,
           now,
+          hasConfiguredBundleOffer: configuredBundleRows.length > 0,
         });
 
         const matched = eligibleSuggestions.find((s) => s.offerPublicId === input.offerPublicId);
@@ -831,7 +1097,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async dismissUpsell(
@@ -934,7 +1200,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async adminListUpsellOffers(principal: SessionPrincipal): Promise<AdminCartUpsellsListResult> {
@@ -993,7 +1259,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         featureUpsellEnabled,
         bundleRuleEnabled: bundleRule.enabled && bundleRule.discountPercent > 0,
         bundleRuleLabel: bundleRule.enabled ? bundleRule.label : null,
-        offers: rows.map((row) => toAdminOfferView(row, catalogMap)),
+        offers: rows.map((row) => toAdminOfferView(row, catalogMap, bundleRule)),
         catalogProducts,
       };
     },
@@ -1004,7 +1270,11 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
     ): Promise<AdminCartUpsellOfferView> {
       await assertAdminUpsellManagePrecheck(principal);
 
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [catalogGroups, bundleRule] = await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
       const catalogMap = indexCatalog(catalogGroups);
       const { normalizedTriggerIds } = validateOfferAgainstCatalog(input, catalogGroups, catalogMap);
 
@@ -1015,7 +1285,9 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
 
         await tx.insert(cartUpsellOffers).values({
           publicId,
+          seedKey: null,
           kind: input.kind,
+          ruleType: "standard",
           title: input.title,
           shortText: input.shortText,
           triggerMode: input.triggerMode,
@@ -1059,7 +1331,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         return inserted!;
       });
 
-      return toAdminOfferView(createdRow, catalogMap);
+      return toAdminOfferView(createdRow, catalogMap, bundleRule);
     },
 
     async adminUpdateUpsellOffer(
@@ -1068,9 +1340,12 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
     ): Promise<AdminCartUpsellOfferView> {
       await assertAdminUpsellManagePrecheck(principal);
 
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [catalogGroups, bundleRule] = await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
       const catalogMap = indexCatalog(catalogGroups);
-      const { normalizedTriggerIds } = validateOfferAgainstCatalog(input, catalogGroups, catalogMap);
 
       const updatedRow = await deps.db.transaction(async (tx) => {
         const liveActor = await assertAdminUpsellActorInTx(principal, tx);
@@ -1084,17 +1359,36 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         if (!existing) throw offerNotFound();
         if (existing.version !== input.expectedVersion) throw staleOfferVersion();
 
+        const isBundleRuleRow = normalizeRuleType(existing.ruleType) === "bundle_completion";
+        let normalizedTriggerIds: string[] = [];
+        if (isBundleRuleRow) {
+          if (input.triggerMode === "products") {
+            const deduped = [...new Set(input.triggerProductPublicIds)];
+            if (deduped.length === 0) {
+              throw validation("TRIGGER_PRODUCTS_REQUIRED", "Select at least one trigger product.");
+            }
+            for (const pid of deduped) {
+              if (!catalogMap.has(pid)) {
+                throw validation("TRIGGER_PRODUCT_NOT_FOUND", "One of the selected trigger products does not exist.");
+              }
+            }
+            normalizedTriggerIds = deduped;
+          }
+        } else {
+          normalizedTriggerIds = validateOfferAgainstCatalog(input, catalogGroups, catalogMap).normalizedTriggerIds;
+        }
+
         const now = deps.clock.now();
         const nextVersion = existing.version + 1;
         const [cas] = await tx
           .update(cartUpsellOffers)
           .set({
-            kind: input.kind,
+            kind: isBundleRuleRow ? "add_on" : input.kind,
             title: input.title,
             shortText: input.shortText,
             triggerMode: input.triggerMode,
             triggerProductPublicIds: normalizedTriggerIds,
-            targetProductPublicId: input.targetProductPublicId,
+            targetProductPublicId: isBundleRuleRow ? existing.targetProductPublicId : input.targetProductPublicId,
             priority: input.priority,
             active: input.active,
             startsAt: input.startsAt ?? null,
@@ -1120,9 +1414,10 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
             actor: { userId: principal.userId, role: liveActor.role },
             resource: { type: "cart_upsell_offer", publicId: existing.publicId },
             attributes: {
-              kind: input.kind,
+              kind: isBundleRuleRow ? "add_on" : input.kind,
+              rule_type: normalizeRuleType(existing.ruleType),
               trigger_mode: input.triggerMode,
-              target_product_public_id: input.targetProductPublicId,
+              target_product_public_id: isBundleRuleRow ? existing.targetProductPublicId : input.targetProductPublicId,
               priority: input.priority,
               active: input.active,
             },
@@ -1133,7 +1428,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         return reloaded!;
       });
 
-      return toAdminOfferView(updatedRow, catalogMap);
+      return toAdminOfferView(updatedRow, catalogMap, bundleRule);
     },
 
     async adminSetUpsellOfferActive(
@@ -1142,7 +1437,11 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
     ): Promise<AdminCartUpsellOfferView> {
       await assertAdminUpsellManagePrecheck(principal);
 
-      const catalogGroups = await cartOrdersPort(deps.services).listActiveCatalog();
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [catalogGroups, bundleRule] = await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
       const catalogMap = indexCatalog(catalogGroups);
 
       const updatedRow = await deps.db.transaction(async (tx) => {
@@ -1156,6 +1455,16 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
 
         if (!existing) throw offerNotFound();
         if (existing.version !== input.expectedVersion) throw staleOfferVersion();
+
+        if (input.active && normalizeRuleType(existing.ruleType) !== "bundle_completion") {
+          const targetEntry = catalogMap.get(existing.targetProductPublicId);
+          if (!targetEntry || !targetEntry.product.active) {
+            throw validation(
+              "TARGET_PRODUCT_UNAVAILABLE",
+              "This suggestion targets a retired catalogue item. Choose an active target product before enabling it.",
+            );
+          }
+        }
 
         const now = deps.clock.now();
         const [cas] = await tx
@@ -1190,7 +1499,206 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         return reloaded!;
       });
 
-      return toAdminOfferView(updatedRow, catalogMap);
+      return toAdminOfferView(updatedRow, catalogMap, bundleRule);
+    },
+
+    async adminSetUpsellFeature(
+      principal: SessionPrincipal,
+      input: z.infer<typeof adminUpsellSetFeatureInputSchema>,
+    ): Promise<{ featureCartEnabled: boolean; featureUpsellEnabled: boolean }> {
+      await assertAdminUpsellManagePrecheck(principal);
+
+      return deps.db.transaction(async (tx) => {
+        const liveActor = await assertAdminUpsellActorInTx(principal, tx);
+        await writeFeatureFlagInTx(CART_UPSELL_FEATURE_FLAG.flag, input.enabled, tx);
+        if (input.enabled && input.alsoEnableCart) {
+          await writeFeatureFlagInTx(CART_FEATURE_FLAG.flag, true, tx);
+        }
+
+        const [featureCartEnabled, featureUpsellEnabled] = await Promise.all([
+          deps.settings.isFeatureEnabled(CART_FEATURE_FLAG.flag, tx),
+          deps.settings.isFeatureEnabled(CART_UPSELL_FEATURE_FLAG.flag, tx),
+        ]);
+
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "cart.upsell_feature.toggled",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: liveActor.role },
+            resource: { type: "platform_setting", publicId: "feature.cart.upsell" },
+            attributes: {
+              feature_cart_upsell: featureUpsellEnabled,
+              feature_cart: featureCartEnabled,
+              also_enable_cart: Boolean(input.alsoEnableCart),
+            },
+          },
+          tx,
+        );
+
+        return { featureCartEnabled, featureUpsellEnabled };
+      });
+    },
+
+    async adminSetAllUpsellOffersActive(
+      principal: SessionPrincipal,
+      input: z.infer<typeof adminUpsellSetAllActiveInputSchema>,
+    ): Promise<{ active: boolean; updatedCount: number; skippedUnavailableCount: number }> {
+      await assertAdminUpsellManagePrecheck(principal);
+
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [catalogGroups, bundleRule] = await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
+      const catalogMap = indexCatalog(catalogGroups);
+      const bundleActive = bundleRule.enabled && bundleRule.discountPercent > 0 && catalogMap.size > 0;
+
+      return deps.db.transaction(async (tx) => {
+        const liveActor = await assertAdminUpsellActorInTx(principal, tx);
+        const rows = await tx
+          .select()
+          .from(cartUpsellOffers)
+          .orderBy(asc(cartUpsellOffers.id))
+          .for("update");
+
+        const now = deps.clock.now();
+        let updatedCount = 0;
+        let skippedUnavailableCount = 0;
+
+        for (const row of rows) {
+          if (row.active === input.active) continue;
+          if (input.active) {
+            const isBundleRuleRow = normalizeRuleType(row.ruleType) === "bundle_completion";
+            const targetAvailable = isBundleRuleRow
+              ? bundleActive
+              : Boolean(catalogMap.get(row.targetProductPublicId)?.product.active);
+            if (!targetAvailable) {
+              skippedUnavailableCount += 1;
+              continue;
+            }
+          }
+
+          await tx
+            .update(cartUpsellOffers)
+            .set({
+              active: input.active,
+              version: row.version + 1,
+              updatedAt: now,
+            })
+            .where(eq(cartUpsellOffers.id, row.id));
+          updatedCount += 1;
+        }
+
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: input.active ? "cart.upsell_offers.enabled_all" : "cart.upsell_offers.disabled_all",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: liveActor.role },
+            resource: { type: "cart_upsell_offer" },
+            attributes: {
+              active: input.active,
+              updated_count: updatedCount,
+              skipped_unavailable_count: skippedUnavailableCount,
+            },
+          },
+          tx,
+        );
+
+        return { active: input.active, updatedCount, skippedUnavailableCount };
+      });
+    },
+
+    async adminSeedSuggestedUpsellOffers(
+      principal: SessionPrincipal,
+    ): Promise<{ addedCount: number; skippedExistingCount: number }> {
+      await assertAdminUpsellManagePrecheck(principal);
+      return seedStarterOffersInternal({ mode: "manual", principal });
+    },
+
+    async adminDuplicateUpsellOffer(
+      principal: SessionPrincipal,
+      input: z.infer<typeof adminUpsellDuplicateInputSchema>,
+    ): Promise<AdminCartUpsellOfferView> {
+      await assertAdminUpsellManagePrecheck(principal);
+
+      const ordersSvc = cartOrdersPort(deps.services);
+      const [catalogGroups, bundleRule] = await Promise.all([
+        ordersSvc.listActiveCatalog(),
+        ordersSvc.getBundleRule(),
+      ]);
+      const catalogMap = indexCatalog(catalogGroups);
+
+      const createdRow = await deps.db.transaction(async (tx) => {
+        const liveActor = await assertAdminUpsellActorInTx(principal, tx);
+        const [existing] = await tx
+          .select()
+          .from(cartUpsellOffers)
+          .where(eq(cartUpsellOffers.publicId, input.offerPublicId))
+          .limit(1);
+        if (!existing) throw offerNotFound();
+
+        const now = deps.clock.now();
+        const publicId = ulid(now.getTime());
+        const copySuffix = " (Copy)";
+        const copyTitle =
+          existing.title.length + copySuffix.length <= 120
+            ? `${existing.title}${copySuffix}`
+            : `${existing.title.slice(0, 120 - copySuffix.length).trimEnd()}${copySuffix}`;
+
+        await tx.insert(cartUpsellOffers).values({
+          publicId,
+          seedKey: null,
+          kind: existing.kind,
+          ruleType: normalizeRuleType(existing.ruleType),
+          title: copyTitle,
+          shortText: existing.shortText,
+          triggerMode: existing.triggerMode,
+          triggerProductPublicIds: Array.isArray(existing.triggerProductPublicIds)
+            ? existing.triggerProductPublicIds
+            : [],
+          targetProductPublicId: existing.targetProductPublicId,
+          priority: existing.priority,
+          active: false,
+          startsAt: existing.startsAt ?? null,
+          endsAt: existing.endsAt ?? null,
+          createdByUserId: principal.userId,
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        const [inserted] = await tx
+          .select()
+          .from(cartUpsellOffers)
+          .where(eq(cartUpsellOffers.publicId, publicId))
+          .limit(1);
+
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "cart.upsell_offer.duplicated",
+            action: "create",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: liveActor.role },
+            resource: { type: "cart_upsell_offer", publicId },
+            attributes: {
+              source_offer_public_id: existing.publicId,
+              kind: existing.kind,
+              rule_type: normalizeRuleType(existing.ruleType),
+              active: false,
+            },
+          },
+          tx,
+        );
+
+        return inserted!;
+      });
+
+      return toAdminOfferView(createdRow, catalogMap, bundleRule);
     },
 
     async adminDeleteUpsellOffer(

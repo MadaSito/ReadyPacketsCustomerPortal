@@ -21,6 +21,12 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Checked by schema test only:** the regenerated `orders.schema.json` and RECORDS.md rows.
 - **Not verified:** a backup restore of the new tables (owned by the backup module), restore with different keys (unsupported by design), and promotion or upsell transfer (excluded by decision).
 
+## Increment 06
+
+- **Tested (one file, `portable.test.ts`):** the manifest lists the new exclusions `security-operations`, `policy-notices` and `report-definitions` next to the increment 05 ones.
+- **Reviewed, not tested:** the wording changes to `historical-evidence` (receipts) and `internal-order-notes` (task notes and waivers). No collector reads the new tables.
+- **Not verified here:** that a backup restore covers the new tables (owned by the backup module).
+
 ## Release limits and proposed decisions
 
 - **Historical modules**: This portal export does not collect engagement, support, billing, or compliance evidence; permissions/grants, internal notes and historical file revisions are excluded. When verified input contains historical evidence, inactive file versions, or optional unknown extensions, retain them inert rather than inserting live module rows or replaying side effects. Decide which historical evidence must be portable and which parts may be shown to authorized target users.

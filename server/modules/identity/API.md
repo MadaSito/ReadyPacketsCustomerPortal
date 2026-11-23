@@ -311,3 +311,45 @@ refused), country rule (`off | allow | deny`, scope `all | customers | console`,
 Per-request violations end the session (`restriction_ip` / `restriction_country`). Cached ≤ 5 s per process.
 Break-glass: host recovery (`recoverLocalAdministratorPassword`) also clears restrictions; `PROTECTION_DISABLED=1`
 disables enforcement.
+
+## Increment 06 — sign-in signals (D7), policy remediation (D13), profile audit (D11) (package K)
+
+### Ports provided
+
+- `signInSignals.publish({ kind, outcome, userId? }): Promise<void>`: never throws. Call it AFTER the transaction that decided the
+  outcome. Kinds: `password | mfa | recovery_code | passkey | password_reset | sso_callback`; outcomes: `success | failure`.
+  Forwards `{ ip (trusted request context), accountRef?, kind, outcome, correlationId, at }` to
+  `services.protection.recordSignInSignal` when it is mounted. It never carries an e-mail, password, token or name.
+- `signInSignals.forEmail(kind, outcome, email)`: the same, keyed by the sign-in identifier, including unknown accounts.
+- `signInSignals.accountRefForEmail(email): string | undefined` and
+  `signInSignals.accountRefForUser(userId, { tx? }): Promise<string | null>` return the keyed blind index of the normalized
+  e-mail (purpose `protection.account_ref`). It is the same value as the audit attribute `account_ref`.
+- `endSessionsForUser(userId, reason, { tx? }): Promise<void>` ends every session of the user. `reason` must match
+  `^[a-z][a-z0-9_]{2,39}$` (e.g. `policy_deadline`, `policy_declined`, `policy_admin_ended`); otherwise it fails with VALIDATION
+  `REASON_INVALID`. An unknown user fails with NOT_FOUND `USER_NOT_FOUND`. It is audited as `auth.session.revoked_all`
+  (reasonCode = upper-cased reason, `source: "policy_enforcement"`).
+- Batch reads (since increment 05): `getUsersByIds(ids)` (at most 500 ids; returns decrypted views for authorised callers) and
+  `findCustomerIds(filter)` (customer audience ids for compliance/policy enforcement).
+
+### Ports consumed
+
+- `services.compliance.policyEnforcement.requiresRemediation(userId, role, tx?) → boolean` (assurance_engineer). When it is
+  true, transition step `accept_policy` (always last in TRANSITION_STEPS) holds the session in remediation. It is
+  evaluated on every resolve, so an extant full session past the deadline is held before any sweeper runs.
+  Fail closed: the check throws if compliance is mounted without the port, if the role is missing, or if the port
+  throws. Only a container without a compliance module (isolated harnesses) skips the step.
+- `services.protection.recordSignInSignal(signal)` (http_security_engineer). Optional. The banned-IP precheck runs at the HTTP
+  entry points, before credentials are examined.
+
+### Audit attributes
+
+- `step` (`password | password_reset | sso`) and `account_ref` on `auth.login.failed / succeeded`,
+  `auth.password.reset_completed`, `auth.token.rejected` (non-verify purposes), `auth.password.change_denied` and
+  `identity.sso.callback_refused / completion_refused`. `account_ref` is kept in the local store only (never sent to SIEM).
+- `identity.profile.updated` carries `name_changed: true`. It records that the name changed, never the name itself (D11).
+
+### Client
+
+- Route `/accept-policy` (transition) and guard `STEP_PATHS.accept_policy`. The page owns the h1 and an always-visible Sign
+  out. The compliance forms mount through `PolicyRemediationSlot` (app/slots.tsx). The only possible actions are reading/accepting
+  or signing out (the server enforces this: only sessionProcedure endpoints that check `pendingSteps[0] === "accept_policy"`).

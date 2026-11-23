@@ -62,7 +62,15 @@ listed under "Verified" has not been proven and must not be described as working
 | Cart suggestions (increment 05) | up to three server-priced add-on, tier-upgrade or bundle-completion suggestions; accept and dismiss; admin page `/admin/carts/suggestions`; off by default (`feature.cart.upsell`); ADR 0043 | `server/modules/cart`, `client/src/features/cart` |
 | Discount codes (increment 05) | codes, batches up to 5,000, fragment links (`/promo#promo=<CODE>`); redemption inside order creation; 50 % global guard; uniform refusals, rate limit and pause; conservative release rule; console `/admin/promotions`; off by default (`feature.promotions`); ADR 0044 | `server/modules/promotions`, `client/src/features/promotions`, `server/modules/{cart,orders,compliance}` |
 | Policy acceptance log centre (increment 05) | read-only Log, Coverage and Policy updates at `/admin/policy-acceptances`, customer profile Policies tab, step-up CSV export up to 5,000 rows; always on; ADR 0045 | `server/modules/compliance`, `client/src/features/compliance/pages/acceptances` |
-| Documentation | 45 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
+| Recording (increment 06) | Record button wherever audio is accepted; runtime format choice with device fallback; preflight; server conversion to WebM/Opus (a re-encode, original kept); on by default; ADR 0047 | `server/modules/files`, `client/src/features/files` |
+| Installable app (increment 06) | manifest, install entry for each platform, a service worker limited to an allowlisted public static precache; ADR 0048 | `client/public`, `client/src/app`, `deploy/` |
+| Reports (increment 06) | 8 built-in reports, whitelisted custom reports, step-up CSV; ADR 0049 | `server/modules/reports`, `client/src/features/reports` |
+| Sign-in bans and incidents (increment 06) | escalating IP bans with lock-out guards, rate-limit back-off, correlated incidents forwarded to SIEM; ADR 0050 | `server/modules/{protection,identity,audit,siem}`, `client/src/features/{protection,audit}` |
+| Phase tasks (increment 06) | upload, acknowledge (incl. order note), record, respond to a document; per-task type restrictions; waivers; package format 2; ADR 0051 | `server/modules/orders`, `docs/guides/WORKFLOW_CUSTOMER_TASKS.md` |
+| Word editing (increment 06) | browser-only conversion; save as new version, original kept; stated limits; ADR 0052 | `client/src/lib/docconvert`, `client/src/features/docedit`, `server/modules/files` |
+| Policies and MNDA (increment 06) | import from Word/Markdown/PDF, timed notices, enforcement with session end and `/accept-policy`, typed-name check, order agreement gate (off by default); ADR 0053 | `server/modules/{compliance,identity,orders,jobs}`, `client/src/features/compliance`, `client/src/lib/agreementGate` |
+| Receipts and discount limits (increment 06) | one receipt per confirmed payment with PDF, e-mail and portal tab; small-total waive/block; discount limits up to 100 % and `set_total`; ADR 0054 | `server/modules/{compliance,payments,promotions,cart}`, `client/src/features/{compliance,payments,promotions,cart}` |
+| Documentation | 54 ADRs, threat model, security reviews, guides for customers / staff / admins, runbooks, requirements register | `docs/` |
 
 ## Verified in session 01 (integrator's own runs)
 
@@ -362,8 +370,55 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
 
+## Verified for increment 06 (integrator's own runs)
+
+The lead checked these live in a real Chromium browser, against a QA build with strict CSP and synthetic data, on 2026-11-23.
+
+- **D1 side panel:** the customer side panel is navy.
+- **D2 recording:**
+  - preflight, then record, pause, stop, review and upload (`recording.webm`);
+  - an `.m4a` upload produced a WebM/Opus derivative, with the original kept.
+- **D3 cart suggestions:** the seeded suggestions are all inactive, with the per-row Enable, Enable all and the master switch.
+- **D4 PWA:** the manifest, `sw.js`, the offline page and the Apple meta tags are served, with `Permissions-Policy: microphone=(self)`.
+- **D5 discount limits:**
+  - the Limits card;
+  - codes at 99.99 %, at 100 %, and `set_total` at 0 and at 1 cent;
+  - a $0.00 checkout places a Paid order;
+  - a $0.01 order becomes a one-cent invoice when no payment provider is enabled.
+- **D6 reports:** the 8 built-in reports, the Orders report with CSV export, and the custom builder loading 12 datasets.
+- **D7 protection:** the bans, rate-limit and incident pages render. Ban and back-off behaviour is covered by automated tests only, because loopback is exempt in QA.
+- **D8 phase tasks:** customer tasks with type restrictions.
+- **D9 Word editing:** a customer uploaded a `.docx`, edited it in the portal editor and saved it as v2, with the original kept. Headings, a list and a table were preserved.
+- **D10 workflow transfer:** the Import, Export selected and Export all controls.
+- **D11 name check:** a mismatched name was refused with the expected-name message, and a case-insensitive match was accepted.
+- **D12 policy import and notices:**
+  - `.docx`, `.md` and `.pdf` were imported into a draft;
+  - publishing scheduled a notice with a countdown;
+  - "Send now" queued it.
+- **D13 enforcement:** with 0 h grace, the next sign-in landed on `/accept-policy`, and every other API call was refused until the policy was accepted.
+- **D14 order agreement:** working on an order went upload → agreement dialog → typed name → upload resumed automatically.
+- **D15 receipts:** receipts `RPR-2026-000001` and `-000002` with a branded PDF, the portal Receipts tab, and the receipt e-mail queued.
+- **Gates (lead's own run, quiet machine):** type check clean, lint clean (zero warnings), full suite 203 of 203 files and 2,599 tests passed (4 todo) at `8243000`, `pnpm audit --prod` clean, gitleaks clean at `84f7379`. PR #13. The merge commit is the PR #13 merge on `main` (see `git log --merges main`).
+
+Defects found in lead QA and fixed before merge:
+
+- **Receipts deep link:** fixed to `/invoices?tab=receipts` (`36a486e`).
+- **Checkout dead end:** checkout stopped when the gate policy used a typed name (recovery_ops_engineer, `8243000`; rechecked live by the lead: one inline typed-name field, mismatch message beside it, order placed).
+- **Tick box shown for a typed-name gate:** `/accept-policy` and the policy prompt showed only a tick box when the gate required a typed name, so the customer could not accept (compliance_engineer, `672e900`; UI feedback `7a39164` and `4810201`; rechecked live by the lead).
+- **Prompt re-opening:** the policy prompt re-opened on every navigation after "Later" (`39fb16e`).
+- **Notice copy:** singular and plural in the notice dialog (`7a39164`).
+- **CodeQL on PR #13:** two findings at or above the gate were fixed before merge: table-cell escaping in the document importer and a check-then-read race on the brand logo file (`a10cc50`, with an escape-aware table reader shared by the policy renderer and the Markdown importer). Policy links now also refuse backslash-prefixed paths (`d14a34c`). All four workflows (ci, security, container, native-install) passed at `d14a34c`.
+- **Test timeouts:** hardened (`0e63c94`, `4614c02`).
+- **Layout and focus:** the PageHeader wrap and the install dialog focus (`751fccc`, `80af96e`).
+
 ## Not verified
 
+- increment 06:
+  - no real Stripe or Square account, so the waive path for totals below the provider minimum is covered by tests only;
+  - receipt e-mail delivery end to end (mail is not configured in QA);
+  - physical Apple, Android and Windows devices, including Safari recording and PWA install;
+  - automatic sign-in bans live (loopback is exempt in QA);
+  - real Microsoft 365, Entra ID and cloud storage, and the real P101 / P201 receiver, remain untested as before.
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
   tenant (Graph mail, SharePoint, OneDrive, sign-in completion), Amazon S3, Wasabi, Backblaze B2, Azure
   Blob, Dropbox or Google Drive. These are covered by tests against local protocol fakes only. A complete
@@ -454,6 +509,11 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   - API v1 does not accept discount codes;
   - staff (not only administrators) can read the acceptance log.
 - Increment 05 follow-ups are tracked in `docs/security/INCREMENT_05_REVIEW.md`.
+- Increment 06 assumptions awaiting owner confirmation (listed in ADRs 0047–0054):
+  - recording, editing, receipts, reports, the name check and automatic bans are on after upgrade; enforcement, the MNDA gate and cart suggestions are off;
+  - amounts below the provider minimum are waived by default (`payments.small_totals`), and the owner may prefer `block`;
+  - shared custom reports are visible to administrators only;
+  - no legal text is shipped for the MNDA; the owner imports their own.
 - Search indexing: the portal is private and `noindex` by design (ADR 0010). SEO / GEO / AEO work belongs
   on the public marketing site.
 - Native mobile apps are a later phase. The portal is responsive and installable as a PWA (ADR 0020).

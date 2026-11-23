@@ -90,6 +90,10 @@ export const paymentAttempts = mysqlTable(
     providerOrderRef: varchar("provider_order_ref", { length: 128 }),
     /** Confirmed provider payment/charge id populated once `fetchPayment` verifies payment. */
     providerPaymentRef: varchar("provider_payment_ref", { length: 128 }),
+    /** Increment 06 D15: card/network brand reported by provider (never full card number). */
+    paymentMethodBrand: varchar("payment_method_brand", { length: 32 }),
+    /** Increment 06 D15: last 4 digits reported by provider (never full card number). */
+    paymentMethodLast4: varchar("payment_method_last4", { length: 4 }),
     /** AES-256-GCM encrypted hosted checkout URL (`payment_attempts.redirect_url:<publicId>`). */
     redirectUrlEnc: text("redirect_url_enc"),
     /** External event ID of the verified signed webhook that authorized Decision 12 booking. */

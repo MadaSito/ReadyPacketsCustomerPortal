@@ -21,6 +21,9 @@ const options = z.strictObject({
   source: z.literal("recording").optional(),
 });
 const downloadBody = z.strictObject({ ticket: z.string().length(43).regex(/^[a-zA-Z0-9_-]{43}$/) });
+const publicId = z.string().length(26).regex(ULID_PATTERN);
+const documentParams = z.strictObject({ orderPublicId: publicId, filePublicId: publicId });
+const documentQuery = z.strictObject({ taskKey: slotKeySchema.optional() });
 const multipartInvalid = () => validation("INVALID_MULTIPART", "Send one or more files using the multipart file fields.");
 const requestTooLarge = () => validation("UPLOAD_REQUEST_TOO_LARGE", "The upload request exceeds the allowed size.");
 const countExceeded = () => validation("TOO_MANY_FILES", "This upload contains too many files.");
@@ -175,7 +178,8 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
           if (error instanceof DomainError && (["NOT_FOUND", "FORBIDDEN", "UNAUTHENTICATED", "LOCKED", "CONFLICT", "VALIDATION", "REMEDIATION_REQUIRED"].includes(error.code)
               || error.reasonCode === "FILE_SCANNER_UNAVAILABLE")) {
             await services.files.rejectUpload(principal, orderId, error.reasonCode);
-            results.push({ index, outcome: "refused", reason: error.reasonCode, message: error.safeMessage });
+            results.push({ index, outcome: "refused", reason: error.reasonCode, message: error.safeMessage,
+              ...(error.reasonCode === "AGREEMENT_REQUIRED" ? { details: error.details } : {}) });
           } else {
             await services.files.rejectUpload(principal, orderId, "FILE_UPLOAD_UNCONFIRMED");
             results.push({ index, outcome: "unknown", reason: "FILE_UPLOAD_UNCONFIRMED", message: "The upload could not be confirmed. Reload the file list before retrying." });
@@ -183,6 +187,52 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
         }
       }
       res.set("Cache-Control", "no-store").json({ results });
+    } finally {
+      await Promise.all(candidates.flatMap((candidate) => "staged" in candidate ? [services.files.cleanUpload(candidate.staged)] : []));
+    }
+  });
+
+  const documentPath = "/orders/:orderPublicId/:filePublicId/document";
+  router.get(documentPath, async (req, res) => {
+    const principal = requireFullSession(req);
+    const locator = documentParams.safeParse(req.params);
+    if (!locator.success || !documentQuery.safeParse(req.query).success) throw validation("DOCUMENT_REFERENCE_INVALID", "Choose a valid order document.");
+    const { file, stream } = await services.files.openDocumentForEditing(principal, locator.data);
+    let outcome: "completed" | "failed" | "unknown" = "unknown";
+    try {
+      await sendPrivateDownload(res, { stream, filename: file.displayName, contentType: file.contentType, size: file.size });
+      if (res.writableFinished) outcome = "completed";
+    } catch (error) {
+      if (!res.headersSent && !res.destroyed) { outcome = "failed"; throw error; }
+      res.destroy();
+    } finally {
+      stream.destroy();
+      await services.files.recordDownloadResult(principal, file.publicId, outcome)
+        .catch(() => services.logger.error("Order document download outcome could not be recorded"));
+    }
+  });
+
+  router.post(documentPath, async (req, res) => {
+    const principal = requireFullSession(req);
+    const locator = documentParams.safeParse(req.params);
+    const query = documentQuery.safeParse(req.query);
+    if (!locator.success || !query.success) throw validation("DOCUMENT_REFERENCE_INVALID", "Choose a valid order document.");
+    const plan = await services.files.beginEditedVersion(principal, { ...locator.data, ...query.data });
+    let candidates: Candidate[] = [];
+    try {
+      const parsed = await readMultipart(req, services, plan);
+      candidates = parsed.candidates;
+      const [candidate] = candidates;
+      if (parsed.transcript !== undefined || !candidate || req.aborted || res.destroyed) throw multipartInvalid();
+      if ("error" in candidate) throw candidate.error;
+      const file = await services.files.saveEditedVersion(principal, plan, candidate.staged);
+      res.set("Cache-Control", "no-store").json(file);
+    } catch (error) {
+      if (error instanceof DomainError && error.code !== "AUDIT_UNAVAILABLE") {
+        if (error.reasonCode === "UPLOAD_REQUEST_TOO_LARGE" && req.httpVersionMajor === 1) res.set("Connection", "close");
+        await services.files.rejectUpload(principal, plan.orderPublicId, error.reasonCode);
+      }
+      throw error;
     } finally {
       await Promise.all(candidates.flatMap((candidate) => "staged" in candidate ? [services.files.cleanUpload(candidate.staged)] : []));
     }

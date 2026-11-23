@@ -33,21 +33,39 @@ export const fileRulesSetting = defineSetting({
   sensitivity: "internal",
 });
 
+const audioDefaults = { enabled: true, maxMinutes: 30, bitrateKbps: 128, keepOriginal: true } as const;
 export const audioRulesSchema = z.strictObject({
-  enabled: z.boolean(),
-  maxMinutes: z.number().int().min(1).max(20),
-  bitrateKbps: z.number().int().min(24).max(128),
-  keepOriginal: z.literal(true),
+  enabled: z.boolean().default(audioDefaults.enabled),
+  maxMinutes: z.number().int().min(1).max(120).default(audioDefaults.maxMinutes),
+  bitrateKbps: z.number().int().min(24).max(256).default(audioDefaults.bitrateKbps),
+  keepOriginal: z.literal(true).default(audioDefaults.keepOriginal),
 });
-export type AudioRules = z.infer<typeof audioRulesSchema>;
+export type AudioRules = z.output<typeof audioRulesSchema>;
 export const audioRulesSetting = defineSetting<AudioRules>({
   key: "files.audio_conversion",
   owner: "files",
   group: "files",
   label: "Order audio recording and conversion",
-  description: "Enable microphone recording and local conversion to WebM/Opus. The original is always retained.",
+  description: "Enable microphone recording and local re-encoding to WebM/Opus. The original is always retained.",
   schema: audioRulesSchema,
-  default: { enabled: false, maxMinutes: 5, bitrateKbps: 48, keepOriginal: true },
+  default: audioDefaults,
+  sensitivity: "internal",
+  managedBy: { href: "/admin/files", label: "File administration" },
+});
+
+export const documentEditingRulesSchema = z.strictObject({
+  enabled: z.boolean().default(true),
+  maxBytes: z.number().int().min(1024).max(10 * 1024 * 1024).default(10 * 1024 * 1024),
+});
+export type DocumentEditingRules = z.output<typeof documentEditingRulesSchema>;
+export const documentEditingSetting = defineSetting<DocumentEditingRules>({
+  key: "files.document_editing",
+  owner: "files",
+  group: "files",
+  label: "Edit Word documents on orders",
+  description: "Allow authorised users to replace an order Word document with a new version. The original remains available.",
+  schema: documentEditingRulesSchema,
+  default: { enabled: true, maxBytes: 10 * 1024 * 1024 },
   sensitivity: "internal",
   managedBy: { href: "/admin/files", label: "File administration" },
 });

@@ -351,10 +351,10 @@ install_node() {
     say "Installing Node.js $node_version"
     local current='' target="$node_home/v$node_version" work
     if [[ -e $node || -L $node ]]; then
-        current=$("$node" --version 2>/dev/null || true)
+        current=$("$node" --version 2>/dev/null) || current=''
         if [[ $(readlink -f -- "$node") != "$node_home"/* ]]; then
-            "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number);process.exit(major===22&&minor>=12?0:1)' 2>/dev/null ||
-                die "$node is ${current:-not runnable} and was not installed by this script; Node.js 22.12 or later in the 22 series is required there"
+            node_version_supported "$current" ||
+                die "$node is ${current:-not runnable} and was not installed by this script. Update $node to Node.js 22.13.0 or later in the Node 22 series, then retry."
             note "keeping the existing $node ($current)"
             return
         fi

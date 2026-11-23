@@ -8,7 +8,7 @@ import type { PublishedPolicyView } from "@server/modules/compliance/policiesSer
 import type * as sessionModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
-import { Route } from "wouter";
+import { Route, useLocation, useSearch } from "wouter";
 import { InvoiceDetailPage, InvoicesPage, OrderInvoicesTab } from "./InvoicePages";
 import OrderIntakeTab from "./OrderIntakeTab";
 import PolicyAcceptanceWidget, { RequiredPolicyGate } from "./PolicyAcceptance";
@@ -16,7 +16,8 @@ import { LegalPage, MyPoliciesPage } from "./PolicyPages";
 
 const mocks = vi.hoisted(() => ({
   policyStatus: vi.fn(), published: vi.fn(), accept: vi.fn(), intakeList: vi.fn(), history: vi.fn(),
-  save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(), fetch: vi.fn(),
+  save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(),
+  receiptList: vi.fn(), orderReceipts: vi.fn(), receipt: vi.fn(), fetch: vi.fn(),
 }));
 vi.mock("@/lib/sessionTransport", async (load) => ({ ...await load<typeof sessionModule>(), sessionFetch: mocks.fetch }));
 vi.mock("@/lib/trpc", async (load) => {
@@ -44,6 +45,11 @@ vi.mock("@/lib/trpc", async (load) => {
         invoices: {
           listMine: query("invoices", mocks.invoiceList), get: query("invoice", mocks.invoice),
           listForOrder: query("order-invoices", mocks.orderInvoices),
+        },
+        receipts: {
+          myList: query("receipts", mocks.receiptList),
+          forOrder: query("order-receipts", mocks.orderReceipts),
+          get: query("receipt", mocks.receipt),
         },
       },
     }),
@@ -79,7 +85,7 @@ const invoice: InvoiceDetailView = {
   invoicePublicId: publicId("6"), orderPublicId: orderId, orderReference: "RP-123", invoiceNumber: "RP-INV-123",
   status: "issued", paymentState: "partially_refunded", currency: "USD", subtotalMinor: 10000, discountMinor: 0,
   bundleDiscountMinor: 0, discountLabel: null, promoDiscountMinor: 0, promoLabel: null, taxMinor: 0, totalMinor: 10000,
-  grossPaidMinor: 4000, refundedMinor: 1000, netPaidMinor: 3000, balanceDueMinor: 7000, issuedAt: date,
+  grossPaidMinor: 4000, waivedMinor: 0, refundedMinor: 1000, netPaidMinor: 3000, balanceDueMinor: 7000, issuedAt: date,
   dueAt: date, voidedAt: null, origin: "portal", version: 1, createdAt: date, issuerName: "ReadyPackets",
   issuerAddress: "", memo: null, voidReason: null, paymentInstructions: "", onlinePaymentConfigured: false,
   onlinePaymentMessage: null, canManage: false, canRecordPayment: false,
@@ -102,6 +108,8 @@ beforeEach(() => {
   mocks.invoiceList.mockResolvedValue({ items: [invoice], nextCursor: null });
   mocks.orderInvoices.mockResolvedValue({ items: [invoice] });
   mocks.invoice.mockResolvedValue(invoice);
+  mocks.receiptList.mockResolvedValue({ items: [], nextCursor: null });
+  mocks.orderReceipts.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -343,5 +351,201 @@ describe("customer invoices", () => {
     await waitFor(() => expect(click).toHaveBeenCalledOnce());
     expect(objectUrl).toHaveBeenCalledOnce();
     expect(revokeUrl).toHaveBeenCalledWith("blob:synthetic-invoice");
+  });
+
+  it("renders customer payment receipts with refund notes and hides order receipts for non-billing collaborators", async () => {
+    const user = userEvent.setup();
+    const receiptId = publicId("C");
+    const noteId = publicId("D");
+    const sampleReceipt = {
+      receiptPublicId: receiptId,
+      receiptNumber: "RPR-2026-000001",
+      settlementKind: "provider_online" as const,
+      invoicePublicId: invoice.invoicePublicId,
+      paymentPublicId: publicId("8"),
+      orderPublicId: orderId,
+      orderReference: "RP-123",
+      customerRef: "CUST-1",
+      currency: "USD",
+      subtotalMinor: 10000,
+      discountMinor: 0,
+      bundleDiscountMinor: 0,
+      promoDiscountMinor: 0,
+      promoLabel: null,
+      taxMinor: 0,
+      amountWaivedMinor: 0,
+      amountPaidMinor: 10000,
+      refundedMinor: 1000,
+      refundState: "partially_refunded" as const,
+      paymentMethod: "provider_online" as const,
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+      paymentMethodSummary: "Visa ending in 4242",
+      provider: "stripe",
+      issuedAt: date,
+      origin: "portal" as const,
+      refundNotes: [
+        {
+          notePublicId: noteId,
+          noteNumber: "RPRN-2026-000001",
+          receiptPublicId: receiptId,
+          refundPublicId: publicId("9"),
+          orderPublicId: orderId,
+          currency: "USD",
+          refundAmountMinor: 1000,
+          cumulativeRefundedMinor: 1000,
+          resultingRefundState: "partially_refunded" as const,
+          reasonCode: "ADJUSTMENT",
+          reference: "Refund ABC",
+          issuedAt: date,
+        },
+      ],
+    };
+    mocks.receiptList.mockResolvedValue({ items: [sampleReceipt], nextCursor: null });
+
+    const { container, unmount } = renderUi(<InvoicesPage />, { path: "/invoices" });
+    await user.click(await screen.findByRole("tab", { name: "Receipts" }));
+    expect(await screen.findByRole("link", { name: "RPR-2026-000001" })).toHaveAttribute("href", `/receipts/${receiptId}`);
+    expect(screen.getByText("Visa ending in 4242")).toBeVisible();
+    expect(screen.getByText("RPRN-2026-000001")).toBeVisible();
+    await expectNoAxeViolations(container);
+    unmount();
+
+    // Non-billing collaborator receiving FORBIDDEN sees invoices cleanly without receipt leakage or error crash.
+    mocks.orderReceipts.mockRejectedValue({
+      message: "Receipts are available only to the buyer.",
+      data: { safe: { message: "Receipts are available only to the buyer.", domainCode: "FORBIDDEN", reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING" } },
+    });
+    renderUi(<OrderInvoicesTab orderId={orderId} area="customer" />);
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(screen.queryByText("Payment receipts")).not.toBeInTheDocument();
+  });
+
+  it("deep-links /invoices?tab=receipts on load, defaults unknown tabs to invoices, and replaces the query string on tab switch", async () => {
+    const user = userEvent.setup();
+    const receiptId = publicId("E");
+    mocks.invoiceList.mockResolvedValue({ items: [invoice], nextCursor: null });
+    mocks.receiptList.mockResolvedValue({
+      items: [
+        {
+          receiptPublicId: receiptId,
+          receiptNumber: "RPR-2026-000042",
+          settlementKind: "provider_online" as const,
+          invoicePublicId: invoice.invoicePublicId,
+          paymentPublicId: publicId("8"),
+          orderPublicId: orderId,
+          orderReference: "RP-123",
+          customerRef: "CUST-1",
+          currency: "USD",
+          subtotalMinor: 10000,
+          discountMinor: 0,
+          bundleDiscountMinor: 0,
+          promoDiscountMinor: 0,
+          promoLabel: null,
+          taxMinor: 0,
+          amountWaivedMinor: 0,
+          amountPaidMinor: 10000,
+          refundedMinor: 0,
+          refundState: "none" as const,
+          paymentMethod: "provider_online" as const,
+          paymentMethodBrand: "visa",
+          paymentMethodLast4: "4242",
+          paymentMethodSummary: "Visa ending in 4242",
+          provider: "stripe",
+          issuedAt: date,
+          origin: "portal" as const,
+          refundNotes: [],
+        },
+      ],
+      nextCursor: null,
+    });
+
+    function LocationProbe() {
+      const [loc] = useLocation();
+      const search = useSearch();
+      return <output data-testid="invoices-url-probe">{search ? `${loc}?${search}` : loc}</output>;
+    }
+
+    const deepLinked = renderUi(
+      <>
+        <InvoicesPage />
+        <LocationProbe />
+      </>,
+      { path: "/invoices?tab=receipts" },
+    );
+    expect(screen.getByRole("tab", { name: "Receipts" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RPR-2026-000042" })).toBeVisible();
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices?tab=receipts");
+    expect(deepLinked.location.history).toHaveLength(1);
+
+    await user.click(screen.getByRole("tab", { name: "Invoices" }));
+    expect(screen.getByRole("tab", { name: "Invoices" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices");
+    expect(deepLinked.location.history).toHaveLength(1);
+
+    await user.click(screen.getByRole("tab", { name: "Receipts" }));
+    expect(screen.getByRole("tab", { name: "Receipts" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices?tab=receipts");
+    expect(deepLinked.location.history).toHaveLength(1);
+    await expectNoAxeViolations(deepLinked.container);
+    deepLinked.unmount();
+
+    const invalidTab = renderUi(<InvoicesPage />, { path: "/invoices?tab=unexpected" });
+    expect(screen.getByRole("tab", { name: "Invoices" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    invalidTab.unmount();
+  });
+
+  it("shows expected account name and link to /account on SIGNER_NAME_MISMATCH", async () => {
+    const user = userEvent.setup();
+    const pending = { ...document, requiresTypedSignature: true };
+    mocks.policyStatus.mockResolvedValue({
+      published: [pending],
+      pendingRequired: [pending],
+      acceptances: [],
+      expectedSignerName: "Ada Lovelace",
+    });
+    mocks.accept.mockRejectedValueOnce({
+      message: "The typed signature must match your account profile name.",
+      data: {
+        safe: {
+          safeMessage: "The typed signature must match your account profile name.",
+          domainCode: "VALIDATION_ERROR",
+          reasonCode: "SIGNER_NAME_MISMATCH",
+          details: { expectedName: "Ada Augusta Lovelace" },
+        },
+      },
+    });
+    mocks.accept.mockResolvedValueOnce({ acceptancePublicId: publicId("F"), duplicate: false });
+
+    const gateView = renderUi(<RequiredPolicyGate><button>Start the wizard</button></RequiredPolicyGate>);
+    expect(await screen.findByText(/Expected account name: Ada Lovelace/)).toBeVisible();
+    await user.click(screen.getByRole("checkbox", { name: /I have read and agree/ }));
+    const signerInput = screen.getByLabelText(/Type your full name to sign/);
+    await user.type(signerInput, "Grace Hopper");
+    await user.click(screen.getByRole("button", { name: "Accept this version" }));
+    expect(await screen.findAllByText("The typed signature must match your account profile name.")).not.toHaveLength(0);
+    expect(signerInput).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getAllByText(/Ada Augusta Lovelace/).length).toBeGreaterThanOrEqual(1);
+    const profileLink = await screen.findByRole("link", { name: "Update your profile name" });
+    expect(profileLink).toHaveAttribute("href", "/account");
+    gateView.unmount();
+
+    // Prompt dialog (`PolicyAcceptanceWidget`) also renders the typed-name field + hint and submits `signerName`.
+    renderUi(<PolicyAcceptanceWidget />);
+    await user.click(await screen.findByRole("button", { name: "Review required policies" }));
+    const dialog = await screen.findByRole("dialog", { name: "Required policy review" });
+    expect(within(dialog).getByText(/Expected account name: Ada Lovelace/)).toBeVisible();
+    await user.click(within(dialog).getByRole("checkbox", { name: /I have read and agree/ }));
+    await user.type(within(dialog).getByLabelText(/Type your full name to sign/), "Ada Lovelace");
+    await user.click(within(dialog).getByRole("button", { name: "Accept this version" }));
+    await waitFor(() =>
+      expect(mocks.accept.mock.calls.at(-1)?.[0]).toEqual({
+        versionPublicId: pending.versionPublicId,
+        contentHash: pending.contentHash,
+        signerName: "Ada Lovelace",
+      }),
+    );
   });
 });

@@ -80,3 +80,16 @@ export function CustomerMaintenanceSlot() {
 export function CartBadgeSlot() {
   return CartBadgeImpl ? slot(<CartBadgeImpl />) : null;
 }
+
+/**
+ * Increment 06 D13: required-policy remediation forms (compliance feature) on the identity-owned /accept-policy
+ * transition screen. The host page owns the h1 and an always-visible Sign out, so a failing slot cannot trap the user.
+ */
+const PolicyRemediationImpl = optionalSlot<object>(
+  import.meta.glob<Record<string, unknown>>("../features/compliance/policyUpdates/PolicyEnforcementPrompt.tsx"),
+  "PolicyEnforcementRemediation",
+);
+export function PolicyRemediationSlot() {
+  return PolicyRemediationImpl ? slot(<PolicyRemediationImpl />) : null;
+}
+

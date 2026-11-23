@@ -23,7 +23,7 @@ updates:
         update-types: [minor, patch]
     # Major versions arrive as individual PRs so each gets its own review and ADR if needed.
     ignore:
-      # Type definitions must track the runtime: package.json engines pins Node >=22.12 <23.
+      # Type definitions must track the runtime: package.json engines pins Node >=22.13.0 <23.
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 

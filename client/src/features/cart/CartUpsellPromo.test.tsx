@@ -168,6 +168,7 @@ function makeCart(overrides: Partial<CartViewData> = {}): CartViewData {
     promotionsEnabled: true,
     promoNotice: null,
     upsells: sampleUpsells,
+    smallTotalEvaluation: null,
     paymentProvider: "none",
     paymentEnvironment: "test",
     onlinePaymentEnabled: false,
@@ -472,38 +473,37 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
     await screen.findByLabelText("Discount code");
   });
 
-  it("completes zero-total checkout with a 100% discount and renders 'Nothing to pay - your discount covers this order' on confirmation", async () => {
+  it("completes zero-total checkout with a 100% or set_total discount and renders 'Nothing to pay — your discount covers this order.' on CartPage, CheckoutPage, and confirmation", async () => {
     const user = userEvent.setup();
     const zeroCartId = "01JQACART00000000000000001";
     const zeroOrderId = "01JQAORDER0000000000000001";
     const zeroInvoiceId = "01JQAINV000000000000000001";
 
-    handlers.set("cart.get", () =>
-      makeCart({
-        cartPublicId: zeroCartId,
-        upsells: [],
-        onlinePaymentEnabled: true,
-        paymentProvider: "stripe",
-        paymentEnvironment: "test",
-        totals: {
-          currency: "USD",
-          subtotalMinor: 25000,
-          discountMinor: 25000,
-          discountLabel: "Complimentary order",
-          subtotalAfterDiscountMinor: 0,
-          taxRateBps: 0,
-          taxMinor: 0,
-          totalMinor: 0,
-          bundle: null,
-          promo: {
-            promoPublicId: "01JQAPROMO0000000000000100",
-            label: "Complimentary order",
-            promoDiscountMinor: 25000,
-            bundleDiscountMinor: 0,
-          },
+    const zeroCart = makeCart({
+      cartPublicId: zeroCartId,
+      upsells: [],
+      onlinePaymentEnabled: true,
+      paymentProvider: "stripe",
+      paymentEnvironment: "test",
+      totals: {
+        currency: "USD",
+        subtotalMinor: 25000,
+        discountMinor: 25000,
+        discountLabel: "Complimentary order",
+        subtotalAfterDiscountMinor: 0,
+        taxRateBps: 0,
+        taxMinor: 0,
+        totalMinor: 0,
+        bundle: null,
+        promo: {
+          promoPublicId: "01JQAPROMO0000000000000100",
+          label: "Complimentary order",
+          promoDiscountMinor: 25000,
+          bundleDiscountMinor: 0,
         },
-      }),
-    );
+      },
+    });
+    handlers.set("cart.get", () => zeroCart);
 
     handlers.set("cart.checkout", () => ({
       mode: "no_payment_due" as const,
@@ -538,6 +538,7 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
       taxRateBps: 0,
       taxMinor: 0,
       totalMinor: 0,
+      waivedMinor: 0,
       balanceDueMinor: 0,
       canRestoreToCart: false,
       alreadyRestored: false,
@@ -548,15 +549,22 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
     renderUi(
       <main>
         <Switch>
+          <Route path="/cart" component={CartPage} />
           <Route path="/cart/checkout" component={CheckoutPage} />
           <Route path="/checkout/return" component={CheckoutReturnPage} />
         </Switch>
       </main>,
-      { path: "/cart/checkout" },
+      { path: "/cart" },
     );
 
     expect(
-      await screen.findByText("Nothing to pay - your discount covers this order"),
+      await screen.findByText("Nothing to pay — your discount covers this order."),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Continue to checkout" }));
+
+    expect(
+      await screen.findByText("Nothing to pay — your discount covers this order."),
     ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Place order" }));
@@ -565,7 +573,7 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
       await screen.findByRole("heading", { name: "Checkout status" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Nothing to pay - your discount covers this order"),
+      screen.getByText("Nothing to pay — your discount covers this order."),
     ).toBeInTheDocument();
     expect(screen.getByText("RP-2026-0100")).toBeInTheDocument();
   });
@@ -595,6 +603,7 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
       taxRateBps: 0,
       taxMinor: 0,
       totalMinor: 0,
+      waivedMinor: 0,
       balanceDueMinor: 0,
       canRestoreToCart: false,
       alreadyRestored: false,
@@ -609,6 +618,6 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
       { path: `/checkout/return?cart=${zeroCartId}` },
     );
 
-    await screen.findByText("Nothing to pay - your discount covers this order");
+    await screen.findByText("Nothing to pay — your discount covers this order.");
   });
 });

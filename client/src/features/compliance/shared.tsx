@@ -2,10 +2,10 @@
  * Shared pure UI helpers and safe policy renderer for the compliance feature.
  * Zero raw HTML (`dangerouslySetInnerHTML`), zero inline color styles, semantic `@/ui` tokens only.
  */
-import { type ReactNode } from "react";
 import { AlertCircle, Ban, CheckCircle2, Clock, FileEdit, Receipt } from "lucide-react";
 import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
+import { SafePolicyText as SharedSafePolicyText } from "@/lib/agreementGate";
 import { Badge } from "@/ui";
 
 export { formatMinorToDecimalInput, parseDecimalToMinor } from "@/lib/moneyInput";
@@ -86,44 +86,7 @@ export function IntakeStatusBadge({ status }: { status: IntakeSubmissionStatus }
 }
 
 /**
- * Renders inline `**bold**` and `` `code` `` segments into React nodes without HTML parsing.
- */
-function renderInlineSafe(text: string): ReactNode[] {
-  const nodes: ReactNode[] = [];
-  const tokenRegex = /(\*\*[^*]+\*\*|`[^`]+`)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let key = 0;
-
-  while ((match = tokenRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      nodes.push(text.slice(lastIndex, match.index));
-    }
-    const token = match[0];
-    if (token.startsWith("**") && token.endsWith("**")) {
-      nodes.push(
-        <strong key={`b-${key++}`} className="font-semibold text-ink">
-          {token.slice(2, -2)}
-        </strong>,
-      );
-    } else if (token.startsWith("`") && token.endsWith("`")) {
-      nodes.push(
-        <code key={`c-${key++}`} className="rounded-[var(--radius-control)] bg-surface-sunken px-1.5 py-0.5 text-ink">
-          {token.slice(1, -1)}
-        </code>,
-      );
-    }
-    lastIndex = match.index + token.length;
-  }
-
-  if (lastIndex < text.length) {
-    nodes.push(text.slice(lastIndex));
-  }
-  return nodes;
-}
-
-/**
- * Safe policy body renderer. Never interprets HTML or external URLs.
+ * Safe policy body renderer. Never interprets HTML or unsafe URLs.
  * Headings start at `h3` so page heading order (`h1` -> `h2` -> `h3`) stays strictly valid.
  */
 export function SafePolicyText({
@@ -133,131 +96,13 @@ export function SafePolicyText({
   bodyText: string;
   format: PolicyContentFormat;
 }) {
-  if (format === "plain_text") {
-    const paragraphs = bodyText.split(/\n{2,}/);
-    return (
-      <div className="flex flex-col gap-3 text-body break-words">
-        {paragraphs.map((p, idx) => (
-          <p key={idx} className="whitespace-pre-line leading-relaxed">
-            {p}
-          </p>
-        ))}
-      </div>
-    );
-  }
-
-  const lines = bodyText.replace(/\r\n?/g, "\n").split("\n");
-  const blocks: ReactNode[] = [];
-  let idx = 0;
-
-  while (idx < lines.length) {
-    const raw = lines[idx] ?? "";
-    const trimmed = raw.trim();
-
-    if (!trimmed) {
-      idx++;
-      continue;
-    }
-
-    if (/^---+$/.test(trimmed)) {
-      blocks.push(<hr key={`hr-${idx}`} className="border-line my-2" />);
-      idx++;
-      continue;
-    }
-
-    if (trimmed.startsWith("### ")) {
-      blocks.push(
-        <h5 key={`h5-${idx}`} className="mt-3 text-base font-semibold text-ink">
-          {renderInlineSafe(trimmed.slice(4))}
-        </h5>,
-      );
-      idx++;
-      continue;
-    }
-    if (trimmed.startsWith("## ")) {
-      blocks.push(
-        <h4 key={`h4-${idx}`} className="mt-4 text-lg font-semibold text-ink">
-          {renderInlineSafe(trimmed.slice(3))}
-        </h4>,
-      );
-      idx++;
-      continue;
-    }
-    if (trimmed.startsWith("# ")) {
-      blocks.push(
-        <h3 key={`h3-${idx}`} className="mt-4 text-xl font-semibold text-ink">
-          {renderInlineSafe(trimmed.slice(2))}
-        </h3>,
-      );
-      idx++;
-      continue;
-    }
-
-    if (/^[-*]\s+/.test(trimmed)) {
-      const items: string[] = [];
-      const start = idx;
-      while (idx < lines.length && /^[-*]\s+/.test((lines[idx] ?? "").trim())) {
-        items.push((lines[idx] ?? "").trim().replace(/^[-*]\s+/, ""));
-        idx++;
-      }
-      blocks.push(
-        <ul key={`ul-${start}`} className="list-disc space-y-1 pl-6 text-body">
-          {items.map((item, itemIdx) => (
-            <li key={itemIdx}>{renderInlineSafe(item)}</li>
-          ))}
-        </ul>,
-      );
-      continue;
-    }
-
-    if (/^\d+\.\s+/.test(trimmed)) {
-      const items: string[] = [];
-      const start = idx;
-      while (idx < lines.length && /^\d+\.\s+/.test((lines[idx] ?? "").trim())) {
-        items.push((lines[idx] ?? "").trim().replace(/^\d+\.\s+/, ""));
-        idx++;
-      }
-      blocks.push(
-        <ol key={`ol-${start}`} className="list-decimal space-y-1 pl-6 text-body">
-          {items.map((item, itemIdx) => (
-            <li key={itemIdx}>{renderInlineSafe(item)}</li>
-          ))}
-        </ol>,
-      );
-      continue;
-    }
-
-    const paraLines: string[] = [];
-    const start = idx;
-    while (
-      idx < lines.length &&
-      (lines[idx] ?? "").trim() !== "" &&
-      !/^(#{1,3}\s+|[-*]\s+|\d+\.\s+|---+$)/.test((lines[idx] ?? "").trim())
-    ) {
-      paraLines.push(lines[idx] ?? "");
-      idx++;
-    }
-    blocks.push(
-      <p key={`p-${start}`} className="leading-relaxed text-body">
-        {renderInlineSafe(paraLines.join(" "))}
-      </p>,
-    );
-  }
-
-  return <div className="flex flex-col gap-3 break-words">{blocks}</div>;
+  return <SharedSafePolicyText bodyText={bodyText} format={format} />;
 }
 
-/**
- * Downloads a private invoice PDF through `sessionFetch` so both HttpOnly cookie sessions
- * and sandboxed preview header sessions work identically.
- */
-export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber: string | null): Promise<void> {
-  const response = await sessionFetch(
-    apiUrl(`/api/compliance/invoices/${encodeURIComponent(invoicePublicId)}/pdf`),
-    { method: "GET" },
-  );
+async function downloadCompliancePdf(path: string, fallbackMessage: string, baseFilename: string): Promise<void> {
+  const response = await sessionFetch(apiUrl(path), { method: "GET" });
   if (!response.ok) {
-    let message = "Unable to download invoice PDF.";
+    let message = fallbackMessage;
     try {
       const json = (await response.json()) as { error?: { message?: string } };
       if (json?.error?.message) message = json.error.message;
@@ -267,7 +112,7 @@ export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber:
     throw new Error(message);
   }
   const blob = await response.blob();
-  const safeName = `${(invoiceNumber ?? `invoice-${invoicePublicId}`).replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`;
+  const safeName = `${baseFilename.replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`;
   const url = URL.createObjectURL(blob);
   try {
     const anchor = document.createElement("a");
@@ -279,4 +124,75 @@ export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber:
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * Downloads a private invoice PDF through `sessionFetch` so both HttpOnly cookie sessions
+ * and sandboxed preview header sessions work identically.
+ */
+export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber: string | null): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/invoices/${encodeURIComponent(invoicePublicId)}/pdf`,
+    "Unable to download invoice PDF.",
+    invoiceNumber ?? `invoice-${invoicePublicId}`,
+  );
+}
+
+export async function downloadReceiptPdf(receiptPublicId: string, receiptNumber: string): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/receipts/${encodeURIComponent(receiptPublicId)}/pdf`,
+    "Unable to download payment receipt PDF.",
+    receiptNumber || `receipt-${receiptPublicId}`,
+  );
+}
+
+export async function downloadRefundNotePdf(notePublicId: string, noteNumber: string): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/refund-notes/${encodeURIComponent(notePublicId)}/pdf`,
+    "Unable to download refund note PDF.",
+    noteNumber || `refund-note-${notePublicId}`,
+  );
+}
+
+export type ReceiptRefundState = "none" | "partially_refunded" | "refunded";
+
+export function ReceiptRefundBadge({ state }: { state: ReceiptRefundState }) {
+  switch (state) {
+    case "refunded":
+      return <Badge tone="warning">Refunded</Badge>;
+    case "partially_refunded":
+      return <Badge tone="info">Partially refunded</Badge>;
+    case "none":
+      return (
+        <Badge tone="success" icon={<CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />}>
+          Confirmed
+        </Badge>
+      );
+  }
+}
+
+export function formatReceiptMethodSummary(item: {
+  settlementKind: "provider_online" | "manual_payment" | "zero_total" | "waived_small_total";
+  paymentMethod: string;
+  paymentMethodBrand: string | null;
+  paymentMethodLast4: string | null;
+}): string {
+  if (item.settlementKind === "zero_total") return "Discount covered full order ($0.00)";
+  if (item.settlementKind === "waived_small_total") return "Small balance waived";
+  if (item.paymentMethodBrand && item.paymentMethodLast4) {
+    const brand = item.paymentMethodBrand.charAt(0).toUpperCase() + item.paymentMethodBrand.slice(1);
+    return `${brand} ending in ${item.paymentMethodLast4}`;
+  }
+  if (item.paymentMethodLast4) return `Card ending in ${item.paymentMethodLast4}`;
+  const labels: Record<string, string> = {
+    provider_online: "Online card payment",
+    bank_transfer: "Bank transfer",
+    wire: "Wire transfer",
+    ach: "ACH",
+    check: "Check",
+    card_manual: "Manual card",
+    waiver: "Waived",
+    other: "Recorded payment",
+  };
+  return labels[item.paymentMethod] ?? "Confirmed payment";
 }

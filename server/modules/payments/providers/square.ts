@@ -34,6 +34,12 @@ const paymentResponse = z.object({ payment: z.object({
   status: z.enum(["COMPLETED", "APPROVED", "PENDING", "FAILED", "CANCELED"]),
   amount_money: money, total_money: money.optional(), tip_money: money.optional(), refunded_money: money.optional(),
   updated_at: z.iso.datetime({ offset: true }).optional(),
+  card_details: z.object({
+    card: z.object({
+      card_brand: z.string().max(32).optional(),
+      last_4: z.string().regex(/^[0-9]{4}$/u).optional(),
+    }).optional(),
+  }).optional(),
 }) });
 type Mode = keyof typeof apiHosts;
 type Claim = Pick<Parameters<PaymentProviderAdapter["fetchPayment"]>[0], "signal" | "beforeSend">;
@@ -173,8 +179,15 @@ export function createSquareProvider(egress: Pick<EgressPolicy, "fetchPinned">):
           (payment.refunded_money?.amount ?? 0) !== 0 || (payment.tip_money?.amount ?? 0) !== 0) {
         throw unavailable("SQUARE_PAYMENT_MISMATCH");
       }
+      const rawBrand = payment.card_details?.card?.card_brand?.trim().toLowerCase() ?? "";
+      const paymentMethodBrand =
+        rawBrand && /^[a-z][a-z0-9 _-]{0,31}$/u.test(rawBrand) && !/\d{4,}/u.test(rawBrand)
+          ? rawBrand
+          : null;
+      const paymentMethodLast4 = payment.card_details?.card?.last_4 ?? null;
       return { ...binding, providerPaymentRef: payment.id,
         paidAt: payment.status === "COMPLETED" && payment.updated_at ? new Date(payment.updated_at) : null,
+        paymentMethodBrand, paymentMethodLast4,
         status: payment.status === "COMPLETED" ? "paid" : ["CANCELED", "FAILED"].includes(payment.status) ? "failed" : "open" };
     },
   };

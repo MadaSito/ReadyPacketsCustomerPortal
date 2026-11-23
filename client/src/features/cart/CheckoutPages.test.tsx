@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { CheckoutCartResult } from "@server/modules/cart/types";
@@ -15,22 +15,39 @@ const mocks = vi.hoisted(() => ({
   checkout: vi.fn(),
   status: vi.fn(),
   restore: vi.fn(),
+  policyMyStatus: vi.fn(),
+  policyAccept: vi.fn(),
 }));
 vi.mock("@/lib/trpc", async (original) => ({
   ...await original<typeof transport>(),
-  useTRPC: () => ({ cart: {
-    get: { queryKey: () => ["cart"], queryOptions: () => ({ queryKey: ["cart"], queryFn: mocks.cart }) },
-    badgeCount: { queryKey: () => ["badge"] },
-    checkoutStatus: { queryOptions: (input: unknown, options: object) => ({
-      ...options, queryKey: ["checkout", input], queryFn: () => mocks.status(input),
-    }) },
-    restoreCheckout: { mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.restore(input) }) },
-  } }),
+  useTRPC: () => ({
+    cart: {
+      get: { queryKey: () => ["cart"], queryOptions: () => ({ queryKey: ["cart"], queryFn: mocks.cart }) },
+      badgeCount: { queryKey: () => ["badge"] },
+      checkoutStatus: { queryOptions: (input: unknown, options: object) => ({
+        ...options, queryKey: ["checkout", input], queryFn: () => mocks.status(input),
+      }) },
+      restoreCheckout: { mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.restore(input) }) },
+    },
+    compliance: {
+      policies: {
+        myStatus: {
+          queryKey: () => ["compliance.policies.myStatus"],
+          queryOptions: () => ({ queryKey: ["compliance.policies.myStatus"], queryFn: mocks.policyMyStatus }),
+        },
+        accept: {
+          mutationOptions: () => ({ mutationFn: (input: unknown) => mocks.policyAccept(input) }),
+        },
+      },
+    },
+  }),
   useTRPCClient: () => ({ cart: { checkout: { mutate: mocks.checkout } } }),
 }));
 
 const id = (end: number) => `01J${"0".repeat(22)}${end}`;
 const [cartId, attemptId, orderId, invoiceId] = [id(1), id(2), id(3), id(4)];
+const mndaDocId = id(9);
+const mndaVersionId = id(8);
 const date = new Date("2026-11-21T12:00:00Z");
 const requiredPolicy: CartViewData["pendingPolicies"][number] = {
   documentPublicId: id(5), slug: "synthetic-policy", title: "Synthetic checkout policy", audience: "customer",
@@ -47,6 +64,7 @@ const cart: CartViewData = {
     unitPriceMinor: 1600, lineTotalMinor: 1600, currency: "USD", available: true }],
   hasUnavailableItems: false, mixedCurrency: false, paymentProvider: "none", paymentEnvironment: "test", onlinePaymentEnabled: false,
   promotionsEnabled: false, promoNotice: null, upsells: [],
+  smallTotalEvaluation: null,
   totals: { currency: "USD", subtotalMinor: 1600, discountMinor: 200, discountLabel: "Bundle savings", subtotalAfterDiscountMinor: 1400,
     taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, bundle: null, promo: null },
   pendingPolicies: [requiredPolicy], updatedAt: date,
@@ -57,7 +75,7 @@ const pending: CheckoutStatus = {
   orderReference: "RP-SYNTHETIC", invoicePublicId: invoiceId, invoiceNumber: "INV-SYNTHETIC",
   invoiceStatus: "issued", currency: "USD", subtotalMinor: 1600, discountMinor: 200, discountLabel: "Bundle savings",
   promoDiscountMinor: 0, promoLabel: null,
-  taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, balanceDueMinor: 1540, canRestoreToCart: true, alreadyRestored: false,
+  taxRateBps: 1000, taxMinor: 140, totalMinor: 1540, waivedMinor: 0, balanceDueMinor: 1540, canRestoreToCart: true, alreadyRestored: false,
   checkedOutAt: date,
 };
 const invoice: CheckoutCartResult = {
@@ -74,6 +92,25 @@ beforeEach(() => {
     mocks.status.mockResolvedValue({ ...pending, confirmationState: "cancelled", canRestoreToCart: false, alreadyRestored: true });
     return { restored: true, alreadyRestored: false, cart };
   });
+  mocks.policyMyStatus.mockResolvedValue({
+    expectedSignerName: "Synthetic Customer",
+    published: [
+      {
+        documentPublicId: mndaDocId,
+        title: "Mutual Non-Disclosure Agreement",
+        versionPublicId: mndaVersionId,
+        versionNumber: 1,
+        versionLabel: "1.0",
+        effectiveAt: date,
+        contentFormat: "plain_text",
+        bodyText: "Short MNDA text that fits without scrolling in tests.",
+        contentHash: "b".repeat(64),
+        requiresTypedSignature: true,
+      },
+    ],
+    accepted: [],
+  });
+  mocks.policyAccept.mockResolvedValue({ acceptancePublicId: id(9) });
 });
 
 const review = () => renderUi(<main><title>Checkout · ReadyPackets</title><CheckoutPage /></main>, { path: "/cart/checkout" });
@@ -93,16 +130,33 @@ pageA11y("/checkout/return pending confirmation", async () => {
   returned();
   await screen.findByText("Waiting for payment confirmation");
 });
+pageA11y("/checkout/return waived small total", async () => {
+  mocks.status.mockResolvedValue({
+    ...pending,
+    confirmationState: "no_payment_due",
+    paymentMode: "waived_small_total",
+    attemptPublicId: null,
+    attemptStatus: null,
+    invoiceStatus: "paid",
+    totalMinor: 40,
+    waivedMinor: 40,
+    balanceDueMinor: 0,
+    canRestoreToCart: false,
+  });
+  returned(`?cart=${cartId}`);
+  await screen.findByText("Order placed — remaining balance waived");
+});
 pageA11y("/checkout/cancel restore confirmation", async () => {
   cancelled();
   await userEvent.click(await screen.findByRole("button", { name: "Restore items to cart" }));
   await screen.findByRole("alertdialog", { name: "Cancel checkout and restore items?" });
 });
 
-it("places an invoice order with versioned policy evidence but no client totals and opens the status route", async () => {
+it("places an invoice order with versioned policy evidence and profile link hint, and opens the status route", async () => {
   const user = userEvent.setup();
   const { location } = review();
   expect(await screen.findByText("Bundle savings")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "update name in profile" })).toHaveAttribute("href", "/account");
   await user.click(screen.getByRole("checkbox", { name: /I have read and agree/u }));
   await user.type(screen.getByRole("textbox", { name: /^Type your full name/u }), "Synthetic Customer");
   await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
@@ -114,6 +168,263 @@ it("places an invoice order with versioned policy evidence but no client totals 
   });
   expect(mocks.checkout).toHaveBeenCalledTimes(1);
 }, 10_000);
+
+it("handles D14 AGREEMENT_REQUIRED at checkout by opening AgreementDialog, accepting, and retrying checkout automatically", async () => {
+  const user = userEvent.setup();
+  mocks.cart.mockResolvedValue({ ...cart, pendingPolicies: [] });
+  mocks.checkout
+    .mockRejectedValueOnce(
+      Object.assign(new Error("Please read and accept the agreement to continue."), {
+        data: {
+          safe: {
+            domainCode: "CONFLICT",
+            reasonCode: "AGREEMENT_REQUIRED",
+            safeMessage: "Please read and accept the agreement to continue.",
+            details: { policyPublicId: mndaDocId, signatureMode: "typed_name" },
+          },
+        },
+      }),
+    )
+    .mockResolvedValueOnce(invoice);
+
+  const { location } = review();
+  await user.click(await screen.findByRole("button", { name: "Place order and receive invoice" }));
+
+  // AgreementDialog opens for the required policy
+  expect(
+    await screen.findByRole("dialog", { name: "Review and accept Mutual Non-Disclosure Agreement" }),
+  ).toBeInTheDocument();
+
+  await user.click(screen.getByRole("checkbox", { name: /I have read and agree to Mutual Non-Disclosure Agreement/i }));
+  await user.type(
+    screen.getByRole("textbox", { name: /Type your full name/i }),
+    "Synthetic Customer",
+  );
+  await user.click(screen.getByRole("button", { name: "Accept and continue" }));
+
+  await waitFor(() => {
+    expect(mocks.policyAccept).toHaveBeenCalledTimes(1);
+    expect(mocks.checkout).toHaveBeenCalledTimes(2);
+    expect(location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
+  });
+}, 10_000);
+
+it("D14 live QA regression: renders inline typed-name field once (in both requiresTypedSignature worlds), shows SIGNER_NAME_MISMATCH next to the field, and falls back to AgreementDialog on stale/prior-checkbox views", async () => {
+  const user = userEvent.setup();
+  const qaMndaCheckboxPolicy: CartViewData["pendingPolicies"][number] = {
+    documentPublicId: mndaDocId,
+    slug: "qa-mutual-nda",
+    title: "QA Mutual NDA",
+    audience: "customer",
+    requiresAcceptance: true,
+    requiresTypedSignature: false,
+    versionPublicId: mndaVersionId,
+    versionNumber: 1,
+    versionLabel: "1.0",
+    contentFormat: "plain_text",
+    bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+    contentHash: "b".repeat(64),
+    changeSummary: null,
+    effectiveAt: date,
+    publishedAt: date,
+  };
+
+  mocks.policyMyStatus.mockResolvedValue({
+    expectedSignerName: "Synthetic Customer",
+    published: [
+      {
+        documentPublicId: mndaDocId,
+        title: "QA Mutual NDA",
+        versionPublicId: mndaVersionId,
+        versionNumber: 1,
+        versionLabel: "1.0",
+        effectiveAt: date,
+        contentFormat: "plain_text",
+        bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+        contentHash: "b".repeat(64),
+        requiresTypedSignature: true,
+      },
+    ],
+    accepted: [],
+  });
+
+  // 1. Fresh checkout view (works identically whether `requiresTypedSignature` is false + `placeOrderAgreement`
+  // or `requiresTypedSignature: true` from compliance): renders ONE inline typed-name field, shows
+  // SIGNER_NAME_MISMATCH error right next to the field, and places the order in one step without opening AgreementDialog!
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [qaMndaCheckboxPolicy],
+    placeOrderAgreement: {
+      required: true,
+      met: false,
+      policyPublicId: mndaDocId,
+      signatureMode: "typed_name",
+    },
+  });
+  mocks.checkout
+    .mockRejectedValueOnce(
+      Object.assign(new Error("The typed signature must match your account profile name."), {
+        data: {
+          safe: {
+            domainCode: "VALIDATION",
+            reasonCode: "SIGNER_NAME_MISMATCH",
+            safeMessage: "The typed signature must match your account profile name.",
+            details: { expectedName: "Synthetic Customer", profilePath: "/account" },
+          },
+        },
+      }),
+    )
+    .mockResolvedValueOnce(invoice);
+
+  const { location, unmount } = review();
+  const inlineCheckbox = await screen.findByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i });
+  const inlineSignerInput = screen.getByRole("textbox", { name: /Type your full name to sign QA Mutual NDA/i });
+
+  await user.click(inlineCheckbox);
+  await user.type(inlineSignerInput, "Wrong Person");
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  // Name-mismatch error is rendered directly next to the field (`aria-invalid="true"` + field error text)
+  expect(
+    await screen.findByText(
+      "The typed signature must match your account profile name. Expected account name: Synthetic Customer.",
+    ),
+  ).toBeInTheDocument();
+  expect(inlineSignerInput).toHaveAttribute("aria-invalid", "true");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+  // Typing clears the field error; submitting the matching name completes in ONE step without asking twice!
+  await user.clear(inlineSignerInput);
+  await user.type(inlineSignerInput, "Synthetic Customer");
+  expect(inlineSignerInput).not.toHaveAttribute("aria-invalid");
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  await waitFor(() => {
+    expect(mocks.checkout).toHaveBeenCalledTimes(2);
+    expect(mocks.policyAccept).not.toHaveBeenCalled();
+    expect(location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
+  });
+  expect(mocks.checkout.mock.calls[1]?.[0]?.policyAcceptances).toEqual([
+    {
+      versionPublicId: mndaVersionId,
+      contentHash: "b".repeat(64),
+      signerName: "Synthetic Customer",
+    },
+  ]);
+  unmount();
+}, 10_000);
+
+it("D14 live QA regression: opens AgreementDialog when server raises AGREEMENT_REQUIRED on a stale checkbox-only view or prior checkbox acceptance, then completes checkout once signed", async () => {
+  const user = userEvent.setup();
+  const qaMndaCheckboxPolicy: CartViewData["pendingPolicies"][number] = {
+    documentPublicId: mndaDocId,
+    slug: "qa-mutual-nda",
+    title: "QA Mutual NDA",
+    audience: "customer",
+    requiresAcceptance: true,
+    requiresTypedSignature: false,
+    versionPublicId: mndaVersionId,
+    versionNumber: 1,
+    versionLabel: "1.0",
+    contentFormat: "plain_text",
+    bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+    contentHash: "b".repeat(64),
+    changeSummary: null,
+    effectiveAt: date,
+    publishedAt: date,
+  };
+  mocks.policyMyStatus.mockResolvedValue({
+    expectedSignerName: "Synthetic Customer",
+    published: [
+      {
+        documentPublicId: mndaDocId,
+        title: "QA Mutual NDA",
+        versionPublicId: mndaVersionId,
+        versionNumber: 1,
+        versionLabel: "1.0",
+        effectiveAt: date,
+        contentFormat: "plain_text",
+        bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+        contentHash: "b".repeat(64),
+        requiresTypedSignature: false,
+      },
+    ],
+    accepted: [],
+  });
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [qaMndaCheckboxPolicy],
+  });
+  mocks.checkout
+    .mockRejectedValueOnce(
+      Object.assign(new Error("Please read and accept the agreement to continue."), {
+        data: {
+          safe: {
+            domainCode: "CONFLICT",
+            reasonCode: "AGREEMENT_REQUIRED",
+            safeMessage: "Please read and accept the agreement to continue.",
+            details: { policyPublicId: mndaDocId, signatureMode: "typed_name" },
+          },
+        },
+      }),
+    )
+    .mockResolvedValueOnce(invoice);
+
+  const staleRender = review();
+  await user.click(await screen.findByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i }));
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Review and accept QA Mutual NDA" });
+  const dialogCheckbox = within(dialog).getByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i });
+  await waitFor(() => expect(dialogCheckbox).not.toBeDisabled());
+  await user.click(dialogCheckbox);
+  await user.type(within(dialog).getByRole("textbox", { name: /Type your full name/i }), "Synthetic Customer");
+  await user.click(within(dialog).getByRole("button", { name: "Accept and continue" }));
+
+  await waitFor(() => {
+    expect(mocks.policyAccept).toHaveBeenCalledTimes(1);
+    expect(mocks.checkout).toHaveBeenCalledTimes(2);
+    expect(staleRender.location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
+  });
+  expect(mocks.checkout.mock.calls[1]?.[0]?.policyAcceptances).toEqual([]);
+}, 10_000);
+
+it("renders D5 small-total waive and block callouts and shows waived amount on CheckoutReturnPage", async () => {
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [],
+    onlinePaymentEnabled: true,
+    paymentProvider: "stripe",
+    totals: {
+      ...cart.totals,
+      totalMinor: 40,
+    },
+    smallTotalEvaluation: {
+      belowMinimum: true,
+      minimumMinor: 50,
+      smallTotalAction: "waive",
+    },
+  });
+  review();
+  expect(await screen.findByText("Remaining balance will be waived")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Place order" })).toBeInTheDocument();
+
+  mocks.status.mockResolvedValue({
+    ...pending,
+    confirmationState: "no_payment_due",
+    paymentMode: "waived_small_total",
+    attemptPublicId: null,
+    attemptStatus: null,
+    invoiceStatus: "paid",
+    totalMinor: 40,
+    waivedMinor: 40,
+    balanceDueMinor: 0,
+    canRestoreToCart: false,
+  });
+  returned(`?cart=${cartId}`);
+  expect(await screen.findByText("Order placed — remaining balance waived")).toBeInTheDocument();
+  expect(screen.getByText("Amount waived")).toBeInTheDocument();
+});
 
 it("polls read-only until the server confirms payment, and does not perform a write on return", async () => {
   mocks.status.mockResolvedValueOnce(pending).mockResolvedValue({

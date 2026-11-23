@@ -299,3 +299,85 @@ export const auditRetentionRuns = mysqlTable("audit_retention_runs", {
   finishedAt: utcDateTime("finished_at"),
   checkpointPublicId: char("checkpoint_public_id", { length: 26 }),
 });
+
+/* ------------------------------------------------------------------ increment 06, D7: event correlation */
+
+/**
+ * Security incidents produced by the correlation rules (correlation/rules.ts). Mutable workflow rows (status,
+ * counts) — the evidence stays in `audit_events`; every change here is itself recorded as `security.incident.*`.
+ * No raw addresses or identifiers: `subject_ref` is a keyed pseudonym (source address / account blind index) or a
+ * user public id; `address_event_id` names the correlated event whose encrypted address a ban action may resolve.
+ */
+export const securityIncidents = mysqlTable(
+  "security_incidents",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    ruleKey: varchar("rule_key", { length: 40 }).notNull(),
+    severity: varchar("severity", { length: 8 }).notNull(),
+    status: varchar("status", { length: 16 }).notNull().default("open"),
+    /** SHA-256 hex of rule_key|subject_kind|subject_ref: merges new evidence into the open incident. */
+    dedupeKey: char("dedupe_key", { length: 64 }).notNull(),
+    subjectKind: varchar("subject_kind", { length: 12 }).notNull(),
+    subjectRef: varchar("subject_ref", { length: 64 }),
+    userPublicId: varchar("user_public_id", { length: 64 }),
+    addressEventId: char("address_event_id", { length: 26 }),
+    firstEventAt: utcDateTime("first_event_at").notNull(),
+    lastEventAt: utcDateTime("last_event_at").notNull(),
+    eventCount: int("event_count", { unsigned: true }).notNull().default(0),
+    accountCount: int("account_count", { unsigned: true }).notNull().default(0),
+    addressCount: int("address_count", { unsigned: true }).notNull().default(0),
+    version: int("version", { unsigned: true }).notNull().default(1),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+    acknowledgedAt: utcDateTime("acknowledged_at"),
+    acknowledgedBy: refColumn("acknowledged_by"),
+    closedAt: utcDateTime("closed_at"),
+    closedBy: refColumn("closed_by"),
+    closeReason: varchar("close_reason", { length: 24 }),
+  },
+  (t) => [
+    index("ix_sec_inc_status_last").on(t.status, t.lastEventAt),
+    index("ix_sec_inc_dedupe").on(t.dedupeKey, t.status),
+    index("ix_sec_inc_rule_last").on(t.ruleKey, t.lastEventAt),
+    index("ix_sec_inc_last").on(t.lastEventAt, t.id),
+  ],
+);
+
+/** Correlated audit events of an incident (capped per incident; `event_count` keeps counting past the cap). */
+export const securityIncidentEvents = mysqlTable(
+  "security_incident_events",
+  {
+    id: idColumn(),
+    incidentId: refColumn("incident_id").notNull(),
+    eventId: char("event_id", { length: 26 }).notNull(),
+    eventName: varchar("event_name", { length: 96 }).notNull(),
+    occurredAt: utcDateTime("occurred_at").notNull(),
+    addedAt: utcDateTime("added_at").notNull(),
+  },
+  (t) => [uniqueIndex("ux_sec_inc_event").on(t.incidentId, t.eventId), index("ix_sec_inc_event_event").on(t.eventId), index("ix_sec_inc_event_time").on(t.incidentId, t.occurredAt)],
+);
+
+/** Append-only incident timeline (opened, events added, escalated, acknowledged, closed, actions). Safe values only. */
+export const securityIncidentTimeline = mysqlTable(
+  "security_incident_timeline",
+  {
+    id: idColumn(),
+    incidentId: refColumn("incident_id").notNull(),
+    at: utcDateTime("at").notNull(),
+    kind: varchar("kind", { length: 24 }).notNull(),
+    actorUserId: refColumn("actor_user_id"),
+    detail: json("detail").$type<Record<string, string | number | boolean | null>>().notNull(),
+  },
+  (t) => [index("ix_sec_inc_timeline").on(t.incidentId, t.at, t.id)],
+);
+
+/** Singleton (id = 1): serialises correlation runs (SELECT … FOR UPDATE) and keeps the last run summary for health. */
+export const securityCorrelationState = mysqlTable("security_correlation_state", {
+  id: tinyint("id", { unsigned: true }).primaryKey(),
+  lastRunAt: utcDateTime("last_run_at"),
+  lastRunEvents: int("last_run_events", { unsigned: true }).notNull().default(0),
+  lastRunFindings: int("last_run_findings", { unsigned: true }).notNull().default(0),
+  lastRunTruncated: boolean("last_run_truncated").notNull().default(false),
+  lastRunReason: varchar("last_run_reason", { length: 64 }),
+});

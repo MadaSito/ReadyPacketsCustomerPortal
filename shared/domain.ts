@@ -20,6 +20,8 @@ export const TRANSITION_STEPS = [
   "enroll_mfa",
   "acknowledge_recovery_codes",
   "change_password",
+  /** Increment 06 D13: a policy with enforcement `required_to_continue` must be accepted (read/accept/sign out only). */
+  "accept_policy",
 ] as const;
 export type TransitionStep = (typeof TRANSITION_STEPS)[number];
 

@@ -107,9 +107,20 @@ export interface CreatedCheckoutOrder {
   afterCommit: () => Promise<void>;
 }
 
+export interface CartPlaceOrderAgreementStatus {
+  required: boolean;
+  met: boolean;
+  policyPublicId: string | null;
+  signatureMode: "checkbox" | "typed_name";
+}
+
 export interface CartOrdersPort {
   listActiveCatalog(tx?: Tx, opts?: { forShare?: boolean }): Promise<CatalogGroupView[]>;
   getBundleRule(tx?: Tx): Promise<BundleRule>;
+  /** Increment 06 (D14): read-only status of the `placeOrder` account-level agreement gate. */
+  getPlaceOrderAgreementStatus(principal: SessionPrincipal, tx?: DbOrTx): Promise<CartPlaceOrderAgreementStatus>;
+  /** Increment 06 (D14): early account-level order agreement (MNDA) gate check inside checkout `tx`. */
+  assertCustomerMayPlaceOrder(principal: SessionPrincipal, tx: Tx): Promise<void>;
   createOrderFromCheckoutInTx(
     principal: SessionPrincipal,
     input: {
@@ -127,9 +138,21 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
   const ordersMod = (services as Partial<Services>).orders as Record<string, unknown> | undefined;
   const catalogHolder = ordersMod?.catalog;
   const innerOrdersHolder = ordersMod?.orders;
+  const gatesHolder = ordersMod?.gates;
 
   const listActiveCatalog = method<CartOrdersPort["listActiveCatalog"]>(catalogHolder, "listActive");
   const getBundleRule = method<CartOrdersPort["getBundleRule"]>(catalogHolder, "getBundleRule");
+  const agreementFor = method<
+    (input: {
+      tx?: DbOrTx;
+      actor: SessionPrincipal;
+      scope: "placeOrder" | "workOnOrder";
+    }) => Promise<CartPlaceOrderAgreementStatus>
+  >(gatesHolder, "agreementFor");
+  const assertGatePlaceOrder = method<(input: { tx: DbOrTx; actor: SessionPrincipal }) => Promise<void>>(
+    gatesHolder,
+    "assertCustomerMayPlaceOrder",
+  );
   const createOrderFromCheckoutInTx =
     method<CartOrdersPort["createOrderFromCheckoutInTx"]>(ordersMod, "createOrderFromCheckoutInTx") ??
     method<CartOrdersPort["createOrderFromCheckoutInTx"]>(innerOrdersHolder, "createOrderFromCheckoutInTx");
@@ -140,6 +163,22 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
   return {
     listActiveCatalog,
     getBundleRule,
+    async getPlaceOrderAgreementStatus(principal, tx) {
+      if (!agreementFor) {
+        return {
+          required: false,
+          met: true,
+          policyPublicId: null,
+          signatureMode: "typed_name",
+        };
+      }
+      return agreementFor({ ...(tx ? { tx } : {}), actor: principal, scope: "placeOrder" });
+    },
+    async assertCustomerMayPlaceOrder(principal, tx) {
+      if (assertGatePlaceOrder) {
+        await assertGatePlaceOrder({ tx, actor: principal });
+      }
+    },
     async createOrderFromCheckoutInTx(principal, input, tx) {
       if (!createOrderFromCheckoutInTx) throw unavailable("ORDERS_CHECKOUT_PORT_UNAVAILABLE");
       return createOrderFromCheckoutInTx(principal, input, tx);
@@ -168,6 +207,16 @@ export interface CartPromotionContext {
   bundleLabel: string | null;
 }
 
+export interface CartPromotionLineAllocation {
+  lineIndex: number;
+  productPublicId: string;
+  grossMinor: number;
+  bundleDiscountMinor: number;
+  promoDiscountMinor: number;
+  discountMinor: number;
+  netMinor: number;
+}
+
 export interface CartPromotionOutcome {
   promoPublicId: string;
   label: string;
@@ -176,7 +225,21 @@ export interface CartPromotionOutcome {
   discountMinor: number;
   discountLabel: string;
   totalMinor: number;
+  lineAllocations?: readonly CartPromotionLineAllocation[];
 }
+
+/**
+ * Promotion refusal reason codes safe to surface verbatim when a customer is entitled to the code
+ * (minimum subtotal, no eligible items, or D5 `promotions.policy` discount limits).
+ */
+export const PROMO_SPECIFIC_REASON_CODES: ReadonlySet<string> = new Set([
+  "PROMO_MIN_SUBTOTAL",
+  "PROMO_NOT_ELIGIBLE_ITEMS",
+  "PROMO_LIMIT_MAX_PERCENT",
+  "PROMO_LIMIT_MAX_FIXED",
+  "PROMO_LIMIT_ZERO_TOTAL",
+  "PROMO_LIMIT_MIN_TOTAL",
+]);
 
 export interface CartPromotionsPort {
   preview(ctx: CartPromotionContext, opts?: { tx?: DbOrTx; recheck?: boolean }): Promise<CartPromotionOutcome>;
@@ -340,13 +403,28 @@ export function cartCompliancePort(services: Services): CartCompliancePort {
   };
 }
 
+export interface CartCheckoutAmountEvaluation {
+  onlineEnabled: boolean;
+  provider: "none" | "stripe" | "square";
+  minimumMinor: number;
+  belowMinimum: boolean;
+  smallTotalAction: "none" | "zero_total" | "waive" | "block";
+}
+
 export interface CartPaymentsPort {
+  /** True when the underlying payments module implements Increment 06 `evaluateCheckoutAmount` & settled receipts. */
+  readonly supportsSettledReceipts?: boolean;
   isOnlineCheckoutEnabled(tx?: DbOrTx): Promise<boolean>;
   getPublicCheckoutConfig(tx?: DbOrTx): Promise<{
     provider: "none" | "stripe" | "square";
     mode: "test" | "live";
     currency: string;
   }>;
+  evaluateCheckoutAmount?(
+    amountMinor: number,
+    currency: string,
+    tx?: DbOrTx,
+  ): Promise<CartCheckoutAmountEvaluation>;
   startCheckout(
     invoicePublicId: string,
     returnPaths?: { successPath?: string; cancelPath?: string },
@@ -357,6 +435,13 @@ export interface CartPaymentsPort {
     },
   ): Promise<
     | { mode: "invoice"; invoicePublicId: string }
+    | {
+        mode: "settled";
+        settlementKind: "zero_total" | "waived_small_total";
+        invoicePublicId: string;
+        waivedMinor?: number;
+        receiptPublicId?: string | null;
+      }
     | {
         mode: "redirect";
         attemptPublicId: string;
@@ -376,6 +461,8 @@ export interface CartPaymentsPort {
     invoiceStatus: "draft" | "issued" | "paid" | "void";
     amountMinor: number;
     balanceDueMinor: number;
+    waivedMinor?: number;
+    receiptPublicId?: string | null;
     currency: string;
     providerConfigured: "none" | "stripe" | "square";
     environment: "test" | "live";
@@ -405,15 +492,19 @@ export interface CartPaymentsPort {
   }>;
 }
 
-export function cartPaymentsPort(services: Services): CartPaymentsPort {
+export function cartPaymentsPort(services: Services): CartPaymentsPort & {
+  evaluateCheckoutAmount(amountMinor: number, currency: string, tx?: DbOrTx): Promise<CartCheckoutAmountEvaluation>;
+} {
   const paymentsMod = (services as unknown as Record<string, unknown>).payments as Record<string, unknown> | undefined;
   const isOnlineCheckoutEnabled = method<CartPaymentsPort["isOnlineCheckoutEnabled"]>(paymentsMod, "isOnlineCheckoutEnabled");
   const getPublicCheckoutConfig = method<CartPaymentsPort["getPublicCheckoutConfig"]>(paymentsMod, "getPublicCheckoutConfig");
+  const evaluateCheckoutAmount = method<CartPaymentsPort["evaluateCheckoutAmount"]>(paymentsMod, "evaluateCheckoutAmount");
   const startCheckout = method<CartPaymentsPort["startCheckout"]>(paymentsMod, "startCheckout");
   const getCheckoutStatus = method<CartPaymentsPort["getCheckoutStatus"]>(paymentsMod, "getCheckoutStatus");
   const cancelAttemptIfUnpaid = method<CartPaymentsPort["cancelAttemptIfUnpaid"]>(paymentsMod, "cancelAttemptIfUnpaid");
 
   return {
+    supportsSettledReceipts: Boolean(evaluateCheckoutAmount),
     async isOnlineCheckoutEnabled(tx) {
       if (!isOnlineCheckoutEnabled) return false;
       return isOnlineCheckoutEnabled(tx);
@@ -421,6 +512,22 @@ export function cartPaymentsPort(services: Services): CartPaymentsPort {
     async getPublicCheckoutConfig(tx) {
       if (!getPublicCheckoutConfig) return { provider: "none", mode: "test", currency: "USD" };
       return getPublicCheckoutConfig(tx);
+    },
+    async evaluateCheckoutAmount(amountMinor, currency, tx) {
+      if (evaluateCheckoutAmount) {
+        return evaluateCheckoutAmount(amountMinor, currency, tx);
+      }
+      const [onlineEnabled, cfg] = await Promise.all([
+        isOnlineCheckoutEnabled ? isOnlineCheckoutEnabled(tx) : Promise.resolve(false),
+        getPublicCheckoutConfig ? getPublicCheckoutConfig(tx) : Promise.resolve({ provider: "none" as const, mode: "test" as const, currency }),
+      ]);
+      return {
+        onlineEnabled,
+        provider: cfg.provider,
+        minimumMinor: 0,
+        belowMinimum: false,
+        smallTotalAction: amountMinor === 0 ? "zero_total" : "none",
+      };
     },
     async startCheckout(invoicePublicId, returnPaths, options) {
       if (!startCheckout) {

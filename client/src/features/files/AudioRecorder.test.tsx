@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { pageA11y } from "@/test/a11y";
 import { renderUi } from "@/ui/testing";
 import { AudioRecorder } from "./AudioRecorder";
+import { extensionForRecording, pickRecorderFormat } from "./recordingDevice";
 
 class Recorder extends EventTarget {
   static isTypeSupported = (type: string) => type === "audio/webm;codecs=opus";
@@ -50,6 +51,16 @@ it("explains the fallback when MediaRecorder is unavailable", () => {
   renderRecorder();
   expect(screen.getByText(/not supported in this browser/iu)).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Start recording" })).not.toBeInTheDocument();
+});
+
+it("prefers WebM/Opus, then the supported MP4 variation, then falls back to the browser default", () => {
+  const isTypeSupported = vi.fn((type: string) => type === "audio/mp4;codecs=mp4a.40.2" || type === "audio/ogg;codecs=opus");
+  vi.stubGlobal("MediaRecorder", { isTypeSupported });
+  expect(pickRecorderFormat(["webm", "mp4", "ogg"])).toBe("audio/mp4;codecs=mp4a.40.2");
+  expect(isTypeSupported.mock.calls.map(([mime]) => mime)).toEqual(["audio/webm;codecs=opus", "audio/webm", "audio/mp4;codecs=mp4a.40.2"]);
+  expect(pickRecorderFormat(["wav"])).toBe("");
+  expect(pickRecorderFormat(["pdf"])).toBeNull();
+  expect(extensionForRecording("audio/mp4;codecs=mp4a.40.2", ["mp4"])).toBe("mp4");
 });
 
 it("requires a user gesture, allows keyboard pause and review, and releases the local recording", async () => {

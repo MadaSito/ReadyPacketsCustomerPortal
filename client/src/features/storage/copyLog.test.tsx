@@ -68,7 +68,7 @@ it("applies the order deep-link scope and exposes the logged target path in the 
   const table = await screen.findByRole("table", { name: "Storage copy attempts" });
   expect(within(table).getByText(row.targetPath)).toBeInTheDocument();
   expect(requests).toContainEqual({ route: "storage.copies.list", input: { direction: "forward", orderPublicId } });
-  await user.click(within(table).getByRole("button", { name: /View Order file copy attempt/ }));
+  await user.click(within(table).getByRole("button", { name: /Details for Order file copy attempt/ }));
   const drawer = await screen.findByRole("dialog", { name: "Copy attempt details" });
   expect(await within(drawer).findByText(row.targetPath)).toBeVisible();
 });
@@ -85,7 +85,7 @@ it("applies named filters and opens unverified write details by keyboard", async
     route: "storage.copies.list", input: { connectionPublicId, direction: "forward", state: "written", text: "copy-test" },
   }));
   const details = await within(screen.getByRole("table", { name: "Storage copy attempts" }))
-    .findByRole("button", { name: /View Order file copy attempt/ });
+    .findByRole("button", { name: /Details for Order file copy attempt/ });
   details.focus();
   await user.keyboard("{Enter}");
   const drawer = await screen.findByRole("dialog", { name: "Copy attempt details" });

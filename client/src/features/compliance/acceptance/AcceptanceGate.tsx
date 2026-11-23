@@ -10,7 +10,8 @@ import { CheckCircle2, FileSignature, ShieldCheck } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { Link } from "wouter";
 import type { AppRouter } from "@server/trpc/root";
-import { errorMessage, useTRPC } from "@/lib/trpc";
+import { ME_QUERY_KEY, type MeResult } from "@/lib/authApi";
+import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, Checkbox, DateTime, Field, Input, useToast } from "@/ui";
 import { SafePolicyText } from "../shared";
 
@@ -47,6 +48,7 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
   const [agreed, setAgreed] = useState(false);
   const [typedName, setTypedName] = useState("");
   const [error, setError] = useState<string | null>(carried);
+  const [mismatchExpectedName, setMismatchExpectedName] = useState<string | null>(null);
   const textId = useId();
   const textRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -54,6 +56,8 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
   }, [focusText]);
   const typed = gate.signatureMode === "typed_name";
   const policy = gate.policy!;
+  const sessionAccountName = queryClient.getQueryData<MeResult>(ME_QUERY_KEY)?.user.name ?? null;
+  const displayedExpectedName = mismatchExpectedName ?? sessionAccountName;
 
   const accept = useMutation(
     trpc.compliance.acceptance.accept.mutationOptions({
@@ -63,6 +67,16 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
         await queryClient.invalidateQueries({ queryKey: trpc.compliance.acceptance.forOrder.queryKey({ orderId }) });
       },
       onError: async (e) => {
+        const safe = safeError(e);
+        const serverExpected =
+          safe?.reasonCode === "SIGNER_NAME_MISMATCH" &&
+          safe.details &&
+          typeof (safe.details as { expectedName?: unknown }).expectedName === "string"
+            ? (safe.details as { expectedName: string }).expectedName
+            : null;
+        if (serverExpected) {
+          setMismatchExpectedName(serverExpected);
+        }
         const message = errorMessage(e);
         setError(message);
         onOutcome({ kind: "error", gateKey: gate.key, message });
@@ -80,6 +94,7 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
       onSubmit={(event) => {
         event.preventDefault();
         setError(null);
+        setMismatchExpectedName(null);
         if (!canSubmit) return;
         accept.mutate({
           orderId,
@@ -106,7 +121,15 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
         <SafePolicyText bodyText={policy.text} format={policy.contentFormat} />
       </div>
       {typed ? (
-        <Field label="Type your full name to sign" hint="Your typed name is your signature on this order." required>
+        <Field
+          label="Type your full name to sign"
+          hint={
+            displayedExpectedName
+              ? `Expected account name: ${displayedExpectedName}. Your typed name is your signature on this order.`
+              : "Your typed name is your signature on this order."
+          }
+          required
+        >
           <Input value={typedName} onChange={(e) => setTypedName(e.target.value)} autoComplete="name" maxLength={120} />
         </Field>
       ) : null}
@@ -116,11 +139,35 @@ function GateForm({ orderId, gate, carried, focusText, onOutcome }: {
         onCheckedChange={setAgreed}
         required
       />
-      {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
-      <div>
+      {error ? (
+        <Callout tone="danger" live="assertive">
+          <div className="space-y-1">
+            <p>{error}</p>
+            {mismatchExpectedName ? (
+              <p className="text-sm">
+                Expected account name: <strong>{mismatchExpectedName}</strong>.{" "}
+                <Link href="/account" className="font-medium underline underline-offset-2">
+                  Update your profile name
+                </Link>{" "}
+                if your legal name has changed.
+              </p>
+            ) : null}
+          </div>
+        </Callout>
+      ) : null}
+      <div className="space-y-2">
         <Button type="submit" disabled={!canSubmit} loading={accept.isPending} leadingIcon={<FileSignature className="h-4 w-4" aria-hidden />}>
           {typed ? "Sign and accept" : "Accept"}
         </Button>
+        {typed ? (
+          <p className="text-xs text-muted">
+            Need to update your account name?{" "}
+            <Link href="/account" className="font-medium text-action underline underline-offset-2">
+              Edit your profile name
+            </Link>
+            .
+          </p>
+        ) : null}
       </div>
     </form>
   );

@@ -187,6 +187,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     const method = METHOD_LABELS.has(req.method) ? req.method : "OTHER";
     res.setHeader("X-Request-Id", context.requestId);
     runWithRequestContext(context, () => {
+      services.protection?.captureClientAddress?.(req);
       res.once("close", () => runWithRequestContext(context, () => {
         const status = res.writableFinished ? res.statusCode : 499;
         const rateLimitBucket = limitedRequests.get(req) ?? (status === 429 ? "unclassified" : undefined);
@@ -250,6 +251,11 @@ export function createApp(services: Services, options: AppOptions = {}): Express
 
   app.use(async (req, _res, next) => {
     const { protection } = services;
+    const retryAfter = await protection?.credentialRetryAfter?.(req);
+    if (retryAfter && retryAfter > 0) {
+      limitedRequests.set(req, "signin_ban");
+      throw rateLimited(retryAfter);
+    }
     if (protection && (await protection.inspect(req)).action === "block") {
       throw new DomainError("FORBIDDEN", "PROTECTION_BLOCKED", "This request was refused by the portal's protection policy.");
     }

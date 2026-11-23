@@ -1,7 +1,31 @@
 /** Compliance mail templates (plain text; mail subsystem derives escaped HTML). */
-import type { Mailer } from "../../core/types.js";
+import type { Mailer, MailTemplate } from "../../core/types.js";
+import { PAYMENT_RECEIPT_TEMPLATE } from "../jobs/receiptMail.js";
+
+function registerTemplateIfMissing(mailer: Mailer, template: MailTemplate): void {
+  const existingMap = (mailer as { templates?: unknown }).templates;
+  if (existingMap instanceof Map && existingMap.has(template.key)) {
+    return;
+  }
+  try {
+    mailer.registerTemplate(template);
+  } catch (err) {
+    if (err instanceof Error && /DUPLICATE_MAIL_TEMPLATE|duplicate mail template/iu.test(err.message)) {
+      return;
+    }
+    throw err;
+  }
+}
 
 export function registerComplianceMailTemplates(mailer: Mailer): void {
+  registerTemplateIfMissing(mailer, {
+    key: PAYMENT_RECEIPT_TEMPLATE,
+    vars: ["receiptNumber"],
+    sensitiveVars: ["receiptNumber"],
+    subject: () => "Your ReadyPackets payment receipt",
+    text: ({ receiptNumber }) =>
+      `Thank you for your payment. Your ReadyPackets payment receipt number is ${String(receiptNumber)}.`,
+  });
   mailer.registerTemplate({
     key: "compliance.intake_returned",
     vars: ["orderReference", "questionnaireTitle", "portalPath"],

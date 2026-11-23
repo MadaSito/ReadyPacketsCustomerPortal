@@ -6,6 +6,7 @@ import type { ModuleDeps } from "../../container.js";
 import type { ModuleHealth, ModuleLifecycle, SessionPrincipal } from "../../core/types.js";
 import type { AuditCtx } from "./access.js";
 import * as cases from "./cases.js";
+import * as incidents from "./correlation/incidents.js";
 import { createChainService, HORIZON_MS, type ChainVerification } from "./chain.js";
 import { isDurableAuditEmitter } from "./emitter.js";
 import { projectForExternal, type AuditEnvelope, type ExternalAuditEvent } from "./envelope.js";
@@ -25,6 +26,10 @@ export type { TriggerCatalogueEntry, TriggerField, TriggerRecipient } from "./tr
 export { TRIGGER_CATALOGUE } from "./triggerCatalogue.js";
 export type { OrderActivityCategory, OrderActivityCustomerItem, OrderActivityPage, OrderActivityStaffItem, OrderStatusHistoryItem, OrderStatusHistoryPage } from "./orderActivity.js";
 export { ORDER_ACTIVITY_CATALOGUE, ORDER_ACTIVITY_CATEGORIES } from "./orderActivity.js";
+export type { CloseReason, IncidentDetail, IncidentEventItem, IncidentStatus, IncidentSummary, IncidentTimelineItem, RulesView } from "./correlation/incidents.js";
+export { BAN_DURATIONS, CLOSE_REASONS, CORRELATION_JOB, INCIDENT_STATUSES } from "./correlation/incidents.js";
+export type { CorrelationConfig, IncidentSeverity, RuleKey, RuleParams } from "./correlation/rules.js";
+export { BOUNDS as CORRELATION_BOUNDS, INCIDENT_SEVERITIES, RULE_INFO, RULE_KEYS } from "./correlation/rules.js";
 export type { AuditQuery, Group as AuditQueryGroup, Term as AuditQueryTerm, PivotKind, StatBucket, StatDimension } from "./query.js";
 
 export const SEAL_JOB = "audit.chain.seal";
@@ -85,6 +90,19 @@ export interface AuditModule extends ModuleLifecycle {
   createLegalHold: Tail<typeof retention.createLegalHold>;
   releaseLegalHold: Tail<typeof retention.releaseLegalHold>;
   runRetention: Tail<typeof retention.runRetentionAsAdmin>;
+
+  /* ---- increment 06, D7: security incidents (event correlation) ---- */
+  /** Runs one correlation pass now (the job does this every minute). Trusted server-side callers only. */
+  runCorrelation(): Promise<incidents.RunSummary>;
+  listIncidents: Tail<typeof incidents.listIncidents>;
+  getIncident: Tail<typeof incidents.getIncident>;
+  acknowledgeIncident: Tail<typeof incidents.acknowledgeIncident>;
+  closeIncident: Tail<typeof incidents.closeIncident>;
+  banIncidentAddress: Tail<typeof incidents.banIncidentAddress>;
+  endIncidentSessions: Tail<typeof incidents.endIncidentSessions>;
+  banEventAddress: Tail<typeof incidents.banEventAddress>;
+  getCorrelationRules: Tail<typeof incidents.getRules>;
+  updateCorrelationRules: Tail<typeof incidents.updateRules>;
 }
 
 const bind =
@@ -114,6 +132,11 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
     const run = await retention.runRetention(ctx, { dryRun: false, requestedBy: null });
     return run.status === "completed" ? { outcome: "completed", safeCounts: run.counts } : { outcome: "failed", reasonCode: "RETENTION_FAILED", retryable: true };
   });
+  deps.jobs.register(incidents.CORRELATION_JOB, async () => {
+    const run = await incidents.runCorrelation(ctx);
+    return { outcome: "completed", safeCounts: { events: run.events, findings: run.findings, opened: run.opened, updated: run.updated } };
+  });
+  deps.jobs.registerSchedule({ name: "security.correlation.minute", type: incidents.CORRELATION_JOB, everyMs: 60_000 });
   deps.jobs.registerSchedule({ name: "audit.chain.seal", type: SEAL_JOB, everyMs: 10_000 });
   deps.jobs.registerSchedule({ name: "audit.chain.sweep", type: SWEEP_JOB, everyMs: 24 * 3_600_000 });
   deps.jobs.registerSchedule({ name: "audit.checkpoint.hourly", type: CHECKPOINT_JOB, everyMs: 3_600_000 });
@@ -160,6 +183,16 @@ export function createAuditModule(deps: ModuleDeps): AuditModule {
     createLegalHold: bind(ctx, retention.createLegalHold),
     releaseLegalHold: bind(ctx, retention.releaseLegalHold),
     runRetention: bind(ctx, retention.runRetentionAsAdmin),
+    runCorrelation: () => incidents.runCorrelation(ctx),
+    listIncidents: bind(ctx, incidents.listIncidents),
+    getIncident: bind(ctx, incidents.getIncident),
+    acknowledgeIncident: bind(ctx, incidents.acknowledgeIncident),
+    closeIncident: bind(ctx, incidents.closeIncident),
+    banIncidentAddress: bind(ctx, incidents.banIncidentAddress),
+    endIncidentSessions: bind(ctx, incidents.endIncidentSessions),
+    banEventAddress: bind(ctx, incidents.banEventAddress),
+    getCorrelationRules: bind(ctx, incidents.getRules),
+    updateCorrelationRules: bind(ctx, incidents.updateRules),
 
     async health(): Promise<ModuleHealth[]> {
       const checkedAt = deps.clock.now();

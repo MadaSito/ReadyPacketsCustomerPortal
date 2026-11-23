@@ -145,6 +145,22 @@ describe("workflow transfer", () => {
     expect(downloadWorkflowFile).toHaveBeenCalledTimes(3);
   });
 
+  it("a single-row export keeps focus on its button while it runs; other export buttons wait", async () => {
+    let finish: (value: unknown) => void = () => {};
+    handlers.set(`${transfer}.export`, () => new Promise((resolve) => (finish = () => resolve({ fileName, packageText }))));
+    renderPage();
+    const standard = await screen.findByRole("button", { name: "Export Standard" });
+    await userEvent.click(standard);
+    await waitFor(() => expect(standard).toHaveAttribute("aria-busy", "true"));
+    expect(standard).not.toBeDisabled();
+    expect(standard).toHaveAttribute("aria-disabled", "true");
+    expect(document.activeElement).toBe(standard);
+    expect(screen.getByRole("button", { name: "Export all" })).toBeDisabled();
+    finish(undefined);
+    await waitFor(() => expect(downloadWorkflowFile).toHaveBeenCalledWith(fileName, packageText));
+    expect(document.activeElement).toBe(standard);
+  });
+
   it.each([{ enabled: false }, { canExport: false, canImport: false }])("hides transfer controls when status is %j", async (changes) => {
     handlers.set(`${transfer}.status`, () => ({ ...baseStatus, ...changes }));
     renderPage();
@@ -153,6 +169,43 @@ describe("workflow transfer", () => {
     expect(screen.queryByRole("button", { name: "Import workflows" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Export selected" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Export Standard" })).not.toBeInTheDocument();
+  });
+
+  it("D10: when off, an admin turns it on from the page with a labelled switch; turning off asks first", async () => {
+    let enabled = false;
+    handlers.set(`${transfer}.status`, () => ({ ...baseStatus, enabled, canToggle: true }));
+    handlers.set(`${transfer}.setEnabled`, (input) => {
+      enabled = (input as { enabled: boolean }).enabled;
+      return { enabled, changed: true };
+    });
+    renderPage();
+    const toggle = await screen.findByRole("switch", { name: "Workflow export and import" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle).toHaveAccessibleDescription(/Off\. Turn it on/);
+    expect(screen.queryByRole("button", { name: "Import workflows" })).not.toBeInTheDocument();
+    toggle.focus();
+    await userEvent.keyboard(" ");
+    await waitFor(() => expect(requestInputs("setEnabled")).toEqual([{ enabled: true }]));
+    await screen.findByRole("button", { name: "Export selected" });
+    expect(screen.getByRole("switch", { name: "Workflow export and import" })).toHaveAttribute("aria-checked", "true");
+    await userEvent.click(screen.getByRole("switch", { name: "Workflow export and import" }));
+    const dialog = await screen.findByRole("alertdialog", { name: /Turn off workflow export and import/ }).catch(() => screen.findByRole("dialog", { name: /Turn off workflow export and import/ }));
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(requestInputs("setEnabled")).toHaveLength(1);
+  });
+
+  it("D10: the switch is absent without canToggle and a refused save is announced", async () => {
+    handlers.set(`${transfer}.status`, () => ({ ...baseStatus, enabled: false, canToggle: false }));
+    const view = renderPage();
+    await screen.findByRole("button", { name: "New workflow" });
+    await waitFor(() => expect(requestInputs("status")).toHaveLength(1));
+    expect(screen.queryByRole("switch", { name: "Workflow export and import" })).not.toBeInTheDocument();
+    view.unmount();
+    handlers.set(`${transfer}.status`, () => ({ ...baseStatus, enabled: false, canToggle: true }));
+    handlers.set(`${transfer}.setEnabled`, () => { throw { data: { safe: { domainCode: "ACTOR_NOT_AUTHORIZED", safeMessage: "You do not have permission to perform this action." } } }; });
+    renderPage();
+    await userEvent.click(await screen.findByRole("switch", { name: "Workflow export and import" }));
+    expect(await screen.findByText("You do not have permission to perform this action.")).toBeInTheDocument();
   });
 
   it("rejects non-JSON and oversize files locally and stops on a rejected server digest", async () => {

@@ -352,6 +352,80 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
   });
 });
 
+describe("workflow designer — customer tasks and findings (increment 06, D8)", () => {
+  const toRules = async (user: ReturnType<typeof userEvent.setup>) => {
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    for (let i = 0; i < 4; i += 1) await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    await screen.findByRole("heading", { level: 2, name: "Phases and requirements" });
+  };
+
+  it("adds a recording and a document task with presets and response modes; the saved definition carries them", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
+    handlers.set("orders.admin.workflows.drafts.save", () => ({ rowVersion: 2, issues: [], publishable: true }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    const { container } = designer();
+    await toRules(user);
+
+    await user.click(screen.getAllByRole("button", { name: /^Add recording to / })[0]!);
+    expect(screen.getByLabelText(/How the customer adds audio/)).toHaveValue("either");
+    const minutes = screen.getByLabelText(/Longest recording \(minutes\)/);
+    await user.clear(minutes);
+    await user.type(minutes, "15");
+
+    await user.click(screen.getAllByRole("button", { name: /^Add document task to / })[0]!);
+    await user.type(screen.getByLabelText(/Document name/), "Contract to sign");
+    await user.click(screen.getByRole("checkbox", { name: "Edit in the portal" }));
+    const presets = screen.getAllByRole("group", { name: /^File type presets for / }).at(-1)!;
+    expect(within(presets).getByRole("checkbox", { name: /^Word/ })).toBeChecked();
+    await user.click(within(presets).getByRole("checkbox", { name: /^PDF/ }));
+    await user.click(within(presets).getByRole("checkbox", { name: /^Images/ }));
+    await expectNoAxeViolations(container);
+
+    await user.click(screen.getByRole("button", { name: "Save and continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review and publish" })).toBeInTheDocument();
+    const lastSave = calls.filter((c) => c.path === "orders.admin.workflows.drafts.save").at(-1)?.input as {
+      definition: { states: { requirements?: { uploads: { kind: string; capture?: string; maxMinutes?: number }[]; documents?: { label: string; responseModes: string[]; allowedTypes: string[] }[] } }[] };
+    };
+    const requirements = lastSave.definition.states[0]!.requirements!;
+    expect(requirements.uploads.at(-1)).toMatchObject({ kind: "audio", capture: "either", maxMinutes: 15 });
+    expect(requirements.documents?.[0]).toMatchObject({ label: "Contract to sign", responseModes: ["edit_in_portal", "upload_reply"] });
+    expect(requirements.documents?.[0]?.allowedTypes).toEqual(["docx", "png", "jpg"]);
+  });
+
+  it("the “to fix” badge opens a findings list and Show focuses the field with the problem", async () => {
+    const labelIssue = { severity: "error", code: "UPLOAD_LABEL_REQUIRED", path: "states.0.requirements.uploads.0.label", message: "Submitted: upload 1 needs a name." };
+    handlers.set("orders.admin.workflows.drafts.get", () => ({
+      ...draftView([transition], [labelIssue]),
+      definition: { states: [{ ...states[0], requirements: { uploads: [{ key: "contract", label: "", kind: "document", minCount: 1, maxCount: 1, allowedTypes: ["pdf"], uploadedBy: ["customer"] }], acknowledgements: [] } }, states[1]], transitions: [transition] },
+    }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    const toggle = screen.getByRole("button", { name: /1 to fix/ });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const findings = document.getElementById("wf-findings")!;
+    await user.click(within(findings).getByRole("button", { name: `Show: ${labelIssue.message}` }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement?.id).toBe("wf-field-states-0-requirements-uploads-0-label"));
+    expect(document.activeElement).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("a finding without a matching field falls back to the step's problem list", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([], [deadEnd]));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    const user = userEvent.setup();
+    designer();
+    await screen.findByRole("heading", { level: 2, name: "Statuses" });
+    await user.click(screen.getByRole("button", { name: /1 to fix/ }));
+    await user.click(within(document.getElementById("wf-findings")!).getByRole("button", { name: `Show: ${deadEnd.message}` }));
+    await waitFor(() => expect(["wf-step-problems", "wf-field-states-0"]).toContain(document.activeElement?.id));
+  });
+});
+
 describe("workflow designer — review summary", () => {
   it("Review and publish summarises phases, requirement counts, gates and the files folder", async () => {
     const reviewStates = [

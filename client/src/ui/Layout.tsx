@@ -50,8 +50,9 @@ export function PageHeader({ title, description, actions, breadcrumbs, meta, cla
   return (
     <header className={cn("mb-6 flex flex-col gap-3", className)}>
       {breadcrumbs}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
+      {/* The title keeps at least ~20rem beside the actions; a wide action group wraps below instead of squeezing it. */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
+        <div className="min-w-0 sm:flex-[1_1_20rem]">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <h1 className="text-2xl font-semibold tracking-tight text-ink break-words sm:text-[1.75rem]">{title}</h1>
             {meta}

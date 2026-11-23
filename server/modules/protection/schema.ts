@@ -44,3 +44,33 @@ export const protectionEvents = mysqlTable("protection_events", {
   index("protection_events_action_idx").on(t.action, t.id),
   index("protection_events_country_idx").on(t.country, t.id),
 ]);
+
+/** Fixed slots cap unauthenticated cardinality. A slot's address key must match before any state is used. */
+export const protectionSignInStrikes = mysqlTable("protection_signin_strikes", {
+  slot: int("slot", { unsigned: true }).primaryKey(),
+  addressKey: char("address_key", { length: 64 }).notNull(),
+  /** Only pseudonymous account references (or null), never raw identifiers. */
+  failures: json("failures").$type<{ atMs: number; accountRef: string | null }[]>().notNull(),
+  banCount: int("ban_count", { unsigned: true }).notNull().default(0),
+  lastBanAt: utcDateTime("last_ban_at"),
+  updatedAt: updatedAtColumn(),
+}, (t) => [
+  index("protection_signin_strikes_updated_idx").on(t.updatedAt),
+]);
+
+/** Durable independent sign-in bans; addresses encrypted and exact entries keyed for deduplication. */
+export const protectionSignInBans = mysqlTable("protection_signin_bans", {
+  id: idColumn(),
+  publicId: publicIdColumn(),
+  addressKey: char("address_key", { length: 64 }).notNull(),
+  addressEnc: text("address_enc").notNull(),
+  source: mysqlEnum("source", ["automatic", "manual"]).notNull(),
+  reason: varchar("reason", { length: 240 }).notNull(),
+  strikes: int("strikes", { unsigned: true }).notNull().default(0),
+  expiresAt: utcDateTime("expires_at"),
+  createdAt: createdAtColumn(),
+}, (t) => [
+  uniqueIndex("protection_signin_bans_public_uidx").on(t.publicId),
+  uniqueIndex("protection_signin_bans_address_uidx").on(t.addressKey),
+  index("protection_signin_bans_expiry_idx").on(t.expiresAt, t.id),
+]);

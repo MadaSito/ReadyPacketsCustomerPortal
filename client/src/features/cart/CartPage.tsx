@@ -534,6 +534,25 @@ function SummaryCard({
           <dd className="border-t border-line pt-2 text-right font-semibold text-ink">{money(totals.totalMinor, totals.currency)}</dd>
         </dl>
 
+        {cart.items.length > 0 && !cart.mixedCurrency && totals.currency && totals.totalMinor === 0 ? (
+          <Callout tone="success" className="mt-4">
+            Nothing to pay — your discount covers this order.
+          </Callout>
+        ) : null}
+
+        {cart.items.length > 0 && !cart.mixedCurrency && totals.currency && cart.smallTotalEvaluation?.smallTotalAction === "waive" ? (
+          <Callout tone="info" className="mt-4" title="Remaining balance will be waived">
+            Your remaining balance ({money(totals.totalMinor, totals.currency)}) is below the online payment minimum (
+            {money(cart.smallTotalEvaluation.minimumMinor, totals.currency)}) and will be waived automatically at checkout.
+          </Callout>
+        ) : null}
+
+        {cart.items.length > 0 && !cart.mixedCurrency && totals.currency && cart.smallTotalEvaluation?.smallTotalAction === "block" ? (
+          <Callout tone="warning" className="mt-4" title="Total below online payment minimum">
+            Online card payments require at least {money(cart.smallTotalEvaluation.minimumMinor, totals.currency)}. Add another item or remove the discount code before placing your order.
+          </Callout>
+        ) : null}
+
         {showPromoField ? (
           <div className="mt-4 border-t border-line pt-4">
             <PromoCodeField

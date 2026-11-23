@@ -494,7 +494,7 @@ describe("3-2-1 off-site backup strategy UI", () => {
     );
 
     // Trigger row-level manual Copy now on verified archive.
-    await userEvent.click(screen.getAllByRole("button", { name: `Copy verified backup ${ID} off-site now` })[0]!);
+    await userEvent.click(screen.getAllByRole("button", { name: `Copy now: verified backup ${ID} off-site` })[0]!);
     await waitFor(() => expect(copyNow).toHaveBeenCalledWith({ backupPublicId: ID }));
     await expectNoAxeViolations(container);
   });

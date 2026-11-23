@@ -43,7 +43,7 @@ export interface OrderServiceDeps {
   /** Increment 04: copies active customer-wide console grants onto a new order (inside the create tx). */
   access: { onOrderCreated(tx: Tx, input: { orderId: number; ownerUserId: number; now: Date }): Promise<number> };
   /** Part B (B6): acceptance gate, run inside the transition tx. */
-  gates: Pick<OrderGatesService, "assertCustomerMayWork" | "assertSystemMayWork">;
+  gates: Pick<OrderGatesService, "assertCustomerMayWork" | "assertSystemMayWork" | "assertCustomerMayPlaceOrder">;
   /** Part B (B1): console payment badge; registered by compliance at init. Null ⇒ badge hidden. */
   paymentSummary: () => OrderPaymentSummaryProvider | null;
 }
@@ -504,6 +504,9 @@ export function createOrderService(deps: OrderServiceDeps) {
             // No existing order row is locked here, so the actor check is the first statement.
             const actor = await assertActorCurrent(principal, tx, "orders.create");
             if (input.onBehalfOfCustomerPublicId && !roleHasCapability(actor.role, "orders.manage")) throw forbidden("ACTOR_NOT_AUTHORIZED");
+            // D14: a customer placing an order accepts the order agreement first (staff creating for a customer are
+            // not gated; that customer is checked when they work on the order).
+            await deps.gates.assertCustomerMayPlaceOrder({ tx, actor: principal });
             const result = await createInTx(tx, principal, input, ownerUserId, prefix);
             return { publicId: result.publicId, reference: result.reference, created: true as const };
           }),
@@ -535,6 +538,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       if (principal.role !== "customer" || !roleHasCapability(principal.role, "orders.create")) throw forbidden("CAPABILITY_NOT_GRANTED");
       await assertActorCurrent(principal, tx, "orders.create");
       await compliancePort(deps.services)?.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+      await deps.gates.assertCustomerMayPlaceOrder({ tx, actor: principal });
       const [existing] = await tx
         .select({ id: orders.id, publicId: orders.publicId, reference: orders.reference, currency: orders.currency, subtotalMinor: orders.subtotalMinor, discountMinor: orders.discountMinor, discountLabel: orders.discountLabel, promoDiscountMinor: orders.promoDiscountMinor, promoLabel: orders.promoLabel, totalMinor: orders.totalMinor })
         .from(orders)

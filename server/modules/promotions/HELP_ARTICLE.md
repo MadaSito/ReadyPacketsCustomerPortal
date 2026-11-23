@@ -21,6 +21,7 @@ If you received a ReadyPackets link such as `/promo#promo=...`:
 ## How discounts are calculated
 
 - **Bundle and promotional discounts**: unless a promotion is marked as combinable with bundle discounts, you automatically receive whichever single discount saves you more.
+- **Discount kinds and portal limits**: codes may take a percentage off (up to two decimal places), take a fixed currency amount off, or set the pre-tax order total to a specific amount (including zero-total orders when permitted by portal policy). If a code exceeds an active portal discount limit, the portal explains which limit prevented it from applying.
 - **Eligible items and minimum subtotal**: some codes apply only to specific packets, tiers, or products, or require a minimum pre-tax subtotal.
 - **Tax**: applicable tax is calculated on the discounted subtotal.
 - **Price changes before submission**: if a code expires or reaches its redemption limit before you submit your order, your order is not placed automatically — you will be asked to review and confirm the updated total first.

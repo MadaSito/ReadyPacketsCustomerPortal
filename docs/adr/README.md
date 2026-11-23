@@ -51,3 +51,11 @@ Records are immutable once accepted; a later decision supersedes an earlier one 
 | 0044 | Discount codes and links with atomic redemption, a global discount guard and uniform refusals | Accepted (owner confirmation requested) |
 | 0045 | Policy acceptance log centre: a read-only view over the existing append-only evidence | Accepted (owner confirmation requested) |
 | 0046 | Authenticator setup: a newer sign-in replaces an abandoned setup instead of being refused for ten minutes | Accepted |
+| 0047 | Recording on orders from any device: runtime format choice, preflight check, server conversion to WebM/Opus with the original kept | Accepted |
+| 0048 | Installable app (PWA): manifest, install entry for each platform, static-only service worker | Accepted |
+| 0049 | Reports: built-in reports and whitelisted, parameterised custom reports with no free-form SQL | Accepted |
+| 0050 | Sign-in bans with lock-out guards, progressive rate-limit back-off and security event correlation | Accepted |
+| 0051 | Phase tasks: upload, acknowledge, record and respond to a document, with type restrictions | Accepted |
+| 0052 | Editing Word documents in the browser; every save is a new version and the original is kept | Accepted |
+| 0053 | Policy import, update notices, enforcement with session end, the typed-name check and the order agreement (MNDA) | Accepted |
+| 0054 | Receipts for every confirmed payment, including waived amounts below the provider minimum | Accepted |

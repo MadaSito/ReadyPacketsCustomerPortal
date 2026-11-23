@@ -6,9 +6,12 @@ import { conflict, DomainError, notFound, validation } from "../../core/errors.j
 import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { AuditOutcome, ClaimedJob, JobQueue, JobResult, Mailer, MailTemplate, OutboundMail, SessionPrincipal, Tx } from "../../core/types.js";
 import { defineSetting, readSetting } from "../platform/settingsRegistry.js";
+import { decodeMailAttachments, encodeMailAttachments, storedAttachments } from "./mailAttachments.js";
 import type { MailSenderIdentity, MailTemplateStore, MailTransport, MailTransportKey, MailTransportResult, PublishedMailTemplate } from "./mailPorts.js";
 import { HEADER_CONTROL, MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER, mailAddress as address } from "./mailSettings.js";
 import { currentCorrelation, JOB_TYPE, keyHash, validKey, type QueueDeps } from "./queue.js";
+import { POLICY_UPDATE_TEMPLATE, POLICY_WARNING_TEMPLATE } from "./policyNoticeJobs.js";
+import { PAYMENT_RECEIPT_TEMPLATE } from "./receiptMail.js";
 import { mailAttempts, mailAuditVerification, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 
 const DELIVER = "jobs.mail.deliver";
@@ -25,6 +28,7 @@ const payloadSchema = z.strictObject({
   to: z.union([z.strictObject({ userId: z.number().int().positive() }), z.strictObject({ address })]),
   vars: varsSchema,
   sensitiveVars: z.array(z.string().regex(VAR_NAME)).max(40).optional(),
+  attachments: storedAttachments,
 });
 const jobPayload = z.strictObject({ mailId: z.string().regex(ULID_PATTERN), generation: z.number().int().min(1).max(20) });
 const captureSchema = z.strictObject({ to: address, subject: z.string().max(255), text: z.string().max(65_536) });
@@ -32,6 +36,7 @@ const contentSchema = captureSchema.extend({ html: z.string().max(512 * 1024) })
 type MailRow = typeof mailOutbox.$inferSelect;
 type RenderedMail = z.infer<typeof captureSchema>;
 type MessageContent = z.infer<typeof contentSchema>;
+type DeliverableContent = MessageContent & { attachments?: OutboundMail["attachments"] };
 type DeliveryJob = z.infer<typeof jobPayload>;
 type MailAttemptOutcome = "accepted" | "held" | "failed" | "unknown" | "captured";
 type AttemptPurpose = typeof mailTransportAttempts.$inferSelect.purpose;
@@ -39,7 +44,7 @@ type MailDeliveryResult = MailTransportResult | { outcome: "expired"; retryable?
 export type SmtpDeliveryResult = MailTransportResult;
 type MailDeps = QueueDeps & { jobs: JobQueue };
 type DeliveryDeps = {
-  findRecipient(userId: number): Promise<{ email: string; status: string } | null>;
+  findRecipient(userId: number): Promise<{ email: string; status: string; emailVerified: boolean } | null>;
   getLegacySender(): Promise<MailSenderIdentity | null>;
 };
 
@@ -79,9 +84,13 @@ export async function mailAudit(
   }, tx);
 }
 
-function htmlAlternative(text: string): string {
+function escapeHtml(text: string): string {
   const escapes: Readonly<Record<string, string>> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-  return `<!doctype html><html lang="en"><body><p>${text.replace(/[&<>"']/g, (character) => escapes[character]!).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
+  return text.replace(/[&<>"']/g, (character) => escapes[character]!);
+}
+
+function htmlAlternative(text: string): string {
+  return `<!doctype html><html lang="en"><body><p>${escapeHtml(text).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
 }
 
 export class MailEngine implements Mailer {
@@ -90,6 +99,25 @@ export class MailEngine implements Mailer {
   #templateStore: MailTemplateStore | undefined;
 
   constructor(readonly deps: MailDeps) {
+    this.registerTemplate({
+      key: PAYMENT_RECEIPT_TEMPLATE,
+      vars: ["receiptNumber"],
+      sensitiveVars: ["receiptNumber"],
+      subject: () => "Your ReadyPackets payment receipt",
+      text: ({ receiptNumber }) => `Thank you for your payment. Your ReadyPackets payment receipt number is ${receiptNumber}.`,
+    });
+    this.registerTemplate({
+      key: POLICY_UPDATE_TEMPLATE,
+      vars: ["policyTitle", "summary", "portalUrl"],
+      subject: () => "A ReadyPackets policy has been updated",
+      text: ({ policyTitle, summary, portalUrl }) => `Policy update: ${policyTitle}\n\n${summary}\n\nReview the updated policy in the ReadyPackets portal:\n${portalUrl}`,
+    });
+    this.registerTemplate({
+      key: POLICY_WARNING_TEMPLATE,
+      vars: ["policyTitle", "deadline", "warningText", "portalUrl"],
+      subject: () => "Action required: Review a ReadyPackets policy",
+      text: ({ policyTitle, deadline, warningText, portalUrl }) => `Policy: ${policyTitle}\nDeadline: ${deadline}\n\n${warningText}\n\nReview and accept the updated policy in the ReadyPackets portal:\n${portalUrl}`,
+    });
     this.registerTemplate({
       key: VERIFY_AUDIT,
       vars: ["code"],
@@ -196,14 +224,17 @@ export class MailEngine implements Mailer {
     // Validate output before accepting the message, then validate again on delivery.
     this.#content(template, parsed.data.vars);
     const now = deps.clock.now();
-    const ttl = template.sensitiveVars?.length ? 30 * 60_000 : ONE_DAY;
+    const ttl = template.key !== PAYMENT_RECEIPT_TEMPLATE && template.sensitiveVars?.length ? VERIFY_TTL : ONE_DAY;
     const requestedExpiry = mail.expiresAt?.getTime() ?? now.getTime() + ttl;
     if (!Number.isFinite(requestedExpiry) || requestedExpiry <= now.getTime()) {
       throw validation("INVALID_MAIL_EXPIRY", "The mail expiry is not valid.");
     }
     const expiresAt = new Date(Math.min(now.getTime() + MAX_TTL, requestedExpiry));
-    const serialized = JSON.stringify({ ...parsed.data, sensitiveVars: template.sensitiveVars });
-    if (Buffer.byteLength(serialized) > 96 * 1024) throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
+    const body = { ...parsed.data, sensitiveVars: template.sensitiveVars };
+    const serializedBody = JSON.stringify(body);
+    if (Buffer.byteLength(serializedBody) > 96 * 1024) throw validation("INVALID_MAIL_INPUT", "The mail input is not valid.");
+    const attachments = encodeMailAttachments(mail);
+    const serialized = attachments ? JSON.stringify({ ...body, attachments }) : serializedBody;
     const run = async (inner: Tx) => {
       const publicId = ulid(now.getTime());
       const correlationId = currentCorrelation(publicId);
@@ -360,6 +391,20 @@ export class MailEngine implements Mailer {
     throw validation("INVALID_MAIL_RENDER", "The message template could not be rendered safely.");
   }
 
+  #customerReceiptLink(data: MessageContent, attached: boolean): MessageContent {
+    const url = new URL("/invoices?tab=receipts", this.deps.config.canonicalOrigin).href;
+    const detail = attached ? "The PDF is attached. You can also download it in the portal."
+      : "The PDF is not attached. Download it securely in the portal.";
+    const htmlFooter = `<p>${detail} <a href="${escapeHtml(url)}">Open Receipts in ReadyPackets</a>.</p>`;
+    return {
+      ...data,
+      text: `${data.text}\n\n${detail}\nOpen Receipts in ReadyPackets: ${url}`,
+      html: /<\/body>\s*<\/html>\s*$/i.test(data.html)
+        ? data.html.replace(/(<\/body>\s*<\/html>\s*)$/i, (_match, closing: string) => `${htmlFooter}${closing}`)
+        : `${data.html}${htmlFooter}`,
+    };
+  }
+
   async #deliver(job: ClaimedJob, delivery: DeliveryDeps): Promise<JobResult> {
     const identifier = jobPayload.safeParse(job.payload);
     if (!identifier.success) return { outcome: "failed", reasonCode: "INVALID_MAIL_JOB", retryable: false };
@@ -372,7 +417,7 @@ export class MailEngine implements Mailer {
     if (!row) return { outcome: "completed" };
 
     let mode: boolean;
-    let data: MessageContent;
+    let data: DeliverableContent;
     let redacted: MessageContent | undefined;
     let retainDays = 0;
     let redactionFailed = false;
@@ -385,11 +430,19 @@ export class MailEngine implements Mailer {
       if (!row.payloadEnc || !template) throw new Error("MAIL_PAYLOAD_UNAVAILABLE");
       const payload = payloadSchema.parse(JSON.parse(deps.crypto.decrypt(row.payloadEnc, `mail_outbox.payload_enc:${row.publicId}`)));
       if (Object.keys(payload.vars).some((name) => !template.vars.includes(name))) throw new Error("MAIL_TEMPLATE_VARS_CHANGED");
-      const recipient = "userId" in payload.to ? await delivery.findRecipient(payload.to.userId) : { email: payload.to.address, status: "active" };
-      if (!recipient || !["active", "pending_activation"].includes(recipient.status)) {
+      const recipient = "userId" in payload.to
+        ? await delivery.findRecipient(payload.to.userId)
+        : { email: payload.to.address, status: "active", emailVerified: false };
+      const isReceipt = row.template === PAYMENT_RECEIPT_TEMPLATE;
+      if (!recipient || (isReceipt
+        ? recipient.status !== "active" || recipient.emailVerified !== true
+        : !["active", "pending_activation"].includes(recipient.status))) {
         return this.#preSendFailure(job, ids, "MAIL_RECIPIENT_UNAVAILABLE", true);
       }
       data = { ...this.#content(template, payload.vars), to: address.parse(recipient.email) };
+      const attachments = decodeMailAttachments(row.template, payload.vars, payload.to, payload.attachments);
+      if (!mode && isReceipt) data = this.#customerReceiptLink(data, Boolean(attachments));
+      if (!mode && attachments) data.attachments = attachments;
       if (!mode) {
         [sender, routing, retainDays] = await Promise.all([
           this.getMailSenderIdentity(), readSetting(deps.settings, MAIL_ROUTING), this.retentionDays(),
@@ -420,7 +473,9 @@ export class MailEngine implements Mailer {
         return false;
       }
       if (mode) {
-        const { to, subject, text } = data;
+        const { to, subject, text } = row.template === PAYMENT_RECEIPT_TEMPLATE
+          ? { to: data.to, subject: "Your ReadyPackets payment receipt", text: "Receipt attachment omitted from development capture." }
+          : data;
         await tx.insert(mailAttempts).values({
           mailId: current.id, generation: current.generation, state: "captured", startedAt: now, finishedAt: now,
         });
@@ -490,7 +545,7 @@ export class MailEngine implements Mailer {
     return { outcome: "completed" };
   }
 
-  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: MessageContent, expiresAt?: Date): Promise<MailDeliveryResult> {
+  async #send(job: ClaimedJob, key: MailTransportKey, sender: MailSenderIdentity | null, data: DeliverableContent, expiresAt?: Date): Promise<MailDeliveryResult> {
     const adapter = this.#transports.get(key);
     if (!adapter || !sender) return { outcome: "not_configured" };
     try {

@@ -33,22 +33,11 @@ export default defineConfig(({ mode }) => {
               injectRegister: false,
               registerType: "prompt",
               manifest: false,
-              filename: "sw.js",
-              strategies: "generateSW",
-              workbox: {
+              srcDir: "src/pwa",
+              filename: "sw.ts",
+              strategies: "injectManifest",
+              injectManifest: {
                 globPatterns: ["offline.html", "offline.css", "assets/**/*.{js,css}", "fonts/*.woff2", "brand/*.png", "favicon.ico", "manifest.webmanifest"],
-                navigateFallback: null,
-                cleanupOutdatedCaches: true,
-                clientsClaim: false,
-                skipWaiting: false,
-                runtimeCaching: [
-                  { urlPattern: ({ url }) => url.pathname.startsWith("/api/"), handler: "NetworkOnly" },
-                  {
-                    urlPattern: ({ request }) => request.mode === "navigate",
-                    handler: "NetworkOnly",
-                    options: { precacheFallback: { fallbackURL: "offline.html" } },
-                  },
-                ],
               },
             }),
           ]),

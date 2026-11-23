@@ -65,3 +65,19 @@ f8629acadb0c6c376b3b4e43e4f68162be4c7f9b:server/modules/integrations/production/
 7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:753
 7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:757
 7ffc405005956304542e0ae54e171a2d8651d6fa:server/modules/cart/cartUpsellPromo.test.ts:generic-api-key:770
+# Increment 06, reviewed 2026-11-23: test idempotency keys and made-up Stripe test-style strings
+# ("sk_test_ReadyPackets…", "sk_test_inc06_receipt…") in cart and receipt regression tests. None is a credential.
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1067
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1078
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1165
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1175
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1228
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1279
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1289
+bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:stripe-access-token:1009
+f17c9c41b15deb040cb73926cd239982b6bf2158:server/modules/compliance/receiptsAndSmallTotals.test.ts:generic-api-key:702
+# 8243000: synthetic idempotency keys in cart tests (reviewed by lead, increment 06 QA fixes)
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:974
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1013
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1064
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1152

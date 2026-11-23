@@ -33,13 +33,16 @@ import { createAccessService, type AccessService } from "./access.js";
 import { createRequirementsService, type FileUploadSlot, type FileUploadSlots, type RequirementsService } from "./requirements.js";
 export type { FileUploadSlot, FileUploadSlots, RequirementsView } from "./requirements.js";
 import { createGatesService, type OrderGatesService } from "./gates.js";
+import { createAgreementGateService, type AgreementGateService } from "./agreementGate.js";
+export type { AgreementRequirement } from "./gates.js";
+export { AGREEMENT_GATE_KEY } from "./gates.js";
 export type { AcceptanceGate, OrderGateAction, OrderGateContext, OrderGatePoint, OrderGateProvider, OrderGatesService } from "./gates.js";
 import { createFolderRouting, type OrderFileFolderRouting } from "./folders.js";
 export type { OrderFileFolderRouting } from "./folders.js";
 import type { OrderPaymentSummaryProvider } from "./orderService.js";
 export type { OrderPaymentState, OrderPaymentSummaryProvider } from "./orderService.js";
-import { readSetting } from "../platform/index.js";
-import { ORDER_WORKFLOW_RULES_ENABLED, ORDER_WORKFLOW_TRANSFER_ENABLED } from "./settings.js";
+import { readSetting, writeSetting } from "../platform/index.js";
+import { ORDER_AGREEMENT_GATE, ORDER_WORKFLOW_RULES_ENABLED, ORDER_WORKFLOW_TRANSFER_ENABLED, parseAgreementGate } from "./settings.js";
 import { createWorkflowTransferService, type WorkflowTransferService } from "./workflowTransferService.js";
 export type { TransferApplyInput, TransferApplyResult, TransferPreview, TransferSelection, TransferStatus } from "./workflowTransferService.js";
 
@@ -109,6 +112,8 @@ export interface OrdersModule extends ModuleLifecycle {
   workflows: WorkflowService;
   /** Increment 05 (A1): workflow export / import (`orders.admin.workflows.transfer.*`). */
   workflowTransfer: WorkflowTransferService;
+  /** Increment 06 (D14): order agreement (MNDA) setting administration and customer status. */
+  agreementGate: AgreementGateService;
   orders: OrderService;
   sharing: SharingService;
 }
@@ -125,7 +130,12 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     actorCheck,
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
   });
-  const gates = createGatesService({ db: deps.db, policy, workflows });
+  const gates = createGatesService({
+    db: deps.db,
+    policy,
+    workflows,
+    agreementGate: (tx) => deps.settings.get(ORDER_AGREEMENT_GATE.key, parseAgreementGate, parseAgreementGate(undefined), tx as Tx | undefined),
+  });
   const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck, gates });
   const access = createAccessService({ ...deps, policy, actorCheck });
   let paymentProvider: OrderPaymentSummaryProvider | null = null;
@@ -141,10 +151,13 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     services: deps.services,
     actorCheck,
     enabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_TRANSFER_ENABLED, tx),
+    writeEnabled: (value, tx) => writeSetting(deps.settings, ORDER_WORKFLOW_TRANSFER_ENABLED, value, tx),
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
     release: deps.config.releaseRef,
     installationLabel: deps.config.installationId,
   });
+
+  const agreementGate = createAgreementGateService({ db: deps.db, audit: deps.audit, settings: deps.settings, services: deps.services, actorCheck, gates });
 
   const apiProvider = createOrdersApiProvider({ db: deps.db, services: deps.services, workflows, catalog, orders });
 
@@ -191,6 +204,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     catalog,
     workflows,
     workflowTransfer,
+    agreementGate,
     orders,
     sharing,
     async health(): Promise<ModuleHealth[]> {

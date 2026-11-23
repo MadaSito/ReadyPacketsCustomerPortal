@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { acceptsDeclaredType, classifyFile, sanitizeDisplayName } from "./classification.js";
-import { exampleMp4, exampleOgg, examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
+import { acceptsDeclaredType, classifyFile, docxMime, sanitizeDisplayName } from "./classification.js";
+import { exampleDocx, exampleMp4, exampleOgg, examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
+import { audioRulesSchema, audioRulesSetting } from "./settings.js";
 
 const classify = (value: Buffer) => classifyFile(async (offset, length) => value.subarray(offset, offset + length), value.length);
 
 describe("canonical file admission", () => {
   it.each([
     [exampleWebm("audio", true), "webm", "audio/webm"],
+    [exampleWebm("audio", "unknown_clusters"), "webm", "audio/webm"],
     [exampleWebm("video"), "webm", "video/webm"],
     [exampleMp4("audio"), "m4a", "audio/mp4"],
     [exampleMp4("audio", "isom"), "m4a", "audio/mp4"],
@@ -16,6 +18,7 @@ describe("canonical file admission", () => {
     [exampleOgg("video"), "ogg", "video/ogg"],
     [exampleWav(), "wav", "audio/wav"],
     [examplePdf(), "pdf", "application/pdf"],
+    [exampleDocx(), "docx", docxMime],
   ])("selects the canonical extension and MIME from synthesized track signatures", async (bytes, extension, mime) => {
     await expect(classify(bytes)).resolves.toEqual({ extension, mime });
   });
@@ -35,6 +38,9 @@ describe("canonical file admission", () => {
     Buffer.concat([exampleWebm("audio", true), Buffer.from("unframed additional bytes")]),
     Buffer.concat([exampleMp4("video"), Buffer.from("unframed additional bytes")]),
     Buffer.concat([exampleOgg("video"), Buffer.from("unframed additional bytes")]),
+    exampleDocx("Synthetic Word document", "word/vbaProject.bin"),
+    exampleDocx("Synthetic Word document", "../document.xml"),
+    Buffer.concat([exampleDocx(), Buffer.from("unframed additional bytes")]),
   ])("refuses unsafe formats, inconsistent structure and trailing unframed content", async (bytes) => {
     await expect(classify(bytes)).resolves.toBeNull();
   });
@@ -49,5 +55,15 @@ describe("canonical file admission", () => {
   it("normalizes display filenames and strips delimiter and control characters", () => {
     expect(sanitizeDisplayName(" ..Résumé\r\n//\\\"\u202e.pdf.. ")).toBe("Résumé_______.pdf");
     expect(() => sanitizeDisplayName("name with no extension")).toThrow();
+  });
+
+  it("preserves explicitly stored old audio rules and applies the bounded defaults to unset fields", () => {
+    const prior = { enabled: false, keepOriginal: true, bitrateKbps: 48, maxMinutes: 5 };
+    expect(audioRulesSchema.parse(prior)).toEqual(prior);
+    expect(audioRulesSchema.parse({})).toEqual({ enabled: true, keepOriginal: true, bitrateKbps: 128, maxMinutes: 30 });
+    expect(audioRulesSchema.parse(audioRulesSetting.default)).toEqual(audioRulesSchema.parse({}));
+    expect(audioRulesSchema.safeParse({ maxMinutes: 120, bitrateKbps: 256 }).success).toBe(true);
+    expect(audioRulesSchema.safeParse({ maxMinutes: 121 }).success).toBe(false);
+    expect(audioRulesSchema.safeParse({ bitrateKbps: 257 }).success).toBe(false);
   });
 });

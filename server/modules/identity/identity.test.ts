@@ -783,6 +783,166 @@ describe("identity module (MySQL)", () => {
     });
   });
 
+  /* ------------------------------------------------------------------ increment 06 (D7, D13) */
+
+  describe("sign-in signals (D7)", () => {
+    type Signal = { ip: unknown; accountRef?: string; kind: string; outcome: string; correlationId: string; at: Date };
+    let signals: Signal[];
+    let failPort = false;
+    beforeEach(() => {
+      signals = [];
+      failPort = false;
+      (h.services as unknown as { protection: unknown }).protection = {
+        recordSignInSignal: async (s: Signal) => {
+          if (failPort) throw new Error("protection down");
+          signals.push(s);
+        },
+      };
+    });
+
+    it("publishes password failure/success with a blind account ref and never the e-mail", async () => {
+      const user = await makeUser();
+      await rejects(identity.auth.signIn({ email: user.email, password: PW2 }, {}), "BAD_CREDENTIALS");
+      await rejects(identity.auth.signIn({ email: `ghost${seq}@example.test`, password: PW }, {}), "BAD_CREDENTIALS");
+      await identity.auth.signIn({ email: user.email, password: PW }, {});
+      expect(signals.map((x) => `${x.kind}:${x.outcome}`)).toEqual(["password:failure", "password:failure", "password:success"]);
+      const ref = identity.signInSignals.accountRefForEmail(user.email);
+      expect(ref).toBeTruthy();
+      expect(signals[0]!.accountRef).toBe(ref);
+      expect(signals[2]!.accountRef).toBe(ref);
+      expect(signals[1]!.accountRef).toBeTruthy(); // unknown accounts are counted too
+      expect(signals[1]!.accountRef).not.toBe(ref);
+      expect(JSON.stringify(signals)).not.toContain("@example.test");
+      expect(await identity.signInSignals.accountRefForUser(user.id)).toBe(ref);
+      // Audit correlation attributes.
+      const failed = h.audit.named("auth.login.failed");
+      expect(failed.length).toBeGreaterThan(0);
+      for (const e of failed) {
+        expect(e.attributes?.step).toBe("password");
+        expect(e.attributes?.account_ref).toBeTruthy();
+      }
+      expect(h.audit.named("auth.login.succeeded")[0]!.attributes?.account_ref).toBe(ref);
+    });
+
+    it("a failing protection port never changes the sign-in result", async () => {
+      const user = await makeUser();
+      failPort = true;
+      await rejects(identity.auth.signIn({ email: user.email, password: PW2 }, {}), "BAD_CREDENTIALS");
+      const ok = await identity.auth.signIn({ email: user.email, password: PW }, {});
+      expect(ok.sessionId).toBeTruthy();
+    });
+
+    it("publishes password_reset failure on a bad link and success on redemption; change-password failure", async () => {
+      const user = await makeUser();
+      await rejects(identity.auth.resetPassword({ token: "x".repeat(43), password: PW2 }), "LINK_INVALID");
+      await identity.auth.requestPasswordReset({ email: user.email });
+      await h.jobs.runAll(PASSWORD_RESET_JOB);
+      const link = tokenFromMail(h.mailer.last("auth.password_reset")!.vars.link);
+      await identity.auth.resetPassword({ token: link, password: PW2 });
+      const ref = identity.signInSignals.accountRefForEmail(user.email);
+      const resets = signals.filter((x) => x.kind === "password_reset");
+      expect(resets.map((x) => x.outcome)).toEqual(["failure", "success"]);
+      expect(resets[1]!.accountRef).toBe(ref);
+      expect(h.audit.named("auth.password.reset_completed")[0]!.attributes?.step).toBe("password_reset");
+
+      const other = await makeUser();
+      const { principal } = await session(other.email);
+      signals = [];
+      await rejects(identity.auth.changePassword(principal, { currentPassword: PW2, newPassword: PW2 }), "CURRENT_PASSWORD_INCORRECT");
+      expect(signals.map((x) => `${x.kind}:${x.outcome}`)).toEqual(["password:failure"]);
+    });
+
+    it("publish() by user id never throws, even for unknown users or a failing port", async () => {
+      failPort = true;
+      await expect(identity.signInSignals.publish({ kind: "mfa", outcome: "failure", userId: 999_999_999 })).resolves.toBeUndefined();
+      failPort = false;
+      await identity.signInSignals.publish({ kind: "passkey", outcome: "success", userId: 999_999_999 });
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.accountRef).toBeUndefined();
+    });
+  });
+
+  describe("profile name change (D11)", () => {
+    it("is audited in the transaction with a flag only, never the name", async () => {
+      const user = await makeUser();
+      const { principal } = await session(user.email);
+      h.audit.clear();
+      await identity.admin.updateOwnProfile(principal, { name: "Renamed Synthetic Person" });
+      const [event] = h.audit.named("identity.profile.updated");
+      expect(event?.attributes).toEqual({ name_changed: true });
+      expect(JSON.stringify(event)).not.toContain("Renamed");
+      expect((await identity.getUser(user.id))?.name).toBe("Renamed Synthetic Person");
+    });
+  });
+
+  describe("endSessionsForUser (D13)", () => {
+    it("ends every session, audits with the reason and validates input", async () => {
+      const user = await makeUser();
+      const a = await session(user.email);
+      const b = await session(user.email);
+      await db.db.transaction((tx) => identity.endSessionsForUser(user.id, "policy_declined", { tx: tx as Tx }));
+      for (const t of [a.token, b.token]) expect(await identity.sessionResolver.resolve({ token: t, transport: "cookie" })).toBeNull();
+      const [event] = h.audit.named("auth.session.revoked_all");
+      expect(event?.reasonCode).toBe("POLICY_DECLINED");
+      expect(event?.attributes?.source).toBe("policy_enforcement");
+      await rejects(identity.endSessionsForUser(user.id, "Bad Reason!"), "REASON_INVALID");
+      await rejects(identity.endSessionsForUser(999_999_999, "policy_deadline"), "USER_NOT_FOUND");
+    });
+  });
+
+  describe("accept_policy step (D13)", () => {
+    function enforce(fn: (userId: number, role: string) => Promise<boolean>) {
+      (h.services as unknown as { compliance: unknown }).compliance = { policyEnforcement: { requiresRemediation: fn } };
+    }
+
+    it("a user with a required policy gets accept_policy as the next step; none when not required", async () => {
+      const user = await makeUser();
+      enforce(async (id) => id === user.id);
+      const signed = await identity.auth.signIn({ email: user.email, password: PW }, {});
+      expect(signed.nextStep).toBe("mfa_challenge");
+      const issued = await identity.sessions.markMfaVerified(signed.sessionId);
+      const principal = await identity.sessionResolver.resolve({ token: issued.token, transport: "cookie" });
+      expect(principal?.pendingSteps).toEqual(["accept_policy"]);
+      enforce(async () => false);
+      const again = await identity.sessionResolver.resolve({ token: issued.token, transport: "cookie" });
+      expect(again?.pendingSteps ?? []).toEqual([]);
+    });
+
+    it("an existing full session past the deadline is held to accept_policy before any sweeper runs: protected calls refused, full again only after acceptance", async () => {
+      const user = await makeUser();
+      const { token } = await session(user.email); // full session opened before the policy became overdue
+      let accepted = false;
+      enforce(async (id) => id === user.id && !accepted);
+      const held = await identity.sessionResolver.resolve({ token, transport: "cookie" });
+      expect(held?.state).toBe("remediation");
+      expect(held?.pendingSteps).toEqual(["accept_policy"]);
+      const callerFor = (p: SessionPrincipal) =>
+        createCallerFactory(identityRouter)({ services: h.services, session: p, request: newRequestContext("test"), transport: { issue() {}, clear() {} } } as never);
+      await expect(callerFor(held!).profile.update({ name: "Blocked Change" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+      await expect(callerFor(held!).sessions.list()).rejects.toThrow();
+      accepted = true; // compliance records the acceptance
+      const restored = await identity.sessionResolver.resolve({ token, transport: "cookie" });
+      expect(restored?.state).toBe("full");
+      await expect(callerFor(restored!).sessions.list()).resolves.toBeTruthy();
+    });
+
+    it("fails closed when compliance is mounted without the enforcement port (wiring regression)", async () => {
+      const user = await makeUser();
+      const { token } = await session(user.email);
+      (h.services as unknown as { compliance: unknown }).compliance = {};
+      const principal = await identity.sessionResolver.resolve({ token, transport: "cookie" }).catch(() => null);
+      expect(principal === null || principal.state !== "full").toBe(true);
+    });
+
+    it("fails closed when the enforcement port throws", async () => {
+      const user = await makeUser();
+      const { token } = await session(user.email);
+      enforce(async () => Promise.reject(new Error("db down")));
+      const principal = await identity.sessionResolver.resolve({ token, transport: "cookie" }).catch(() => null);
+      expect(principal === null || principal.pendingSteps.length > 0).toBe(true);
+    });
+  });
+
   describe("router", () => {
     const createCaller = createCallerFactory(identityRouter);
     const issued: unknown[] = [];

@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Shell scripts (ShellCheck)
-        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh scripts/ci/native-install-upgrade.sh scripts/ci/assert-release-migrations.sh scripts/ci/assert-workflow-import-edge.sh
+        run: shellcheck -x deploy/auto-install.sh deploy/install.sh deploy/upgrade.sh deploy/uninstall.sh deploy/protection-bans.sh deploy/lib.sh scripts/ci/native-install-smoke.sh scripts/ci/native-install-prepare.sh scripts/ci/native-install-run.sh scripts/ci/native-install-upgrade.sh scripts/ci/assert-release-migrations.sh scripts/ci/assert-workflow-import-edge.sh
       - name: Make the runner look like a new server
         run: sudo --preserve-env=GITHUB_ACTIONS,GITHUB_WORKSPACE bash scripts/ci/native-install-prepare.sh "$PORTAL_HOST" "$ALIAS_HOST"
       - name: Refusals that change nothing

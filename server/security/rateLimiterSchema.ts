@@ -7,6 +7,8 @@ export const rateLimitCounters = mysqlTable("http_rate_limit_counters", {
   hits: int("hits", { unsigned: true }).notNull(),
   resetAt: datetime("reset_at", { mode: "date", fsp: 3 }).notNull(),
   blockPublicId: char("block_public_id", { length: 26 }),
+  backoffLevel: int("backoff_level", { unsigned: true }).notNull().default(0),
+  lastExceededAt: datetime("last_exceeded_at", { mode: "date", fsp: 3 }),
 }, (t) => [
   primaryKey({ columns: [t.category, t.slot] }),
   index("http_rate_limit_reset_idx").on(t.resetAt),

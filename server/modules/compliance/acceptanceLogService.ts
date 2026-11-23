@@ -42,7 +42,7 @@ import { users, type UserStatus } from "../identity/schema.js";
 import type { UserView } from "../identity/index.js";
 import { orders } from "../orders/schema.js";
 import { EVIDENCE_MAX_IDS, EVIDENCE_MAX_LIMIT, type OrderGateEvidence } from "./acceptance.js";
-import { orderPolicyAcceptances } from "./acceptanceSchema.js";
+import { orderPolicyAcceptances, type SignatureNameMatchResult } from "./acceptanceSchema.js";
 import { assertLiveActorInTx, runComplianceTx } from "./actorAuth.js";
 import {
   policyAcceptances,
@@ -118,6 +118,8 @@ export interface AcceptanceLogItem {
   source: AcceptanceLogSource;
   method: AcceptanceLogMethod;
   hasTypedSignature: boolean;
+  /** Increment 06 D11: server-side typed-name match outcome (`null` for checkbox or pre-06/imported rows). */
+  signatureMatch: SignatureNameMatchResult | null;
   freshness: AcceptanceFreshness;
   supersededByVersionPublicId: string | null;
   supersededByVersionLabel: string | null;
@@ -404,6 +406,7 @@ interface RawUnifiedCandidate {
   origin: "portal" | "import";
   method: AcceptanceLogMethod;
   hasTypedSignature: boolean;
+  signatureMatch: SignatureNameMatchResult | null;
   orderPublicId: string | null;
   gateKey: string | null;
   addressPseudonym: string | null;
@@ -1238,6 +1241,7 @@ export function createAcceptanceLogService(
         origin: policyAcceptances.origin,
         method: policyAcceptances.method,
         signerNameEnc: policyAcceptances.signerNameEnc,
+        signerNameMatch: policyAcceptances.signerNameMatch,
         orderPublicId: policyAcceptances.orderPublicId,
         sourceAddressPseudonym: policyAcceptances.sourceAddressPseudonym,
         requestId: policyAcceptances.requestId,
@@ -1261,6 +1265,7 @@ export function createAcceptanceLogService(
         origin: r.origin,
         method: mapAccountMethod(r.method, r.origin),
         hasTypedSignature: r.signerNameEnc !== null,
+        signatureMatch: r.signerNameMatch ?? null,
         orderPublicId: r.orderPublicId,
         gateKey: null,
         addressPseudonym: r.sourceAddressPseudonym,
@@ -1339,6 +1344,7 @@ export function createAcceptanceLogService(
         origin: "portal",
         method: item.method === "typed_name" ? "typed_signature" : "checkbox",
         hasTypedSignature: item.signerNameEnc !== null,
+        signatureMatch: item.typedNameMatch ?? null,
         orderPublicId: item.orderPublicId,
         gateKey: item.gateKey,
         addressPseudonym: item.addressPseudonym,
@@ -1416,6 +1422,7 @@ export function createAcceptanceLogService(
         source,
         method: c.method,
         hasTypedSignature: c.hasTypedSignature,
+        signatureMatch: c.signatureMatch,
         freshness,
         supersededByVersionPublicId,
         supersededByVersionLabel,
@@ -1674,6 +1681,7 @@ export function createAcceptanceLogService(
         origin: acctRow.origin,
         method: mapAccountMethod(acctRow.method, acctRow.origin),
         hasTypedSignature: acctRow.signerNameEnc !== null,
+        signatureMatch: acctRow.signerNameMatch ?? null,
         orderPublicId: acctRow.orderPublicId,
         gateKey: null,
         addressPseudonym: acctRow.sourceAddressPseudonym,
@@ -1775,6 +1783,7 @@ export function createAcceptanceLogService(
       origin: "portal",
       method: gateItem.method === "typed_name" ? "typed_signature" : "checkbox",
       hasTypedSignature: gateItem.signerNameEnc !== null,
+      signatureMatch: gateItem.typedNameMatch ?? null,
       orderPublicId: gateItem.orderPublicId,
       gateKey: gateItem.gateKey,
       addressPseudonym: gateItem.addressPseudonym,

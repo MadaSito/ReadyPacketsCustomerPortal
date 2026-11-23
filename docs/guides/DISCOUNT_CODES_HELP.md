@@ -27,7 +27,7 @@ Each discount has its own line above tax and the total, on the invoice page (`/i
 - **Bundle discount**: the multi-packet saving.
 - **Discount (name of the offer)**: the saving from your code or link. The code itself is never printed.
 
-If the discounts bring the total to $0.00, the invoice is issued as **Paid** with nothing to pay, and you can download the PDF straight away.
+If the discounts bring the total to $0.00, checkout shows **Nothing to pay - your discount covers this order** and places the order without sending you to a payment page. The invoice is issued as **Paid** with nothing to pay, and you can download the PDF straight away.
 
 ## Good to know
 

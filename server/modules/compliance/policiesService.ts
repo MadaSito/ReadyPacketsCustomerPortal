@@ -1,10 +1,11 @@
 import { and, asc, count, desc, eq, inArray, lt, lte } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
-import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
+import { conflict, DomainError, notFound } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { writeSetting } from "../platform/index.js";
 import { users } from "../identity/schema.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import { createAcceptanceLogService } from "./acceptanceLogService.js";
@@ -13,8 +14,29 @@ import {
   encodeIdCursor,
   hashPolicyContent,
   normalizePolicyBody,
-  normalizeSignerComparison,
 } from "./domain.js";
+import type { SignatureNameMatchResult } from "./acceptanceSchema.js";
+import {
+  type EffectiveTypedSignatureGateSnapshot,
+  loadAccountDisplayName,
+  parseOrderAgreementGateSnapshot,
+  readOrderAgreementGateSnapshot,
+  recordSignatureMismatchAuditIfNeeded,
+  resolveEffectiveRequiresTypedSignature,
+  verifyTypedSignatureInTx,
+} from "./signatureNameCheck.js";
+
+export {
+  type EffectiveTypedSignatureGateSnapshot,
+  parseOrderAgreementGateSnapshot,
+  readOrderAgreementGateSnapshot,
+  resolveEffectiveRequiresTypedSignature,
+};
+import {
+  parseSignatureNameCheckSetting,
+  SIGNATURE_NAME_CHECK,
+  type SignatureNameCheckSetting,
+} from "./settings.js";
 import {
   policyAcceptances,
   policyDocuments,
@@ -55,6 +77,7 @@ export interface RequiredPolicySummary {
   contentFormat: PolicyContentFormat;
   bodyText: string;
   contentHash: string;
+  changeSummary?: string | null;
   effectiveAt: Date;
   publishedAt: Date;
 }
@@ -72,6 +95,7 @@ export interface PolicyAcceptanceEvidenceView {
   requestId: string;
   method: PolicyAcceptanceMethod;
   hasTypedSignature: boolean;
+  signerNameMatch?: SignatureNameMatchResult | null;
   orderPublicId: string | null;
   origin: "portal" | "import";
 }
@@ -154,7 +178,27 @@ function audienceAppliesToRole(audience: PolicyAudience, role: "customer" | "sta
   return role === "staff" || role === "admin";
 }
 
-export function createPoliciesService(deps: ModuleDeps) {
+export interface PoliciesServiceHooks {
+  onVersionPublished?: (
+    tx: Tx,
+    input: {
+      documentId: number;
+      versionId: number;
+      publishedAt: Date;
+      requiresAcceptance: boolean;
+      active: boolean;
+      actor: { userId: number; role: "customer" | "staff" | "admin" };
+    },
+  ) => Promise<void>;
+  assertRemediationPending?: (
+    userId: number,
+    role: "customer" | "staff" | "admin",
+    versionPublicId: string,
+    tx: Tx,
+  ) => Promise<void>;
+}
+
+export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceHooks) {
   async function loadActiveEffectivePublishedPolicies(
     dbOrTx: DbOrTx,
     now: Date,
@@ -221,14 +265,17 @@ export function createPoliciesService(deps: ModuleDeps) {
       !opts?.callerRole || opts.callerRole === "customer"
         ? ["all", "customer"]
         : ["all", "staff"];
-    const pairs = await loadActiveEffectivePublishedPolicies(deps.db, now, allowedAudiences);
+    const [pairs, gateSnapshot] = await Promise.all([
+      loadActiveEffectivePublishedPolicies(deps.db, now, allowedAudiences),
+      readOrderAgreementGateSnapshot(deps),
+    ]);
     return pairs.map(({ doc, ver }) => ({
       documentPublicId: doc.publicId,
       slug: doc.slug,
       title: doc.title,
       audience: doc.audience,
       requiresAcceptance: doc.requiresAcceptance,
-      requiresTypedSignature: doc.requiresTypedSignature,
+      requiresTypedSignature: resolveEffectiveRequiresTypedSignature(doc, gateSnapshot),
       versionPublicId: ver.publicId,
       versionNumber: ver.versionNumber,
       versionLabel: ver.versionLabel,
@@ -263,7 +310,10 @@ export function createPoliciesService(deps: ModuleDeps) {
     const dbOrTx = opts?.tx ?? deps.db;
     const now = deps.clock.now();
     const role = await resolveTargetRole(userId, opts?.audience, dbOrTx);
-    const activePairs = await loadActiveEffectivePublishedPolicies(dbOrTx, now);
+    const [activePairs, gateSnapshot] = await Promise.all([
+      loadActiveEffectivePublishedPolicies(dbOrTx, now),
+      readOrderAgreementGateSnapshot(deps, dbOrTx),
+    ]);
 
     const applicable = activePairs.filter(
       ({ doc }) => doc.requiresAcceptance && audienceAppliesToRole(doc.audience, role),
@@ -299,13 +349,14 @@ export function createPoliciesService(deps: ModuleDeps) {
         slug: doc.slug,
         title: doc.title,
         audience: doc.audience,
-        requiresTypedSignature: doc.requiresTypedSignature,
+        requiresTypedSignature: resolveEffectiveRequiresTypedSignature(doc, gateSnapshot),
         versionPublicId: ver.publicId,
         versionNumber: ver.versionNumber,
         versionLabel: ver.versionLabel,
         contentFormat: ver.contentFormat,
         bodyText: ver.bodyText,
         contentHash: ver.contentHash,
+        changeSummary: ver.changeSummary ?? null,
         effectiveAt: ver.effectiveAt,
         publishedAt: ver.publishedAt ?? ver.effectiveAt,
       }));
@@ -333,9 +384,10 @@ export function createPoliciesService(deps: ModuleDeps) {
     published: PublishedPolicyView[];
     pendingRequired: RequiredPolicySummary[];
     acceptances: PolicyAcceptanceEvidenceView[];
+    expectedSignerName: string | null;
   }> {
     const liveRole = await resolveTargetRole(principal.userId, undefined, deps.db);
-    const [published, pendingRequired, rows] = await Promise.all([
+    const [published, pendingRequired, rows, expectedSignerName] = await Promise.all([
       listPublished({ callerRole: liveRole }),
       requiredAcceptancesFor(principal.userId),
       deps.db
@@ -350,11 +402,13 @@ export function createPoliciesService(deps: ModuleDeps) {
         .where(eq(policyAcceptances.userId, principal.userId))
         .orderBy(desc(policyAcceptances.acceptedAt), desc(policyAcceptances.id))
         .limit(100),
+      loadAccountDisplayName(deps, principal.userId, deps.db),
     ]);
 
     return {
       published: published.filter((p) => audienceAppliesToRole(p.audience, principal.role)),
       pendingRequired,
+      expectedSignerName,
       acceptances: rows.map(({ acceptance, doc, ver }) => ({
         acceptancePublicId: acceptance.publicId,
         documentPublicId: doc.publicId,
@@ -368,6 +422,7 @@ export function createPoliciesService(deps: ModuleDeps) {
         requestId: acceptance.requestId,
         method: acceptance.method,
         hasTypedSignature: acceptance.signerNameEnc !== null,
+        signerNameMatch: acceptance.signerNameMatch ?? null,
         orderPublicId: acceptance.orderPublicId,
         origin: acceptance.origin,
       })),
@@ -384,6 +439,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       versionPublicId: string;
       contentHash: string;
       flow: "portal" | "registration" | "checkout";
+      requestedMethod?: "portal_checkbox" | "typed_signature" | undefined;
       signerName?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
@@ -446,18 +502,23 @@ export function createPoliciesService(deps: ModuleDeps) {
       );
     }
 
-    if (doc.requiresTypedSignature) {
-      if (!input.signerName || input.signerName.trim().length < 2) {
-        throw validation("TYPED_SIGNATURE_REQUIRED", "Please enter your full name to sign this policy.");
-      }
-      const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
-      const userView = identitySvc?.getUser ? await identitySvc.getUser(input.userId, { tx }) : null;
-      if (userView && normalizeSignerComparison(userView.name) !== normalizeSignerComparison(input.signerName)) {
-        throw validation(
-          "SIGNER_NAME_MISMATCH",
-          "The typed signature must match your account profile name.",
-        );
-      }
+    const gateSnapshot = await readOrderAgreementGateSnapshot(deps, tx);
+    const requiresTyped = resolveEffectiveRequiresTypedSignature(doc, gateSnapshot);
+    let cleanedSignerName: string | null = null;
+    let signerNameMatch: SignatureNameMatchResult | null = null;
+
+    if (requiresTyped) {
+      const verified = await verifyTypedSignatureInTx(deps, {
+        tx,
+        userId: input.userId,
+        actorRole: input.actorRole,
+        typedName: input.signerName,
+        requiredErrorCode: "TYPED_SIGNATURE_REQUIRED",
+        requiredErrorMessage: "Please enter your full name to sign this policy.",
+        resource: { type: "policy_version", publicId: ver.publicId },
+      });
+      cleanedSignerName = verified.cleanedTypedName;
+      signerNameMatch = verified.matchResult;
     }
 
     const [existing] = await tx
@@ -474,6 +535,22 @@ export function createPoliciesService(deps: ModuleDeps) {
       .limit(1);
 
     if (existing) {
+      if (requiresTyped && existing.method !== "typed_signature" && cleanedSignerName) {
+        const upgradedEnc = deps.crypto.encrypt(
+          cleanedSignerName,
+          `policy_acceptances.signer_name:${existing.publicId}`,
+        );
+        await tx
+          .update(policyAcceptances)
+          .set({
+            method: "typed_signature",
+            signerNameEnc: upgradedEnc,
+            signerNameMatch,
+            acceptedAt: now,
+          })
+          .where(eq(policyAcceptances.id, existing.id));
+        return { acceptancePublicId: existing.publicId, duplicate: false };
+      }
       return { acceptancePublicId: existing.publicId, duplicate: true };
     }
 
@@ -484,15 +561,15 @@ export function createPoliciesService(deps: ModuleDeps) {
       : null;
 
     const acceptancePublicId = ulid(now.getTime());
-    // Derive method strictly on the server; never trust client-supplied method claims.
-    const effectiveMethod: PolicyAcceptanceMethod = doc.requiresTypedSignature
+    // Derive method strictly on the server; allow upgrading to typed_signature when requested (e.g. D14 MNDA gate).
+    const effectiveMethod: PolicyAcceptanceMethod = requiresTyped
       ? "typed_signature"
       : input.flow === "registration"
         ? "registration"
         : "portal_checkbox";
     const signerNameEnc =
-      doc.requiresTypedSignature && input.signerName
-        ? deps.crypto.encrypt(input.signerName.trim(), `policy_acceptances.signer_name:${acceptancePublicId}`)
+      requiresTyped && cleanedSignerName
+        ? deps.crypto.encrypt(cleanedSignerName, `policy_acceptances.signer_name:${acceptancePublicId}`)
         : null;
 
     await tx.insert(policyAcceptances).values({
@@ -507,6 +584,7 @@ export function createPoliciesService(deps: ModuleDeps) {
       method: effectiveMethod,
       context: input.flow,
       signerNameEnc,
+      signerNameMatch,
       orderId: input.resolvedOrderId,
       orderPublicId: input.resolvedOrderPublicId,
       origin: "portal",
@@ -526,6 +604,7 @@ export function createPoliciesService(deps: ModuleDeps) {
           version_public_id: ver.publicId,
           content_hash: ver.contentHash,
           method: effectiveMethod,
+          ...(signerNameMatch ? { signature_match: signerNameMatch } : {}),
           has_order_binding: input.resolvedOrderPublicId !== null,
         },
       },
@@ -545,31 +624,108 @@ export function createPoliciesService(deps: ModuleDeps) {
       orderPublicId?: string | undefined;
     },
   ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
-    return runComplianceTx(deps, principal, { type: "policy_version", publicId: input.versionPublicId }, async (tx) => {
-      const liveActor = await assertLiveActorInTx(deps, principal, tx);
-      const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
-      let resolvedOrderId: number | null = null;
-      let resolvedOrderPublicId: string | null = null;
-      if (input.orderPublicId) {
-        const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
-        if (!ordersSvc) {
-          throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order verification is temporarily unavailable.");
+    const resource = { type: "policy_version", publicId: input.versionPublicId };
+    return runComplianceTx(
+      deps,
+      principal,
+      resource,
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx);
+        const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
+        let resolvedOrderId: number | null = null;
+        let resolvedOrderPublicId: string | null = null;
+        if (input.orderPublicId) {
+          const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+          if (!ordersSvc) {
+            throw new DomainError("UNAVAILABLE", "ORDERS_UNAVAILABLE", "Order verification is temporarily unavailable.");
+          }
+          const orderView = await ordersSvc.assertCanReadOrder(livePrincipal, input.orderPublicId, { tx });
+          resolvedOrderId = orderView.id;
+          resolvedOrderPublicId = orderView.publicId;
         }
-        const orderView = await ordersSvc.assertCanReadOrder(livePrincipal, input.orderPublicId, { tx });
-        resolvedOrderId = orderView.id;
-        resolvedOrderPublicId = orderView.publicId;
-      }
-      return acceptPolicyInTx(tx, {
-        userId: liveActor.userId,
-        actorRole: liveActor.role,
-        resolvedOrderId,
-        resolvedOrderPublicId,
-        versionPublicId: input.versionPublicId,
-        contentHash: input.contentHash,
-        flow: "portal",
-        signerName: input.signerName,
-      });
-    });
+        return acceptPolicyInTx(tx, {
+          userId: liveActor.userId,
+          actorRole: liveActor.role,
+          resolvedOrderId,
+          resolvedOrderPublicId,
+          versionPublicId: input.versionPublicId,
+          contentHash: input.contentHash,
+          flow: "portal",
+          requestedMethod: input.method,
+          signerName: input.signerName,
+        });
+      },
+      {
+        onRefusalAfterRollback: async (err) => {
+          await recordSignatureMismatchAuditIfNeeded(
+            deps,
+            { userId: principal.userId, role: principal.role },
+            resource,
+            err,
+          );
+        },
+      },
+    );
+  }
+
+  /**
+   * Increment 06 D13: Narrow remediation acceptance endpoint when `pendingSteps[0] === "accept_policy"`.
+   * Verifies inside `tx` that `versionPublicId` is genuinely pending enforcement for the live actor.
+   */
+  async function acceptRemediation(
+    principal: SessionPrincipal,
+    input: {
+      versionPublicId: string;
+      contentHash: string;
+      method?: "portal_checkbox" | "typed_signature" | undefined;
+      signerName?: string | undefined;
+    },
+  ): Promise<{ acceptancePublicId: string; duplicate: boolean }> {
+    const resource = { type: "policy_version", publicId: input.versionPublicId };
+    return runComplianceTx(
+      deps,
+      principal,
+      resource,
+      async (tx) => {
+        const liveActor = await assertLiveActorInTx(deps, principal, tx, undefined, {
+          allowPolicyRemediation: true,
+        });
+        if (!hooks?.assertRemediationPending) {
+          throw new DomainError(
+            "UNAVAILABLE",
+            "POLICY_ENFORCEMENT_UNAVAILABLE",
+            "Policy remediation verification is temporarily unavailable.",
+          );
+        }
+        await hooks.assertRemediationPending(
+          liveActor.userId,
+          liveActor.role,
+          input.versionPublicId,
+          tx,
+        );
+        return acceptPolicyInTx(tx, {
+          userId: liveActor.userId,
+          actorRole: liveActor.role,
+          resolvedOrderId: null,
+          resolvedOrderPublicId: null,
+          versionPublicId: input.versionPublicId,
+          contentHash: input.contentHash,
+          flow: "portal",
+          requestedMethod: input.method,
+          signerName: input.signerName,
+        });
+      },
+      {
+        onRefusalAfterRollback: async (err) => {
+          await recordSignatureMismatchAuditIfNeeded(
+            deps,
+            { userId: principal.userId, role: principal.role },
+            resource,
+            err,
+          );
+        },
+      },
+    );
   }
 
   async function recordRegistrationAcceptances(
@@ -1131,6 +1287,17 @@ export function createPoliciesService(deps: ModuleDeps) {
         })
         .where(eq(policyDocuments.id, doc.id));
 
+      if (hooks?.onVersionPublished) {
+        await hooks.onVersionPublished(tx, {
+          documentId: doc.id,
+          versionId: ver.id,
+          publishedAt: now,
+          requiresAcceptance: doc.requiresAcceptance,
+          active: doc.active,
+          actor: liveActor,
+        });
+      }
+
       await deps.audit.record(
         {
           category: "admin",
@@ -1243,6 +1410,7 @@ export function createPoliciesService(deps: ModuleDeps) {
         sourceAddressPseudonym: acceptance.sourceAddressPseudonym,
         method: acceptance.method,
         hasTypedSignature: acceptance.signerNameEnc !== null,
+        signerNameMatch: acceptance.signerNameMatch ?? null,
         orderPublicId: acceptance.orderPublicId,
         origin: acceptance.origin,
       })),
@@ -1360,12 +1528,58 @@ export function createPoliciesService(deps: ModuleDeps) {
 
   const acceptanceLog = createAcceptanceLogService(deps);
 
+  async function readSignatureNameCheck(tx?: Tx): Promise<SignatureNameCheckSetting> {
+    const mode = await deps.settings.get(
+      SIGNATURE_NAME_CHECK.key,
+      parseSignatureNameCheckSetting,
+      SIGNATURE_NAME_CHECK.default,
+      tx,
+    );
+    return parseSignatureNameCheckSetting(mode);
+  }
+
+  async function adminGetSignatureNameCheck(
+    principal: SessionPrincipal,
+  ): Promise<SignatureNameCheckSetting> {
+    await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx, "policies.manage");
+    return readSignatureNameCheck();
+  }
+
+  async function adminUpdateSignatureNameCheck(
+    principal: SessionPrincipal,
+    input: SignatureNameCheckSetting,
+  ): Promise<SignatureNameCheckSetting> {
+    const cleaned = parseSignatureNameCheckSetting(input);
+    return runComplianceTx(deps, principal, { type: "compliance_setting", publicId: SIGNATURE_NAME_CHECK.key }, async (tx) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
+      const prev = await readSignatureNameCheck(tx);
+      await writeSetting(deps.settings, SIGNATURE_NAME_CHECK, cleaned, tx);
+      await deps.audit.record(
+        {
+          category: "admin",
+          eventName: "compliance.signature_name_check.updated",
+          action: "update",
+          outcome: "completed",
+          actor: { userId: liveActor.userId, role: liveActor.role },
+          resource: { type: "compliance_setting", publicId: SIGNATURE_NAME_CHECK.key },
+          attributes: {
+            previous_mode: prev.mode,
+            next_mode: cleaned.mode,
+          },
+        },
+        tx,
+      );
+      return cleaned;
+    });
+  }
+
   return {
     listPublished,
     requiredAcceptancesFor,
     assertRequiredPoliciesAccepted,
     myStatus,
     accept,
+    acceptRemediation,
     recordRegistrationAcceptances,
     recordCheckoutAcceptances,
     versionForGate,
@@ -1381,6 +1595,8 @@ export function createPoliciesService(deps: ModuleDeps) {
       publishVersion: adminPublishVersion,
       listAcceptances: adminListAcceptances,
       acceptanceLog,
+      getSignatureNameCheck: adminGetSignatureNameCheck,
+      updateSignatureNameCheck: adminUpdateSignatureNameCheck,
     },
     healthCounts,
   };

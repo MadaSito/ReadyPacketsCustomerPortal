@@ -97,6 +97,8 @@ export interface ProviderFetchedPayment {
   attemptPublicId: string | null;
   invoicePublicId: string | null;
   paidAt: Date | null;
+  paymentMethodBrand?: string | null | undefined;
+  paymentMethodLast4?: string | null | undefined;
 }
 
 export type ProviderRefundExecutionOutcome =

@@ -16,7 +16,7 @@ function currentUrl(): string {
   return `${window.location.pathname}${window.location.search}${window.location.hash}`;
 }
 
-function useReturnFocus(open: boolean | undefined) {
+function useReturnFocus(open: boolean | undefined, returnFocusRef?: RefObject<HTMLElement | null>) {
   const previous = useRef<HTMLElement | null>(null);
   const openedAt = useRef<string | null>(null);
   useLayoutEffect(() => {
@@ -30,6 +30,12 @@ function useReturnFocus(open: boolean | undefined) {
     const navigated = openedAt.current !== null && openedAt.current !== currentUrl();
     previous.current = null;
     openedAt.current = null;
+    const explicitTarget = returnFocusRef?.current;
+    if (explicitTarget?.isConnected) {
+      event.preventDefault();
+      explicitTarget.focus();
+      return;
+    }
     // Closed because the user navigated (e.g. a link in a nav drawer): route focus management owns focus now.
     if (navigated) {
       event.preventDefault();
@@ -59,12 +65,14 @@ export interface DialogProps {
   dismissible?: boolean;
   /** Element to focus first instead of the first focusable. */
   initialFocusRef?: RefObject<HTMLElement | null>;
+  /** For a triggerless dialog, focus this connected element on close before trying the opener. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
 const dialogSizes = { sm: "sm:max-w-sm", md: "sm:max-w-lg", lg: "sm:max-w-2xl", xl: "sm:max-w-4xl" } as const;
 
-export function Dialog({ open, onOpenChange, trigger, title, description, children, footer, size = "md", dismissible = true, initialFocusRef }: DialogProps) {
-  const onCloseAutoFocus = useReturnFocus(trigger ? false : open);
+export function Dialog({ open, onOpenChange, trigger, title, description, children, footer, size = "md", dismissible = true, initialFocusRef, returnFocusRef }: DialogProps) {
+  const onCloseAutoFocus = useReturnFocus(trigger ? false : open, returnFocusRef);
   return (
     <RDialog.Root open={open} onOpenChange={onOpenChange}>
       {trigger ? <RDialog.Trigger asChild>{trigger}</RDialog.Trigger> : null}

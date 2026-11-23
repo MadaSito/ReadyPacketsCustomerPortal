@@ -2,7 +2,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, read
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const requiredTag = "0005_increment_05";
+const requiredTag = "0006_increment_06";
 
 // A release must include both the journal entry and SQL; a file omitted from
 // the journal would otherwise be silently skipped by Drizzle.

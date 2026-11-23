@@ -128,6 +128,8 @@ export function classifyAddress(address: string | undefined): SourceAddressClass
 }
 
 /** Validates one attribute; returns the safe value or undefined if it must be dropped. */
+const ADDRESS_REF_VALUE = /^[0-9a-f]{32}$/;
+const ACCOUNT_REF_VALUE = /^[0-9a-f]{32,64}$/;
 const PII_KEY = /email|name|ip_?addr|address|phone|filename|body|sql|query_text|message|note|comment|user_agent/;
 
 /**
@@ -144,6 +146,12 @@ export function sanitiseAttribute(key: string, value: unknown): SafeAttributeVal
   // Opaque public identifiers (`note_public_id`): the key may contain a personal-field word ("note") but the value is
   // an id, so only an id-shaped value is accepted, and a long id is not mistaken for a token.
   if (key.endsWith("_public_id") && typeof value === "string") return PUBLIC_ID_VALUE.test(value) ? value : undefined;
+  // D7 (increment 06): correlation keys. `address_ref` is the audit source-address pseudonym (32 lowercase hex, same
+  // as `source_address_ref`); `account_ref` is identity's keyed blind index of the sign-in identifier. Both are opaque
+  // keyed digests, never the address or identifier itself; anything else under these keys is dropped. They stay in
+  // the local store only: neither is in EXTERNAL_ATTRIBUTE_KEYS, so SIEM/syslog projections withhold them.
+  if (key === "address_ref") return typeof value === "string" && ADDRESS_REF_VALUE.test(value) ? value : undefined;
+  if (key === "account_ref") return typeof value === "string" && ACCOUNT_REF_VALUE.test(value) ? value : undefined;
   if (PII_KEY.test(key)) {
     // A flag ABOUT a secret or personal field (`password_updated: true`, `secrets_included: false`) carries no
     // secret material; any other value type — including a digest of personal data (`email_hash`) — is dropped.

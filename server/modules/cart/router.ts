@@ -11,7 +11,10 @@ import {
   adminListOpenInputSchema,
   adminUpsellCreateInputSchema,
   adminUpsellDeleteInputSchema,
+  adminUpsellDuplicateInputSchema,
   adminUpsellSetActiveInputSchema,
+  adminUpsellSetAllActiveInputSchema,
+  adminUpsellSetFeatureInputSchema,
   adminUpsellUpdateInputSchema,
   applyCodeInputSchema,
   checkoutInputSchema,
@@ -141,6 +144,33 @@ export const cartRouter = router({
         .input(adminUpsellSetActiveInputSchema)
         .mutation(({ ctx, input }) =>
           requireCartModule(ctx.services).adminSetUpsellOfferActive(ctx.session, input),
+        ),
+
+      setFeature: upsellsManageProcedure
+        .meta({ rateLimit: "form_submission" })
+        .input(adminUpsellSetFeatureInputSchema)
+        .mutation(({ ctx, input }) =>
+          requireCartModule(ctx.services).adminSetUpsellFeature(ctx.session, input),
+        ),
+
+      setAllActive: upsellsManageProcedure
+        .meta({ rateLimit: "form_submission" })
+        .input(adminUpsellSetAllActiveInputSchema)
+        .mutation(({ ctx, input }) =>
+          requireCartModule(ctx.services).adminSetAllUpsellOffersActive(ctx.session, input),
+        ),
+
+      seedSuggested: upsellsManageProcedure
+        .meta({ rateLimit: "form_submission" })
+        .mutation(({ ctx }) =>
+          requireCartModule(ctx.services).adminSeedSuggestedUpsellOffers(ctx.session),
+        ),
+
+      duplicate: upsellsManageProcedure
+        .meta({ rateLimit: "form_submission" })
+        .input(adminUpsellDuplicateInputSchema)
+        .mutation(({ ctx, input }) =>
+          requireCartModule(ctx.services).adminDuplicateUpsellOffer(ctx.session, input),
         ),
 
       delete: upsellsManageProcedure

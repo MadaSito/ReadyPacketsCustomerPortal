@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, FileText, MoreHorizontal } from "lucide-react";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearch } from "wouter";
 import type { FileRecord } from "@server/modules/files/index";
+import { orderDocumentEditHref } from "@/lib/docconvert";
 import { apiUrl } from "@/lib/runtime";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
@@ -12,6 +14,7 @@ import {
 import { formatDuration } from "./AudioRecorder";
 import { categoryLabels, FileUploadPanel, visibilityLabels } from "./FileUploadPanel";
 import { formatBytes } from "./format";
+import { audioFileExtensions } from "./recordingDevice";
 
 type Props = { orderId: string; area: "customer" | "console" };
 type FileAction = { file: FileRecord; kind: "remove" | "restore" | "visibility" };
@@ -73,7 +76,11 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const [replacement, setReplacement] = useState<FileRecord | null>(null);
   const [action, setAction] = useState<FileAction | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [slotSelection, setSlotSelection] = useState("");
+  const search = useSearch();
+  const params = new URLSearchParams(search);
+  const requestedSlot = params.get("slot") ?? "";
+  const [slotSelection, setSlotSelection] = useState<{ search: string; key: string } | null>(null);
+  const panelHeading = useRef<HTMLSpanElement>(null);
   const [playing, setPlaying] = useState<FileRecord | null>(null);
   const list = useInfiniteQuery(trpc.files.list.infiniteQueryOptions(
     { orderId, limit: 25, includeVersions: versions, includeDeleted: consoleArea && trash },
@@ -87,7 +94,16 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   const first = list.data?.pages[0];
   const policy = first?.uploadPolicy;
   const slots = first?.uploadSlots;
-  const chosenSlot = slots?.slots.find((slot) => slot.key === slotSelection);
+  const uploadSlots = slots?.slots.filter((slot) => slot.acceptsUpload !== false) ?? [];
+  const activeSlot = slotSelection?.search === search ? slotSelection.key : requestedSlot;
+  const chosenSlot = uploadSlots.find((slot) => slot.key === activeSlot);
+  const routedSlot = !!chosenSlot && requestedSlot === chosenSlot.key && slotSelection?.search !== search;
+  const launchRecording = routedSlot && params.get("mode") === "record" && first?.audio?.enabled === true &&
+    chosenSlot.kind === "audio" && chosenSlot.capture !== "upload" && audioFileExtensions.some((ext) =>
+      policy?.extensions.includes(ext) && (!chosenSlot.allowedTypes.length || chosenSlot.allowedTypes.includes(ext)));
+  useEffect(() => {
+    if (routedSlot && !launchRecording) panelHeading.current?.focus();
+  }, [routedSlot, launchRecording, requestedSlot]);
   const replacementSlot = replacement?.slotKey && slots?.statusKey === replacement.statusKey
     ? slots?.slots.find((slot) => slot.key === replacement.slotKey) : undefined;
   const canChange = first?.canUpload === true;
@@ -157,15 +173,17 @@ export default function OrderFilesTab({ orderId, area }: Props) {
   return (
     <Section title="Order files" description="View order documents, supporting evidence, and deliverables. Downloads are limited to your current access.">
       <div className="grid min-w-0 gap-5">
-        {canChange && policy ? <Card title={consoleArea ? "Add an order file" : "Upload supporting files"} headingLevel={3}
+        {canChange && policy ? <Card title={<span tabIndex={-1} ref={panelHeading}>
+          {chosenSlot?.label ?? (consoleArea ? "Add an order file" : "Upload supporting files")}
+        </span>} headingLevel={3}
           description={consoleArea ? "Staff may add deliverables and choose who can see them." : "Add documents requested by your ReadyPackets team."}>
           <div className="grid min-w-0 gap-4">
-            {slots?.slots.length ? <Field label="Upload to" hint="Choose a workflow requirement, or add a general file that does not count toward a requirement.">
-              <Select value={chosenSlot?.key ?? ""} onChange={(event) => setSlotSelection(event.target.value)}
-                options={[{ value: "", label: "General order files" }, ...slots.slots.map((slot) => ({ value: slot.key, label: slot.label }))]} />
+            {uploadSlots.length ? <Field label="Upload to" hint="Choose a workflow requirement, or add a general file that does not count toward a requirement.">
+              <Select value={chosenSlot?.key ?? ""} onChange={(event) => setSlotSelection({ search, key: event.target.value })}
+                options={[{ value: "", label: "General order files" }, ...uploadSlots.map((slot) => ({ value: slot.key, label: slot.label }))]} />
             </Field> : null}
-            <FileUploadPanel key={`${slots?.statusKey ?? ""}:${chosenSlot?.key ?? ""}`} orderId={orderId} staff={consoleArea} policy={policy}
-              slot={chosenSlot && slots ? { ...chosenSlot, statusKey: slots.statusKey } : undefined} audio={first.audio} onChanged={reload} />
+            <FileUploadPanel key={`${slots?.statusKey ?? ""}:${chosenSlot?.key ?? ""}:${launchRecording ? "record" : "files"}`} orderId={orderId} staff={consoleArea} policy={policy}
+              slot={chosenSlot && slots ? { ...chosenSlot, statusKey: slots.statusKey } : undefined} audio={first.audio} launchRecording={launchRecording} onChanged={reload} />
           </div>
         </Card> : first ? <Callout tone="info" title="File changes unavailable">
           Your access or the order’s current state does not allow file changes.
@@ -186,10 +204,11 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                   <span className="block break-all font-medium text-ink">{file.displayName}</span>
                   <span className="text-sm text-muted">{file.extension.toUpperCase()} · {formatBytes(file.size)}</span>
                   {file.conversionState ? <span className="block text-sm text-body">
-                    {file.conversionState === "converting" ? "Converting audio to WebM" : file.conversionState === "converted" ? "WebM copy available" :
-                      file.conversionReason === "AUDIO_CONVERSION_UNAVAILABLE" ? "Conversion not available. Original kept." : "Conversion failed. Original kept."}
+                    {file.conversionState === "converting" ? "Re-encoding to WebM/Opus. Original kept." : file.conversionState === "converted" ? "Original audio. WebM/Opus copy available." :
+                      file.conversionReason === "AUDIO_CONVERSION_DISABLED" ? "Re-encoding is off. Original kept." :
+                        file.conversionReason === "AUDIO_CONVERSION_UNAVAILABLE" ? "Re-encoding unavailable. Original kept." : "Re-encoding failed. Original kept."}
                   </span> : null}
-                  {file.derivedFromPublicId ? <span className="block text-sm text-body">Converted WebM audio</span> : null}
+                  {file.derivedFromPublicId ? <span className="block text-sm text-body">WebM/Opus audio</span> : null}
                 </div> },
                 { key: "category", header: "Category", cell: (file) => <div className="min-w-0">
                   <span>{categoryLabels[file.category]}</span>
@@ -209,6 +228,9 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                     loading={downloading === file.publicId} onClick={() => { void download(file); }} aria-label={`Download ${file.displayName}`}>Download</Button> : null}
                   {!file.deletedAt && file.contentType.startsWith("audio/") ?
                     <Button size="sm" variant="secondary" onClick={() => setPlaying(file)} aria-label={`Listen to ${file.displayName}`}>Listen</Button> : null}
+                  {!file.deletedAt && !file.supersededAt && file.extension === "docx" ? <Button asChild size="sm" variant="secondary">
+                    <Link href={orderDocumentEditHref(orderId, file.publicId, { area })} aria-label={`Edit ${file.displayName}`}>Edit document</Link>
+                  </Button> : null}
                   {canReplace || staffActions ? <DropdownMenu
                     trigger={<IconButton variant="ghost" label={`Actions for ${file.displayName}`} icon={<MoreHorizontal aria-hidden />} />}
                     items={[

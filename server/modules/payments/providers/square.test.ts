@@ -114,8 +114,17 @@ describe("Square hosted checkout protocol", () => {
     await expect(adapter.fetchPayment({ ...fetchArgs, providerPaymentRef: payment.id })).resolves.toEqual({
       providerRef: link.id, providerOrderRef: order.id, providerPaymentRef: payment.id, status: "paid", amountMinor: price.amount,
       currency: price.currency, livemode: false, attemptPublicId, invoicePublicId, paidAt: null,
+      paymentMethodBrand: null, paymentMethodLast4: null,
     });
     expect(wire.mock.calls.flat()).toEqual([`/v2/online-checkout/payment-links/${link.id}`, `/v2/orders/${order.id}`, `/v2/payments/${payment.id}`]);
+    const withCard = protocolFake({
+      payment: { ...payment, card_details: { card: { card_brand: "VISA", last_4: "4242" } } },
+    });
+    await expect(withCard.adapter.fetchPayment({ ...fetchArgs, providerPaymentRef: payment.id })).resolves.toMatchObject({
+      status: "paid",
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+    });
     for (const wrong of [
       { order_id: "ORDER_02" }, { location_id: "LOCATION_02" }, { amount_money: { ...price, amount: 1298 } },
       { amount_money: { ...price, currency: "CAD" } }, { refunded_money: { ...price, amount: 1 } }, { tip_money: { ...price, amount: 1 } },

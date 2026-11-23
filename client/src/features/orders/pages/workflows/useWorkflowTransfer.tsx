@@ -1,7 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { errorMessage, useTRPC, useTRPCClient } from "@/lib/trpc";
-import { Button, Callout, Checkbox, useStepUp, useToast } from "@/ui";
+import { Button, Callout, Checkbox, ConfirmSwitch, StepUpCancelledError, useStepUp, useToast } from "@/ui";
 import type { DraftListRow, WorkflowListRow } from "./model";
 import { WorkflowImportDialog } from "./WorkflowImportDialog";
 import { downloadWorkflowFile } from "./transferFiles";
@@ -11,6 +11,7 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
   const api = useTRPCClient();
   const stepUp = useStepUp();
   const toast = useToast();
+  const queryClient = useQueryClient();
   const status = useQuery(trpc.orders.admin.workflows.transfer.status.queryOptions(undefined, { retry: false }));
   const canExport = !status.error && status.data?.enabled === true && status.data.canExport;
   const canImport = !status.error && status.data?.enabled === true && status.data.canImport;
@@ -27,6 +28,35 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
   const selectedKeys = [...selection].filter((key) => eligible.has(key));
   const importOpen = Boolean(canImport && importing);
   const policies = useQuery(trpc.compliance.policies.listPublished.queryOptions(undefined, { enabled: importOpen }));
+
+  const [switchError, setSwitchError] = useState<string>();
+  /** Increment 06 (D10): the on-page switch (admin + workflows.manage; audited on the server). */
+  async function setEnabled(enabled: boolean) {
+    setSwitchError(undefined);
+    try {
+      await stepUp.run(() => api.orders.admin.workflows.transfer.setEnabled.mutate({ enabled }), { reason: enabled ? "Turning on workflow export and import." : "Turning off workflow export and import." });
+      await queryClient.invalidateQueries({ queryKey: trpc.orders.admin.workflows.transfer.status.queryKey() });
+      toast.show({ tone: "success", title: enabled ? "Workflow export and import turned on" : "Workflow export and import turned off" });
+    } catch (error) {
+      if (error instanceof StepUpCancelledError) return;
+      setSwitchError(errorMessage(error, "The setting could not be saved. Please try again."));
+      throw error;
+    }
+  }
+  const canToggle = !status.error && status.data?.canToggle === true;
+  const switchCard = canToggle ? (
+    <section aria-label="Workflow export and import setting" className="grid min-w-0 gap-2 rounded-xl border border-line bg-surface p-4">
+      <ConfirmSwitch
+        id="workflow-transfer-switch"
+        label="Workflow export and import"
+        description={status.data?.enabled ? "On. Admins can download workflows as a file and import them as drafts." : "Off. Turn it on to download workflows as a file and import them as drafts. Imports never publish anything."}
+        checked={status.data?.enabled === true}
+        onConfirmedChange={(next) => setEnabled(next).catch(() => undefined)}
+        confirmOff={{ title: "Turn off workflow export and import?", description: "Admins can no longer export or import workflows until it is turned on again. Existing workflows and drafts are not changed.", confirmLabel: "Turn off" }}
+      />
+      {switchError ? <Callout title="Setting not saved" tone="danger" live="assertive">{switchError}</Callout> : null}
+    </section>
+  ) : null;
 
   async function doExport(action: Exclude<typeof exporting, null>) {
     if (!canExport || exportLock.current) return;
@@ -49,17 +79,17 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
 
   return {
     importAction: canImport ? <Button variant="secondary" onClick={() => setImporting(true)}>Import workflows</Button> : null,
-    toolbar: canExport ? <section aria-label="Workflow export" className="grid min-w-0 gap-2 rounded-xl border border-line bg-surface p-4">
+    toolbar: <>{switchCard}{canExport ? <section aria-label="Workflow export" className="grid min-w-0 gap-2 rounded-xl border border-line bg-surface p-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-        <Button variant="secondary" loading={exporting === "selected"} disabled={!selectedKeys.length || selectedKeys.length > maxWorkflows || exporting !== null}
+        <Button variant="secondary" loading={exporting === "selected"} disabled={exporting === "selected" ? false : !selectedKeys.length || selectedKeys.length > maxWorkflows || exporting !== null}
           onClick={() => void doExport("selected")}>Export selected</Button>
-        <Button variant="secondary" loading={exporting === "all"} disabled={!eligible.size || eligible.size > maxWorkflows || exporting !== null}
+        <Button variant="secondary" loading={exporting === "all"} disabled={exporting === "all" ? false : !eligible.size || eligible.size > maxWorkflows || exporting !== null}
           onClick={() => void doExport("all")}>Export all</Button>
         <p role="status" className="text-sm text-muted">{selectedKeys.length} {selectedKeys.length === 1 ? "workflow" : "workflows"} selected</p>
       </div>
       {eligible.size > maxWorkflows ? <p className="text-sm text-muted">Select up to {maxWorkflows} workflows per export. Export all is unavailable because there are more than {maxWorkflows}.</p> : null}
       {exportError ? <Callout title="Export needs attention" tone="danger" live="assertive">{exportError}</Callout> : null}
-    </section> : null,
+    </section> : null}</>,
     selectionControl: (key: string, name: string) => canExport && eligible.has(key) ? <Checkbox
       label={<span className="[overflow-wrap:anywhere]">Select {name}</span>} checked={selection.has(key)}
       disabled={exporting !== null || (!selection.has(key) && selectedKeys.length >= maxWorkflows)}
@@ -70,7 +100,7 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
         return next;
       })} /> : null,
     exportAction: (key: string, name: string) => canExport && eligible.has(key) ? <Button size="sm" variant="secondary"
-      aria-label={`Export ${name}`} loading={typeof exporting === "object" && exporting?.key === key} disabled={exporting !== null}
+      aria-label={`Export ${name}`} loading={typeof exporting === "object" && exporting?.key === key} disabled={exporting !== null && !(typeof exporting === "object" && exporting.key === key)}
       onClick={() => void doExport({ key })}>Export</Button> : null,
     dialog: importOpen ? <WorkflowImportDialog close={() => setImporting(false)}
       policies={policies.error ? [] : policies.data ?? []}

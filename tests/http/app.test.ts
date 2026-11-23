@@ -317,6 +317,24 @@ describe("HTTP edge: cookie CSRF, sessions and tRPC", () => {
     expect(consume.mock.calls).toEqual(Array.from({ length: 3 }, () => ["api", "ip:192.0.2.7", 1]));
   });
 
+  it("serves a generic batched sign-in refusal before session resolution or firewall inspection", async () => {
+    const h = harness();
+    const captureClientAddress = vi.fn();
+    const inspect = vi.fn();
+    h.services.protection = {
+      captureClientAddress, inspect, recordRateLimit: async () => undefined, credentialRetryAfter: async () => 85,
+    } as unknown as typeof h.services.protection;
+    const result = await h.http.post("/api/trpc/identity.me%2Cidentity.signIn?batch=1")
+      .set("Host", HOST).set("Origin", ORIGIN).send({}).expect(429).expect("Retry-After", "85");
+    expect(captureClientAddress).toHaveBeenCalledOnce();
+    expect(inspect).not.toHaveBeenCalled();
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(result.body).toHaveLength(2);
+    for (const item of result.body as { error: { json: { data: { safe: unknown } } } }[]) {
+      expect(item.error.json.data.safe).toMatchObject({ domainCode: "RATE_LIMITED", reasonCode: "RATE_LIMITED" });
+    }
+  });
+
   it("applies identical CSRF controls to raw module routes and refuses mutation over GET", async () => {
     const h = harness();
     const cookie = requestCookies(h.config, TOKEN_A, csrfA);

@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { Button, Checkbox, ErrorState, Tabs, ConfirmDialog, DataTable, Dialog, Drawer, Field, Input, StatusBadge, useStepUp, useToast } from "@/ui";
 import { OPERATION_STATES } from "@shared/domain";
@@ -28,12 +28,20 @@ describe("Field", () => {
   });
 });
 
-function DialogHarness() {
+function DialogHarness({ restoreToReminder = false }: { restoreToReminder?: boolean }) {
   const [open, setOpen] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const reminder = useRef<HTMLButtonElement>(null);
+  const change = (nextOpen: boolean) => {
+    if (!nextOpen) setDismissed(true);
+    setOpen(nextOpen);
+  };
   return (
     <>
       <Button onClick={() => setOpen(true)}>Open</Button>
-      <Dialog open={open} onOpenChange={setOpen} title="Edit name" footer={<Button onClick={() => setOpen(false)}>Save</Button>}>
+      {restoreToReminder && dismissed ? <Button ref={reminder}>Review later</Button> : null}
+      <Dialog open={open} onOpenChange={change} title="Edit name" footer={<Button onClick={() => change(false)}>Save</Button>}
+        returnFocusRef={restoreToReminder && !open ? reminder : undefined}>
         <Field label="Name">
           <Input />
         </Field>
@@ -58,6 +66,15 @@ describe("Dialog / Drawer focus behaviour", () => {
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(trigger).toHaveFocus();
+  });
+  it("restores focus to an explicit target mounted as a controlled dialog closes", async () => {
+    const user = userEvent.setup();
+    renderUi(<DialogHarness restoreToReminder />);
+    await user.click(screen.getByRole("button", { name: "Open" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit name" });
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    const reminder = await screen.findByRole("button", { name: "Review later" });
+    await waitFor(() => expect(reminder).toHaveFocus());
   });
   it("drawer is a labelled modal with a close button", async () => {
     const user = userEvent.setup();

@@ -28,6 +28,16 @@ export const LIGHT_TOKENS = {
   "action-soft": "#E3F1EF",
   "on-navy": "#F2F8F8",
   "on-navy-muted": "#B8C7D2",
+  "nav-active": "#124A4F",
+  "nav-accent": "#2EC4B6",
+  "nav-hover": "#17304A",
+  "nav-edge": "#1A7A6E",
+  "chart-1": "#137568",
+  "chart-2": "#1A6FA8",
+  "chart-3": "#B0640C",
+  "chart-4": "#7A4DB0",
+  "chart-5": "#B3261E",
+  "chart-6": "#4A5568",
   focus: "#137568",
 } as const;
 
@@ -59,6 +69,16 @@ export const DARK_TOKENS: Record<TokenName, string> = {
   "action-soft": "#0F3438",
   "on-navy": "#F2F8F8",
   "on-navy-muted": "#B8C7D2",
+  "nav-active": "#0E4048",
+  "nav-accent": "#8CE8DC",
+  "nav-hover": "#123444",
+  "nav-edge": "#2EC4B6",
+  "chart-1": "#2EC4B6",
+  "chart-2": "#6DBCF0",
+  "chart-3": "#EFBD65",
+  "chart-4": "#C7A4F5",
+  "chart-5": "#FF8D87",
+  "chart-6": "#B8C7D2",
   focus: "#55D6C9",
 };
 
@@ -107,4 +127,14 @@ export const RENDERED_PAIRS: ReadonlyArray<readonly [TokenName, TokenName, numbe
   ["ink", "action-soft", 4.5],
   ["on-navy", "navy", 4.5],
   ["on-navy-muted", "navy", 4.5],
+  // D1 navigation on navy: labels, current entry, hover, accent bar / focus ring, panel edge against the page.
+  ["nav-accent", "navy", 4.5],
+  ["on-navy", "nav-active", 4.5],
+  ["on-navy-muted", "nav-active", 4.5],
+  ["on-navy", "nav-hover", 4.5],
+  ["on-navy-muted", "nav-hover", 4.5],
+  ["nav-accent", "nav-active", 3],
+  ["nav-accent", "nav-hover", 3],
+  ["nav-edge", "surface-soft", 3],
+  ...([1, 2, 3, 4, 5, 6] as const).flatMap((n) => (["surface", "surface-soft", "surface-sunken"] as const).map((bg) => [`chart-${n}`, bg, 3] as const)),
 ];

@@ -28,10 +28,19 @@ export function acceptsLocalProbe(req: Request, hostname: string | undefined): b
 }
 
 export function clientAddress(req: Request): string | undefined {
-  const address = req.ip ?? req.socket.remoteAddress;
-  if (!address || !isIP(address)) return undefined;
-  const unmapped = address.replace(/^::ffff:/i, "");
-  return isIP(unmapped) === 4 ? unmapped : address;
+  const raw = req.ip ?? req.socket.remoteAddress;
+  if (!raw) return undefined;
+  const family = isIP(raw);
+  if (family === 4) return raw;
+  if (family !== 6) return undefined;
+  // Canonicalize once for audit pseudonyms, credential bans and other request-context consumers.
+  const source = raw.split("%", 1)[0];
+  const canonical = new URL(`http://[${source}]`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (!mapped) return canonical;
+  const high = Number.parseInt(mapped[1]!, 16);
+  const low = Number.parseInt(mapped[2]!, 16);
+  return [high >> 8, high & 255, low >> 8, low & 255].join(".");
 }
 
 export function isNavigation(req: Request): boolean {

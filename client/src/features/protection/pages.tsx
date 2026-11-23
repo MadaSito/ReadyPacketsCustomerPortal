@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { inferRouterInputs, inferRouterOutputs } from "@trpc/server";
-import { useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import type { AppRouter } from "@server/trpc/root";
 import { errorMessage, useTRPC } from "@/lib/trpc";
@@ -39,6 +39,20 @@ function Page({ index, description, children }: { index: number; description: st
 
 function Status({ feedback }: { feedback: Feedback | null }) {
   return feedback ? <Callout tone={feedback.error ? "danger" : "success"} live={feedback.error ? "assertive" : "polite"}>{feedback.message}</Callout> : null;
+}
+
+function useReleaseFocus(rows: readonly { publicId: string }[] | undefined, dialogOpen: boolean) {
+  const headingId = useId();
+  const [releasedId, setReleasedId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!releasedId || dialogOpen || !rows || rows.some((row) => row.publicId === releasedId)) return;
+    const frame = requestAnimationFrame(() => {
+      if (document.activeElement === document.body) document.getElementById(headingId)?.focus();
+      setReleasedId(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [dialogOpen, headingId, releasedId, rows]);
+  return { headingId, setReleasedId };
 }
 
 function PolicyEditor({ children }: { children: (policy: Policy, update: (next: Policy) => void) => ReactNode }) {
@@ -254,10 +268,25 @@ function RateEditor({ item }: { item: Out["getRateLimits"][number] }) {
             onChange={(e) => setDraft({ ...effective, windowSeconds: Number(e.target.value) })} />
         </Field>
       </div>
+      <fieldset className="grid min-w-0 gap-3">
+        <legend className="mb-2 font-medium">Progressive back-off</legend>
+        <Checkbox label="Increase waits after repeated refusals" checked={effective.backoff.enabled}
+          onCheckedChange={(enabled) => setDraft({ ...effective, backoff: { ...effective.backoff, enabled } })} />
+        <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+          {([
+            ["factor", "Multiplier", 2, 8],
+            ["maxSeconds", "Maximum wait (seconds)", 30, 3600],
+            ["resetAfterMinutes", "Forget after (minutes)", 1, 1440],
+          ] as const).map(([key, label, min, max]) => <Field key={key} label={label} required>
+            <Input type="number" min={min} max={max} required value={effective.backoff[key]}
+              onChange={(e) => setDraft({ ...effective, backoff: { ...effective.backoff, [key]: Number(e.target.value) } })} />
+          </Field>)}
+        </div>
+      </fieldset>
       <Status feedback={feedback} />
       <div className="flex flex-wrap gap-2">
         <Button type="submit" disabled={!draft}>Review limit</Button>
-        <Button type="button" variant="secondary" onClick={() => setConfirmation("reset")}>Reset to default</Button>
+        <Button type="button" variant="secondary" onClick={() => setConfirmation("reset")}>Restore defaults</Button>
       </div>
     </form>
     {confirmation ? <ConfirmDialog open onOpenChange={() => setConfirmation(null)} title={confirmation === "reset" ? "Restore default rate limit?" : "Save rate limit?"}
@@ -275,17 +304,19 @@ function Blocks({ source }: { source: "automatic" | "rate" }) {
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const rows = source === "automatic" ? query.data?.automatic.map((r) => ({ publicId: r.publicId, expiresAt: r.expiresAt, subject: r.ipAddress })) :
     query.data?.rateLimits.map((r) => ({ publicId: r.publicId, expiresAt: r.expiresAt, subject: categoryLabels[r.category] }));
+  const releaseFocus = useReleaseFocus(rows, selection !== null);
   async function confirm() {
     if (!selection) return;
     try {
       await stepUp.run(() => release.mutateAsync({ source, publicId: selection }), { reason: "Releasing blocks requires fresh verification." });
+      releaseFocus.setReleasedId(selection);
       setFeedback({ error: false, message: "Block released." });
       void query.refetch();
     } catch (error) {
       if (!(error instanceof StepUpCancelledError)) setFeedback({ error: true, message: errorMessage(error) });
     }
   }
-  return <Card title={title} description={source === "automatic" ? "Release does not remove an IP from the manual deny list." : "This view shows up to 100 anonymized buckets. Subjects sharing a bucket are released together."}>
+  return <Card title={<span id={releaseFocus.headingId} tabIndex={-1}>{title}</span>} description={source === "automatic" ? "Release does not remove an IP from the manual deny list." : "This view shows up to 100 anonymized buckets. Subjects sharing a bucket are released together."}>
     <Status feedback={feedback} />
     <DataTable caption={title} loading={query.isPending} error={query.error} onRetry={() => void query.refetch()}
       rows={rows ?? []} rowKey={(r) => r.publicId}
@@ -306,6 +337,127 @@ export function RateLimitsPage() {
       <div className="grid min-w-0 gap-4 xl:grid-cols-2">{query.data.map((item) => <RateEditor key={item.category} item={item} />)}</div>
     )}
     <Blocks source="rate" />
+  </Page>;
+}
+
+type SignInBanList = Out["listSignInBans"];
+type SignInBanPolicy = SignInBanList["policy"];
+
+function SignInBanControls({ data, refetch }: { data: SignInBanList; refetch: () => void }) {
+  const trpc = useTRPC();
+  const stepUp = useStepUp();
+  const create = useMutation(trpc.protection.manualSignInBan.mutationOptions());
+  const release = useMutation(trpc.protection.releaseSignInBan.mutationOptions());
+  const save = useMutation(trpc.protection.setSignInBanPolicy.mutationOptions());
+  const [draft, setDraft] = useState<SignInBanPolicy | null>(null);
+  const [address, setAddress] = useState("");
+  const [reason, setReason] = useState("");
+  const [duration, setDuration] = useState("60");
+  const [permanent, setPermanent] = useState(false);
+  const [selection, setSelection] = useState<SignInBanList["items"][number] | null>(null);
+  const [confirm, setConfirm] = useState<"ban" | "release" | "settings" | null>(null);
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const policy = draft ?? data.policy;
+  const canBan = data.determinable && !data.bypassed;
+  const releaseFocus = useReleaseFocus(data.items, confirm !== null);
+  async function apply() {
+    try {
+      if (confirm === "ban" && canBan) {
+        await stepUp.run(() => create.mutateAsync({ address, durationMinutes: permanent ? null : Number(duration), reason }),
+          { reason: "Banning a network requires fresh verification." });
+        setAddress(""); setReason(""); setPermanent(false); setDuration("60");
+        setFeedback({ error: false, message: "Sign-in ban saved." });
+      } else if (confirm === "release" && selection) {
+        await stepUp.run(() => release.mutateAsync({ publicId: selection.publicId }), { reason: "Releasing a sign-in ban requires fresh verification." });
+        releaseFocus.setReleasedId(selection.publicId);
+        setFeedback({ error: false, message: "Sign-in ban released." });
+      } else if (confirm === "settings" && draft) {
+        await stepUp.run(() => save.mutateAsync(draft), { reason: "Changing automatic sign-in bans requires fresh verification." });
+        setDraft(null);
+        setFeedback({ error: false, message: "Automatic ban settings saved." });
+      }
+      refetch();
+    } catch (error) {
+      if (!(error instanceof StepUpCancelledError)) setFeedback({ error: true, message: errorMessage(error) });
+    }
+  }
+  return <>
+    {data.bypassed ? <Callout tone="warning" title="Emergency bypass is active">Sign-in bans are not being enforced.</Callout>
+      : !data.determinable ? <Callout tone="warning" title="Client address cannot be verified">
+        Sign-in bans are not applied when the client address cannot be determined. Check the proxy configuration before adding bans.
+      </Callout> : null}
+    <Status feedback={feedback} />
+    <Card title={<span id={releaseFocus.headingId} tabIndex={-1}>Active sign-in bans</span>}>
+      {!data.policy.enabled && data.items.some((item) => item.source === "automatic") ? <Callout tone="info" title="Automatic bans are paused">
+        Automatic entries remain listed until release or expiry. Manual bans are still enforced when the client address is verified.
+      </Callout> : null}
+      <DataTable caption="Active sign-in bans" rows={data.items} rowKey={(item) => item.publicId}
+        columns={[
+          { key: "address", header: "Address or CIDR", primary: true, cell: (item) => <span className="break-all">{item.address}</span> },
+          { key: "source", header: "Source", cell: (item) => item.source === "manual" ? "Manual" : "Automatic" },
+          { key: "reason", header: "Reason", cell: (item) => <span className="[overflow-wrap:anywhere]">{item.reason}</span> },
+          { key: "strikes", header: "Strikes", cell: (item) => <span className="tabular-nums">{item.strikes}</span> },
+          { key: "expiry", header: "Expires", cell: (item) => item.expiresAt ? <DateTime value={item.expiresAt} /> : "Permanent" },
+        ]}
+        empty={<EmptyState title="No active sign-in bans" headingLevel={3} />}
+        rowActions={(item) => <Button variant="secondary" aria-label={`Unban ${item.address}`} onClick={() => { setSelection(item); setConfirm("release"); }}>Unban</Button>} />
+    </Card>
+    <Card title="Ban an IP address or range" description="Protected networks and your own address cannot be banned. Avoid broad ranges on shared networks.">
+      <form className="grid min-w-0 gap-3" onSubmit={(e) => { e.preventDefault(); if (canBan) setConfirm("ban"); }}>
+        <fieldset disabled={!canBan} className="grid min-w-0 gap-3 sm:grid-cols-2" aria-label="Manual ban details">
+          <Field label="IP address or CIDR" required><Input value={address} maxLength={48} required onChange={(e) => setAddress(e.target.value)} /></Field>
+          <Field label="Reason" hint="Do not include credentials or personal details." required><Input value={reason} minLength={3} maxLength={240} required onChange={(e) => setReason(e.target.value)} /></Field>
+          <Checkbox label="Permanent ban" checked={permanent} disabled={!canBan} onCheckedChange={setPermanent} />
+          {!permanent ? <Field label="Duration (minutes)" required><Input type="number" min={1} max={10080} required value={duration} onChange={(e) => setDuration(e.target.value)} /></Field> : null}
+        </fieldset>
+        <div><Button type="submit" disabled={!canBan}>Review manual ban</Button></div>
+      </form>
+    </Card>
+    <Card title="Automatic ban settings" description="These settings are independent of firewall monitor and enforce modes.">
+      <form className="grid min-w-0 gap-3" onSubmit={(e) => { e.preventDefault(); if (draft) setConfirm("settings"); }}>
+        <Checkbox label="Enable automatic sign-in bans" checked={policy.enabled} onCheckedChange={(enabled) => setDraft({ ...policy, enabled })} />
+        <Checkbox label="Require more failures when only one account is targeted" checked={policy.countDistinctAccounts}
+          onCheckedChange={(countDistinctAccounts) => setDraft({ ...policy, countDistinctAccounts })} />
+        <div className="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {([
+            ["threshold", "Failure threshold", 3, 100],
+            ["windowMinutes", "Failure window (minutes)", 1, 60],
+            ["banMinutes", "First ban (minutes)", 1, 120],
+          ] as const).map(([key, label, min, max]) => <Field key={key} label={label} required>
+            <Input type="number" min={min} max={max} required value={policy[key]} onChange={(e) => setDraft({ ...policy, [key]: Number(e.target.value) })} />
+          </Field>)}
+          {([
+            ["factor", "Escalation multiplier", 2, 8],
+            ["maxMinutes", "Maximum ban (minutes)", policy.banMinutes, 10080],
+            ["memoryHours", "Escalation memory (hours)", 1, 168],
+          ] as const).map(([key, label, min, max]) => <Field key={key} label={label} required>
+            <Input type="number" min={min} max={max} required value={policy.escalation[key]}
+              onChange={(e) => setDraft({ ...policy, escalation: { ...policy.escalation, [key]: Number(e.target.value) } })} />
+          </Field>)}
+          <Field label="Permanent after this many bans" hint="Leave empty to keep all automatic bans temporary.">
+            <Input type="number" min={2} max={20} value={policy.permanentAfter ?? ""}
+              onChange={(e) => setDraft({ ...policy, permanentAfter: e.target.value ? Number(e.target.value) : null })} />
+          </Field>
+        </div>
+        <div><Button type="submit" disabled={!draft}>Review automatic ban settings</Button></div>
+      </form>
+    </Card>
+    {confirm ? <ConfirmDialog open onOpenChange={() => { setConfirm(null); setSelection(null); }}
+      destructive={confirm !== "release"}
+      title={confirm === "ban" ? "Apply this sign-in ban?" : confirm === "release" ? "Release this sign-in ban?" : "Save automatic ban settings?"}
+      description={confirm === "ban" ? `${address} will be blocked from credential endpoints ${permanent ? "until released" : `for ${duration} minutes`}.`
+        : confirm === "release" ? `${selection?.address ?? "This network"} can try to sign in again, subject to other protections.`
+          : "These changes can affect administrators and customers who share an address."}
+      confirmLabel={confirm === "ban" ? "Ban address" : confirm === "release" ? "Unban address" : "Save automatic ban settings"} onConfirm={apply} /> : null}
+  </>;
+}
+
+export function SignInBansPage() {
+  const trpc = useTRPC();
+  const query = useQuery(trpc.protection.listSignInBans.queryOptions());
+  return <Page index={6} description="Review and manage network restrictions for sign-in.">
+    {query.isPending ? <Skeleton lines={4} /> : query.isError ? <ErrorState error={query.error} onRetry={() => void query.refetch()} /> :
+      <SignInBanControls data={query.data} refetch={() => { void query.refetch(); }} />}
   </Page>;
 }
 

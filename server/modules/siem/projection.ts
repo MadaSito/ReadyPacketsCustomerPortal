@@ -31,26 +31,36 @@ const SAFE_ATTR_KEY = /^[a-z][a-z0-9_]{0,39}$/;
  * Arbitrary free-form text keys (`note`, `comment`, `summary`, `customer_label`, etc.) are NEVER exported.
  */
 export const EXTERNAL_STRING_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "ack_key",
   "action_kind",
   "audience",
   "auth_method",
   "bucket",
   "capability",
   "category",
+  "check_mode",
   "checkpoint_reason",
+  "close_reason",
   "continuity_mode",
+  "dataset",
   "decision",
   "derived_invoice_status",
   "dimension",
+  "discount_type",
   "disposition",
+  "enabled_from",
+  "enabled_to",
   "event_type",
+  "export_kind",
   "field",
+  "file_visibility",
   "flag",
   "format",
   "from_priority",
   "from_role",
   "from_state",
   "from_status",
+  "from_value",
   "integrity",
   "key_custody",
   "key_readiness",
@@ -63,6 +73,7 @@ export const EXTERNAL_STRING_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "mode_from",
   "mode_to",
   "next_step",
+  "panel",
   "phase",
   "previous_status",
   "priority",
@@ -71,68 +82,114 @@ export const EXTERNAL_STRING_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "profile",
   "protocol",
   "purpose",
+  "rate_limit_bucket",
   "receipt_confirmation",
   "record_type",
+  "release_reason",
+  "report_key",
   "role",
+  "rule_key",
   "scope_kind",
+  "selection",
   "setting_key",
+  "severity",
   "status",
+  "status_key",
   "target",
+  "task_key",
+  "task_kind",
   "template",
   "tls_mode",
   "to_priority",
   "to_role",
   "to_state",
   "to_status",
+  "to_value",
+  "trigger",
+  "via",
+  "visibility",
 ]);
 
-/** Integrity custody SHA-256 hex digest keys permitted on external audit checkpoint/export events. */
+/** Integrity custody SHA-256 hex digest keys permitted on external audit checkpoint/export/spec/template events (never personal data). */
 export const EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
-  "head_link_hmac_sha256",
+  "digest",
   "export_sha256",
+  "head_link_hmac_sha256",
+  "spec_hash",
+  "text_sha256",
 ]);
 
 /**
  * Strict typed allowlist of numeric attribute keys permitted to leave the installation.
  */
 export const EXTERNAL_NUMERIC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  "account_count",
+  "address_count",
   "attempt",
   "attempts",
+  "batch_size",
   "checkpoint_seq",
+  "confirmed_count",
+  "delay_hours",
+  "event_count",
+  "failed_count",
+  "generated_count",
+  "grace_hours",
   "keep_last_count",
   "max_age_days",
   "max_attempts",
+  "max_discount_bps",
+  "max_discount_percent",
+  "note_version",
+  "pause_minutes",
   "port",
+  "recipient_count",
   "revision_number",
+  "row_count",
+  "sessions_ended",
   "status_code",
+  "threshold",
   "tolerance_seconds",
+  "total_batch_size",
   "version",
   "version_number",
+  "window_minutes",
   "workflow_version",
 ]);
 
 /** Explicit allowlist of boolean/null flag keys permitted in external audit projections. */
 export const EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "active",
+  "affects_current_audience",
   "allow_private_address",
   "allow_private_network",
+  "allow_zero_total",
+  "automatic",
+  "can_reach_zero",
+  "compare",
+  "digest_matches",
   "email_verified",
   "enabled",
   "endpoint_changed",
+  "escalated",
   "expired",
+  "gates_removed",
   "has_auth_secret",
   "has_client_cert",
   "has_client_key",
   "has_custom_ca",
   "has_mtls",
   "include_bom",
+  "is_batch",
   "locked",
+  "manual",
   "mfa_enrolled",
   "mfa_required",
   "mfa_verified",
   "migrate_backlog",
   "must_change_password",
   "password_updated",
+  "permanent",
   "probe",
   "recovery_used",
   "remember_device",
@@ -144,6 +201,7 @@ export const EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
   "synthetic",
   "totp_enrolled",
   "truncated",
+  "typed_name_present",
   "uncertain_delivery",
   "was_enabled",
 ]);
@@ -151,15 +209,21 @@ export const EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
 /** Explicit allowlist of `safe_counts` metric keys permitted in external audit projections. */
 export const EXTERNAL_SAFE_COUNT_KEYS: ReadonlySet<string> = new Set([
   "active_spool",
+  "attached",
   "attempts",
   "backlog_migrated",
   "backlog_quarantined",
   "bytes",
   "categories",
+  "characters",
   "count",
+  "created",
   "delivered",
+  "drafted",
   "dropped",
   "events",
+  "events_added",
+  "expired_tickets",
   "failed",
   "files",
   "filtered_queued",
@@ -167,6 +231,7 @@ export const EXTERNAL_SAFE_COUNT_KEYS: ReadonlySet<string> = new Set([
   "matched",
   "migrated_queued",
   "missing",
+  "policy_references",
   "pruned",
   "purged",
   "quarantined_queued",
@@ -174,18 +239,51 @@ export const EXTERNAL_SAFE_COUNT_KEYS: ReadonlySet<string> = new Set([
   "records",
   "removed_outbox_items",
   "replayed",
+  "requested",
   "returned",
+  "rows",
   "sessions_revoked",
+  "skipped",
   "spool_max",
+  "staging_removed",
   "succeeded",
   "total",
   "uncertain_events",
+  "unpublished",
+  "workflows",
 ]);
 
-/** Closed value vocabularies for discrete enum attributes; remaining allowlisted string keys require strict lowercase identifier syntax. */
-const EXTERNAL_ENUM_VOCABULARIES: Readonly<Record<string, ReadonlySet<string>>> = {
+/**
+ * Closed value vocabularies for discrete enum attributes; remaining allowlisted string keys require strict lowercase identifier syntax.
+ */
+export const EXTERNAL_ENUM_VOCABULARIES: Readonly<Record<string, ReadonlySet<string>>> = {
   category: VALID_CATEGORIES,
   min_severity: VALID_SEVERITIES,
+  severity: new Set(["low", "medium", "high", "critical", ...SEVERITIES]),
+  rule_key: new Set([
+    "brute_force_account",
+    "password_spraying",
+    "credential_stuffing",
+    "distributed_account",
+    "success_after_failures",
+    "mfa_fatigue",
+    "rate_limit_repeated",
+    "ban_evasion",
+    "privilege_then_export",
+  ]),
+  close_reason: new Set(["resolved", "false_positive", "duplicate", "accepted_risk"]),
+  check_mode: new Set(["off", "warn", "require"]),
+  discount_type: new Set(["percent", "fixed", "set_total"]),
+  export_kind: new Set(["codes", "redemptions", "builtin", "custom"]),
+  visibility: new Set(["private", "shared", "internal", "customer", "public"]),
+  file_visibility: new Set(["private", "shared", "internal", "customer", "public"]),
+  task_kind: new Set(["upload", "acknowledge", "order_note", "record", "respond_document"]),
+  selection: new Set(["all", "keys"]),
+  trigger: new Set(["admin", "deadline", "decline", "manual", "schedule"]),
+  enabled_from: new Set(["true", "false"]),
+  enabled_to: new Set(["true", "false"]),
+  from_value: new Set(["true", "false"]),
+  to_value: new Set(["true", "false"]),
   role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
   from_role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
   to_role: new Set(["admin", "staff", "customer", "system", "anonymous"]),
@@ -387,6 +485,27 @@ export function matchesDestinationFilter(
   const minRank = OTEL_SEVERITY_NUMBER[filter.minSeverity] ?? OTEL_SEVERITY_NUMBER.INFO;
   if (eventRank < minRank) return false;
   return filter.categories.includes(event.category);
+}
+
+/**
+ * Projects a raw `AuditEnvelopeLike` for external SIEM delivery: applies the audit module's
+ * envelope identity/address-class projection while evaluating `attributes` and `safe_counts`
+ * against SIEM's strict typed allowlists and closed vocabularies without double-counting drops.
+ */
+export function projectAuditEnvelopeForSiem(
+  rawEvent: AuditEnvelopeLike,
+  externalProjector?: (event: AuditEnvelopeLike) => ExternalAuditEvent,
+): ExternalAuditEvent {
+  if (!externalProjector) {
+    return sanitizeProjectedEvent(rawEvent);
+  }
+  const base = externalProjector(rawEvent);
+  return sanitizeProjectedEvent({
+    ...base,
+    attributes: rawEvent.attributes,
+    safe_counts: rawEvent.safe_counts,
+    dropped_attributes: rawEvent.dropped_attributes,
+  });
 }
 
 /**

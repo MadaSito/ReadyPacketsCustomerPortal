@@ -387,3 +387,43 @@ The result is `{ importPublicId, replayed, results: { key, action, workflowKey, 
 - `workflow.imported` (digest, source_label, outcome, gates_removed; counts created / drafted / skipped; import id).
 
 **Body size:** `packageText` is capped at 2 MiB by zod. The per-path HTTP body cap (about 6 MiB for preview and applyImport) is owned by http_security_engineer.
+
+## Increment 06 — D8 customer tasks, D10 transfer default, D14 order agreement gate
+
+Additive. Existing workflow definitions stay valid; every new field is optional and old stored values parse with defaults.
+
+### D8: definition fields (per status `requirements`)
+
+| Field | Values | Notes |
+| --- | --- | --- |
+| `uploads[].kind` | `document` \| `audio` | `audio` with `capture` is a **record** task |
+| `uploads[].capture` | `either` \| `record` \| `upload` | audio only; default `either` |
+| `uploads[].maxMinutes` | 1–120 | audio only; `RECORD_MINUTES_RANGE` outside the range |
+| `uploads[].allowedTypes` | server extension list | the designer offers presets: Word (docx), PDF, Images (png, jpg), Audio (mp3, m4a, wav, ogg, webm, mp4, aac) |
+| `acknowledgements[].source` | `definition` \| `order_note` | `order_note`: staff write a per-order note the customer acknowledges with the definition text |
+| `documents[]` | `{ key, label, hint?, required, responseModes[], allowedTypes[] }`, ≤ 5 per status | `responseModes` ⊆ `edit_in_portal`, `upload_reply`, `acknowledge`; `edit_in_portal` needs `docx` |
+
+Workflow transfer packages are `formatVersion: 2`; import accepts 1 and 2.
+
+### D8: `orders.requirements.*`
+
+| Procedure | Guard | Notes |
+| --- | --- | --- |
+| `forOrder` (query) | order access | adds `uploads[].{taskKind, capture, maxMinutes, waived}`, `acknowledgements[].{source, orderNote, canEditNote, waived}` (`canAccept` false until the note exists), `documents[]` (`replySlotKey` = `<key>_reply`, `sourceCount`, `replyCount`, `acknowledged`, `textSha256` of `label\n\nhint`, `met`, `waived`, `canStaffUpload`, `canReply` false until a source exists, `canEdit`, `canAcknowledge`), top-level `canWaive`, `agreementPending: { policyPublicId, signatureMode } \| null` |
+| `setTaskNote` | staff, `orders.manage` | `{ orderId, statusKey, ackKey, body ≤ 4000 plain text, expectedVersion? }`. Errors `TASK_NOTE_MARKUP`, `TASK_NOTE_LENGTH`, `TASK_NOT_FOUND`, `TASK_NOTE_ACKNOWLEDGED`, `STALE_VERSION`. Audit `order.task_note.saved` |
+| `waive` | staff, `orders.phase.unlock` | `{ orderId, statusKey, taskKey, reason 10–500 }`; the reason is kept as an internal note. Errors `TASK_NOT_FOUND`, `TASK_ALREADY_WAIVED`. Audit `order.task.waived` |
+| `acknowledge` | as before | new errors `ACK_NOTE_MISSING`, `DOCUMENT_NOT_READY` |
+
+Files port: `FileUploadSlot` gains `task { kind: upload \| record \| document_source \| document_reply, taskKey }`, `capture`, `maxMinutes`, `acceptsUpload`, `acceptsEdit`, `sourceSlotKey`. Source slot `K` is staff-only; `K_reply` is customer-only. The client links to `/orders/:id/files?slot=K[&mode=record]` (console `/admin/orders/:id/files?…`); the Files tab owns the recorder and focus.
+
+### D10: workflow transfer default
+
+`orders.workflow_transfer.enabled` now defaults to **true** (an old stored `false` stays false). `transfer.status` adds `canToggle`. `transfer.setEnabled({ enabled })` (admin + `workflows.manage`; no step-up, as export needs none) ⇒ `{ enabled, changed }`; audit `workflow.transfer_setting_changed` with `setting_key`, `from_value`, `to_value`, `via=workflows_page`. The switch is on the Workflows page.
+
+### D14: order agreement gate (setting `orders.agreement_gate`)
+
+- Shape `{ enabled (default false), policyPublicId, applyTo: { placeOrder, workOnOrder }, signatureMode: checkbox \| typed_name, askAgainOnNewVersion }`. A damaged stored value parses to "off" for display, but enforcement fails closed with `UNAVAILABLE ORDER_GATES_UNAVAILABLE`.
+- `orders.admin.agreementGate.get` / `update({ setting, expectedEnabled? })` (admin + `policies.manage`, which needs a fresh step-up, re-checked from the database; otherwise `STEP_UP_REQUIRED`). Errors `AGREEMENT_SETTING_INVALID`, `AGREEMENT_POLICY_INVALID`, `AGREEMENT_SETTING_CHANGED`. Audit `order.agreement_gate.updated` in the tx with `setting_key`, `enabled_from`, `enabled_to`, `policy_from`, `policy_public_id`, `apply_place_order`, `apply_work_on_order`, `signature_mode`, `ask_again_on_new_version`. The admin card (`/admin/policies#order-agreement`) belongs to compliance.
+- `orders.agreement.status({ scope: placeOrder \| workOnOrder })` ⇒ `{ required, met, policyPublicId, signatureMode }`.
+- Enforcement is an implicit gate (`gate.key = "order_agreement"`) on the ADR 0039 gateway. Ports for other modules: `assertCustomerMayPlaceOrder` (cart; also enforced inside `createOrderFromCheckoutInTx`) and `assertCustomerMayWork` (files). Staff and API v1 (`assertSystemMayWork`) are exempt.
+- Refusal: `CONFLICT AGREEMENT_REQUIRED` with `details { policyPublicId, signatureMode }`. The order wizard, the order page status change and the customer task panel open the shared `AgreementDialog` (`@/lib/agreementGate`) and retry once after acceptance (the wizard reuses its idempotency key; a status change resends the identical request with the same `expectedVersion`).

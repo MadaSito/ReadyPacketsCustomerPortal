@@ -14,6 +14,7 @@ import {
   StatGrid,
   type Column,
 } from "@/ui";
+import { EndPolicySessionsAction } from "../../policyUpdates/PolicyEnforcementCards";
 import { TimestampWithUtc, formatPolicyAudience } from "./shared";
 import {
   useAcceptanceLogProcedures,
@@ -138,6 +139,8 @@ function CoveragePolicyCard({ policy }: { policy: PolicyCoverageDocumentView }) 
               columns={outstandingColumnsFor(policy.title)}
               rows={policy.outstandingCustomers}
               rowKey={(row) => row.customer.userPublicId}
+              rowActions={(row) => <EndPolicySessionsAction userPublicId={row.customer.userPublicId}
+                versionPublicId={policy.currentVersionPublicId} customerName={row.customer.name} checkOnDemand />}
             />
             {policy.outstandingTruncated ? (
               <Callout tone="info" title="Preview capped">

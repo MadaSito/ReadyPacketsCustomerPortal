@@ -3,6 +3,7 @@ import { Link } from "wouter";
 import { useAuthApi, type Accepted } from "@/lib/authApi";
 import { errorMessage } from "@/lib/trpc";
 import { Button, Callout, Field, Input } from "@/ui";
+import { RateLimitCountdown } from "@/lib/RateLimitCountdown";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PreviewLinkCallout, useFocusOnError } from "../components/bits";
 
@@ -10,6 +11,8 @@ export default function ForgotPasswordPage() {
   const api = useAuthApi();
   const [email, setEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /** D7: the raw failure, so a rate-limited response can show its authoritative retry countdown. */
+  const [failure, setFailure] = useState<unknown>(null);
   const [done, setDone] = useState<Accepted | null>(null);
   const [busy, setBusy] = useState(false);
   const errorRef = useFocusOnError(error);
@@ -21,10 +24,12 @@ export default function ForgotPasswordPage() {
       return;
     }
     setError(null);
+    setFailure(null);
     setBusy(true);
     try {
       setDone(await api.requestPasswordReset({ email: email.trim() }));
     } catch (err) {
+      setFailure(err);
       setError(errorMessage(err));
     } finally {
       setBusy(false);
@@ -46,6 +51,7 @@ export default function ForgotPasswordPage() {
       ) : (
         <>
           <FormError message={error} focusRef={errorRef} />
+      <RateLimitCountdown error={failure} />
           <form onSubmit={submit} noValidate className="flex flex-col gap-5">
             <Field label="Email">
               <Input type="email" autoComplete="username" inputMode="email" autoCapitalize="none" spellCheck={false} value={email} onChange={(e) => setEmail(e.target.value)} maxLength={254} />

@@ -140,6 +140,25 @@ describe("PromoCodeField", () => {
     expect(await errorText("Add $20.00 more to use this code.")).toBeTruthy();
   });
 
+  it("D5: names a store-wide limit; only a staff refusal with the known href links to the Limits card", async () => {
+    const user = userEvent.setup();
+    const limitError = (details?: Record<string, unknown>) => Object.assign(new Error("PROMO_LIMIT_ZERO_TOTAL"), {
+      data: { safe: { domainCode: "VALIDATION", reasonCode: "PROMO_LIMIT_ZERO_TOTAL", safeMessage: "This code would make the order free, which the store does not allow.", requestId: "r", ...(details ? { details } : {}) } },
+    });
+    const { unmount } = page(<Host onApply={async () => { throw limitError({ limit: "allowZeroTotal", limitLabel: "Allow zero-total orders", limitsHref: "/admin/promotions#limits" }); }} />);
+    await user.type(screen.getByLabelText("Discount code"), "FREE-ORDER");
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(await errorText("This code would make the order free, which the store does not allow.")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review “Allow zero-total orders” in the Limits card" })).toHaveAttribute("href", "/admin/promotions#limits");
+    unmount();
+    // Customers get no href from the server; an unexpected href is never rendered.
+    page(<Host onApply={async () => { throw limitError({ limit: "allowZeroTotal", limitsHref: "https://evil.example/" }); }} />);
+    await user.type(screen.getByLabelText("Discount code"), "FREE-ORDER");
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(await errorText("This code would make the order free, which the store does not allow.")).toBeTruthy();
+    expect(screen.queryByRole("link")).toBeNull();
+  });
+
   it("offers a code saved from a link without applying it, then clears it once applied", async () => {
     const user = userEvent.setup();
     savePromoCode("LINK-CODE-77");

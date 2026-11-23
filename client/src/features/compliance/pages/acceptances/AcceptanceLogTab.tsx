@@ -2,6 +2,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link } from "wouter";
 import {
+  Badge,
   Button,
   CopyButton,
   DataTable,
@@ -32,7 +33,22 @@ import {
   type AcceptanceLogItem,
   type AcceptanceLogMethod,
   type AcceptanceLogSource,
+  type SignatureMatchKind,
 } from "./types";
+
+export function SignatureMatchBadge({ match }: { match?: SignatureMatchKind | null }) {
+  if (!match) return null;
+  switch (match) {
+    case "exact":
+      return <Badge tone="success">Matched (full name)</Badge>;
+    case "first_last":
+      return <Badge tone="success">Matched (first + last)</Badge>;
+    case "mismatch_warn":
+      return <Badge tone="warning">Name mismatch (warn)</Badge>;
+    case "unchecked":
+      return <Badge tone="neutral">Name unchecked</Badge>;
+  }
+}
 
 export interface AcceptanceLogUiFilters {
   customerDraft: string;
@@ -163,9 +179,10 @@ export function AcceptanceLogTab({
         key: "sourceMethod",
         header: "Source & method",
         cell: (row) => (
-          <div className="flex flex-col gap-0.5">
+          <div className="flex flex-col items-start gap-1">
             <span className="font-medium text-ink">{formatAcceptanceSource(row.source)}</span>
             <span className="text-xs text-muted">{formatAcceptanceMethod(row.method)}</span>
+            <SignatureMatchBadge match={row.signatureMatch} />
           </div>
         ),
       },

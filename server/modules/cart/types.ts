@@ -148,9 +148,12 @@ export const dismissUpsellInputSchema = z
   })
   .strict();
 
+export const adminUpsellRuleTypeSchema = z.enum(["standard", "next_packet", "bundle_completion"]);
+
 export const adminUpsellOfferFieldsSchema = z
   .object({
     kind: z.enum(["add_on", "tier_upgrade"]),
+    ruleType: adminUpsellRuleTypeSchema.optional().default("standard"),
     title: nfcTrim(1, 120),
     shortText: nfcTrim(1, 200),
     triggerMode: z.enum(["any_cart", "products"]),
@@ -176,6 +179,7 @@ export const adminUpsellUpdateInputSchema = z
     offerPublicId: ulidSchema,
     expectedVersion: z.number().int().min(1).max(1_000_000_000),
     kind: z.enum(["add_on", "tier_upgrade"]),
+    ruleType: adminUpsellRuleTypeSchema.optional(),
     title: nfcTrim(1, 120),
     shortText: nfcTrim(1, 200),
     triggerMode: z.enum(["any_cart", "products"]),
@@ -199,6 +203,25 @@ export const adminUpsellSetActiveInputSchema = z
     offerPublicId: ulidSchema,
     expectedVersion: z.number().int().min(1).max(1_000_000_000),
     active: z.boolean(),
+  })
+  .strict();
+
+export const adminUpsellSetFeatureInputSchema = z
+  .object({
+    enabled: z.boolean(),
+    alsoEnableCart: z.boolean().optional().default(false),
+  })
+  .strict();
+
+export const adminUpsellSetAllActiveInputSchema = z
+  .object({
+    active: z.boolean(),
+  })
+  .strict();
+
+export const adminUpsellDuplicateInputSchema = z
+  .object({
+    offerPublicId: ulidSchema,
   })
   .strict();
 
@@ -352,6 +375,19 @@ export interface CartUpsellSuggestionView {
   } | null;
 }
 
+export interface CartSmallTotalEvaluationView {
+  minimumMinor: number;
+  belowMinimum: boolean;
+  smallTotalAction: "none" | "zero_total" | "waive" | "block";
+}
+
+export interface CartPlaceOrderAgreementView {
+  required: boolean;
+  met: boolean;
+  policyPublicId: string | null;
+  signatureMode: "checkbox" | "typed_name";
+}
+
 export interface CartView {
   cartPublicId: string | null;
   version: number;
@@ -370,7 +406,9 @@ export interface CartView {
   paymentProvider: "none" | "stripe" | "square";
   paymentEnvironment: "test" | "live";
   onlinePaymentEnabled: boolean;
+  smallTotalEvaluation: CartSmallTotalEvaluationView | null;
   pendingPolicies: PublishedPolicyView[];
+  placeOrderAgreement?: CartPlaceOrderAgreementView;
   updatedAt: Date | null;
 }
 
@@ -389,7 +427,9 @@ export interface AdminCartUpsellCatalogProductView {
 export interface AdminCartUpsellOfferView {
   offerPublicId: string;
   version: number;
+  seedKey: string | null;
   kind: "add_on" | "tier_upgrade";
+  ruleType: "standard" | "next_packet" | "bundle_completion";
   title: string;
   shortText: string;
   triggerMode: "any_cart" | "products";
@@ -430,6 +470,19 @@ export type CheckoutCartResult =
       invoiceNumber: string;
       currency: string;
       totalMinor: 0;
+      receiptPublicId?: string | null;
+    }
+  | {
+      mode: "waived_small_total";
+      cartPublicId: string;
+      orderPublicId: string;
+      orderReference: string;
+      invoicePublicId: string;
+      invoiceNumber: string;
+      currency: string;
+      totalMinor: number;
+      waivedMinor: number;
+      receiptPublicId?: string | null;
     }
   | {
       mode: "invoice";
@@ -467,7 +520,7 @@ export type CheckoutConfirmationState =
 export interface CheckoutStatusResult {
   cartPublicId: string;
   confirmationState: CheckoutConfirmationState;
-  paymentMode: "invoice" | "redirect" | "no_payment_due";
+  paymentMode: "invoice" | "redirect" | "no_payment_due" | "waived_small_total";
   provider: "none" | "stripe" | "square";
   attemptPublicId: string | null;
   attemptStatus: "created" | "redirected" | "paid" | "failed" | "expired" | "cancelled" | null;
@@ -486,7 +539,9 @@ export interface CheckoutStatusResult {
   taxRateBps: number;
   taxMinor: number;
   totalMinor: number;
+  waivedMinor: number;
   balanceDueMinor: number;
+  receiptPublicId?: string | null;
   canRestoreToCart: boolean;
   alreadyRestored: boolean;
   checkedOutAt: Date | null;
@@ -561,9 +616,25 @@ export interface CartModule extends ModuleLifecycle {
     principal: SessionPrincipal,
     input: z.infer<typeof adminUpsellSetActiveInputSchema>,
   ): Promise<AdminCartUpsellOfferView>;
+  adminSetUpsellFeature(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellSetFeatureInputSchema>,
+  ): Promise<{ featureCartEnabled: boolean; featureUpsellEnabled: boolean }>;
+  adminSetAllUpsellOffersActive(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellSetAllActiveInputSchema>,
+  ): Promise<{ active: boolean; updatedCount: number; skippedUnavailableCount: number }>;
+  adminSeedSuggestedUpsellOffers(
+    principal: SessionPrincipal,
+  ): Promise<{ addedCount: number; skippedExistingCount: number }>;
+  adminDuplicateUpsellOffer(
+    principal: SessionPrincipal,
+    input: z.infer<typeof adminUpsellDuplicateInputSchema>,
+  ): Promise<AdminCartUpsellOfferView>;
   adminDeleteUpsellOffer(
     principal: SessionPrincipal,
     input: z.infer<typeof adminUpsellDeleteInputSchema>,
   ): Promise<{ deleted: true; offerPublicId: string }>;
+  ensureDefaultUpsellOffers(): Promise<{ addedCount: number; skippedExistingCount: number }>;
   expireAbandonedCarts(options?: { limit?: number }): Promise<{ expiredCount: number }>;
 }

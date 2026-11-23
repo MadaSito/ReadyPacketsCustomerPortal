@@ -2,9 +2,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
+import {
+  AgreementDialog,
+  parseAgreementRequiredDetails,
+  SafePolicyText,
+  type AgreementRequiredDetails,
+} from "@/lib/agreementGate";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, EmptyState, ErrorState, Field, Input, Money, PageHeader, Skeleton, Textarea } from "@/ui";
-import { SafePolicyText } from "../compliance/shared";
 import type { CartViewData } from "./CartPage";
 
 const emptyBilling = {
@@ -106,19 +111,61 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   const [note, setNote] = useState(cart.note);
   const [billing, setBilling] = useState<Billing>(cart.billing ?? emptyBilling);
   const [policies, setPolicies] = useState<Record<string, PolicyDraft>>({});
+  const [policyErrors, setPolicyErrors] = useState<Record<string, { message: string; expectedName: string | null }>>({});
   const [submitting, setSubmitting] = useState(false);
   const [failure, setFailure] = useState<{ message: string; checkStatus: boolean }>();
   const [reconfirmNotice, setReconfirmNotice] = useState<string | null>(null);
+  const [agreementPrompt, setAgreementPrompt] = useState<AgreementRequiredDetails | null>(null);
+  const [acceptedAgreementPolicyIds, setAcceptedAgreementPolicyIds] = useState<string[]>([]);
   const reconfirmRef = useRef<HTMLDivElement>(null);
+  const signerInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
   const request = useRef<{ version: number; key: string } | null>(null);
   const inFlight = useRef(false);
   const statusHref = `/checkout/return?cart=${encodeURIComponent(cart.cartPublicId)}`;
+  const currency = cart.totals.currency!;
   const noPaymentDue = cart.totals.totalMinor === 0;
-  const online = !noPaymentDue && cart.onlinePaymentEnabled && cart.paymentProvider !== "none";
+  const smallEval = cart.smallTotalEvaluation;
+  const waivedSmallTotal = !noPaymentDue && smallEval?.smallTotalAction === "waive";
+  const blockedSmallTotal = !noPaymentDue && smallEval?.smallTotalAction === "block";
+  const online =
+    !noPaymentDue &&
+    !waivedSmallTotal &&
+    !blockedSmallTotal &&
+    cart.onlinePaymentEnabled &&
+    cart.paymentProvider !== "none";
+
+  // Decision D14: compute effective typed-signature requirement from both `policy.requiresTypedSignature`
+  // and `cart.placeOrderAgreement` (`signatureMode === "typed_name"`) so `/cart/checkout` renders an
+  // inline typed-name field (never a checkbox-only dead end, and never asking twice). Policies already
+  // signed via `AgreementDialog` in this session are omitted from inline prompts on retry.
+  function policyNeedsTypedSignature(policy: Policy): boolean {
+    if (policy.requiresTypedSignature) return true;
+    const gate = cart.placeOrderAgreement;
+    return Boolean(
+      gate?.required &&
+      gate.signatureMode === "typed_name" &&
+      gate.policyPublicId === policy.documentPublicId,
+    );
+  }
+
+  function getInlinePendingPolicies(extraAcceptedPolicyId?: string): Policy[] {
+    const acceptedSet = new Set(acceptedAgreementPolicyIds);
+    if (extraAcceptedPolicyId) acceptedSet.add(extraAcceptedPolicyId);
+    return cart.pendingPolicies.filter((policy) => !acceptedSet.has(policy.documentPublicId));
+  }
+  const inlinePendingPolicies = getInlinePendingPolicies();
 
   function updatePolicy(policy: Policy, update: Partial<PolicyDraft>) {
     const key = policyKey(policy);
     setPolicies((previous) => ({ ...previous, [key]: { ...(previous[key] ?? emptyPolicy), ...update } }));
+    if (update.signerName !== undefined) {
+      setPolicyErrors((previous) => {
+        if (!(key in previous)) return previous;
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
+    }
   }
 
   async function handleApplyPromo(code: string) {
@@ -138,18 +185,17 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     setFailure(undefined);
   }
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function performCheckout(justAcceptedPolicyPublicId?: string) {
     if (inFlight.current) return;
     if (!projectName.trim() || billingFields.some((field) => field.required && !billing[field.key].trim()) ||
         !/^[A-Za-z]{2}$/u.test(billing.country.trim())) {
       setFailure({ message: "Complete the required billing and project fields. Use a two-letter country code.", checkStatus: false });
       return;
     }
-    const pending = cart.pendingPolicies;
+    const pending = getInlinePendingPolicies(justAcceptedPolicyPublicId);
     if (pending.some((policy) => {
       const draft = policies[policyKey(policy)];
-      return !draft?.accepted || (policy.requiresTypedSignature && !draft.signerName.trim());
+      return !draft?.accepted || (policyNeedsTypedSignature(policy) && !draft.signerName.trim());
     })) {
       setFailure({ message: "Review and accept each required policy, and sign where indicated.", checkStatus: false });
       return;
@@ -158,6 +204,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     inFlight.current = true;
     setSubmitting(true);
     setFailure(undefined);
+    setPolicyErrors({});
     setReconfirmNotice(null);
     try {
       const result = await client.cart.checkout.mutate({
@@ -165,7 +212,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
         billing: { ...billing, country: billing.country.trim().toUpperCase() },
         policyAcceptances: pending.map((policy) => ({
           versionPublicId: policy.versionPublicId, contentHash: policy.contentHash,
-          ...(policy.requiresTypedSignature ? { signerName: policies[policyKey(policy)]!.signerName.trim() } : {}),
+          ...(policyNeedsTypedSignature(policy) ? { signerName: policies[policyKey(policy)]!.signerName.trim() } : {}),
         })),
         idempotencyKey: request.current.key,
       });
@@ -177,7 +224,42 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       }
       navigate(`/checkout/return?cart=${encodeURIComponent(result.cartPublicId)}`, { replace: true });
     } catch (error) {
+      const agreementDetails = parseAgreementRequiredDetails(error);
+      if (agreementDetails) {
+        request.current = null;
+        setAgreementPrompt(agreementDetails);
+        return;
+      }
       const code = safeError(error);
+      if (code?.reasonCode === "SIGNER_NAME_MISMATCH") {
+        request.current = null;
+        const details =
+          code.details && typeof code.details === "object"
+            ? (code.details as { expectedName?: unknown; versionPublicId?: unknown; documentPublicId?: unknown })
+            : null;
+        const expectedName =
+          typeof details?.expectedName === "string" && details.expectedName.length > 0 ? details.expectedName : null;
+        const targetVersionId = typeof details?.versionPublicId === "string" ? details.versionPublicId : null;
+        const targetDocId = typeof details?.documentPublicId === "string" ? details.documentPublicId : null;
+        const baseMsg = errorMessage(error, "The typed signature must match your account profile name.");
+        const matching = pending.filter((policy) => {
+          if (!policyNeedsTypedSignature(policy)) return false;
+          if (targetVersionId) return policy.versionPublicId === targetVersionId;
+          if (targetDocId) return policy.documentPublicId === targetDocId;
+          return true;
+        });
+        const targets = matching.length > 0 ? matching : pending.filter((policy) => policyNeedsTypedSignature(policy));
+        if (targets.length > 0) {
+          const nextErrors: Record<string, { message: string; expectedName: string | null }> = {};
+          for (const policy of targets) {
+            nextErrors[policyKey(policy)] = { message: baseMsg, expectedName };
+          }
+          setPolicyErrors(nextErrors);
+          const firstKey = policyKey(targets[0]!);
+          requestAnimationFrame(() => signerInputRefs.current.get(firstKey)?.focus());
+          return;
+        }
+      }
       if (code?.reasonCode === "PROMO_RECONFIRM_TOTAL" || code?.reasonCode === "TOTAL_CHANGED_RECONFIRM") {
         request.current = null;
         await reload();
@@ -191,7 +273,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
         request.current = null;
         await reload();
         setFailure({ message: "Your cart changed. Review the refreshed details and totals before placing your order.", checkStatus: false });
-      } else if (code?.reasonCode && ["POLICY_VERSION_NOT_FOUND", "POLICY_VERSION_SUPERSEDED", "POLICY_HASH_MISMATCH", "POLICY_ACCEPTANCE_REQUIRED"].includes(code.reasonCode)) {
+      } else if (code?.reasonCode && ["POLICY_VERSION_NOT_FOUND", "POLICY_VERSION_SUPERSEDED", "POLICY_HASH_MISMATCH", "POLICY_ACCEPTANCE_REQUIRED", "TYPED_SIGNATURE_REQUIRED"].includes(code.reasonCode)) {
         request.current = null;
         await reload();
         setFailure({ message: "The required policies changed. Review the refreshed versions and accept them before placing your order.", checkStatus: false });
@@ -205,13 +287,19 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     }
   }
 
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await performCheckout();
+  }
+
+  const noCardCharge = noPaymentDue || waivedSmallTotal;
   const submitLabel = reconfirmNotice
-    ? noPaymentDue
+    ? noCardCharge
       ? "Confirm new total and place order"
       : online
         ? "Confirm new total and continue to payment"
         : "Confirm new total and receive invoice"
-    : noPaymentDue
+    : noCardCharge
       ? "Place order"
       : online
         ? "Place order and continue to payment"
@@ -234,19 +322,47 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
           </Field>)}
         </div>
       </Card>
-      {cart.pendingPolicies.length ? <Card title="Required policies" description="Read and accept the current versions before placing your order.">
+      {inlinePendingPolicies.length ? <Card title="Required policies" description="Read and accept the current versions before placing your order.">
         <div className="grid gap-5">
-          {cart.pendingPolicies.map((policy) => {
-            const draft = policies[policyKey(policy)] ?? emptyPolicy;
-            return <div key={policyKey(policy)} className="grid gap-3 rounded-lg border border-line p-3 sm:p-4">
+          {inlinePendingPolicies.map((policy) => {
+            const pKey = policyKey(policy);
+            const draft = policies[pKey] ?? emptyPolicy;
+            const needsTyped = policyNeedsTypedSignature(policy);
+            const fieldErr = policyErrors[pKey];
+            return <div key={pKey} className="grid gap-3 rounded-lg border border-line p-3 sm:p-4">
               <details>
                 <summary className="cursor-pointer break-words font-semibold text-action">{policy.title} · Version {policy.versionNumber}</summary>
                 <div className="mt-3"><SafePolicyText bodyText={policy.bodyText} format={policy.contentFormat} /></div>
               </details>
               <Checkbox label={`I have read and agree to ${policy.title} (version ${policy.versionNumber}).`}
                 checked={draft.accepted} onCheckedChange={(accepted) => updatePolicy(policy, { accepted })} disabled={submitting} />
-              {policy.requiresTypedSignature ? <Field label={`Type your full name to sign ${policy.title}`} hint="Use the name on your ReadyPackets profile." required>
-                <Input value={draft.signerName} onChange={(e) => updatePolicy(policy, { signerName: e.target.value })} maxLength={160} required disabled={submitting} />
+              {needsTyped ? <Field
+                label={`Type your full name to sign ${policy.title}`}
+                hint={<span>
+                  {fieldErr?.expectedName
+                    ? <>Expected account name: <strong>{fieldErr.expectedName}</strong>. </>
+                    : <>Use the name on your ReadyPackets profile </>}
+                  (<Link href="/account" className="text-action underline">update name in profile</Link>).
+                </span>}
+                error={fieldErr
+                  ? fieldErr.expectedName
+                    ? `${fieldErr.message} Expected account name: ${fieldErr.expectedName}.`
+                    : fieldErr.message
+                  : undefined}
+                required
+              >
+                <Input
+                  ref={(el) => {
+                    if (el) signerInputRefs.current.set(pKey, el);
+                    else signerInputRefs.current.delete(pKey);
+                  }}
+                  value={draft.signerName}
+                  onChange={(e) => updatePolicy(policy, { signerName: e.target.value })}
+                  maxLength={160}
+                  autoComplete="name"
+                  required
+                  disabled={submitting}
+                />
               </Field> : null}
             </div>;
           })}
@@ -255,8 +371,13 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     </form>
     <div className="grid min-w-0 gap-4">
       <CheckoutSummary cart={cart} submitting={submitting} onApplyPromo={handleApplyPromo} onRemovePromo={handleRemovePromo} />
-      {noPaymentDue ? <Callout tone="success" title="Nothing to pay - your discount covers this order">
+      {noPaymentDue ? <Callout tone="success" title="Nothing to pay — your discount covers this order.">
         We’ll place your order and issue a settled zero-balance invoice. No payment is collected.
+      </Callout> : waivedSmallTotal && smallEval ? <Callout tone="success" title="Remaining balance will be waived">
+        Your remaining balance (<Money value={{ amountMinor: cart.totals.totalMinor, currency }} />) is below the online payment minimum (
+        <Money value={{ amountMinor: smallEval.minimumMinor, currency }} />) and will be waived automatically. No card payment is collected.
+      </Callout> : blockedSmallTotal && smallEval ? <Callout tone="warning" title="Total below online payment minimum">
+        Online card payments require at least <Money value={{ amountMinor: smallEval.minimumMinor, currency }} />. Add another item in your cart or remove the discount code before placing your order.
       </Callout> : online ? <Callout tone={cart.paymentEnvironment === "test" ? "warning" : "info"} title={cart.paymentEnvironment === "test" ? "Test checkout" : "Secure hosted payment"}>
         {cart.paymentEnvironment === "test" ? "This checkout uses a test environment. No real money is collected." :
           "You’ll continue to the payment provider. ReadyPackets never collects your card details."}
@@ -272,6 +393,24 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       </Callout> : null}
       <Button type="submit" form={checkoutFormId} size="lg" loading={submitting} disabled={submitting}>{submitLabel}</Button>
     </div>
+
+    <AgreementDialog
+      open={agreementPrompt !== null}
+      policyPublicId={agreementPrompt?.policyPublicId ?? ""}
+      signatureMode={agreementPrompt?.signatureMode ?? "typed_name"}
+      onClose={() => setAgreementPrompt(null)}
+      onAccepted={async () => {
+        const acceptedPolicyId = agreementPrompt?.policyPublicId;
+        if (acceptedPolicyId) {
+          setAcceptedAgreementPolicyIds((prev) =>
+            prev.includes(acceptedPolicyId) ? prev : [...prev, acceptedPolicyId],
+          );
+        }
+        setAgreementPrompt(null);
+        request.current = null;
+        await performCheckout(acceptedPolicyId);
+      }}
+    />
   </div>;
 }
 

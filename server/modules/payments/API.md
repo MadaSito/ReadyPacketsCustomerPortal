@@ -279,3 +279,20 @@ Mounted by `http_security_engineer` (`server/http/API.md` slots `K webhook` and 
   - Drizzle tables `paymentAttempts`, `paymentWebhookEvents`, `paymentRefunds` from `server/modules/payments/schema.ts`
 - Client export (for `/root` `client/src/app/registry.ts`):
   - `paymentsFeature` from `client/src/features/payments/routes.tsx` (`/admin/payments`, Console group `"Billing & compliance"`, `order: 41`, `capability: "payments.manage"`, plus Console order workspace Refunds tab).
+
+---
+
+## 7. Increment 06 — D5 Small Totals & Provider Minimums + D15 Receipt Preferences
+
+- Settings (`server/modules/payments/settings.ts`):
+  - `payments.small_totals`: `{ belowProviderMinimum: "waive" | "block" }` (default `"waive"`, backward-compatible parse with defaults).
+  - `payments.receipts`: `{ enabled: boolean, emailCustomer: boolean, footerText: string }` (default `{ enabled: true, emailCustomer: true, footerText: "" }`).
+- Provider minimum table (`server/modules/payments/providerMinimums.ts`):
+  - Exports `providerMinimumMinor(provider, currency)` (`50` minor units USD/EUR/CAD/AUD, `30` GBP for Stripe; `100` minor units for Square; `0` when `provider === "none"`), `evaluateSmallTotalForProvider`, and `PaymentsModule.evaluateSmallTotal(amountMinor, currency, opts?)`.
+- Checkout settlement (`StartCheckoutResult` in `server/modules/payments/types.ts`):
+  - `{ mode: "settled_zero", invoicePublicId, receiptPublicId }` when `balanceDueMinor === 0` (`$0.00` order/promo total) — settles immediately with zero provider calls and issues a `$0.00` receipt (`RPR-...`).
+  - `{ mode: "settled_waived", invoicePublicId, waivedMinor, receiptPublicId }` when `0 < balanceDueMinor < providerMinimumMinor` and `belowProviderMinimum === "waive"` — acquires `FOR UPDATE` on the invoice row, checks `payment_attempts` under `FOR SHARE NOWAIT`, refuses waiver (`CONFLICT` / `PRIOR_PAYMENT_EXPOSURE`) if **any** prior provider attempt row exists or if lock contention occurs, and records an idempotent `"waiver"` settlement row + receipt (`waivedMinor` settles balance while keeping `grossPaidMinor = 0`).
+  - Throws `VALIDATION_ERROR` (`BELOW_PROVIDER_MINIMUM`, `{ minimumMinor, currency, provider }`) when `0 < balanceDueMinor < providerMinimumMinor` and `belowProviderMinimum === "block"`.
+- `payments.getCheckoutStatus` exposes `waivedMinor`, `settlementKind`, and `receiptPublicId` (including `settled_zero` / `settled_waived` invoices that never created a provider attempt) for `cart` return/confirmation surfaces.
+- Admin UI (`client/src/features/payments/PaymentSettings.tsx`, designed and tested against WCAG 2.2 AA) configures both `smallTotals.belowProviderMinimum` and `receipts.{enabled,emailCustomer,footerText}` behind `payments.admin.updateSettings` (`payments.manage` + step-up MFA).
+

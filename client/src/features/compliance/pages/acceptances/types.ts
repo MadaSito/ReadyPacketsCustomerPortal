@@ -25,6 +25,7 @@ export type AcceptanceLogSource =
 export type AcceptanceLogMethod = "checkbox" | "typed_signature" | "imported";
 export type AcceptanceFreshness = "current" | "superseded";
 export type AcceptanceEvidenceKind = "account" | "order_gate";
+export type SignatureMatchKind = "exact" | "first_last" | "mismatch_warn" | "unchecked";
 
 export interface AcceptanceLogCustomerSummary {
   userPublicId: string;
@@ -67,6 +68,7 @@ export interface AcceptanceLogItem {
   source: AcceptanceLogSource;
   method: AcceptanceLogMethod;
   hasTypedSignature: boolean;
+  signatureMatch?: SignatureMatchKind | null;
   freshness: AcceptanceFreshness;
   supersededByVersionPublicId: string | null;
   supersededByVersionLabel: string | null;

@@ -21,6 +21,8 @@ export const STEP_PATHS: Record<TransitionStep, readonly string[]> = {
   // Enrolment shows the freshly issued codes inline; /mfa/recovery-codes handles reissue after a lost response.
   acknowledge_recovery_codes: ["/mfa/recovery-codes", "/mfa/enrol"],
   change_password: ["/change-password"],
+  // Increment 06 D13: read and accept a required policy (or sign out); nothing else is reachable.
+  accept_policy: ["/accept-policy"],
 };
 
 export function stepPath(step: TransitionStep): string {

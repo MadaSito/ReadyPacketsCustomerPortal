@@ -2,11 +2,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Suspense, useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "wouter";
 import type { RequiredPolicySummary } from "@server/modules/compliance/policiesService";
-import { errorMessage, useTRPC } from "@/lib/trpc";
+import { ME_QUERY_KEY, type MeResult } from "@/lib/authApi";
+import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, DateTime, Dialog, ErrorState, Field, Input, PageHeader, Skeleton } from "@/ui";
 import { SafePolicyText } from "../shared";
 
-function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
+function PolicyAcceptanceForm({
+  policy,
+  expectedSignerName,
+}: {
+  policy: RequiredPolicySummary;
+  expectedSignerName?: string | null;
+}) {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const accept = useMutation(trpc.compliance.policies.accept.mutationOptions());
@@ -14,12 +21,18 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
   const viewport = useRef<HTMLDivElement>(null);
   const documentBody = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLParagraphElement>(null);
+  const signerInputRef = useRef<HTMLInputElement>(null);
   const requestInFlight = useRef(false);
   const [reviewed, setReviewed] = useState(false);
   const [accepted, setAccepted] = useState(false);
   const [signerName, setSignerName] = useState("");
   const [error, setError] = useState<string>();
+  const [signerFieldError, setSignerFieldError] = useState<string>();
+  const [mismatchExpectedName, setMismatchExpectedName] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
+
+  const sessionAccountName = queryClient.getQueryData<MeResult>(ME_QUERY_KEY)?.user.name ?? null;
+  const displayedExpectedName = mismatchExpectedName ?? expectedSignerName ?? sessionAccountName;
 
   function checkEnd() {
     const el = viewport.current;
@@ -41,6 +54,8 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
     requestInFlight.current = true;
     setConfirming(true);
     setError(undefined);
+    setSignerFieldError(undefined);
+    setMismatchExpectedName(null);
     try {
       await accept.mutateAsync({
         versionPublicId: policy.versionPublicId,
@@ -50,7 +65,28 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
       setAccepted(false);
       setSignerName("");
     } catch (failure) {
-      setError(errorMessage(failure, "We couldn't confirm acceptance. Refresh policy status before trying again."));
+      const safe = safeError(failure);
+      const isSignatureError =
+        safe?.reasonCode === "SIGNER_NAME_MISMATCH" ||
+        safe?.reasonCode === "TYPED_SIGNATURE_REQUIRED";
+      const serverExpected =
+        safe?.reasonCode === "SIGNER_NAME_MISMATCH" &&
+        safe.details &&
+        typeof (safe.details as { expectedName?: unknown }).expectedName === "string"
+          ? (safe.details as { expectedName: string }).expectedName
+          : null;
+      if (serverExpected) {
+        setMismatchExpectedName(serverExpected);
+      }
+      const message = errorMessage(
+        failure,
+        "We couldn't confirm acceptance. Refresh policy status before trying again.",
+      );
+      if (policy.requiresTypedSignature && isSignatureError) {
+        setSignerFieldError(message);
+        signerInputRef.current?.focus();
+      }
+      setError(message);
     } finally {
       // Evidence and current versions come from the server, even after an uncertain response.
       await queryClient.invalidateQueries({ queryKey: trpc.compliance.policies.myStatus.queryKey() });
@@ -66,6 +102,11 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
           <h2 id={`${id}-title`} className="break-words text-lg font-semibold text-ink">{policy.title}</h2>
           <p className="text-sm text-muted">Version {policy.versionNumber} · {policy.versionLabel} · Effective <DateTime value={policy.effectiveAt} format="date" /></p>
         </div>
+        {policy.changeSummary ? (
+          <div className="rounded-[var(--radius-control)] border border-line bg-surface-raised px-3 py-2 text-sm text-ink">
+            <span className="font-medium">What changed:</span> {policy.changeSummary}
+          </div>
+        ) : null}
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- Allow keyboard scrolling of the bounded document. */}
         <div ref={viewport} tabIndex={0} role="region" aria-label={`${policy.title} policy text`}
           onScroll={checkEnd} className="max-h-72 overflow-auto rounded-[var(--radius-control)] border border-line bg-surface-sunken p-4">
@@ -86,11 +127,54 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
         <Checkbox label={`I have read and agree to ${policy.title} (version ${policy.versionNumber}).`}
           checked={accepted} onCheckedChange={setAccepted} disabled={!reviewed || confirming} />
         {policy.requiresTypedSignature ? (
-          <Field label="Type your full name to sign" required>
-            <Input value={signerName} onChange={(event) => setSignerName(event.target.value)} maxLength={160} disabled={!reviewed || confirming} />
-          </Field>
+          <div className="space-y-1.5">
+            <Field
+              label="Type your full name to sign"
+              hint={
+                displayedExpectedName
+                  ? `Expected account name: ${displayedExpectedName}.`
+                  : "Enter the full name on your account."
+              }
+              error={signerFieldError}
+              required
+            >
+              <Input
+                ref={signerInputRef}
+                value={signerName}
+                onChange={(event) => {
+                  setSignerName(event.target.value);
+                  setSignerFieldError(undefined);
+                }}
+                maxLength={160}
+                autoComplete="name"
+                disabled={!reviewed || confirming}
+              />
+            </Field>
+            <p className="text-xs text-muted">
+              Need to update your account name?{" "}
+              <Link href="/account" className="font-medium text-action underline underline-offset-2">
+                Edit your profile name
+              </Link>
+              .
+            </p>
+          </div>
         ) : null}
-        {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
+        {error ? (
+          <Callout tone="danger" live="assertive">
+            <div className="space-y-1">
+              <p>{error}</p>
+              {mismatchExpectedName ? (
+                <p className="text-sm">
+                  Expected account name: <strong>{mismatchExpectedName}</strong>.{" "}
+                  <Link href="/account" className="font-medium underline underline-offset-2">
+                    Update your profile name
+                  </Link>{" "}
+                  if your legal name has changed.
+                </p>
+              ) : null}
+            </div>
+          </Callout>
+        ) : null}
         <Button type="submit" disabled={!reviewed || !accepted || (policy.requiresTypedSignature && !signerName.trim())}
           loading={confirming}>Accept this version</Button>
       </form>
@@ -98,10 +182,24 @@ function PolicyAcceptanceForm({ policy }: { policy: RequiredPolicySummary }) {
   );
 }
 
-export function RequiredPolicyForms({ policies }: { policies: readonly RequiredPolicySummary[] }) {
-  return <div className="grid gap-4">
-    {policies.map((policy) => <PolicyAcceptanceForm key={`${policy.versionPublicId}:${policy.contentHash}:${policy.requiresTypedSignature}`} policy={policy} />)}
-  </div>;
+export function RequiredPolicyForms({
+  policies,
+  expectedSignerName,
+}: {
+  policies: readonly RequiredPolicySummary[];
+  expectedSignerName?: string | null;
+}) {
+  return (
+    <div className="grid gap-4">
+      {policies.map((policy) => (
+        <PolicyAcceptanceForm
+          key={`${policy.versionPublicId}:${policy.contentHash}:${policy.requiresTypedSignature}`}
+          policy={policy}
+          expectedSignerName={expectedSignerName}
+        />
+      ))}
+    </div>
+  );
 }
 
 export function usePolicyStatus() {
@@ -136,7 +234,7 @@ export function RequiredPolicyGate({ children }: { children: ReactNode }) {
         {status.isFetching ? <Skeleton lines={3} /> : <ErrorState title="We couldn't verify your policy status" onRetry={() => void status.refetch()} />}
       </> : <>
         <PageHeader title="Review required policies" description="Accept every required version before starting a new order." />
-        <RequiredPolicyForms policies={status.data.pendingRequired} />
+        <RequiredPolicyForms policies={status.data.pendingRequired} expectedSignerName={status.data.expectedSignerName} />
         <p className="mt-4"><Link className="text-action underline" href="/orders">Back to orders</Link></p>
       </> : null}
     </>
@@ -159,7 +257,7 @@ export default function PolicyAcceptanceWidget() {
           size="xl" title="Required policy review"
           description="Review each required version and explicitly agree before starting a new order.">
           {status.isError ? <ErrorState title="We couldn't verify your current policy status" onRetry={() => void status.refetch()} />
-            : policies.length ? <RequiredPolicyForms policies={policies} />
+            : policies.length ? <RequiredPolicyForms policies={policies} expectedSignerName={status.data?.expectedSignerName} />
               : <Callout tone="success" live="polite">The portal confirmed all required versions are accepted.</Callout>}
         </Dialog>
         <Button asChild variant="link" className="whitespace-normal text-left"><Link href="/policies">View published policies and acceptance history</Link></Button>

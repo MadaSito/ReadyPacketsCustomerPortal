@@ -5,6 +5,7 @@ import { useState, type FormEvent } from "react";
 import type { PasskeyChallenge, SecondFactorInput } from "@/lib/authApi";
 import { errorMessage } from "@/lib/trpc";
 import { Button, Field, Input, RadioGroup } from "@/ui";
+import { RateLimitCountdown } from "@/lib/RateLimitCountdown";
 import { FormError, useFocusOnError } from "./bits";
 
 type Method = "totp" | "recovery_code" | "passkey";
@@ -23,6 +24,8 @@ export function FactorForm({
   const [method, setMethod] = useState<Method>(methods[0] ?? "totp");
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /** D7: the raw failure, so a rate-limited response can show its authoritative retry countdown. */
+  const [failure, setFailure] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const errorRef = useFocusOnError(error);
 
@@ -34,6 +37,7 @@ export function FactorForm({
       setError(method === "totp" ? "Enter the 6-digit code from your authenticator app." : "Enter one of your recovery codes.");
       return;
     }
+    setFailure(null);
     setBusy(true);
     try {
       if (method === "passkey") {
@@ -45,6 +49,7 @@ export function FactorForm({
       }
       setCode("");
     } catch (err) {
+      setFailure(err);
       setError(err instanceof Error && err.name === "NotAllowedError" ? "The passkey request was cancelled or timed out. Try again or use another method." : errorMessage(err, "That code didn't work. Check it and try again."));
     } finally {
       setBusy(false);
@@ -55,6 +60,7 @@ export function FactorForm({
   return (
     <>
       <FormError message={error} focusRef={errorRef} />
+      <RateLimitCountdown error={failure} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
         {methods.length > 1 ? (
           <RadioGroup

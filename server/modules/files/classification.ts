@@ -2,8 +2,11 @@ import { fileTypeFromBuffer } from "file-type";
 import { validation } from "../../core/errors.js";
 
 export type FileReader = (offset: number, length: number) => Promise<Buffer>;
-export type FileClassification = { extension: string; mime: string };
-export const allowedExtensions = ["pdf", "png", "jpg", "wav", "webm", "mp4", "m4a", "ogg"] as const;
+export type FileClassification = { extension: string; mime: string; requiresReencode?: true };
+export const audioExtensions = ["wav", "webm", "mp4", "m4a", "ogg", "mp3", "aac", "caf"] as const;
+export const documentExtensions = ["pdf", "png", "jpg", "docx"] as const;
+export const allowedExtensions = [...documentExtensions, ...audioExtensions] as const;
+export const docxMime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 export type FileExtension = (typeof allowedExtensions)[number];
 
 const signature = (input: Buffer, offset: number, text: string) =>
@@ -41,11 +44,26 @@ function vint(buf: Buffer, offset: number, id: boolean): { value: number; width:
   return value > BigInt(Number.MAX_SAFE_INTEGER) && !unknown ? null : { value: Number(value), width, unknown };
 }
 
-async function webm(read: FileReader, size: number): Promise<FileClassification | null> {
+function cachedReader(reader: FileReader, size: number): FileReader {
+  // Sequential containers make many small reads; avoid one I/O per frame.
+  let cache: Buffer = Buffer.alloc(0);
+  let base = 0;
+  return async (offset, length) => {
+    if (length > 16_384) return reader(offset, length);
+    if (offset < base || offset + length > base + cache.length) {
+      cache = await reader(offset, Math.min(16_384, size - offset));
+      base = offset;
+    }
+    return cache.subarray(offset - base, offset - base + length);
+  };
+}
+
+async function webm(reader: FileReader, size: number): Promise<FileClassification | null> {
+  const read = cachedReader(reader, size);
   let iterations = 0;
   async function* children(start: number, end: number, streamRoot = false) {
     while (start < end) {
-      if (++iterations > 50_000) throw new MalformedMedia();
+      if (++iterations > 500_000) throw new MalformedMedia();
       const head = await read(start, Math.min(12, end - start));
       const id = vint(head, 0, true);
       const length = id && vint(head, id.width, false);
@@ -54,13 +72,14 @@ async function webm(read: FileReader, size: number): Promise<FileClassification 
       if (length.unknown && (!streamRoot || ![0x18538067, 0x1f43b675].includes(id.value))) throw new MalformedMedia();
       const dataEnd = length.unknown ? end : dataStart + length.value;
       if (dataEnd > end || dataEnd <= start) throw new MalformedMedia();
-      yield { id: id.value, start: dataStart, end: dataEnd };
+      yield { id: id.value, start: dataStart, end: dataEnd, unknown: length.unknown };
       start = dataEnd;
     }
   }
   let header = false;
   let segment = false;
   let audio = false;
+  let vorbis = false;
   let video = false;
   let cluster = false;
   for await (const root of children(0, size, true)) {
@@ -73,9 +92,24 @@ async function webm(read: FileReader, size: number): Promise<FileClassification 
       for await (const part of children(root.start, root.end, true)) {
         if (part.id === 0x1f43b675) {
           const permitted = new Set([0xe7, 0x5854, 0xa7, 0xab, 0xa3, 0xa0, 0xec, 0xbf]);
-          for await (const entry of children(part.start, part.end)) {
-            if (!permitted.has(entry.id)) throw new MalformedMedia();
-            if (entry.id === 0xa3 || entry.id === 0xa0) cluster ||= entry.end - entry.start > 3;
+          // Live MediaRecorder streams can omit cluster sizes. An ensuing Cluster ID is a sibling.
+          let start = part.start;
+          while (start < part.end) {
+            let next: number | undefined;
+            for await (const entry of children(start, part.end, part.unknown)) {
+              if (part.unknown && entry.id === 0x1f43b675) {
+                if (entry.unknown) { next = entry.start; break; }
+                for await (const block of children(entry.start, entry.end)) {
+                  if (!permitted.has(block.id)) throw new MalformedMedia();
+                  if (block.id === 0xa3 || block.id === 0xa0) cluster ||= block.end - block.start > 3;
+                }
+              } else {
+                if (!permitted.has(entry.id)) throw new MalformedMedia();
+                if (entry.id === 0xa3 || entry.id === 0xa0) cluster ||= entry.end - entry.start > 3;
+              }
+            }
+            if (next === undefined) break;
+            start = next;
           }
         }
         if (part.id !== 0x1654ae6b) {
@@ -95,13 +129,18 @@ async function webm(read: FileReader, size: number): Promise<FileClassification 
             if (field.id === 0x86 && len > 0 && len <= 32) codec = (await read(field.start, len)).toString("ascii");
           }
           if (type === 1 && ["V_VP8", "V_VP9", "V_AV1"].includes(codec)) video = true;
-          else if (type === 2 && ["A_OPUS", "A_VORBIS"].includes(codec)) audio = true;
+          else if (type === 2 && ["A_OPUS", "A_VORBIS"].includes(codec)) {
+            audio = true;
+            vorbis ||= codec === "A_VORBIS";
+          }
           else throw new MalformedMedia();
         }
       }
     } else throw new MalformedMedia();
   }
-  return header && segment && cluster && (video || audio) ? { extension: "webm", mime: video ? "video/webm" : "audio/webm" } : null;
+  return header && segment && cluster && (video || audio)
+    ? { extension: "webm", mime: video ? "video/webm" : "audio/webm", ...(!video && vorbis ? { requiresReencode: true as const } : {}) }
+    : null;
 }
 
 class MalformedMedia extends Error {}
@@ -261,6 +300,124 @@ async function wav(read: FileReader, size: number, head: Buffer): Promise<boolea
   return fmt && data && offset === size;
 }
 
+async function caf(read: FileReader, size: number, head: Buffer): Promise<boolean> {
+  if (head.length < 8 || head.readUInt16BE(4) !== 1 || head.readUInt16BE(6) !== 0) return false;
+  let offset = 8;
+  let description = false;
+  let data = false;
+  for (let chunks = 0; offset < size && chunks < 1024; chunks++) {
+    if (size - offset < 12) return false;
+    const header = await read(offset, 12);
+    const kind = header.toString("ascii", 0, 4);
+    const declaredLength = header.readBigInt64BE(4);
+    offset += 12;
+    const length = kind === "data" && declaredLength === -1n ? BigInt(size - offset) : declaredLength;
+    if (length < 0n || length > BigInt(size - offset)) return false;
+    if (kind === "desc" && chunks === 0 && length === 32n) {
+      const format = await read(offset, 32);
+      const rate = format.readDoubleBE(0);
+      const channels = format.readUInt32BE(24);
+      description = Number.isFinite(rate) && rate >= 1 && rate <= 384_000 && channels >= 1 && channels <= 32 &&
+        ["lpcm", "aac ", "alac", "ima4", "ulaw", "alaw"].includes(format.toString("ascii", 8, 12));
+    } else if (kind === "data" && description && !data && length > 4n) data = true;
+    else if (!description || !["free", "pakt", "chan", "info", "kuki", "mark", "strg"].includes(kind)) return false;
+    offset += Number(length);
+  }
+  return description && data && offset === size;
+}
+
+async function framedAudio(reader: FileReader, size: number, extension: "aac" | "mp3") {
+  const read = cachedReader(reader, size);
+  let offset = 0;
+  const header = await read(0, Math.min(10, size));
+  if (signature(header, 0, "ID3")) {
+    if (header.length < 10 || ![2, 3, 4].includes(header[3]!) || header.subarray(6).some((value) => value > 127)) return false;
+    const tagSize = header.subarray(6).reduce((value, byte) => (value << 7) | byte, 0);
+    offset = 10 + tagSize + (header[3] === 4 && (header[5]! & 0x10) ? 10 : 0);
+    if (offset > Math.min(size, 1024 * 1024)) return false;
+  }
+  let frames = 0;
+  while (offset < size && frames < 500_000) {
+    if (extension === "mp3" && size - offset === 128 && signature(await read(offset, 3), 0, "TAG")) {
+      offset = size;
+      break;
+    }
+    const required = extension === "aac" ? 7 : 4;
+    if (size - offset < required) return false;
+    const frame = await read(offset, required);
+    if (frame[0] !== 0xff) return false;
+    let length: number;
+    if (extension === "aac") {
+      if ((frame[1]! & 0xf6) !== 0xf0 || ((frame[2]! >> 2) & 15) > 12) return false;
+      length = ((frame[3]! & 3) << 11) | (frame[4]! << 3) | (frame[5]! >> 5);
+      if (length <= (frame[1]! & 1 ? 7 : 9)) return false;
+    } else {
+      const version = (frame[1]! >> 3) & 3;
+      const bitrateIndex = frame[2]! >> 4;
+      const sampleIndex = (frame[2]! >> 2) & 3;
+      if ((frame[1]! & 0xe6) !== 0xe2 || version === 1 || !bitrateIndex || bitrateIndex === 15 || sampleIndex === 3) return false;
+      const bitrates = version === 3 ? [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320] :
+        [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+      const sampleRate = [44_100, 48_000, 32_000][sampleIndex]! / (version === 3 ? 1 : version === 2 ? 2 : 4);
+      length = Math.floor((version === 3 ? 144_000 : 72_000) * bitrates[bitrateIndex]! / sampleRate) + ((frame[2]! >> 1) & 1);
+      if (length <= 4) return false;
+    }
+    offset += length;
+    frames++;
+  }
+  return frames > 0 && offset === size;
+}
+
+/** Bounded, non-inflating ZIP envelope check; Word conversion stays in the browser. */
+async function docx(read: FileReader, size: number): Promise<boolean> {
+  if (size > 10 * 1024 * 1024 || size < 22) return false;
+  const tailOffset = Math.max(0, size - 65_557);
+  const tail = await read(tailOffset, size - tailOffset);
+  let end = tail.length - 22;
+  while (end >= 0 && (tail.readUInt32LE(end) !== 0x06054b50 || tail.readUInt16LE(end + 20) !== tail.length - end - 22)) end--;
+  if (end < 0 || tail.readUInt16LE(end + 4) || tail.readUInt16LE(end + 6)) return false;
+  const count = tail.readUInt16LE(end + 10);
+  const directorySize = tail.readUInt32LE(end + 12);
+  const directoryStart = tail.readUInt32LE(end + 16);
+  if (tail.readUInt16LE(end + 8) !== count || !count || count > 2048 || directorySize > 1024 * 1024 ||
+      directoryStart + directorySize !== tailOffset + end) return false;
+  const directory = await read(directoryStart, directorySize);
+  const names = new Set<string>();
+  const spans: { from: number; to: number }[] = [];
+  let pos = 0;
+  let expanded = 0;
+  for (let i = 0; i < count; i++) {
+    if (pos + 46 > directory.length || directory.readUInt32LE(pos) !== 0x02014b50) return false;
+    const flags = directory.readUInt16LE(pos + 8);
+    const method = directory.readUInt16LE(pos + 10);
+    const packed = directory.readUInt32LE(pos + 20);
+    const raw = directory.readUInt32LE(pos + 24);
+    const nameLength = directory.readUInt16LE(pos + 28);
+    const next = pos + 46 + nameLength + directory.readUInt16LE(pos + 30) + directory.readUInt16LE(pos + 32);
+    const from = directory.readUInt32LE(pos + 42);
+    expanded += raw;
+    if (flags & ~0x080e || ![0, 8].includes(method) || (method === 0 && packed !== raw) || raw > 64 * 1024 * 1024 ||
+        expanded > 64 * 1024 * 1024 || (raw > 1024 * 1024 && raw > packed * 200) || nameLength < 1 || nameLength > 512 ||
+        next > directory.length || from + 30 + nameLength > directoryStart || directory.readUInt16LE(pos + 34)) return false;
+    const nameBytes = directory.subarray(pos + 46, pos + 46 + nameLength);
+    const name = nameBytes.toString("utf8");
+    const canonical = name.toLowerCase();
+    if (names.has(canonical) || /[\\:\p{C}]|^\/|(?:^|\/)\.\.?(?:\/|$)|(?:^|\/)(?:vbaProject(?:\.bin)?|activeX|embeddings)(?:\/|$)/iu.test(name)) return false;
+    names.add(canonical);
+    const local = await read(from, 30 + nameLength);
+    const to = from + 30 + nameLength + local.readUInt16LE(28) + packed;
+    if (local.readUInt32LE(0) !== 0x04034b50 || local.readUInt16LE(6) !== flags || local.readUInt16LE(8) !== method ||
+        local.readUInt16LE(26) !== nameLength || !local.subarray(30).equals(nameBytes) || to > directoryStart) return false;
+    if (!(flags & 8) && (local.readUInt32LE(14) !== directory.readUInt32LE(pos + 16) ||
+        local.readUInt32LE(18) !== packed || local.readUInt32LE(22) !== raw)) return false;
+    spans.push({ from, to });
+    pos = next;
+  }
+  spans.sort((a, b) => a.from - b.from);
+  return pos === directory.length && spans[0]?.from === 0 && spans.every((span, i) => !i || spans[i - 1]!.to <= span.from) &&
+    ["[content_types].xml", "_rels/.rels", "word/document.xml"].every((name) => names.has(name));
+}
+
 // These conservative PDF gates are not content disarm, a renderer, or a malware scanner.
 async function passivePdf(read: FileReader, size: number): Promise<boolean> {
   const tail = (await read(Math.max(0, size - 1024), Math.min(1024, size))).toString("latin1");
@@ -295,12 +452,16 @@ export async function classifyFile(reader: FileReader, size: number): Promise<Fi
     if (signature(head, 0, "\x1a\x45\xdf\xa3")) return await webm(read, size);
     if (head.length >= 16 && signature(head, 4, "ftyp")) return await mp4(read, size, head);
     if (signature(head, 0, "OggS")) return await ogg(read, size);
+    if (signature(head, 0, "caff") && await caf(read, size, head)) return { extension: "caf", mime: "audio/x-caf" };
+    if (signature(head, 0, "PK\x03\x04") && await docx(read, size)) return { extension: "docx", mime: docxMime };
     const kind = await fileTypeFromBuffer(head).catch(() => undefined);
     if (!kind) return null;
     if (kind.ext === "pdf" && signature(head, 0, "%PDF-") && await passivePdf(read, size)) return { extension: "pdf", mime: kind.mime };
     if (kind.ext === "png" && await png(read, size)) return { extension: "png", mime: kind.mime };
     if (kind.ext === "jpg" && await jpeg(read, size, head)) return { extension: "jpg", mime: kind.mime };
     if (kind.ext === "wav" && await wav(read, size, head)) return { extension: "wav", mime: kind.mime };
+    if (kind.ext === "mp3" && await framedAudio(read, size, "mp3")) return { extension: "mp3", mime: "audio/mpeg" };
+    if (kind.ext === "aac" && await framedAudio(read, size, "aac")) return { extension: "aac", mime: "audio/aac" };
     return null;
   } catch (error) {
     if (error instanceof MalformedMedia) return null;

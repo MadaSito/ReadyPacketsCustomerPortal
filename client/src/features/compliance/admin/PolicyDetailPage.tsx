@@ -3,8 +3,11 @@ import { useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { Link, useParams } from "wouter";
+import { DocumentImportButton } from "@/lib/docconvert";
 import { useTRPC } from "@/lib/trpc";
 import { Badge, Breadcrumbs, Button, Callout, Card, Checkbox, ConfirmDialog, DataTable, DateTime, Dialog, Field, FilterBar, Input, KeyValueList, LoadMore, PageHeader, Select, Textarea } from "@/ui";
+import { PolicyEnforcementCard } from "../policyUpdates/PolicyEnforcementCards";
+import { PolicyNoticeCard } from "../policyUpdates/PolicyNoticeCard";
 import { SafePolicyText } from "../shared";
 import { QueryState, useGuardedAction } from "./common";
 import { ACCEPTANCE_METHOD_LABELS, AUDIENCE_LABELS, FORMAT_LABELS, ULID, acceptanceCounts, fromLocalInput, shortHash, toLocalInput, type PolicyAcceptance, type PolicyAudience, type PolicyDocumentDetail, type PolicyFormat, type PolicyVersion } from "./model";
@@ -100,6 +103,12 @@ export default function PolicyDetailPage() {
                 empty={<p className="text-body">No versions yet.</p>}
               />
             </Card>
+            {doc.requiresAcceptance ? (
+              <>
+                <PolicyNoticeCard documentPublicId={doc.documentPublicId} />
+                <PolicyEnforcementCard documentPublicId={doc.documentPublicId} />
+              </>
+            ) : null}
             <AcceptanceEvidence documentPublicId={doc.documentPublicId} versions={data.versions.filter((v) => v.status === "published")} requiresAcceptance={doc.requiresAcceptance} />
             {editing ? <SettingsDialog document={doc} onClose={() => setEditing(false)} /> : null}
             {draftEditor ? <DraftDialog documentPublicId={doc.documentPublicId} version={draftEditor === "new" ? null : draftEditor} latest={data.versions[0] ?? null} onClose={() => setDraftEditor(null)} /> : null}
@@ -216,7 +225,20 @@ function DraftDialog({ documentPublicId, version, latest, onClose }: { documentP
             <Select options={FORMAT_OPTIONS} value={values.contentFormat} onChange={(event) => setValues((c) => ({ ...c, contentFormat: event.target.value as PolicyFormat }))} />
           </Field>
         </div>
-        <Field label="Policy text" required hint={`${FORMAT_LABELS[values.contentFormat]}. HTML and links are never rendered.`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <DocumentImportButton
+            label="Import document (.docx, .md, .pdf)"
+            disabled={create.isPending || update.isPending}
+            onImport={(imported) =>
+              setValues((current) => ({
+                ...current,
+                contentFormat: imported.sourceKind === "pdf" ? "plain_text" : "safe_markdown",
+                bodyText: imported.sourceKind === "pdf" ? imported.plainText : imported.markdown,
+              }))
+            }
+          />
+        </div>
+        <Field label="Policy text" required hint={`${FORMAT_LABELS[values.contentFormat]}. HTML and links are never rendered. Imported files fill this draft for review and are never published automatically.`}>
           <Textarea value={values.bodyText} onChange={(event) => setValues((c) => ({ ...c, bodyText: event.target.value }))} rows={12} />
         </Field>
         <Field label="Change summary" hint="Optional. What changed and why.">

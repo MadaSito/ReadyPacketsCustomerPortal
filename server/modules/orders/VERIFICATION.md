@@ -158,3 +158,24 @@ Run: `scripts/dev/test.sh` per file (above), `scripts/dev/tc.sh` (no errors unde
 Tested only against fakes: the promotions port (real module is audit_engineer's); the compliance `orderPaymentExposureInTx` port (real implementation with `providerAttemptEver` in 97f2178, using `FOR SHARE NOWAIT` that fails closed; orders tests use a fake exposure port, and the end-to-end cancel → compliance → release path has not been run here); the real `guardAttempt` (siem_engineer); `compliance.listPublishedPolicies` for policy mapping.
 
 Not verified: real concurrent redemptions across connections; the HTTP body cap for transfer procedures; a real browser (320 px, zoom, dark mode contrast, screen-reader reading of the announcement); the transfer UI (files_engineer).
+
+## Increment 06 — D8 customer tasks, D10 transfer default, D14 order agreement gate
+
+| Requirement | Method | Evidence |
+| --- | --- | --- |
+| Old definitions and settings parse unchanged; new fields optional; ranges (`RECORD_MINUTES_RANGE` incl. > 120), ≤ 5 documents, `edit_in_portal` needs docx | automated-test | requirements.test.ts (18), requirementsTasks.test.ts (8), workflowDesigner.test.ts (20) |
+| Order note: staff only, plain text ≤ 4000, stale version refused, cannot change after acknowledgement; customer cannot accept before the note exists | automated-test | requirementsTasks.test.ts |
+| Waive: staff with `orders.phase.unlock`, reason 10–500, once; audited in the tx | automated-test | requirementsTasks.test.ts |
+| Transfer: default on, old stored `false` respected, `setEnabled` admin + capability, audited with `via=workflows_page`; format 2 export, import accepts 1 and 2 | automated-test | workflowTransfer.test.ts (17) |
+| Agreement gate: off by default, enable needs a published policy, optimistic `expectedEnabled`, place / work scopes, staff and API v1 exempt, damaged value fails closed | automated-test | agreementGate.test.ts (11) |
+| Existing order behaviour unchanged | automated-test | orders.test.ts (35), consoleOrder.test.ts (13) |
+| Client: record / document links to the right slot, note in the acknowledgement dialog, staff note and waive dialogs, paused-by-agreement callout, axe | automated-test | client rules.test.tsx (27) |
+| Designer: record and document task editor, presets, response modes saved; "N to fix" opens a findings list; Show opens the step and focuses the field, falling back to the step's problem list | automated-test | client workflows.test.tsx (16) |
+| On-page transfer switch with confirmation when turning off | automated-test | client workflowTransfer.test.tsx (21) |
+| Wizard: `AGREEMENT_REQUIRED` opens the agreement; Not now explains; accepting retries with the same idempotency key | automated-test (dialog stubbed) | client orders.test.tsx (43) |
+| Order page transition: `AGREEMENT_REQUIRED` opens the agreement; Not now keeps the note and explains; accepting resends the identical request (same `expectedVersion`, so it cannot apply twice) | automated-test (dialog stubbed) | client orders.test.tsx |
+| Agreement setting: admin + `policies.manage` (a step-up capability, re-checked from the database in the tx); a stale step-up is refused with nothing written; every change audited in the tx with `enabled_from/to`, `policy_from`, `policy_public_id` | automated-test | agreementGate.test.ts (11) |
+
+Run: `scripts/dev/test.sh` per file, `scripts/dev/tc.sh` (no errors under `orders/`), ESLint on changed paths.
+
+Not verified: a real browser (320 px, zoom, both themes, screen-reader reading of the findings jump and pause callout); the real `AgreementDialog` inside the order pages (stubbed in orders.test.tsx); the Files recorder and edit-in-portal end to end (files / integrations).

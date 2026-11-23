@@ -12,6 +12,8 @@ import { CASE_SEVERITIES, CASE_STATUSES } from "./cases.js";
 import { EXPORT_FORMATS, EXPORT_PROFILES } from "./formats.js";
 import { auditQuerySchema, MAX_PAGE, PIVOT_KINDS, STAT_BUCKETS, STAT_DIMENSIONS } from "./query.js";
 import { MAX_RETAIN_DAYS, MIN_RETAIN_DAYS } from "./retention.js";
+import { BAN_DURATIONS, CLOSE_REASONS, INCIDENT_STATUSES } from "./correlation/incidents.js";
+import { INCIDENT_SEVERITIES, RULE_KEYS, correlationConfigSchema } from "./correlation/rules.js";
 
 const ulidId = z.string().regex(ULID_PATTERN);
 const eventId = z.string().regex(ULID_PATTERN);
@@ -22,6 +24,12 @@ const read = adminProcedure.use(requireCapability("audit.read"));
 const manageCases = adminProcedure.use(requireCapability("audit.cases.manage"));
 const exportCap = adminProcedure.use(requireCapability("audit.export"));
 const retentionCap = adminProcedure.use(requireCapability("audit.retention.manage"));
+const incidentsRead = adminProcedure.use(requireCapability("security.incidents.read"));
+const banCap = incidentsRead.use(requireCapability("security.firewall.manage"));
+const revokeCap = incidentsRead.use(requireCapability("sessions.revoke_any"));
+const banDuration = z.union([z.literal(BAN_DURATIONS[0]), z.literal(BAN_DURATIONS[1]), z.literal(BAN_DURATIONS[2]), z.literal(BAN_DURATIONS[3]), z.null()]);
+const banReason = z.string().trim().min(3).max(240);
+const incidentRef = z.strictObject({ publicId: ulidId, expectedVersion: z.number().int().min(1).max(2_147_483_647) });
 
 const searchInput = z.strictObject({
   query: auditQuerySchema,
@@ -107,4 +115,30 @@ export const auditRouter = router({
     run: retentionCap.meta({ rateLimit: "expensive" }).input(z.strictObject({ dryRun: z.boolean() }))
       .mutation(({ ctx, input }) => ctx.services.auditCenter.runRetention(ctx.session, input.dryRun)),
   }),
+  /** Increment 06, D7: security incidents from event correlation (`security.incidents.read`, admins). */
+  incidents: router({
+    list: incidentsRead
+      .input(z.strictObject({
+        status: z.enum(INCIDENT_STATUSES).optional(),
+        severity: z.enum(INCIDENT_SEVERITIES).optional(),
+        ruleKey: z.enum(RULE_KEYS).optional(),
+        cursor: z.string().max(40).regex(/^\d{10,15}_\d{1,15}$/).nullish(),
+        limit: z.number().int().min(1).max(100).optional(),
+      }))
+      .query(({ ctx, input }) => ctx.services.auditCenter.listIncidents(ctx.session, input)),
+    get: incidentsRead.input(z.strictObject({ publicId: ulidId })).query(({ ctx, input }) => ctx.services.auditCenter.getIncident(ctx.session, input.publicId)),
+    acknowledge: incidentsRead.input(incidentRef).mutation(({ ctx, input }) => ctx.services.auditCenter.acknowledgeIncident(ctx.session, input)),
+    close: incidentsRead.input(incidentRef.extend({ reason: z.enum(CLOSE_REASONS) })).mutation(({ ctx, input }) => ctx.services.auditCenter.closeIncident(ctx.session, input)),
+    banAddress: banCap
+      .input(z.strictObject({ publicId: ulidId, eventId: eventId.optional(), durationMinutes: banDuration, reason: banReason }))
+      .mutation(({ ctx, input }) => ctx.services.auditCenter.banIncidentAddress(ctx.session, input)),
+    endSessions: revokeCap.input(z.strictObject({ publicId: ulidId })).mutation(({ ctx, input }) => ctx.services.auditCenter.endIncidentSessions(ctx.session, input)),
+    rules: incidentsRead.query(({ ctx }) => ctx.services.auditCenter.getCorrelationRules(ctx.session)),
+    updateRules: incidentsRead.use(requireCapability("security.firewall.manage")).input(correlationConfigSchema).mutation(({ ctx, input }) => ctx.services.auditCenter.updateCorrelationRules(ctx.session, input)),
+  }),
+  /** "Ban this IP" from an audit event (admins, `security.firewall.manage` with step-up). */
+  banEventAddress: read
+    .use(requireCapability("security.firewall.manage"))
+    .input(z.strictObject({ eventId, durationMinutes: banDuration, reason: banReason }))
+    .mutation(({ ctx, input }) => ctx.services.auditCenter.banEventAddress(ctx.session, input)),
 });

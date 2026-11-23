@@ -15,6 +15,14 @@ import { users } from "../identity/schema.js";
 export const ACCEPTANCE_SIGNATURE_MODES = ["checkbox", "typed_name"] as const;
 export type AcceptanceSignatureMode = (typeof ACCEPTANCE_SIGNATURE_MODES)[number];
 
+export const SIGNATURE_NAME_MATCH_RESULTS = [
+  "exact",
+  "first_last",
+  "mismatch_warn",
+  "skipped_off",
+] as const;
+export type SignatureNameMatchResult = (typeof SIGNATURE_NAME_MATCH_RESULTS)[number];
+
 export const orderPolicyAcceptances = mysqlTable(
   "order_policy_acceptances",
   {
@@ -36,6 +44,8 @@ export const orderPolicyAcceptances = mysqlTable(
     signatureMode: mysqlEnum("signature_mode", ACCEPTANCE_SIGNATURE_MODES).notNull(),
     /** AES-256-GCM, AAD `order_policy_acceptances.typed_name:<publicId>`. */
     typedNameEnc: text("typed_name_enc"),
+    /** Increment 06 D11: server-side typed-name match outcome (`null` for checkbox or pre-06 rows). */
+    typedNameMatch: mysqlEnum("typed_name_match", SIGNATURE_NAME_MATCH_RESULTS),
     acceptedAt: utcDateTime("accepted_at").notNull(),
     /** AES-256-GCM, AAD `order_policy_acceptances.ip:<publicId>`. Console: only with sessions.read_all. */
     sourceAddressEnc: text("source_address_enc"),
