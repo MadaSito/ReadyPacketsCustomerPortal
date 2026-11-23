@@ -362,6 +362,12 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
   not started; the pipeline switch was turned off afterwards. webhook.site is a request inspector, so this
   proves delivery and format, not the production receiver.
 
+## Verification for increment 06
+
+> **PLACEHOLDER — to be completed by /root.** platform_engineer has not seen any increment 06 check run.
+> Increment 06 is in progress. Implemented rows are added as owners deliver; nothing is verified until
+> /root replaces this block with the checks it ran and saw.
+
 ## Not verified
 
 - increment 03 against real services: nothing was sent to or received from a real Microsoft 365 / Entra ID
