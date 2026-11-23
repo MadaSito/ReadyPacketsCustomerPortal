@@ -45,3 +45,25 @@ describe("imported table round trip", () => {
     expect(Array.from(doc.querySelectorAll("td")).map((cell) => cell.textContent)).toEqual(["A | B", "C"]);
   });
 });
+
+describe("link allow-list", () => {
+  it("renders https and same-origin links and leaves everything else as plain text", () => {
+    render(
+      <SafePolicyText
+        format="safe_markdown"
+        bodyText={[
+          "[ok](https://example.com/terms)",
+          "[path](/policies)",
+          "[script](javascript:alert(1))",
+          "[protocol-relative](//evil.example/x)",
+          "[backslash](/\\evil.example/x)",
+          "[data](data:text/html,x)",
+        ].join("\n\n")}
+      />,
+    );
+    expect(screen.getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
+      "https://example.com/terms",
+      "/policies",
+    ]);
+  });
+});

@@ -13,7 +13,8 @@ export type SafePolicyContentFormat = "plain_text" | "safe_markdown";
 function isSafeLinkHref(href: string): boolean {
   const trimmed = href.trim();
   if (!trimmed) return false;
-  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) return true;
+  // Same-origin paths only. Browsers read "/\\" like "//", so both forms are refused.
+  if (trimmed.startsWith("/")) return !/^\/[/\\]/u.test(trimmed);
   try {
     const parsed = new URL(trimmed);
     return parsed.protocol === "https:" || parsed.protocol === "http:" || parsed.protocol === "mailto:";
