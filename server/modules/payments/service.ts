@@ -131,6 +131,8 @@ export interface CheckoutStatusView {
   invoiceStatus: "draft" | "issued" | "paid" | "void";
   amountMinor: number;
   balanceDueMinor: number;
+  waivedMinor: number;
+  receiptPublicId: string | null;
   currency: string;
   providerConfigured: PaymentProviderChoice;
   environment: PaymentEnvironmentMode;
@@ -734,7 +736,10 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (invoice.totalMinor === 0) {
       const settledZero = await deps.db.transaction(async (tx) => {
         if (opts?.principal) {
-          await assertLiveActorInTx(deps, opts.principal, tx);
+          const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
+          if (liveActor.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
+            throw notFound("INVOICE_NOT_FOUND");
+          }
         }
         const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
         if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
@@ -763,7 +768,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
 
     if (invoice.status === "paid" || invoice.balanceDueMinor <= 0) {
-      // Idempotent replay check: if this invoice was settled via `waived_small_total`, return the settled outcome.
+      // Idempotent replay check: if this invoice was settled via `waived_small_total`, validate live principal
+      // and order lock inside `tx` before replaying/ensuring the settled receipt.
       const [existingWaived] = await deps.db
         .select({
           id: complianceInvoicePayments.id,
@@ -779,19 +785,35 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         )
         .limit(1);
       if (existingWaived) {
-        const replaySettled =
-          typeof complianceSvc.settleCheckoutInvoiceInTx === "function"
-            ? await deps.db.transaction((tx) =>
-                complianceSvc.settleCheckoutInvoiceInTx(
-                  {
-                    settlementKind: "waived_small_total",
-                    invoicePublicId: invoice.invoicePublicId,
-                    providerMinimumMinor: 0,
-                  },
-                  tx,
-                ),
-              )
-            : null;
+        const replaySettled = await deps.db.transaction(async (tx) => {
+          if (opts?.principal) {
+            const liveActor = await assertLiveActorInTx(deps, opts.principal, tx);
+            if (liveActor.role === "customer" && invoice.ownerUserId !== liveActor.userId) {
+              throw notFound("INVOICE_NOT_FOUND");
+            }
+          }
+          const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+          if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+            const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+            if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
+            if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+              throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
+                lockState: lockedOrder.lockState,
+              });
+            }
+          }
+          if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+            return complianceSvc.settleCheckoutInvoiceInTx(
+              {
+                settlementKind: "waived_small_total",
+                invoicePublicId: invoice.invoicePublicId,
+                providerMinimumMinor: 0,
+              },
+              tx,
+            );
+          }
+          return null;
+        });
         return {
           mode: "settled",
           settlementKind: "waived_small_total",
@@ -880,7 +902,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
       }
 
-      // Increment 06 D5: Re-verify provider minimum under row lock so concurrent settings/balance changes cannot slip through.
+      // Increment 06 D5: Re-verify provider minimum under canonical row locks (order -> invoice -> attempts).
       const smallTotals = await loadSmallTotals(tx);
       const minimumMinor = resolveProviderMinimumMinor(activeProvider, lockedInvoice.currency, smallTotals);
       if (lockedInvoice.balanceDueMinor > 0 && lockedInvoice.balanceDueMinor < minimumMinor) {
@@ -897,6 +919,31 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             },
           );
         }
+
+        // Fail closed: ANY previously committed `payment_attempts` row on this invoice (including
+        // ref-less `failed` rows from ambiguous provider dispatches or locally expired rows) blocks
+        // automatic small-balance waiver so we never issue a waiver receipt while external exposure may exist.
+        const priorAttempts = await tx
+          .select({
+            publicId: paymentAttempts.publicId,
+            status: paymentAttempts.status,
+          })
+          .from(paymentAttempts)
+          .where(eq(paymentAttempts.invoiceId, lockedInvoice.invoiceId))
+          .for("update");
+        if (priorAttempts.length > 0) {
+          const blockingAttempt = priorAttempts[0]!;
+          throw new DomainError(
+            "CONFLICT",
+            "PAYMENT_ATTEMPT_OUTSTANDING",
+            "Cannot waive small balance when a prior payment attempt has been recorded for this invoice.",
+            {
+              attemptPublicId: blockingAttempt.publicId,
+              attemptStatus: blockingAttempt.status,
+            },
+          );
+        }
+
         if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
           const settledWaive = await complianceSvc.settleCheckoutInvoiceInTx(
             {
@@ -1216,6 +1263,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       invoiceStatus: invoice.status,
       amountMinor: invoice.totalMinor,
       balanceDueMinor: invoice.balanceDueMinor,
+      waivedMinor: invoice.waivedMinor ?? 0,
+      receiptPublicId: invoice.receiptPublicId ?? null,
       currency: invoice.currency,
       providerConfigured: onlineReady ? config.provider : "none",
       environment: config.mode,

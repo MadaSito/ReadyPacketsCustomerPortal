@@ -41,6 +41,7 @@ export interface InvoicePdfInput {
   taxMinor: number;
   totalMinor: number;
   grossPaidMinor: number;
+  waivedMinor?: number | undefined;
   refundedMinor: number;
   netPaidMinor: number;
   balanceDueMinor: number;
@@ -849,6 +850,9 @@ export function renderInvoicePdf(input: InvoicePdfInput): Buffer {
   drawSummaryRow("Invoice Total", input.totalMinor, true);
   if (input.grossPaidMinor > 0) {
     drawSummaryRow("Payments Recorded", input.grossPaidMinor);
+  }
+  if ((input.waivedMinor ?? 0) > 0) {
+    drawSummaryRow("Small-Balance Waiver", -(input.waivedMinor ?? 0));
   }
   if (input.refundedMinor > 0) {
     drawSummaryRow("Refunds Recorded", -input.refundedMinor);

@@ -45,6 +45,7 @@ interface FakeOrderRecord {
   ownerPublicId: string;
   lockState: OrderLockState;
   origin: "portal" | "import";
+  collaborators?: Map<number, { role: "viewer" | "contributor"; hasBillingGrant?: boolean }>;
 }
 
 function buildFakeOrders(ordersByPubId: Map<string, FakeOrderRecord>): OrdersModule {
@@ -54,14 +55,19 @@ function buildFakeOrders(ordersByPubId: Map<string, FakeOrderRecord>): OrdersMod
     return m;
   };
 
-  function resolveRole(principal: SessionPrincipal, order: FakeOrderRecord): OrderAccessRole | null {
-    if (principal.role === "admin") return "admin";
-    if (principal.role === "staff") return "staff";
-    if (order.ownerUserId === principal.userId) return "owner";
+  function resolveRole(
+    principal: SessionPrincipal,
+    order: FakeOrderRecord,
+  ): { role: OrderAccessRole; hasBillingGrant?: boolean } | null {
+    if (principal.role === "admin") return { role: "admin" };
+    if (principal.role === "staff") return { role: "staff" };
+    if (order.ownerUserId === principal.userId) return { role: "owner" };
+    const collab = order.collaborators?.get(principal.userId);
+    if (collab) return { role: collab.role, ...(collab.hasBillingGrant ? { hasBillingGrant: true } : {}) };
     return null;
   }
 
-  function toView(order: FakeOrderRecord, role: OrderAccessRole): OrderAccessView {
+  function toView(order: FakeOrderRecord, role: OrderAccessRole, hasBillingGrant?: boolean): OrderAccessView {
     return {
       id: order.id,
       publicId: order.publicId,
@@ -77,6 +83,7 @@ function buildFakeOrders(ordersByPubId: Map<string, FakeOrderRecord>): OrdersMod
       origin: order.origin,
       version: 1,
       workflowVersionId: 1,
+      ...(hasBillingGrant ? ({ hasBillingGrant: true } as Record<string, unknown>) : {}),
     };
   }
 
@@ -84,9 +91,9 @@ function buildFakeOrders(ordersByPubId: Map<string, FakeOrderRecord>): OrdersMod
     if (principal.state !== "full" || principal.pendingSteps.length > 0) throw notFound("ORDER_NOT_FOUND");
     const order = ordersByPubId.get(orderPublicId);
     if (!order) throw notFound("ORDER_NOT_FOUND");
-    const role = resolveRole(principal, order);
-    if (!role) throw notFound("ORDER_NOT_FOUND");
-    return toView(order, role);
+    const resolved = resolveRole(principal, order);
+    if (!resolved) throw notFound("ORDER_NOT_FOUND");
+    return toView(order, resolved.role, resolved.hasBillingGrant);
   }
 
   return {
@@ -137,6 +144,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
   let customerBPrincipal: SessionPrincipal;
   const ordersMap = new Map<string, FakeOrderRecord>();
   let orderSeq = 900;
+  let stripeSeq = 1;
 
   beforeAll(async () => {
     tdb = await createTestDb({
@@ -229,7 +237,6 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       },
     };
 
-    let stripeSeq = 1;
     const stripeSessions = new Map<
       string,
       {
@@ -350,6 +357,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
     };
 
     const referralPaidCalls: string[] = [];
+    const suspendedUserIds = new Set<number>();
 
     const servicesObj = Object.assign(t.services, {
       config: { ...t.config, canonicalOrigin: "https://portal.readypackets.test" },
@@ -363,11 +371,12 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
             const all = [adminPrincipal, staffPrincipal, customerAPrincipal, customerBPrincipal];
             const found = all.find((p) => p.sessionId === sessionId);
             if (!found) return null;
+            const suspended = suspendedUserIds.has(found.userId);
             return {
-              live: true,
+              live: !suspended,
               userId: found.userId,
               userPublicId: found.userPublicId,
-              userStatus: "active" as const,
+              userStatus: suspended ? ("suspended" as const) : ("active" as const),
               authMethod: found.authMethod,
               role: found.role,
               state: found.state,
@@ -452,13 +461,36 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
 
     return {
       t,
+      moduleDeps,
+      servicesObj,
       compliance,
       payments,
       stripeSessions,
       referralPaidCalls,
+      suspendedUserIds,
       seedOrder,
       complianceCaller,
       paymentsCaller,
+      spawnFreshComplianceCaller(session: SessionPrincipal | null) {
+        const freshT = createTestDeps({ db: tdb.db, now: new Date(clockMs) });
+        freshT.deps.clock.now = () => new Date(clockMs);
+        const freshServices = Object.assign({}, servicesObj) as Services;
+        const freshDeps: ModuleDeps = {
+          ...freshT.deps,
+          logger: testLogger,
+          config: { ...freshT.config, canonicalOrigin: "https://portal.readypackets.test" },
+          services: freshServices,
+        };
+        const freshCompliance = createComplianceModule(freshDeps);
+        (freshServices as unknown as Record<string, unknown>).compliance = freshCompliance;
+        freshCompliance.init?.();
+        return createCallerFactory(complianceRouter)({
+          services: freshServices,
+          session,
+          request: newRequestContext("test"),
+          transport: { issue() {}, clear() {} },
+        });
+      },
       advanceClockMs(delta: number) {
         clockMs += delta;
       },
@@ -639,6 +671,24 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
     expect(waivedReceipt.amountWaivedMinor).toBe(35);
     expect(waivedReceipt.amountPaidMinor).toBe(0);
     expect(waivedReceipt.settlementKind).toBe("waived_small_total");
+
+    // Accounting boundary + checkout status: waived nominal amount is NEVER reported as captured cash
+    const waivedInvoiceDetail = await h.complianceCaller(customerAPrincipal).invoices.get({
+      invoicePublicId: invBlocked.invoicePublicId,
+    });
+    expect(waivedInvoiceDetail.status).toBe("paid");
+    expect(waivedInvoiceDetail.grossPaidMinor).toBe(0);
+    expect(waivedInvoiceDetail.netPaidMinor).toBe(0);
+    expect(waivedInvoiceDetail.waivedMinor).toBe(35);
+    expect(waivedInvoiceDetail.balanceDueMinor).toBe(0);
+
+    const checkoutStatusAfterWaive = await h.payments.getCheckoutStatus(customerAPrincipal, {
+      invoicePublicId: invBlocked.invoicePublicId,
+    });
+    expect(checkoutStatusAfterWaive.invoiceStatus).toBe("paid");
+    expect(checkoutStatusAfterWaive.balanceDueMinor).toBe(0);
+    expect(checkoutStatusAfterWaive.waivedMinor).toBe(35);
+    expect(checkoutStatusAfterWaive.receiptPublicId).toBe(waivedRes.receiptPublicId);
 
     // Waived payment CANNOT be refunded in cash
     const ledger = await h.compliance.invoices.listOrderPaymentsAndRefunds(ordBlocked.publicId);
@@ -1033,5 +1083,283 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       publicId: accV2.acceptancePublicId,
     });
     expect(detail2.signatureMatch).toBe("mismatch_warn");
+  });
+
+  it("Wave 2 security regressions: blocks waiver when prior provider attempt has exposure, enforces DB-durable 3/hr resend across instances, and denies generic order collaborators on receipts/PDFs", async () => {
+    const h = createHarness();
+    const webhookSecret = "whsec_test_inc06_wave2_sec_regressions_999";
+    await h.paymentsCaller(adminPrincipal).admin.updateSettings({
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_inc06_wave2_sec_key_1234567890",
+      stripeWebhookSecret: webhookSecret,
+      smallTotals: {
+        belowProviderMinimum: "waive",
+        minimumOverrides: { stripe: { USD: 50 } },
+      },
+      receipts: {
+        enabled: true,
+        emailCustomer: true,
+        footerText: "Retain for audit.",
+      },
+    });
+
+    // (1) Pre-existing provider attempt under lock MUST block small-total waiver when minimum later rises
+    const ordAttemptFirst = h.seedOrder(customerAPrincipal);
+    const invAttemptFirst = await tdb.db.transaction((tx) =>
+      h.compliance.invoices.issueCheckoutInvoiceInTx(
+        {
+          principal: customerAPrincipal,
+          orderId: ordAttemptFirst.id,
+          orderPublicId: ordAttemptFirst.publicId,
+          currency: "USD",
+          lines: [{ description: "Micro Add-on", quantity: 1, unitAmountMinor: 75 }],
+          discountMinor: 0,
+          taxMinor: 0,
+        },
+        tx,
+      ),
+    );
+
+    // At $0.50 minimum, $0.75 creates a real Stripe checkout session (`redirected` with `providerRef`)
+    const redirectAttempt = await h.payments.startCheckout(invAttemptFirst.invoicePublicId, undefined, {
+      principal: customerAPrincipal,
+      idempotencyKey: `idem-attempt-75-${invAttemptFirst.invoicePublicId}`,
+    });
+    expect(redirectAttempt.mode).toBe("redirect");
+
+    // Admin raises Stripe USD minimum override to $1.00 (`100` minor) while the $0.75 session is still open externally
+    await h.paymentsCaller(adminPrincipal).admin.updateSettings({
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      smallTotals: {
+        belowProviderMinimum: "waive",
+        minimumOverrides: { stripe: { USD: 100 } },
+      },
+    });
+
+    // Attempting checkout with a fresh idempotency key MUST fail closed (`PAYMENT_ATTEMPT_OUTSTANDING`) — zero waiver rows & zero receipts
+    await expect(
+      h.payments.startCheckout(invAttemptFirst.invoicePublicId, undefined, {
+        principal: customerAPrincipal,
+        idempotencyKey: `idem-waive-blocked-by-attempt-${invAttemptFirst.invoicePublicId}`,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PAYMENT_ATTEMPT_OUTSTANDING",
+    });
+
+    // Even if the customer locally cancels the attempt, prior attempt record still blocks waiver
+    if (redirectAttempt.mode === "redirect") {
+      await h.payments.cancelAttemptIfUnpaid(customerAPrincipal, { attemptPublicId: redirectAttempt.attemptPublicId });
+    }
+    await expect(
+      h.payments.startCheckout(invAttemptFirst.invoicePublicId, undefined, {
+        principal: customerAPrincipal,
+        idempotencyKey: `idem-waive-blocked-after-cancel-${invAttemptFirst.invoicePublicId}`,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PAYMENT_ATTEMPT_OUTSTANDING",
+    });
+
+    // Even a ref-less `failed` attempt (e.g. ambiguous network failure during provider session creation) blocks waiver
+    const ordReflessFailed = h.seedOrder(customerAPrincipal);
+    const invReflessFailed = await tdb.db.transaction((tx) =>
+      h.compliance.invoices.issueCheckoutInvoiceInTx(
+        {
+          principal: customerAPrincipal,
+          orderId: ordReflessFailed.id,
+          orderPublicId: ordReflessFailed.publicId,
+          currency: "USD",
+          lines: [{ description: "Ambiguous Dispatch Item", quantity: 1, unitAmountMinor: 60 }],
+          discountMinor: 0,
+          taxMinor: 0,
+        },
+        tx,
+      ),
+    );
+    const [invRowForRefless] = await tdb.db
+      .select({ id: complianceSchema.complianceInvoices.id })
+      .from(complianceSchema.complianceInvoices)
+      .where(eq(complianceSchema.complianceInvoices.publicId, invReflessFailed.invoicePublicId))
+      .limit(1);
+    await tdb.db.insert(paymentAttempts).values({
+      publicId: ulid(Date.now() + 999),
+      orderPublicId: ordReflessFailed.publicId,
+      invoiceId: invRowForRefless!.id,
+      invoicePublicId: invReflessFailed.invoicePublicId,
+      customerUserId: customerAPrincipal.userId,
+      provider: "stripe",
+      environment: "test",
+      status: "failed",
+      amountMinor: 60,
+      currency: "USD",
+      idempotencyKey: `idem-refless-failed-${invReflessFailed.invoicePublicId}`,
+      successPath: "/checkout/complete",
+      cancelPath: "/checkout/cancelled",
+      failureReasonCode: "PROVIDER_NETWORK_TIMEOUT",
+      createdAt: new Date("2026-11-23T12:05:00.000Z"),
+      updatedAt: new Date("2026-11-23T12:05:00.000Z"),
+    });
+    await expect(
+      h.payments.startCheckout(invReflessFailed.invoicePublicId, undefined, {
+        principal: customerAPrincipal,
+        idempotencyKey: `idem-waive-after-refless-${invReflessFailed.invoicePublicId}`,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      reasonCode: "PAYMENT_ATTEMPT_OUTSTANDING",
+    });
+
+    const prematureReceipts = await h.compliance.receipts.forOrder(adminPrincipal, ordAttemptFirst.publicId);
+    expect(prematureReceipts).toHaveLength(0);
+
+    // (1b) Waived replay path validates live actor inside `tx` (suspended user rejected)
+    const ordWaiveReplay = h.seedOrder(customerAPrincipal);
+    const invWaiveReplay = await tdb.db.transaction((tx) =>
+      h.compliance.invoices.issueCheckoutInvoiceInTx(
+        {
+          principal: customerAPrincipal,
+          orderId: ordWaiveReplay.id,
+          orderPublicId: ordWaiveReplay.publicId,
+          currency: "USD",
+          lines: [{ description: "Sub-min Item", quantity: 1, unitAmountMinor: 40 }],
+          discountMinor: 0,
+          taxMinor: 0,
+        },
+        tx,
+      ),
+    );
+    const initialWaive = await h.payments.startCheckout(invWaiveReplay.invoicePublicId, undefined, {
+      principal: customerAPrincipal,
+      idempotencyKey: `idem-waive-live-${invWaiveReplay.invoicePublicId}`,
+    });
+    expect(initialWaive.mode).toBe("settled");
+
+    await tdb.db.update(users).set({ status: "suspended" }).where(eq(users.id, customerAPrincipal.userId));
+    try {
+      await expect(
+        h.payments.startCheckout(invWaiveReplay.invoicePublicId, undefined, {
+          principal: customerAPrincipal,
+          idempotencyKey: `idem-waive-live-${invWaiveReplay.invoicePublicId}`,
+        }),
+      ).rejects.toMatchObject({
+        code: "UNAUTHENTICATED",
+      });
+    } finally {
+      await tdb.db.update(users).set({ status: "active" }).where(eq(users.id, customerAPrincipal.userId));
+    }
+
+    // (2) DB-durable 3/hr "Send again" limit across independent ComplianceModule instances + window expiry
+    const ordCollab = h.seedOrder(customerAPrincipal);
+    ordCollab.collaborators = new Map([[customerBPrincipal.userId, { role: "viewer" }]]);
+    const draftCollabInv = await h.compliance.invoices.admin.createDraft(adminPrincipal, {
+      orderPublicId: ordCollab.publicId,
+      currency: "USD",
+      lines: [{ description: "Enterprise Packet", quantity: 1, unitAmountMinor: 12_000 }],
+      discountMinor: 0,
+      taxMinor: 0,
+    });
+    await h.compliance.invoices.admin.issue(adminPrincipal, {
+      invoicePublicId: draftCollabInv.invoicePublicId,
+    });
+    const recordedManual = await h.compliance.invoices.admin.recordManualPayment(adminPrincipal, {
+      invoicePublicId: draftCollabInv.invoicePublicId,
+      method: "wire",
+      amountMinor: 12_000,
+      currency: "USD",
+      reference: "WIRE-SEC-0001",
+      receivedAt: new Date("2026-11-23T12:15:00.000Z"),
+      idempotencyKey: "idem-sec-manual-wire-1",
+    });
+    const collabReceipts = await h.compliance.receipts.forOrder(adminPrincipal, ordCollab.publicId);
+    expect(collabReceipts).toHaveLength(1);
+    const targetReceiptId = collabReceipts[0]!.receiptPublicId;
+
+    // Issue a partial refund so a refund note also exists on this receipt
+    await h.compliance.invoices.admin.recordRefund(adminPrincipal, {
+      invoicePublicId: draftCollabInv.invoicePublicId,
+      paymentPublicId: recordedManual.paymentPublicId,
+      amountMinor: 2_000,
+      currency: "USD",
+      reasonCode: "price_adjustment",
+      reference: "WIRE-RFD-0001",
+      confirmationPhrase: "REFUND ORDER",
+      idempotencyKey: "idem-sec-manual-rfd-1",
+    });
+    const receiptWithNote = await h.compliance.receipts.get(adminPrincipal, targetReceiptId);
+    expect(receiptWithNote.refundNotes).toHaveLength(1);
+    const targetNoteId = receiptWithNote.refundNotes[0]!.notePublicId;
+
+    // Send 3 times on primary module instance
+    for (let i = 0; i < 3; i++) {
+      await h.complianceCaller(staffPrincipal).receipts.admin.resend({ receiptPublicId: targetReceiptId });
+      h.advanceClockMs(60_000);
+    }
+
+    // Spawn a brand-new ComplianceModule instance (zero shared in-memory state) -> 4th send within 1 hour STILL blocked by DB!
+    const freshStaffCaller = h.spawnFreshComplianceCaller(staffPrincipal);
+    await expect(
+      freshStaffCaller.receipts.admin.resend({ receiptPublicId: targetReceiptId }),
+    ).rejects.toMatchObject({
+      code: "TOO_MANY_REQUESTS",
+      cause: expect.objectContaining({
+        code: "RATE_LIMITED",
+        reasonCode: "RECEIPT_RESEND_RATE_LIMITED",
+      }),
+    });
+
+    // Advance clock past the 1-hour sliding window -> resend succeeds again and updates slot durably
+    h.advanceClockMs(3600 * 1000);
+    const unlockedResend = await freshStaffCaller.receipts.admin.resend({ receiptPublicId: targetReceiptId });
+    expect(unlockedResend.resendCount).toBe(4);
+
+    // (3) Generic order collaborator (`viewer` / `contributor` without explicit billing grant) is DENIED on all receipt & refund-note surfaces
+    // AND public NOT_FOUND error carries zero `details` oracle distinguishing real receipts from nonexistent IDs.
+    const deniedBefore = h.t.audit.named("authz.compliance.denied").length;
+    await expect(
+      h.complianceCaller(customerBPrincipal).receipts.forOrder({ orderPublicId: ordCollab.publicId }),
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      cause: expect.objectContaining({
+        reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING",
+      }),
+    });
+    let collabGetErr: unknown;
+    try {
+      await h.complianceCaller(customerBPrincipal).receipts.get({ receiptPublicId: targetReceiptId });
+    } catch (e) {
+      collabGetErr = e;
+    }
+    expect(collabGetErr).toMatchObject({ code: "NOT_FOUND" });
+    expect(((collabGetErr as { cause?: { details?: unknown } })?.cause)?.details).toBeUndefined();
+
+    await expect(
+      h.compliance.receipts.downloadReceiptPdf(customerBPrincipal, targetReceiptId),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      details: undefined,
+    });
+    await expect(
+      h.compliance.receipts.downloadRefundNotePdf(customerBPrincipal, targetNoteId),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      details: undefined,
+    });
+    expect(h.t.audit.named("authz.compliance.denied").length).toBeGreaterThanOrEqual(deniedBefore + 4);
+
+    // Granting an explicit billing grant (`hasBillingGrant: true`) unlocks receipt read & PDF download for that collaborator
+    ordCollab.collaborators.set(customerBPrincipal.userId, { role: "viewer", hasBillingGrant: true });
+    const billingGrantedList = await h.complianceCaller(customerBPrincipal).receipts.forOrder({
+      orderPublicId: ordCollab.publicId,
+    });
+    expect(billingGrantedList).toHaveLength(1);
+    const billingGrantedPdf = await h.compliance.receipts.downloadReceiptPdf(customerBPrincipal, targetReceiptId);
+    expect(billingGrantedPdf.buffer.subarray(0, 8).toString("latin1")).toBe("%PDF-1.4");
+    const billingGrantedNotePdf = await h.compliance.receipts.downloadRefundNotePdf(customerBPrincipal, targetNoteId);
+    expect(billingGrantedNotePdf.buffer.subarray(0, 8).toString("latin1")).toBe("%PDF-1.4");
   });
 });

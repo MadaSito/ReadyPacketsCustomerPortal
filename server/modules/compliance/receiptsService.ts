@@ -151,16 +151,32 @@ function isStaffOrAdmin(principal: SessionPrincipal): boolean {
 }
 
 function hasStaffReceiptReadCap(role: SessionPrincipal["role"]): boolean {
+  return roleHasCapability(role, "invoices.read_all");
+}
+
+function hasExplicitOrderBillingGrant(orderView: unknown): boolean {
+  if (!orderView || typeof orderView !== "object") return false;
+  const candidate = orderView as {
+    hasBillingGrant?: unknown;
+    billingAccess?: unknown;
+    accessRole?: unknown;
+  };
   return (
-    roleHasCapability(role, "invoices.read_all") ||
-    roleHasCapability(role, "invoices.manage") ||
-    roleHasCapability(role, "invoices.record_payment")
+    candidate.hasBillingGrant === true ||
+    candidate.billingAccess === true ||
+    candidate.accessRole === "billing"
   );
 }
 
-export function createReceiptsService(deps: ModuleDeps) {
-  const hourlyResendTimestamps = new Map<string, number[]>();
+function buildReceiptResendSlotKeys(receiptId: number): string[] {
+  const keys: string[] = [];
+  for (let slot = 0; slot < RECEIPT_MAX_RESENDS_PER_HOUR; slot++) {
+    keys.push(`rcpt_r${slot}:${receiptId}`);
+  }
+  return keys;
+}
 
+export function createReceiptsService(deps: ModuleDeps) {
   function requireOrdersService() {
     const svc = (deps.services as Partial<typeof deps.services>).orders;
     if (!svc) {
@@ -1030,10 +1046,13 @@ export function createReceiptsService(deps: ModuleDeps) {
     return map;
   }
 
+  const collaboratorDeniedErrors = new WeakSet<DomainError>();
+
   async function assertCanReadReceiptRow(
     principal: SessionPrincipal,
     row: typeof compliancePaymentReceipts.$inferSelect,
     tx?: Tx,
+    notFoundCode: "RECEIPT_NOT_FOUND" | "REFUND_NOTE_NOT_FOUND" = "RECEIPT_NOT_FOUND",
   ): Promise<{ liveRole: SessionPrincipal["role"]; liveUserId: number }> {
     const liveActor = await assertLiveActorInTx(deps, principal, tx ?? (deps.db as unknown as Tx));
     const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
@@ -1046,18 +1065,37 @@ export function createReceiptsService(deps: ModuleDeps) {
       return { liveRole: livePrincipal.role, liveUserId: liveActor.userId };
     }
 
-    // Check order read scope (supports granted collaborators or staff with order read access).
+    // Increment 06 security boundary: generic order collaborators (`viewer` / `contributor`) do NOT
+    // receive receipt or refund-note access. Only an explicit billing grant on the order qualifies.
     try {
       const ordersSvc = requireOrdersService();
-      await ordersSvc.assertCanReadOrder(
+      const orderView = await ordersSvc.assertCanReadOrder(
         livePrincipal,
         row.orderPublicId,
         tx ? { tx } : undefined,
       );
-      return { liveRole: livePrincipal.role, liveUserId: liveActor.userId };
+      if (orderView.ownerUserId === liveActor.userId || hasExplicitOrderBillingGrant(orderView)) {
+        return { liveRole: livePrincipal.role, liveUserId: liveActor.userId };
+      }
     } catch {
-      throw notFound("RECEIPT_NOT_FOUND");
+      throw notFound(notFoundCode);
     }
+
+    if (!tx) {
+      await deps.audit.record({
+        category: "security",
+        eventName: "authz.compliance.denied",
+        action: "authorize",
+        outcome: "denied",
+        severity: "WARN",
+        reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING",
+        actor: { userId: liveActor.userId, role: livePrincipal.role },
+        resource: { type: "payment_receipt", publicId: row.publicId },
+      });
+    }
+    const err = notFound(notFoundCode);
+    collaboratorDeniedErrors.add(err);
+    throw err;
   }
 
   async function myList(
@@ -1100,7 +1138,18 @@ export function createReceiptsService(deps: ModuleDeps) {
     const liveActor = await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx);
     const livePrincipal: SessionPrincipal = { ...principal, role: liveActor.role };
     const ordersSvc = requireOrdersService();
-    await ordersSvc.assertCanReadOrder(livePrincipal, orderPublicId);
+    const orderView = await ordersSvc.assertCanReadOrder(livePrincipal, orderPublicId);
+
+    const allowed =
+      (isStaffOrAdmin(livePrincipal) && hasStaffReceiptReadCap(livePrincipal.role)) ||
+      orderView.ownerUserId === liveActor.userId ||
+      hasExplicitOrderBillingGrant(orderView);
+    if (!allowed) {
+      await denyComplianceAuthz(deps, livePrincipal, "NOT_RECEIPT_BUYER_OR_BILLING", {
+        type: "order_receipts",
+        publicId: orderPublicId,
+      });
+    }
 
     const rows = await deps.db
       .select()
@@ -1147,103 +1196,145 @@ export function createReceiptsService(deps: ModuleDeps) {
     principal: SessionPrincipal,
     receiptPublicId: string,
   ): Promise<{ filename: string; contentType: "application/pdf"; buffer: Buffer }> {
-    return runComplianceTx(deps, principal, { type: "payment_receipt", publicId: receiptPublicId }, async (tx) => {
-      const [row] = await tx
-        .select()
-        .from(compliancePaymentReceipts)
-        .where(eq(compliancePaymentReceipts.publicId, receiptPublicId))
-        .limit(1);
-      if (!row) throw notFound("RECEIPT_NOT_FOUND");
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "payment_receipt", publicId: receiptPublicId },
+      async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(compliancePaymentReceipts)
+          .where(eq(compliancePaymentReceipts.publicId, receiptPublicId))
+          .limit(1);
+        if (!row) throw notFound("RECEIPT_NOT_FOUND");
 
-      const { liveRole, liveUserId } = await assertCanReadReceiptRow(principal, row, tx);
-      const b64 = deps.crypto.decrypt(row.pdfEnc, receiptPdfAad(row.publicId));
-      const buffer = Buffer.from(b64, "base64");
-      if (sha256Hex(buffer) !== row.pdfSha256) {
-        throw new DomainError(
-          "INTERNAL" as never,
-          "RECEIPT_PDF_INTEGRITY_MISMATCH",
-          "Stored receipt PDF failed cryptographic integrity verification.",
-        );
-      }
+        const { liveRole, liveUserId } = await assertCanReadReceiptRow(principal, row, tx, "RECEIPT_NOT_FOUND");
+        const b64 = deps.crypto.decrypt(row.pdfEnc, receiptPdfAad(row.publicId));
+        const buffer = Buffer.from(b64, "base64");
+        if (sha256Hex(buffer) !== row.pdfSha256) {
+          throw new DomainError(
+            "INTERNAL" as never,
+            "RECEIPT_PDF_INTEGRITY_MISMATCH",
+            "Stored receipt PDF failed cryptographic integrity verification.",
+          );
+        }
 
-      await deps.audit.record(
-        {
-          category: "business",
-          eventName: "compliance.receipt.downloaded",
-          action: "download",
-          outcome: "completed",
-          actor: { userId: liveUserId, role: liveRole },
-          resource: { type: "payment_receipt", publicId: row.publicId },
-          attributes: {
-            receipt_number: row.receiptNumber,
-            order_public_id: row.orderPublicId,
-            invoice_public_id: row.invoicePublicId,
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "compliance.receipt.downloaded",
+            action: "download",
+            outcome: "completed",
+            actor: { userId: liveUserId, role: liveRole },
+            resource: { type: "payment_receipt", publicId: row.publicId },
+            attributes: {
+              receipt_number: row.receiptNumber,
+              order_public_id: row.orderPublicId,
+              invoice_public_id: row.invoicePublicId,
+            },
           },
-        },
-        tx,
-      );
+          tx,
+        );
 
-      return {
-        filename: `${row.receiptNumber}.pdf`,
-        contentType: "application/pdf" as const,
-        buffer,
-      };
-    });
+        return {
+          filename: `${row.receiptNumber}.pdf`,
+          contentType: "application/pdf" as const,
+          buffer,
+        };
+      },
+      {
+        onRefusalAfterRollback: async (err: DomainError) => {
+          if (collaboratorDeniedErrors.has(err)) {
+            await deps.audit.record({
+              category: "security",
+              eventName: "authz.compliance.denied",
+              action: "authorize",
+              outcome: "denied",
+              severity: "WARN",
+              reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING",
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "payment_receipt", publicId: receiptPublicId },
+            });
+          }
+        },
+      },
+    );
   }
 
   async function downloadRefundNotePdf(
     principal: SessionPrincipal,
     notePublicId: string,
   ): Promise<{ filename: string; contentType: "application/pdf"; buffer: Buffer }> {
-    return runComplianceTx(deps, principal, { type: "receipt_refund_note", publicId: notePublicId }, async (tx) => {
-      const [note] = await tx
-        .select()
-        .from(complianceReceiptRefundNotes)
-        .where(eq(complianceReceiptRefundNotes.publicId, notePublicId))
-        .limit(1);
-      if (!note) throw notFound("REFUND_NOTE_NOT_FOUND");
+    return runComplianceTx(
+      deps,
+      principal,
+      { type: "receipt_refund_note", publicId: notePublicId },
+      async (tx) => {
+        const [note] = await tx
+          .select()
+          .from(complianceReceiptRefundNotes)
+          .where(eq(complianceReceiptRefundNotes.publicId, notePublicId))
+          .limit(1);
+        if (!note) throw notFound("REFUND_NOTE_NOT_FOUND");
 
-      const [receipt] = await tx
-        .select()
-        .from(compliancePaymentReceipts)
-        .where(eq(compliancePaymentReceipts.id, note.receiptId))
-        .limit(1);
-      if (!receipt) throw notFound("REFUND_NOTE_NOT_FOUND");
+        const [receipt] = await tx
+          .select()
+          .from(compliancePaymentReceipts)
+          .where(eq(compliancePaymentReceipts.id, note.receiptId))
+          .limit(1);
+        if (!receipt) throw notFound("REFUND_NOTE_NOT_FOUND");
 
-      const { liveRole, liveUserId } = await assertCanReadReceiptRow(principal, receipt, tx);
-      const b64 = deps.crypto.decrypt(note.pdfEnc, refundNotePdfAad(note.publicId));
-      const buffer = Buffer.from(b64, "base64");
-      if (sha256Hex(buffer) !== note.pdfSha256) {
-        throw new DomainError(
-          "INTERNAL" as never,
-          "REFUND_NOTE_PDF_INTEGRITY_MISMATCH",
-          "Stored refund note PDF failed cryptographic integrity verification.",
-        );
-      }
+        const { liveRole, liveUserId } = await assertCanReadReceiptRow(principal, receipt, tx, "REFUND_NOTE_NOT_FOUND");
+        const b64 = deps.crypto.decrypt(note.pdfEnc, refundNotePdfAad(note.publicId));
+        const buffer = Buffer.from(b64, "base64");
+        if (sha256Hex(buffer) !== note.pdfSha256) {
+          throw new DomainError(
+            "INTERNAL" as never,
+            "REFUND_NOTE_PDF_INTEGRITY_MISMATCH",
+            "Stored refund note PDF failed cryptographic integrity verification.",
+          );
+        }
 
-      await deps.audit.record(
-        {
-          category: "business",
-          eventName: "compliance.receipt_refund_note.downloaded",
-          action: "download",
-          outcome: "completed",
-          actor: { userId: liveUserId, role: liveRole },
-          resource: { type: "receipt_refund_note", publicId: note.publicId },
-          attributes: {
-            note_number: note.noteNumber,
-            receipt_public_id: receipt.publicId,
-            order_public_id: note.orderPublicId,
+        await deps.audit.record(
+          {
+            category: "business",
+            eventName: "compliance.receipt_refund_note.downloaded",
+            action: "download",
+            outcome: "completed",
+            actor: { userId: liveUserId, role: liveRole },
+            resource: { type: "receipt_refund_note", publicId: note.publicId },
+            attributes: {
+              note_number: note.noteNumber,
+              receipt_public_id: receipt.publicId,
+              order_public_id: note.orderPublicId,
+            },
           },
-        },
-        tx,
-      );
+          tx,
+        );
 
-      return {
-        filename: `${note.noteNumber}.pdf`,
-        contentType: "application/pdf" as const,
-        buffer,
-      };
-    });
+        return {
+          filename: `${note.noteNumber}.pdf`,
+          contentType: "application/pdf" as const,
+          buffer,
+        };
+      },
+      {
+        onRefusalAfterRollback: async (err: DomainError) => {
+          if (collaboratorDeniedErrors.has(err)) {
+            await deps.audit.record({
+              category: "security",
+              eventName: "authz.compliance.denied",
+              action: "authorize",
+              outcome: "denied",
+              severity: "WARN",
+              reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING",
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "receipt_refund_note", publicId: notePublicId },
+            });
+          }
+        },
+      },
+    );
   }
 
   async function assertStaffReceiptAccess(principal: SessionPrincipal): Promise<void> {
@@ -1356,6 +1447,8 @@ export function createReceiptsService(deps: ModuleDeps) {
 
         const now = deps.clock.now();
         const nowMs = now.getTime();
+        const nowSec = Math.floor(nowMs / 1000);
+        const hourlyWindowSec = Math.floor(RECEIPT_RESEND_HOURLY_WINDOW_MS / 1000);
         if (row.resendCount >= RECEIPT_MAX_RESEND_COUNT) {
           throw new DomainError(
             "RATE_LIMITED",
@@ -1370,11 +1463,17 @@ export function createReceiptsService(deps: ModuleDeps) {
             "This receipt was just sent. Please wait a minute before sending it again.",
           );
         }
-        const recentWindow = (hourlyResendTimestamps.get(row.publicId) ?? []).filter(
-          (ts) => nowMs - ts < RECEIPT_RESEND_HOURLY_WINDOW_MS,
-        );
-        if (recentWindow.length >= RECEIPT_MAX_RESENDS_PER_HOUR) {
-          hourlyResendTimestamps.set(row.publicId, recentWindow);
+
+        const slotKeys = buildReceiptResendSlotKeys(row.id);
+        const slotRows = await tx
+          .select()
+          .from(complianceSequences)
+          .where(inArray(complianceSequences.seqKey, slotKeys))
+          .for("update");
+        const recentInHour = slotRows.filter(
+          (slot) => slot.nextVal > 0 && nowSec - slot.nextVal < hourlyWindowSec,
+        ).length;
+        if (recentInHour >= RECEIPT_MAX_RESENDS_PER_HOUR) {
           throw new DomainError(
             "RATE_LIMITED",
             "RECEIPT_RESEND_RATE_LIMITED",
@@ -1408,8 +1507,21 @@ export function createReceiptsService(deps: ModuleDeps) {
             updatedAt: now,
           })
           .where(eq(compliancePaymentReceipts.id, row.id));
-        recentWindow.push(nowMs);
-        hourlyResendTimestamps.set(row.publicId, recentWindow);
+
+        const targetSlotKey = `rcpt_r${row.resendCount % RECEIPT_MAX_RESENDS_PER_HOUR}:${row.id}`;
+        await tx
+          .insert(complianceSequences)
+          .values({
+            seqKey: targetSlotKey,
+            nextVal: nowSec,
+            updatedAt: now,
+          })
+          .onDuplicateKeyUpdate({
+            set: {
+              nextVal: nowSec,
+              updatedAt: now,
+            },
+          });
 
         await deps.audit.record(
           {
@@ -1457,10 +1569,24 @@ export function createReceiptsService(deps: ModuleDeps) {
     );
   }
 
+  async function findLatestReceiptPublicIdForInvoice(
+    dbOrTx: DbOrTx,
+    invoiceId: number,
+  ): Promise<string | null> {
+    const [latest] = await dbOrTx
+      .select({ publicId: compliancePaymentReceipts.publicId })
+      .from(compliancePaymentReceipts)
+      .where(eq(compliancePaymentReceipts.invoiceId, invoiceId))
+      .orderBy(desc(compliancePaymentReceipts.id))
+      .limit(1);
+    return latest?.publicId ?? null;
+  }
+
   return {
     issueReceiptForPaymentInTx,
     issueReceiptForZeroInvoiceInTx,
     onPaymentRefundedInTx,
+    findLatestReceiptPublicIdForInvoice,
     myList,
     forOrder,
     get,

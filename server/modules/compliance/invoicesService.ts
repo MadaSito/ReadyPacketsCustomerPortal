@@ -93,6 +93,7 @@ export interface InvoiceSummaryView {
   taxMinor: number;
   totalMinor: number;
   grossPaidMinor: number;
+  waivedMinor: number;
   refundedMinor: number;
   netPaidMinor: number;
   balanceDueMinor: number;
@@ -270,6 +271,8 @@ export interface CheckoutInvoiceSnapshot {
   currency: string;
   totalMinor: number;
   balanceDueMinor: number;
+  waivedMinor: number;
+  receiptPublicId?: string | null | undefined;
   issuedAt: Date | null;
   voidedAt: Date | null;
   origin: "portal" | "import";
@@ -576,22 +579,41 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
   }
 
+  interface LedgerSums {
+    /** Actual captured cash (excludes waived balances). */
+    grossPaidMinor: number;
+    /** Non-cash balance waived at checkout (`waived_small_total` / `method = "waiver"`). */
+    waivedMinor: number;
+    /** `grossPaidMinor + waivedMinor` — total settled credit toward invoice total. */
+    settledGrossMinor: number;
+    refundedMinor: number;
+  }
+
+  const EMPTY_LEDGER_SUMS: LedgerSums = {
+    grossPaidMinor: 0,
+    waivedMinor: 0,
+    settledGrossMinor: 0,
+    refundedMinor: 0,
+  };
+
   async function computeLedgerSums(
     dbOrTx: DbOrTx,
     invoiceIds: readonly number[],
-  ): Promise<Map<number, { grossPaidMinor: number; refundedMinor: number }>> {
-    const map = new Map<number, { grossPaidMinor: number; refundedMinor: number }>();
+  ): Promise<Map<number, LedgerSums>> {
+    const map = new Map<number, LedgerSums>();
     if (invoiceIds.length === 0) return map;
     for (const id of invoiceIds) {
-      map.set(id, { grossPaidMinor: 0, refundedMinor: 0 });
+      map.set(id, { ...EMPTY_LEDGER_SUMS });
     }
 
     const [payments, refunds] = await Promise.all([
       dbOrTx
         .select({
           invoiceId: complianceInvoicePayments.invoiceId,
+          method: complianceInvoicePayments.method,
           status: complianceInvoicePayments.status,
           amountMinor: complianceInvoicePayments.amountMinor,
+          waivedMinor: complianceInvoicePayments.waivedMinor,
         })
         .from(complianceInvoicePayments)
         .where(inArray(complianceInvoicePayments.invoiceId, [...invoiceIds])),
@@ -607,7 +629,16 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     for (const p of payments) {
       if (p.status === "succeeded") {
         const entry = map.get(p.invoiceId);
-        if (entry) entry.grossPaidMinor += p.amountMinor;
+        if (entry) {
+          const rowWaived =
+            p.method === "waiver"
+              ? Math.max(0, p.waivedMinor || p.amountMinor)
+              : Math.max(0, Math.min(p.amountMinor, p.waivedMinor ?? 0));
+          const rowCaptured = Math.max(0, p.amountMinor - rowWaived);
+          entry.grossPaidMinor += rowCaptured;
+          entry.waivedMinor += rowWaived;
+          entry.settledGrossMinor += rowCaptured + rowWaived;
+        }
       }
     }
     for (const r of refunds) {
@@ -621,27 +652,28 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
   function toSummaryView(
     inv: typeof complianceInvoices.$inferSelect,
     orderReference: string,
-    sums: { grossPaidMinor: number; refundedMinor: number },
+    sums: LedgerSums,
   ): InvoiceSummaryView {
     const derivedStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       totalMinor: inv.totalMinor,
-      grossPaidMinor: sums.grossPaidMinor,
+      grossPaidMinor: sums.settledGrossMinor,
       refundedMinor: sums.refundedMinor,
     });
     const derivedPaymentState = deriveInvoicePaymentState({
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       totalMinor: inv.totalMinor,
-      grossPaidMinor: sums.grossPaidMinor,
+      grossPaidMinor: sums.settledGrossMinor,
       refundedMinor: sums.refundedMinor,
     });
     const netPaidMinor = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+    const netSettledMinor = Math.max(0, sums.settledGrossMinor - sums.refundedMinor);
     const balanceDueMinor =
       derivedStatus === "void" || derivedStatus === "draft"
         ? 0
-        : Math.max(0, inv.totalMinor - netPaidMinor);
+        : Math.max(0, inv.totalMinor - netSettledMinor);
 
     return {
       invoicePublicId: inv.publicId,
@@ -656,6 +688,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       taxMinor: inv.taxMinor,
       totalMinor: inv.totalMinor,
       grossPaidMinor: sums.grossPaidMinor,
+      waivedMinor: sums.waivedMinor,
       refundedMinor: sums.refundedMinor,
       netPaidMinor,
       balanceDueMinor,
@@ -747,7 +780,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       lockState: orderView.lockState,
       onlinePaymentConfigured: onlineConfigured,
       items: visibleRows.map((inv) =>
-        toSummaryView(inv, orderView.reference, sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 }),
+        toSummaryView(inv, orderView.reference, sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS),
       ),
     };
   }
@@ -794,13 +827,13 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     );
     const visible = input.status
       ? candidates.filter((r) => {
-          const s = sumsMap.get(r.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+          const s = sumsMap.get(r.id) ?? EMPTY_LEDGER_SUMS;
           return (
             deriveInvoiceStatus({
               totalMinor: r.totalMinor,
               issuedAt: r.issuedAt,
               voidedAt: r.voidedAt,
-              grossPaidMinor: s.grossPaidMinor,
+              grossPaidMinor: s.settledGrossMinor,
               refundedMinor: s.refundedMinor,
             }) === input.status
           );
@@ -822,7 +855,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         toSummaryView(
           inv,
           refByOrderId.get(inv.orderId) ?? inv.orderPublicId,
-          sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 },
+          sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
         ),
       )
       .filter((view) => (input.status ? view.status === input.status : true));
@@ -878,7 +911,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     const summary = toSummaryView(
       inv,
       orderView.reference,
-      sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 },
+      sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
     );
 
     const orderDiscountMinor = Math.max(0, orderView.discountMinor ?? 0);
@@ -1026,7 +1059,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         toSummaryView(
           inv,
           refByOrderId.get(inv.orderId) ?? inv.orderPublicId,
-          sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 },
+          sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
         ),
       ),
       nextCursor: hasMore && slice.length > 0 ? encodeIdCursor(slice[slice.length - 1]!.id) : null,
@@ -1425,7 +1458,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       }
 
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const netPaidMinor = sums.grossPaidMinor - sums.refundedMinor;
       if (netPaidMinor > 0) {
         throw conflict(
@@ -1433,12 +1466,18 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           "Cannot void an invoice that has unrefunded payments. Record a refund first.",
         );
       }
+      if (sums.waivedMinor > 0) {
+        throw conflict(
+          "INVOICE_ALREADY_SETTLED",
+          "Cannot void an invoice that has already been settled via checkout waiver.",
+        );
+      }
 
       const derivedStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: now,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
 
@@ -1570,20 +1609,20 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
             })
           : null;
         const sumsMap = await computeLedgerSums(tx, [inv.id]);
-        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         const status = deriveInvoiceStatus({
           issuedAt: inv.issuedAt,
           voidedAt: inv.voidedAt,
           totalMinor: inv.totalMinor,
-          grossPaidMinor: sums.grossPaidMinor,
+          grossPaidMinor: sums.settledGrossMinor,
           refundedMinor: sums.refundedMinor,
         });
-        const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+        const netSettled = Math.max(0, sums.settledGrossMinor - sums.refundedMinor);
         return {
           paymentPublicId: existingIdem.publicId,
           receiptPublicId: receiptRes?.receiptPublicId ?? null,
           invoiceStatus: status,
-          balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
+          balanceDueMinor: Math.max(0, inv.totalMinor - netSettled),
           duplicate: true,
         };
       }
@@ -1599,9 +1638,9 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       }
 
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
-      const currentNetPaid = sums.grossPaidMinor - sums.refundedMinor;
-      const remainingBalance = inv.totalMinor - currentNetPaid;
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
+      const currentNetSettled = sums.settledGrossMinor - sums.refundedMinor;
+      const remainingBalance = inv.totalMinor - currentNetSettled;
       if (input.amountMinor > remainingBalance) {
         throw validation(
           "PAYMENT_EXCEEDS_BALANCE_DUE",
@@ -1632,15 +1671,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         createdAt: now,
       });
 
-      const nextGrossPaid = sums.grossPaidMinor + input.amountMinor;
+      const nextSettledGross = sums.settledGrossMinor + input.amountMinor;
       const nextStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: nextGrossPaid,
+        grossPaidMinor: nextSettledGross,
         refundedMinor: sums.refundedMinor,
       });
-      const nextBalance = Math.max(0, inv.totalMinor - (nextGrossPaid - sums.refundedMinor));
+      const nextBalance = Math.max(0, inv.totalMinor - (nextSettledGross - sums.refundedMinor));
 
       if (nextStatus !== inv.status) {
         await tx
@@ -1722,7 +1761,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           discountMinor: inv.discountMinor,
           taxMinor: inv.taxMinor,
           totalMinor: inv.totalMinor,
-          netPaidMinor: nextGrossPaid - sums.refundedMinor,
+          netPaidMinor: sums.grossPaidMinor + input.amountMinor - sums.refundedMinor,
           currency,
           paymentPublicId,
           method: input.method,
@@ -1868,19 +1907,19 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
 
       if (existingIdem) {
         const sumsMap = await computeLedgerSums(tx, [inv.id]);
-        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         const status = deriveInvoiceStatus({
           issuedAt: inv.issuedAt,
           voidedAt: inv.voidedAt,
           totalMinor: inv.totalMinor,
-          grossPaidMinor: sums.grossPaidMinor,
+          grossPaidMinor: sums.settledGrossMinor,
           refundedMinor: sums.refundedMinor,
         });
-        const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+        const netSettled = Math.max(0, sums.settledGrossMinor - sums.refundedMinor);
         return {
           refundPublicId: existingIdem.publicId,
           invoiceStatus: status,
-          balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
+          balanceDueMinor: Math.max(0, inv.totalMinor - netSettled),
           duplicate: true,
         };
       }
@@ -1959,15 +1998,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       }
 
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const nextStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
-      const nextBalance = Math.max(0, inv.totalMinor - Math.max(0, sums.grossPaidMinor - sums.refundedMinor));
+      const nextBalance = Math.max(0, inv.totalMinor - Math.max(0, sums.settledGrossMinor - sums.refundedMinor));
 
       if (nextStatus !== inv.status) {
         await tx
@@ -2200,6 +2239,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       taxMinor: detail.taxMinor,
       totalMinor: detail.totalMinor,
       grossPaidMinor: detail.grossPaidMinor,
+      waivedMinor: detail.waivedMinor,
       refundedMinor: detail.refundedMinor,
       netPaidMinor: detail.netPaidMinor,
       balanceDueMinor: detail.balanceDueMinor,
@@ -2527,8 +2567,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     const summary = toSummaryView(
       inv,
       orderReference,
-      sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 },
+      sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS,
     );
+    const receiptPublicId =
+      receiptsSvc && (summary.status === "paid" || inv.totalMinor === 0)
+        ? await receiptsSvc.findLatestReceiptPublicIdForInvoice(dbOrTx, inv.id)
+        : null;
 
     return {
       invoiceId: inv.id,
@@ -2542,6 +2586,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       currency: inv.currency,
       totalMinor: inv.totalMinor,
       balanceDueMinor: summary.balanceDueMinor,
+      waivedMinor: summary.waivedMinor,
+      receiptPublicId,
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       origin: inv.origin,
@@ -2621,15 +2667,15 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
           })
         : null;
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const status = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
-      const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+      const netSettled = Math.max(0, sums.settledGrossMinor - sums.refundedMinor);
       return {
         paymentPublicId: existingIdem.publicId,
         receiptPublicId: receiptRes?.receiptPublicId ?? null,
@@ -2637,7 +2683,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         invoicePublicId: inv.publicId,
         invoiceNumber: inv.invoiceNumber,
         invoiceStatus: status,
-        balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
+        balanceDueMinor: Math.max(0, inv.totalMinor - netSettled),
         duplicate: true,
       };
     }
@@ -2662,9 +2708,9 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
-    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
-    const currentNetPaid = sums.grossPaidMinor - sums.refundedMinor;
-    const remainingBalance = inv.totalMinor - currentNetPaid;
+    const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
+    const currentNetSettled = sums.settledGrossMinor - sums.refundedMinor;
+    const remainingBalance = inv.totalMinor - currentNetSettled;
     if (input.amountMinor > remainingBalance) {
       throw conflict(
         "PAYMENT_EXCEEDS_BALANCE_DUE",
@@ -2696,15 +2742,16 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       createdAt: now,
     });
 
-    const nextGrossPaid = sums.grossPaidMinor + input.amountMinor;
+    const nextSettledGross = sums.settledGrossMinor + input.amountMinor;
+    const nextCapturedGross = sums.grossPaidMinor + input.amountMinor;
     const nextStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       totalMinor: inv.totalMinor,
-      grossPaidMinor: nextGrossPaid,
+      grossPaidMinor: nextSettledGross,
       refundedMinor: sums.refundedMinor,
     });
-    const nextBalance = Math.max(0, inv.totalMinor - (nextGrossPaid - sums.refundedMinor));
+    const nextBalance = Math.max(0, inv.totalMinor - (nextSettledGross - sums.refundedMinor));
 
     if (nextStatus !== inv.status) {
       await tx
@@ -2791,7 +2838,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         discountMinor: inv.discountMinor,
         taxMinor: inv.taxMinor,
         totalMinor: inv.totalMinor,
-        netPaidMinor: nextGrossPaid - sums.refundedMinor,
+        netPaidMinor: nextCapturedGross - sums.refundedMinor,
         currency,
         paymentPublicId,
         method: "provider_online",
@@ -2925,8 +2972,8 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
-    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
-    const remainingBalance = inv.totalMinor - (sums.grossPaidMinor - sums.refundedMinor);
+    const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
+    const remainingBalance = inv.totalMinor - (sums.settledGrossMinor - sums.refundedMinor);
     if (remainingBalance <= 0) {
       throw conflict("INVOICE_ALREADY_PAID", "This invoice has already been paid.");
     }
@@ -3061,12 +3108,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
 
     for (const [orderPubId, rows] of byOrder) {
       const evidence = rows.map((inv) => {
-        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         return {
           issuedAt: inv.issuedAt,
           voidedAt: inv.voidedAt,
           totalMinor: inv.totalMinor,
-          grossPaidMinor: sums.grossPaidMinor,
+          grossPaidMinor: sums.settledGrossMinor,
           refundedMinor: sums.refundedMinor,
         };
       });
@@ -3103,12 +3150,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     );
     return deriveOrderPaymentSummaryState(
       rows.map((inv) => {
-        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         return {
           issuedAt: inv.issuedAt,
           voidedAt: inv.voidedAt,
           totalMinor: inv.totalMinor,
-          grossPaidMinor: sums.grossPaidMinor,
+          grossPaidMinor: sums.settledGrossMinor,
           refundedMinor: sums.refundedMinor,
         };
       }),
@@ -3160,12 +3207,12 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
 
     const summaryStates = deriveOrderPaymentSummaryState(
       invoices.map((inv) => {
-        const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+        const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
         return {
           issuedAt: inv.issuedAt,
           voidedAt: inv.voidedAt,
           totalMinor: inv.totalMinor,
-          grossPaidMinor: sums.grossPaidMinor,
+          grossPaidMinor: sums.settledGrossMinor,
           refundedMinor: sums.refundedMinor,
         };
       }),
@@ -3202,19 +3249,19 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     for (const p of paymentRows) {
       const inv = invById.get(p.invoiceId);
       if (!inv) continue;
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const invoiceStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
       const invoicePaymentState = deriveInvoicePaymentState({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
       const ledgerRefunds = refundsByPaymentId.get(p.id) ?? [];
@@ -3339,7 +3386,7 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       })
       .from(complianceInvoiceRefunds)
       .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
-    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+    const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
 
     return {
       orderId: orderRef.id,
@@ -3353,14 +3400,14 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       }),
       invoicePaymentState: deriveInvoicePaymentState({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       }),
       currency: inv.currency,
@@ -3445,28 +3492,28 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     if (existingIdem) {
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
       const orderState = await computeOrderWorkspacePaymentState(tx, inv.orderPublicId);
-      const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+      const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
       const invoiceStatus = deriveInvoiceStatus({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
       const invoicePaymentState = deriveInvoicePaymentState({
         issuedAt: inv.issuedAt,
         voidedAt: inv.voidedAt,
         totalMinor: inv.totalMinor,
-        grossPaidMinor: sums.grossPaidMinor,
+        grossPaidMinor: sums.settledGrossMinor,
         refundedMinor: sums.refundedMinor,
       });
-      const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
+      const netSettled = Math.max(0, sums.settledGrossMinor - sums.refundedMinor);
       return {
         complianceRefundPublicId: existingIdem.publicId,
         invoiceStatus,
         invoicePaymentState,
         orderPaymentState: orderState.workspaceState,
-        balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
+        balanceDueMinor: Math.max(0, inv.totalMinor - netSettled),
         fullyRefundedInvoice: sums.grossPaidMinor > 0 && sums.refundedMinor >= sums.grossPaidMinor,
         duplicate: true,
       };
@@ -3523,22 +3570,22 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
-    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+    const sums = sumsMap.get(inv.id) ?? EMPTY_LEDGER_SUMS;
     const nextStatus = deriveInvoiceStatus({
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       totalMinor: inv.totalMinor,
-      grossPaidMinor: sums.grossPaidMinor,
+      grossPaidMinor: sums.settledGrossMinor,
       refundedMinor: sums.refundedMinor,
     });
     const nextPaymentState = deriveInvoicePaymentState({
       issuedAt: inv.issuedAt,
       voidedAt: inv.voidedAt,
       totalMinor: inv.totalMinor,
-      grossPaidMinor: sums.grossPaidMinor,
+      grossPaidMinor: sums.settledGrossMinor,
       refundedMinor: sums.refundedMinor,
     });
-    const nextBalance = Math.max(0, inv.totalMinor - Math.max(0, sums.grossPaidMinor - sums.refundedMinor));
+    const nextBalance = Math.max(0, inv.totalMinor - Math.max(0, sums.settledGrossMinor - sums.refundedMinor));
 
     if (nextStatus !== inv.status) {
       await tx
@@ -3708,11 +3755,16 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
     }
 
     let grossPaidMinor = 0;
-    const grossByInvoice = new Map<number, number>();
+    const settledByInvoice = new Map<number, number>();
     for (const pmt of paymentRows) {
       if (pmt.status === "succeeded") {
-        grossPaidMinor += pmt.amountMinor;
-        grossByInvoice.set(pmt.invoiceId, (grossByInvoice.get(pmt.invoiceId) ?? 0) + pmt.amountMinor);
+        const rowWaived =
+          pmt.method === "waiver"
+            ? Math.max(0, pmt.waivedMinor || pmt.amountMinor)
+            : Math.max(0, Math.min(pmt.amountMinor, pmt.waivedMinor ?? 0));
+        const rowCaptured = Math.max(0, pmt.amountMinor - rowWaived);
+        grossPaidMinor += rowCaptured;
+        settledByInvoice.set(pmt.invoiceId, (settledByInvoice.get(pmt.invoiceId) ?? 0) + rowCaptured + rowWaived);
       }
     }
 
@@ -3725,10 +3777,10 @@ export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsSe
       if (inv.voidedAt !== null || inv.issuedAt === null || inv.totalMinor <= 0) {
         return false;
       }
-      const invGross = grossByInvoice.get(inv.id) ?? 0;
+      const invSettled = settledByInvoice.get(inv.id) ?? 0;
       const invRefunded = refundedByInvoice.get(inv.id) ?? 0;
-      const invNetPaid = Math.max(0, invGross - invRefunded);
-      return inv.totalMinor - invNetPaid > 0;
+      const invNetSettled = Math.max(0, invSettled - invRefunded);
+      return inv.totalMinor - invNetSettled > 0;
     });
 
     // Fail closed if the payments evidence port is unavailable, throws, or if ANY payment_attempts
