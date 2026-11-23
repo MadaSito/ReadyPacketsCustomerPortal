@@ -11,6 +11,7 @@ import { assertLiveActorInTx, runComplianceTx } from "./actorAuth.js";
 import { type POLICY_ENFORCEMENT_MODES, type POLICY_ENFORCEMENT_REASONS, policyEnforcementActions, policyEnforcementPreferences } from "./policyEnforcementSchema.js";
 import { audienceUserFilter, hasPortalAcceptance } from "./policyNotices.js";
 import { policyDocuments, policyVersions } from "./schema.js";
+import { readOrderAgreementGateSnapshot, resolveEffectiveRequiresTypedSignature } from "./signatureNameCheck.js";
 
 export const POLICY_WARNING_SETTING = "compliance.policies.default_enforcement_warning";
 export const DEFAULT_POLICY_WARNING = "Review and accept {policy} by {deadline} to keep using the portal. Time remaining: {timeLeft}.";
@@ -135,16 +136,21 @@ export function createPolicyEnforcement(deps: ModuleDeps) {
   async function pendingForUser(principal: SessionPrincipal) {
     if (!permitsPolicyStep(principal)) throw forbidden("POLICY_ENFORCEMENT_STEP_NOT_AVAILABLE");
     if (disabledByHost) return [];
-    const [rows, defaultWarning] = await Promise.all([
+    const [rows, defaultWarning, gateSnapshot] = await Promise.all([
       pendingRows(principal.userId, principal.role, deps.db, undefined, principal.state === "remediation"),
       deps.settings.get(POLICY_WARNING_SETTING, parsePolicyWarning, DEFAULT_POLICY_WARNING),
+      readOrderAgreementGateSnapshot(deps),
     ]);
     const now = deps.clock.now();
     return rows.map((row) => ({
       versionPublicId: row.versionPublicId, documentPublicId: row.documentPublicId,
       title: row.title, versionLabel: row.versionLabel, contentHash: row.contentHash,
       bodyText: row.bodyText, contentFormat: row.contentFormat, changeSummary: row.changeSummary,
-      requiresTypedSignature: row.requiresTypedSignature, deadline: deadline(row),
+      requiresTypedSignature: resolveEffectiveRequiresTypedSignature(
+        { publicId: row.documentPublicId, requiresTypedSignature: row.requiresTypedSignature },
+        gateSnapshot,
+      ),
+      deadline: deadline(row),
       warningText: row.warningText ?? defaultWarning, blocking: Boolean(row.handled) || deadline(row) <= now,
     }));
   }

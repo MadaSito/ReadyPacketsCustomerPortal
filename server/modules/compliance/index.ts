@@ -54,10 +54,14 @@ import {
 } from "./receiptsService.js";
 import {
   createPoliciesService,
+  type EffectiveTypedSignatureGateSnapshot,
+  parseOrderAgreementGateSnapshot,
   type PoliciesService,
   type PolicyForGateView,
   type PolicyGateVersionView,
   type PublishedPolicyView,
+  readOrderAgreementGateSnapshot,
+  resolveEffectiveRequiresTypedSignature,
   type RequiredPolicySummary,
 } from "./policiesService.js";
 import {
@@ -73,6 +77,12 @@ import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
 
 export type PolicyNoticesService = ReturnType<typeof createPolicyNoticeRuntime>;
 export type { PolicyEnforcementService };
+export {
+  type EffectiveTypedSignatureGateSnapshot,
+  parseOrderAgreementGateSnapshot,
+  readOrderAgreementGateSnapshot,
+  resolveEffectiveRequiresTypedSignature,
+};
 export type { SignatureNameMatchResult } from "./acceptanceSchema.js";
 export type {
   AcceptanceEvidenceKind,

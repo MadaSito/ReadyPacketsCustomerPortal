@@ -131,6 +131,68 @@ export async function readSignatureNameCheckMode(
   }
 }
 
+export interface EffectiveTypedSignatureGateSnapshot {
+  readonly enabled: boolean;
+  readonly policyPublicId: string | null;
+  readonly signatureMode: "typed_name" | "checkbox";
+}
+
+const DEFAULT_TYPED_SIGNATURE_GATE_SNAPSHOT: EffectiveTypedSignatureGateSnapshot = {
+  enabled: false,
+  policyPublicId: null,
+  signatureMode: "typed_name",
+};
+
+/**
+ * Parses `orders.agreement_gate` with the same backward-compatible defaults as `orders/settings.ts`
+ * (never throws; `signatureMode` defaults to `"typed_name"`).
+ */
+export function parseOrderAgreementGateSnapshot(raw: unknown): EffectiveTypedSignatureGateSnapshot {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return DEFAULT_TYPED_SIGNATURE_GATE_SNAPSHOT;
+  }
+  const obj = raw as Record<string, unknown>;
+  const enabled = obj.enabled === true;
+  const policyPublicId =
+    typeof obj.policyPublicId === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(obj.policyPublicId)
+      ? obj.policyPublicId
+      : null;
+  const signatureMode = obj.signatureMode === "checkbox" ? "checkbox" : "typed_name";
+  return { enabled, policyPublicId, signatureMode };
+}
+
+export async function readOrderAgreementGateSnapshot(
+  deps: Pick<ModuleDeps, "settings">,
+  dbOrTx?: DbOrTx,
+): Promise<EffectiveTypedSignatureGateSnapshot> {
+  try {
+    const raw = await deps.settings.get(
+      "orders.agreement_gate",
+      parseOrderAgreementGateSnapshot,
+      DEFAULT_TYPED_SIGNATURE_GATE_SNAPSHOT,
+      dbOrTx ? (dbOrTx as Tx) : undefined,
+    );
+    return parseOrderAgreementGateSnapshot(raw);
+  } catch {
+    return DEFAULT_TYPED_SIGNATURE_GATE_SNAPSHOT;
+  }
+}
+
+/**
+ * Single source of truth for the effective typed-signature requirement on a policy document:
+ * true when the document's own `requiresTypedSignature` flag is true OR `orders.agreement_gate`
+ * is enabled on `doc.publicId` with `signatureMode === "typed_name"`.
+ */
+export function resolveEffectiveRequiresTypedSignature(
+  doc: { publicId: string; requiresTypedSignature: boolean },
+  gate: EffectiveTypedSignatureGateSnapshot,
+): boolean {
+  return (
+    doc.requiresTypedSignature ||
+    (gate.enabled && gate.policyPublicId === doc.publicId && gate.signatureMode === "typed_name")
+  );
+}
+
 export async function loadAccountDisplayName(
   deps: ModuleDeps,
   userId: number,
@@ -180,11 +242,16 @@ export async function verifyTypedSignatureInTx(
   const raw = input.typedName ?? "";
   const cleaned = raw.normalize("NFC").replace(/\s+/gu, " ").trim();
   const cpLen = [...cleaned].length;
+  const versionPublicId =
+    input.resource.type === "policy_version" ? input.resource.publicId : undefined;
   if (cpLen < 2 || cpLen > 160 || /[\p{Cc}\p{Cf}]/u.test(cleaned) || !/\p{L}/u.test(cleaned)) {
+    const requiredDetails: Record<string, string> = {};
+    if (input.requiredField) requiredDetails.field = input.requiredField;
+    if (versionPublicId) requiredDetails.versionPublicId = versionPublicId;
     throw validation(
       input.requiredErrorCode ?? "TYPED_SIGNATURE_REQUIRED",
       input.requiredErrorMessage ?? "Please enter your full name to sign.",
-      input.requiredField ? { field: input.requiredField } : undefined,
+      Object.keys(requiredDetails).length > 0 ? requiredDetails : undefined,
     );
   }
 
@@ -226,10 +293,12 @@ export async function verifyTypedSignatureInTx(
         matchResult: "mismatch_warn",
       };
     }
+    const noAccountDetails: Record<string, string> = { profilePath: "/account" };
+    if (versionPublicId) noAccountDetails.versionPublicId = versionPublicId;
     throw validation(
       "SIGNER_NAME_MISMATCH",
       "The typed signature must match your account profile name.",
-      { profilePath: "/account" },
+      noAccountDetails,
     );
   }
 
@@ -269,13 +338,15 @@ export async function verifyTypedSignatureInTx(
 
   // `mode === "require"`: throw DomainError; caller's `onRefusalAfterRollback` records the durable audit
   // outside the rolled-back transaction WITHOUT storing the typed text in clear.
+  const mismatchDetails: Record<string, string> = {
+    expectedName: accountName,
+    profilePath: "/account",
+  };
+  if (versionPublicId) mismatchDetails.versionPublicId = versionPublicId;
   throw validation(
     "SIGNER_NAME_MISMATCH",
     "The typed signature must match your account profile name.",
-    {
-      expectedName: accountName,
-      profilePath: "/account",
-    },
+    mismatchDetails,
   );
 }
 

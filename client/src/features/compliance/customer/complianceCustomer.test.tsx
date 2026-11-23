@@ -506,23 +506,46 @@ describe("customer invoices", () => {
       acceptances: [],
       expectedSignerName: "Ada Lovelace",
     });
-    mocks.accept.mockRejectedValue({
-      message: "Typed signature must match your account name.",
+    mocks.accept.mockRejectedValueOnce({
+      message: "The typed signature must match your account profile name.",
       data: {
         safe: {
-          message: "Typed signature must match your account name.",
+          safeMessage: "The typed signature must match your account profile name.",
           domainCode: "VALIDATION_ERROR",
           reasonCode: "SIGNER_NAME_MISMATCH",
-          details: { expectedName: "Ada Lovelace" },
+          details: { expectedName: "Ada Augusta Lovelace" },
         },
       },
     });
-    renderUi(<RequiredPolicyGate><button>Start the wizard</button></RequiredPolicyGate>);
+    mocks.accept.mockResolvedValueOnce({ acceptancePublicId: publicId("F"), duplicate: false });
+
+    const gateView = renderUi(<RequiredPolicyGate><button>Start the wizard</button></RequiredPolicyGate>);
     expect(await screen.findByText(/Expected account name: Ada Lovelace/)).toBeVisible();
     await user.click(screen.getByRole("checkbox", { name: /I have read and agree/ }));
-    await user.type(screen.getByLabelText(/Type your full name to sign/), "Grace Hopper");
+    const signerInput = screen.getByLabelText(/Type your full name to sign/);
+    await user.type(signerInput, "Grace Hopper");
     await user.click(screen.getByRole("button", { name: "Accept this version" }));
+    expect(await screen.findAllByText("The typed signature must match your account profile name.")).not.toHaveLength(0);
+    expect(signerInput).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getAllByText(/Ada Augusta Lovelace/).length).toBeGreaterThanOrEqual(1);
     const profileLink = await screen.findByRole("link", { name: "Update your profile name" });
     expect(profileLink).toHaveAttribute("href", "/account");
+    gateView.unmount();
+
+    // Prompt dialog (`PolicyAcceptanceWidget`) also renders the typed-name field + hint and submits `signerName`.
+    renderUi(<PolicyAcceptanceWidget />);
+    await user.click(await screen.findByRole("button", { name: "Review required policies" }));
+    const dialog = await screen.findByRole("dialog", { name: "Required policy review" });
+    expect(within(dialog).getByText(/Expected account name: Ada Lovelace/)).toBeVisible();
+    await user.click(within(dialog).getByRole("checkbox", { name: /I have read and agree/ }));
+    await user.type(within(dialog).getByLabelText(/Type your full name to sign/), "Ada Lovelace");
+    await user.click(within(dialog).getByRole("button", { name: "Accept this version" }));
+    await waitFor(() =>
+      expect(mocks.accept.mock.calls.at(-1)?.[0]).toEqual({
+        versionPublicId: pending.versionPublicId,
+        contentHash: pending.contentHash,
+        signerName: "Ada Lovelace",
+      }),
+    );
   });
 });

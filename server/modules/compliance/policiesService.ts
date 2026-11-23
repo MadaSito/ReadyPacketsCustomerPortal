@@ -17,10 +17,21 @@ import {
 } from "./domain.js";
 import type { SignatureNameMatchResult } from "./acceptanceSchema.js";
 import {
+  type EffectiveTypedSignatureGateSnapshot,
   loadAccountDisplayName,
+  parseOrderAgreementGateSnapshot,
+  readOrderAgreementGateSnapshot,
   recordSignatureMismatchAuditIfNeeded,
+  resolveEffectiveRequiresTypedSignature,
   verifyTypedSignatureInTx,
 } from "./signatureNameCheck.js";
+
+export {
+  type EffectiveTypedSignatureGateSnapshot,
+  parseOrderAgreementGateSnapshot,
+  readOrderAgreementGateSnapshot,
+  resolveEffectiveRequiresTypedSignature,
+};
 import {
   parseSignatureNameCheckSetting,
   SIGNATURE_NAME_CHECK,
@@ -254,14 +265,17 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
       !opts?.callerRole || opts.callerRole === "customer"
         ? ["all", "customer"]
         : ["all", "staff"];
-    const pairs = await loadActiveEffectivePublishedPolicies(deps.db, now, allowedAudiences);
+    const [pairs, gateSnapshot] = await Promise.all([
+      loadActiveEffectivePublishedPolicies(deps.db, now, allowedAudiences),
+      readOrderAgreementGateSnapshot(deps),
+    ]);
     return pairs.map(({ doc, ver }) => ({
       documentPublicId: doc.publicId,
       slug: doc.slug,
       title: doc.title,
       audience: doc.audience,
       requiresAcceptance: doc.requiresAcceptance,
-      requiresTypedSignature: doc.requiresTypedSignature,
+      requiresTypedSignature: resolveEffectiveRequiresTypedSignature(doc, gateSnapshot),
       versionPublicId: ver.publicId,
       versionNumber: ver.versionNumber,
       versionLabel: ver.versionLabel,
@@ -296,7 +310,10 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
     const dbOrTx = opts?.tx ?? deps.db;
     const now = deps.clock.now();
     const role = await resolveTargetRole(userId, opts?.audience, dbOrTx);
-    const activePairs = await loadActiveEffectivePublishedPolicies(dbOrTx, now);
+    const [activePairs, gateSnapshot] = await Promise.all([
+      loadActiveEffectivePublishedPolicies(dbOrTx, now),
+      readOrderAgreementGateSnapshot(deps, dbOrTx),
+    ]);
 
     const applicable = activePairs.filter(
       ({ doc }) => doc.requiresAcceptance && audienceAppliesToRole(doc.audience, role),
@@ -332,7 +349,7 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
         slug: doc.slug,
         title: doc.title,
         audience: doc.audience,
-        requiresTypedSignature: doc.requiresTypedSignature,
+        requiresTypedSignature: resolveEffectiveRequiresTypedSignature(doc, gateSnapshot),
         versionPublicId: ver.publicId,
         versionNumber: ver.versionNumber,
         versionLabel: ver.versionLabel,
@@ -485,16 +502,8 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
       );
     }
 
-    const rawAgreementGate = await deps.settings.get("orders.agreement_gate", (v) => v, null, tx);
-    const agreementRequiresTyped =
-      Boolean(
-        rawAgreementGate &&
-          typeof rawAgreementGate === "object" &&
-          (rawAgreementGate as Record<string, unknown>).enabled === true &&
-          (rawAgreementGate as Record<string, unknown>).policyPublicId === doc.publicId &&
-          (rawAgreementGate as Record<string, unknown>).signatureMode === "typed_name",
-      );
-    const requiresTyped = doc.requiresTypedSignature || agreementRequiresTyped;
+    const gateSnapshot = await readOrderAgreementGateSnapshot(deps, tx);
+    const requiresTyped = resolveEffectiveRequiresTypedSignature(doc, gateSnapshot);
     let cleanedSignerName: string | null = null;
     let signerNameMatch: SignatureNameMatchResult | null = null;
 

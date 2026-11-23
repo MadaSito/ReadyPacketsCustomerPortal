@@ -21,11 +21,13 @@ function PolicyAcceptanceForm({
   const viewport = useRef<HTMLDivElement>(null);
   const documentBody = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLParagraphElement>(null);
+  const signerInputRef = useRef<HTMLInputElement>(null);
   const requestInFlight = useRef(false);
   const [reviewed, setReviewed] = useState(false);
   const [accepted, setAccepted] = useState(false);
   const [signerName, setSignerName] = useState("");
   const [error, setError] = useState<string>();
+  const [signerFieldError, setSignerFieldError] = useState<string>();
   const [mismatchExpectedName, setMismatchExpectedName] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
 
@@ -52,6 +54,7 @@ function PolicyAcceptanceForm({
     requestInFlight.current = true;
     setConfirming(true);
     setError(undefined);
+    setSignerFieldError(undefined);
     setMismatchExpectedName(null);
     try {
       await accept.mutateAsync({
@@ -63,6 +66,9 @@ function PolicyAcceptanceForm({
       setSignerName("");
     } catch (failure) {
       const safe = safeError(failure);
+      const isSignatureError =
+        safe?.reasonCode === "SIGNER_NAME_MISMATCH" ||
+        safe?.reasonCode === "TYPED_SIGNATURE_REQUIRED";
       const serverExpected =
         safe?.reasonCode === "SIGNER_NAME_MISMATCH" &&
         safe.details &&
@@ -72,7 +78,15 @@ function PolicyAcceptanceForm({
       if (serverExpected) {
         setMismatchExpectedName(serverExpected);
       }
-      setError(errorMessage(failure, "We couldn't confirm acceptance. Refresh policy status before trying again."));
+      const message = errorMessage(
+        failure,
+        "We couldn't confirm acceptance. Refresh policy status before trying again.",
+      );
+      if (policy.requiresTypedSignature && isSignatureError) {
+        setSignerFieldError(message);
+        signerInputRef.current?.focus();
+      }
+      setError(message);
     } finally {
       // Evidence and current versions come from the server, even after an uncertain response.
       await queryClient.invalidateQueries({ queryKey: trpc.compliance.policies.myStatus.queryKey() });
@@ -121,11 +135,16 @@ function PolicyAcceptanceForm({
                   ? `Expected account name: ${displayedExpectedName}.`
                   : "Enter the full name on your account."
               }
+              error={signerFieldError}
               required
             >
               <Input
+                ref={signerInputRef}
                 value={signerName}
-                onChange={(event) => setSignerName(event.target.value)}
+                onChange={(event) => {
+                  setSignerName(event.target.value);
+                  setSignerFieldError(undefined);
+                }}
                 maxLength={160}
                 autoComplete="name"
                 disabled={!reviewed || confirming}

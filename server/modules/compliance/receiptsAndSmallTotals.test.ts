@@ -1085,6 +1085,142 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
     expect(detail2.signatureMatch).toBe("mismatch_warn");
   });
 
+  it("D13 × D14 × D11 lockout regression: reports effective requiresTypedSignature across listPublished, myStatus, requiredAcceptancesFor, and enforcement.pending when orders.agreement_gate is typed_name, and reverts to false when disabled", async () => {
+    const h = createHarness();
+    const doc = await h.compliance.policies.admin.createDocument(adminPrincipal, {
+      slug: "qa-mutual-nda",
+      title: "QA Mutual NDA",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: false,
+      versionLabel: "2.0",
+      contentFormat: "plain_text",
+      bodyText: "Mutual NDA governed by order agreement gate.",
+    });
+    const pub = await h.compliance.policies.admin.publishVersion(adminPrincipal, {
+      versionPublicId: doc.draftVersionPublicId,
+    });
+
+    // Enable session enforcement with graceHours: 0 (immediate remediation)
+    const enfStatus = await h.complianceCaller(adminPrincipal).policies.enforcement.status({
+      documentPublicId: doc.documentPublicId,
+    });
+    await h.complianceCaller(adminPrincipal).policies.enforcement.configure({
+      documentPublicId: doc.documentPublicId,
+      expectedVersion: enfStatus.expectedVersion,
+      mode: "required_to_continue",
+      graceHours: 0,
+      warningText: null,
+      confirmedCount: enfStatus.affectedCount,
+    });
+
+    // Enable `orders.agreement_gate` targeting `qa-mutual-nda` with `signatureMode: "typed_name"`
+    await h.t.settings.set("orders.agreement_gate", {
+      enabled: true,
+      policyPublicId: doc.documentPublicId,
+      applyTo: { placeOrder: true, workOnOrder: true },
+      signatureMode: "typed_name",
+      askAgainOnNewVersion: true,
+    });
+
+    // 1. Every customer/acceptance listing reports effective `requiresTypedSignature: true`
+    const published = await h.complianceCaller(customerAPrincipal).policies.listPublished({ slug: "qa-mutual-nda" });
+    expect(published[0]?.requiresTypedSignature).toBe(true);
+
+    const status = await h.complianceCaller(customerAPrincipal).policies.myStatus();
+    expect(status.published.find((p) => p.documentPublicId === doc.documentPublicId)?.requiresTypedSignature).toBe(true);
+    expect(status.pendingRequired.find((p) => p.documentPublicId === doc.documentPublicId)?.requiresTypedSignature).toBe(true);
+    expect(status.expectedSignerName).toBe("María Elena García-López");
+
+    const rawRequired = await h.compliance.requiredAcceptancesFor(customerAPrincipal.userId, { audience: "customer" });
+    expect(rawRequired.find((p) => p.documentPublicId === doc.documentPublicId)?.requiresTypedSignature).toBe(true);
+
+    const remediationPrincipal: SessionPrincipal = {
+      ...customerAPrincipal,
+      state: "remediation",
+      pendingSteps: ["accept_policy"],
+    };
+    const pendingEnforcement = await h.complianceCaller(remediationPrincipal).policies.enforcement.pending();
+    const enfItem = pendingEnforcement.find((p) => p.documentPublicId === doc.documentPublicId);
+    expect(enfItem?.requiresTypedSignature).toBe(true);
+    expect(enfItem?.blocking).toBe(true);
+
+    // Admin document editor still sees the document's own stored flag (`false`)
+    const adminDoc = await h.complianceCaller(adminPrincipal).policies.admin.getDocument({
+      documentPublicId: doc.documentPublicId,
+    });
+    expect(adminDoc.document.requiresTypedSignature).toBe(false);
+
+    // 2. When gate is switched to `checkbox` or disabled (`enabled: false`), effective flag reports `false`
+    await h.t.settings.set("orders.agreement_gate", {
+      enabled: true,
+      policyPublicId: doc.documentPublicId,
+      applyTo: { placeOrder: true, workOnOrder: true },
+      signatureMode: "checkbox",
+      askAgainOnNewVersion: true,
+    });
+    expect(
+      (await h.complianceCaller(remediationPrincipal).policies.enforcement.pending()).find(
+        (p) => p.documentPublicId === doc.documentPublicId,
+      )?.requiresTypedSignature,
+    ).toBe(false);
+
+    await h.t.settings.set("orders.agreement_gate", {
+      enabled: false,
+      policyPublicId: doc.documentPublicId,
+      applyTo: { placeOrder: true, workOnOrder: true },
+      signatureMode: "typed_name",
+      askAgainOnNewVersion: true,
+    });
+    expect(
+      (await h.complianceCaller(customerAPrincipal).policies.myStatus()).pendingRequired.find(
+        (p) => p.documentPublicId === doc.documentPublicId,
+      )?.requiresTypedSignature,
+    ).toBe(false);
+    expect(
+      (await h.complianceCaller(remediationPrincipal).policies.enforcement.pending()).find(
+        (p) => p.documentPublicId === doc.documentPublicId,
+      )?.requiresTypedSignature,
+    ).toBe(false);
+
+    // 3. Re-enable `typed_name` gate and complete `/accept-policy` remediation end-to-end:
+    //    mismatch rejected with `SIGNER_NAME_MISMATCH` + `versionPublicId`, matching name unlocks remediation
+    await h.t.settings.set("orders.agreement_gate", {
+      enabled: true,
+      policyPublicId: doc.documentPublicId,
+      applyTo: { placeOrder: true, workOnOrder: true },
+      signatureMode: "typed_name",
+      askAgainOnNewVersion: true,
+    });
+
+    await expect(
+      h.complianceCaller(remediationPrincipal).policies.enforcement.accept({
+        versionPublicId: pub.versionPublicId,
+        contentHash: pub.contentHash,
+        signerName: "Wrong Signer",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      cause: expect.objectContaining({
+        reasonCode: "SIGNER_NAME_MISMATCH",
+        details: expect.objectContaining({
+          expectedName: "María Elena García-López",
+          profilePath: "/account",
+          versionPublicId: pub.versionPublicId,
+        }),
+      }),
+    });
+
+    await h.complianceCaller(remediationPrincipal).policies.enforcement.accept({
+      versionPublicId: pub.versionPublicId,
+      contentHash: pub.contentHash,
+      signerName: "María Elena García-López",
+    });
+    expect(
+      await h.compliance.policyEnforcement.requiresRemediation(customerAPrincipal.userId, "customer"),
+    ).toBe(false);
+  });
+
   it("Wave 2 security regressions: blocks waiver when prior provider attempt has exposure, enforces DB-durable 3/hr resend across instances, and denies generic order collaborators on receipts/PDFs", async () => {
     const h = createHarness();
     const webhookSecret = "whsec_test_inc06_wave2_sec_regressions_999";
