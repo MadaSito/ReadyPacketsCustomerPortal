@@ -145,6 +145,22 @@ describe("workflow transfer", () => {
     expect(downloadWorkflowFile).toHaveBeenCalledTimes(3);
   });
 
+  it("a single-row export keeps focus on its button while it runs; other export buttons wait", async () => {
+    let finish: (value: unknown) => void = () => {};
+    handlers.set(`${transfer}.export`, () => new Promise((resolve) => (finish = () => resolve({ fileName, packageText }))));
+    renderPage();
+    const standard = await screen.findByRole("button", { name: "Export Standard" });
+    await userEvent.click(standard);
+    await waitFor(() => expect(standard).toHaveAttribute("aria-busy", "true"));
+    expect(standard).not.toBeDisabled();
+    expect(standard).toHaveAttribute("aria-disabled", "true");
+    expect(document.activeElement).toBe(standard);
+    expect(screen.getByRole("button", { name: "Export all" })).toBeDisabled();
+    finish(undefined);
+    await waitFor(() => expect(downloadWorkflowFile).toHaveBeenCalledWith(fileName, packageText));
+    expect(document.activeElement).toBe(standard);
+  });
+
   it.each([{ enabled: false }, { canExport: false, canImport: false }])("hides transfer controls when status is %j", async (changes) => {
     handlers.set(`${transfer}.status`, () => ({ ...baseStatus, ...changes }));
     renderPage();

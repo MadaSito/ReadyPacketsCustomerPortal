@@ -81,9 +81,9 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
     importAction: canImport ? <Button variant="secondary" onClick={() => setImporting(true)}>Import workflows</Button> : null,
     toolbar: <>{switchCard}{canExport ? <section aria-label="Workflow export" className="grid min-w-0 gap-2 rounded-xl border border-line bg-surface p-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-        <Button variant="secondary" loading={exporting === "selected"} disabled={!selectedKeys.length || selectedKeys.length > maxWorkflows || exporting !== null}
+        <Button variant="secondary" loading={exporting === "selected"} disabled={exporting === "selected" ? false : !selectedKeys.length || selectedKeys.length > maxWorkflows || exporting !== null}
           onClick={() => void doExport("selected")}>Export selected</Button>
-        <Button variant="secondary" loading={exporting === "all"} disabled={!eligible.size || eligible.size > maxWorkflows || exporting !== null}
+        <Button variant="secondary" loading={exporting === "all"} disabled={exporting === "all" ? false : !eligible.size || eligible.size > maxWorkflows || exporting !== null}
           onClick={() => void doExport("all")}>Export all</Button>
         <p role="status" className="text-sm text-muted">{selectedKeys.length} {selectedKeys.length === 1 ? "workflow" : "workflows"} selected</p>
       </div>
@@ -100,7 +100,7 @@ export function useWorkflowTransfer(workflows: readonly WorkflowListRow[], draft
         return next;
       })} /> : null,
     exportAction: (key: string, name: string) => canExport && eligible.has(key) ? <Button size="sm" variant="secondary"
-      aria-label={`Export ${name}`} loading={typeof exporting === "object" && exporting?.key === key} disabled={exporting !== null}
+      aria-label={`Export ${name}`} loading={typeof exporting === "object" && exporting?.key === key} disabled={exporting !== null && !(typeof exporting === "object" && exporting.key === key)}
       onClick={() => void doExport({ key })}>Export</Button> : null,
     dialog: importOpen ? <WorkflowImportDialog close={() => setImporting(false)}
       policies={policies.error ? [] : policies.data ?? []}
