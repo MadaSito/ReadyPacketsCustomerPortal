@@ -1,8 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { useLocation } from "wouter";
-import { useRefreshSession } from "@/lib/session";
-import { errorMessage, useTRPC } from "@/lib/trpc";
+import { useRefreshSession, useSession } from "@/lib/session";
+import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, ConfirmDialog, Countdown, DateTime, Dialog, ErrorState, Field, Input, Skeleton } from "@/ui";
 import { RequiredPolicyForms, usePolicyStatus } from "../customer/PolicyAcceptance";
 import { SafePolicyText } from "../shared";
@@ -37,6 +37,7 @@ function WarningMessage({ item, onElapsed }: { item: Pending; onElapsed?: () => 
 function AcceptanceForm({ item, onAccepted }: { item: Pending; onAccepted?: () => void }) {
   const api = useTRPC().compliance.policies;
   const refreshSession = useRefreshSession();
+  const { me } = useSession();
   const qc = useQueryClient();
   const accept = useMutation(api.enforcement.accept.mutationOptions());
   const id = useId();
@@ -44,6 +45,7 @@ function AcceptanceForm({ item, onAccepted }: { item: Pending; onAccepted?: () =
   const [signerName, setSignerName] = useState("");
   const [error, setError] = useState<string>();
   const [fieldError, setFieldError] = useState<string>();
+  const [expectedName, setExpectedName] = useState<string>();
   const signerRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLParagraphElement>(null);
@@ -87,12 +89,21 @@ function AcceptanceForm({ item, onAccepted }: { item: Pending; onAccepted?: () =
       ]);
       onAccepted?.();
     } catch (cause) {
-      setError(errorMessage(cause, "The policy could not be accepted. Review the current version and try again."));
+      const safe = safeError(cause);
+      if (item.requiresTypedSignature && (safe?.reasonCode === "SIGNER_NAME_MISMATCH" || safe?.reasonCode === "TYPED_SIGNATURE_REQUIRED")) {
+        const verifiedName = safe.details?.expectedName;
+        if (typeof verifiedName === "string" && verifiedName.trim()) setExpectedName(verifiedName);
+        setFieldError(safe.safeMessage);
+        signerRef.current?.focus();
+      } else {
+        setError(errorMessage(cause, "The policy could not be accepted. Review the current version and try again."));
+      }
     } finally {
       inFlight.current = false;
     }
   };
 
+  const nameOnAccount = expectedName ?? me?.user.name;
   return (
     <form aria-labelledby={id} onSubmit={(event) => void submit(event)} noValidate className="min-w-0 space-y-4">
       <h2 className="text-lg font-semibold break-words" id={id}>{item.title}</h2>
@@ -108,8 +119,13 @@ function AcceptanceForm({ item, onAccepted }: { item: Pending; onAccepted?: () =
       {!reviewed ? <Button size="sm" variant="secondary" onClick={() => { endRef.current?.focus(); checkEnd(); }}>Go to end of policy</Button> : null}
       <Checkbox label={`I have read and agree to ${item.title}, version ${item.versionLabel}.`} checked={consent} onCheckedChange={setConsent} disabled={!reviewed || accept.isPending} />
       {item.requiresTypedSignature ? (
-        <Field label="Type your full name to sign" hint="Use the name on your account." error={fieldError} required>
-          <Input ref={signerRef} autoComplete="name" value={signerName} maxLength={160} onChange={(event) => setSignerName(event.target.value)} />
+        <Field label="Type your full name to sign" hint={nameOnAccount
+          ? `Use the name on your account: ${nameOnAccount}.`
+          : "Use the name on your account."} error={fieldError} required>
+          <Input ref={signerRef} autoComplete="name" value={signerName} maxLength={160} onChange={(event) => {
+            setSignerName(event.target.value);
+            setFieldError(undefined);
+          }} />
         </Field>
       ) : null}
       {fieldError ? <p className="sr-only" role="alert">{fieldError}</p> : null}

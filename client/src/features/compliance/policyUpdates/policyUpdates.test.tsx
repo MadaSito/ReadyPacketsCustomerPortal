@@ -27,11 +27,18 @@ function grace() {
   }, { role: "customer" });
 }
 
-function remediation() {
+function remediation(rejectName = false) {
   let accepted = false;
   return renderWithTrpc(<Host><PolicyEnforcementRemediation /></Host>, {
     "compliance.policies.enforcement.pending": () => accepted ? [] : [{ ...item, blocking: true }],
-    "compliance.policies.enforcement.accept": () => { accepted = true; return { accepted: true }; },
+    "compliance.policies.enforcement.accept": () => {
+      if (rejectName) throw { safe: {
+        code: "VALIDATION_FAILED", reasonCode: "SIGNER_NAME_MISMATCH",
+        safeMessage: "The typed signature must match your account profile name.", details: { expectedName: "Avery Updated Name" },
+      } };
+      accepted = true;
+      return { accepted: true };
+    },
   }, { role: "customer" });
 }
 
@@ -73,6 +80,35 @@ it("requires review and consent, focuses the missing signature, then submits the
     versionPublicId: item.versionPublicId, contentHash: item.contentHash, signerName: "Avery Example",
   }));
   await waitFor(() => expect(screen.getByRole("heading", { name: "Pending required policies" })).toHaveFocus());
+});
+
+it("associates a server name mismatch with the signer field and announces it", async () => {
+  remediation(true);
+  const form = await screen.findByRole("form", { name: item.title });
+  const signature = within(form).getByRole("textbox", { name: /Type your full name to sign/ });
+  await waitFor(() => expect(signature).toHaveAccessibleDescription("Use the name on your account: Avery Example."));
+  await userEvent.click(within(form).getByRole("checkbox"));
+  await userEvent.type(signature, "Wrong name");
+  await userEvent.click(within(form).getByRole("button", { name: "Accept this version" }));
+  const error = "The typed signature must match your account profile name.";
+  expect(await within(form).findByRole("alert")).toHaveTextContent(error);
+  expect(signature).toHaveFocus();
+  expect(signature).toHaveAttribute("aria-invalid", "true");
+  expect(signature).toHaveAccessibleDescription(`Use the name on your account: Avery Updated Name. ${error}`);
+});
+
+it.each([[1, "1 person who has"], [2, "2 people who have"]])("describes %i unaccepted recipients correctly", async (count, wording) => {
+  renderWithTrpc(<Host><PolicyNoticeCard documentPublicId="01JD0000000000000000000401" /></Host>, {
+    "compliance.policies.notices.status": () => ({
+      delayHours: 24, notice: {
+        publicId: "01JD0000000000000000000411", scheduledAt: item.deadline, state: "scheduled",
+        revision: 1, pending: count, queued: 0, sent: 0, failed: 0, accepted: 0,
+      },
+    }),
+  });
+  await userEvent.click(await screen.findByRole("button", { name: "Send notice to everyone now" }));
+  expect(await screen.findByRole("alertdialog", { name: "Send this policy notice now?" }))
+    .toHaveAccessibleDescription(`This will email ${wording} not accepted this version and notify them in the portal.`);
 });
 
 it("binds cancellation to the revision reviewed, even if the card refreshes to a newer notice", async () => {

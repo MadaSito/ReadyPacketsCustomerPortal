@@ -142,7 +142,7 @@ export function PolicyNoticeCard({ documentPublicId }: { documentPublicId: strin
       </div>
       <ConfirmDialog open={action === "cancel" || review} onOpenChange={(next) => { if (!next) open(null); }}
         title={action === "cancel" ? "Cancel this policy notice?" : action === "remind" ? "Send a reminder?" : "Send this policy notice now?"}
-        description={review ? `This will email ${confirmedCount} ${confirmedCount === 1 ? "person" : "people"} who have not accepted this version and notify them in the portal.` : "The scheduled email and portal notifications will not be sent."}
+        description={review ? `This will email ${confirmedCount} ${confirmedCount === 1 ? "person who has" : "people who have"} not accepted this version and notify them in the portal.` : "The scheduled email and portal notifications will not be sent."}
         confirmLabel={action === "cancel" ? "Cancel notice" : "Send now"} destructive={action === "cancel"}
         onConfirm={perform}>
         {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}

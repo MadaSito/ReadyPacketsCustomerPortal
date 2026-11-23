@@ -221,7 +221,7 @@ const requireFullSession = t.middleware(async ({ ctx, next, path }) => {
     throw new DomainError(
       "REMEDIATION_REQUIRED",
       "ACCOUNT_STEP_PENDING",
-      "Please finish securing your account to continue.",
+      session.pendingSteps[0] === "accept_policy" ? "Accept the updated policy to continue." : "Please finish securing your account to continue.",
       { nextStep: session.pendingSteps[0] ?? "unknown" },
     );
   }

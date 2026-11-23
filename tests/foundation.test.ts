@@ -81,6 +81,17 @@ describe("foundation: procedure guards", () => {
     expect(h.audit.named("authz.access.denied").map((event) => event.reasonCode)).toEqual(["NO_SESSION", "REMEDIATION_SESSION"]);
   });
 
+  it.each([
+    [["accept_policy"], "Accept the updated policy to continue."],
+    [["enroll_mfa", "accept_policy"], "Please finish securing your account to continue."],
+  ] as const)("describes only the first remediation step for %j", async (pendingSteps, message) => {
+    const remediation = fakePrincipal({ state: "remediation", pendingSteps: [...pendingSteps] });
+    await expect(caller(remediation).data()).rejects.toMatchObject({
+      code: "FORBIDDEN", message,
+      cause: { code: "REMEDIATION_REQUIRED", reasonCode: "ACCOUNT_STEP_PENDING", details: { nextStep: pendingSteps[0] } },
+    });
+  });
+
   it("refuses an anonymous session probe without writing to the audit chain", async () => {
     const before = h.audit.named("authz.access.denied").length;
     await expect(caller(null).probe()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
