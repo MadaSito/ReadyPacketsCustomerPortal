@@ -23,12 +23,12 @@ function WarningMessage({ item, onElapsed }: { item: Pending; onElapsed?: () => 
         <Fragment key={index}>
           {part === "{policy}" ? item.title : part === "{deadline}" ? <DateTime value={item.deadline} /> : part === "{timeLeft}" ? (
             <Countdown to={item.deadline} label={`Time left to accept ${item.title}`} announce={time === index ? "milestones" : "off"}
-              onElapsed={time === index ? onElapsed : undefined} elapsedText="Deadline reached" />
+              {...(time === index && onElapsed ? { onElapsed } : {})} elapsedText="Deadline reached" />
           ) : part}
         </Fragment>
       ))}
       {time === -1 ? (
-        <> Time remaining: <Countdown to={item.deadline} label={`Time left to accept ${item.title}`} onElapsed={onElapsed} elapsedText="Deadline reached" />.</>
+        <> Time remaining: <Countdown to={item.deadline} label={`Time left to accept ${item.title}`} {...(onElapsed ? { onElapsed } : {})} elapsedText="Deadline reached" />.</>
       ) : null}
     </p>
   );

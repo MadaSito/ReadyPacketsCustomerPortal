@@ -1,10 +1,12 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, type ReactNode } from "react";
 import { expect, it } from "vitest";
 import { pageA11y } from "@/test/a11y";
 import { renderWithTrpc } from "../acceptance/testkit";
+import { EndPolicySessionsAction } from "./PolicyEnforcementCards";
 import { PolicyEnforcementPrompt, PolicyEnforcementRemediation } from "./PolicyEnforcementPrompt";
+import { PolicyNoticeCard } from "./PolicyNoticeCard";
 
 const item = {
   title: "Production agreement", versionLabel: "2.0", versionPublicId: "01JD0000000000000000000402",
@@ -37,7 +39,7 @@ it("enters the grace dialog, moves keyboard focus into policy review, and dismis
   grace();
   const dialog = await screen.findByRole("dialog", { name: "An updated policy needs your attention" });
   const read = within(dialog).getByRole("button", { name: "Read and accept" });
-  expect(dialog).toContainElement(document.activeElement);
+  expect(dialog.contains(document.activeElement)).toBe(true);
   read.focus();
   await userEvent.keyboard("{Enter}");
   await waitFor(() => expect(screen.getByText("Policy text and acceptance")).toHaveFocus());
@@ -71,6 +73,51 @@ it("requires review and consent, focuses the missing signature, then submits the
     versionPublicId: item.versionPublicId, contentHash: item.contentHash, signerName: "Avery Example",
   }));
   await waitFor(() => expect(screen.getByRole("heading", { name: "Pending required policies" })).toHaveFocus());
+});
+
+it("binds cancellation to the revision reviewed, even if the card refreshes to a newer notice", async () => {
+  const publicId = "01JD0000000000000000000411";
+  const scheduled = {
+    delayHours: 24,
+    notice: { publicId, scheduledAt: item.deadline, state: "scheduled", revision: 1, pending: 2, queued: 0, sent: 0, failed: 0, accepted: 0 },
+  };
+  const { calls, queryClient } = renderWithTrpc(<Host><PolicyNoticeCard documentPublicId="01JD0000000000000000000401" /></Host>, {
+    "compliance.policies.notices.status": () => scheduled,
+    "compliance.policies.notices.cancel": () => ({ revision: 2, state: "cancelled" }),
+  });
+  await userEvent.click(await screen.findByRole("button", { name: "Cancel notice" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Cancel this policy notice?" });
+  const statusQuery = queryClient.getQueryCache().getAll().find(({ queryKey }) =>
+    JSON.stringify(queryKey).includes('["compliance","policies","notices","status"]'));
+  expect(statusQuery).toBeDefined();
+  act(() => {
+    queryClient.setQueryData(statusQuery!.queryKey, {
+      ...scheduled, notice: { ...scheduled.notice, publicId: "01JD0000000000000000000412", revision: 2, queued: 17 },
+    });
+  });
+  await screen.findByText("17");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel notice" }));
+  await waitFor(() => expect(calls.find(({ path }) => path === "compliance.policies.notices.cancel")?.input).toEqual({
+    noticePublicId: publicId, revision: 1,
+  }));
+});
+
+it("checks enforcement on demand before a named coverage-row action and requires explicit confirmation", async () => {
+  const userPublicId = "01JD0000000000000000000301";
+  const { calls } = renderWithTrpc(<Host><EndPolicySessionsAction
+    userPublicId={userPublicId} versionPublicId={item.versionPublicId} customerName="Avery Example" checkOnDemand
+  /></Host>, {
+    "compliance.policies.enforcement.forTarget": () => ({ canEndSessions: true }),
+    "compliance.policies.enforcement.endNow": () => ({ ended: 2 }),
+  });
+  const trigger = await screen.findByRole("button", { name: "End sessions now for Avery Example" });
+  expect(calls).toHaveLength(0);
+  await userEvent.click(trigger);
+  const dialogue = await screen.findByRole("alertdialog", { name: "End all sessions for this user?" });
+  expect(calls.map(({ path }) => path)).toEqual(["compliance.policies.enforcement.forTarget"]);
+  await userEvent.click(within(dialogue).getByRole("button", { name: "End sessions now" }));
+  await screen.findByText("Ended 2 sessions.");
+  expect(calls[1]?.input).toEqual({ userPublicId, versionPublicId: item.versionPublicId });
 });
 
 pageA11y("policy remediation exact-version form", async () => {

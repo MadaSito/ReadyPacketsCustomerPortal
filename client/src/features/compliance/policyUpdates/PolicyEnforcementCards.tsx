@@ -44,9 +44,29 @@ export function PolicyDefaultWarningCard() {
 export function PolicyEnforcementCard({ documentPublicId }: { documentPublicId: string }) {
   const api = useTRPC().compliance.policies.enforcement;
   const query = useQuery(api.status.queryOptions({ documentPublicId }));
-  if (query.isPending) return <Card title="Session enforcement" headingLevel={2}><Skeleton lines={3} /></Card>;
-  if (query.isError) return <Card title="Session enforcement" headingLevel={2}><ErrorState error={query.error} onRetry={() => void query.refetch()} /></Card>;
-  return <ConfigForm key={query.data.expectedVersion} documentPublicId={documentPublicId} initial={query.data} onSaved={() => { void query.refetch(); }} />;
+  const heading = useRef<HTMLHeadingElement>(null);
+  const [message, setMessage] = useState("");
+  return <Card>
+    <div className="space-y-4">
+      <h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">Session enforcement</h2>
+      <p className="text-sm text-muted">After the grace period, users must review and accept the current policy before they can continue.</p>
+      <p role="status" className="sr-only">{message}</p>
+      {query.isPending ? <Skeleton lines={3} /> : query.isError
+        ? <ErrorState error={query.error} onRetry={() => void query.refetch()} />
+        : <ConfigForm key={`${documentPublicId}:${query.data.expectedVersion}`} documentPublicId={documentPublicId} initial={query.data}
+          onSaved={() => {
+            const active = document.activeElement;
+            void query.refetch().then(() => {
+              setMessage("Enforcement settings saved.");
+              requestAnimationFrame(() => {
+                if (document.activeElement === document.body || document.activeElement === active && active instanceof HTMLElement && !active.isConnected) {
+                  heading.current?.focus();
+                }
+              });
+            });
+          }} />}
+    </div>
+  </Card>;
 }
 
 interface EnforcementConfig {
@@ -65,7 +85,7 @@ function ConfigForm({ documentPublicId, initial, onSaved }: { documentPublicId: 
   const [enabled, setEnabled] = useState(initial.mode === "required_to_continue");
   const [grace, setGrace] = useState(String(initial.graceHours));
   const [warning, setWarning] = useState(initial.warningText ?? "");
-  const [confirm, setConfirm] = useState(false);
+  const [confirmedCount, setConfirmedCount] = useState<number | null>(null);
   const [error, setError] = useState<string>();
   const [graceError, setGraceError] = useState<string>();
   const graceRef = useRef<HTMLInputElement>(null);
@@ -83,7 +103,7 @@ function ConfigForm({ documentPublicId, initial, onSaved }: { documentPublicId: 
   };
 
   return (
-    <Card title="Session enforcement" headingLevel={2} description="After the grace period, users must review and accept the current policy before they can continue.">
+    <>
       <form className="space-y-4" noValidate onSubmit={(event) => {
         event.preventDefault();
         setError(undefined);
@@ -93,7 +113,7 @@ function ConfigForm({ documentPublicId, initial, onSaved }: { documentPublicId: 
           graceRef.current?.focus();
           return;
         }
-        if (enabled && (initial.mode === "none" || Number(grace) < initial.graceHours)) setConfirm(true);
+        if (enabled && (initial.mode === "none" || Number(grace) < initial.graceHours)) setConfirmedCount(initial.affectedCount);
         else void submit().catch(() => undefined);
       }}>
         {initial.disabledByHost ? <Callout tone="warning" title="Emergency override active">Your server is not enforcing policy sign-outs. Other acceptance requirements still apply.</Callout> : null}
@@ -107,16 +127,16 @@ function ConfigForm({ documentPublicId, initial, onSaved }: { documentPublicId: 
           <Textarea rows={3} maxLength={1000} value={warning} onChange={(event) => setWarning(event.target.value)} />
         </Field>
         {graceError ? <p className="sr-only" role="alert">{graceError}</p> : null}
-        {!confirm && error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
+        {confirmedCount === null && error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
         <Button type="submit" loading={save.isPending}>Save enforcement settings</Button>
       </form>
-      <ConfirmDialog open={confirm} onOpenChange={(open) => { setConfirm(open); if (!open) setError(undefined); }}
+      <ConfirmDialog open={confirmedCount !== null} onOpenChange={(open) => { if (!open) { setConfirmedCount(null); setError(undefined); } }}
         title={initial.mode === "none" ? "Turn on policy session enforcement?" : "Shorten the grace period?"}
-        description={`${initial.affectedCount} ${initial.affectedCount === 1 ? "person in this audience has" : "people in this audience have"} not accepted the current version. Users who do not accept by the deadline will be signed out.`}
-        confirmLabel="Confirm enforcement" destructive onConfirm={() => submit(initial.affectedCount)}>
+        description={`${confirmedCount ?? 0} ${confirmedCount === 1 ? "person in this audience has" : "people in this audience have"} not accepted the current version. Users who do not accept by the deadline will be signed out.`}
+        confirmLabel="Confirm enforcement" destructive onConfirm={() => submit(confirmedCount ?? undefined)}>
         {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
       </ConfirmDialog>
-    </Card>
+    </>
   );
 }
 

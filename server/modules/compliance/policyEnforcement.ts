@@ -6,6 +6,7 @@ import type { UserRole } from "../../../shared/domain.js";
 import { conflict, forbidden, notFound, validation } from "../../core/errors.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { users, userSessions } from "../identity/schema.js";
+import { defineSetting } from "../platform/settingsRegistry.js";
 import { assertLiveActorInTx, runComplianceTx } from "./actorAuth.js";
 import { type POLICY_ENFORCEMENT_MODES, type POLICY_ENFORCEMENT_REASONS, policyEnforcementActions, policyEnforcementPreferences } from "./policyEnforcementSchema.js";
 import { audienceUserFilter, hasPortalAcceptance } from "./policyNotices.js";
@@ -16,6 +17,18 @@ export const DEFAULT_POLICY_WARNING = "Review and accept {policy} by {deadline} 
 export const warningTextSchema = z.string().trim().min(1).max(1000)
   .refine((text) => !/[{}]/u.test(text.replaceAll(/\{(?:policy|deadline|timeLeft)\}/gu, "")),
     "Use only {policy}, {deadline}, and {timeLeft} as placeholders.");
+defineSetting({
+  key: POLICY_WARNING_SETTING,
+  owner: "compliance",
+  group: "compliance",
+  label: "Default policy enforcement warning",
+  description: "Plain-text warning shown before the policy grace period expires.",
+  schema: warningTextSchema,
+  default: DEFAULT_POLICY_WARNING,
+  sensitivity: "internal",
+  writeCapability: "policies.manage",
+  managedBy: { href: "/admin/policies", label: "Policies" },
+});
 type ActorRole = UserRole;
 type EnforcementMode = (typeof POLICY_ENFORCEMENT_MODES)[number];
 type EnforcementReason = (typeof POLICY_ENFORCEMENT_REASONS)[number];

@@ -5,6 +5,7 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal } from "../../core/types.js";
 import { users, userSessions } from "../identity/schema.js";
+import { getSettingDefinition } from "../platform/settingsRegistry.js";
 import { createPolicyEnforcement, DEFAULT_POLICY_WARNING, parsePolicyWarning, policyDeadline, POLICY_WARNING_SETTING } from "./policyEnforcement.js";
 import { policyEnforcementActions, policyEnforcementPreferences } from "./policyEnforcementSchema.js";
 import { createPolicyNotices, policyNoticeSchedule, type PolicyNoticeJob, type PolicyNoticesPorts } from "./policyNotices.js";
@@ -65,6 +66,7 @@ describe("policy update notices and session enforcement", () => {
   }
 
   it("defaults the warning for missing/legacy values and establishes grace no earlier than publication, effectiveness and opt-in", () => {
+    expect(getSettingDefinition(POLICY_WARNING_SETTING)).toMatchObject({ owner: "compliance", writeCapability: "policies.manage" });
     expect(parsePolicyWarning({ text: "old setting" })).toBe(DEFAULT_POLICY_WARNING);
     expect(parsePolicyWarning("Bad {other}")).toBe(DEFAULT_POLICY_WARNING);
     expect(parsePolicyWarning("{policy} at {deadline} ({timeLeft})")).toContain("{deadline}");
@@ -157,12 +159,29 @@ describe("policy update notices and session enforcement", () => {
     expect(await service.requiresRemediation(staff.userId, "staff")).toBe(false);
     h.clock.advance(HOUR);
     expect(await service.requiresRemediation(secondCustomer.userId, "customer")).toBe(true);
+    const remediation = { ...secondCustomer, state: "remediation", pendingSteps: ["accept_policy"] } satisfies SessionPrincipal;
+    expect(await service.pendingForUser(remediation)).toEqual([expect.objectContaining({ versionPublicId: item.versionPublicId, blocking: true })]);
+    const session = { userId: secondCustomer.userId, csrfSecretEnc: "synthetic", lastSeenAt: h.clock.now(), absoluteExpiresAt: new Date(+NOW + 2 * HOUR) };
+    // A post-deadline remediation sign-in alone is not swept.
+    await testDb.db.insert(userSessions).values({ ...session, publicId: ulid(), tokenHash: "1".repeat(64), authenticatedAt: h.clock.now() });
+    const sweep = async () => {
+      await h.jobs.enqueue("compliance.policy_enforcement.sweep", {});
+      await h.jobs.runAll("compliance.policy_enforcement.sweep");
+    };
+    await sweep();
+    expect(endSessionsForUser).toHaveBeenCalledTimes(1);
+    // A pre-deadline session triggers termination even if a newer sign-in exists.
+    await testDb.db.insert(userSessions).values({ ...session, publicId: ulid(), tokenHash: "2".repeat(64), authenticatedAt: NOW });
+    await sweep();
+    expect(endSessionsForUser).toHaveBeenLastCalledWith(secondCustomer.userId, "policy_deadline", { tx: expect.anything() });
+    await sweep();
+    expect(endSessionsForUser).toHaveBeenCalledTimes(2);
     await accept(secondCustomer.userId, item);
     expect(await service.requiresRemediation(secondCustomer.userId, "customer")).toBe(false);
     const override = createPolicyEnforcement(createTestDeps({ db: testDb.db, now: h.clock.now(), config: { policyEnforcementDisabled: true } }).deps);
     expect(await override.requiresRemediation(customer.userId, "customer")).toBe(false);
     expect(await override.pendingForUser(customer)).toEqual([]);
     await expect(override.endNow(admin, { userPublicId: customer.userPublicId })).rejects.toMatchObject({ reasonCode: "POLICY_ENFORCEMENT_DISABLED" });
-    expect(h.audit.named("policy.enforcement.session_ended")).toHaveLength(1);
+    expect(h.audit.named("policy.enforcement.session_ended")).toHaveLength(2);
   });
 });

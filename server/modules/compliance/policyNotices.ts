@@ -238,6 +238,10 @@ export function createPolicyNotices(deps: ModuleDeps, ports: PolicyNoticesPorts)
         eq(policyNoticeRecipients.userId, users.id),
       ))),
     )).orderBy(users.id).limit(limit);
+    // A stored policy title may contain line breaks; notification and mail headings are single-line.
+    const policyTitle = row.doc.title.replace(/\p{Cc}+/gu, " ").trim() || "Required policy";
+    const summary = row.version.changeSummary?.replaceAll("\0", "").trim();
+    const portalUrl = new URL(POLICY_NOTICE_PORTAL_PATH, deps.config.canonicalOrigin).href;
     for (const recipient of recipients) {
       claim.signal.throwIfAborted();
       await tx.insert(policyNoticeRecipients).values({
@@ -245,13 +249,13 @@ export function createPolicyNotices(deps: ModuleDeps, ports: PolicyNoticesPorts)
         reminderPublicId: locked.reminderPublicId, nextMailCheckAt: now,
       });
       await ports.mail({
-        ...mailRound(row), recipientUserId: recipient.id, policyTitle: row.doc.title,
-        portalUrl: new URL(POLICY_NOTICE_PORTAL_PATH, deps.config.canonicalOrigin).href,
-        ...(row.version.changeSummary ? { summary: row.version.changeSummary } : {}),
+        ...mailRound(row), recipientUserId: recipient.id, policyTitle, portalUrl,
+        ...(summary ? { summary } : {}),
       }, tx);
       await deps.services.engagement.notifications.notify({
-        userId: recipient.id, kind: "policy.updated", title: "Policy update",
-        body: `Review and accept the latest version of ${row.doc.title}.`, link: POLICY_NOTICE_PORTAL_PATH,
+        // Required policy notices use the locked-on in-app security category. Email is already in the Jobs outbox.
+        userId: recipient.id, kind: "security.policy_updated", title: "Policy update",
+        body: `Review and accept the latest version of ${policyTitle}.`, link: POLICY_NOTICE_PORTAL_PATH,
         idempotencyKey: `policy-notice:${row.version.publicId}:${locked.reminderPublicId ?? "original"}`, skipEmail: true,
       }, tx);
     }

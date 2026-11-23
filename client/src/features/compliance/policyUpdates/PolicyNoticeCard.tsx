@@ -26,6 +26,7 @@ export function PolicyNoticeCard({ documentPublicId }: { documentPublicId: strin
   const [localTime, setLocalTime] = useState("");
   const [action, setAction] = useState<"send" | "remind" | "cancel" | "reschedule" | null>(null);
   const [confirmedCount, setConfirmedCount] = useState(0);
+  const reviewedNotice = useRef<{ noticePublicId: string; revision: number } | null>(null);
   const [error, setError] = useState<string>();
   const [message, setMessage] = useState("");
   const [clock, setClock] = useState(Date.now);
@@ -59,16 +60,17 @@ export function PolicyNoticeCard({ documentPublicId }: { documentPublicId: strin
 
   const open = (next: typeof action) => {
     setError(undefined);
+    reviewedNotice.current = next && notice ? { noticePublicId: notice.publicId, revision: notice.revision } : null;
     if (next === "reschedule" && notice) setLocalTime(toLocalInput(notice.scheduledAt));
     setConfirmedCount(notice?.pending ?? 0);
     setAction(next);
   };
 
   const perform = async () => {
-    if (!notice || !action) return;
+    const input = reviewedNotice.current;
+    if (!input || !action) return;
     setError(undefined);
     try {
-      const input = { noticePublicId: notice.publicId, revision: notice.revision };
       if (action === "reschedule") {
         const scheduledAt = fromLocalInput(localTime);
         if (!scheduledAt || scheduledAt.getTime() <= Date.now()) throw new Error("Select a future date and time.");
