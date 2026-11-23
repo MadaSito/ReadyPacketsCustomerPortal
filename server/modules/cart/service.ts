@@ -1400,7 +1400,6 @@ export function createCartService(deps: ModuleDeps): CartModule {
         invoiceNumber: string;
         currency: string;
         totalMinor: number;
-        waivedMinor: number;
         afterCommit?: () => Promise<void>;
       };
 
@@ -1423,7 +1422,6 @@ export function createCartService(deps: ModuleDeps): CartModule {
           invoiceNumber: existingByIdem.checkoutInvoiceNumber,
           currency: existingByIdem.checkedOutCurrency,
           totalMinor: existingByIdem.checkedOutTotalMinor,
-          waivedMinor: existingByIdem.checkedOutWaivedMinor ?? 0,
         };
       } else {
         let deniedOtherCustomerCart = false;
@@ -1591,15 +1589,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
             const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
             const promoLabel = createdOrder.promoLabel ?? null;
             const zeroTotal = issuedInvoice.totalMinor === 0;
-            const waivedSmallTotal = amountEval.smallTotalAction === "waive" && issuedInvoice.totalMinor > 0;
-            const initialWaivedMinor = waivedSmallTotal ? issuedInvoice.totalMinor : 0;
 
             const nextVersion = targetCart.version + 1;
             const [casUpdate] = await tx
               .update(carts)
               .set({
                 activeOwnerSlot: null,
-                status: zeroTotal || waivedSmallTotal ? "checked_out" : "awaiting_payment",
+                // Never record a predictive waiver or checked_out state before settlement confirms in Phase 2.
+                // Only legacy zero-total checkouts (where no Wave-2 receipt settlement step exists) finish in Phase 1.
+                status: zeroTotal && !paymentsSvc.supportsSettledReceipts ? "checked_out" : "awaiting_payment",
                 paymentMode: null,
                 paymentAttemptPublicId: null,
                 projectName: input.projectName,
@@ -1626,7 +1624,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 checkedOutTaxRateBps: taxQuote.taxRateBps,
                 checkedOutTaxMinor: issuedInvoice.taxMinor,
                 checkedOutTotalMinor: issuedInvoice.totalMinor,
-                checkedOutWaivedMinor: initialWaivedMinor,
+                checkedOutWaivedMinor: 0,
                 lastActivityAt: now,
                 checkedOutAt: now,
                 version: nextVersion,
@@ -1646,11 +1644,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 attributes: {
                   order_public_id: createdOrder.publicId,
                   invoice_public_id: issuedInvoice.invoicePublicId,
-                  ...(zeroTotal
-                    ? { payment_mode: "no_payment_due" }
-                    : waivedSmallTotal
-                      ? { payment_mode: "waived_small_total", waived_minor: initialWaivedMinor }
-                      : {}),
+                  ...(zeroTotal ? { payment_mode: "no_payment_due" } : {}),
                   currency: issuedInvoice.currency,
                   subtotal_minor: issuedInvoice.subtotalMinor,
                   discount_minor: issuedInvoice.discountMinor,
@@ -1674,7 +1668,6 @@ export function createCartService(deps: ModuleDeps): CartModule {
               invoiceNumber: issuedInvoice.invoiceNumber,
               currency: issuedInvoice.currency,
               totalMinor: issuedInvoice.totalMinor,
-              waivedMinor: initialWaivedMinor,
               afterCommit: createdOrder.afterCommit,
             };
           });
@@ -1787,9 +1780,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
             if (!(err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID")) {
               throw err;
             }
+            const ledgerZero = await paymentsSvc.getCheckoutStatus(principal, {
+              invoicePublicId: committed.invoicePublicId,
+            });
+            if (ledgerZero.receiptPublicId) {
+              zeroReceiptPublicId = ledgerZero.receiptPublicId;
+            }
           }
-        }
-        if (existingByIdem && existingByIdem.status !== "checked_out") {
           await deps.db.transaction(async (tx) => {
             const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
             if (!locked || locked.status === "checked_out") return;
@@ -1800,6 +1797,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 status: "checked_out",
                 paymentMode: null,
                 paymentAttemptPublicId: null,
+                checkedOutWaivedMinor: 0,
                 version: locked.version + 1,
                 updatedAt: now,
               })
@@ -1819,50 +1817,55 @@ export function createCartService(deps: ModuleDeps): CartModule {
         } satisfies CheckoutCartResult;
       }
 
-      // Idempotent replay of an already-waived small-total checkout.
-      if (existingByIdem && committed.waivedMinor > 0 && existingByIdem.status === "checked_out") {
-        let waivedReceiptPublicId: string | undefined;
-        try {
-          const replayStart = await paymentsSvc.startCheckout(
-            committed.invoicePublicId,
-            { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
-            { principal, cartPublicId: committed.cartPublicId, idempotencyKey: input.idempotencyKey },
-          );
-          if (replayStart.mode === "settled" && replayStart.receiptPublicId) {
-            waivedReceiptPublicId = replayStart.receiptPublicId;
-          }
-        } catch (err) {
-          if (!(err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID")) {
+      // Start hosted payment session, waive sub-minimum balance, or settle into pay-by-invoice mode OUTSIDE `tx`.
+      // On idempotent replay (`existingByIdem`), we NEVER return a predictive waiver from cart columns: we re-run
+      // `paymentsSvc.startCheckout` (or reconcile against the actual invoice ledger on `INVOICE_ALREADY_PAID`) so
+      // `checkedOutWaivedMinor` and the returned mode reflect what actually settled.
+      let paymentStart: Awaited<ReturnType<typeof paymentsSvc.startCheckout>>;
+      try {
+        paymentStart = await paymentsSvc.startCheckout(
+          committed.invoicePublicId,
+          {
+            successPath: "/checkout/return",
+            cancelPath: "/checkout/cancel",
+          },
+          {
+            principal,
+            cartPublicId: committed.cartPublicId,
+            idempotencyKey: input.idempotencyKey,
+          },
+        );
+      } catch (err) {
+        if (existingByIdem && err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID") {
+          const ledgerStatus = await paymentsSvc.getCheckoutStatus(principal, {
+            invoicePublicId: committed.invoicePublicId,
+          });
+          if (ledgerStatus.invoiceStatus === "paid" && (ledgerStatus.waivedMinor ?? 0) > 0) {
+            paymentStart = {
+              mode: "settled",
+              settlementKind: "waived_small_total",
+              invoicePublicId: committed.invoicePublicId,
+              waivedMinor: ledgerStatus.waivedMinor!,
+              ...(ledgerStatus.receiptPublicId !== undefined ? { receiptPublicId: ledgerStatus.receiptPublicId } : {}),
+            };
+          } else if (existingByIdem.paymentMode === "invoice") {
+            return {
+              mode: "invoice",
+              cartPublicId: committed.cartPublicId,
+              orderPublicId: committed.orderPublicId,
+              orderReference: committed.orderReference,
+              invoicePublicId: committed.invoicePublicId,
+              invoiceNumber: committed.invoiceNumber,
+              currency: committed.currency,
+              totalMinor: committed.totalMinor,
+            } satisfies CheckoutCartResult;
+          } else {
             throw err;
           }
+        } else {
+          throw err;
         }
-        return {
-          mode: "waived_small_total",
-          cartPublicId: committed.cartPublicId,
-          orderPublicId: committed.orderPublicId,
-          orderReference: committed.orderReference,
-          invoicePublicId: committed.invoicePublicId,
-          invoiceNumber: committed.invoiceNumber,
-          currency: committed.currency,
-          totalMinor: committed.totalMinor,
-          waivedMinor: committed.waivedMinor,
-          ...(waivedReceiptPublicId ? { receiptPublicId: waivedReceiptPublicId } : {}),
-        } satisfies CheckoutCartResult;
       }
-
-      // Start hosted payment session, waive sub-minimum balance, or settle into pay-by-invoice mode OUTSIDE `tx`
-      const paymentStart = await paymentsSvc.startCheckout(
-        committed.invoicePublicId,
-        {
-          successPath: "/checkout/return",
-          cancelPath: "/checkout/cancel",
-        },
-        {
-          principal,
-          cartPublicId: committed.cartPublicId,
-          idempotencyKey: input.idempotencyKey,
-        },
-      );
 
       if (paymentStart.mode === "settled") {
         const settledWaivedMinor =
@@ -1873,6 +1876,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
         await deps.db.transaction(async (tx) => {
           const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
           if (!locked) return;
+          const alreadyReconciled =
+            locked.status === "checked_out" &&
+            locked.paymentMode === null &&
+            locked.paymentAttemptPublicId === null &&
+            (locked.checkedOutWaivedMinor ?? 0) === settledWaivedMinor;
+          if (alreadyReconciled) return;
+
           const now = deps.clock.now();
           await tx
             .update(carts)
@@ -1918,7 +1928,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
             currency: committed.currency,
             totalMinor: committed.totalMinor,
             waivedMinor: settledWaivedMinor,
-            receiptPublicId: paymentStart.receiptPublicId,
+            ...(paymentStart.receiptPublicId ? { receiptPublicId: paymentStart.receiptPublicId } : {}),
           } satisfies CheckoutCartResult;
         }
 
@@ -1931,21 +1941,30 @@ export function createCartService(deps: ModuleDeps): CartModule {
           invoiceNumber: committed.invoiceNumber,
           currency: committed.currency,
           totalMinor: 0,
-          receiptPublicId: paymentStart.receiptPublicId,
+          ...(paymentStart.receiptPublicId ? { receiptPublicId: paymentStart.receiptPublicId } : {}),
         } satisfies CheckoutCartResult;
       }
 
       await deps.db.transaction(async (tx) => {
         const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
         if (!locked) return;
-        const now = deps.clock.now();
         const nextStatus = paymentStart.mode === "invoice" ? "checked_out" : "awaiting_payment";
+        const nextAttemptPublicId = paymentStart.mode === "redirect" ? paymentStart.attemptPublicId : null;
+        const alreadyReconciled =
+          locked.status === nextStatus &&
+          locked.paymentMode === paymentStart.mode &&
+          locked.paymentAttemptPublicId === nextAttemptPublicId &&
+          (locked.checkedOutWaivedMinor ?? 0) === 0;
+        if (alreadyReconciled) return;
+
+        const now = deps.clock.now();
         await tx
           .update(carts)
           .set({
             status: nextStatus,
             paymentMode: paymentStart.mode,
-            paymentAttemptPublicId: paymentStart.mode === "redirect" ? paymentStart.attemptPublicId : null,
+            paymentAttemptPublicId: nextAttemptPublicId,
+            checkedOutWaivedMinor: 0,
             version: locked.version + 1,
             updatedAt: now,
           })
@@ -1964,7 +1983,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               invoice_public_id: committed.invoicePublicId,
               payment_mode: paymentStart.mode,
               provider: paymentStart.mode === "redirect" ? paymentStart.provider : "none",
-              attempt_public_id: paymentStart.mode === "redirect" ? paymentStart.attemptPublicId : null,
+              attempt_public_id: nextAttemptPublicId,
             },
           },
           tx,
@@ -2040,8 +2059,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
             : {}),
       });
 
-      const waivedMinor = cartRow.checkedOutWaivedMinor ?? 0;
-      const isWaivedSmallTotal = waivedMinor > 0 && cartRow.paymentMode === null;
+      const waivedMinor =
+        paymentStatus.invoiceStatus === "paid"
+          ? (paymentStatus.waivedMinor ?? (cartRow.paymentMode === null ? (cartRow.checkedOutWaivedMinor ?? 0) : 0))
+          : 0;
+      const isWaivedSmallTotal = waivedMinor > 0;
       const isNoPaymentDue =
         !isWaivedSmallTotal &&
         (cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor) === 0 &&
@@ -2076,7 +2098,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
           ? "no_payment_due"
           : isWaivedSmallTotal
             ? "waived_small_total"
-            : (cartRow.paymentMode ?? "invoice"),
+            : (cartRow.paymentMode ?? (paymentStatus.providerConfigured !== "none" ? "redirect" : "invoice")),
         provider: attempt?.provider ?? paymentStatus.providerConfigured,
         attemptPublicId: attempt?.attemptPublicId ?? cartRow.paymentAttemptPublicId ?? null,
         attemptStatus: attempt?.status ?? null,

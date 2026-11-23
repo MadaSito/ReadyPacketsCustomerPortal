@@ -30,6 +30,16 @@ import * as complianceTables from "../compliance/schema.js";
 import { createComplianceModule, type ComplianceModule } from "../compliance/index.js";
 import * as promotionsTables from "../promotions/schema.js";
 import { createPromotionsModule, type PromotionsModule } from "../promotions/index.js";
+import * as paymentsTables from "../payments/schema.js";
+import {
+  createPaymentsService,
+  type PaymentProviderAdapter,
+  type PaymentRefundAdapter,
+  PAYMENTS_CONFIG_SETTING,
+  PAYMENTS_SMALL_TOTALS_SETTING,
+  PAYMENTS_STRIPE_SECRET_KEY,
+  PAYMENTS_STRIPE_WEBHOOK_SECRET,
+} from "../payments/index.js";
 import * as cartTables from "./schema.js";
 import {
   CART_FEATURE_FLAG,
@@ -46,6 +56,7 @@ const testSchema = {
   ...orderTables,
   ...complianceTables,
   ...promotionsTables,
+  ...paymentsTables,
   ...cartTables,
 };
 
@@ -904,5 +915,435 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
     });
     expect(placed.mode).toBe("invoice");
     expect(placed.orderPublicId).toBeTruthy();
+  });
+
+  it("D5 regression: never stores predictive waiver before settlement, reconciles Phase 2 failures and settings/provider flips against the actual ledger", async () => {
+    const prevPayments = h.services.payments;
+    const aliceCaller = callerFor(alice.principal);
+
+    let createdRedirectSessions = 0;
+    const stripeAdapter: PaymentProviderAdapter = {
+      key: "stripe",
+      async createCheckout(input) {
+        createdRedirectSessions += 1;
+        return {
+          redirectUrl: `https://checkout.stripe.com/c/pay/cs_test_${input.attemptPublicId}`,
+          providerRef: `cs_test_${input.attemptPublicId}`,
+          expiresAt: null,
+        };
+      },
+      verifyWebhook() {
+        return { ok: false, reasonCode: "UNSUPPORTED_IN_TEST" };
+      },
+      async fetchPayment(input) {
+        return {
+          providerRef: input.providerRef,
+          providerOrderRef: null,
+          providerPaymentRef: null,
+          status: "open",
+          amountMinor: 40,
+          currency: "USD",
+          livemode: false,
+          attemptPublicId: null,
+          invoicePublicId: null,
+          paidAt: null,
+        };
+      },
+    };
+    const squareAdapter: PaymentProviderAdapter = {
+      ...stripeAdapter,
+      key: "square",
+    };
+    const noopRefundAdapter: PaymentRefundAdapter<"stripe"> = {
+      provider: "stripe",
+      async createRefund() {
+        return { outcome: "failed", failureReasonCode: "UNSUPPORTED_IN_TEST" };
+      },
+      async lookupRefund() {
+        return { status: "absent", providerRefundRef: null, failureReasonCode: null, settledAt: null };
+      },
+    };
+    const noopSquareRefundAdapter: PaymentRefundAdapter<"square"> = {
+      ...noopRefundAdapter,
+      provider: "square",
+    };
+
+    const realPayments = createPaymentsService(h.deps, {
+      stripeAdapter,
+      squareAdapter,
+      stripeRefundAdapter: noopRefundAdapter,
+      squareRefundAdapter: noopSquareRefundAdapter,
+    });
+
+    let failNextStartCheckout = false;
+    let simulateCrashAfterLedgerSettle = false;
+    const faultInjectablePayments = new Proxy(realPayments, {
+      get(target, prop, receiver) {
+        if (prop === "startCheckout") {
+          return async (...args: Parameters<typeof realPayments.startCheckout>) => {
+            if (failNextStartCheckout) {
+              failNextStartCheckout = false;
+              throw new DomainError(
+                "UNAVAILABLE",
+                "PAYMENTS_START_TRANSIENT_FAILURE",
+                "Simulated failure between Phase 1 and Phase 2 before settlement.",
+              );
+            }
+            const res = await target.startCheckout(...args);
+            if (simulateCrashAfterLedgerSettle) {
+              simulateCrashAfterLedgerSettle = false;
+              throw new DomainError(
+                "UNAVAILABLE",
+                "PROCESS_CRASH_AFTER_SETTLEMENT",
+                "Simulated crash after ledger settlement before cart reconciliation.",
+              );
+            }
+            return res;
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const configureStripeOnline = async () => {
+      await h.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, "sk_test_ReadyPacketsD5RegressionKey123456");
+      await h.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, "whsec_ReadyPacketsD5RegressionHook123456");
+      await h.settings.set(PAYMENTS_CONFIG_SETTING.key, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+        successPath: "/invoices",
+        cancelPath: "/invoices",
+        webhookToleranceSeconds: 300,
+        stripeSecretKeyLast4: "3456",
+        stripeWebhookSecretLast4: "3456",
+        squareLocationId: null,
+        squareAccessTokenLast4: null,
+        squareWebhookSignatureKeyLast4: null,
+      });
+    };
+
+    const configureInvoiceOnly = async () => {
+      await h.settings.set(PAYMENTS_CONFIG_SETTING.key, {
+        provider: "none",
+        mode: "test",
+        currency: "USD",
+        successPath: "/invoices",
+        cancelPath: "/invoices",
+        webhookToleranceSeconds: 300,
+        stripeSecretKeyLast4: "3456",
+        stripeWebhookSecretLast4: "3456",
+        squareLocationId: null,
+        squareAccessTokenLast4: null,
+        squareWebhookSignatureKeyLast4: null,
+      });
+    };
+
+    try {
+      h.services.payments = faultInjectablePayments as unknown as Services["payments"];
+      await configureStripeOnline();
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "waive",
+      });
+
+      await promotionsMod.admin.create(admin.principal, {
+        name: "Sub-minimum $0.40 regression promo",
+        label: "$0.40 regression total",
+        type: "set_total",
+        setTotalMinor: 40,
+        currency: "USD",
+        scope: { kind: "all" },
+        code: "REGRESS40",
+        maxPerCustomer: 10,
+      });
+
+      // -----------------------------------------------------------------------
+      // Case 1: Transient failure between Phase 1 and Phase 2, then retry settles,
+      // then settings + provider flip AFTER settlement -> replay reflects what really settled!
+      // -----------------------------------------------------------------------
+      await aliceCaller.cart.addItems({ items: [{ productPublicId: p1Basic, quantity: 1 }] });
+      const cart1 = await aliceCaller.cart.applyCode({
+        code: "REGRESS40",
+        idempotencyKey: "idem-regress40-apply-1",
+      });
+      expect(cart1.totals.totalMinor).toBe(40);
+
+      const payload1 = {
+        cartPublicId: cart1.cartPublicId!,
+        expectedVersion: cart1.version,
+        projectName: "D5 Phase 2 Failure Then Waive",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [],
+        idempotencyKey: "idem-d5-phase2-fail-then-waive-01",
+      };
+
+      failNextStartCheckout = true;
+      await expect(aliceCaller.cart.checkout(payload1)).rejects.toSatisfy(
+        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
+      );
+
+      // Verify cart did NOT store a predictive waiver or premature `checked_out` state!
+      const [cart1AfterFail] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart1.cartPublicId!));
+      expect(cart1AfterFail?.status).toBe("awaiting_payment");
+      expect(cart1AfterFail?.checkedOutWaivedMinor).toBe(0);
+      expect(cart1AfterFail?.paymentMode).toBeNull();
+
+      // Phase 1 `cart.checked_out` audit event must NOT claim a predictive waiver
+      const checkedOutAudit1 = h.audit.events.find(
+        (ev) => ev.eventName === "cart.checked_out" && ev.resource?.publicId === cart1.cartPublicId,
+      );
+      expect(checkedOutAudit1).toBeDefined();
+      expect(checkedOutAudit1?.attributes).not.toHaveProperty("payment_mode");
+      expect(checkedOutAudit1?.attributes).not.toHaveProperty("waived_minor");
+
+      // `checkoutStatus` while unpaid reports `pending_confirmation` with `waivedMinor: 0` and `balanceDueMinor: 40`
+      const status1BeforeRetry = await aliceCaller.cart.checkoutStatus({
+        cartPublicId: cart1.cartPublicId!,
+      });
+      expect(status1BeforeRetry.confirmationState).toBe("pending_confirmation");
+      expect(status1BeforeRetry.invoiceStatus).toBe("issued");
+      expect(status1BeforeRetry.waivedMinor).toBe(0);
+      expect(status1BeforeRetry.balanceDueMinor).toBe(40);
+
+      // Retry with the same idempotencyKey now settles the waiver in the ledger and reconciles the cart row
+      const settled1 = await aliceCaller.cart.checkout(payload1);
+      expect(settled1).toMatchObject({
+        mode: "waived_small_total",
+        cartPublicId: cart1.cartPublicId,
+        totalMinor: 40,
+        waivedMinor: 40,
+      });
+      if (settled1.mode !== "waived_small_total") throw new Error("Expected waived_small_total");
+      expect(settled1.receiptPublicId).toBeTruthy();
+
+      const [cart1AfterSettle] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart1.cartPublicId!));
+      expect(cart1AfterSettle?.status).toBe("checked_out");
+      expect(cart1AfterSettle?.checkedOutWaivedMinor).toBe(40);
+
+      // Now flip `payments.small_totals` to `"block"` AND flip provider to `"none"` AFTER settlement:
+      // idempotent replay MUST still return what actually settled (`waived_small_total`, `waivedMinor: 40`)!
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "block",
+      });
+      const replayAfterFlipToBlock = await aliceCaller.cart.checkout(payload1);
+      expect(replayAfterFlipToBlock).toEqual(settled1);
+
+      await configureInvoiceOnly();
+      const replayAfterFlipToInvoice = await aliceCaller.cart.checkout(payload1);
+      expect(replayAfterFlipToInvoice).toEqual(settled1);
+
+      // Only one `cart.checkout_payment_started` audit event was emitted for cart1 across retries/replays
+      const startedAudits1 = h.audit.events.filter(
+        (ev) => ev.eventName === "cart.checkout_payment_started" && ev.resource?.publicId === cart1.cartPublicId,
+      );
+      expect(startedAudits1).toHaveLength(1);
+      expect(startedAudits1[0]?.attributes).toMatchObject({
+        payment_mode: "waived_small_total",
+        waived_minor: 40,
+      });
+
+      // -----------------------------------------------------------------------
+      // Case 2: Phase 2 fails BEFORE settlement, then `payments.small_totals` flips to `"block"`
+      // (replay rejects with `AMOUNT_BELOW_PROVIDER_MINIMUM` — never claims a fake waiver!),
+      // and when provider subsequently switches to `"none"` (invoice), replay returns `mode: "invoice"`!
+      // -----------------------------------------------------------------------
+      await configureStripeOnline();
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "waive",
+      });
+
+      await aliceCaller.cart.addItems({ items: [{ productPublicId: p2Basic, quantity: 1 }] });
+      const cart2 = await aliceCaller.cart.applyCode({
+        code: "REGRESS40",
+        idempotencyKey: "idem-regress40-apply-2",
+      });
+
+      const payload2 = {
+        cartPublicId: cart2.cartPublicId!,
+        expectedVersion: cart2.version,
+        projectName: "D5 Flip Before Settlement",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [],
+        idempotencyKey: "idem-d5-flip-before-settlement-02",
+      };
+
+      failNextStartCheckout = true;
+      await expect(aliceCaller.cart.checkout(payload2)).rejects.toSatisfy(
+        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
+      );
+
+      // Flip `payments.small_totals` to `"block"` BEFORE Phase 2 ever settled
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "block",
+      });
+
+      await expect(aliceCaller.cart.checkout(payload2)).rejects.toSatisfy(
+        (err) => extractCodes(err).reasonCode === "AMOUNT_BELOW_PROVIDER_MINIMUM",
+      );
+
+      const [cart2AfterBlockedReplay] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart2.cartPublicId!));
+      expect(cart2AfterBlockedReplay?.status).toBe("awaiting_payment");
+      expect(cart2AfterBlockedReplay?.checkedOutWaivedMinor).toBe(0);
+
+      // Now admin switches provider to `"none"` (pay by invoice); replay settles into `"invoice"` mode with `checkedOutWaivedMinor === 0`!
+      await configureInvoiceOnly();
+      const invoiceReplay2 = await aliceCaller.cart.checkout(payload2);
+      expect(invoiceReplay2).toMatchObject({
+        mode: "invoice",
+        cartPublicId: cart2.cartPublicId,
+        totalMinor: 40,
+      });
+
+      const [cart2AfterInvoiceReplay] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart2.cartPublicId!));
+      expect(cart2AfterInvoiceReplay?.status).toBe("checked_out");
+      expect(cart2AfterInvoiceReplay?.paymentMode).toBe("invoice");
+      expect(cart2AfterInvoiceReplay?.checkedOutWaivedMinor).toBe(0);
+
+      // -----------------------------------------------------------------------
+      // Case 3: Phase 2 fails BEFORE settlement, then provider minimum is lowered to $0.30
+      // so $0.40 is no longer sub-minimum -> replay creates a hosted redirect attempt (`checkedOutWaivedMinor === 0`)!
+      // -----------------------------------------------------------------------
+      await configureStripeOnline();
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "waive",
+      });
+
+      await aliceCaller.cart.addItems({ items: [{ productPublicId: p3Basic, quantity: 1 }] });
+      const cart3 = await aliceCaller.cart.applyCode({
+        code: "REGRESS40",
+        idempotencyKey: "idem-regress40-apply-3",
+      });
+
+      const payload3 = {
+        cartPublicId: cart3.cartPublicId!,
+        expectedVersion: cart3.version,
+        projectName: "D5 Lowered Minimum Redirect",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [],
+        idempotencyKey: "idem-d5-lowered-min-redirect-03",
+      };
+
+      failNextStartCheckout = true;
+      await expect(aliceCaller.cart.checkout(payload3)).rejects.toSatisfy(
+        (err) => extractCodes(err).reasonCode === "PAYMENTS_START_TRANSIENT_FAILURE",
+      );
+
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "block",
+        minimumOverrides: { stripe: { USD: 30 } },
+      });
+
+      const redirectReplay3 = await aliceCaller.cart.checkout(payload3);
+      expect(redirectReplay3).toMatchObject({
+        mode: "redirect",
+        cartPublicId: cart3.cartPublicId,
+        provider: "stripe",
+        totalMinor: 40,
+      });
+      expect(createdRedirectSessions).toBe(1);
+
+      const [cart3AfterRedirect] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart3.cartPublicId!));
+      expect(cart3AfterRedirect?.status).toBe("awaiting_payment");
+      expect(cart3AfterRedirect?.paymentMode).toBe("redirect");
+      expect(cart3AfterRedirect?.checkedOutWaivedMinor).toBe(0);
+
+      // -----------------------------------------------------------------------
+      // Case 4: Crash AFTER ledger waiver settlement BEFORE cart row reconciliation:
+      // replay reconciles `checkedOutWaivedMinor` from the ledger even after `payments.small_totals` flipped to `"block"`!
+      // -----------------------------------------------------------------------
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "waive",
+      });
+
+      await aliceCaller.cart.addItems({ items: [{ productPublicId: addonWorkshop, quantity: 1 }] });
+      const cart4 = await aliceCaller.cart.applyCode({
+        code: "REGRESS40",
+        idempotencyKey: "idem-regress40-apply-4",
+      });
+
+      const payload4 = {
+        cartPublicId: cart4.cartPublicId!,
+        expectedVersion: cart4.version,
+        projectName: "D5 Crash After Ledger Settle",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [],
+        idempotencyKey: "idem-d5-crash-after-settle-04",
+      };
+
+      simulateCrashAfterLedgerSettle = true;
+      await expect(aliceCaller.cart.checkout(payload4)).rejects.toSatisfy(
+        (err) => extractCodes(err).reasonCode === "PROCESS_CRASH_AFTER_SETTLEMENT",
+      );
+
+      // Cart row has not been reconciled yet (`checkedOutWaivedMinor === 0`), even though the ledger settled!
+      const [cart4BeforeReconcile] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart4.cartPublicId!));
+      expect(cart4BeforeReconcile?.status).toBe("awaiting_payment");
+      expect(cart4BeforeReconcile?.checkedOutWaivedMinor).toBe(0);
+
+      // Even before replay updates the cart row, `checkoutStatus` sees `invoiceStatus === "paid"` and blocks restore!
+      const status4BeforeReconcile = await aliceCaller.cart.checkoutStatus({
+        cartPublicId: cart4.cartPublicId!,
+      });
+      expect(status4BeforeReconcile.invoiceStatus).toBe("paid");
+      expect(status4BeforeReconcile.canRestoreToCart).toBe(false);
+      if (status4BeforeReconcile.waivedMinor > 0) {
+        expect(status4BeforeReconcile.confirmationState).toBe("no_payment_due");
+        expect(status4BeforeReconcile.paymentMode).toBe("waived_small_total");
+        expect(status4BeforeReconcile.waivedMinor).toBe(40);
+      }
+
+      // Flip `payments.small_totals` to `"block"` before replay, then replay -> reconciles `checkedOutWaivedMinor = 40` from ledger!
+      await h.settings.set(PAYMENTS_SMALL_TOTALS_SETTING.key, {
+        belowProviderMinimum: "block",
+      });
+      const reconciled4 = await aliceCaller.cart.checkout(payload4);
+      expect(reconciled4).toMatchObject({
+        mode: "waived_small_total",
+        cartPublicId: cart4.cartPublicId,
+        totalMinor: 40,
+        waivedMinor: 40,
+      });
+
+      const [cart4AfterReconcile] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart4.cartPublicId!));
+      expect(cart4AfterReconcile?.status).toBe("checked_out");
+      expect(cart4AfterReconcile?.checkedOutWaivedMinor).toBe(40);
+
+      const status4AfterReconcile = await aliceCaller.cart.checkoutStatus({
+        cartPublicId: cart4.cartPublicId!,
+      });
+      expect(status4AfterReconcile.confirmationState).toBe("no_payment_due");
+      expect(status4AfterReconcile.paymentMode).toBe("waived_small_total");
+      expect(status4AfterReconcile.waivedMinor).toBe(40);
+      expect(status4AfterReconcile.canRestoreToCart).toBe(false);
+    } finally {
+      h.services.payments = prevPayments;
+      h.settings.values.delete(PAYMENTS_CONFIG_SETTING.key);
+      h.settings.values.delete(PAYMENTS_SMALL_TOTALS_SETTING.key);
+    }
   });
 });
