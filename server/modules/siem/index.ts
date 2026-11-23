@@ -21,7 +21,12 @@ import type {
 } from "../../core/types.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { computeRetryBackoffMs } from "./backoff.js";
-import { isSiemOperationalSelfEvent, matchesDestinationFilter, sanitizeProjectedEvent } from "./projection.js";
+import {
+  isSiemOperationalSelfEvent,
+  matchesDestinationFilter,
+  projectAuditEnvelopeForSiem,
+  sanitizeProjectedEvent,
+} from "./projection.js";
 import { siemDestinations, siemOutbox, type SiemDestinationRow, type SiemOutboxRow } from "./schema.js";
 import {
   SIEM_BATCH_SIZE,
@@ -97,11 +102,23 @@ export {
   formatOtlpLogsPayload,
 } from "./formats.js";
 export {
+  EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS,
+  EXTERNAL_ENUM_VOCABULARIES,
+  EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS,
   EXTERNAL_NUMERIC_ATTRIBUTE_KEYS,
+  EXTERNAL_SAFE_COUNT_KEYS,
   EXTERNAL_STRING_ATTRIBUTE_KEYS,
+  isSiemOperationalSelfEvent,
   matchesDestinationFilter,
+  projectAuditEnvelopeForSiem,
   sanitizeProjectedEvent,
 } from "./projection.js";
+export {
+  findSiemCatalogueEntry,
+  SIEM_EVENT_CATALOGUE,
+  SIEM_NEVER_FORWARDED_ATTRIBUTE_KEYS,
+  type SiemCatalogueEntry,
+} from "./catalogue.js";
 
 const CERT_EXPIRY_WARN_MS = 14 * 24 * 60 * 60 * 1_000;
 const LEASE_DURATION_SECONDS = 60;
@@ -1767,9 +1784,10 @@ export function createSiemModule(deps: ModuleDeps): SiemModule {
         if (typeof rawEvent.chain_seq === "number" && rawEvent.chain_seq > lastSeq) {
           lastSeq = rawEvent.chain_seq;
         }
-        const projected = auditPort.projectForExternal
-          ? sanitizeProjectedEvent(auditPort.projectForExternal(rawEvent))
-          : sanitizeProjectedEvent(rawEvent);
+        const projected = projectAuditEnvelopeForSiem(
+          rawEvent,
+          auditPort.projectForExternal ? (event) => auditPort.projectForExternal!(event) : undefined,
+        );
 
         if (isSiemOperationalSelfEvent(projected.event_name)) continue;
         if (

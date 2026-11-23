@@ -1,21 +1,33 @@
 import { describe, expect, it } from "vitest";
 import {
+  EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS,
+  EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS,
+  EXTERNAL_NUMERIC_ATTRIBUTE_KEYS,
+  EXTERNAL_SAFE_COUNT_KEYS,
+  EXTERNAL_STRING_ATTRIBUTE_KEYS,
+  SIEM_EVENT_CATALOGUE,
+  SIEM_NEVER_FORWARDED_ATTRIBUTE_KEYS,
   UTF8_BOM_BYTES,
   computeSyslogPri,
   escapeCefExtensionValue,
   escapeCefHeaderField,
   escapeSdParamValue,
+  findSiemCatalogueEntry,
   formatCefSyslogFrame,
   formatJsonlRecord,
   formatOtlpLogsPayload,
   formatRfc3339UtcMs,
   formatRfc5424Message,
   frameOctetCounted,
+  isSiemOperationalSelfEvent,
+  matchesDestinationFilter,
   neutralizeControls,
   otelSeverityToSyslog,
+  projectAuditEnvelopeForSiem,
   sanitizePrintUsAscii,
   sanitizeProjectedEvent,
   truncateUtf8Buffer,
+  type AuditEnvelopeLike,
   type ExternalAuditEvent,
 } from "./index.js";
 
@@ -323,5 +335,234 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
     expect("unallowlisted_free_text" in projected.attributes).toBe(false);
     expect("arbitrary_amount" in projected.attributes).toBe(false);
     expect(projected.dropped_attributes).toBeGreaterThanOrEqual(10);
+  });
+
+  it("validates SIEM event catalogue consistency and strict local-only attribute redaction invariants", () => {
+    const allowedAttrKeys = new Set<string>([
+      ...EXTERNAL_STRING_ATTRIBUTE_KEYS,
+      ...EXTERNAL_NUMERIC_ATTRIBUTE_KEYS,
+      ...EXTERNAL_BOOLEAN_ATTRIBUTE_KEYS,
+      ...EXTERNAL_HEX_DIGEST_ATTRIBUTE_KEYS,
+    ]);
+
+    for (const forbiddenKey of SIEM_NEVER_FORWARDED_ATTRIBUTE_KEYS) {
+      expect(allowedAttrKeys.has(forbiddenKey)).toBe(false);
+      expect(EXTERNAL_SAFE_COUNT_KEYS.has(forbiddenKey)).toBe(false);
+    }
+
+    for (const entry of SIEM_EVENT_CATALOGUE) {
+      for (const attr of entry.forwardedAttributes) {
+        expect(allowedAttrKeys.has(attr)).toBe(true);
+      }
+      for (const countKey of entry.forwardedSafeCounts) {
+        expect(EXTERNAL_SAFE_COUNT_KEYS.has(countKey)).toBe(true);
+      }
+      for (const localKey of entry.withheldLocalKeys) {
+        expect(allowedAttrKeys.has(localKey)).toBe(false);
+      }
+    }
+
+    for (const d7Event of [
+      "security.incident.opened",
+      "security.incident.updated",
+      "security.incident.acknowledged",
+      "security.incident.closed",
+      "security.incident.action",
+      "security.ban.created",
+      "security.ban.released",
+      "security.ban.policy_updated",
+    ]) {
+      const entry = findSiemCatalogueEntry(d7Event);
+      expect(entry).not.toBeNull();
+      expect(entry!.category).toBe("security");
+      expect(entry!.forwardable).toBe(true);
+    }
+
+    expect(findSiemCatalogueEntry("policy.notice.scheduled")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("report.definition.created")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("siem.delivery.failed")?.forwardable).toBe(false);
+    expect(isSiemOperationalSelfEvent("siem.delivery.failed")).toBe(true);
+  });
+
+  it("forwards D7 security.incident.* and security.ban.* safe attributes across all wire formats while withholding address_ref, account_ref, and local ULIDs", () => {
+    const incidentActionRaw: AuditEnvelopeLike = {
+      ...sampleEvent({
+        event_id: "01JEINCIDENTEVT00000000001",
+        event_name: "security.incident.action",
+        action: "ban",
+        outcome: "completed",
+        severity_text: "WARN",
+        category: "security",
+        resource_type: "security_incident",
+        resource_ref: "9f8e7d6c5b4a39281726354455667788",
+        correlation_id: "01JEINCIDENT00000000000001",
+      }),
+      actor_user_id: 7,
+      resource_public_id: "01JEINCIDENT00000000000001",
+      source_address_ref: "deadbeef00112233445566778899aabb",
+      safe_counts: { events_added: 4 },
+      attributes: {
+        incident_public_id: "01JEINCIDENT00000000000001",
+        ban_public_id: "01JEBAN0000000000000000009",
+        address_ref: "deadbeef00112233445566778899aabb",
+        account_ref: "cafebabe00112233445566778899aabb",
+        rule_key: "password_spraying",
+        severity: "high",
+        status: "acknowledged",
+        event_count: 14,
+        account_count: 9,
+        address_count: 1,
+        action_kind: "ban_ip",
+        permanent: false,
+      },
+      dropped_attributes: 0,
+    };
+
+    // Simulate auditPort.projectForExternal stripping attributes that are not yet in audit's older list.
+    const narrowerAuditProjector = (raw: AuditEnvelopeLike): ExternalAuditEvent => ({
+      ...sampleEvent({
+        event_id: raw.event_id,
+        event_name: raw.event_name,
+        action: raw.action,
+        outcome: raw.outcome,
+        severity_text: raw.severity_text,
+        category: raw.category,
+        resource_type: raw.resource_type,
+        resource_ref: raw.resource_ref,
+        correlation_id: raw.correlation_id,
+      }),
+      safe_counts: {},
+      attributes: { status: "acknowledged", action_kind: "ban_ip" },
+      dropped_attributes: 10,
+    });
+
+    const projectedIncident = projectAuditEnvelopeForSiem(incidentActionRaw, narrowerAuditProjector);
+    expect(projectedIncident.attributes).toEqual({
+      rule_key: "password_spraying",
+      severity: "high",
+      status: "acknowledged",
+      event_count: 14,
+      account_count: 9,
+      address_count: 1,
+      action_kind: "ban_ip",
+      permanent: false,
+    });
+    expect(projectedIncident.safe_counts).toEqual({ events_added: 4 });
+    expect(projectedIncident.dropped_attributes).toBe(4);
+    expect(projectedIncident.correlation_id).toBe("01JEINCIDENT00000000000001");
+    expect(
+      matchesDestinationFilter(projectedIncident, { minSeverity: "WARN", categories: ["security"] }),
+    ).toBe(true);
+
+    const banCreatedRaw: AuditEnvelopeLike = {
+      ...sampleEvent({
+        event_id: "01JEBANEVT0000000000000002",
+        event_name: "security.ban.created",
+        action: "create",
+        outcome: "completed",
+        severity_text: "WARN",
+        category: "security",
+        resource_type: "signin_ban",
+        resource_ref: "11223344556677889900aabbccddeeff",
+      }),
+      source_address_ref: "deadbeef00112233445566778899aabb",
+      attributes: {
+        ban_public_id: "01JEBAN0000000000000000009",
+        automatic: true,
+        address_ref: "deadbeef00112233445566778899aabb",
+        reason: "Manual operator reason mentioning 203.0.113.55",
+      },
+      dropped_attributes: 0,
+    };
+
+    const projectedBan = projectAuditEnvelopeForSiem(banCreatedRaw, narrowerAuditProjector);
+    expect(projectedBan.attributes).toEqual({ automatic: true });
+    expect(projectedBan.dropped_attributes).toBe(3);
+
+    const wirePayloads = [
+      formatRfc5424Message(projectedIncident).text,
+      formatJsonlRecord(projectedIncident).toString("utf8"),
+      formatCefSyslogFrame(projectedIncident).cefText,
+      formatOtlpLogsPayload([projectedIncident, projectedBan]).toString("utf8"),
+      formatRfc5424Message(projectedBan).text,
+      formatJsonlRecord(projectedBan).toString("utf8"),
+      formatCefSyslogFrame(projectedBan).cefText,
+    ].join("\n");
+
+    expect(wirePayloads).not.toContain("deadbeef00112233445566778899aabb");
+    expect(wirePayloads).not.toContain("cafebabe00112233445566778899aabb");
+    expect(wirePayloads).not.toContain("01JEBAN0000000000000000009");
+    expect(wirePayloads).not.toContain("203.0.113.55");
+    expect(wirePayloads).not.toContain("address_ref");
+    expect(wirePayloads).not.toContain("account_ref");
+    expect(wirePayloads).toContain("password_spraying");
+
+    // Closed-vocabulary enforcement on D7 incident enums: free-text close_reason or unknown rule_key is dropped.
+    const invalidVocabIncident = sanitizeProjectedEvent({
+      ...sampleEvent({ event_name: "security.incident.closed" }),
+      attributes: {
+        rule_key: "custom_operator_text_rule",
+        close_reason: "Customer called support and explained",
+        severity: "critical",
+      },
+    });
+    expect(invalidVocabIncident.attributes).toEqual({ severity: "critical" });
+    expect(invalidVocabIncident.dropped_attributes).toBe(2);
+  });
+
+  it("projects Increment 06 promotions, reports, workflows, orders, and compliance events cleanly", () => {
+    const specSha = "a".repeat(64);
+    const reportExport = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "business",
+        severity_text: "INFO",
+        event_name: "report.exported",
+        action: "export",
+        outcome: "completed",
+      }),
+      safe_counts: { rows: 250 },
+      attributes: {
+        report_key: "payments_discounts",
+        dataset: "orders",
+        kind: "custom",
+        truncated: false,
+        spec_hash: specSha,
+        definition_public_id: "01JEREPORTDEF0000000000001",
+      },
+    });
+    expect(reportExport.attributes).toEqual({
+      report_key: "payments_discounts",
+      dataset: "orders",
+      kind: "custom",
+      truncated: false,
+      spec_hash: specSha,
+    });
+    expect(reportExport.safe_counts).toEqual({ rows: 250 });
+    expect(reportExport.dropped_attributes).toBe(1);
+
+    const promoSettings = sanitizeProjectedEvent({
+      ...sampleEvent({
+        category: "admin",
+        severity_text: "WARN",
+        event_name: "promotion.settings_updated",
+        action: "update",
+        outcome: "completed",
+      }),
+      attributes: {
+        enabled: true,
+        allow_zero_total: false,
+        max_discount_percent: 45.25,
+        max_discount_bps: 4525,
+        max_fixed_amount_minor: 5000,
+        min_order_total_after_discount_minor: 1000,
+      },
+    });
+    expect(promoSettings.attributes).toEqual({
+      enabled: true,
+      allow_zero_total: false,
+      max_discount_percent: 45.25,
+      max_discount_bps: 4525,
+    });
+    expect(promoSettings.dropped_attributes).toBe(2);
   });
 });
