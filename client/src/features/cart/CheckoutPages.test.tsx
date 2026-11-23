@@ -195,7 +195,12 @@ it("handles D14 AGREEMENT_REQUIRED at checkout by opening AgreementDialog, accep
     await screen.findByRole("dialog", { name: "Review and accept Mutual Non-Disclosure Agreement" }),
   ).toBeInTheDocument();
 
-  await user.click(screen.getByRole("checkbox", { name: /I have read and agree to Mutual Non-Disclosure Agreement/i }));
+  // The agreement controls unlock one animation frame after the dialog opens (end-of-text check).
+  const agreementCheckbox = screen.getByRole("checkbox", {
+    name: /I have read and agree to Mutual Non-Disclosure Agreement/i,
+  });
+  await waitFor(() => expect(agreementCheckbox).not.toBeDisabled());
+  await user.click(agreementCheckbox);
   await user.type(
     screen.getByRole("textbox", { name: /Type your full name/i }),
     "Synthetic Customer",
