@@ -38,8 +38,9 @@ export function registerStatic(app: Express, staticDir: string, publicPaths: Rea
     redirect: false,
     dotfiles: "ignore",
     setHeaders(res, file) {
-      if (res.getHeader("Cache-Control") === "no-store") return;
       const relative = file.slice(root.length + 1).split(sep).join("/");
+      if (relative === "sw.js") res.setHeader("Service-Worker-Allowed", "/");
+      if (res.getHeader("Cache-Control") === "no-store") return;
       // Only build-generated assets are immutable. The service worker, manifest
       // and other fixed filenames must be revalidated.
       if (HASHED_ASSET.test(relative)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
@@ -48,7 +49,8 @@ export function registerStatic(app: Express, staticDir: string, publicPaths: Rea
   });
 
   app.use((req, res, next) => {
-    // HTML is rendered only by the shell handler. It cannot be served raw as an asset.
+    // Only the fixed, public offline document may be served raw. The app shell needs a fresh nonce.
+    if (req.path === "/offline.html") return serve(req, res, next);
     let decoded: string;
     try {
       decoded = decodeURIComponent(req.path);

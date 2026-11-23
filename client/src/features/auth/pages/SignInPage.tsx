@@ -3,6 +3,7 @@ import { Link, useSearch } from "wouter";
 import { useAuthApi } from "@/lib/authApi";
 import { errorMessage, safeError } from "@/lib/trpc";
 import { CustomerMaintenanceSlot, SsoSignInSlot } from "@/app/slots";
+import { PwaInstallEntry } from "@/app/PwaInstallEntry";
 import { Button, Callout, Field, Input } from "@/ui";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, useFocusOnError } from "../components/bits";
@@ -54,6 +55,7 @@ export default function SignInPage() {
           <Link href="/register" className="font-semibold text-action underline-offset-2 hover:underline">
             Create an account
           </Link>
+          {" "}<PwaInstallEntry />
         </>
       }
     >

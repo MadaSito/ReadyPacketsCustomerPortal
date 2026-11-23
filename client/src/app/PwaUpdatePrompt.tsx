@@ -1,13 +1,14 @@
 /**
  * Service-worker registration + "update available" prompt (no virtual modules, so the shell builds with or
  * without vite-plugin-pwa). The SW precaches the static shell only; /api and authenticated content are
- * NetworkOnly (config: see app/API.md § PWA). Not registered in dev or the preview build.
+ * network-only (worker: src/pwa/sw.ts). Not registered in dev or the preview build.
  * Update flow: new worker installs → waits → user chooses Reload → SKIP_WAITING → controllerchange → reload.
  */
 import { RefreshCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { RUNTIME } from "@/lib/runtime";
 import { Button } from "@/ui";
+import "./pwaInstallState";
 
 export function shouldRegisterServiceWorker(env: { dev: boolean; preview: boolean; supported: boolean }): boolean {
   return env.supported && !env.dev && !env.preview;
