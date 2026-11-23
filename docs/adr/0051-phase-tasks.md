@@ -1,6 +1,6 @@
 # 0051 — Phase tasks: what the customer must do in each phase
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D8; to be corrected against `server/modules/orders/API.md` and `server/modules/files/API.md`)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked that order phases decide what the customer must do: upload, acknowledge an administrator note, record, or respond to a document an administrator uploaded. They also asked that file and audio types can be restricted. Increment 04 introduced phases, requirements and a requirement gate ([ADR 0029](0029-workflow-phases-requirements-acknowledgements.md)).

@@ -1,6 +1,6 @@
 # 0049 — Reports: built-in reports and safe custom reports
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D6; to be corrected against `server/modules/reports/API.md` and `client/src/features/reports`)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked for detailed reporting (orders, customers, referrals, support tickets and more) and for custom reports built in the admin panel. Free-form queries would open SQL injection and data-exposure risks (OWASP A01 and A03).
@@ -41,6 +41,24 @@ The owner asked for detailed reporting (orders, customers, referrals, support ti
 ## Assumptions to confirm with the owner
 - Reports are on for staff and administrators after upgrade.
 - Staff are limited to built-in reports.
+
+## As implemented
+
+Packages H and I, as reported by the owners:
+
+- **Ranges and comparison.** Ranges go up to 732 days, with time buckets of hour, day, week or month and a comparison with the previous period.
+- **Personal fields.** Staff never see personal fields.
+- **Custom reports:**
+  - up to 20 detail columns;
+  - or up to 4 groupings with 6 aggregates;
+  - up to 16 typed filters and 4 sort rules.
+- **Sharing.** Shared definitions are visible to all administrators; this refines "shared with staff" in the contract. Only the owner edits or deletes, guarded by optimistic version checks.
+- **Limits:**
+  - one run at a time and 10 a minute per person;
+  - a 15-second statement timeout;
+  - CSV of at most 100,000 rows or 16 MiB, marked truncated when a cap is hit.
+- **Retention and audit.** Run history (`report_runs`) is kept for 90 days. Definition changes are audited as `report.definition.*`.
+- **Portable transfer.** Saved reports are excluded from the business export and included in backups.
 
 ## Consequences
 - Each new dataset needs a code change to the whitelist, which is the intended limit.

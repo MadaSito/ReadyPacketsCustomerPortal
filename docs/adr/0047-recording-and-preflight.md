@@ -1,6 +1,6 @@
 # 0047 — Recording on orders from any device, with a preflight check
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D2; to be corrected against `server/modules/files/API.md` when package B lands)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked for audio recording on orders from any device, with a test run beforehand. WebM is the target format. Apple devices should record in their most compatible format, and the recording should then be converted to WebM. Increment 04 added browser recording and a sandboxed FFmpeg conversion job ([ADR 0030](0030-audio-recording-and-server-conversion.md)), but it was switched off by default. Safari on iOS records MP4/AAC rather than WebM.

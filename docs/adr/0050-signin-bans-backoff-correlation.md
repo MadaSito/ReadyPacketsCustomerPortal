@@ -1,6 +1,6 @@
 # 0050 — Sign-in bans, progressive back-off and security event correlation
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D7; to be corrected against the protection, identity, audit and SIEM modules' API.md)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked for three things:
@@ -69,6 +69,18 @@ Increment 04 added a firewall with detect/enforce modes, rate limits, manual IP 
 ## Assumptions to confirm with the owner
 - Automatic bans are on after upgrade with the defaults above, because the guards protect against lock-out.
 - `permanentAfter` stays `null` (no automatic permanent bans) unless the owner sets it.
+
+## As implemented
+
+Packages J and G, as reported by the owners:
+
+- **Pages.**
+  - Bans are managed on `/admin/protection/bans`.
+  - Back-off is set on `/admin/protection/rate-limits`.
+  - Incidents are on `/admin/audit/incidents`.
+- **Correlation.** Correlation runs every minute. Rules can be switched on or off and tuned (severity, threshold, window) with the firewall-manage permission and step-up, and severity rises one level at three times the threshold.
+- **Manual bans.** Incident and audit-event bans last 15 minutes, 1 hour, 1 day, 7 days or are permanent, with a reason. The server takes the address from the events and never shows it.
+- **Lead QA.** In lead QA the pages render. Ban and back-off behaviour is covered by automated tests only, because loopback is exempt in the QA set-up.
 
 ## Consequences
 - Repeated failures from one address are slowed and then blocked without operator action.

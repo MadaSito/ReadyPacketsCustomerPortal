@@ -182,11 +182,19 @@ Requested by the owner on 2026-11-22 (prompt 21). The contract is [INCREMENT_05_
 
 ## Increment 06: recording, phase tasks, reports, protection, policies, receipts, PWA
 
-The owner requested this on 2026-11-23 (prompt 23, fifteen items). The contract is [INCREMENT_06_CONTRACT.md](../engineering/INCREMENT_06_CONTRACT.md), decisions D1–D15. Migration `0006_increment_06` is additive.
+The owner requested this on 2026-11-23 (prompt 23, fifteen items). The contract is [INCREMENT_06_CONTRACT.md](../engineering/INCREMENT_06_CONTRACT.md), decisions D1–D15. Migration `0006_increment_06` is additive (17 new tables, 13 added columns on 8 tables, one enum widening). It needs Node ≥ 22.13 < 23.
 
 Defaults rule: features that are safe and need no configuration are on after upgrade. Features that can lock people out, or that need the owner's choice, are off until configured: policy enforcement, the MNDA gate and cart suggestions. The admin guide's "Where to switch things on" table lists every switch.
 
-_Verification status: placeholder — /root supplies the verified / not verified facts at the end of the increment._
+Verification status:
+
+- **Checked in the lead's QA run.** All fifteen items (D1–D15) were checked live by the lead in a real Chromium browser against a QA build with synthetic data. See [STATUS.md](STATUS.md#verified-for-increment-06-integrators-own-runs).
+- **Not verified:**
+  - real Stripe or Square;
+  - receipt e-mail delivery;
+  - physical Apple, Android and Windows devices;
+  - live automatic bans.
+- **Gate numbers and merge SHA:** PENDING-LEAD.
 
 | Area | What it does | Switch and guard |
 | --- | --- | --- |

@@ -1,6 +1,6 @@
 # 0052 — Editing Word documents in the portal
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D9; to be corrected against `client/src/lib/docconvert`, `client/src/features/docedit` and `server/modules/files/API.md`)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked that customers can edit Word documents in the portal. Running document parsers on the server widens the attack surface (ZIP bombs, XML attacks, parser bugs). A browser editor cannot reproduce all of Word's layout.

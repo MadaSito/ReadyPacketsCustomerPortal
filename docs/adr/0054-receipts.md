@@ -1,6 +1,6 @@
 # 0054 — Receipts for confirmed payments
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D15 and D5; to be corrected against the compliance, payments and jobs modules' API.md)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked that every order confirmed paid produces a receipt with the logo. It should show the customer, the company, the items, the price paid and the discount codes, be e-mailed to the customer and be kept in the customer's portal. Increment 05 relaxed discounts to allow $0 and $0.01 orders. Stripe refuses card charges below its minimum (0.50 USD or the equivalent).

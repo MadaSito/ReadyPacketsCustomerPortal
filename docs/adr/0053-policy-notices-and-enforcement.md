@@ -1,6 +1,6 @@
 # 0053 — Policy import, update notices, enforcement and the order agreement (MNDA)
 
-Status: Proposed (drafted from INCREMENT_06_CONTRACT.md D11–D14; to be corrected against the compliance, identity, orders and jobs modules' API.md)
+Status: Accepted (2026-11-23; implemented in increment 06 and checked in the lead's QA browser run — see STATUS.md. Assumptions below remain open for owner confirmation)
 
 ## Context
 The owner asked for six things:

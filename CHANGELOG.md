@@ -20,7 +20,7 @@ procedure.
 
 ## Increment 06
 
-<!-- platform_engineer: drafted from INCREMENT_06_CONTRACT.md; corrected against owners' API.md as packages land. Verification facts come from /root. -->
+<!-- platform_engineer: from INCREMENT_06_CONTRACT.md and the owners' handoffs. Verification is recorded in docs/application-context/STATUS.md; PR and merge SHA: PENDING-LEAD. -->
 
 ### Added
 
@@ -77,7 +77,11 @@ procedure.
 ### Operations
 
 - **Totals below the card minimum.** Stripe refuses card charges below its minimum (0.50 USD or the equivalent). `payments.small_totals` defaults to `waive`: the amount is recorded as waived and shown on the receipt. Set it to `block` to refuse such orders instead.
-- **Migration `0006_increment_06`**: additive. Details: _placeholder — /root to supply table and column counts._
+- **Migration `0006_increment_06`** (`d9b84c2`) is additive. There are no drops, renames or data rewrites.
+  - **New tables (17):** `compliance_payment_receipts`, `compliance_receipt_refund_notes`, `order_task_notes`, `order_task_waivers`, `policy_enforcement_actions`, `policy_enforcement_preferences`, `policy_notice_preferences`, `policy_notice_recipients`, `policy_notices`, `protection_signin_bans`, `protection_signin_strikes`, `report_definitions`, `report_runs`, `security_correlation_state`, `security_incident_events`, `security_incident_timeline` and `security_incidents`.
+  - **Other changes:** 13 added columns on 8 existing tables, and one enum widening (`promo_batches.discount_type` gains `set_total`).
+  - **Indexes and keys:** only new indexes and foreign keys.
+- **Runtime:** Node ≥ 22.13 and < 23. The upgrade commands are the same as for increment 05.
 - **Upgrade notes:** [UPGRADE.md — increment 06 and migration 0006](docs/operations/UPGRADE.md#increment-06-and-migration-0006). They cover the service-worker and manifest headers, and the upload size for recordings and file uploads.
   - On managed Nginx or Caddy, the multipart limit stays at 256 MiB. Legacy Nginx rises from 55 MiB to 256 MiB.
   - Uploaded or captured audio sources follow the Files hard maximum, which is 100 MiB and configurable.
