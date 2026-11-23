@@ -385,7 +385,7 @@ export function createStripeProvider(
 
       const egress = getEgress();
       const targetUrl = new URL(
-        `/v1/checkout/sessions/${encodeURIComponent(input.providerRef)}?expand[]=payment_intent`,
+        `/v1/checkout/sessions/${encodeURIComponent(input.providerRef)}?expand[]=payment_intent.latest_charge`,
         STRIPE_API_ORIGIN,
       );
       const response = await egress.fetchPinned(targetUrl, "stripe", {
@@ -446,6 +446,22 @@ export function createStripeProvider(
       const amountRefunded = typeof piObj?.amount_refunded === "number" ? piObj.amount_refunded : 0;
       const piCreated = typeof piObj?.created === "number" ? new Date(piObj.created * 1000) : null;
 
+      // Extract non-sensitive card brand & last4 when Stripe expands `latest_charge` or `charges.data[0]`.
+      const latestChargeObj =
+        asRecord(piObj?.latest_charge) ??
+        (Array.isArray(asRecord(piObj?.charges)?.data)
+          ? asRecord((asRecord(piObj?.charges)?.data as unknown[])[0])
+          : null);
+      const pmDetails = asRecord(latestChargeObj?.payment_method_details);
+      const cardDetails = asRecord(pmDetails?.card);
+      const rawBrand = typeof cardDetails?.brand === "string" ? cardDetails.brand.trim().toLowerCase() : "";
+      const paymentMethodBrand =
+        rawBrand && /^[a-z][a-z0-9_-]{0,31}$/u.test(rawBrand) && !/\d{4,}/u.test(rawBrand)
+          ? rawBrand
+          : null;
+      const rawLast4 = typeof cardDetails?.last4 === "string" ? cardDetails.last4.trim() : "";
+      const paymentMethodLast4 = /^[0-9]{4}$/u.test(rawLast4) ? rawLast4 : null;
+
       let status: "paid" | "open" | "failed" | "expired" = "open";
       if (amountRefunded > 0) {
         status = "failed";
@@ -468,6 +484,8 @@ export function createStripeProvider(
         attemptPublicId,
         invoicePublicId,
         paidAt: status === "paid" ? piCreated : null,
+        paymentMethodBrand,
+        paymentMethodLast4,
       };
     },
   };

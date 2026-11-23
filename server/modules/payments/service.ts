@@ -23,6 +23,7 @@ import { ULID_PATTERN, ulid } from "../../core/ids.js";
 import type { DbOrTx, EnqueueOptions, SessionPrincipal, Tx } from "../../core/types.js";
 import { assertLiveActorInTx, runComplianceTx } from "../compliance/actorAuth.js";
 import { decodeIdCursor, encodeIdCursor, type InvoicePaymentState } from "../compliance/domain.js";
+import { complianceInvoicePayments } from "../compliance/schema.js";
 import {
   REFUND_NOTICE_TEMPLATE_KEY,
   REFUND_RECONCILE_JOB,
@@ -54,14 +55,26 @@ import {
   type PaymentWebhookStatus,
 } from "./schema.js";
 import {
+  DEFAULT_PAYMENTS_RECEIPTS,
+  DEFAULT_PAYMENTS_SMALL_TOTALS,
+  DEFAULT_PROVIDER_MINIMUMS_MINOR,
   isSafePortalReturnPath,
   maskLast4,
+  parsePaymentsReceiptsSetting,
+  parsePaymentsSmallTotals,
   PAYMENTS_CONFIG_SETTING,
   type PaymentsConfigValue,
+  PAYMENTS_RECEIPTS_SETTING,
+  type PaymentsReceiptsValue,
+  PAYMENTS_SMALL_TOTALS_SETTING,
+  type PaymentsSmallTotalsValue,
   PAYMENTS_SQUARE_ACCESS_TOKEN,
   PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY,
   PAYMENTS_STRIPE_SECRET_KEY,
   PAYMENTS_STRIPE_WEBHOOK_SECRET,
+  resolveProviderMinimumMinor,
+  sanitizeCardBrand,
+  sanitizeCardLast4,
 } from "./settings.js";
 
 export interface CheckoutReturnPaths {
@@ -75,10 +88,25 @@ export interface StartCheckoutOptions {
   idempotencyKey?: string | undefined;
 }
 
+export interface CheckoutAmountEvaluation {
+  onlineEnabled: boolean;
+  provider: PaymentProviderChoice;
+  minimumMinor: number;
+  belowMinimum: boolean;
+  smallTotalAction: "none" | "zero_total" | "waive" | "block";
+}
+
 export type StartCheckoutResult =
   | {
       mode: "invoice";
       invoicePublicId: string;
+    }
+  | {
+      mode: "settled";
+      settlementKind: "zero_total" | "waived_small_total";
+      invoicePublicId: string;
+      waivedMinor?: number | undefined;
+      receiptPublicId?: string | undefined;
     }
   | {
       mode: "redirect";
@@ -171,6 +199,9 @@ export interface PaymentsAdminSettingsView
     egressHost: "connect.squareup.com" | "connect.squareupsandbox.com";
     egressAllowlisted: boolean;
   };
+  smallTotals: PaymentsSmallTotalsValue;
+  defaultProviderMinimumsMinor: Readonly<Record<ActivePaymentProvider, Readonly<Record<string, number>>>>;
+  receipts: PaymentsReceiptsValue;
 }
 
 export interface UpdatePaymentsSettingsInput {
@@ -189,6 +220,8 @@ export interface UpdatePaymentsSettingsInput {
   clearSquareAccessToken?: boolean | undefined;
   squareWebhookSignatureKey?: string | undefined;
   clearSquareWebhookSignatureKey?: boolean | undefined;
+  smallTotals?: PaymentsSmallTotalsValue | undefined;
+  receipts?: PaymentsReceiptsValue | undefined;
 }
 
 export interface AdminPaymentAttemptSummary {
@@ -504,6 +537,71 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     return readSetting(deps.settings, PAYMENTS_CONFIG_SETTING, tx);
   }
 
+  async function loadSmallTotals(tx?: Tx): Promise<PaymentsSmallTotalsValue> {
+    try {
+      const raw = await deps.settings.get(
+        PAYMENTS_SMALL_TOTALS_SETTING.key,
+        parsePaymentsSmallTotals,
+        DEFAULT_PAYMENTS_SMALL_TOTALS,
+        tx,
+      );
+      return parsePaymentsSmallTotals(raw);
+    } catch {
+      return { ...DEFAULT_PAYMENTS_SMALL_TOTALS };
+    }
+  }
+
+  async function loadReceiptsSetting(tx?: Tx): Promise<PaymentsReceiptsValue> {
+    try {
+      const raw = await deps.settings.get(
+        PAYMENTS_RECEIPTS_SETTING.key,
+        parsePaymentsReceiptsSetting,
+        DEFAULT_PAYMENTS_RECEIPTS,
+        tx,
+      );
+      return parsePaymentsReceiptsSetting(raw);
+    } catch {
+      return { ...DEFAULT_PAYMENTS_RECEIPTS };
+    }
+  }
+
+  async function evaluateCheckoutAmount(
+    amountMinor: number,
+    currency: string,
+    tx?: DbOrTx,
+  ): Promise<CheckoutAmountEvaluation> {
+    const config = await loadConfig(tx as Tx | undefined);
+    const onlineEnabled = await isProviderCredentialsReady(config, tx as Tx | undefined);
+    if (amountMinor <= 0) {
+      return {
+        onlineEnabled,
+        provider: onlineEnabled ? config.provider : "none",
+        minimumMinor: 0,
+        belowMinimum: false,
+        smallTotalAction: "zero_total",
+      };
+    }
+    if (!onlineEnabled || config.provider === "none") {
+      return {
+        onlineEnabled: false,
+        provider: "none",
+        minimumMinor: 0,
+        belowMinimum: false,
+        smallTotalAction: "none",
+      };
+    }
+    const smallTotals = await loadSmallTotals(tx as Tx | undefined);
+    const minimumMinor = resolveProviderMinimumMinor(config.provider, currency, smallTotals);
+    const belowMinimum = amountMinor > 0 && amountMinor < minimumMinor;
+    return {
+      onlineEnabled: true,
+      provider: config.provider,
+      minimumMinor,
+      belowMinimum,
+      smallTotalAction: belowMinimum ? smallTotals.belowProviderMinimum : "none",
+    };
+  }
+
   async function isProviderCredentialsReady(
     config: PaymentsConfigValue,
     tx?: Tx,
@@ -630,7 +728,78 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     if (invoice.issuedAt === null || invoice.status === "draft") {
       throw conflict("INVOICE_NOT_ISSUED", "Draft invoices must be issued before starting checkout.");
     }
+
+    // Increment 06 D5 + D15: Zero-total invoices settle directly and issue a `zero_total` receipt
+    // without touching any external payment processor.
+    if (invoice.totalMinor === 0) {
+      const settledZero = await deps.db.transaction(async (tx) => {
+        if (opts?.principal) {
+          await assertLiveActorInTx(deps, opts.principal, tx);
+        }
+        const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+        if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+          const lockedOrder = await ordersSvc.getOrderRefById(invoice.orderId, tx, { forUpdate: true });
+          if (!lockedOrder) throw notFound("INVOICE_NOT_FOUND");
+          if (lockedOrder.lockState === "legal_hold" || lockedOrder.lockState === "imported_read_only") {
+            throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against checkout.", {
+              lockState: lockedOrder.lockState,
+            });
+          }
+        }
+        if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+          return complianceSvc.settleCheckoutInvoiceInTx(
+            { settlementKind: "zero_total", invoicePublicId: invoice.invoicePublicId },
+            tx,
+          );
+        }
+        return { receiptPublicId: null };
+      });
+      return {
+        mode: "settled",
+        settlementKind: "zero_total",
+        invoicePublicId: invoice.invoicePublicId,
+        ...(settledZero.receiptPublicId ? { receiptPublicId: settledZero.receiptPublicId } : {}),
+      };
+    }
+
     if (invoice.status === "paid" || invoice.balanceDueMinor <= 0) {
+      // Idempotent replay check: if this invoice was settled via `waived_small_total`, return the settled outcome.
+      const [existingWaived] = await deps.db
+        .select({
+          id: complianceInvoicePayments.id,
+          amountMinor: complianceInvoicePayments.amountMinor,
+          waivedMinor: complianceInvoicePayments.waivedMinor,
+        })
+        .from(complianceInvoicePayments)
+        .where(
+          and(
+            eq(complianceInvoicePayments.invoiceId, invoice.invoiceId),
+            eq(complianceInvoicePayments.idempotencyKey, `waive:${invoice.invoicePublicId}`),
+          ),
+        )
+        .limit(1);
+      if (existingWaived) {
+        const replaySettled =
+          typeof complianceSvc.settleCheckoutInvoiceInTx === "function"
+            ? await deps.db.transaction((tx) =>
+                complianceSvc.settleCheckoutInvoiceInTx(
+                  {
+                    settlementKind: "waived_small_total",
+                    invoicePublicId: invoice.invoicePublicId,
+                    providerMinimumMinor: 0,
+                  },
+                  tx,
+                ),
+              )
+            : null;
+        return {
+          mode: "settled",
+          settlementKind: "waived_small_total",
+          invoicePublicId: invoice.invoicePublicId,
+          waivedMinor: replaySettled?.waivedMinor ?? (existingWaived.waivedMinor || existingWaived.amountMinor),
+          ...(replaySettled?.receiptPublicId ? { receiptPublicId: replaySettled.receiptPublicId } : {}),
+        };
+      }
       throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
     }
 
@@ -711,6 +880,40 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         throw conflict("INVOICE_ALREADY_PAID", "This invoice is already paid in full.");
       }
 
+      // Increment 06 D5: Re-verify provider minimum under row lock so concurrent settings/balance changes cannot slip through.
+      const smallTotals = await loadSmallTotals(tx);
+      const minimumMinor = resolveProviderMinimumMinor(activeProvider, lockedInvoice.currency, smallTotals);
+      if (lockedInvoice.balanceDueMinor > 0 && lockedInvoice.balanceDueMinor < minimumMinor) {
+        if (smallTotals.belowProviderMinimum === "block") {
+          const minFormatted = (minimumMinor / 100).toFixed(2);
+          throw new DomainError(
+            "CONFLICT",
+            "AMOUNT_BELOW_PROVIDER_MINIMUM",
+            `Online card payments require a minimum charge of ${lockedInvoice.currency.toUpperCase()} ${minFormatted}. Adjust your order or contact support.`,
+            {
+              minimumMinor,
+              balanceDueMinor: lockedInvoice.balanceDueMinor,
+              currency: lockedInvoice.currency.toUpperCase(),
+            },
+          );
+        }
+        if (typeof complianceSvc.settleCheckoutInvoiceInTx === "function") {
+          const settledWaive = await complianceSvc.settleCheckoutInvoiceInTx(
+            {
+              settlementKind: "waived_small_total",
+              invoicePublicId: lockedInvoice.invoicePublicId,
+              providerMinimumMinor: minimumMinor,
+            },
+            tx,
+          );
+          return {
+            kind: "settled_waived" as const,
+            waivedMinor: settledWaive.waivedMinor,
+            receiptPublicId: settledWaive.receiptPublicId,
+          };
+        }
+      }
+
       const [existing] = await tx
         .select()
         .from(paymentAttempts)
@@ -738,7 +941,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             `payment_attempts.redirect_url:${existing.publicId}`,
           );
           return {
-            reused: true as const,
+            kind: "reused" as const,
             attemptPublicId: existing.publicId,
             redirectUrl,
             expiresAt: existing.expiresAt,
@@ -794,14 +997,24 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       );
 
       return {
-        reused: false as const,
+        kind: "created" as const,
         attemptId: ins.insertId,
         attemptPublicId,
         amountMinor: lockedInvoice.balanceDueMinor,
       };
     });
 
-    if (preAttempt.reused) {
+    if (preAttempt.kind === "settled_waived") {
+      return {
+        mode: "settled",
+        settlementKind: "waived_small_total",
+        invoicePublicId: invoice.invoicePublicId,
+        waivedMinor: preAttempt.waivedMinor,
+        ...(preAttempt.receiptPublicId ? { receiptPublicId: preAttempt.receiptPublicId } : {}),
+      };
+    }
+
+    if (preAttempt.kind === "reused") {
       return {
         mode: "redirect",
         attemptPublicId: preAttempt.attemptPublicId,
@@ -1297,6 +1510,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const paidAt = input.fetched.paidAt ?? now;
     const providerPaymentRef =
       input.fetched.providerPaymentRef ?? input.fetched.providerRef ?? locked.providerRef ?? locked.publicId;
+    const cleanBrand = sanitizeCardBrand(input.fetched.paymentMethodBrand);
+    const cleanLast4 = sanitizeCardLast4(input.fetched.paymentMethodLast4);
 
     const booking = await complianceSvc.bookVerifiedProviderPayment(
       {
@@ -1309,6 +1524,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         currency: locked.currency,
         paidAt,
         idempotencyKey: `pmt-attempt:${locked.publicId}`,
+        paymentMethodBrand: cleanBrand,
+        paymentMethodLast4: cleanLast4,
       },
       tx,
     );
@@ -1319,6 +1536,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         status: "paid",
         providerPaymentRef,
         compliancePaymentPublicId: booking.paymentPublicId,
+        paymentMethodBrand: cleanBrand,
+        paymentMethodLast4: cleanLast4,
         reconciliationNote: null,
         failureReasonCode: null,
         paidAt,
@@ -2086,7 +2305,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
   /* ------------------------------------------------------------- admin console */
 
   async function buildAdminSettingsView(tx?: Tx): Promise<PaymentsAdminSettingsView> {
-    const config = await loadConfig(tx);
+    const [config, smallTotals, receipts] = await Promise.all([
+      loadConfig(tx),
+      loadSmallTotals(tx),
+      loadReceiptsSetting(tx),
+    ]);
     const [stripeKeySet, stripeWhSet, squareTokenSet, squareSigSet] = await Promise.all([
       isSecretConfigured(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
       isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
@@ -2153,6 +2376,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         egressHost: squareHost,
         egressAllowlisted: squareAllowlisted,
       },
+      smallTotals,
+      defaultProviderMinimumsMinor: DEFAULT_PROVIDER_MINIMUMS_MINOR,
+      receipts,
     };
   }
 
@@ -2308,6 +2534,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       }
 
       await writeSetting(deps.settings, PAYMENTS_CONFIG_SETTING, nextConfig, tx);
+      if (input.smallTotals !== undefined) {
+        const cleanedSmallTotals = parsePaymentsSmallTotals(input.smallTotals);
+        await writeSetting(deps.settings, PAYMENTS_SMALL_TOTALS_SETTING, cleanedSmallTotals, tx);
+      }
+      if (input.receipts !== undefined) {
+        const cleanedReceipts = parsePaymentsReceiptsSetting(input.receipts);
+        await writeSetting(deps.settings, PAYMENTS_RECEIPTS_SETTING, cleanedReceipts, tx);
+      }
 
       await deps.audit.record(
         {
@@ -3915,6 +4149,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
   return {
     isOnlineCheckoutEnabled,
     getPublicCheckoutConfig,
+    evaluateCheckoutAmount,
     startCheckout,
     getCheckoutStatus,
     cancelAttemptIfUnpaid,

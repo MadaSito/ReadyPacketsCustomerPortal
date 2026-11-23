@@ -273,16 +273,23 @@ export function createAcceptanceService(deps: ModuleDeps) {
       const policy = (await currentPolicies(input.tx, [input.gate.policyPublicId])).get(input.gate.policyPublicId);
       if (!policy) return { met: false };
 
+      const baseConds = [
+        eq(policyAcceptances.userId, input.userId),
+        eq(policyAcceptances.origin, "portal"),
+      ];
+      if (input.gate.signatureMode === "typed_name") {
+        baseConds.push(eq(policyAcceptances.method, "typed_signature"));
+      }
+
       if (input.gate.askAgainOnNewVersion) {
         const [row] = await input.tx
           .select({ id: policyAcceptances.id })
           .from(policyAcceptances)
           .where(
             and(
-              eq(policyAcceptances.userId, input.userId),
+              ...baseConds,
               eq(policyAcceptances.policyVersionId, policy.versionId),
               eq(policyAcceptances.versionContentHash, policy.contentHash),
-              eq(policyAcceptances.origin, "portal"),
             ),
           )
           .limit(1);
@@ -294,9 +301,8 @@ export function createAcceptanceService(deps: ModuleDeps) {
         .from(policyAcceptances)
         .where(
           and(
-            eq(policyAcceptances.userId, input.userId),
+            ...baseConds,
             eq(policyAcceptances.documentId, policy.documentId),
-            eq(policyAcceptances.origin, "portal"),
           ),
         )
         .limit(1);

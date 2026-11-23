@@ -5,6 +5,7 @@ import { conflict, DomainError, notFound } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import { getRequestContext } from "../../core/requestContext.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
+import { writeSetting } from "../platform/index.js";
 import { users } from "../identity/schema.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import { createAcceptanceLogService } from "./acceptanceLogService.js";
@@ -20,6 +21,11 @@ import {
   recordSignatureMismatchAuditIfNeeded,
   verifyTypedSignatureInTx,
 } from "./signatureNameCheck.js";
+import {
+  parseSignatureNameCheckSetting,
+  SIGNATURE_NAME_CHECK,
+  type SignatureNameCheckSetting,
+} from "./settings.js";
 import {
   policyAcceptances,
   policyDocuments,
@@ -479,8 +485,16 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
       );
     }
 
-    const requiresTyped =
-      doc.requiresTypedSignature || input.requestedMethod === "typed_signature";
+    const rawAgreementGate = await deps.settings.get("orders.agreement_gate", (v) => v, null, tx);
+    const agreementRequiresTyped =
+      Boolean(
+        rawAgreementGate &&
+          typeof rawAgreementGate === "object" &&
+          (rawAgreementGate as Record<string, unknown>).enabled === true &&
+          (rawAgreementGate as Record<string, unknown>).policyPublicId === doc.publicId &&
+          (rawAgreementGate as Record<string, unknown>).signatureMode === "typed_name",
+      );
+    const requiresTyped = doc.requiresTypedSignature || agreementRequiresTyped;
     let cleanedSignerName: string | null = null;
     let signerNameMatch: SignatureNameMatchResult | null = null;
 
@@ -512,6 +526,22 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
       .limit(1);
 
     if (existing) {
+      if (requiresTyped && existing.method !== "typed_signature" && cleanedSignerName) {
+        const upgradedEnc = deps.crypto.encrypt(
+          cleanedSignerName,
+          `policy_acceptances.signer_name:${existing.publicId}`,
+        );
+        await tx
+          .update(policyAcceptances)
+          .set({
+            method: "typed_signature",
+            signerNameEnc: upgradedEnc,
+            signerNameMatch,
+            acceptedAt: now,
+          })
+          .where(eq(policyAcceptances.id, existing.id));
+        return { acceptancePublicId: existing.publicId, duplicate: false };
+      }
       return { acceptancePublicId: existing.publicId, duplicate: true };
     }
 
@@ -1489,6 +1519,51 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
 
   const acceptanceLog = createAcceptanceLogService(deps);
 
+  async function readSignatureNameCheck(tx?: Tx): Promise<SignatureNameCheckSetting> {
+    const mode = await deps.settings.get(
+      SIGNATURE_NAME_CHECK.key,
+      parseSignatureNameCheckSetting,
+      SIGNATURE_NAME_CHECK.default,
+      tx,
+    );
+    return parseSignatureNameCheckSetting(mode);
+  }
+
+  async function adminGetSignatureNameCheck(
+    principal: SessionPrincipal,
+  ): Promise<SignatureNameCheckSetting> {
+    await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx, "policies.manage");
+    return readSignatureNameCheck();
+  }
+
+  async function adminUpdateSignatureNameCheck(
+    principal: SessionPrincipal,
+    input: SignatureNameCheckSetting,
+  ): Promise<SignatureNameCheckSetting> {
+    const cleaned = parseSignatureNameCheckSetting(input);
+    return runComplianceTx(deps, principal, { type: "compliance_setting", publicId: SIGNATURE_NAME_CHECK.key }, async (tx) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "policies.manage");
+      const prev = await readSignatureNameCheck(tx);
+      await writeSetting(deps.settings, SIGNATURE_NAME_CHECK, cleaned, tx);
+      await deps.audit.record(
+        {
+          category: "admin",
+          eventName: "compliance.signature_name_check.updated",
+          action: "update",
+          outcome: "completed",
+          actor: { userId: liveActor.userId, role: liveActor.role },
+          resource: { type: "compliance_setting", publicId: SIGNATURE_NAME_CHECK.key },
+          attributes: {
+            previous_mode: prev.mode,
+            next_mode: cleaned.mode,
+          },
+        },
+        tx,
+      );
+      return cleaned;
+    });
+  }
+
   return {
     listPublished,
     requiredAcceptancesFor,
@@ -1511,6 +1586,8 @@ export function createPoliciesService(deps: ModuleDeps, hooks?: PoliciesServiceH
       publishVersion: adminPublishVersion,
       listAcceptances: adminListAcceptances,
       acceptanceLog,
+      getSignatureNameCheck: adminGetSignatureNameCheck,
+      updateSignatureNameCheck: adminUpdateSignatureNameCheck,
     },
     healthCounts,
   };

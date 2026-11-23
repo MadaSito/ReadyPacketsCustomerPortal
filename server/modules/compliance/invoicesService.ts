@@ -4,7 +4,8 @@ import type { ModuleDeps } from "../../container.js";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
-import { readSetting } from "../platform/index.js";
+import { readSetting, writeSetting } from "../platform/index.js";
+import { sanitizeCardBrand, sanitizeCardLast4 } from "../payments/settings.js";
 import { assertLiveActorInTx, denyComplianceAuthz, runComplianceTx } from "./actorAuth.js";
 import {
   computeInvoiceTotals,
@@ -18,6 +19,7 @@ import {
   type OrderHeaderPaymentState,
 } from "./domain.js";
 import { renderInvoicePdf } from "./invoicePdf.js";
+import type { ReceiptsService } from "./receiptsService.js";
 import {
   complianceInvoiceLines,
   complianceInvoicePayments,
@@ -30,11 +32,17 @@ import {
   type PaymentRecordStatus,
 } from "./schema.js";
 import {
+  DEFAULT_ISSUER_LOGO_SETTING,
   INVOICE_DEFAULT_TAX_RATE_BPS,
   INVOICE_ISSUER_ADDRESS,
+  INVOICE_ISSUER_CONTACT,
+  INVOICE_ISSUER_LOGO,
   INVOICE_ISSUER_NAME,
+  INVOICE_ISSUER_TAX_ID,
   INVOICE_NUMBER_PREFIX,
   INVOICE_PAYMENT_INSTRUCTIONS,
+  type IssuerLogoSetting,
+  parseIssuerLogoSetting,
 } from "./settings.js";
 
 export interface InvoiceLineView {
@@ -213,15 +221,40 @@ export interface BookVerifiedProviderPaymentInput {
   currency: string;
   paidAt: Date;
   idempotencyKey: string;
+  paymentMethodBrand?: string | null | undefined;
+  paymentMethodLast4?: string | null | undefined;
 }
 
 export interface BookVerifiedProviderPaymentResult {
   paymentPublicId: string;
+  receiptPublicId?: string | null | undefined;
   invoiceId: number;
   invoicePublicId: string;
   invoiceNumber: string | null;
   invoiceStatus: InvoiceStatus;
   balanceDueMinor: number;
+  duplicate: boolean;
+}
+
+export type SettleCheckoutInvoiceInput =
+  | {
+      settlementKind: "zero_total";
+      invoicePublicId: string;
+    }
+  | {
+      settlementKind: "waived_small_total";
+      invoicePublicId: string;
+      providerMinimumMinor: number;
+    };
+
+export interface SettleCheckoutInvoiceResult {
+  settlementKind: "zero_total" | "waived_small_total";
+  invoiceId: number;
+  invoicePublicId: string;
+  invoiceNumber: string | null;
+  invoiceStatus: InvoiceStatus;
+  waivedMinor: number;
+  receiptPublicId: string | null;
   duplicate: boolean;
 }
 
@@ -370,7 +403,7 @@ async function assertStaffInvoiceRead(deps: ModuleDeps, principal: SessionPrinci
  */
 export const PROVIDER_LEDGER_BOOKING_ENABLED = false as const;
 
-export function createInvoicesService(deps: ModuleDeps) {
+export function createInvoicesService(deps: ModuleDeps, receiptsSvc?: ReceiptsService) {
   const paidListeners: InvoicePaidListener[] = [];
 
   function onInvoicePaid(listener: InvoicePaidListener): void {
@@ -1456,6 +1489,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     },
   ): Promise<{
     paymentPublicId: string;
+    receiptPublicId: string | null;
     invoiceStatus: InvoiceStatus;
     balanceDueMinor: number;
     duplicate: boolean;
@@ -1528,6 +1562,13 @@ export function createInvoicesService(deps: ModuleDeps) {
         .limit(1);
 
       if (existingIdem) {
+        const receiptRes = receiptsSvc
+          ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+              invoiceId: inv.id,
+              paymentId: existingIdem.id,
+              settlementKind: existingIdem.method === "waiver" ? "waived_small_total" : "manual_payment",
+            })
+          : null;
         const sumsMap = await computeLedgerSums(tx, [inv.id]);
         const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
         const status = deriveInvoiceStatus({
@@ -1540,6 +1581,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
         return {
           paymentPublicId: existingIdem.publicId,
+          receiptPublicId: receiptRes?.receiptPublicId ?? null,
           invoiceStatus: status,
           balanceDueMinor: Math.max(0, inv.totalMinor - netPaid),
           duplicate: true,
@@ -1573,12 +1615,13 @@ export function createInvoicesService(deps: ModuleDeps) {
         ? deps.crypto.encrypt(input.notes.trim(), `compliance_invoice_payments.notes:${paymentPublicId}`)
         : null;
 
-      await tx.insert(complianceInvoicePayments).values({
+      const [insPmt] = await tx.insert(complianceInvoicePayments).values({
         publicId: paymentPublicId,
         invoiceId: inv.id,
         method: input.method,
         status: "succeeded",
         amountMinor: input.amountMinor,
+        waivedMinor: input.method === "waiver" ? input.amountMinor : 0,
         currency,
         reference: input.reference,
         notesEnc,
@@ -1610,6 +1653,14 @@ export function createInvoicesService(deps: ModuleDeps) {
           .where(eq(complianceInvoices.id, inv.id));
       }
 
+      const receiptRes = receiptsSvc
+        ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+            invoiceId: inv.id,
+            paymentId: insPmt.insertId,
+            settlementKind: input.method === "waiver" ? "waived_small_total" : "manual_payment",
+          })
+        : null;
+
       await deps.audit.record(
         {
           category: "business",
@@ -1630,7 +1681,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         tx,
       );
 
-      if (nextStatus === "paid" && inv.status !== "paid") {
+      if (nextStatus === "paid" && inv.status !== "paid" && input.method !== "waiver") {
         const engagementSvc = (deps.services as Partial<typeof deps.services>).engagement;
         if (engagementSvc && typeof engagementSvc.notify === "function") {
           await engagementSvc.notify(
@@ -1682,6 +1733,7 @@ export function createInvoicesService(deps: ModuleDeps) {
 
       return {
         paymentPublicId,
+        receiptPublicId: receiptRes?.receiptPublicId ?? null,
         invoiceStatus: nextStatus,
         balanceDueMinor: nextBalance,
         duplicate: false,
@@ -1762,6 +1814,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       "CURRENCY_MISMATCH",
       "REFUND_EXCEEDS_PAYMENT",
       "PROVIDER_PAYMENT_USE_ORDER_REFUNDS",
+      "WAIVED_PAYMENT_NOT_REFUNDABLE",
       "ORDER_LOCKED",
     ]);
 
@@ -1846,6 +1899,12 @@ export function createInvoicesService(deps: ModuleDeps) {
       if (!pmt || pmt.status !== "succeeded") {
         throw notFound("PAYMENT_NOT_FOUND");
       }
+      if (pmt.method === "waiver" || (pmt.waivedMinor ?? 0) >= pmt.amountMinor) {
+        throw conflict(
+          "WAIVED_PAYMENT_NOT_REFUNDABLE",
+          "Waived balances have no collected funds to refund.",
+        );
+      }
       if (pmt.method === "provider_online" || pmt.provider !== null) {
         throw conflict(
           "PROVIDER_PAYMENT_USE_ORDER_REFUNDS",
@@ -1861,12 +1920,13 @@ export function createInvoicesService(deps: ModuleDeps) {
         .from(complianceInvoiceRefunds)
         .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
       const alreadyRefunded = priorPaymentRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
+      const refundableBase = Math.max(0, pmt.amountMinor - (pmt.waivedMinor ?? 0));
 
-      if (alreadyRefunded + input.amountMinor > pmt.amountMinor) {
+      if (alreadyRefunded + input.amountMinor > refundableBase) {
         throw validation(
           "REFUND_EXCEEDS_PAYMENT",
           "Refund amount exceeds the remaining refundable amount on that payment.",
-          { maxRefundableMinor: Math.max(0, pmt.amountMinor - alreadyRefunded) },
+          { maxRefundableMinor: Math.max(0, refundableBase - alreadyRefunded) },
         );
       }
 
@@ -1875,7 +1935,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         ? deps.crypto.encrypt(input.notes.trim(), `compliance_invoice_refunds.notes:${refundPublicId}`)
         : null;
 
-      await tx.insert(complianceInvoiceRefunds).values({
+      const [insRfd] = await tx.insert(complianceInvoiceRefunds).values({
         publicId: refundPublicId,
         invoiceId: inv.id,
         paymentId: pmt.id,
@@ -1890,6 +1950,13 @@ export function createInvoicesService(deps: ModuleDeps) {
         origin: "portal",
         createdAt: now,
       });
+
+      if (receiptsSvc) {
+        await receiptsSvc.onPaymentRefundedInTx(tx, {
+          paymentId: pmt.id,
+          refundId: insRfd.insertId,
+        });
+      }
 
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
       const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
@@ -2093,6 +2160,15 @@ export function createInvoicesService(deps: ModuleDeps) {
         ? await identitySvc.getUser(orderView.ownerUserId)
         : null;
 
+    const [issuerContact, issuerTaxId, issuerLogoRaw] = await Promise.all([
+      readSetting(deps.settings, INVOICE_ISSUER_CONTACT),
+      readSetting(deps.settings, INVOICE_ISSUER_TAX_ID),
+      deps.settings
+        .get(INVOICE_ISSUER_LOGO.key, parseIssuerLogoSetting, DEFAULT_ISSUER_LOGO_SETTING)
+        .catch(() => ({ ...DEFAULT_ISSUER_LOGO_SETTING })),
+    ]);
+    const issuerLogo = parseIssuerLogoSetting(issuerLogoRaw);
+
     const invoiceLabel = detail.invoiceNumber ?? `DRAFT-${detail.invoicePublicId.slice(-8)}`;
     const pdfBuffer = renderInvoicePdf({
       invoicePublicId: detail.invoicePublicId,
@@ -2101,8 +2177,12 @@ export function createInvoicesService(deps: ModuleDeps) {
       orderReference: detail.orderReference,
       issuerName: detail.issuerName,
       issuerAddress: detail.issuerAddress,
+      issuerContact,
+      issuerTaxId,
+      issuerLogo,
       customerName: ownerProfile?.name ?? "Customer",
       customerEmail: ownerProfile?.email ?? "",
+      customerRef: ownerProfile?.customerRef ?? null,
       currency: detail.currency,
       issuedAt: detail.issuedAt,
       dueAt: detail.dueAt,
@@ -2533,6 +2613,13 @@ export function createInvoicesService(deps: ModuleDeps) {
       .limit(1);
 
     if (existingIdem) {
+      const receiptRes = receiptsSvc
+        ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+            invoiceId: inv.id,
+            paymentId: existingIdem.id,
+            settlementKind: "provider_online",
+          })
+        : null;
       const sumsMap = await computeLedgerSums(tx, [inv.id]);
       const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
       const status = deriveInvoiceStatus({
@@ -2545,6 +2632,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       const netPaid = Math.max(0, sums.grossPaidMinor - sums.refundedMinor);
       return {
         paymentPublicId: existingIdem.publicId,
+        receiptPublicId: receiptRes?.receiptPublicId ?? null,
         invoiceId: inv.id,
         invoicePublicId: inv.publicId,
         invoiceNumber: inv.invoiceNumber,
@@ -2585,16 +2673,21 @@ export function createInvoicesService(deps: ModuleDeps) {
     }
 
     const paymentPublicId = ulid(now.getTime());
-    await tx.insert(complianceInvoicePayments).values({
+    const cleanBrand = sanitizeCardBrand(input.paymentMethodBrand);
+    const cleanLast4 = sanitizeCardLast4(input.paymentMethodLast4);
+    const [insPmt] = await tx.insert(complianceInvoicePayments).values({
       publicId: paymentPublicId,
       invoiceId: inv.id,
       method: "provider_online",
       status: "succeeded",
       amountMinor: input.amountMinor,
+      waivedMinor: 0,
       currency,
       reference: providerRef,
       provider: input.provider,
       providerEventId: input.attemptPublicId,
+      paymentMethodBrand: cleanBrand,
+      paymentMethodLast4: cleanLast4,
       notesEnc: null,
       receivedAt: input.paidAt,
       recordedByUserId: null,
@@ -2623,6 +2716,14 @@ export function createInvoicesService(deps: ModuleDeps) {
         })
         .where(eq(complianceInvoices.id, inv.id));
     }
+
+    const receiptRes = receiptsSvc
+      ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+          invoiceId: inv.id,
+          paymentId: insPmt.insertId,
+          settlementKind: "provider_online",
+        })
+      : null;
 
     await deps.audit.record(
       {
@@ -2701,11 +2802,231 @@ export function createInvoicesService(deps: ModuleDeps) {
 
     return {
       paymentPublicId,
+      receiptPublicId: receiptRes?.receiptPublicId ?? null,
       invoiceId: inv.id,
       invoicePublicId: inv.publicId,
       invoiceNumber: inv.invoiceNumber,
       invoiceStatus: nextStatus,
       balanceDueMinor: nextBalance,
+      duplicate: false,
+    };
+  }
+
+  /**
+   * Increment 06 D5 + D15: Settles a $0.00 checkout invoice (`zero_total`) or waives a sub-minimum
+   * checkout balance (`waived_small_total`) under canonical order -> invoice `FOR UPDATE` locking,
+   * issuing a `RPR-<year>-<6 digits>` payment receipt inside `tx`.
+   *
+   * Security boundary:
+   *  - `zero_total` is ONLY permitted when the server-locked invoice has `totalMinor === 0`.
+   *  - `waived_small_total` is ONLY permitted when `0 < remainingBalance < providerMinimumMinor`.
+   *  - Waived payments record `waivedMinor = amountMinor`, `capturedMinor = 0`, and never trigger
+   *    referral cash rewards or allow cash refunds.
+   */
+  async function settleCheckoutInvoiceInTx(
+    input: SettleCheckoutInvoiceInput,
+    tx: Tx,
+  ): Promise<SettleCheckoutInvoiceResult> {
+    const [invRef] = await tx
+      .select({
+        id: complianceInvoices.id,
+        orderId: complianceInvoices.orderId,
+        origin: complianceInvoices.origin,
+      })
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.publicId, input.invoicePublicId))
+      .limit(1);
+    if (!invRef) throw notFound("INVOICE_NOT_FOUND");
+    if (invRef.origin !== "portal") {
+      throw conflict("IMPORTED_INVOICE_READ_ONLY", "Imported historical invoices cannot be settled.");
+    }
+
+    const ordersSvc = requireOrdersService();
+    const orderRef =
+      typeof ordersSvc.getOrderRefById === "function"
+        ? await ordersSvc.getOrderRefById(invRef.orderId, tx, { forUpdate: true })
+        : null;
+    if (!orderRef) {
+      throw notFound("ORDER_NOT_FOUND");
+    }
+    if (orderRef.lockState === "legal_hold" || orderRef.lockState === "imported_read_only") {
+      throw new DomainError("LOCKED", "ORDER_LOCKED", "Order is locked against invoice ledger changes.", {
+        lockState: orderRef.lockState,
+      });
+    }
+
+    const [inv] = await tx
+      .select()
+      .from(complianceInvoices)
+      .where(eq(complianceInvoices.id, invRef.id))
+      .for("update")
+      .limit(1);
+    if (!inv) throw notFound("INVOICE_NOT_FOUND");
+    if (inv.voidedAt !== null) {
+      throw conflict("INVOICE_VOIDED", "Cannot settle a voided invoice.");
+    }
+    if (inv.issuedAt === null) {
+      throw conflict("INVOICE_NOT_ISSUED", "Cannot settle an unissued invoice.");
+    }
+
+    if (input.settlementKind === "zero_total") {
+      if (inv.totalMinor !== 0) {
+        throw validation(
+          "NON_ZERO_INVOICE_CANNOT_ZERO_SETTLE",
+          "Only $0.00 invoices can be settled without payment.",
+        );
+      }
+      const receiptRes = receiptsSvc
+        ? await receiptsSvc.issueReceiptForZeroInvoiceInTx(tx, { invoiceId: inv.id })
+        : null;
+      return {
+        settlementKind: "zero_total",
+        invoiceId: inv.id,
+        invoicePublicId: inv.publicId,
+        invoiceNumber: inv.invoiceNumber,
+        invoiceStatus: "paid",
+        waivedMinor: 0,
+        receiptPublicId: receiptRes?.receiptPublicId ?? null,
+        duplicate: false,
+      };
+    }
+
+    // `waived_small_total`
+    const idempotencyKey = `waive:${inv.publicId}`;
+    const [existingWaive] = await tx
+      .select()
+      .from(complianceInvoicePayments)
+      .where(
+        and(
+          eq(complianceInvoicePayments.invoiceId, inv.id),
+          eq(complianceInvoicePayments.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .limit(1);
+
+    if (existingWaive) {
+      const receiptRes = receiptsSvc
+        ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+            invoiceId: inv.id,
+            paymentId: existingWaive.id,
+            settlementKind: "waived_small_total",
+          })
+        : null;
+      return {
+        settlementKind: "waived_small_total",
+        invoiceId: inv.id,
+        invoicePublicId: inv.publicId,
+        invoiceNumber: inv.invoiceNumber,
+        invoiceStatus: "paid",
+        waivedMinor: existingWaive.waivedMinor || existingWaive.amountMinor,
+        receiptPublicId: receiptRes?.receiptPublicId ?? null,
+        duplicate: true,
+      };
+    }
+
+    const sumsMap = await computeLedgerSums(tx, [inv.id]);
+    const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
+    const remainingBalance = inv.totalMinor - (sums.grossPaidMinor - sums.refundedMinor);
+    if (remainingBalance <= 0) {
+      throw conflict("INVOICE_ALREADY_PAID", "This invoice has already been paid.");
+    }
+    if (
+      !Number.isSafeInteger(input.providerMinimumMinor) ||
+      input.providerMinimumMinor <= 1 ||
+      remainingBalance >= input.providerMinimumMinor
+    ) {
+      throw conflict(
+        "AMOUNT_NOT_BELOW_PROVIDER_MINIMUM",
+        "Only balances strictly below the configured card processor minimum may be waived.",
+      );
+    }
+
+    const now = deps.clock.now();
+    const paymentPublicId = ulid(now.getTime());
+    const [insPmt] = await tx.insert(complianceInvoicePayments).values({
+      publicId: paymentPublicId,
+      invoiceId: inv.id,
+      method: "waiver",
+      status: "succeeded",
+      amountMinor: remainingBalance,
+      waivedMinor: remainingBalance,
+      currency: inv.currency,
+      reference: "WAIVED-BELOW-MINIMUM",
+      provider: null,
+      providerEventId: null,
+      paymentMethodBrand: null,
+      paymentMethodLast4: null,
+      notesEnc: null,
+      receivedAt: now,
+      recordedByUserId: null,
+      idempotencyKey,
+      origin: "portal",
+      createdAt: now,
+    });
+
+    await tx
+      .update(complianceInvoices)
+      .set({
+        status: "paid",
+        version: inv.version + 1,
+        updatedAt: now,
+      })
+      .where(eq(complianceInvoices.id, inv.id));
+
+    const receiptRes = receiptsSvc
+      ? await receiptsSvc.issueReceiptForPaymentInTx(tx, {
+          invoiceId: inv.id,
+          paymentId: insPmt.insertId,
+          settlementKind: "waived_small_total",
+        })
+      : null;
+
+    await deps.audit.record(
+      {
+        category: "business",
+        eventName: "invoice.payment.recorded",
+        action: "create",
+        outcome: "completed",
+        actor: { role: "system" },
+        resource: { type: "invoice_payment", publicId: paymentPublicId },
+        attributes: {
+          invoice_public_id: inv.publicId,
+          order_public_id: inv.orderPublicId,
+          method: "waiver",
+          amount_minor: remainingBalance,
+          waived_minor: remainingBalance,
+          provider_minimum_minor: input.providerMinimumMinor,
+          currency: inv.currency,
+          derived_invoice_status: "paid",
+        },
+      },
+      tx,
+    );
+
+    const engagementSvc = (deps.services as Partial<typeof deps.services>).engagement;
+    if (engagementSvc && typeof engagementSvc.notify === "function") {
+      await engagementSvc.notify(
+        {
+          userId: orderRef.ownerUserId,
+          kind: "order.invoice_paid",
+          title: `Order ${orderRef.reference} confirmed`,
+          body: `Your balance below the card minimum on ${inv.invoiceNumber ?? "your invoice"} was waived.`,
+          link: `/invoices/${inv.publicId}`,
+          idempotencyKey: `invoice-paid:${inv.publicId}:${paymentPublicId}`,
+          skipEmail: true,
+        },
+        tx,
+      );
+    }
+
+    return {
+      settlementKind: "waived_small_total",
+      invoiceId: inv.id,
+      invoicePublicId: inv.publicId,
+      invoiceNumber: inv.invoiceNumber,
+      invoiceStatus: "paid",
+      waivedMinor: remainingBalance,
+      receiptPublicId: receiptRes?.receiptPublicId ?? null,
       duplicate: false,
     };
   }
@@ -2910,7 +3231,7 @@ export function createInvoicesService(deps: ModuleDeps) {
         provider: p.provider,
         reference: p.reference,
         providerEventId: p.providerEventId,
-        capturedMinor: p.amountMinor,
+        capturedMinor: p.method === "waiver" ? 0 : Math.max(0, p.amountMinor - (p.waivedMinor ?? 0)),
         ledgerRefundedMinor,
         currency: p.currency,
         receivedAt: p.receivedAt,
@@ -3004,6 +3325,9 @@ export function createInvoicesService(deps: ModuleDeps) {
     if (!pmt) {
       throw notFound("PAYMENT_NOT_FOUND");
     }
+    if (pmt.method === "waiver" || (pmt.waivedMinor ?? 0) >= pmt.amountMinor) {
+      throw conflict("WAIVED_PAYMENT_NOT_REFUNDABLE", "Waived balances have no collected funds to refund.");
+    }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
     const ledgerRefundRows = await tx
@@ -3047,7 +3371,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       provider: pmt.provider,
       providerReference: pmt.reference,
       providerEventId: pmt.providerEventId,
-      capturedMinor: pmt.amountMinor,
+      capturedMinor: Math.max(0, pmt.amountMinor - (pmt.waivedMinor ?? 0)),
       paidAt: pmt.receivedAt,
       ledgerRefunds: ledgerRefundRows,
     };
@@ -3151,13 +3475,17 @@ export function createInvoicesService(deps: ModuleDeps) {
     if (currency !== inv.currency) {
       throw validation("CURRENCY_MISMATCH", `Refund currency (${currency}) must match invoice currency (${inv.currency}).`);
     }
+    if (pmt.method === "waiver" || (pmt.waivedMinor ?? 0) >= pmt.amountMinor) {
+      throw conflict("WAIVED_PAYMENT_NOT_REFUNDABLE", "Waived balances have no collected funds to refund.");
+    }
 
     const priorPaymentRefunds = await tx
       .select({ amountMinor: complianceInvoiceRefunds.amountMinor })
       .from(complianceInvoiceRefunds)
       .where(eq(complianceInvoiceRefunds.paymentId, pmt.id));
     const alreadyRefunded = priorPaymentRefunds.reduce((sum, r) => sum + r.amountMinor, 0);
-    if (alreadyRefunded + input.amountMinor > pmt.amountMinor) {
+    const capturedMinor = Math.max(0, pmt.amountMinor - (pmt.waivedMinor ?? 0));
+    if (alreadyRefunded + input.amountMinor > capturedMinor) {
       throw conflict(
         "REFUND_EXCEEDS_REFUNDABLE",
         "Refund amount exceeds the remaining refundable amount on that payment.",
@@ -3169,7 +3497,7 @@ export function createInvoicesService(deps: ModuleDeps) {
       ? deps.crypto.encrypt(input.notes.trim(), `compliance_invoice_refunds.notes:${complianceRefundPublicId}`)
       : null;
 
-    await tx.insert(complianceInvoiceRefunds).values({
+    const [insRfd] = await tx.insert(complianceInvoiceRefunds).values({
       publicId: complianceRefundPublicId,
       invoiceId: inv.id,
       paymentId: pmt.id,
@@ -3186,6 +3514,13 @@ export function createInvoicesService(deps: ModuleDeps) {
       origin: "portal",
       createdAt: now,
     });
+
+    if (receiptsSvc) {
+      await receiptsSvc.onPaymentRefundedInTx(tx, {
+        paymentId: pmt.id,
+        refundId: insRfd.insertId,
+      });
+    }
 
     const sumsMap = await computeLedgerSums(tx, [inv.id]);
     const sums = sumsMap.get(inv.id) ?? { grossPaidMinor: 0, refundedMinor: 0 };
@@ -3415,6 +3750,88 @@ export function createInvoicesService(deps: ModuleDeps) {
     };
   }
 
+  async function readCompanyProfile(tx?: Tx) {
+    const [issuerName, issuerAddress, issuerContact, issuerTaxId, rawLogo, paymentInstructions, defaultTaxRateBps] =
+      await Promise.all([
+        readSetting(deps.settings, INVOICE_ISSUER_NAME, tx),
+        readSetting(deps.settings, INVOICE_ISSUER_ADDRESS, tx),
+        readSetting(deps.settings, INVOICE_ISSUER_CONTACT, tx),
+        readSetting(deps.settings, INVOICE_ISSUER_TAX_ID, tx),
+        deps.settings.get(INVOICE_ISSUER_LOGO.key, parseIssuerLogoSetting, DEFAULT_ISSUER_LOGO_SETTING, tx),
+        readSetting(deps.settings, INVOICE_PAYMENT_INSTRUCTIONS, tx),
+        readSetting(deps.settings, INVOICE_DEFAULT_TAX_RATE_BPS, tx),
+      ]);
+    return {
+      issuerName: issuerName.trim() || "ReadyPackets",
+      issuerAddress: issuerAddress.trim(),
+      issuerContact: issuerContact.trim(),
+      issuerTaxId: issuerTaxId.trim(),
+      issuerLogo: parseIssuerLogoSetting(rawLogo),
+      paymentInstructions: paymentInstructions.trim(),
+      defaultTaxRateBps,
+    };
+  }
+
+  async function adminGetCompanyProfile(principal: SessionPrincipal): Promise<{
+    issuerName: string;
+    issuerAddress: string;
+    issuerContact: string;
+    issuerTaxId: string;
+    issuerLogo: IssuerLogoSetting;
+    paymentInstructions: string;
+    defaultTaxRateBps: number;
+  }> {
+    await assertLiveActorInTx(deps, principal, deps.db as unknown as Tx, "invoices.manage");
+    return readCompanyProfile();
+  }
+
+  async function adminUpdateCompanyProfile(
+    principal: SessionPrincipal,
+    input: {
+      issuerName: string;
+      issuerAddress: string;
+      issuerContact: string;
+      issuerTaxId: string;
+      issuerLogo: IssuerLogoSetting;
+      paymentInstructions?: string | undefined;
+    },
+  ) {
+    return runComplianceTx(deps, principal, { type: "compliance_setting", publicId: "compliance.invoices.company_profile" }, async (tx) => {
+      const liveActor = await assertLiveActorInTx(deps, principal, tx, "invoices.manage");
+      const cleanedLogo = parseIssuerLogoSetting(input.issuerLogo);
+      await writeSetting(deps.settings, INVOICE_ISSUER_NAME, input.issuerName.trim(), tx);
+      await writeSetting(deps.settings, INVOICE_ISSUER_ADDRESS, input.issuerAddress.trim(), tx);
+      await writeSetting(deps.settings, INVOICE_ISSUER_CONTACT, input.issuerContact.trim(), tx);
+      await writeSetting(deps.settings, INVOICE_ISSUER_TAX_ID, input.issuerTaxId.trim(), tx);
+      await writeSetting(deps.settings, INVOICE_ISSUER_LOGO, cleanedLogo, tx);
+      if (input.paymentInstructions !== undefined) {
+        await writeSetting(deps.settings, INVOICE_PAYMENT_INSTRUCTIONS, input.paymentInstructions.trim(), tx);
+      }
+
+      await deps.audit.record(
+        {
+          category: "admin",
+          eventName: "compliance.company_profile.updated",
+          action: "update",
+          outcome: "completed",
+          actor: { userId: liveActor.userId, role: liveActor.role },
+          resource: { type: "compliance_setting", publicId: "compliance.invoices.company_profile" },
+          attributes: {
+            issuer_name: input.issuerName.trim(),
+            has_address: input.issuerAddress.trim().length > 0,
+            has_contact: input.issuerContact.trim().length > 0,
+            has_tax_id: input.issuerTaxId.trim().length > 0,
+            logo_mode: cleanedLogo.mode,
+            logo_brand_path: cleanedLogo.brandPath,
+          },
+        },
+        tx,
+      );
+
+      return readCompanyProfile(tx);
+    });
+  }
+
   return {
     listForOrder,
     listMine,
@@ -3425,6 +3842,7 @@ export function createInvoicesService(deps: ModuleDeps) {
     issueCheckoutInvoiceInTx,
     getInvoiceForCheckout,
     bookVerifiedProviderPayment,
+    settleCheckoutInvoiceInTx,
     onInvoicePaid,
     getOrderPaymentSummaries,
     listOrderPaymentsAndRefunds,
@@ -3439,6 +3857,8 @@ export function createInvoicesService(deps: ModuleDeps) {
       void: adminVoid,
       recordManualPayment: adminRecordManualPayment,
       recordRefund: adminRecordRefund,
+      getCompanyProfile: adminGetCompanyProfile,
+      updateCompanyProfile: adminUpdateCompanyProfile,
     },
     healthCounts,
   };

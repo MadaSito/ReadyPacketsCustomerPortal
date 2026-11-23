@@ -22,7 +22,11 @@ import {
   PAYMENT_PROVIDER_CHOICES,
   PAYMENT_WEBHOOK_STATUSES,
 } from "./schema.js";
-import { isSafePortalReturnPath } from "./settings.js";
+import {
+  isSafePortalReturnPath,
+  paymentsReceiptsSchema,
+  paymentsSmallTotalsSchema,
+} from "./settings.js";
 
 const publicIdSchema = z.string().length(26).regex(ULID_PATTERN, "Invalid identifier.");
 const cursorSchema = z.string().trim().min(1).max(64);
@@ -86,6 +90,8 @@ export const updatePaymentsSettingsInputSchema = z.strictObject({
   clearSquareAccessToken: z.boolean().optional(),
   squareWebhookSignatureKey: z.string().trim().min(1).max(256).optional(),
   clearSquareWebhookSignatureKey: z.boolean().optional(),
+  smallTotals: paymentsSmallTotalsSchema.optional(),
+  receipts: paymentsReceiptsSchema.optional(),
 });
 
 export const paymentsRouter = router({

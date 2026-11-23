@@ -40,8 +40,18 @@ import {
   type OrderRefundLedgerSnapshot,
   type RecordProviderPaymentInput,
   type RecordProviderPaymentResult,
+  type SettleCheckoutInvoiceInput,
+  type SettleCheckoutInvoiceResult,
 } from "./invoicesService.js";
 import { registerComplianceMailTemplates } from "./mail.js";
+import {
+  type AdminReceiptSummaryView,
+  createReceiptsService,
+  type ReceiptDetailView,
+  type ReceiptsService,
+  type ReceiptSummaryView,
+  type RefundNoteSummaryView,
+} from "./receiptsService.js";
 import {
   createPoliciesService,
   type PoliciesService,
@@ -88,6 +98,7 @@ export type {
 } from "./acceptanceLogService.js";
 
 export type {
+  AdminReceiptSummaryView,
   BookSettledRefundInput,
   BookSettledRefundResult,
   BookVerifiedProviderPaymentInput,
@@ -115,10 +126,24 @@ export type {
   PortableEvidenceBatch,
   PortableEvidenceOptions,
   PublishedPolicyView,
+  ReceiptDetailView,
+  ReceiptsService,
+  ReceiptSummaryView,
   RecordProviderPaymentInput,
   RecordProviderPaymentResult,
+  RefundNoteSummaryView,
   RequiredPolicySummary,
+  SettleCheckoutInvoiceInput,
+  SettleCheckoutInvoiceResult,
 };
+export {
+  parsePngForPdf,
+  type ReceiptSnapshot,
+  type RefundNoteSnapshot,
+  renderInvoicePdf,
+  renderPaymentReceiptPdf,
+  renderRefundNotePdf,
+} from "./invoicePdf.js";
 export * from "./settings.js";
 
 export interface ComplianceModule extends ModuleLifecycle {
@@ -187,6 +212,10 @@ export interface ComplianceModule extends ModuleLifecycle {
     input: BookVerifiedProviderPaymentInput,
     tx: Tx,
   ): Promise<BookVerifiedProviderPaymentResult>;
+  settleCheckoutInvoiceInTx(
+    input: SettleCheckoutInvoiceInput,
+    tx: Tx,
+  ): Promise<SettleCheckoutInvoiceResult>;
   onInvoicePaid(listener: InvoicePaidListener): void;
   /** Increment 05 (G-C3-02): authoritative transactional payment exposure for order cancel / promo release. */
   orderPaymentExposureInTx(tx: Tx, orderPublicId: string): Promise<OrderPaymentExposure>;
@@ -198,6 +227,7 @@ export interface ComplianceModule extends ModuleLifecycle {
   acceptance: AcceptanceService;
   intake: IntakeService;
   invoices: InvoicesService;
+  receipts: ReceiptsService;
 }
 
 export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
@@ -210,7 +240,8 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
       policyEnforcement.assertPending(userId, role, versionPublicId, tx),
   });
   const intake = createIntakeService(deps);
-  const invoices = createInvoicesService(deps);
+  const receipts = createReceiptsService(deps);
+  const invoices = createInvoicesService(deps, receipts);
   const portable = createPortableComplianceService(deps);
   const acceptance = createAcceptanceService(deps);
 
@@ -227,6 +258,7 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     recordCheckoutAcceptances: policies.recordCheckoutAcceptances,
     getInvoiceForCheckout: invoices.getInvoiceForCheckout,
     bookVerifiedProviderPayment: invoices.bookVerifiedProviderPayment,
+    settleCheckoutInvoiceInTx: invoices.settleCheckoutInvoiceInTx,
     onInvoicePaid: invoices.onInvoicePaid,
     orderPaymentExposureInTx: invoices.orderPaymentExposureInTx,
     policies,
@@ -234,6 +266,7 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     policyEnforcement,
     intake,
     invoices,
+    receipts,
     acceptance,
 
     async init(): Promise<void> {

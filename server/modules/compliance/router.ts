@@ -36,8 +36,10 @@ import {
 import { acceptanceRouter } from "./acceptanceRouter.js";
 import { policyEnforcementRouter } from "./policyEnforcementRouter.js";
 import { policyNoticesRouter } from "./policyNoticesRouter.js";
+import { issuerLogoSettingSchema, signatureNameCheckSettingSchema } from "./settings.js";
 
 const policiesManageProc = protectedProcedure.use(requireCapability("policies.manage"));
+const policiesManageStaffProc = staffProcedure.use(requireCapability("policies.manage"));
 const acceptanceLogReadProc = staffProcedure.use(requireCapability("policies.acceptances.read"));
 const acceptanceLogExportProc = staffProcedure.use(
   requireCapability("policies.acceptances.export"),
@@ -45,6 +47,7 @@ const acceptanceLogExportProc = staffProcedure.use(
 const intakeManageProc = protectedProcedure.use(requireCapability("intake.manage"));
 const intakeReviewProc = staffProcedure.use(requireCapability("intake.review"));
 const invoicesManageProc = staffProcedure.use(requireCapability("invoices.manage"));
+const invoicesReadAllProc = staffProcedure.use(requireCapability("invoices.read_all"));
 const paymentsRefundProc = staffProcedure.use(requireCapability("payments.refund"));
 
 export const complianceRouter = router({
@@ -238,6 +241,25 @@ export const complianceRouter = router({
             return ctx.services.compliance.policies.admin.acceptanceLog.export(
               ctx.session,
               input ?? {},
+            );
+          }),
+      }),
+
+      signatureNameCheck: router({
+        get: policiesManageStaffProc
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({}).optional())
+          .query(async ({ ctx }) => {
+            return ctx.services.compliance.policies.admin.getSignatureNameCheck(ctx.session);
+          }),
+
+        update: policiesManageStaffProc
+          .meta({ rateLimit: "form_submission" })
+          .input(signatureNameCheckSettingSchema)
+          .mutation(async ({ ctx, input }) => {
+            return ctx.services.compliance.policies.admin.updateSignatureNameCheck(
+              ctx.session,
+              input,
             );
           }),
       }),
@@ -451,6 +473,94 @@ export const complianceRouter = router({
         .input(recordRefundSchema)
         .mutation(async ({ ctx, input }) => {
           return ctx.services.compliance.invoices.admin.recordRefund(ctx.session, input);
+        }),
+
+      companyProfile: router({
+        get: invoicesManageProc
+          .meta({ rateLimit: "api" })
+          .input(z.strictObject({}).optional())
+          .query(async ({ ctx }) => {
+            return ctx.services.compliance.invoices.admin.getCompanyProfile(ctx.session);
+          }),
+
+        update: invoicesManageProc
+          .meta({ rateLimit: "form_submission" })
+          .input(
+            z.strictObject({
+              issuerName: z.string().trim().min(1).max(160),
+              issuerAddress: z.string().trim().max(400),
+              issuerContact: z.string().trim().max(240),
+              issuerTaxId: z.string().trim().max(80),
+              issuerLogo: issuerLogoSettingSchema,
+              paymentInstructions: z.string().trim().max(1000).optional(),
+            }),
+          )
+          .mutation(async ({ ctx, input }) => {
+            return ctx.services.compliance.invoices.admin.updateCompanyProfile(
+              ctx.session,
+              input,
+            );
+          }),
+      }),
+    }),
+  }),
+
+  /* ------------------------------------------------ Increment 06 D15: receipts */
+  receipts: router({
+    myList: protectedProcedure
+      .meta({ rateLimit: "api" })
+      .input(
+        z
+          .strictObject({
+            cursor: z.string().max(128).optional(),
+            limit: z.number().int().min(1).max(100).default(20),
+          })
+          .optional(),
+      )
+      .query(async ({ ctx, input }) => {
+        return ctx.services.compliance.receipts.myList(ctx.session, input ?? {});
+      }),
+
+    forOrder: protectedProcedure
+      .meta({ rateLimit: "api" })
+      .input(z.strictObject({ orderPublicId: publicIdSchema }))
+      .query(async ({ ctx, input }) => {
+        return ctx.services.compliance.receipts.forOrder(ctx.session, input.orderPublicId);
+      }),
+
+    get: protectedProcedure
+      .meta({ rateLimit: "api" })
+      .input(z.strictObject({ receiptPublicId: publicIdSchema }))
+      .query(async ({ ctx, input }) => {
+        return ctx.services.compliance.receipts.get(ctx.session, input.receiptPublicId);
+      }),
+
+    admin: router({
+      forOrder: invoicesReadAllProc
+        .meta({ rateLimit: "api" })
+        .input(z.strictObject({ orderPublicId: publicIdSchema }))
+        .query(async ({ ctx, input }) => {
+          return ctx.services.compliance.receipts.admin.listForOrder(ctx.session, input.orderPublicId);
+        }),
+
+      forCustomer: invoicesReadAllProc
+        .meta({ rateLimit: "api" })
+        .input(
+          z.strictObject({
+            customerPublicId: publicIdSchema,
+            cursor: z.string().max(128).optional(),
+            limit: z.number().int().min(1).max(100).default(20),
+          }),
+        )
+        .query(async ({ ctx, input }) => {
+          return ctx.services.compliance.receipts.admin.listForCustomer(ctx.session, input);
+        }),
+
+      resend: invoicesReadAllProc
+        .meta({ rateLimit: "form_submission" })
+        .input(z.strictObject({ receiptPublicId: publicIdSchema }))
+        .mutation(async ({ ctx, input }) => {
+          return ctx.services.compliance.receipts.admin.resend(ctx.session, input);
         }),
     }),
   }),
