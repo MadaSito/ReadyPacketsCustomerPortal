@@ -397,3 +397,13 @@ const tabs = ORDER_TABS.filter(visible).map((t) => ({ value: t.key, label: t.lab
 <RouteTabPanel idBase="order-tabs" value={active}>{panel}</RouteTabPanel>
 ```
 Tests: `client/src/ui/routeTabs.test.tsx`.
+
+## Increment 06 additions
+
+| Component | Props | Notes |
+| --- | --- | --- |
+| `Countdown` | `to`, `label`, `now?`, `milestones?` (seconds, default 3600/900/300/60/0), `announce?: "milestones" \| "off"`, `onElapsed?`, `elapsedText?` | Visible `<time>` text (coarse; seconds only under 2 min) is not live. A polite sr-only status speaks once per milestone crossed and at the end, never on mount. No animation. `formatRemaining(seconds)` exported. |
+| `ConfirmSwitch` | `label`, `description?`, `checked`, `onConfirmedChange(next)`, `confirmOn?`, `confirmOff?` (`{title, description?, body?, confirmLabel?, destructive?, confirmText?}`) | The switch keeps the stored value until confirmed; Cancel/Escape changes nothing and focus returns to the switch. A direction without a step changes immediately. Throw from `onConfirmedChange` to keep the dialog open. |
+| `ChartFrame` | `title`, `headingLevel?`, `description?`, `summary`, `table`, `legend?: {label, series: 1..6, pattern?}[]`, `actions?`, `loading?`, `error?`, `onRetry?`, `empty?: ReactNode \| true`, `defaultView?` | Section with heading, always-visible text summary, Chart/Table switch (table = complete data alternative), legend with swatches. Inside, the chart SVG uses `useChartIds()` → `labelledBy`, `patternFill(n)`; `role="img"`, `viewBox`, no fixed width. |
+| Chart tokens | `fill-chart-1..6`, `stroke-chart-1..6`, `stroke-line` (grid), `fill-muted` (axis text) | Each series ≥ 3:1 on all surfaces in both themes (tokens.test.ts). Pair with `patternFill(n)` so colour is not the only cue. |
+| Nav tokens (D1) | `.rp-nav-panel`, `.rp-nav-edge`, `.rp-nav-section`, `.rp-nav-item`, `.rp-nav-tab`, `--color-nav-active/accent/hover/edge` | Shell-only. The current entry (`aria-current="page"`) gets a tinted fill, a 4 px accent bar and semibold text; forced colours keep a Highlight outline and bar. |

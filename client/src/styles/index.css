@@ -83,6 +83,18 @@
   /* Text on navy brand panels (both themes). */
   --color-on-navy: #F2F8F8;
   --color-on-navy-muted: #B8C7D2;
+  /* Side panels, drawer and bottom bar (increment 06, D1): always on navy. Verified in tokens.test.ts. */
+  --color-nav-active: #124A4F;
+  --color-nav-accent: #2EC4B6;
+  --color-nav-hover: #17304A;
+  --color-nav-edge: #1A7A6E;
+  /* Chart series (D6): each ≥ 3:1 on surface, surface-soft, surface-sunken (tokens.test.ts); pair with patterns. */
+  --color-chart-1: #137568;
+  --color-chart-2: #1A6FA8;
+  --color-chart-3: #B0640C;
+  --color-chart-4: #7A4DB0;
+  --color-chart-5: #B3261E;
+  --color-chart-6: #4A5568;
   --color-focus: #137568;
 
   --radius-card: 0.75rem;
@@ -133,6 +145,16 @@ html.dark {
   --color-action-soft: #0F3438;
   --color-on-navy: #F2F8F8;
   --color-on-navy-muted: #B8C7D2;
+  --color-nav-active: #0E4048;
+  --color-nav-accent: #8CE8DC;
+  --color-nav-hover: #123444;
+  --color-nav-edge: #2EC4B6;
+  --color-chart-1: #2EC4B6;
+  --color-chart-2: #6DBCF0;
+  --color-chart-3: #EFBD65;
+  --color-chart-4: #C7A4F5;
+  --color-chart-5: #FF8D87;
+  --color-chart-6: #B8C7D2;
   --color-focus: #55D6C9;
   --shadow-card: 0 1px 2px rgb(0 0 0 / 0.35), 0 1px 3px rgb(0 0 0 / 0.3);
   --shadow-raised: 0 10px 28px rgb(0 0 0 / 0.45), 0 2px 6px rgb(0 0 0 / 0.3);
@@ -213,6 +235,29 @@ html:not(.dark) {
   }
   /* Navy surfaces (console sidebar, mobile console drawer): light focus ring keeps ≥ 3:1 against navy. */
   .rp-on-navy { --color-focus: var(--color-teal-light); }
+  /*
+   * Navigation on navy (D1). The current entry has three cues: tinted fill, a 4 px accent bar and semibold text;
+   * forced-colours mode keeps a system-colour bar and outline (box-shadow and backgrounds are dropped there).
+   */
+  .rp-nav-panel { background: var(--color-navy); color: var(--color-on-navy-muted); }
+  .rp-nav-edge { box-shadow: inset -1px 0 0 var(--color-nav-edge), 4px 0 16px -8px rgb(0 0 0 / 0.35); }
+  .rp-nav-section { color: var(--color-nav-accent); }
+  .rp-nav-item { color: var(--color-on-navy-muted); font-weight: 500; }
+  .rp-nav-item:hover { background: var(--color-nav-hover); color: var(--color-on-navy); }
+  .rp-nav-item[aria-current="page"] {
+    background: var(--color-nav-active);
+    color: var(--color-on-navy);
+    font-weight: 600;
+    box-shadow: inset 4px 0 0 var(--color-nav-accent);
+  }
+  .rp-nav-tab { color: var(--color-on-navy-muted); font-weight: 500; }
+  .rp-nav-tab:hover { color: var(--color-on-navy); }
+  .rp-nav-tab[aria-current="page"], .rp-nav-tab[data-current] {
+    background: var(--color-nav-active);
+    color: var(--color-on-navy);
+    font-weight: 600;
+    box-shadow: inset 0 3px 0 var(--color-nav-accent);
+  }
   .rp-skip-link:focus { top: 0.75rem; }
 
   .prose-rp { color: var(--color-body); max-width: 72ch; }
@@ -239,6 +284,10 @@ html:not(.dark) {
 @media (forced-colors: active) {
   :focus-visible { outline: 3px solid CanvasText; }
   .rp-forced-border { border: 1px solid CanvasText; }
+  .rp-nav-edge { border-right: 1px solid CanvasText; }
+  .rp-nav-bar-top { border-top: 1px solid CanvasText; }
+  .rp-nav-item[aria-current="page"] { outline: 2px solid Highlight; outline-offset: -2px; border-left: 4px solid Highlight; }
+  .rp-nav-tab[aria-current="page"], .rp-nav-tab[data-current] { outline: 2px solid Highlight; outline-offset: -2px; }
 }
 
 /*

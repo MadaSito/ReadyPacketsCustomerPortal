@@ -44,3 +44,6 @@ export { SegmentedControl, ThemeControl, THEME_OPTIONS, type SegmentedControlPro
 export { Stepper, PhaseRail, Checklist, checklistSummary, type StepperProps, type StepperStep, type StepState, type PhaseRailProps, type ChecklistProps, type ChecklistItem, type ChecklistState } from "./Progress";
 export { StatCard, StatGrid, Timeline, Pagination, pageWindow, CodeSamples, type StatCardProps, type TimelineItem, type TimelineProps, type PaginationProps, type CodeSample, type CodeSamplesProps } from "./Display";
 export { CopyField, TagInput, type CopyFieldProps, type TagInputProps } from "./Inputs";
+export { Countdown, formatRemaining, type CountdownProps } from "./Countdown";
+export { ConfirmSwitch, type ConfirmSwitchProps, type ConfirmSwitchStep } from "./ConfirmSwitch";
+export { ChartFrame, ChartPatterns, useChartIds, type ChartFrameProps, type ChartIds, type ChartLegendItem, type ChartSeries } from "./ChartFrame";
