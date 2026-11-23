@@ -76,5 +76,6 @@ Owner: ui_foundation_engineer. The UI kit is documented in `client/src/ui/README
 
 ## PWA
 
-- Files: `client/public/manifest.webmanifest`, `offline.html` and `offline.css`. `app/PwaUpdatePrompt.tsx` registers `${BASE_URL}sw.js`, but not in dev or preview builds.
-- The integrator configured VitePWA in vite.config.ts. It precaches static assets only (index.html is not precached because it carries a per-response CSP nonce), makes navigations NetworkOnly with an offline.html fallback, makes `/api` NetworkOnly, and the update is user-driven (`SKIP_WAITING`).
+- **Install**: `PwaInstallEntry.tsx` exports a shared `usePwaInstall()` and controlled `PwaInstallDialog`. Call `prompt()` from a user gesture and open the dialog only for `unavailable`. The native one-shot prompt and Safari instructions are suppressed in installed/standalone mode. The sole persistent preference is a device boolean for install dismissal; it holds no portal or session data.
+- **Worker and updates**: `PwaUpdatePrompt.tsx` registers `${BASE_URL}sw.js` in the standard production build only. `src/pwa/sw.ts` precaches only allowlisted public static assets fetched without credentials and refuses private, attachment, redirected or unexpected response types. The dynamic application document, APIs (`/api` and `/trpc`), uploads and downloads do not enter the worker cache. No background sync. Updates are user-driven (`SKIP_WAITING`).
+- **Offline and sign-out**: Normal navigations go to the network first. Only eligible same-origin HTML navigations may get the public offline document on network failure. Sign-out clears Cache Storage, including the public precache; a script-free offline response built into the worker still works without re-creating the cache.

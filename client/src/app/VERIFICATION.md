@@ -49,6 +49,6 @@ The idle timeout reads `me.session.idleTimeoutSeconds` (identity 84d3089), with 
 - No real-browser runs: no Playwright/axe in a browser, no responsive screenshots at 320, 768, 1280 and 1920 px, no 200%/400% zoom or reflow checks, no forced-colors or reduced-motion visual checks.
 - No screen-reader passes (NVDA, JAWS, VoiceOver, TalkBack).
 - Passkey ceremonies were tested only as UI wiring (`@simplewebauthn/browser` is not exercised in jsdom).
-- Service worker: VitePWA is configured by the integrator (navigations NetworkOnly with an offline.html fallback, index.html not precached, /api NetworkOnly). The update prompt and offline behaviour have not been checked in a browser.
+- PWA route, static-response and Safari detection fixtures pass. Real Chromium and Safari install flows, standalone display, offline navigation after sign-out and update prompt behavior have not been verified in a browser.
 - The analytics consent slot is now provided by integrations (3f99849). It has not been checked in a rendered browser.
 - The production build has not been run by me since the latest commits (it is the integrator's responsibility).
