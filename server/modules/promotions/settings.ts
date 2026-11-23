@@ -129,7 +129,7 @@ export const PROMOTIONS_POLICY_SETTING = defineSetting<PromotionsPolicyConfig>({
     },
   },
   managedBy: {
-    href: "/admin/promotions#limits",
+    href: "/admin/promotions",
     label: "Discount codes — Limits",
   },
 });

@@ -28,6 +28,15 @@ import {
   promoCodes,
   promoRedemptions,
 } from "./schema.js";
+import {
+  allocateMinorAcrossCapacities,
+  computePromotionPricing,
+  roundHalfUpBps,
+} from "./service.js";
+import {
+  PROMOTIONS_POLICY_SETTING,
+  parsePromotionsPolicy,
+} from "./settings.js";
 
 const noopTransport: SessionTransport = {
   issue() {},
@@ -361,7 +370,14 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     });
 
     const settingsDefault = await adminCall.caller.admin.getSettings();
-    expect(settingsDefault).toEqual({ enabled: false, maxDiscountPercent: 50 });
+    expect(settingsDefault).toEqual({
+      enabled: false,
+      maxDiscountPercent: 100,
+      maxDiscountBps: 10_000,
+      maxFixedAmountMinor: null,
+      allowZeroTotal: true,
+      minOrderTotalAfterDiscountMinor: 0,
+    });
 
     const offErr = await mod
       .preview({
@@ -456,7 +472,26 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       totalMinor: 7_500,
     });
 
-    // 2. Combinable 80% promo + 10% bundle capped by the global 50% guard (never exceeds 50% = 5,000 minor units).
+    // 2. Under D5, creating an 80% promo while `maxDiscountPercent` is 50% rejects naming `maxDiscountPercent`;
+    // raising `maxDiscountPercent` to 90% allows creation, and lowering back to 50% rejects preview with `PROMO_LIMIT_MAX_PERCENT`.
+    const blocked80 = await adminCall.caller.admin
+      .create({
+        name: "Combinable 80%",
+        label: "VIP 80%",
+        type: "percent",
+        percentBps: 8_000,
+        scope: { kind: "all" },
+        combineWithBundle: true,
+        code: "VIP-80-COMB",
+      })
+      .then(() => {
+        throw new Error("expected limit rejection");
+      }, (e: unknown) => extractSafeError(e));
+    expect(blocked80.safe?.reasonCode).toBe("PROMO_LIMIT_MAX_PERCENT");
+    expect(blocked80.safe?.details?.limit).toBe("maxDiscountPercent");
+
+    // Raising global limit to 90% allows creation and full combined discount (1,000 bundle + 80% of remaining 9,000 = 7,200 -> 8,200).
+    await adminCall.caller.admin.updateSettings({ maxDiscountPercent: 90 });
     await adminCall.caller.admin.create({
       name: "Combinable 80%",
       label: "VIP 80%",
@@ -467,25 +502,6 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       code: "VIP-80-COMB",
     });
 
-    const guardCapped = await mod.preview({
-      code: "VIP-80-COMB",
-      customerUserId: alice.id,
-      actorUserId: alice.id,
-      currency: "USD",
-      lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
-      subtotalMinor: 10_000,
-      bundleDiscountMinor: 1_000,
-      bundleLabel: "Bundle 10%",
-    });
-    expect(guardCapped).toMatchObject({
-      bundleDiscountMinor: 1_000,
-      promoDiscountMinor: 4_000,
-      discountMinor: 5_000,
-      totalMinor: 5_000,
-    });
-
-    // Raising global guard to 90% allows full combined discount (1,000 bundle + 80% of remaining 9,000 = 7,200 -> 8,200).
-    await adminCall.caller.admin.updateSettings({ maxDiscountPercent: 90 });
     const raised = await mod.preview({
       code: "VIP-80-COMB",
       customerUserId: alice.id,
@@ -502,6 +518,24 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
       discountMinor: 8_200,
       totalMinor: 1_800,
     });
+
+    await adminCall.caller.admin.updateSettings({ maxDiscountPercent: 50 });
+    const guardRejected = await mod
+      .preview({
+        code: "VIP-80-COMB",
+        customerUserId: alice.id,
+        actorUserId: alice.id,
+        currency: "USD",
+        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 10_000 }],
+        subtotalMinor: 10_000,
+        bundleDiscountMinor: 1_000,
+        bundleLabel: "Bundle 10%",
+      })
+      .then(() => {
+        throw new Error("expected limit rejection");
+      }, (e: unknown) => extractSafeError(e));
+    expect(guardRejected.safe?.reasonCode).toBe("PROMO_LIMIT_MAX_PERCENT");
+    expect(guardRejected.safe?.details?.limit).toBe("maxDiscountPercent");
 
     // 3. Fixed code larger than eligible subtotal + 100% guard never produces a negative total.
     await adminCall.caller.admin.updateSettings({ maxDiscountPercent: 100 });
@@ -1106,35 +1140,31 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     );
     expect(thirdRedeem.promoDiscountMinor).toBe(1_000);
 
-    // 2. Global 50% guard floors ($0.01 subtotal = 1 minor unit -> max guard is floor(0.5) = 0, never 100%!).
+    // 2. Global 50% limit floors ($0.01 subtotal = 1 minor unit -> max guard is floor(0.5) = 0, rejecting 50% rounding up to 100%!).
     await adminCall.caller.admin.create({
-      name: "100% Promo Under 50% Guard",
-      label: "100% Promo",
+      name: "50% Promo Under 50% Guard",
+      label: "50% Promo",
       type: "percent",
-      percentBps: 10_000,
+      percentBps: 5_000,
       maxRedemptions: 1,
       maxPerCustomer: 1,
       combineWithBundle: false,
       scope: { kind: "all" },
-      code: "HUNDRED-26",
+      code: "FIFTY-26",
     });
 
-    const oneCentPreview = await mod.preview({
-      code: "HUNDRED-26",
-      customerUserId: bob.id,
-      actorUserId: bob.id,
-      currency: "USD",
-      lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 1 }],
-      subtotalMinor: 1,
-      bundleDiscountMinor: 0,
-      bundleLabel: null,
-    });
-    expect(oneCentPreview).toMatchObject({
-      promoDiscountMinor: 0,
-      discountMinor: 0,
-      discountLabel: "",
-      totalMinor: 1,
-    });
+    await expect(
+      mod.preview({
+        code: "FIFTY-26",
+        customerUserId: bob.id,
+        actorUserId: bob.id,
+        currency: "USD",
+        lines: [{ productPublicId: sampleProductA, packetNumber: 1, tierKey: "Basic", lineTotalMinor: 1 }],
+        subtotalMinor: 1,
+        bundleDiscountMinor: 0,
+        bundleLabel: null,
+      }),
+    ).rejects.toMatchObject({ reasonCode: "PROMO_LIMIT_MAX_PERCENT" });
 
     // Bundle beats non-combinable 10% promo (bundle 2,000 vs promo 1,000): `redeemInTx` leaves code UNUSED!
     await adminCall.caller.admin.create({
@@ -1283,7 +1313,7 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
     ).rejects.toMatchObject({ reasonCode: "PROMO_NOT_APPLICABLE" });
 
     const validBetweenFailures = await mod.preview({
-      code: "HUNDRED-26",
+      code: "FIFTY-26",
       customerUserId: dave.id,
       actorUserId: dave.id,
       currency: "USD",
@@ -1332,5 +1362,263 @@ describe("server/modules/promotions (Increment 05, Package C1)", () => {
         ),
       ),
     ).rejects.toMatchObject({ reasonCode: "PROMO_ATTEMPTS_BLOCKED" });
+  });
+
+  describe("Increment 06 D5 — policy limits, two-decimal percent, set_total, allocation", () => {
+    const lineFor = (lineTotalMinor: number, productPublicId = sampleProductA) => ({
+      productPublicId,
+      packetNumber: 1,
+      tierKey: "Basic",
+      lineTotalMinor,
+    });
+
+    it("parses legacy stored promotions.policy values with defaults and never throws", async () => {
+      expect(parsePromotionsPolicy({ maxDiscountPercent: 50 })).toEqual({
+        maxDiscountPercent: 50,
+        maxFixedAmountMinor: null,
+        allowZeroTotal: true,
+        minOrderTotalAfterDiscountMinor: 0,
+      });
+      for (const legacy of [{}, null, undefined, "garbage", { maxDiscountPercent: "bad" }, { maxDiscountPercent: 0 }]) {
+        expect(() => parsePromotionsPolicy(legacy)).not.toThrow();
+        expect(parsePromotionsPolicy(legacy).allowZeroTotal).toBe(true);
+      }
+      expect(PROMOTIONS_POLICY_SETTING.schema.safeParse({ maxDiscountPercent: 50 }).success).toBe(true);
+      expect(parsePromotionsPolicy({ maxDiscountPercent: 50.25 }).maxDiscountPercent).toBe(50.25);
+
+      // Installed site upgraded in place: old row `{ maxDiscountPercent: 50 }` is read cleanly via getSettings.
+      await tdb.db.insert(platformSettings).values({
+        settingKey: PROMOTIONS_POLICY_SETTING.key,
+        kind: "value",
+        valueJson: { maxDiscountPercent: 50 },
+      });
+      const admin = await seedUser({ email: "admin-d5a@synthetic.test", role: "admin", stepUp: true });
+      const s = await callerFor(admin.principal).caller.admin.getSettings();
+      expect(s).toMatchObject({
+        maxDiscountPercent: 50,
+        maxDiscountBps: 5_000,
+        maxFixedAmountMinor: null,
+        allowZeroTotal: true,
+        minOrderTotalAfterDiscountMinor: 0,
+      });
+    });
+
+    it("supports two-decimal percent, set_total test orders, fixed-zero hint, limit rejections, and canReachZero", async () => {
+      const admin = await seedUser({ email: "admin-d5b@synthetic.test", role: "admin", stepUp: true });
+      const alice = await seedUser({ email: "alice-d5b@synthetic.test", role: "customer" });
+      const adminCall = callerFor(admin.principal);
+      await adminCall.caller.admin.updateSettings({ enabled: true, maxDiscountPercent: 50.25 });
+      expect((await adminCall.caller.admin.getSettings()).maxDiscountBps).toBe(5_025);
+
+      const ctx = (code: string, subtotal: number) => ({
+        code,
+        customerUserId: alice.id,
+        actorUserId: alice.id,
+        currency: "USD",
+        lines: [lineFor(subtotal)],
+        subtotalMinor: subtotal,
+        bundleDiscountMinor: 0,
+        bundleLabel: null,
+      });
+
+      // 50.25% code is allowed at 50.25% limit; 10,000 * 50.25% = 5,025.
+      await adminCall.caller.admin.create({
+        name: "Two decimal", label: "Two decimal", type: "percent", percentBps: 5_025,
+        scope: { kind: "all" }, code: "TWODEC-5025",
+      });
+      expect((await mod.preview(ctx("TWODEC-5025", 10_000))).discountMinor).toBe(5_025);
+
+      // 0.01% on 10,000 = 1 (half-up of exactly 1.0).
+      await adminCall.caller.admin.create({
+        name: "Tiny", label: "Tiny percent", type: "percent", percentBps: 1,
+        scope: { kind: "all" }, code: "TINY-0001",
+      });
+      expect((await mod.preview(ctx("TINY-0001", 10_000))).discountMinor).toBe(1);
+
+      // 50.26% exceeds limit at creation.
+      const over = await adminCall.caller.admin
+        .create({ name: "Over", label: "Over", type: "percent", percentBps: 5_026, scope: { kind: "all" }, code: "OVER-5026" })
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(over.safe?.reasonCode).toBe("PROMO_LIMIT_MAX_PERCENT");
+      expect(over.safe?.details?.limitsHref).toBe("/admin/promotions#limits");
+
+      await adminCall.caller.admin.updateSettings({ maxDiscountPercent: 100 });
+
+      // Fixed 0 -> hint to use set_total.
+      const zeroFixed = await adminCall.caller.admin
+        .create({ name: "Zero fixed", label: "Zero fixed", type: "fixed", amountMinor: 0, currency: "USD", scope: { kind: "all" }, code: "ZERO-FIXED" })
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(zeroFixed.safe?.reasonCode).toBe("PROMO_ZERO_FIXED_USE_SET_TOTAL");
+
+      // set_total $0.00 and $0.01.
+      const zeroCreated = await adminCall.caller.admin.create({
+        name: "Test order zero", label: "Test order", type: "set_total", setTotalMinor: 0,
+        currency: "USD", scope: { kind: "all" }, code: "SETZERO-01", maxPerCustomer: 5,
+      });
+      expect(zeroCreated.promotion.canReachZero).toBe(true);
+      expect(zeroCreated.promotion.setTotalMinor).toBe(0);
+      const zeroOutcome = await mod.preview(ctx("SETZERO-01", 12_345));
+      expect(zeroOutcome).toMatchObject({ discountMinor: 12_345, totalMinor: 0 });
+      expect(zeroOutcome.discountLabel.length).toBeGreaterThan(0);
+
+      const pennyCreated = await adminCall.caller.admin.create({
+        name: "Test order penny", label: "Penny order", type: "set_total", setTotalMinor: 1,
+        currency: "USD", scope: { kind: "all" }, code: "SETPENNY-01",
+      });
+      expect(pennyCreated.promotion.canReachZero).toBe(false);
+      expect(await mod.preview(ctx("SETPENNY-01", 12_345))).toMatchObject({ discountMinor: 12_344, totalMinor: 1 });
+
+      // set_total above subtotal -> PROMO_MIN_SUBTOTAL.
+      const below = await mod
+        .preview({ ...ctx("SETPENNY-01", 1), lines: [lineFor(1)], subtotalMinor: 1 })
+        .then((o) => o, (e: unknown) => extractSafeError(e));
+      // subtotal 1 == setTotal 1 is allowed (discount 0); set_total $10 on $5 cart -> PROMO_MIN_SUBTOTAL.
+      expect(below).toMatchObject({ totalMinor: 1 });
+      await adminCall.caller.admin.create({
+        name: "Ten total", label: "Ten total", type: "set_total", setTotalMinor: 1_000,
+        currency: "USD", scope: { kind: "all" }, code: "SETTEN-01",
+      });
+      const shortErr = await mod
+        .preview(ctx("SETTEN-01", 500))
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(shortErr.safe?.reasonCode).toBe("PROMO_MIN_SUBTOTAL");
+      expect(shortErr.safe?.details?.shortfallMinor).toBe(500);
+
+      // Percent canReachZero: 100% true, 99.99% false.
+      const p100 = await adminCall.caller.admin.create({ name: "P100", label: "P100", type: "percent", percentBps: 10_000, scope: { kind: "all" }, code: "PCT-10000" });
+      const p9999 = await adminCall.caller.admin.create({ name: "P9999", label: "P9999", type: "percent", percentBps: 9_999, scope: { kind: "all" }, code: "PCT-9999" });
+      expect(p100.promotion.canReachZero).toBe(true);
+      expect(p9999.promotion.canReachZero).toBe(false);
+      const list = await adminCall.caller.admin.list({});
+      expect(list.items.find((i) => i.publicId === zeroCreated.promotion.publicId)?.canReachZero).toBe(true);
+
+      // allowZeroTotal = false: preview of zero-capable code rejects; creating a new zero-capable code rejects.
+      await adminCall.caller.admin.updateSettings({ allowZeroTotal: false });
+      const custZero = await mod
+        .preview(ctx("SETZERO-01", 5_000))
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(custZero.safe?.reasonCode).toBe("PROMO_LIMIT_ZERO_TOTAL");
+      expect(custZero.safe?.details?.limit).toBe("allowZeroTotal");
+      expect(custZero.safe?.details?.limitsHref).toBeUndefined();
+      const createZero = await adminCall.caller.admin
+        .create({ name: "Z2", label: "Z2", type: "set_total", setTotalMinor: 0, currency: "USD", scope: { kind: "all" }, code: "SETZERO-02" })
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(createZero.safe?.reasonCode).toBe("PROMO_LIMIT_ZERO_TOTAL");
+      await adminCall.caller.admin.updateSettings({ allowZeroTotal: true });
+
+      // minOrderTotalAfterDiscountMinor.
+      await adminCall.caller.admin.updateSettings({ minOrderTotalAfterDiscountMinor: 500 });
+      const minTotal = await mod
+        .preview(ctx("SETPENNY-01", 5_000))
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(minTotal.safe?.reasonCode).toBe("PROMO_LIMIT_MIN_TOTAL");
+      expect(minTotal.safe?.details?.limit).toBe("minOrderTotalAfterDiscountMinor");
+      await adminCall.caller.admin.updateSettings({ minOrderTotalAfterDiscountMinor: 0 });
+
+      // maxFixedAmountMinor.
+      await adminCall.caller.admin.create({ name: "F30", label: "Thirty off", type: "fixed", amountMinor: 3_000, currency: "USD", scope: { kind: "all" }, code: "FIXED-3000" });
+      await adminCall.caller.admin.updateSettings({ maxFixedAmountMinor: 2_000 });
+      const fixedOver = await mod
+        .preview(ctx("FIXED-3000", 10_000))
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(fixedOver.safe?.reasonCode).toBe("PROMO_LIMIT_MAX_FIXED");
+      expect(fixedOver.safe?.details?.limit).toBe("maxFixedAmountMinor");
+      const fixedCreateOver = await adminCall.caller.admin
+        .create({ name: "F25", label: "Twenty five off", type: "fixed", amountMinor: 2_500, currency: "USD", scope: { kind: "all" }, code: "FIXED-2500" })
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(fixedCreateOver.safe?.reasonCode).toBe("PROMO_LIMIT_MAX_FIXED");
+
+      const settingsEvents = h.audit.events.filter((e) => e.eventName === "promotion.settings_updated");
+      expect(settingsEvents.length).toBeGreaterThanOrEqual(6);
+    });
+
+    it("rejects set_total when an ineligible line is mixed in", async () => {
+      const admin = await seedUser({ email: "admin-d5c@synthetic.test", role: "admin", stepUp: true });
+      const alice = await seedUser({ email: "alice-d5c@synthetic.test", role: "customer" });
+      const adminCall = callerFor(admin.principal);
+      await adminCall.caller.admin.updateSettings({ enabled: true });
+      await adminCall.caller.admin.create({
+        name: "Scoped set", label: "Scoped set", type: "set_total", setTotalMinor: 0, currency: "USD",
+        scope: { kind: "products", productPublicIds: [sampleProductA] }, code: "SCOPED-SET",
+      });
+      const other = ulid();
+      const err = await mod
+        .preview({
+          code: "SCOPED-SET", customerUserId: alice.id, actorUserId: alice.id, currency: "USD",
+          lines: [lineFor(5_000), lineFor(3_000, other)], subtotalMinor: 8_000, bundleDiscountMinor: 0, bundleLabel: null,
+        })
+        .then(() => { throw new Error("expected"); }, (e: unknown) => extractSafeError(e));
+      expect(err.safe?.reasonCode).toBe("PROMO_NOT_ELIGIBLE_ITEMS");
+    });
+
+    it("property test: single half-up rounding and allocation invariants over seeded random carts", () => {
+      expect(roundHalfUpBps(1, 5_000)).toBe(1);
+      expect(roundHalfUpBps(3, 3_333)).toBe(1);
+      expect(allocateMinorAcrossCapacities(200, [100, 100, 1])).toEqual([99, 100, 1]);
+      expect(allocateMinorAcrossCapacities(1_000, [1_000, 1_000, 1_000])).toEqual([333, 333, 334]);
+
+      let seed = 0x5eed_d5;
+      const rnd = (n: number) => {
+        seed = (seed * 1_103_515_245 + 12_345) & 0x7fff_ffff;
+        return seed % n;
+      };
+      const types = ["percent", "fixed", "set_total"] as const;
+      for (let iter = 0; iter < 800; iter += 1) {
+        const n = 1 + rnd(8);
+        const lines = Array.from({ length: n }, (_, i) => ({
+          productPublicId: `P${i}`,
+          packetNumber: 1,
+          tierKey: "basic",
+          lineTotalMinor: rnd(4) === 0 ? 1 : 1 + rnd(50_000),
+        }));
+        if (iter === 0) {
+          lines.splice(0, lines.length, ...[100, 100, 1].map((v, i) => ({ productPublicId: `P${i}`, packetNumber: 1, tierKey: "basic", lineTotalMinor: v })));
+        }
+        const subtotal = lines.reduce((a, l) => a + l.lineTotalMinor, 0);
+        const type = types[rnd(3)]!;
+        const scoped = type !== "set_total" && rnd(3) === 0;
+        const mask = lines.map((_, i) => !scoped || i % 2 === 0);
+        const bundle = rnd(3) === 0 ? rnd(subtotal + 1) : 0;
+        const setTotal = iter === 0 ? 1 : rnd(subtotal + 1);
+        const outcome = computePromotionPricing(
+          {
+            publicId: "PROMO",
+            label: "Label",
+            discountType: type,
+            percentBps: type === "percent" ? 1 + rnd(10_000) : null,
+            maxDiscountMinor: type === "percent" && rnd(2) === 0 ? 1 + rnd(subtotal) : null,
+            fixedAmountMinor: type === "fixed" ? 1 + rnd(subtotal * 2) : null,
+            setTotalMinor: type === "set_total" ? setTotal : null,
+            combineWithBundle: rnd(2) === 0,
+            scopeKind: scoped ? "products" : "all",
+          },
+          { lines, subtotalMinor: subtotal, bundleDiscountMinor: bundle, bundleLabel: "Bundle" },
+          mask,
+        );
+        const allocs = outcome.lineAllocations!;
+        expect(outcome.totalMinor).toBeGreaterThanOrEqual(0);
+        expect(outcome.totalMinor).toBe(subtotal - outcome.discountMinor);
+        expect(outcome.discountMinor).toBe(outcome.bundleDiscountMinor + outcome.promoDiscountMinor);
+        expect(outcome.discountLabel.trim().length).toBeGreaterThan(0);
+        expect(allocs.reduce((a, l) => a + l.discountMinor, 0)).toBe(outcome.discountMinor);
+        expect(allocs.reduce((a, l) => a + l.netMinor, 0)).toBe(outcome.totalMinor);
+        expect(allocs.reduce((a, l) => a + l.promoDiscountMinor, 0)).toBe(outcome.promoDiscountMinor);
+        for (const [i, a] of allocs.entries()) {
+          expect(a.netMinor).toBeGreaterThanOrEqual(0);
+          expect(a.discountMinor).toBeGreaterThanOrEqual(0);
+          expect(a.discountMinor).toBeLessThanOrEqual(a.grossMinor);
+          if (!mask[i]) expect(a.promoDiscountMinor).toBe(0);
+        }
+        if (type === "set_total" && bundle <= subtotal - setTotal) {
+          // Never below target unless bundle alone already went below it.
+          expect(outcome.totalMinor).toBeGreaterThanOrEqual(
+            Math.min(setTotal, subtotal - outcome.bundleDiscountMinor),
+          );
+        }
+        if (iter === 0) {
+          expect(allocs.map((a) => a.netMinor).every((v) => v >= 0)).toBe(true);
+        }
+      }
+    });
   });
 });

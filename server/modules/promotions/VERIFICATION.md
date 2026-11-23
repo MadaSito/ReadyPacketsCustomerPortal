@@ -4,7 +4,7 @@ Owner: `siem_engineer` (`server/modules/promotions/**`)
 
 ## Commands Executed
 
-- `scripts/dev/test.sh server/modules/promotions/promotions.test.ts` — 7/7 tests passing against real MySQL (`createTestDb`).
+- `scripts/dev/test.sh server/modules/promotions/promotions.test.ts` — 11/11 tests passing against real MySQL (`createTestDb`), including Increment 06 D5 policy limits, legacy stored setting upgrade, `set_total`, two-decimal percentages, `canReachZero`, and an 800-case seeded rounding/allocation property test.
 - `scripts/dev/test.sh server/modules/orders/promotions.test.ts` — 12/12 cross-module Orders + Promotions integration tests passing against real MySQL.
 - `scripts/dev/test.sh server/modules/cart/cartUpsellPromo.test.ts` — 4/4 cross-module Cart + Promotions integration tests passing against real MySQL.
 - `scripts/dev/tc.sh` — workspace-wide TypeScript check.
@@ -25,6 +25,9 @@ Owner: `siem_engineer` (`server/modules/promotions/**`)
 | `firstOrderOnly` checks all historical `orders` rows (`FOR SHARE`), including cancelled orders | `service.ts` (`evaluateCode`) | `reuses smallest free slot after non-last release...` (`FIRST-STRICT` against cancelled historical order) |
 | CSPRNG single-use batch generation (unambiguous alphabet, 12 random chars, idempotent replay + `IDEMPOTENCY_KEY_MISMATCH`), formula-safe CSV exports (`exportCodes` `/promo#promo=...`, `exportRedemptions`) | `codes.ts`, `service.ts` (`generateBatch`, `exportCodes`, `exportRedemptions`) | `generates idempotent CSPRNG single-use batches, neutralizes CSV formulas, and enforces G-C3-02 release fence` |
 | Strictly conservative G-C3-02 release fence (`isCancelState` against bound `order_workflow_versions.definition` + `grossPaidMinor === 0`, `!payableInvoiceOpen`, `!providerCapturePending`, `!providerAttemptEver`) | `service.ts` (`releaseForOrderInTx`, `releaseRedemption`) | `generates idempotent CSPRNG single-use batches, neutralizes CSV formulas, and enforces G-C3-02 release fence` |
+| Increment 06 D5 `promotions.policy` limits (`maxDiscountPercent` `0.01..100` default `100`, `maxFixedAmountMinor` default `null`, `allowZeroTotal` default `true`, `minOrderTotalAfterDiscountMinor` default `0`) + seamless upgrade parsing of legacy stored `{ maxDiscountPercent: 50 }` | `settings.ts` (`PROMOTIONS_POLICY_SETTING`, `parsePromotionsPolicy`), `service.ts` | `parses legacy stored promotions.policy values with defaults and never throws` |
+| Increment 06 D5 two-decimal percentages (`percentBps` `1..10_000`), `set_total` (`$0.00` & `$0.01` test orders, mixed ineligible line refusal), `PROMO_ZERO_FIXED_USE_SET_TOTAL` hint, explicit `PROMO_LIMIT_*` rejection codes (`limitsHref` gated to staff/admin), `canReachZero` list flag, and live-session step-up re-validation | `schema.ts`, `contracts.ts`, `service.ts` | `supports two-decimal percent, set_total test orders, fixed-zero hint, limit rejections, and canReachZero` + `rejects set_total when an ineligible line is mixed in` |
+| Increment 06 D5 single half-up rounding & largest-remainder per-line allocation (`sum(discountMinor) === discountMinor`, `sum(netMinor) === totalMinor`, `netMinor >= 0` for every line) | `service.ts` (`computePromotionPricing`, `allocateAcrossLines`) | `property test: single half-up rounding and allocation invariants over seeded random carts` |
 
 ## What Is Not Verified Here
 
