@@ -9,6 +9,7 @@ import {
   isAllowedDocumentHref,
   sanitizeDocumentHtmlWithWarnings,
 } from "./sanitize";
+import { splitPipeRow } from "../pipeTable";
 
 const MAX_MARKDOWN_LINES = 25_000;
 
@@ -63,10 +64,7 @@ function renderInlineMarkdown(escapedLine: string, warnings: Set<string>): strin
   });
 }
 
-function splitTableRow(line: string): string[] {
-  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
-  return trimmed.split("|").map((cell) => cell.trim());
-}
+const splitTableRow = splitPipeRow;
 
 function parseTableSeparator(line: string): Array<"left" | "center" | "right" | null> | null {
   const trimmed = line.trim();
@@ -383,6 +381,8 @@ export function htmlToMarkdown(sanitizedHtml: string): string {
             Array.from(c.childNodes)
               .map(serializeInlineToMarkdown)
               .join("")
+              // Escape backslashes before pipes so an existing backslash cannot cancel the pipe escape.
+              .replace(/\\/g, "\\\\")
               .replace(/\|/g, "\\|")
               .replace(/\s*\n\s*/g, " ")
               .trim(),

@@ -6,6 +6,7 @@
  * and safe `https://`, `mailto:`, or same-origin `/...` links.
  */
 import { type ReactNode } from "react";
+import { splitPipeRow } from "../pipeTable";
 
 export type SafePolicyContentFormat = "plain_text" | "safe_markdown";
 
@@ -78,12 +79,6 @@ function renderInlineSafe(text: string): ReactNode[] {
     nodes.push(text.slice(lastIndex));
   }
   return nodes;
-}
-
-function splitPipeRow(line: string): string[] {
-  const trimmed = line.trim();
-  const stripped = trimmed.replace(/^\|/, "").replace(/\|$/, "");
-  return stripped.split("|").map((cell) => cell.trim());
 }
 
 function isTableSeparatorLine(line: string): boolean {

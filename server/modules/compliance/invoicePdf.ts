@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import type { InvoiceStatus, ReceiptNoteRefundState, ReceiptSettlementKind } from "./schema.js";
@@ -349,14 +349,20 @@ export function loadAllowlistedBrandLogo(brandPath: string | null | undefined): 
       parsedLogoCache.set(brandPath, null);
       return null;
     }
-    const stat = statSync(candidate);
-    if (!stat.isFile() || stat.size > MAX_LOGO_PNG_BYTES) {
-      parsedLogoCache.set(brandPath, null);
-      return null;
+    // Check and read through one descriptor so the file cannot change between the size check and the read.
+    const fd = openSync(candidate, "r");
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > MAX_LOGO_PNG_BYTES) {
+        parsedLogoCache.set(brandPath, null);
+        return null;
+      }
+      const decoded = parsePngForPdf(readFileSync(fd));
+      parsedLogoCache.set(brandPath, decoded);
+      return decoded;
+    } finally {
+      closeSync(fd);
     }
-    const decoded = parsePngForPdf(readFileSync(candidate));
-    parsedLogoCache.set(brandPath, decoded);
-    return decoded;
   } catch {
     parsedLogoCache.set(brandPath, null);
     return null;
