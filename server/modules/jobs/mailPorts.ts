@@ -14,6 +14,7 @@ export interface MailTransportMessage {
   subject: string;
   text: string;
   html: string;
+  attachments?: OutboundMail["attachments"];
   signal: AbortSignal;
 }
 

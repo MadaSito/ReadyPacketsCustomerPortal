@@ -17,6 +17,10 @@ export type {
 } from "./mailPorts.js";
 export { REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, registerRefundReconciliation } from "./refundSupport.js";
 export type { RefundReconcileContext, RefundReconciler } from "./refundSupport.js";
+export { enqueuePolicyNoticeMail, policyNoticeMailKey, registerPolicyNoticeJobs } from "./policyNoticeJobs.js";
+export type { PolicyNoticeBatch, PolicyNoticeBatchInput, PolicyNoticeMailState } from "./policyNoticeJobs.js";
+export { enqueuePaymentReceipt } from "./receiptMail.js";
+export type { PaymentReceiptMailInput } from "./receiptMail.js";
 export type JobsModule = ReturnType<typeof createJobsAdmin> & ModuleLifecycle & {
   startWorker(): Promise<WorkerHandle>;
   registerMailTransport(transport: MailTransport): void;

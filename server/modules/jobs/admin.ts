@@ -7,6 +7,7 @@ import { roleHasCapability, STEP_UP_CAPABILITIES, type Capability } from "../../
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { createCustomerMaintenance } from "./customerMaintenance.js";
 import { allowsMailCapture, mailAudit, mailEngineFor } from "./mail.js";
+import { readPolicyNoticeMailStates } from "./policyNoticeJobs.js";
 import { engineFor, ensureMaintenanceGate, gateDraining, jobAudit, MAINTENANCE_ID } from "./queue.js";
 import { type JOB_STATES, jobAttempts, jobMaintenance, jobRuns, type MAIL_STATES, mailAttempts, mailManualResends, mailOutbox, mailTransportAttempts } from "./schema.js";
 
@@ -174,6 +175,7 @@ export function createJobsAdmin(deps: ModuleDeps) {
 
   return {
     isDraining,
+    policyNoticeMailStates: (keys: readonly string[], tx?: Tx) => readPolicyNoticeMailStates(db, keys, tx),
     // Always acquire this lock before locking the caller's outbox row. Never settle or mutate the prior job here.
     async canReplaceFailedOutboxJob(jobPublicId: string, expectedJobType: string, tx: Tx): Promise<boolean> {
       const row = await lockJob(tx, jobPublicId);

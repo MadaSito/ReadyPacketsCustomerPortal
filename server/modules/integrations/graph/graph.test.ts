@@ -756,6 +756,7 @@ describe("increment 03 — Graph client, cloud egress presets, mail failover cla
 
     // 202 Accepted uses authoritative `message.sender` (`fromAddress`, `fromName`, `replyToAddress`)
     graphMailBehavior = "202";
+    const receiptPdf = Buffer.from("%PDF-1.7\n");
     const graphAccepted = await registeredTransport!.send({
       sender: {
         fromAddress: "shared-sender@readypackets.example",
@@ -766,6 +767,7 @@ describe("increment 03 — Graph client, cloud egress presets, mail failover cla
       subject: "Welcome",
       text: "Hi",
       html: "<p>Hi</p>",
+      attachments: [{ filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: receiptPdf }],
       signal: new AbortController().signal,
     });
     expect(graphAccepted.outcome).toBe("accepted");
@@ -777,6 +779,10 @@ describe("increment 03 — Graph client, cloud egress presets, mail failover cla
         from: { emailAddress: { address: "shared-sender@readypackets.example", name: "Shared ReadyPackets" } },
         replyTo: [{ emailAddress: { address: "support@readypackets.example" } }],
         toRecipients: [{ emailAddress: { address: "customer@example.com" } }],
+        attachments: [{
+          "@odata.type": "#microsoft.graph.fileAttachment", name: "RPR-2026-000032.pdf",
+          contentType: "application/pdf", contentBytes: receiptPdf.toString("base64"),
+        }],
       },
     });
 

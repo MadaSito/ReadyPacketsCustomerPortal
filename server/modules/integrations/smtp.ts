@@ -15,7 +15,7 @@ import nodemailer from "nodemailer";
 import type { Capability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
 import { DomainError, forbidden, validation } from "../../core/errors.js";
-import type { SessionPrincipal, SettingsStore, Tx } from "../../core/types.js";
+import type { OutboundMailAttachment, SessionPrincipal, SettingsStore, Tx } from "../../core/types.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../platform/index.js";
 import { flagKey } from "../platform/settingsRegistry.js";
 import { assertAdminStepUpAnyInTx, assertAdminStepUpAnyPreflight } from "./authz.js";
@@ -87,6 +87,7 @@ export interface SmtpSendInput {
   subject: string;
   text: string;
   html: string;
+  attachments?: readonly OutboundMailAttachment[];
   signal: AbortSignal;
 }
 
@@ -129,6 +130,7 @@ export interface SmtpTransportMessage {
   subject: string;
   text: string;
   html: string;
+  attachments?: OutboundMailAttachment[];
 }
 
 export interface SmtpTransportAdapter {
@@ -161,6 +163,8 @@ const defaultTransportFactory: SmtpTransportFactory = (options) =>
     greetingTimeout: options.greetingTimeout,
     socketTimeout: options.socketTimeout,
     tls: options.tls,
+    disableFileAccess: true,
+    disableUrlAccess: true,
   });
 
 function isCompleteSmtpEndpoint(cfg: SmtpConfigSetting, hasPassword: boolean): boolean {
@@ -827,6 +831,9 @@ export function createSmtpService(
           subject: input.subject,
           text: input.text,
           html: input.html,
+          ...(input.attachments ? { attachments: input.attachments.map(({ filename, content, contentType }) => ({
+            filename, content, contentType,
+          })) } : {}),
         });
         const acceptedCount = Array.isArray(info.accepted) ? info.accepted.length : 0;
         if (acceptedCount > 0) {

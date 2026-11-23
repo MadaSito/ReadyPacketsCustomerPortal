@@ -13,7 +13,9 @@ import { createJobsModule } from "./index.js";
 import { MAIL_CAPTURE, mailEngineFor, type SmtpDeliveryResult } from "./mail.js";
 import type { MailTransportMessage } from "./mailPorts.js";
 import { MAIL_AUDIT_COPY, MAIL_RETAIN_CONTENT, MAIL_RETENTION_DAYS, MAIL_ROUTING, MAIL_SENDER } from "./mailSettings.js";
+import { enqueuePolicyNoticeMail, policyNoticeMailKey, registerPolicyNoticeJobs } from "./policyNoticeJobs.js";
 import { createJobQueue, createMailer, engineFor, JOB_TYPE } from "./queue.js";
+import { enqueuePaymentReceipt, PAYMENT_RECEIPT_TEMPLATE, RECEIPT_PDF_MAX_BYTES } from "./receiptMail.js";
 import {
   REFUND_NOTICE_TEMPLATE_KEY, REFUND_RECONCILE_JOB, REFUND_RECONCILE_MAX_ATTEMPTS,
   registerRefundNotice, registerRefundReconciliation, type RefundReconcileContext,
@@ -60,6 +62,76 @@ function fixture(profile: Parameters<typeof createTestDeps>[0] = {}, useDurableA
   h.services.identity = { sessions: { assertCurrent } } as unknown as typeof h.services.identity;
   return { h, jobs, engine, mailer, mail, admin, operator, assertCurrent, durableAudit };
 }
+
+const noticePublicId = "01JD0000000000000000000001";
+const reminderPublicId = "01JD0000000000000000000002";
+const policyMailInput = {
+  kind: "update" as const, policyVersionPublicId: noticePublicId, recipientUserId: 22,
+  policyTitle: "Access policy", portalUrl: "https://portal.example.test/policies", summary: "Updated summary.",
+};
+const receiptInput = {
+  receiptPublicId: noticePublicId, recipientUserId: 22,
+  receiptNumber: "RPR-2026-000032", pdf: Buffer.from("%PDF-1.7\nPRIVATE-RECEIPT\n%%EOF"),
+};
+
+describe("Scheduled policy notice batches", () => {
+  it("rolls back staged mail and progress on failure, retries with backoff, and chains a single delayed successor", async () => {
+    const f = fixture();
+    f.mail.registerDelivery({ findRecipient: async () => null, getLegacySender: async () => null });
+    const runBatch = vi.fn<Parameters<typeof registerPolicyNoticeJobs>[1]>();
+    runBatch.mockImplementation(async ({ cursor }, _claim, tx) => {
+      if (cursor === null) {
+        await enqueuePolicyNoticeMail(f.mailer, policyMailInput, tx);
+        if (runBatch.mock.calls.length === 1) throw new Error("synthetic batch error");
+      }
+      return { nextCursor: cursor === null ? "22" : null };
+    });
+    const schedule = registerPolicyNoticeJobs({ ...f.h.deps, jobs: f.jobs }, runBatch);
+    const input = { noticePublicId, revision: 1, scheduledAt: new Date(f.h.clock.now().getTime() + 60_000) };
+    await expect(t.db.transaction(async (tx) => {
+      await schedule(input, tx);
+      throw new Error("publish rollback");
+    })).rejects.toThrow("publish rollback");
+    expect(await t.db.select().from(jobRuns)).toHaveLength(0);
+    const first = await schedule(input);
+    expect(await schedule(input)).toEqual(first);
+    expect(await f.engine.claim()).toBeNull();
+    f.h.clock.advance(60_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(await t.db.select().from(mailOutbox)).toHaveLength(0);
+    expect(await f.admin.detail(f.operator, first.jobId)).toMatchObject({ state: "queued", attempt: 1 });
+    expect(await f.engine.claim()).toBeNull();
+    f.h.clock.advance(5_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(runBatch.mock.calls[1]?.[0]).toEqual({ noticePublicId, revision: 1, cursor: null, limit: 25 });
+    expect(await t.db.select().from(mailOutbox)).toHaveLength(1);
+    await f.engine.execute((await f.engine.claim())!); // mail is independently dispatched
+    expect(await f.engine.claim()).toBeNull();
+    f.h.clock.advance(5_000);
+    await f.engine.execute((await f.engine.claim())!);
+    expect(runBatch.mock.calls[2]?.[0]).toMatchObject({ cursor: "22" });
+    expect(runBatch.mock.calls[2]?.[1].correlationId).toBe(runBatch.mock.calls[1]?.[1].correlationId);
+    expect(await f.engine.claim()).toBeNull();
+  });
+
+  it("defers a rate-limited batch without running the writer or consuming its backoff attempts", async () => {
+    const f = fixture();
+    const consume = vi.spyOn(f.h.rateLimiter, "consume").mockResolvedValueOnce({ allowed: false, retryAfterSeconds: 10 });
+    const runBatch = vi.fn(async () => ({ nextCursor: null }));
+    const schedule = registerPolicyNoticeJobs({ ...f.h.deps, jobs: f.jobs }, runBatch);
+    await schedule({ noticePublicId, revision: 1, scheduledAt: f.h.clock.now() });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(consume).toHaveBeenCalledWith("expensive", "jobs:policy-notice-batch", 1);
+    expect(runBatch).not.toHaveBeenCalled();
+    f.h.clock.advance(9_999);
+    expect(await f.engine.claim()).toBeNull();
+    f.h.clock.advance(1);
+    const claim = (await f.engine.claim())!;
+    expect(claim.job.attempt).toBe(1);
+    await f.engine.execute(claim);
+    expect(runBatch).toHaveBeenCalledOnce();
+  });
+});
 
 describe("Outbox generation replacement", () => {
   const type = "storage.copy_order_file";
@@ -687,6 +759,114 @@ describe("MySQL transactional mail outbox", () => {
     });
     return { send, findRecipient };
   }
+
+  it("deduplicates notice mail by version, user and reminder and projects safe progress states", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    const { kind, policyVersionPublicId, recipientUserId } = policyMailInput;
+    const key = policyNoticeMailKey({ kind, policyVersionPublicId, recipientUserId });
+    const reminderKey = policyNoticeMailKey({ kind, policyVersionPublicId, recipientUserId, reminderPublicId });
+    const missingKey = policyNoticeMailKey({ kind: "warning", policyVersionPublicId, recipientUserId });
+    await enqueuePolicyNoticeMail(f.mailer, policyMailInput);
+    await enqueuePolicyNoticeMail(f.mailer, policyMailInput);
+    await enqueuePolicyNoticeMail(f.mailer, { ...policyMailInput, reminderPublicId });
+    expect(await f.admin.policyNoticeMailStates([key, reminderKey, missingKey])).toEqual(new Map([[key, "queued"], [reminderKey, "queued"]]));
+    await f.engine.execute((await f.engine.claim())!);
+    await t.db.update(mailOutbox).set({ state: "unknown" }).where(eq(mailOutbox.state, "queued"));
+    expect(await f.admin.policyNoticeMailStates([key, reminderKey])).toEqual(new Map([[key, "sent"], [reminderKey, "failed"]]));
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      text: expect.stringContaining("Updated summary."), html: expect.stringContaining('lang="en"'),
+    }));
+    await expect(f.admin.policyNoticeMailStates(Array.from({ length: 251 }, () => key))).rejects.toMatchObject({
+      reasonCode: "POLICY_NOTICE_MAIL_KEYS_INVALID",
+    });
+  });
+
+  it("encrypts receipt PDF bytes and never puts the PDF or its filename in retained content, the audit copy or durable audit", async () => {
+    const f = fixture({}, true);
+    const { send } = setDelivery(f, "accepted");
+    const auditTo = "audit@example.test";
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    await f.h.settings.set(MAIL_AUDIT_COPY.key, { enabled: true, address: auditTo });
+    await t.db.insert(mailAuditVerification).values({
+      id: 1, addressHash: f.h.deps.crypto.blindIndex(auditTo, "mail.audit_copy.address"), verifiedAt: f.h.clock.now(),
+    });
+    await expect(t.db.transaction(async (tx) => {
+      await enqueuePaymentReceipt(f.mailer, receiptInput, tx);
+      throw new Error("receipt rollback");
+    })).rejects.toThrow("receipt rollback");
+    await enqueuePaymentReceipt(f.mailer, receiptInput);
+    await enqueuePaymentReceipt(f.mailer, receiptInput);
+    const rows = await t.db.select().from(mailOutbox);
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    const ciphertext = row.payloadEnc!;
+    expect(ciphertext).not.toContain(receiptInput.pdf.toString("base64"));
+    expect(ciphertext).not.toContain(receiptInput.receiptNumber);
+    expect(f.h.deps.crypto.decrypt(ciphertext, `mail_outbox.payload_enc:${row.publicId}`)).toContain(receiptInput.pdf.toString("base64"));
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send.mock.calls.map(([message]) => [message.to, message.attachments])).toEqual([
+      ["current@example.test", [{ filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: receiptInput.pdf }]],
+      [auditTo, undefined],
+    ]);
+    const [sent] = await t.db.select().from(mailOutbox);
+    expect(sent).toMatchObject({ state: "accepted", payloadEnc: null, captureEnc: null });
+    const retained = f.h.deps.crypto.decrypt(sent!.contentEnc!, `mail_outbox.content_enc:${row.publicId}`);
+    expect(retained).not.toMatch(/attachments|PRIVATE-RECEIPT|RPR-2026-000032/);
+    expect(send.mock.calls[1]?.[0].text).not.toContain(receiptInput.receiptNumber);
+    expect(JSON.stringify(await t.db.select().from(auditEvents))).not.toMatch(/contentBase64|PRIVATE-RECEIPT|RPR-2026-000032/);
+    await enqueuePaymentReceipt(f.mailer, { ...receiptInput, resendRequestPublicId: reminderPublicId });
+    await enqueuePaymentReceipt(f.mailer, { ...receiptInput, resendRequestPublicId: reminderPublicId });
+    expect(await t.db.select().from(mailOutbox)).toHaveLength(2);
+  });
+
+  it("rejects unsupported attachments and omits the PDF and receipt number from development capture", async () => {
+    const f = fixture({ config: { deploymentProfile: "test" } });
+    const { send } = setDelivery(f, "accepted");
+    const tooLarge = Buffer.alloc(RECEIPT_PDF_MAX_BYTES + 1);
+    receiptInput.pdf.copy(tooLarge);
+    await expect(enqueuePaymentReceipt(f.mailer, { ...receiptInput, pdf: Buffer.from("Not a PDF") }))
+      .rejects.toMatchObject({ reasonCode: "INVALID_MAIL_ATTACHMENT" });
+    const attachment = { filename: "RPR-2026-000032.pdf", contentType: "application/pdf", content: receiptInput.pdf } as const;
+    await expect(f.mailer.enqueue({ ...input, attachments: [attachment] })).rejects.toMatchObject({ reasonCode: "INVALID_MAIL_ATTACHMENT" });
+    const base = { template: PAYMENT_RECEIPT_TEMPLATE, to: { userId: 22 }, vars: { receiptNumber: receiptInput.receiptNumber }, idempotencyKey: "manual" };
+    for (const attachments of [[{ ...attachment, content: tooLarge }], [attachment, attachment],
+      [{ ...attachment, filename: "../RPR-2026-000032.pdf" }]]) {
+      await expect(f.mailer.enqueue({ ...base, attachments })).rejects.toMatchObject({ reasonCode: "INVALID_MAIL_ATTACHMENT" });
+    }
+    const bounded = Buffer.alloc(RECEIPT_PDF_MAX_BYTES);
+    receiptInput.pdf.copy(bounded);
+    await f.h.settings.set(MAIL_CAPTURE.key, true);
+    await expect(enqueuePaymentReceipt(f.mailer, { ...receiptInput, pdf: bounded })).resolves.toEqual({ attachment: "attached" });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).not.toHaveBeenCalled();
+    const [row] = await t.db.select().from(mailOutbox);
+    expect(row).toMatchObject({ state: "captured", payloadEnc: null });
+    const capture = await f.admin.capture(f.operator, row!.publicId);
+    expect(JSON.stringify(capture)).not.toMatch(/attachments|PRIVATE-RECEIPT|RPR-2026-000032/);
+  });
+
+  it("sends an oversized receipt as a portal-only email with a safe link even after template customization", async () => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    f.mail.registerMailTemplateStore({ resolve: async (key) => key === PAYMENT_RECEIPT_TEMPLATE
+      ? { key, vars: ["receiptNumber"], render: () => ({ subject: "Custom receipt", text: "Thank you.", html: "<p>Thank you.</p>" }) }
+      : null });
+    const pdf = Buffer.alloc(RECEIPT_PDF_MAX_BYTES + 1);
+    receiptInput.pdf.copy(pdf);
+    await expect(enqueuePaymentReceipt(f.mailer, { ...receiptInput, pdf })).resolves.toEqual({ attachment: "omitted_too_large" });
+    const [queued] = await t.db.select().from(mailOutbox);
+    const payload = f.h.deps.crypto.decrypt(queued!.payloadEnc!, `mail_outbox.payload_enc:${queued!.publicId}`);
+    expect(payload).not.toMatch(/attachments|contentBase64|PRIVATE-RECEIPT/);
+    await f.engine.execute((await f.engine.claim())!);
+    const url = new URL("/invoices?tab=receipts", f.h.config.canonicalOrigin).href;
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      subject: "Custom receipt",
+      text: expect.stringContaining(`Open Receipts in ReadyPackets: ${url}`),
+      html: expect.stringContaining(`<a href="${url}">Open Receipts in ReadyPackets</a>`),
+    }));
+    expect(send.mock.calls[0]?.[0].attachments).toBeUndefined();
+  });
 
   it("queues a single refund notice and redacts private refund data from retention and audit", async () => {
     const f = fixture({}, true);

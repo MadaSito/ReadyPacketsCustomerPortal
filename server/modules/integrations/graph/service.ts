@@ -310,6 +310,7 @@ export function createGraphModuleRuntime(
     subject: string,
     text: string,
     html: string,
+    attachments?: MailTransportMessage["attachments"],
   ) {
     const useHtml = html.trim().length > 0;
     return {
@@ -337,6 +338,12 @@ export function createGraphModuleRuntime(
             },
           },
         ],
+        ...(attachments ? { attachments: attachments.map(({ filename, contentType, content }) => ({
+          "@odata.type": "#microsoft.graph.fileAttachment",
+          name: filename,
+          contentType,
+          contentBytes: content.toString("base64"),
+        })) } : {}),
       },
       saveToSentItems: false,
     };
@@ -823,7 +830,11 @@ export function createGraphModuleRuntime(
           message.subject,
           message.text,
           message.html,
+          message.attachments,
         );
+        if (message.attachments && Buffer.byteLength(JSON.stringify(body)) > 4_000_000) {
+          return { outcome: "rejected", retryable: true, safeDetail: "graph_mail_payload_too_large" };
+        }
         const res = await scopedClient.request({
           method: "POST",
           path: `/users/${encodeURIComponent(mailbox)}/sendMail`,
