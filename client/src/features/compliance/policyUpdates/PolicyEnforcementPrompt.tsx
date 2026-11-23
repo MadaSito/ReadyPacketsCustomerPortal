@@ -187,9 +187,6 @@ function usePolicySnooze(key: string, checkpoint = 0) {
       snoozeStorage().setItem(key, String(checkpoint));
       snoozeFallback.delete(key);
     } catch { snoozeFallback.set(key, checkpoint); }
-    requestAnimationFrame(() => {
-      if (document.activeElement === document.body) reminderButton.current?.focus();
-    });
   }
   return {
     open: reviewing || dismissedAt === null || checkpoint > dismissedAt,
@@ -260,6 +257,7 @@ function GraceDialog({ item, snoozeKey, onElapsed }: { item: Pending; snoozeKey:
     <>
       {snooze.hasDismissed ? <PolicyReminder item={item} onReview={snooze.review} reviewRef={snooze.reminderButton} /> : null}
       <Dialog open={snooze.open && !confirmDecline} onOpenChange={(open) => { if (!open) dismiss(); }}
+        returnFocusRef={!snooze.open && !confirmDecline ? snooze.reminderButton : undefined}
         title={reading ? "Read and accept the policy" : "An updated policy needs your attention"}
         description={reading ? "Review the exact version before accepting." : "You can review now or return before the deadline."}
         size="lg" footer={
@@ -295,8 +293,9 @@ function GraceDialog({ item, snoozeKey, onElapsed }: { item: Pending; snoozeKey:
   );
 }
 
-function RequiredUpdateDialog({ policies, snoozeKey }: {
+function RequiredUpdateDialog({ policies, expectedSignerName, snoozeKey }: {
   policies: NonNullable<ReturnType<typeof usePolicyStatus>["data"]>["pendingRequired"];
+  expectedSignerName?: string | null;
   snoozeKey: string;
 }) {
   const snooze = usePolicySnooze(snoozeKey);
@@ -304,13 +303,14 @@ function RequiredUpdateDialog({ policies, snoozeKey }: {
     <>
       {snooze.hasDismissed ? <PolicyReminder onReview={snooze.review} reviewRef={snooze.reminderButton} /> : null}
       <Dialog open={snooze.open} onOpenChange={(open) => { if (!open) snooze.dismiss(); }} title="Updated policies need your review"
+        returnFocusRef={!snooze.open ? snooze.reminderButton : undefined}
         description="Review the latest required versions. You can read and accept them here, or return later."
         size="lg" footer={<Button variant="secondary" onClick={snooze.dismiss}>Later</Button>}>
         <div className="min-w-0 space-y-4">
           {policies.filter((item) => item.changeSummary).map((item) => (
             <p key={item.versionPublicId} className="break-words"><strong>{item.title}, what changed:</strong> {item.changeSummary}</p>
           ))}
-          <RequiredPolicyForms policies={policies} />
+          <RequiredPolicyForms policies={policies} expectedSignerName={expectedSignerName} />
         </div>
       </Dialog>
     </>
@@ -352,5 +352,6 @@ export function PolicyEnforcementPrompt() {
   if (pending.isPending || pending.isError) return null;
   const policies = required.data?.pendingRequired ?? [];
   const snoozeKey = `${SNOOZE_PREFIX}${me.user.publicId}:update:${[...new Set(policies.map((policy) => policy.versionPublicId))].sort().join(":")}`;
-  return policies.length > 0 ? <RequiredUpdateDialog key={snoozeKey} snoozeKey={snoozeKey} policies={policies} /> : null;
+  return policies.length > 0 ? <RequiredUpdateDialog key={snoozeKey} snoozeKey={snoozeKey} policies={policies}
+    expectedSignerName={required.data?.expectedSignerName} /> : null;
 }

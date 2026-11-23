@@ -32,10 +32,10 @@ function grace(policy = item) {
 }
 
 const informationalPolicy = { ...item, versionNumber: 2, effectiveAt: new Date("2026-11-20T12:00:00Z") };
-function informational(current: () => (typeof informationalPolicy)[]) {
+function informational(current: () => (typeof informationalPolicy)[], expectedSignerName?: string) {
   return renderWithTrpc(<Host><PolicyEnforcementPrompt /></Host>, {
     "compliance.policies.enforcement.pending": () => [],
-    "compliance.policies.myStatus": () => ({ pendingRequired: current() }),
+    "compliance.policies.myStatus": () => ({ pendingRequired: current(), expectedSignerName }),
   }, { role: "customer" });
 }
 
@@ -68,6 +68,13 @@ it("enters the grace dialog, moves keyboard focus into policy review, and dismis
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 });
 
+it("uses the policy status signer name instead of a stale session account name", async () => {
+  informational(() => [informationalPolicy], "Avery Updated Name");
+  const dialog = await screen.findByRole("dialog", { name: "Updated policies need your review" });
+  expect(within(dialog).getByRole("textbox", { name: /full name/i }))
+    .toHaveAccessibleDescription("Expected account name: Avery Updated Name.");
+});
+
 it("snoozes the same exact informational versions across navigation and remounts, but prompts for a new version", async () => {
   const second = { ...informationalPolicy, title: "Privacy policy", versionPublicId: "01JD0000000000000000000410" };
   let versions = [informationalPolicy, second];
@@ -76,6 +83,7 @@ it("snoozes the same exact informational versions across navigation and remounts
   const dialog = await screen.findByRole("dialog", { name: title });
   await userEvent.click(within(dialog).getByRole("button", { name: "Later" }));
   const banner = await screen.findByRole("region", { name: "Policy review reminder" });
+  await waitFor(() => expect(within(banner).getByRole("button", { name: "Review policies" })).toHaveFocus());
   expect(banner).not.toHaveAttribute("aria-live");
   expect(screen.queryByRole("dialog", { name: title })).not.toBeInTheDocument();
   expect(testStorage.key(0)).toContain(":01JD0000000000000000000001:update:");
@@ -131,6 +139,7 @@ it("keeps a grace countdown visible on navigation and alerts once per crossed ch
     const title = "An updated policy needs your attention";
     await userEvent.click(within(await screen.findByRole("dialog", { name: title })).getByRole("button", { name: "Later" }));
     const banner = await screen.findByRole("region", { name: "Policy review reminder" });
+    await waitFor(() => expect(within(banner).getByRole("button", { name: "Review policies" })).toHaveFocus());
     expect(banner).toHaveTextContent("Time remaining:");
     expect(banner.querySelector("time")).toHaveAttribute("datetime", policy.deadline.toISOString());
     const queryCount = view.calls.filter(({ path }) => path === "compliance.policies.enforcement.pending").length;
