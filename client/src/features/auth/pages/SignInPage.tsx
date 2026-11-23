@@ -5,6 +5,7 @@ import { errorMessage, safeError } from "@/lib/trpc";
 import { CustomerMaintenanceSlot, SsoSignInSlot } from "@/app/slots";
 import { PwaInstallEntry } from "@/app/PwaInstallEntry";
 import { Button, Callout, Field, Input } from "@/ui";
+import { RateLimitCountdown } from "@/lib/RateLimitCountdown";
 import { AuthLayout } from "../components/AuthLayout";
 import { FormError, PasswordInput, useFocusOnError } from "../components/bits";
 import { useContinueAfterAuth } from "../useAuthNavigation";
@@ -18,6 +19,8 @@ export default function SignInPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /** D7: the raw failure, so a rate-limited response can show its authoritative retry countdown. */
+  const [failure, setFailure] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const errorRef = useFocusOnError(error);
   const reason = new URLSearchParams(search).get("reason");
@@ -29,12 +32,14 @@ export default function SignInPage() {
       setError("Enter your email and password.");
       return;
     }
+    setFailure(null);
     setBusy(true);
     try {
       const result = await api.signIn({ email: email.trim(), password });
       setPassword("");
       await proceed(result.nextStep);
     } catch (err) {
+      setFailure(err);
       const safe = safeError(err);
       const code = safe?.domainCode;
       // Uniform, non-enumerating message for credential failures; pass through rate-limit/maintenance messages.
@@ -66,6 +71,7 @@ export default function SignInPage() {
       ) : null}
       <CustomerMaintenanceSlot />
       <FormError message={error} focusRef={errorRef} />
+      <RateLimitCountdown error={failure} />
       <form onSubmit={submit} noValidate className="flex flex-col gap-5">
         <Field label="Email">
           <Input type="email" name="email" autoComplete="username" inputMode="email" autoCapitalize="none" spellCheck={false} value={email} onChange={(e) => setEmail(e.target.value)} maxLength={254} required />
