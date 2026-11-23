@@ -25,6 +25,8 @@ The owner asked that every order confirmed paid produces a receipt with the logo
   - by e-mail, with the template `payment_receipt`, the PDF attached and the text editable in mail templates;
   - in the portal, under Invoices → **Receipts** and on the order.
 
+  As implemented by jobs_engineer, a PDF of up to 690 KiB is attached. A larger PDF is not attached; the customer gets the e-mail with a secure link to Invoices instead. The shared encryption size cap is unchanged.
+
   Staff see receipts on the order and on the customer profile and can **Send again**, which is audited and rate limited.
 - **Refunds.** A refund marks the receipt "refunded" or "partially refunded" and produces a refund note. The original receipt is never altered.
 - **Settings:**
