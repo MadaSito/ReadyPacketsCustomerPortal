@@ -34,6 +34,8 @@ import {
   updateQuestionnaireSchema,
 } from "./domain.js";
 import { acceptanceRouter } from "./acceptanceRouter.js";
+import { policyEnforcementRouter } from "./policyEnforcementRouter.js";
+import { policyNoticesRouter } from "./policyNoticesRouter.js";
 
 const policiesManageProc = protectedProcedure.use(requireCapability("policies.manage"));
 const acceptanceLogReadProc = staffProcedure.use(requireCapability("policies.acceptances.read"));
@@ -76,6 +78,9 @@ export const complianceRouter = router({
       .mutation(async ({ ctx, input }) => {
         return ctx.services.compliance.policies.accept(ctx.session, input);
       }),
+
+    notices: policyNoticesRouter,
+    enforcement: policyEnforcementRouter,
 
     admin: router({
       listDocuments: policiesManageProc

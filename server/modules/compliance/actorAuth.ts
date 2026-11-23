@@ -81,8 +81,14 @@ export async function assertLiveActorInTx(
   principal: SessionPrincipal,
   tx: Tx,
   requiredCapability?: Capability,
+  options?: { allowPolicyRemediation?: boolean },
 ): Promise<{ userId: number; role: "customer" | "staff" | "admin" }> {
-  if (principal.state !== "full" || principal.pendingSteps.length > 0) {
+  const allowsRemediation =
+    options?.allowPolicyRemediation === true &&
+    principal.state === "remediation" &&
+    principal.pendingSteps[0] === "accept_policy";
+
+  if (!allowsRemediation && (principal.state !== "full" || principal.pendingSteps.length > 0)) {
     throw new DomainError(
       "REMEDIATION_REQUIRED",
       "ACCOUNT_STEP_PENDING",
@@ -93,7 +99,10 @@ export async function assertLiveActorInTx(
   const identitySvc = (deps.services as Partial<typeof deps.services>).identity;
   if (identitySvc?.sessions?.assertCurrent) {
     const { pendingSteps } = await identitySvc.sessions.assertCurrent(principal, tx);
-    if (pendingSteps.length > 0) {
+    const liveAllowsRemediation =
+      options?.allowPolicyRemediation === true &&
+      (pendingSteps.length === 0 || pendingSteps[0] === "accept_policy");
+    if (!liveAllowsRemediation && pendingSteps.length > 0) {
       throw new DomainError(
         "REMEDIATION_REQUIRED",
         "ACCOUNT_STEP_PENDING",

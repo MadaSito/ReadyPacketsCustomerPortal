@@ -57,7 +57,13 @@ import {
   type PortableEvidenceBatch,
   type PortableEvidenceOptions,
 } from "./portableService.js";
+import { createPolicyEnforcement, type PolicyEnforcementService } from "./policyEnforcement.js";
+import { createPolicyNoticeRuntime } from "./policyNoticesRuntime.js";
 import { createInvoicesPublicApiProvider } from "./publicApiProvider.js";
+
+export type PolicyNoticesService = ReturnType<typeof createPolicyNoticeRuntime>;
+export type { PolicyEnforcementService };
+export type { SignatureNameMatchResult } from "./acceptanceSchema.js";
 export type {
   AcceptanceEvidenceKind,
   AcceptanceFilterOptionsView,
@@ -187,6 +193,8 @@ export interface ComplianceModule extends ModuleLifecycle {
 
   /* ---- sub-services consumed by router & http ---- */
   policies: PoliciesService;
+  policyNotices: PolicyNoticesService;
+  policyEnforcement: PolicyEnforcementService;
   acceptance: AcceptanceService;
   intake: IntakeService;
   invoices: InvoicesService;
@@ -194,7 +202,13 @@ export interface ComplianceModule extends ModuleLifecycle {
 
 export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
   registerComplianceMailTemplates(deps.mailer);
-  const policies = createPoliciesService(deps);
+  const policyNotices = createPolicyNoticeRuntime(deps);
+  const policyEnforcement = createPolicyEnforcement(deps);
+  const policies = createPoliciesService(deps, {
+    onVersionPublished: (tx, input) => policyNotices.onPublished(tx, input),
+    assertRemediationPending: (userId, role, versionPublicId, tx) =>
+      policyEnforcement.assertPending(userId, role, versionPublicId, tx),
+  });
   const intake = createIntakeService(deps);
   const invoices = createInvoicesService(deps);
   const portable = createPortableComplianceService(deps);
@@ -216,6 +230,8 @@ export function createComplianceModule(deps: ModuleDeps): ComplianceModule {
     onInvoicePaid: invoices.onInvoicePaid,
     orderPaymentExposureInTx: invoices.orderPaymentExposureInTx,
     policies,
+    policyNotices,
+    policyEnforcement,
     intake,
     invoices,
     acceptance,
