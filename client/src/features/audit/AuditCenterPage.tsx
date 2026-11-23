@@ -7,7 +7,10 @@ import {
   Button, Callout, Checkbox, Dialog, Drawer, ErrorState, Field, FilterBar, Input, LoadMore, PageHeader, RadioGroup,
   Select, Skeleton, StepUpCancelledError, useStepUp, useToast,
 } from "@/ui";
+import { roleHasCapability } from "@shared/capabilities";
+import { useSession } from "@/lib/session";
 import { AuditNav } from "./AuditNav";
+import { BanDialog } from "./BanDialog";
 import { EventDetailPanel, EventsTable } from "./EventParts";
 import { QueryBuilder } from "./QueryBuilder";
 import {
@@ -188,6 +191,7 @@ function EventDrawer({ eventId, onClose, onPivot, pivoting, onAddToCase }: {
   const detail = useQuery({ ...trpc.audit.event.queryOptions({ eventId: eventId ?? "" }), enabled: Boolean(eventId) });
   const reveal = useMutation(trpc.audit.revealSourceAddress.mutationOptions());
   const [revealed, setRevealed] = useState<{ id: string; address: string | null } | null>(null);
+  const canBan = useCanBan();
   return (
     <Drawer open={Boolean(eventId)} onOpenChange={(open) => !open && onClose()} title="Event details" width="lg">
       {detail.isPending ? (
@@ -210,9 +214,49 @@ function EventDrawer({ eventId, onClose, onPivot, pivoting, onAddToCase }: {
             pivoting={pivoting}
             onAddToCase={onAddToCase}
           />
+          {canBan && detail.data.event.source_address_ref && eventId ? <BanEventAddress eventId={eventId} /> : null}
         </>
       ) : null}
     </Drawer>
+  );
+}
+
+/** UI hint only: the server re-checks `security.firewall.manage`, step-up and the protection safeguards. */
+function useCanBan(): boolean {
+  const { me } = useSession();
+  const role = me?.state === "full" ? me.user.role : null;
+  return role !== null && roleHasCapability(role, "security.firewall.manage");
+}
+
+/** D7: "Ban this IP" from one audit event; the address is resolved server-side and never shown. */
+export function BanEventAddress({ eventId }: { eventId: string }) {
+  const trpc = useTRPC();
+  const toast = useToast();
+  const stepUp = useStepUp();
+  const ban = useMutation(trpc.audit.banEventAddress.mutationOptions());
+  const [open, setOpen] = useState(false);
+  return (
+    <section aria-labelledby="ban-event-heading" className="mt-6 border-t border-line pt-4">
+      <h3 id="ban-event-heading" className="text-base font-semibold text-ink">Block this address</h3>
+      <p className="mt-1 text-sm text-body">Refuse sign-ins from the address recorded with this event. You confirm your identity and give a reason; the ban is recorded.</p>
+      <Button className="mt-3" variant="danger" size="sm" onClick={() => setOpen(true)}>Ban this IP</Button>
+      <BanDialog
+        open={open}
+        busy={ban.isPending}
+        onCancel={() => setOpen(false)}
+        description="The address is taken from this event on the server; it is never shown here. Sign-ins from it are refused until the ban ends."
+        onSubmit={async (durationMinutes, reason) => {
+          try {
+            await stepUp.run(() => ban.mutateAsync({ eventId, durationMinutes, reason }), { reason: "Banning an address requires a fresh confirmation." });
+            setOpen(false);
+            toast.show({ title: "Address banned", description: "Release the ban from the firewall page.", tone: "success" });
+          } catch (error) {
+            if (!(error instanceof StepUpCancelledError)) toast.show({ title: "Address not banned", description: errorMessage(error), tone: "danger" });
+            throw error;
+          }
+        }}
+      />
+    </section>
   );
 }
 

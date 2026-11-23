@@ -6,7 +6,9 @@ import type * as transportModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
-import IncidentDetailPage, { BanDialog, CloseDialog, IncidentDetailView, timelineItems } from "./IncidentDetailPage";
+import { BanEventAddress } from "./AuditCenterPage";
+import { BanDialog } from "./BanDialog";
+import IncidentDetailPage, { CloseDialog, IncidentDetailView, timelineItems } from "./IncidentDetailPage";
 import IncidentsPage, { draftErrors, RulesCard } from "./IncidentsPage";
 import { banDurationOf, banReasonError, type CorrelationConfig, type IncidentDetail, type IncidentSummary, type RulesView } from "./model";
 import { auditFeature } from "./routes";
@@ -159,6 +161,19 @@ describe("incident views", () => {
     await user.type(within(dialog).getByLabelText(/Reason/), "Credential stuffing source");
     await user.click(within(dialog).getByRole("button", { name: "Ban address" }));
     expect(onSubmit).toHaveBeenCalledWith(null, "Credential stuffing source");
+    await expectNoAxeViolations();
+  });
+  it("event drawer: Ban this IP confirms duration and reason, then calls audit.banEventAddress", async () => {
+    const seen: unknown[] = [];
+    handlers["audit.banEventAddress"] = (input) => { seen.push(input); return { banPublicId: "01JTESTAAAAAAAAAAAAAAAAAB1", expiresAt: null }; };
+    renderUi(<BanEventAddress eventId="01JTESTEVENT0000000000001" />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Ban this IP" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.selectOptions(within(dialog).getByLabelText(/Duration/), "1440");
+    await user.type(within(dialog).getByLabelText(/Reason/), "Repeated failures from this source");
+    await user.click(within(dialog).getByRole("button", { name: "Ban address" }));
+    await vi.waitFor(() => expect(seen).toEqual([{ eventId: "01JTESTEVENT0000000000001", durationMinutes: 1440, reason: "Repeated failures from this source" }]));
     await expectNoAxeViolations();
   });
   it("close dialog requires a reason", async () => {

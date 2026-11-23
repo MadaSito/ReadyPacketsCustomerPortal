@@ -6,13 +6,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Breadcrumbs, Button, Callout, ConfirmDialog, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, PageHeader, Section, Select,
-  Skeleton, StepUpCancelledError, Textarea, Timeline, useStepUp, useToast, type TimelineItem,
+  Skeleton, StepUpCancelledError, Timeline, useStepUp, useToast, type TimelineItem,
 } from "@/ui";
 import { AuditNav } from "./AuditNav";
+import { BanDialog } from "./BanDialog";
 import { IncidentSeverityBadge, IncidentStatusBadge } from "./IncidentsPage";
 import {
-  BAN_DURATION_OPTIONS, banDurationOf, banReasonError, CLOSE_REASON_OPTIONS, closeReasonLabel, SEVERITY_META, SUBJECT_LABELS, TIMELINE_LABELS,
-  type BanMinutes, type IncidentDetail, type IncidentTimelineItem,
+  CLOSE_REASON_OPTIONS, closeReasonLabel, SEVERITY_META, SUBJECT_LABELS, TIMELINE_LABELS,
+  type IncidentDetail, type IncidentTimelineItem,
 } from "./model";
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -197,36 +198,6 @@ export function CloseDialog({ open, onCancel, onSubmit, busy }: { open: boolean;
         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <Button type="button" variant="secondary" onClick={onCancel}>Cancel</Button>
           <Button type="submit" loading={busy}>Close incident</Button>
-        </div>
-      </form>
-    </Dialog>
-  );
-}
-
-export function BanDialog({ open, onCancel, onSubmit, busy }: { open: boolean; onCancel: () => void; onSubmit: (durationMinutes: BanMinutes, reason: string) => Promise<void>; busy: boolean }) {
-  const [duration, setDuration] = useState("60");
-  const [reason, setReason] = useState("");
-  const [errors, setErrors] = useState<{ duration?: string; reason?: string }>({});
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    const minutes = banDurationOf(duration);
-    const next = { duration: minutes === undefined ? "Choose how long the ban lasts." : undefined, reason: banReasonError(reason) ?? undefined };
-    setErrors(next);
-    if (next.duration || next.reason || minutes === undefined) return;
-    await onSubmit(minutes, reason.trim()).catch(() => undefined);
-  };
-  return (
-    <Dialog open={open} onOpenChange={(o) => !o && onCancel()} title="Ban IP address" description="The address is taken from the incident's events on the server; it is never shown here. Sign-ins from it are refused until the ban ends." dismissible={!busy}>
-      <form onSubmit={submit} noValidate className="space-y-4">
-        <Field label="Duration" error={errors.duration} required>
-          <Select value={duration} onChange={(e) => setDuration(e.target.value)} options={BAN_DURATION_OPTIONS} />
-        </Field>
-        <Field label="Reason" hint="3 to 240 characters. Recorded in the audit log; avoid personal data." error={errors.reason} required>
-          <Textarea value={reason} maxLength={240} rows={3} onChange={(e) => setReason(e.target.value)} />
-        </Field>
-        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <Button type="button" variant="secondary" onClick={onCancel}>Cancel</Button>
-          <Button type="submit" variant="danger" loading={busy}>Ban address</Button>
         </div>
       </form>
     </Dialog>
