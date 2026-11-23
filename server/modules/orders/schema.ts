@@ -535,3 +535,50 @@ export const orderCustomerGrants = mysqlTable(
   },
   (t) => [uniqueIndex("order_customer_grants_live_uq").on(t.liveKey), index("order_customer_grants_owner_idx").on(t.ownerUserId, t.status)],
 );
+
+/**
+ * Increment 06 (D8): the per-order staff note behind an `order_note` acknowledgement task. One row per (order,
+ * pinned version, status, ack key). Editable until the customer acknowledges it; then final (the acknowledgement
+ * pins `textSha256`). Body encrypted (aad `order_task_notes.body:<publicId>`).
+ */
+export const orderTaskNotes = mysqlTable(
+  "order_task_notes",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    orderId: refColumn("order_id").notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    statusKey: varchar("status_key", { length: 48 }).notNull(),
+    ackKey: varchar("ack_key", { length: 48 }).notNull(),
+    bodyEnc: text("body_enc").notNull(),
+    textSha256: char("text_sha256", { length: 64 }).notNull(),
+    authorUserId: refColumn("author_user_id").notNull().references(() => users.id),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [uniqueIndex("order_task_notes_task_uq").on(t.orderId, t.workflowVersionId, t.statusKey, t.ackKey)],
+);
+
+export const TASK_WAIVER_KINDS = ["upload", "record", "acknowledge", "respond_document"] as const;
+
+/**
+ * Increment 06 (D8): staff waiver of one customer task on one order (insert-only). The reason is a staff-only
+ * encrypted order note (`order_notes.public_id`), like a phase unlock. A waived task counts as met.
+ */
+export const orderTaskWaivers = mysqlTable(
+  "order_task_waivers",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    orderId: refColumn("order_id").notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    statusKey: varchar("status_key", { length: 48 }).notNull(),
+    taskKey: varchar("task_key", { length: 48 }).notNull(),
+    taskKind: mysqlEnum("task_kind", TASK_WAIVER_KINDS).notNull(),
+    reasonNotePublicId: varchar("reason_note_public_id", { length: 26 }).notNull(),
+    waivedByUserId: refColumn("waived_by_user_id").notNull().references(() => users.id),
+    waivedAt: utcDateTime("waived_at").notNull(),
+  },
+  (t) => [uniqueIndex("order_task_waivers_task_uq").on(t.orderId, t.workflowVersionId, t.statusKey, t.taskKey), index("order_task_waivers_order_idx").on(t.orderId)],
+);
