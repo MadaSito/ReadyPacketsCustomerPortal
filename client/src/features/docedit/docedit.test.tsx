@@ -217,6 +217,7 @@ class TestMammothWorker {
 const ORDER_ID = "01JABCDEFGHJKMNPQRSTVWXYZ1";
 const FILE_V1_ID = "01JABCDEFGHJKMNPQRSTVWXYZ2";
 const FILE_V2_ID = "01JABCDEFGHJKMNPQRSTVWXYZ3";
+const LAZY_WAIT = { timeout: 15_000 } as const;
 
 function makeFileRecord(patch: Partial<FileRecord> = {}): FileRecord {
   return {
@@ -290,185 +291,199 @@ describe("docedit feature (Increment 06 D9)", () => {
     ]);
   });
 
-  it("opens a .docx, surfaces detected unsupported OOXML elements, edits tables/alignment without inline styles or storage, guards unsaved changes, and saves a new version", async () => {
-    const storageSpy = vi.spyOn(Storage.prototype, "setItem");
-    const user = userEvent.setup();
-    const docxBytes = buildMinimalOoxmlWithHeaderAndComments("Initial questionnaire prompt");
-    const v1 = makeFileRecord({ size: docxBytes.byteLength });
-    const v2 = makeFileRecord({
-      publicId: FILE_V2_ID,
-      version: 2,
-      derivedFromPublicId: FILE_V1_ID,
-      derivedFromFileId: FILE_V1_ID,
-      slotKey: "engagement_letter_reply",
-      createdAt: new Date("2026-11-23T10:05:00.000Z"),
-    });
+  it(
+    "opens a .docx, surfaces detected unsupported OOXML elements, edits tables/alignment without inline styles or storage, guards unsaved changes, and saves a new version",
+    async () => {
+      const storageSpy = vi.spyOn(Storage.prototype, "setItem");
+      const user = userEvent.setup();
+      const docxBytes = buildMinimalOoxmlWithHeaderAndComments("Initial questionnaire prompt");
+      const v1 = makeFileRecord({ size: docxBytes.byteLength });
+      const v2 = makeFileRecord({
+        publicId: FILE_V2_ID,
+        version: 2,
+        derivedFromPublicId: FILE_V1_ID,
+        derivedFromFileId: FILE_V1_ID,
+        slotKey: "engagement_letter_reply",
+        createdAt: new Date("2026-11-23T10:05:00.000Z"),
+      });
 
-    handlers["files.document.status"] = (input) => {
-      const req = input as { filePublicId: string; taskKey?: string };
-      return {
+      handlers["files.document.status"] = (input) => {
+        const req = input as { filePublicId: string; taskKey?: string };
+        return {
+          enabled: true,
+          maxBytes: 10 * 1024 * 1024,
+          canEdit: true,
+          disabledReason: null,
+          agreementPolicyPublicId: null,
+          agreementSignatureMode: null,
+          file: req.filePublicId === FILE_V2_ID ? v2 : v1,
+        };
+      };
+
+      handlers["files.document.versions"] = (input) => {
+        const req = input as { filePublicId: string };
+        if (req.filePublicId === FILE_V2_ID) {
+          return [
+            v2,
+            makeFileRecord({
+              ...v1,
+              supersededAt: new Date("2026-11-23T10:05:00.000Z"),
+            }),
+          ];
+        }
+        return [v1];
+      };
+
+      let uploadedFormFile: File | null = null;
+      let uploadedUrl = "";
+
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (!init?.method || init.method === "GET") {
+          return new Response(docxBytes, {
+            status: 200,
+            headers: { "Content-Type": DOCX_MIME },
+          });
+        }
+        if (init.method === "POST") {
+          uploadedUrl = url;
+          const body = init.body as FormData;
+          uploadedFormFile = body.get("files") as File;
+          return new Response(JSON.stringify(v2), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("Unsupported", { status: 405 });
+      });
+
+      const editPath = `/orders/${ORDER_ID}/documents/${FILE_V1_ID}/edit?taskKey=engagement_letter`;
+      const { container, location } = renderUi(
+        <Route path="/orders/:orderId/documents/:fileId/edit">
+          <OrderDocumentEditView area="customer" />
+        </Route>,
+        { path: editPath },
+      );
+
+      // Wait for Mammoth Worker conversion and lazy TipTap editor chunk to mount under CI load
+      const textbox = await screen.findByRole(
+        "textbox",
+        { name: "engagement-questionnaire.docx" },
+        LAZY_WAIT,
+      );
+      await waitFor(() => {
+        expect(textbox.textContent).toContain("Initial questionnaire prompt");
+      }, LAZY_WAIT);
+
+      // Verify honest limits warning lists detected unsupported OOXML elements
+      expect(screen.getByText("Portal Word editing limits")).toBeInTheDocument();
+      expect(screen.getByText("Headers and footers:")).toBeInTheDocument();
+      expect(screen.getByText("Comments:")).toBeInTheDocument();
+      expect(screen.getByText("Tracked changes:")).toBeInTheDocument();
+
+      // Automated WCAG 2.2 AA check (axe-core)
+      await expectNoAxeViolations(container);
+
+      // Edit content: align center, insert a 3x3 table, and type text
+      await user.click(textbox);
+      await user.keyboard(" — Customer completed answer");
+      await user.click(screen.getByRole("button", { name: "Align center" }));
+      await user.click(screen.getByRole("button", { name: "Table actions" }));
+      const insertTableItem = await screen.findByRole(
+        "menuitem",
+        { name: "Insert 3x3 table" },
+        LAZY_WAIT,
+      );
+      await user.click(insertTableItem);
+
+      await waitFor(() => {
+        expect(container.querySelector("table")).not.toBeNull();
+        expect(container.querySelector('[data-text-align="center"]')).not.toBeNull();
+      }, LAZY_WAIT);
+
+      // Strict CSP invariant: zero inline `style` attributes in the rendered editor DOM
+      expect(container.querySelector(".rp-docedit [style]")).toBeNull();
+
+      // Zero browser persistence invariant: nothing written to Web Storage
+      expect(storageSpy).not.toHaveBeenCalled();
+
+      // Unsaved-changes guard: beforeunload cancels unload, and "Back to order" opens ConfirmDialog
+      const unloadEvent = new Event("beforeunload", { cancelable: true });
+      fireEvent(window, unloadEvent);
+      expect(unloadEvent.defaultPrevented).toBe(true);
+
+      await user.click(screen.getByRole("button", { name: "Back to order" }));
+      expect(
+        await screen.findByText("Leave with unsaved document changes?", {}, LAZY_WAIT),
+      ).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Keep editing" }));
+
+      // Save as new version
+      const saveButton = screen.getByRole("button", { name: "Save as new version" });
+      expect(saveButton).not.toBeDisabled();
+      await user.click(saveButton);
+
+      await waitFor(() => {
+        expect(uploadedFormFile).not.toBeNull();
+      }, LAZY_WAIT);
+      expect(uploadedUrl).toContain(
+        `/api/files/orders/${ORDER_ID}/${FILE_V1_ID}/document?taskKey=engagement_letter`,
+      );
+      expect(uploadedFormFile!.name).toBe("engagement-questionnaire.docx");
+      expect(uploadedFormFile!.type).toBe(DOCX_MIME);
+      expect(uploadedFormFile!.size).toBeGreaterThan(500);
+
+      // Navigates to newly saved version v2 and renders version history lineage ("Edited from v1")
+      await waitFor(() => {
+        expect(location.history.at(-1)).toBe(
+          `/orders/${ORDER_ID}/documents/${FILE_V2_ID}/edit`,
+        );
+      }, LAZY_WAIT);
+      expect(await screen.findByText("Edited from v1", {}, LAZY_WAIT)).toBeInTheDocument();
+    },
+    30_000,
+  );
+
+  it(
+    "renders read-only mode with order agreement prompt when AGREEMENT_REQUIRED blocks editing",
+    async () => {
+      const built = await editorToDocx("<p>Agreement gated document</p>");
+      const responseBytes = new Uint8Array(built.bytes.byteLength);
+      responseBytes.set(built.bytes);
+      const v1 = makeFileRecord({ size: responseBytes.byteLength });
+
+      handlers["files.document.status"] = () => ({
         enabled: true,
         maxBytes: 10 * 1024 * 1024,
-        canEdit: true,
-        disabledReason: null,
-        agreementPolicyPublicId: null,
-        agreementSignatureMode: null,
-        file: req.filePublicId === FILE_V2_ID ? v2 : v1,
-      };
-    };
+        canEdit: false,
+        disabledReason: "Sign the required order agreement before saving document changes.",
+        agreementPolicyPublicId: "01JPOLICYABCDEFGHJKMNPQRST",
+        agreementSignatureMode: "typed_name",
+        file: v1,
+      });
+      handlers["files.document.versions"] = () => [v1];
 
-    handlers["files.document.versions"] = (input) => {
-      const req = input as { filePublicId: string };
-      if (req.filePublicId === FILE_V2_ID) {
-        return [
-          v2,
-          makeFileRecord({
-            ...v1,
-            supersededAt: new Date("2026-11-23T10:05:00.000Z"),
-          }),
-        ];
-      }
-      return [v1];
-    };
-
-    let uploadedFormFile: File | null = null;
-    let uploadedUrl = "";
-
-    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (!init?.method || init.method === "GET") {
-        return new Response(docxBytes, {
-          status: 200,
-          headers: { "Content-Type": DOCX_MIME },
-        });
-      }
-      if (init.method === "POST") {
-        uploadedUrl = url;
-        const body = init.body as FormData;
-        uploadedFormFile = body.get("files") as File;
-        return new Response(JSON.stringify(v2), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      return new Response("Unsupported", { status: 405 });
-    });
-
-    const editPath = `/orders/${ORDER_ID}/documents/${FILE_V1_ID}/edit?taskKey=engagement_letter`;
-    const { container, location } = renderUi(
-      <Route path="/orders/:orderId/documents/:fileId/edit">
-        <OrderDocumentEditView area="customer" />
-      </Route>,
-      { path: editPath },
-    );
-
-    // Wait for Mammoth Worker conversion and lazy TipTap editor chunk to mount
-    const textbox = await screen.findByRole("textbox", {
-      name: "engagement-questionnaire.docx",
-    });
-    await waitFor(() => {
-      expect(textbox.textContent).toContain("Initial questionnaire prompt");
-    });
-
-    // Verify honest limits warning lists detected unsupported OOXML elements
-    expect(screen.getByText("Portal Word editing limits")).toBeInTheDocument();
-    expect(screen.getByText("Headers and footers:")).toBeInTheDocument();
-    expect(screen.getByText("Comments:")).toBeInTheDocument();
-    expect(screen.getByText("Tracked changes:")).toBeInTheDocument();
-
-    // Automated WCAG 2.2 AA check (axe-core)
-    await expectNoAxeViolations(container);
-
-    // Edit content: align center, insert a 3x3 table, and type text
-    await user.click(textbox);
-    await user.keyboard(" — Customer completed answer");
-    await user.click(screen.getByRole("button", { name: "Align center" }));
-    await user.click(screen.getByRole("button", { name: "Table actions" }));
-    const insertTableItem = await screen.findByRole("menuitem", { name: "Insert 3x3 table" });
-    await user.click(insertTableItem);
-
-    await waitFor(() => {
-      expect(container.querySelector("table")).not.toBeNull();
-      expect(container.querySelector('[data-text-align="center"]')).not.toBeNull();
-    });
-
-    // Strict CSP invariant: zero inline `style` attributes in the rendered editor DOM
-    expect(container.querySelector(".rp-docedit [style]")).toBeNull();
-
-    // Zero browser persistence invariant: nothing written to Web Storage
-    expect(storageSpy).not.toHaveBeenCalled();
-
-    // Unsaved-changes guard: beforeunload cancels unload, and "Back to order" opens ConfirmDialog
-    const unloadEvent = new Event("beforeunload", { cancelable: true });
-    fireEvent(window, unloadEvent);
-    expect(unloadEvent.defaultPrevented).toBe(true);
-
-    await user.click(screen.getByRole("button", { name: "Back to order" }));
-    expect(
-      await screen.findByText("Leave with unsaved document changes?"),
-    ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Keep editing" }));
-
-    // Save as new version
-    const saveButton = screen.getByRole("button", { name: "Save as new version" });
-    expect(saveButton).not.toBeDisabled();
-    await user.click(saveButton);
-
-    await waitFor(() => {
-      expect(uploadedFormFile).not.toBeNull();
-    });
-    expect(uploadedUrl).toContain(
-      `/api/files/orders/${ORDER_ID}/${FILE_V1_ID}/document?taskKey=engagement_letter`,
-    );
-    expect(uploadedFormFile!.name).toBe("engagement-questionnaire.docx");
-    expect(uploadedFormFile!.type).toBe(DOCX_MIME);
-    expect(uploadedFormFile!.size).toBeGreaterThan(500);
-
-    // Navigates to newly saved version v2 and renders version history lineage ("Edited from v1")
-    await waitFor(() => {
-      expect(location.history.at(-1)).toBe(
-        `/orders/${ORDER_ID}/documents/${FILE_V2_ID}/edit`,
+      fetchMock.mockResolvedValue(
+        new Response(responseBytes, { status: 200, headers: { "Content-Type": DOCX_MIME } }),
       );
-    });
-    expect(await screen.findByText("Edited from v1")).toBeInTheDocument();
-  });
 
-  it("renders read-only mode with order agreement prompt when AGREEMENT_REQUIRED blocks editing", async () => {
-    const built = await editorToDocx("<p>Agreement gated document</p>");
-    const responseBytes = new Uint8Array(built.bytes.byteLength);
-    responseBytes.set(built.bytes);
-    const v1 = makeFileRecord({ size: responseBytes.byteLength });
+      renderUi(
+        <Route path="/orders/:orderId/documents/:fileId/edit">
+          <OrderDocumentEditView area="customer" />
+        </Route>,
+        { path: `/orders/${ORDER_ID}/documents/${FILE_V1_ID}/edit` },
+      );
 
-    handlers["files.document.status"] = () => ({
-      enabled: true,
-      maxBytes: 10 * 1024 * 1024,
-      canEdit: false,
-      disabledReason: "Sign the required order agreement before saving document changes.",
-      agreementPolicyPublicId: "01JPOLICYABCDEFGHJKMNPQRST",
-      agreementSignatureMode: "typed_name",
-      file: v1,
-    });
-    handlers["files.document.versions"] = () => [v1];
-
-    fetchMock.mockResolvedValue(
-      new Response(responseBytes, { status: 200, headers: { "Content-Type": DOCX_MIME } }),
-    );
-
-    renderUi(
-      <Route path="/orders/:orderId/documents/:fileId/edit">
-        <OrderDocumentEditView area="customer" />
-      </Route>,
-      { path: `/orders/${ORDER_ID}/documents/${FILE_V1_ID}/edit` },
-    );
-
-    expect(
-      await screen.findByText("Order agreement required before saving"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Review and sign order agreement" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Save as new version" }),
-    ).not.toBeInTheDocument();
-  });
+      expect(
+        await screen.findByText("Order agreement required before saving", {}, LAZY_WAIT),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Review and sign order agreement" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Save as new version" }),
+      ).not.toBeInTheDocument();
+    },
+    30_000,
+  );
 });

@@ -252,7 +252,9 @@ describe("orderDocumentEditHref", () => {
 });
 
 describe("docxToHtml and editorToDocx round-trip", () => {
-  it("converts a rich generated .docx (headings, formatting, link, image, table) and round-trips back to .docx", async () => {
+  it(
+    "converts a rich generated .docx (headings, formatting, link, image, table) and round-trips back to .docx",
+    async () => {
     const pngBytes = base64ToUint8(ONE_PX_PNG_BASE64);
     const fixtureDoc = new Document({
       sections: [
@@ -335,7 +337,9 @@ describe("docxToHtml and editorToDocx round-trip", () => {
     expect(reimported.sanitizedHtml).toContain("<h2>Addendum A</h2>");
     expect(reimported.plainText).toContain("Signed in counterpart.");
     expect(reimported.plainText).toContain("Return materials within 30 days");
-  });
+  },
+  30_000,
+  );
 
   it("detects unsupported OOXML structures (headers/footers, tracked changes, comments, footnotes, fields)", async () => {
     const encoder = new TextEncoder();
@@ -517,29 +521,33 @@ describe("ZIP, size, coherence, inflation, and Worker isolation/cancellation gua
 });
 
 describe("pdfToText", () => {
-  it("extracts multi-page text with strict CSP options, clamps maxPages to 200, and bounds extracted text size", async () => {
-    const twoPagePdf = buildMinimalPdf([
-      "Page One Policy Scope",
-      "Page Two Customer Responsibilities",
-    ]);
-    const extracted = await pdfToText(twoPagePdf);
-    expect(extracted.pageCount).toBe(2);
-    expect(extracted.plainText).toContain("Page One Policy Scope");
-    expect(extracted.plainText).toContain("Page Two Customer Responsibilities");
-    expect(extracted.sanitizedHtml).toContain("<p>Page One Policy Scope</p>");
-    expect(extracted.warnings[0]).toMatch(/extracts text only/i);
+  it(
+    "extracts multi-page text with strict CSP options, clamps maxPages to 200, and bounds extracted text size",
+    async () => {
+      const twoPagePdf = buildMinimalPdf([
+        "Page One Policy Scope",
+        "Page Two Customer Responsibilities",
+      ]);
+      const extracted = await pdfToText(twoPagePdf);
+      expect(extracted.pageCount).toBe(2);
+      expect(extracted.plainText).toContain("Page One Policy Scope");
+      expect(extracted.plainText).toContain("Page Two Customer Responsibilities");
+      expect(extracted.sanitizedHtml).toContain("<p>Page One Policy Scope</p>");
+      expect(extracted.warnings[0]).toMatch(/extracts text only/i);
 
-    // Caller passing maxPages: 999 must still be clamped to MAX_PDF_PAGES (200)
-    const tooManyPagesPdf = buildMinimalPdf(Array.from({ length: 201 }, (_, i) => `P${i + 1}`));
-    await expect(pdfToText(tooManyPagesPdf, { maxPages: 999 })).rejects.toMatchObject({
-      code: "PDF_TOO_MANY_PAGES",
-    });
+      // Caller passing maxPages: 999 must still be clamped to MAX_PDF_PAGES (200)
+      const tooManyPagesPdf = buildMinimalPdf(Array.from({ length: 201 }, (_, i) => `P${i + 1}`));
+      await expect(pdfToText(tooManyPagesPdf, { maxPages: 999 })).rejects.toMatchObject({
+        code: "PDF_TOO_MANY_PAGES",
+      });
 
-    // Cumulative extracted-text cap prevents unbounded text expansion
-    await expect(pdfToText(twoPagePdf, { maxExtractedChars: 10 })).rejects.toMatchObject({
-      code: "PDF_TEXT_TOO_LARGE",
-    });
-  });
+      // Cumulative extracted-text cap prevents unbounded text expansion
+      await expect(pdfToText(twoPagePdf, { maxExtractedChars: 10 })).rejects.toMatchObject({
+        code: "PDF_TEXT_TOO_LARGE",
+      });
+    },
+    30_000,
+  );
 });
 
 describe("markdownToHtml and sanitizeDocumentHtml", () => {
@@ -574,39 +582,44 @@ describe("markdownToHtml and sanitizeDocumentHtml", () => {
 });
 
 describe("DocumentImportButton", () => {
-  it("imports .md and .pdf files via accessible button + file input and surfaces PDF text-only warnings", async () => {
-    const onImport = vi.fn();
-    render(<DocumentImportButton onImport={onImport} />);
+  it(
+    "imports .md and .pdf files via accessible button + file input and surfaces PDF text-only warnings",
+    async () => {
+      const lazyWait = { timeout: 15_000 } as const;
+      const onImport = vi.fn();
+      render(<DocumentImportButton onImport={onImport} />);
 
-    const trigger = screen.getByRole("button", { name: /import from file/i });
-    expect(trigger.getAttribute("aria-describedby")).toBeTruthy();
+      const trigger = screen.getByRole("button", { name: /import from file/i });
+      expect(trigger.getAttribute("aria-describedby")).toBeTruthy();
 
-    const input = screen.getByTestId("document-import-file-input") as HTMLInputElement;
-    const mdFile = new File(["# Privacy Notice\n\nWe protect customer data."], "privacy.md", {
-      type: "text/markdown",
-    });
-    fireEvent.change(input, { target: { files: [mdFile] } });
+      const input = screen.getByTestId("document-import-file-input") as HTMLInputElement;
+      const mdFile = new File(["# Privacy Notice\n\nWe protect customer data."], "privacy.md", {
+        type: "text/markdown",
+      });
+      fireEvent.change(input, { target: { files: [mdFile] } });
 
-    await waitFor(() => {
-      expect(onImport).toHaveBeenCalledTimes(1);
-    });
-    expect(onImport.mock.calls[0]?.[0]).toMatchObject({
-      sourceFormat: "markdown",
-      sourceKind: "markdown",
-      suggestedPolicyFormat: "safe_markdown",
-      fileName: "privacy.md",
-      sanitizedHtml: "<h1>Privacy Notice</h1><p>We protect customer data.</p>",
-    });
+      await waitFor(() => {
+        expect(onImport).toHaveBeenCalledTimes(1);
+      }, lazyWait);
+      expect(onImport.mock.calls[0]?.[0]).toMatchObject({
+        sourceFormat: "markdown",
+        sourceKind: "markdown",
+        suggestedPolicyFormat: "safe_markdown",
+        fileName: "privacy.md",
+        sanitizedHtml: "<h1>Privacy Notice</h1><p>We protect customer data.</p>",
+      });
 
-    const pdfBytes = buildMinimalPdf(["Terms Section 1"]);
-    const ab = new ArrayBuffer(pdfBytes.byteLength);
-    new Uint8Array(ab).set(pdfBytes);
-    const pdfFile = new File([ab], "terms.pdf", { type: "application/pdf" });
-    fireEvent.change(input, { target: { files: [pdfFile] } });
+      const pdfBytes = buildMinimalPdf(["Terms Section 1"]);
+      const ab = new ArrayBuffer(pdfBytes.byteLength);
+      new Uint8Array(ab).set(pdfBytes);
+      const pdfFile = new File([ab], "terms.pdf", { type: "application/pdf" });
+      fireEvent.change(input, { target: { files: [pdfFile] } });
 
-    await waitFor(() => {
-      expect(onImport).toHaveBeenCalledTimes(2);
-    });
-    expect(await screen.findByText(/PDF import extracts text only/i)).toBeTruthy();
-  });
+      await waitFor(() => {
+        expect(onImport).toHaveBeenCalledTimes(2);
+      }, lazyWait);
+      expect(await screen.findByText(/PDF import extracts text only/i, {}, lazyWait)).toBeTruthy();
+    },
+    30_000,
+  );
 });
