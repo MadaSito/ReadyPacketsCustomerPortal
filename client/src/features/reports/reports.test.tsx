@@ -10,7 +10,9 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { AppRoutes } from "@/app/AppRouter";
 import { pageA11y } from "@/test/a11y";
+import { renderUi } from "@/ui/testing";
 import { FALLBACK_BUILT_INS } from "./format";
+import { ReportResultSection } from "./ReportChart";
 import { reportsFeature } from "./routes";
 import { renderReportsWithTrpc, throwSafeError, type Fixtures, type Role } from "./testkit";
 import {
@@ -776,6 +778,58 @@ describe("Package I — Reports Overview, Built-in Analytics & Custom Report Bui
         }),
       });
     });
+  });
+
+  it("anchors 30-day line chart end ticks without clipping and adapts viewBox/tick count at 320 px widths", async () => {
+    const rows = Array.from({ length: 30 }, (_, idx) => {
+      const d = new Date(Date.UTC(2026, 9, 25 + idx));
+      return [d.toISOString().slice(0, 10), (idx % 5) + 1];
+    });
+    const table = {
+      columns: [
+        { key: "bucket", label: "Date", type: "datetime" as const },
+        { key: "orders", label: "Orders", type: "number" as const },
+      ],
+      rows,
+      rowCount: rows.length,
+      truncated: false,
+    };
+
+    const { unmount } = renderUi(
+      <ReportResultSection title="Orders over time" chart="line" table={table} />,
+    );
+    const desktopSvg = screen.getByRole("img", { name: /^Orders over time/ });
+    expect(desktopSvg.getAttribute("viewBox")).toBe("0 0 640 272");
+    const firstTick = within(desktopSvg).getByText("2026-10-25");
+    const lastTick = within(desktopSvg).getByText("2026-11-23");
+    expect(firstTick.getAttribute("text-anchor")).toBe("start");
+    expect(lastTick.getAttribute("text-anchor")).toBe("end");
+    unmount();
+
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 254,
+        bottom: 236,
+        width: 254,
+        height: 236,
+        toJSON: () => ({}),
+      } as DOMRect);
+    try {
+      renderUi(<ReportResultSection title="Orders mobile" chart="line" table={table} />);
+      const mobileSvg = await screen.findByRole("img", { name: /^Orders mobile/ });
+      await waitFor(() => {
+        expect(mobileSvg.getAttribute("viewBox")).toBe("0 0 254 236");
+      });
+      expect(within(mobileSvg).getByText("2026-10-25").getAttribute("text-anchor")).toBe("start");
+      expect(within(mobileSvg).getByText("2026-11-23").getAttribute("text-anchor")).toBe("end");
+    } finally {
+      rectSpy.mockRestore();
+    }
   });
 
   pageA11y("Reports overview", async () => {

@@ -4,7 +4,7 @@
  * Colour is never the sole cue: multi-series bars and donut slices apply `ids.patternFill(2..6)`,
  * line series combine distinct dash patterns and point markers, and every chart has a text summary + DataTable.
  */
-import { useId, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import {
   Callout,
   ChartFrame,
@@ -70,6 +70,55 @@ function truncateSvgLabel(raw: string, max = 14): string {
   return raw.length <= max ? raw : `${raw.slice(0, max - 1)}…`;
 }
 
+/**
+ * Measures the rendered chart container width so 1 SVG user unit = 1 CSS pixel
+ * across 320 px mobile and wide desktop viewports (prevents tiny scaled-down axis text at 320 px).
+ * Falls back to `fallback` (640) in non-layout environments such as jsdom.
+ */
+function usePlotWidth(fallback = 640): { ref: (el: HTMLDivElement | null) => void; width: number } {
+  const [width, setWidth] = useState(fallback);
+  const observerRef = useRef<ResizeObserver | null>(null);
+
+  const ref = useCallback((el: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
+    if (!el) return;
+    const measure = () => {
+      const rectW = typeof el.getBoundingClientRect === "function" ? el.getBoundingClientRect().width : 0;
+      const measured = Math.round(rectW || el.clientWidth || 0);
+      if (measured > 0) {
+        const clamped = Math.max(220, measured);
+        setWidth((prev) => (prev === clamped ? prev : clamped));
+      }
+    };
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => measure());
+      ro.observe(el);
+      observerRef.current = ro;
+    }
+  }, []);
+
+  useEffect(() => () => observerRef.current?.disconnect(), []);
+  return { ref, width };
+}
+
+/**
+ * Selects up to `maxTicks` evenly spaced indices including `0` and `count - 1`
+ * without bunching the penultimate tick next to the final tick.
+ */
+function selectTickIndices(count: number, maxTicks: number): Set<number> {
+  if (count <= 0 || maxTicks <= 0) return new Set();
+  if (count <= maxTicks) return new Set(Array.from({ length: count }, (_, i) => i));
+  if (maxTicks === 1) return new Set([0]);
+  const selected = new Set<number>([0, count - 1]);
+  const segments = maxTicks - 1;
+  for (let s = 1; s < segments; s += 1) {
+    selected.add(Math.round((s * (count - 1)) / segments));
+  }
+  return selected;
+}
+
 function extractPlotData(table: TableResult, maxPoints = 24): ExtractedPlotData | null {
   if (table.columns.length === 0 || table.rows.length === 0) return null;
   const metricIndices: number[] = [];
@@ -101,7 +150,7 @@ function extractPlotData(table: TableResult, maxPoints = 24): ExtractedPlotData 
     );
     return {
       label: formattedLabel,
-      shortLabel: truncateSvgLabel(formattedLabel, sliceRows.length > 10 ? 10 : 16),
+      shortLabel: truncateSvgLabel(formattedLabel, sliceRows.length > 10 ? 14 : 16),
       rawRow: row,
       values,
       formattedValues,
@@ -116,18 +165,20 @@ function extractPlotData(table: TableResult, maxPoints = 24): ExtractedPlotData 
   };
 }
 
-function niceAxisBounds(values: readonly number[]): { min: number; max: number; ticks: number[] } {
+function niceAxisBounds(values: readonly number[], maxTickCount = 5): { min: number; max: number; ticks: number[] } {
   let minVal = 0;
   let maxVal = 0;
   for (const v of values) {
     if (v < minVal) minVal = v;
     if (v > maxVal) maxVal = v;
   }
+  const divisions = Math.max(2, maxTickCount - 1);
   if (maxVal === 0 && minVal === 0) {
-    return { min: 0, max: 4, ticks: [0, 1, 2, 3, 4] };
+    const fallbackTicks = Array.from({ length: divisions + 1 }, (_, i) => i);
+    return { min: 0, max: divisions, ticks: fallbackTicks };
   }
   const rawSpan = Math.max(1e-6, maxVal - minVal);
-  const roughStep = rawSpan / 4;
+  const roughStep = rawSpan / divisions;
   const mag = Math.pow(10, Math.floor(Math.log10(roughStep)));
   const residual = roughStep / mag;
   const niceStep =
@@ -135,7 +186,7 @@ function niceAxisBounds(values: readonly number[]): { min: number; max: number; 
   const niceMin = minVal < 0 ? Math.floor(minVal / niceStep) * niceStep : 0;
   const niceMax = Math.max(niceMin + niceStep, Math.ceil(maxVal / niceStep) * niceStep);
   const ticks: number[] = [];
-  for (let t = niceMin; t <= niceMax + niceStep * 0.001 && ticks.length < 7; t += niceStep) {
+  for (let t = niceMin; t <= niceMax + niceStep * 0.001 && ticks.length < maxTickCount + 2; t += niceStep) {
     ticks.push(Number(t.toFixed(6)));
   }
   return { min: niceMin, max: niceMax, ticks };
@@ -216,110 +267,141 @@ function SvgBarChart({
   columns: readonly ColumnView[];
 }) {
   const ids = useChartIds();
-  const width = 640;
-  const height = 272;
-  const padLeft = 86;
-  const padRight = 20;
-  const padTop = 20;
-  const padBottom = 52;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
+  const { ref, width } = usePlotWidth(640);
+  const compact = width < 440;
+  const height = compact ? 236 : 272;
 
   const allValues = plot.points.flatMap((p) => p.values);
-  const { min, max, ticks } = niceAxisBounds(allValues);
+  const { min, max, ticks } = niceAxisBounds(allValues, compact ? 4 : 5);
   const span = Math.max(1e-6, max - min);
-  const zeroY = padTop + plotH - ((0 - min) / span) * plotH;
   const primaryCol = columns[plot.metricIndices[0]!]!;
   const sampleRow = plot.points[0]?.rawRow ?? [];
+
+  const formattedYTicks = ticks.map((t) =>
+    truncateSvgLabel(formatAxisTick(t, primaryCol, sampleRow, columns), compact ? 10 : 12),
+  );
+  const maxYTickChars = Math.max(2, ...formattedYTicks.map((s) => s.length));
+  const padLeft = Math.min(compact ? 70 : 88, Math.max(38, maxYTickChars * 6.8 + 14));
+  const padRight = compact ? 14 : 24;
+  const padTop = 20;
+  const padBottom = 46;
+  const plotW = Math.max(120, width - padLeft - padRight);
+  const plotH = height - padTop - padBottom;
+  const zeroY = padTop + plotH - ((0 - min) / span) * plotH;
 
   const groupCount = plot.points.length;
   const seriesCount = plot.metricIndices.length;
   const slotW = plotW / Math.max(1, groupCount);
   const groupW = Math.min(72, slotW * 0.76);
-  const barW = Math.max(4, (groupW - (seriesCount - 1) * 3) / seriesCount);
-  const showValueLabels = groupCount * seriesCount <= 12;
-  const labelStride = groupCount > 12 ? Math.ceil(groupCount / 8) : 1;
+  const barW = Math.max(3, (groupW - (seriesCount - 1) * 3) / seriesCount);
+  const showValueLabels = !compact && groupCount * seriesCount <= 12;
+
+  const xLabelCharCap = compact ? 9 : groupCount > 10 ? 12 : 16;
+  const maxXChars = Math.max(
+    3,
+    ...plot.points.map((pt) => Math.min(xLabelCharCap, pt.shortLabel.length)),
+  );
+  const maxXTicks = Math.max(
+    groupCount <= 1 ? 1 : 2,
+    Math.min(7, Math.floor(plotW / Math.max(52, maxXChars * 6.5 + 12))),
+  );
+  const visibleXTicks = selectTickIndices(groupCount, maxXTicks);
 
   return (
-    <svg role="img" aria-labelledby={ids.labelledBy} viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
-      {ticks.map((tick) => {
-        const y = padTop + plotH - ((tick - min) / span) * plotH;
-        return (
-          <g key={tick}>
-            <line
-              x1={padLeft}
-              y1={y}
-              x2={width - padRight}
-              y2={y}
-              className="stroke-line"
-              strokeDasharray={tick === 0 ? undefined : "3 3"}
-              strokeWidth={1}
-            />
-            <text
-              x={padLeft - 8}
-              y={y + 4}
-              textAnchor="end"
-              className="fill-muted text-[11px]"
-            >
-              {truncateSvgLabel(formatAxisTick(tick, primaryCol, sampleRow, columns), 12)}
-            </text>
-          </g>
-        );
-      })}
-
-      {plot.points.map((pt, groupIdx) => {
-        const slotCenter = padLeft + slotW * groupIdx + slotW / 2;
-        const groupStart = slotCenter - (seriesCount * barW + (seriesCount - 1) * 3) / 2;
-        return (
-          <g key={`${groupIdx}-${pt.label}`}>
-            {pt.values.map((val, sIdx) => {
-              const series = SERIES_NUMBERS[sIdx % SERIES_NUMBERS.length]!;
-              const valY = padTop + plotH - ((val - min) / span) * plotH;
-              const topY = Math.min(valY, zeroY);
-              const barH = Math.max(2, Math.abs(zeroY - valY));
-              const x = groupStart + sIdx * (barW + 3);
-              const usePattern = seriesCount > 1 && series > 1;
-              return (
-                <g key={series}>
-                  <rect
-                    x={x}
-                    y={topY}
-                    width={barW}
-                    height={barH}
-                    rx={2}
-                    className={usePattern ? "stroke-surface" : `${SERIES_FILL[series]} stroke-surface`}
-                    fill={usePattern ? ids.patternFill(series) : undefined}
-                    strokeWidth={1}
-                  >
-                    <title>{`${pt.label} — ${columns[plot.metricIndices[sIdx]!]!.label}: ${pt.formattedValues[sIdx]}`}</title>
-                  </rect>
-                  {showValueLabels ? (
-                    <text
-                      x={x + barW / 2}
-                      y={Math.max(12, topY - 5)}
-                      textAnchor="middle"
-                      className="fill-ink text-[10px] font-medium"
-                    >
-                      {truncateSvgLabel(pt.formattedValues[sIdx] ?? "", 10)}
-                    </text>
-                  ) : null}
-                </g>
-              );
-            })}
-            {groupIdx % labelStride === 0 ? (
+    <div ref={ref} className="w-full min-w-0">
+      <svg
+        role="img"
+        aria-labelledby={ids.labelledBy}
+        viewBox={`0 0 ${width} ${height}`}
+        className="block w-full h-auto min-h-[14rem]"
+      >
+        {ticks.map((tick, tIdx) => {
+          const y = padTop + plotH - ((tick - min) / span) * plotH;
+          return (
+            <g key={tick}>
+              <line
+                x1={padLeft}
+                y1={y}
+                x2={width - padRight}
+                y2={y}
+                className="stroke-line"
+                strokeDasharray={tick === 0 ? undefined : "3 3"}
+                strokeWidth={1}
+              />
               <text
-                x={slotCenter}
-                y={height - padBottom + 18}
-                textAnchor="middle"
+                x={padLeft - 8}
+                y={y + 4}
+                textAnchor="end"
                 className="fill-muted text-[11px]"
               >
-                {pt.shortLabel}
+                {formattedYTicks[tIdx]}
               </text>
-            ) : null}
-          </g>
-        );
-      })}
-    </svg>
+            </g>
+          );
+        })}
+
+        {plot.points.map((pt, groupIdx) => {
+          const slotCenter = padLeft + slotW * groupIdx + slotW / 2;
+          const groupStart = slotCenter - (seriesCount * barW + (seriesCount - 1) * 3) / 2;
+          const xText = truncateSvgLabel(pt.shortLabel, xLabelCharCap);
+          const halfEst = xText.length * 3.4;
+          const clampStart = groupCount > 1 && groupIdx === 0 && slotCenter - halfEst < padLeft;
+          const clampEnd =
+            groupCount > 1 && groupIdx === groupCount - 1 && slotCenter + halfEst > width - padRight;
+          const tickX = clampStart ? padLeft : clampEnd ? width - padRight : slotCenter;
+          const tickAnchor = clampStart ? "start" : clampEnd ? "end" : "middle";
+
+          return (
+            <g key={`${groupIdx}-${pt.label}`}>
+              {pt.values.map((val, sIdx) => {
+                const series = SERIES_NUMBERS[sIdx % SERIES_NUMBERS.length]!;
+                const valY = padTop + plotH - ((val - min) / span) * plotH;
+                const topY = Math.min(valY, zeroY);
+                const barH = Math.max(2, Math.abs(zeroY - valY));
+                const x = groupStart + sIdx * (barW + 3);
+                const usePattern = seriesCount > 1 && series > 1;
+                return (
+                  <g key={series}>
+                    <rect
+                      x={x}
+                      y={topY}
+                      width={barW}
+                      height={barH}
+                      rx={2}
+                      className={usePattern ? "stroke-surface" : `${SERIES_FILL[series]} stroke-surface`}
+                      fill={usePattern ? ids.patternFill(series) : undefined}
+                      strokeWidth={1}
+                    >
+                      <title>{`${pt.label} — ${columns[plot.metricIndices[sIdx]!]!.label}: ${pt.formattedValues[sIdx]}`}</title>
+                    </rect>
+                    {showValueLabels ? (
+                      <text
+                        x={x + barW / 2}
+                        y={Math.max(12, topY - 5)}
+                        textAnchor="middle"
+                        className="fill-ink text-[10px] font-medium"
+                      >
+                        {truncateSvgLabel(pt.formattedValues[sIdx] ?? "", 10)}
+                      </text>
+                    ) : null}
+                  </g>
+                );
+              })}
+              {visibleXTicks.has(groupIdx) ? (
+                <text
+                  x={tickX}
+                  y={height - padBottom + 20}
+                  textAnchor={tickAnchor}
+                  className="fill-muted text-[11px]"
+                >
+                  {xText}
+                </text>
+              ) : null}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
   );
 }
 
@@ -331,95 +413,131 @@ function SvgLineChart({
   columns: readonly ColumnView[];
 }) {
   const ids = useChartIds();
-  const width = 640;
-  const height = 272;
-  const padLeft = 86;
-  const padRight = 24;
-  const padTop = 20;
-  const padBottom = 52;
-  const plotW = width - padLeft - padRight;
-  const plotH = height - padTop - padBottom;
+  const { ref, width } = usePlotWidth(640);
+  const compact = width < 440;
+  const height = compact ? 236 : 272;
 
   const allValues = plot.points.flatMap((p) => p.values);
-  const { min, max, ticks } = niceAxisBounds(allValues);
+  const { min, max, ticks } = niceAxisBounds(allValues, compact ? 4 : 5);
   const span = Math.max(1e-6, max - min);
   const primaryCol = columns[plot.metricIndices[0]!]!;
   const sampleRow = plot.points[0]?.rawRow ?? [];
+
+  const formattedYTicks = ticks.map((t) =>
+    truncateSvgLabel(formatAxisTick(t, primaryCol, sampleRow, columns), compact ? 10 : 12),
+  );
+  const maxYTickChars = Math.max(2, ...formattedYTicks.map((s) => s.length));
+  const padLeft = Math.min(compact ? 70 : 88, Math.max(38, maxYTickChars * 6.8 + 14));
+  const padRight = compact ? 16 : 28;
+  const padTop = 20;
+  const padBottom = 46;
+  const plotW = Math.max(120, width - padLeft - padRight);
+  const plotH = height - padTop - padBottom;
 
   const count = plot.points.length;
   const xForIndex = (idx: number) =>
     count <= 1 ? padLeft + plotW / 2 : padLeft + (idx / (count - 1)) * plotW;
   const yForVal = (val: number) => padTop + plotH - ((val - min) / span) * plotH;
-  const labelStride = count > 10 ? Math.ceil(count / 7) : 1;
+
+  const xLabelCharCap = compact ? 10 : 14;
+  const maxXChars = Math.max(
+    4,
+    ...plot.points.map((pt) => Math.min(xLabelCharCap, pt.shortLabel.length)),
+  );
+  const maxXTicks = Math.max(
+    count <= 1 ? 1 : 2,
+    Math.min(compact ? 3 : 6, Math.floor(plotW / Math.max(58, maxXChars * 6.6 + 14))),
+  );
+  const visibleXTicks = selectTickIndices(count, maxXTicks);
+  const pointSpacing = plotW / Math.max(1, count - 1);
+  const markerStride = pointSpacing < 12 ? Math.ceil(12 / Math.max(1, pointSpacing)) : 1;
 
   return (
-    <svg role="img" aria-labelledby={ids.labelledBy} viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
-      {ticks.map((tick) => {
-        const y = yForVal(tick);
-        return (
-          <g key={tick}>
-            <line
-              x1={padLeft}
-              y1={y}
-              x2={width - padRight}
-              y2={y}
-              className="stroke-line"
-              strokeDasharray={tick === 0 ? undefined : "3 3"}
-              strokeWidth={1}
-            />
-            <text x={padLeft - 8} y={y + 4} textAnchor="end" className="fill-muted text-[11px]">
-              {truncateSvgLabel(formatAxisTick(tick, primaryCol, sampleRow, columns), 12)}
-            </text>
-          </g>
-        );
-      })}
-
-      {plot.metricIndices.map((colIdx, sIdx) => {
-        const series = SERIES_NUMBERS[sIdx % SERIES_NUMBERS.length]!;
-        const coords = plot.points.map((pt, pIdx) => ({
-          x: xForIndex(pIdx),
-          y: yForVal(pt.values[sIdx] ?? 0),
-          label: pt.label,
-          formatted: pt.formattedValues[sIdx] ?? "0",
-        }));
-        const polyPoints = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ");
-        return (
-          <g key={colIdx}>
-            {coords.length > 1 ? (
-              <polyline
-                fill="none"
-                points={polyPoints}
-                className={SERIES_STROKE[series]}
-                strokeWidth={2.5}
-                strokeDasharray={SERIES_DASH[series]}
-                strokeLinecap="round"
-                strokeLinejoin="round"
+    <div ref={ref} className="w-full min-w-0">
+      <svg
+        role="img"
+        aria-labelledby={ids.labelledBy}
+        viewBox={`0 0 ${width} ${height}`}
+        className="block w-full h-auto min-h-[14rem]"
+      >
+        {ticks.map((tick, tIdx) => {
+          const y = yForVal(tick);
+          return (
+            <g key={tick}>
+              <line
+                x1={padLeft}
+                y1={y}
+                x2={width - padRight}
+                y2={y}
+                className="stroke-line"
+                strokeDasharray={tick === 0 ? undefined : "3 3"}
+                strokeWidth={1}
               />
-            ) : null}
-            {coords.map((c, cIdx) => (
-              <g key={`${cIdx}-${c.label}`}>
-                <LineMarker series={series} cx={c.x} cy={c.y} />
-                <title>{`${c.label} — ${columns[colIdx]!.label}: ${c.formatted}`}</title>
-              </g>
-            ))}
-          </g>
-        );
-      })}
+              <text x={padLeft - 8} y={y + 4} textAnchor="end" className="fill-muted text-[11px]">
+                {formattedYTicks[tIdx]}
+              </text>
+            </g>
+          );
+        })}
 
-      {plot.points.map((pt, idx) =>
-        idx % labelStride === 0 || idx === count - 1 ? (
-          <text
-            key={`${idx}-${pt.label}`}
-            x={xForIndex(idx)}
-            y={height - padBottom + 18}
-            textAnchor="middle"
-            className="fill-muted text-[11px]"
-          >
-            {pt.shortLabel}
-          </text>
-        ) : null,
-      )}
-    </svg>
+        {plot.metricIndices.map((colIdx, sIdx) => {
+          const series = SERIES_NUMBERS[sIdx % SERIES_NUMBERS.length]!;
+          const coords = plot.points.map((pt, pIdx) => ({
+            x: xForIndex(pIdx),
+            y: yForVal(pt.values[sIdx] ?? 0),
+            label: pt.label,
+            formatted: pt.formattedValues[sIdx] ?? "0",
+          }));
+          const polyPoints = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ");
+          return (
+            <g key={colIdx}>
+              {coords.length > 1 ? (
+                <polyline
+                  fill="none"
+                  points={polyPoints}
+                  className={SERIES_STROKE[series]}
+                  strokeWidth={2.5}
+                  strokeDasharray={SERIES_DASH[series]}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              ) : null}
+              {coords.map((c, cIdx) =>
+                cIdx % markerStride === 0 || cIdx === count - 1 ? (
+                  <g key={`${cIdx}-${c.label}`}>
+                    <LineMarker series={series} cx={c.x} cy={c.y} />
+                    <title>{`${c.label} — ${columns[colIdx]!.label}: ${c.formatted}`}</title>
+                  </g>
+                ) : null,
+              )}
+            </g>
+          );
+        })}
+
+        {plot.points.map((pt, idx) => {
+          if (!visibleXTicks.has(idx)) return null;
+          const anchor =
+            count <= 1
+              ? "middle"
+              : idx === 0
+                ? "start"
+                : idx === count - 1
+                  ? "end"
+                  : "middle";
+          return (
+            <text
+              key={`${idx}-${pt.label}`}
+              x={xForIndex(idx)}
+              y={height - padBottom + 20}
+              textAnchor={anchor}
+              className="fill-muted text-[11px]"
+            >
+              {truncateSvgLabel(pt.shortLabel, xLabelCharCap)}
+            </text>
+          );
+        })}
+      </svg>
+    </div>
   );
 }
 
@@ -533,81 +651,95 @@ function SvgPieChart({
   metricLabel: string;
 }) {
   const ids = useChartIds();
-  const width = 640;
-  const height = 244;
-  const cx = 148;
-  const cy = 122;
-  const rOuter = 92;
-  const rInner = 54;
+  const { ref, width } = usePlotWidth(640);
+  const showSideBars = width >= 520;
+  const height = showSideBars ? 244 : 212;
+  const cx = showSideBars ? 132 : Math.round(width / 2);
+  const cy = showSideBars ? 122 : 106;
+  const rOuter = showSideBars ? 90 : Math.min(82, Math.round(width * 0.34));
+  const rInner = Math.round(rOuter * 0.58);
   const total = slices.reduce((acc, s) => acc + s.value, 0);
+
+  const labelX = 256;
+  const pctX = width - 16;
+  const barX = Math.min(418, Math.max(labelX + 110, Math.round(width * 0.56)));
+  const barMaxW = Math.max(64, pctX - 48 - barX);
 
   let angle = -Math.PI / 2;
 
   return (
-    <svg role="img" aria-labelledby={ids.labelledBy} viewBox={`0 0 ${width} ${height}`} className="w-full h-auto">
-      {total <= 0 ? (
-        <g>
-          <circle cx={cx} cy={cy} r={rOuter} className="fill-none stroke-line" strokeWidth={18} />
-          <text x={cx} y={cy + 4} textAnchor="middle" className="fill-muted text-xs">
-            0 total
-          </text>
-        </g>
-      ) : (
-        slices.map((slice) => {
-          const sweep = (slice.value / total) * Math.PI * 2;
-          const nextAngle = angle + sweep;
-          const d = donutArcPath(cx, cy, rOuter, rInner, angle, nextAngle);
-          angle = nextAngle;
-          const usePattern = slice.series > 1;
-          return (
-            <path
-              key={`${slice.series}-${slice.label}`}
-              d={d}
-              className={usePattern ? "stroke-surface" : `${SERIES_FILL[slice.series]} stroke-surface`}
-              fill={usePattern ? ids.patternFill(slice.series) : undefined}
-              strokeWidth={2}
-            >
-              <title>{`${slice.label}: ${slice.formattedValue} (${slice.sharePct})`}</title>
-            </path>
-          );
-        })
-      )}
-
-      <text x={cx} y={cy - 4} textAnchor="middle" className="fill-muted text-[11px]">
-        {truncateSvgLabel(metricLabel, 14)}
-      </text>
-      <text x={cx} y={cy + 14} textAnchor="middle" className="fill-ink text-sm font-semibold">
-        {truncateSvgLabel(formattedTotal, 14)}
-      </text>
-
-      {/* Right-hand proportional horizontal share bars so rank & share are visible directly inside the graphic */}
-      {slices.map((slice, idx) => {
-        const rowY = 34 + idx * 34;
-        const barMaxW = 180;
-        const barW = total > 0 ? Math.max(4, (slice.value / total) * barMaxW) : 0;
-        const usePattern = slice.series > 1;
-        return (
-          <g key={`bar-${slice.series}-${slice.label}`}>
-            <text x={282} y={rowY + 11} className="fill-ink text-[12px] font-medium">
-              {truncateSvgLabel(slice.label, 18)}
-            </text>
-            <rect x={422} y={rowY} width={barMaxW} height={14} rx={3} className="fill-none stroke-line" />
-            <rect
-              x={422}
-              y={rowY}
-              width={barW}
-              height={14}
-              rx={3}
-              className={usePattern ? "stroke-surface" : `${SERIES_FILL[slice.series]} stroke-surface`}
-              fill={usePattern ? ids.patternFill(slice.series) : undefined}
-            />
-            <text x={610} y={rowY + 11} textAnchor="end" className="fill-muted text-[11px]">
-              {slice.sharePct}
+    <div ref={ref} className="w-full min-w-0">
+      <svg
+        role="img"
+        aria-labelledby={ids.labelledBy}
+        viewBox={`0 0 ${width} ${height}`}
+        className="block w-full h-auto min-h-[13rem]"
+      >
+        {total <= 0 ? (
+          <g>
+            <circle cx={cx} cy={cy} r={rOuter} className="fill-none stroke-line" strokeWidth={18} />
+            <text x={cx} y={cy + 4} textAnchor="middle" className="fill-muted text-xs">
+              0 total
             </text>
           </g>
-        );
-      })}
-    </svg>
+        ) : (
+          slices.map((slice) => {
+            const sweep = (slice.value / total) * Math.PI * 2;
+            const nextAngle = angle + sweep;
+            const d = donutArcPath(cx, cy, rOuter, rInner, angle, nextAngle);
+            angle = nextAngle;
+            const usePattern = slice.series > 1;
+            return (
+              <path
+                key={`${slice.series}-${slice.label}`}
+                d={d}
+                className={usePattern ? "stroke-surface" : `${SERIES_FILL[slice.series]} stroke-surface`}
+                fill={usePattern ? ids.patternFill(slice.series) : undefined}
+                strokeWidth={2}
+              >
+                <title>{`${slice.label}: ${slice.formattedValue} (${slice.sharePct})`}</title>
+              </path>
+            );
+          })
+        )}
+
+        <text x={cx} y={cy - 4} textAnchor="middle" className="fill-muted text-[11px]">
+          {truncateSvgLabel(metricLabel, 14)}
+        </text>
+        <text x={cx} y={cy + 14} textAnchor="middle" className="fill-ink text-sm font-semibold">
+          {truncateSvgLabel(formattedTotal, 14)}
+        </text>
+
+        {/* Right-hand proportional horizontal share bars on tablet/desktop; on <520 px mobile, ChartFrame legend below shows full labels & shares */}
+        {showSideBars
+          ? slices.map((slice, idx) => {
+              const rowY = 34 + idx * 34;
+              const barW = total > 0 ? Math.max(4, (slice.value / total) * barMaxW) : 0;
+              const usePattern = slice.series > 1;
+              return (
+                <g key={`bar-${slice.series}-${slice.label}`}>
+                  <text x={labelX} y={rowY + 11} className="fill-ink text-[12px] font-medium">
+                    {truncateSvgLabel(slice.label, 18)}
+                  </text>
+                  <rect x={barX} y={rowY} width={barMaxW} height={14} rx={3} className="fill-none stroke-line" />
+                  <rect
+                    x={barX}
+                    y={rowY}
+                    width={barW}
+                    height={14}
+                    rx={3}
+                    className={usePattern ? "stroke-surface" : `${SERIES_FILL[slice.series]} stroke-surface`}
+                    fill={usePattern ? ids.patternFill(slice.series) : undefined}
+                  />
+                  <text x={pctX} y={rowY + 11} textAnchor="end" className="fill-muted text-[11px]">
+                    {slice.sharePct}
+                  </text>
+                </g>
+              );
+            })
+          : null}
+      </svg>
+    </div>
   );
 }
 
@@ -678,7 +810,7 @@ export function ReportResultSection({
     </div>
   );
 
-  const plot = chart === "table" ? null : extractPlotData(table);
+  const plot = chart === "table" ? null : extractPlotData(table, chart === "line" ? 366 : 24);
 
   // Table-only panels (or custom specs without any numeric metric column) render directly as an accessible section.
   if (chart === "table" || (!loading && !error && table.rows.length > 0 && !plot)) {
