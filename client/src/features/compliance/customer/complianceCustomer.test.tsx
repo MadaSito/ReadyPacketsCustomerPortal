@@ -8,7 +8,7 @@ import type { PublishedPolicyView } from "@server/modules/compliance/policiesSer
 import type * as sessionModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
-import { Route } from "wouter";
+import { Route, useLocation, useSearch } from "wouter";
 import { InvoiceDetailPage, InvoicesPage, OrderInvoicesTab } from "./InvoicePages";
 import OrderIntakeTab from "./OrderIntakeTab";
 import PolicyAcceptanceWidget, { RequiredPolicyGate } from "./PolicyAcceptance";
@@ -419,6 +419,82 @@ describe("customer invoices", () => {
     renderUi(<OrderInvoicesTab orderId={orderId} area="customer" />);
     expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
     expect(screen.queryByText("Payment receipts")).not.toBeInTheDocument();
+  });
+
+  it("deep-links /invoices?tab=receipts on load, defaults unknown tabs to invoices, and replaces the query string on tab switch", async () => {
+    const user = userEvent.setup();
+    const receiptId = publicId("E");
+    mocks.invoiceList.mockResolvedValue({ items: [invoice], nextCursor: null });
+    mocks.receiptList.mockResolvedValue({
+      items: [
+        {
+          receiptPublicId: receiptId,
+          receiptNumber: "RPR-2026-000042",
+          settlementKind: "provider_online" as const,
+          invoicePublicId: invoice.invoicePublicId,
+          paymentPublicId: publicId("8"),
+          orderPublicId: orderId,
+          orderReference: "RP-123",
+          customerRef: "CUST-1",
+          currency: "USD",
+          subtotalMinor: 10000,
+          discountMinor: 0,
+          bundleDiscountMinor: 0,
+          promoDiscountMinor: 0,
+          promoLabel: null,
+          taxMinor: 0,
+          amountWaivedMinor: 0,
+          amountPaidMinor: 10000,
+          refundedMinor: 0,
+          refundState: "none" as const,
+          paymentMethod: "provider_online" as const,
+          paymentMethodBrand: "visa",
+          paymentMethodLast4: "4242",
+          paymentMethodSummary: "Visa ending in 4242",
+          provider: "stripe",
+          issuedAt: date,
+          origin: "portal" as const,
+          refundNotes: [],
+        },
+      ],
+      nextCursor: null,
+    });
+
+    function LocationProbe() {
+      const [loc] = useLocation();
+      const search = useSearch();
+      return <output data-testid="invoices-url-probe">{search ? `${loc}?${search}` : loc}</output>;
+    }
+
+    const deepLinked = renderUi(
+      <>
+        <InvoicesPage />
+        <LocationProbe />
+      </>,
+      { path: "/invoices?tab=receipts" },
+    );
+    expect(screen.getByRole("tab", { name: "Receipts" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RPR-2026-000042" })).toBeVisible();
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices?tab=receipts");
+    expect(deepLinked.location.history).toHaveLength(1);
+
+    await user.click(screen.getByRole("tab", { name: "Invoices" }));
+    expect(screen.getByRole("tab", { name: "Invoices" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices");
+    expect(deepLinked.location.history).toHaveLength(1);
+
+    await user.click(screen.getByRole("tab", { name: "Receipts" }));
+    expect(screen.getByRole("tab", { name: "Receipts" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("invoices-url-probe")).toHaveTextContent("/invoices?tab=receipts");
+    expect(deepLinked.location.history).toHaveLength(1);
+    await expectNoAxeViolations(deepLinked.container);
+    deepLinked.unmount();
+
+    const invalidTab = renderUi(<InvoicesPage />, { path: "/invoices?tab=unexpected" });
+    expect(screen.getByRole("tab", { name: "Invoices" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    invalidTab.unmount();
   });
 
   it("shows expected account name and link to /account on SIGNER_NAME_MISMATCH", async () => {

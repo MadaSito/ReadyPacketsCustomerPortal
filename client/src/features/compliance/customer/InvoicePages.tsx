@@ -1,7 +1,7 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Download, Plus, ReceiptText } from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { Link, useParams } from "wouter";
+import { Link, useLocation, useParams, useSearch } from "wouter";
 import type { InvoiceDetailView, InvoicePaymentView, InvoiceSummaryView } from "@server/modules/compliance/invoicesService";
 import { useTRPC } from "@/lib/trpc";
 import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton, Tabs } from "@/ui";
@@ -53,8 +53,30 @@ function InvoiceList({
   </ul>;
 }
 
+type BillingDocumentsTab = "invoices" | "receipts";
+
+function parseBillingDocumentsTab(search: string): BillingDocumentsTab {
+  const raw = new URLSearchParams(search).get("tab");
+  return raw === "receipts" ? "receipts" : "invoices";
+}
+
 export function InvoicesPage() {
   const trpc = useTRPC();
+  const [location, navigate] = useLocation();
+  const search = useSearch();
+  const activeTab = parseBillingDocumentsTab(search);
+  const handleTabChange = (next: string) => {
+    if (next !== "invoices" && next !== "receipts") return;
+    const pathname = location.split("?")[0] || "/invoices";
+    const params = new URLSearchParams(search);
+    if (next === "invoices") {
+      params.delete("tab");
+    } else {
+      params.set("tab", next);
+    }
+    const nextSearch = params.toString();
+    navigate(nextSearch ? `${pathname}?${nextSearch}` : pathname, { replace: true });
+  };
   const invoices = useInfiniteQuery(trpc.compliance.invoices.listMine.infiniteQueryOptions({ limit: 25 }, {
     getNextPageParam: (page) => page.nextCursor ?? undefined,
   }));
@@ -71,6 +93,8 @@ export function InvoicesPage() {
       <PageHeader title="Invoices" description="See issued invoices, confirmed payment receipts, and their payment status." />
       <Tabs
         label="Billing documents"
+        value={activeTab}
+        onValueChange={handleTabChange}
         items={[
           { value: "invoices", label: "Invoices", content: invoicesContent },
           { value: "receipts", label: "Receipts", content: <CustomerReceiptsPanel /> },
