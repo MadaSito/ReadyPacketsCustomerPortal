@@ -52,6 +52,9 @@ export type CartPaymentMode = (typeof CART_PAYMENT_MODES)[number];
 export const CART_UPSELL_OFFER_KINDS = ["add_on", "tier_upgrade"] as const;
 export type CartUpsellOfferKind = (typeof CART_UPSELL_OFFER_KINDS)[number];
 
+export const CART_UPSELL_RULE_TYPES = ["standard", "next_packet", "bundle_completion"] as const;
+export type CartUpsellRuleType = (typeof CART_UPSELL_RULE_TYPES)[number];
+
 export const CART_UPSELL_TRIGGER_MODES = ["any_cart", "products"] as const;
 export type CartUpsellTriggerMode = (typeof CART_UPSELL_TRIGGER_MODES)[number];
 
@@ -97,6 +100,8 @@ export const carts = mysqlTable(
     checkedOutTaxRateBps: int("checked_out_tax_rate_bps", { unsigned: true }),
     checkedOutTaxMinor: amountMinorColumn("checked_out_tax_minor"),
     checkedOutTotalMinor: amountMinorColumn("checked_out_total_minor"),
+    /** Non-null when `payments.small_totals` waived a sub-minimum balance at checkout (Increment 06, D5). */
+    checkedOutWaivedMinor: amountMinorColumn("checked_out_waived_minor"),
     restoredIntoCartPublicId: char("restored_into_cart_public_id", { length: 26 }),
     lastActivityAt: utcDateTime("last_activity_at").notNull(),
     checkedOutAt: utcDateTime("checked_out_at"),
@@ -161,7 +166,11 @@ export const cartUpsellOffers = mysqlTable(
   {
     id: idColumn(),
     publicId: publicIdColumn(),
+    /** Stable idempotency key for catalogue-seeded offers (Increment 06, D3); NULL for manual admin offers. */
+    seedKey: varchar("seed_key", { length: 96 }),
     kind: mysqlEnum("kind", CART_UPSELL_OFFER_KINDS).notNull(),
+    /** Distinguishes standard add-on/tier-upgrade rows from seeded `next_packet` and `bundle_completion` rows (D3). */
+    ruleType: varchar("rule_type", { length: 32 }).notNull().default("standard"),
     title: varchar("title", { length: 120 }).notNull(),
     shortText: varchar("short_text", { length: 200 }).notNull(),
     triggerMode: mysqlEnum("trigger_mode", CART_UPSELL_TRIGGER_MODES).notNull().default("products"),
@@ -189,6 +198,7 @@ export const cartUpsellOffers = mysqlTable(
     }).onDelete("set null"),
     index("cart_upsell_offer_active_prio_idx").on(t.active, t.priority, t.id),
     index("cart_upsell_offer_target_idx").on(t.targetProductPublicId),
+    uniqueIndex("cart_upsell_offer_seed_key_uq").on(t.seedKey),
   ],
 );
 
