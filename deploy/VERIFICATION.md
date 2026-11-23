@@ -1,5 +1,11 @@
 # Deployment verification
 
+## Increment 06 PWA, migration and file routes
+
+- **Offline verification**: Nine migration bundle and digest fixtures, three file-route edge fixtures, three existing workflow edge fixtures and 41 PWA routing, install detection and static response cases passed. Scoped ESLint, ShellCheck and syntax checks passed. Nginx 1.28.3 accepted both profiles via `nginx -t` in an isolated configuration; Caddy 2.11.9 accepted its configuration via `adapt --validate` with the expected file-route and default caps.
+- **Deployment checks**: Fresh native installs and Compose startup/restart require `0006`; native upgrade CI requires journal hashes for `0003` through `0006`. Native and Compose smoke probes verify the worker, manifest and offline document and their cache headers.
+- **Not verified here**: No local app build, listener, installer, database migration, browser, or backup/restore ran for this package. Use the [upgrade runbook](../docs/operations/UPGRADE.md#increment-06-and-migration-0006) for staging rehearsal.
+
 ## Increment 05 migration packaging
 
 - **Offline fixtures**: All nine cases in `scripts/ci/release-migrations.test.ts` passed. They check a complete SQL bundle; missing journal entries or SQL; unjournaled SQL; and replacement of SQL or the journal with a symlink. A fake database query accepts one matching SHA-256 journal row and refuses zero or two rows. These checks do not start a server or run a migration.

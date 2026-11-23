@@ -82,6 +82,15 @@ done
 ! grep -Eqi '^server:.*[0-9]' "$work/shell.headers" || fail 'the server header discloses a version'
 grep -qi '<div id="root"' "$work/shell.html" || fail 'the shell does not look like the portal'
 web "$origin/api/trpc/identity.passwordPolicy" | grep -q '"minLength"' || fail 'the public API did not answer'
+for asset in sw.js manifest.webmanifest offline.html; do
+    expect "$asset status" "$(web -D "$work/pwa.headers" -o "$work/pwa.body" -w '%{http_code}' "$origin/$asset")" 200
+    grep -Eqi '^cache-control: (no-cache|no-store)[[:space:]]*$' "$work/pwa.headers" || fail "$asset is not revalidated"
+    case $asset in
+        sw.js) grep -Eqi '^service-worker-allowed: /[[:space:]]*$' "$work/pwa.headers" || fail 'service worker scope missing' ;;
+        manifest.webmanifest) jq -e '.display == "standalone" and (.shortcuts | length) == 4' "$work/pwa.body" >/dev/null ;;
+        offline.html) grep -q "You're offline" "$work/pwa.body" || fail 'offline document missing' ;;
+    esac
+done
 expect 'verified certificate' "$(web -o /dev/null -w '%{ssl_verify_result}' "$origin/readyz")" 0
 
 step 'plain HTTP is redirected; unknown names, IP addresses and other ports are refused'
@@ -157,9 +166,9 @@ head -c 400000 /dev/zero | tr '\0' 'a' > "$work/large"
 expect 'large body' "$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     --data-binary "@$work/large" "$origin/api/trpc/identity.signIn")" 413
 expect 'mixed-case upload path keeps the default limit' "$(web -o /dev/null -w '%{http_code}' -X POST \
-    -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/probe")" 413
+    -H 'Content-Type: application/octet-stream' --data-binary "@$work/large" "$origin/api/Files/upload/01J00000000000000000000001")" 413
 upload_status=$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/octet-stream' \
-    --data-binary "@$work/large" "$origin/api/files/upload/probe")
+    --data-binary "@$work/large" "$origin/api/files/upload/01J00000000000000000000001")
 [[ $upload_status =~ ^40[13]$ ]] || fail "upload route: expected the application to refuse (401/403), got $upload_status"
 
 step 'workflow import body limit is scoped to the two canonical POST paths'
@@ -173,7 +182,7 @@ grep -qx '127.0.0.1:5000' <<<"$listeners" || fail 'the application does not list
 grep -qx '127.0.0.1:3306' <<<"$listeners" || fail 'MySQL does not listen on 127.0.0.1:3306'
 expect 'MySQL settings' "$(sql "SELECT CONCAT_WS(' ', @@bind_address, @@skip_name_resolve, @@local_infile)")" '127.0.0.1 1 0'
 step 'release migration 0005 is applied exactly once'
-assert_release_migrations /opt/readypackets/current/migrations sql 0005_increment_05
+assert_release_migrations /opt/readypackets/current/migrations sql 0005_increment_05 0006_increment_06
 
 step 'service sandbox and secrets'
 for unit in readypackets-portal.service readypackets-worker.service; do

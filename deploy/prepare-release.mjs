@@ -11,6 +11,7 @@ const required = [
   "dist/ops/migrate.js", "dist/ops/create-admin.js", "dist/ops/recover-admin.js", "dist/ops/catalog-import.js",
   "dist/ops/run-backup.js", "dist/ops/verify-backup.js",
   "dist/ops/restore-isolated.js", "dist/ops/generate-keys.js", "dist/ops/keys-doctor.js",
+  "dist/ops/protection-bans.js", "dist/public/sw.js", "dist/public/offline.html", "dist/public/manifest.webmanifest",
   "data/catalog/readypackets-offerings-v3.0.json", "data/catalog/offerings.schema.json",
 ];
 const fdPath = (fd, name) => `/proc/self/fd/${fd}/${name}`;

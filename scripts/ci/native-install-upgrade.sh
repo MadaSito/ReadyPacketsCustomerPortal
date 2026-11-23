@@ -8,7 +8,7 @@
 #      refusal gates, and run deploy/upgrade.sh --yes <candidate-sha>.
 #   4. Verify release symlinks (previous -> 89c5cb8, current -> HEAD), verified pre-upgrade backup archive,
 #      post-upgrade admin sign-in + MFA, Maintenance mode clear, pre-upgrade order + customer preservation,
-#      migrations 0003, 0004 and 0005 exactly once each, and existing integration endpoints.
+#      migrations 0003 through 0006 exactly once each, and existing integration endpoints.
 #   5. Run the full scripts/ci/native-install-smoke.sh suite against the upgraded installation.
 set -euo pipefail
 set +x
@@ -288,7 +288,7 @@ expect 'verified pre_upgrade backup count' "$pre_upgrade_backups" 1
 step 'verifying each candidate migration after the baseline was applied exactly once'
 query_release_journal() { mysql --no-defaults --protocol=socket --batch --skip-column-names --execute="$1"; }
 assert_release_migrations "$repo_dir/migrations" query_release_journal \
-    0003_increment_04 0004_increment_04_part_b 0005_increment_05
+    0003_increment_04 0004_increment_04_part_b 0005_increment_05 0006_increment_06
 
 step 'verifying post-upgrade sign-in, MFA, Maintenance clear, pre-upgrade order survival and existing integration routes'
 python3 - "$origin" "$ca_cert" "$admin_email" "$work/permanent.password" "$work/state.json" <<'PY'

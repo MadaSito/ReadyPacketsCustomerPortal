@@ -84,10 +84,24 @@
 		import rp_upstream
 	}
 
-	@file_upload path_regexp ^/api/files/upload/
+	@file_upload {
+		method POST
+		path_regexp "^/api/files/upload/[0-9A-HJKMNP-TV-Z]{26}$"
+	}
 	handle @file_upload {
 		request_body {
 			max_size 256MiB
+		}
+		import rp_upstream
+	}
+
+	@document_save {
+		method POST
+		path_regexp "^/api/files/orders/[0-9A-HJKMNP-TV-Z]{26}/[0-9A-HJKMNP-TV-Z]{26}/document$"
+	}
+	handle @document_save {
+		request_body {
+			max_size 10256KiB
 		}
 		import rp_upstream
 	}
