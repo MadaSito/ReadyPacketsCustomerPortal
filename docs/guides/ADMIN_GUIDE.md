@@ -12,6 +12,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 
 ## Contents
 
+- [Where to switch things on](#where-to-switch-things-on)
 - [Step-up verification](#step-up-verification)
 - [First administrator and setup](#first-administrator-and-setup)
 - [Customers](#customers)
@@ -318,6 +319,52 @@ Open **Storage → Copy log** (`/admin/storage/copies`) as an administrator. The
 - **Read the result**: **Written** means the provider accepted the write, not that a separate check confirmed it. **Verified** means a checksum matched or the provider read-back confirmed the result recorded by that integration. SharePoint checks the order identifier, not the full record, so its writes are recorded as **Written**, not **Verified**. **Not written** can mean canceled or no change was needed. An interrupted job without a confirmed outcome is shown as **Failed**; check the provider before assuming nothing was written.
 - **Investigate and retry**: A **Copies failing** signal in System health flags recent recorded failures or unconfirmed outcomes. Select **View audit trail** in **Details** to search the Audit centre by correlation ID. For an eligible failed backup copy, **Retry backup copy** requires step-up verification and queues a new job; the original remains in the history. For other failed attempts, use the source module's recovery process.
 - **Export**: **Export CSV** downloads up to the 1,000 newest matching attempts and records an audit event. Narrow the date range or other filters if the export is truncated. Handle the file as an operational log; it contains customer-resource and destination identifiers.
+
+## Where to switch things on
+
+<!-- platform_engineer: increment 06 rows drafted from INCREMENT_06_CONTRACT.md; pages and keys are checked against each owner's API.md as they land. -->
+
+Each feature's switch is on the page where you use it and in **Platform → Settings** (`/admin/settings`). Every switch needs step-up and is audited. Turning a feature off breaks nothing; existing records stay.
+
+### On after upgrade
+
+These features are on after the increment 06 upgrade, because they need no configuration.
+
+| Feature | Setting | Where to switch it |
+| --- | --- | --- |
+| Audio recording and conversion to WebM | `files.audio_conversion` (`enabled`) | Files (`/admin/files`) |
+| Editing Word documents in the portal | `files.document_editing` (`enabled`) | Files (`/admin/files`) |
+| Workflow export and import | `orders.workflow_transfer.enabled` | Workflows (`/admin/workflows`) |
+| Receipts and receipt e-mail | `payments.receipts` | Payments settings |
+| Totals below the card minimum (waive or block) | `payments.small_totals` (`waive`) | Payments settings |
+| Reports | none needed; access through `reports.read` | Reports (`/admin/reports`) |
+| Install app prompt | none needed | Account menu |
+| Typed-name check on signatures | `compliance.signature_name_check` (`require`) | Policies |
+| Relaxed discount limits | `promotions.policy` (`maxDiscountPercent` 100, `allowZeroTotal` true) | Discount codes → Limits |
+| Automatic sign-in bans | `protection.signin_bans` (`enabled`) | Protection (`/admin/protection`) |
+| Rate-limit back-off | rate-limit back-off settings | Protection → Rate limits (`/admin/protection/rate-limits`) |
+
+### Off until you configure them
+
+These features are off until you configure them, because they can lock people out or need your choice.
+
+| Feature | Setting | Where to switch it |
+| --- | --- | --- |
+| Cart | `feature.cart` | Platform → Feature flags (`/admin/settings/features`), or offered on Cart suggestions |
+| Cart suggestions | `feature.cart.upsell` | Cart suggestions (`/admin/carts/suggestions`) → "Show suggestions in the cart"; seeded offers start disabled |
+| Discount codes | `feature.promotions` | Discount codes (`/admin/promotions`) |
+| Policy enforcement (end sessions) | per policy `enforcement.mode` | Policies, on each policy |
+| Order agreement (MNDA) | `orders.agreement_gate` | Policies → "Order agreement (MNDA)", or workflow settings |
+| Workflow phases and requirements | `orders.workflow_rules.enabled` | Platform → Settings |
+| Delegated console access | `orders.console_access.enabled` | Platform → Settings |
+| Knowledge Base and Help Centre | `feature.knowledge` | Platform → Feature flags |
+| Community forum | `feature.community` | Platform → Feature flags |
+| Referrals | `feature.referrals` | Platform → Feature flags |
+| Inbound API v1 | `publicApi.enabled` | Platform → Settings, or API (`/admin/api`) |
+| Signed webhooks | `feature.integrations.webhooks` | Platform → Feature flags |
+| Cookies and consent | `feature.privacy.consent` | Privacy (`/admin/privacy`) |
+| PostHog / Microsoft Clarity | `feature.integrations.posthog` / `feature.integrations.clarity` | Integrations, after consent is configured |
+| Online payments | `payments.config.provider` (`none`) | Payments settings |
 
 ## Step-up verification
 
