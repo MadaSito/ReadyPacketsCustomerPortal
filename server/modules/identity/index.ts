@@ -4,6 +4,7 @@
  * See API.md for the contract.
  */
 import type { ModuleDeps } from "../../container.js";
+import { notFound, validation } from "../../core/errors.js";
 import type { DbOrTx, ModuleHealth, ModuleLifecycle, SessionPrincipal, SessionResolver, Tx } from "../../core/types.js";
 import type { AuthMethod, TransitionStep, UserRole } from "../../../shared/domain.js";
 import { createAdminService, type AdminService, type CustomerListItem, type Page } from "./admin.js";
@@ -18,6 +19,7 @@ import { createGates } from "./gates.js";
 import { createSessionCentre, type SessionCentre } from "./sessionCentre.js";
 import { createSessionPolicy, createSignInLog } from "./sessionPolicy.js";
 import { createSessionService, type IssuedSession, type SessionListItem, type SessionState } from "./sessions.js";
+import { createSignInSignals, type SignInSignals } from "./signals.js";
 import { createTokenService } from "./tokens.js";
 import { createTransitionService } from "./transitions.js";
 import { createUserRepo, toView, type LoadOptions, type UserView } from "./users.js";
@@ -35,6 +37,15 @@ export interface IdentityModule extends ModuleLifecycle {
    * view they render and must not log the values.
    */
   getUsersByIds(userIds: readonly number[], opts?: { tx?: DbOrTx }): Promise<Map<number, UserView>>;
+  /**
+   * Increment 06 D13 port (policy enforcement): ends every live session of `userId`. No capability check —
+   * the caller authorizes (admin "End sessions now" needs sessions.revoke_any + step-up). Audited
+   * `auth.session.revoked_all` in the same transaction. `reason` matches /^[a-z][a-z0-9_]{2,39}$/
+   * (e.g. policy_deadline, policy_declined, policy_admin_ended).
+   */
+  endSessionsForUser(userId: number, reason: string, opts?: { tx?: Tx }): Promise<{ ended: number }>;
+  /** Increment 06 D7: sign-in step signals to the protection module + the hashed account reference. */
+  signInSignals: SignInSignals;
   /** Customer ids matching a search (e-mail exact, reference prefix, name prefix); ≤500; caller authorizes + audits. */
   findCustomerIds(query: string, opts?: { status?: UserStatus; limit?: number; tx?: DbOrTx }): Promise<number[]>;
   verifyPassword(userId: number, password: string, opts?: { tx?: Tx }): Promise<boolean>;
@@ -140,6 +151,7 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     { retrySafe: true },
   );
 
+  const signInSignals = createSignInSignals(deps);
   const view = (row: Awaited<ReturnType<typeof repo.byId>>) => (row ? toView(deps.crypto, row) : null);
 
   return {
@@ -183,6 +195,25 @@ export function createIdentityModule(deps: ModuleDeps): IdentityModule {
     portableCustomers: admin.portableCustomers,
     searchCustomers: admin.searchCustomers,
     findCustomerIds: admin.findCustomerIds,
+    async endSessionsForUser(userId, reason, opts) {
+      if (!/^[a-z][a-z0-9_]{2,39}$/.test(reason)) throw validation("REASON_INVALID", "A valid reason is required.");
+      const run = async (tx: Tx) => {
+        const user = await repo.byId(userId, { tx });
+        if (!user) throw notFound("USER_NOT_FOUND");
+        const ended = await sessions.revokeAllForUser(userId, { reason, tx });
+        await deps.audit.record(
+          {
+            category: "security", eventName: "auth.session.revoked_all", action: "revoke", outcome: "completed",
+            reasonCode: reason.toUpperCase(), resource: { type: "user", publicId: user.publicId }, safeCounts: { sessions_revoked: ended },
+            attributes: { source: "policy_enforcement" },
+          },
+          tx,
+        );
+        return { ended };
+      };
+      return opts?.tx ? run(opts.tx) : deps.db.transaction(run);
+    },
+    signInSignals,
     auth,
     admin,
     sso,

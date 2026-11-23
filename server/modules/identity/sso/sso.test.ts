@@ -256,6 +256,18 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       expect(h.audit.named("identity.sso.callback_refused").at(-1)?.reasonCode).toBe("TOKEN_SIGNATURE_INVALID");
     });
 
+    it("D7: a refused callback publishes one sso_callback failure signal (no account ref) and tags the audit step", async () => {
+      await configure();
+      const signals: { kind: string; outcome: string; accountRef?: string }[] = [];
+      (h.services as unknown as { protection: unknown }).protection = {
+        recordSignInSignal: async (x: { kind: string; outcome: string; accountRef?: string }) => { signals.push(x); },
+      };
+      await signIn({ oid: oid(), signWith: idp.otherKey() });
+      expect(signals).toEqual([expect.objectContaining({ kind: "sso_callback", outcome: "failure" })]);
+      expect(signals[0]!.accountRef).toBeUndefined();
+      expect(h.audit.named("identity.sso.callback_refused").at(-1)?.attributes?.step).toBe("sso");
+    });
+
     it("refetches the JWKS once for an unknown key id, then stays bounded", async () => {
       await configure();
       const user = await makeUser();

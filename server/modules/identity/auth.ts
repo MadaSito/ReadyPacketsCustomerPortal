@@ -19,6 +19,7 @@ import type { TokenService } from "./tokens.js";
 import type { TransitionService } from "./transitions.js";
 import type { Gates } from "./gates.js";
 import type { SignInLog } from "./sessionPolicy.js";
+import { createSignInSignals, type SignInSignalKind } from "./signals.js";
 import { emailColumns, emailIndexOf, generateCustomerRef, isDuplicate, nameColumns, toView, type UserRepo } from "./users.js";
 
 export const PASSWORD_RESET_JOB = "identity.password_reset.dispatch";
@@ -56,6 +57,34 @@ export function assertPasswordAcceptable(password: string, context: { email?: st
 }
 
 export function createAuthService(i: AuthInternals) {
+  const signals = createSignInSignals(i.deps);
+  /** D7: run a credential step, then (after commit/rollback, never inside the tx) publish its signal. */
+  async function signalled<T>(
+    kind: SignInSignalKind,
+    account: { email?: string; userId?: number | null },
+    isCredentialFailure: (error: unknown) => boolean,
+    run: () => Promise<T>,
+    successUserId?: (result: T) => number | null | undefined,
+  ): Promise<T> {
+    let result: T;
+    try {
+      result = await run();
+    } catch (error) {
+      if (isCredentialFailure(error)) {
+        if (account.email) await signals.forEmail(kind, "failure", account.email);
+        else await signals.publish({ kind, outcome: "failure", userId: account.userId ?? null });
+      }
+      throw error;
+    }
+    if (account.email) await signals.forEmail(kind, "success", account.email);
+    else await signals.publish({ kind, outcome: "success", userId: successUserId?.(result) ?? account.userId ?? null });
+    return result;
+  }
+  const accountRefAttr = (email: string): { account_ref?: string } => {
+    const ref = signals.accountRefForEmail(email);
+    return ref ? { account_ref: ref } : {};
+  };
+  const isReason = (...codes: string[]) => (error: unknown) => error instanceof DomainError && codes.includes(error.reasonCode);
   const { deps, hasher, repo, tokens, sessions, transitions, gates, signInLog } = i;
   const preview = (path: string) => (deps.config.deploymentProfile === "preview" ? { previewLink: path } : {});
 
@@ -129,7 +158,7 @@ export function createAuthService(i: AuthInternals) {
     error instanceof DomainError && error.reasonCode === "LINK_INVALID"
       ? {
           category: "security", eventName: "auth.token.rejected", action: "verify", outcome: "denied", severity: "WARN",
-          reasonCode: "LINK_INVALID", actor: { role: "anonymous" }, attributes: { purpose },
+          reasonCode: "LINK_INVALID", actor: { role: "anonymous" }, attributes: { purpose, ...(purpose === "verify_email" ? {} : { step: "password_reset" }) },
         }
       : null;
   const racedLogins = new WeakSet<Error>();
@@ -353,6 +382,8 @@ export function createAuthService(i: AuthInternals) {
     },
 
     async signIn(input: { email: string; password: string }, meta: CallMeta): Promise<{ issued: IssuedSession; nextStep: TransitionStep | null; sessionId: string; userId: number }> {
+      // D7: bad password / unknown account / raced credential ⇒ failure signal; throttle and gate refusals are not.
+      return signalled("password", { email: input.email }, isReason("BAD_CREDENTIALS"), async () => {
       const email = normalizeEmail(input.email);
       try {
         await throttle("user_login", `acct:${emailIndexOf(deps.crypto, email)}`);
@@ -373,6 +404,7 @@ export function createAuthService(i: AuthInternals) {
           reasonCode: reason ?? "UNKNOWN_ACCOUNT",
           actor: { role: "anonymous" },
           resource: user ? { type: "user", publicId: user.publicId } : { type: "user" },
+          attributes: { step: "password", ...accountRefAttr(email) },
         });
         await signInLog.note({ kind: "failure", reasonCode: reason ?? "UNKNOWN_ACCOUNT", userId: user?.id ?? null, role: user?.role ?? null, authMethod: "local" });
         throw badCredentials();
@@ -411,7 +443,7 @@ export function createAuthService(i: AuthInternals) {
             outcome: "completed",
             actor: { userId: locked.id, role: locked.role },
             resource: { type: "session", publicId: created.sessionId },
-            attributes: { next_step: steps[0] ?? "none", auth_method: "local" },
+            attributes: { next_step: steps[0] ?? "none", auth_method: "local", step: "password", ...accountRefAttr(email) },
           },
           tx,
         );
@@ -420,12 +452,14 @@ export function createAuthService(i: AuthInternals) {
         ? {
             category: "security", eventName: "auth.login.failed", action: "login", outcome: "denied", severity: "WARN",
             reasonCode: "CREDENTIAL_CHANGED_CONCURRENTLY", actor: { role: "anonymous" }, resource: { type: "user", publicId: user.publicId },
+            attributes: { step: "password", ...accountRefAttr(email) },
           }
         : null).catch(async (error: unknown) => {
           await noteRefusal(error, user, "local");
           throw error;
         });
       return { issued: result.issued, nextStep: result.nextStep, sessionId: result.sessionId, userId: user.id };
+      });
     },
 
     async verifyEmail(token: string, session: SessionPrincipal | null): Promise<{ verified: true; issued?: IssuedSession }> {
@@ -552,6 +586,8 @@ export function createAuthService(i: AuthInternals) {
 
     /** Redeems a password_reset or admin_set_password link. Revokes ALL sessions; MFA is still required at sign-in. */
     async resetPassword(input: { token: string; password: string }): Promise<{ reset: true }> {
+      let resetUserId: number | null = null;
+      return signalled("password_reset", {}, isReason("LINK_INVALID"), async () => {
       const passwordHash = await (async () => {
         // Hash outside the lock only after a cheap shape check; policy is checked inside with user context.
         return hasher.hash(input.password);
@@ -559,6 +595,7 @@ export function createAuthService(i: AuthInternals) {
       await recordDenial(() => deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, input.token, ["password_reset", "admin_set_password"]);
         if (!consumed || consumed.user.status !== "active" || consumed.user.authSource !== "local") throw invalidLink();
+        resetUserId = consumed.user.id;
         const view = toView(deps.crypto, consumed.user);
         assertPasswordAcceptable(input.password, { email: view.email, name: view.name });
         await tx
@@ -576,7 +613,7 @@ export function createAuthService(i: AuthInternals) {
             actor: { userId: consumed.user.id, role: consumed.user.role },
             resource: { type: "user", publicId: consumed.user.publicId },
             safeCounts: { sessions_revoked: revoked },
-            attributes: { mode: consumed.purpose },
+            attributes: { mode: consumed.purpose, step: "password_reset", ...accountRefAttr(view.email) },
           },
           tx,
         );
@@ -585,14 +622,18 @@ export function createAuthService(i: AuthInternals) {
           tx,
         );
       }), linkRejected("password_reset"));
-      return { reset: true };
+      return { reset: true as const };
+      }, () => resetUserId);
     },
 
     async activateAccount(input: { token: string; password: string }): Promise<{ activated: true }> {
+      let activatedUserId: number | null = null;
+      return signalled("password_reset", {}, isReason("LINK_INVALID"), async () => {
       const passwordHash = await hasher.hash(input.password);
       await recordDenial(() => deps.db.transaction(async (tx) => {
         const consumed = await tokens.consume(tx, input.token, ["invitation"]);
         if (!consumed || consumed.user.status !== "pending_activation") throw invalidLink();
+        activatedUserId = consumed.user.id;
         const view = toView(deps.crypto, consumed.user);
         assertPasswordAcceptable(input.password, { email: view.email, name: view.name });
         const now = deps.clock.now();
@@ -622,7 +663,8 @@ export function createAuthService(i: AuthInternals) {
           tx,
         );
       }), linkRejected("activation"));
-      return { activated: true };
+      return { activated: true as const };
+      }, () => activatedUserId);
     },
 
     /** Change password: full session, or a remediation session whose NEXT step is change_password. */
@@ -633,7 +675,7 @@ export function createAuthService(i: AuthInternals) {
         });
       }
       await throttle("auth_high_risk", `pwchange:${principal.userPublicId}`);
-      const issued = await recordDenial(() => deps.db.transaction(async (tx) => {
+      const issued = await signalled("password", { userId: principal.userId }, isReason("CURRENT_PASSWORD_INCORRECT"), () => recordDenial(() => deps.db.transaction(async (tx) => {
         await sessions.assertCurrent(principal, tx); // locks users row then session row
         const user = await repo.byId(principal.userId, { tx });
         if (!user) throw badCredentials();
@@ -674,9 +716,9 @@ export function createAuthService(i: AuthInternals) {
         ? {
             category: "security", eventName: "auth.password.change_denied", action: "update", outcome: "denied", severity: "WARN",
             reasonCode: "CURRENT_PASSWORD_INCORRECT", actor: { userId: principal.userId, role: principal.role },
-            resource: { type: "user", publicId: principal.userPublicId },
+            resource: { type: "user", publicId: principal.userPublicId }, attributes: { step: "password" },
           }
-        : null);
+        : null));
       const { nextStep } = await nextStepFor(principal.userId, principal.sessionId);
       return { issued, nextStep };
     },
