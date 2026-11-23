@@ -15,6 +15,7 @@ import { createCountryResolver } from "./geo.js";
 import { addressOf, compilePolicy, defaultPolicy, policySchema, type ProtectionPolicy, type RequestSignals } from "./policy.js";
 import { isProtectionExempt, recoverySignals, requestEventLabels, requestSignals } from "./request.js";
 import { protectionBlocks, protectionEvents, protectionPolicies } from "./schema.js";
+import { createSignInBans, isSignInRequest } from "./signInBans.js";
 
 const POLICY_ID = 1;
 const CACHE_MS = 2_000;
@@ -76,6 +77,7 @@ function buildProtection(deps: ModuleDeps) {
       throw new DomainError("STEP_UP_REQUIRED", "STEP_UP_REQUIRED", "Confirm your identity before updating protection.", { capability });
     }
   }
+  const signInBans = createSignInBans(deps, assertActor);
 
   async function storeRead(tx?: Tx) {
     const [row] = await (tx ?? db).select({ policy: protectionPolicies.policy, version: protectionPolicies.version })
@@ -196,6 +198,12 @@ function buildProtection(deps: ModuleDeps) {
   jobs.registerSchedule({ name: cleanupJob, type: cleanupJob, everyMs: 15 * CLOCK_MINUTE });
 
   return {
+    ...signInBans,
+    captureClientAddress(req: Request) { signInBans.capture(req); },
+    async credentialRetryAfter(req: Request): Promise<number> {
+      if (!isSignInRequest(req) || !signInBans.clientAddressTrust().determinable) return 0;
+      return signInBans.checkSignInBan(async (tx) => (await storeRead(tx)).policy);
+    },
     clientCountry(req?: Request) {
       if (req) return geo.lookup(addressOf(clientAddress(req))?.text, req);
       const ctx = getRequestContext();
@@ -270,8 +278,8 @@ function buildProtection(deps: ModuleDeps) {
       return db.transaction(async (tx) => {
         await assertActor(principal, false, tx);
         return Promise.all(RATE_LIMIT_CATEGORIES.map(async (category) => ({
-          category, defaults: DEFAULT_BUDGETS[category], bounds: RATE_LIMIT_BOUNDS[category],
-          budget: config.protectionDisabled ? DEFAULT_BUDGETS[category] : boundedBudget(category, await readSetting(settings, rateLimitSettings[category], tx)),
+          category, defaults: boundedBudget(category, DEFAULT_BUDGETS[category]), bounds: RATE_LIMIT_BOUNDS[category],
+          budget: boundedBudget(category, config.protectionDisabled ? DEFAULT_BUDGETS[category] : await readSetting(settings, rateLimitSettings[category], tx)),
         })));
       });
     },
@@ -288,7 +296,9 @@ function buildProtection(deps: ModuleDeps) {
         await audit.record({
           category: "security", eventName: "protection.rate_limit_updated", action: budget ? "update" : "reset",
           outcome: "completed", severity: "INFO",
-          attributes: { category, maxRequests: bounded.maxRequests, windowSeconds: bounded.windowSeconds },
+          attributes: { category, maxRequests: bounded.maxRequests, windowSeconds: bounded.windowSeconds,
+            backoff_enabled: bounded.backoff.enabled, backoff_factor: bounded.backoff.factor,
+            backoff_max_seconds: bounded.backoff.maxSeconds, backoff_reset_minutes: bounded.backoff.resetAfterMinutes },
         }, tx);
         return bounded;
       });
