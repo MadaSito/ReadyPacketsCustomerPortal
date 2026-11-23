@@ -525,6 +525,36 @@ describe("order detail host", () => {
     await expectNoAxeViolations(dialog);
   });
 
+  it("D14: a transition refused with AGREEMENT_REQUIRED opens the agreement; Not now explains; accepting resends the same request once", async () => {
+    handlers.set("orders.get", () => detail);
+    let attempts = 0;
+    handlers.set("orders.transition", () => {
+      attempts += 1;
+      if (attempts <= 2)
+        throw Object.assign(new Error("agreement"), {
+          data: { safe: { domainCode: "CONFLICT", reasonCode: "AGREEMENT_REQUIRED", safeMessage: "Accept the order agreement first.", requestId: "r1", details: { policyPublicId: "01JTESTPOL0000000000000000", signatureMode: "typed_name" } } },
+        });
+      return { version: 4 };
+    });
+    const user = userEvent.setup();
+    renderDetail(`/orders/${ORDER_ID}`);
+    await user.click(await screen.findByRole("button", { name: "Cancel order" }));
+    let dialog = await screen.findByRole("dialog", { name: "Cancel this order?" });
+    await user.type(within(dialog).getByLabelText(/Note/), "No longer needed");
+    await user.click(within(dialog).getByRole("button", { name: "Yes, cancel order" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Order agreement" })).getByRole("button", { name: "Not now" }));
+    dialog = await screen.findByRole("dialog", { name: "Cancel this order?" });
+    expect(within(dialog).getByText("The status was not changed. Accept the order agreement to continue.")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/Note/)).toHaveValue("No longer needed");
+    await user.click(within(dialog).getByRole("button", { name: "Yes, cancel order" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Order agreement" })).getByRole("button", { name: "Accept agreement" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    const sent = calls.filter((c) => c.path === "orders.transition").map((c) => c.input);
+    expect(sent).toHaveLength(3);
+    expect(sent[2]).toEqual(sent[0]);
+    expect(sent[2]).toMatchObject({ orderId: ORDER_ID, toStatus: "canceled", note: "No longer needed" });
+  });
+
   it("customer sees a verb action (not a state name); Keep order closes the dialog without a change", async () => {
     handlers.set("orders.get", () => detail);
     const user = userEvent.setup();

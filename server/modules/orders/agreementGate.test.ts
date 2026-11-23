@@ -185,6 +185,14 @@ describe("orders.admin.agreementGate (admin card)", () => {
     await expect(call(null).agreement.status({ scope: "placeOrder" })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 
+  it("an administrator without a fresh step-up is refused and nothing changes", async () => {
+    const stale = await insertUser(h, t.db, { role: "admin" });
+    await expect(call(stale.principal).admin.agreementGate.update({ setting: ON })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expectError(mod.agreementGate.update(stale.principal, { setting: ON }), "STEP_UP_REQUIRED:STEP_UP_REQUIRED");
+    expect(parseAgreementGate(await h.settings.get(ORDER_AGREEMENT_GATE.key, (raw) => raw, null))).toMatchObject({ enabled: false });
+    expect(h.audit.events.some((event) => event.eventName === "order.agreement_gate.updated")).toBe(false);
+  });
+
   it("get lists customer-facing published policies only", async () => {
     const view = await call(admin.principal).admin.agreementGate.get();
     expect(view).toMatchObject({ enabled: false, policy: null });
@@ -200,7 +208,7 @@ describe("orders.admin.agreementGate (admin card)", () => {
     const saved = await call(admin.principal).admin.agreementGate.update({ setting: ON, expectedEnabled: false });
     expect(saved).toMatchObject({ enabled: true, policy: { publicId: POLICY, title: "Synthetic MNDA" } });
     const event = h.audit.events.find((candidate) => candidate.eventName === "order.agreement_gate.updated");
-    expect(event).toMatchObject({ category: "admin", attributes: { enabled_from: "false", enabled_to: "true", policy_public_id: POLICY, signature_mode: "checkbox" } });
+    expect(event).toMatchObject({ category: "admin", attributes: { enabled_from: "false", enabled_to: "true", policy_from: "none", policy_public_id: POLICY, signature_mode: "checkbox" } });
     expect(h.audit.recordedInTx.at(-1)).toBe(true);
     expect(parseAgreementGate(await h.settings.get(ORDER_AGREEMENT_GATE.key, (raw) => raw, null))).toMatchObject({ enabled: true });
   });

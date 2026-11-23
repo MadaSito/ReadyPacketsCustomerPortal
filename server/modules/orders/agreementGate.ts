@@ -100,6 +100,7 @@ export function createAgreementGateService(deps: AgreementGateDeps) {
               setting_key: ORDER_AGREEMENT_GATE.key,
               enabled_from: String(before.enabled),
               enabled_to: String(next.enabled),
+              policy_from: before.policyPublicId ?? "none",
               policy_public_id: next.policyPublicId ?? "none",
               apply_place_order: String(next.applyTo.placeOrder),
               apply_work_on_order: String(next.applyTo.workOnOrder),

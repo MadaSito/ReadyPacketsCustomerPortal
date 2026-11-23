@@ -8,6 +8,7 @@ import { useParams } from "wouter";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { FEATURES, ORDER_TABS } from "@/app/registry";
+import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredDetails } from "@/lib/agreementGate";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Breadcrumbs, Button, Callout, Card, DataTable, DateTime, Dialog, ErrorState, Field, KeyValueList, Money, PageHeader, Select,
@@ -399,6 +400,7 @@ function Activity({ order, area }: { order: OrderDetail; area: Area }) {
 }
 
 type TransitionOption = OrderDetail["transitions"][number];
+type TransitionRequest = { orderId: string; expectedVersion: number; toStatus: string; note?: string };
 
 /** Button text is always a verb; duplicates (e.g. two cancel states) are disambiguated with the target state. */
 function transitionButtons(options: TransitionOption[]) {
@@ -415,6 +417,9 @@ function TransitionControl({ order }: { order: OrderDetail }) {
   const [target, setTarget] = useState<(TransitionOption & { text: string }) | null>(null);
   const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Increment 06 (D14): a refusal with AGREEMENT_REQUIRED opens the order agreement; after acceptance the exact same
+  // request (same expectedVersion, so it can never apply twice) is sent once more.
+  const [agreement, setAgreement] = useState<{ details: AgreementRequiredDetails; request: TransitionRequest } | null>(null);
   if (order.transitions.length === 0) return null;
   const buttons = transitionButtons(order.transitions);
   const close = () => {
@@ -423,19 +428,24 @@ function TransitionControl({ order }: { order: OrderDetail }) {
     setNote("");
     setError(null);
   };
-  const submit = async () => {
-    if (!target) return;
-    if (target.requiresNote && !note.trim()) return setError("A note is required for this change.");
+  const run = async (request: TransitionRequest, option: TransitionOption & { text: string }) => {
     setError(null);
     try {
-      await transition.mutateAsync({ orderId: order.publicId, expectedVersion: order.version, toStatus: target.to, note: note.trim() || undefined });
-      toast.show({ tone: "success", title: target.destructive ? "Order canceled" : `Status changed to ${target.label}` });
+      await transition.mutateAsync(request);
+      toast.show({ tone: "success", title: option.destructive ? "Order canceled" : `Status changed to ${option.label}` });
       setTarget(null);
       setNote("");
       await queryClient.invalidateQueries({ queryKey: trpc.orders.pathKey() });
     } catch (err) {
+      const details = parseAgreementRequiredDetails(err);
+      if (details) return setAgreement({ details, request });
       setError(errorMessage(err));
     }
+  };
+  const submit = async () => {
+    if (!target) return;
+    if (target.requiresNote && !note.trim()) return setError("A note is required for this change.");
+    await run({ orderId: order.publicId, expectedVersion: order.version, toStatus: target.to, note: note.trim() || undefined }, target);
   };
   const title = target ? (target.destructive ? "Cancel this order?" : `Change status to “${target.label}”?`) : "Change status";
   const description = target?.destructive
@@ -450,8 +460,24 @@ function TransitionControl({ order }: { order: OrderDetail }) {
           </Button>
         ))}
       </div>
+      {agreement && target ? (
+        <AgreementDialog
+          open
+          policyPublicId={agreement.details.policyPublicId}
+          signatureMode={agreement.details.signatureMode}
+          onAccepted={async () => {
+            const { request } = agreement;
+            setAgreement(null);
+            await run(request, target);
+          }}
+          onClose={() => {
+            setAgreement(null);
+            setError("The status was not changed. Accept the order agreement to continue.");
+          }}
+        />
+      ) : null}
       <Dialog
-        open={target !== null}
+        open={target !== null && agreement === null}
         onOpenChange={(open) => (open ? undefined : close())}
         title={title}
         description={description}
