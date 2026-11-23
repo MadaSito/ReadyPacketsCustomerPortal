@@ -82,6 +82,13 @@ describe("config: strict validation", () => {
     expect(issues.join("\n")).not.toContain("unexpected");
   });
 
+  it("allows only an explicit 1 for policy enforcement break-glass", () => {
+    expect(loadConfig(prodEnv()).policyEnforcementDisabled).toBe(false);
+    expect(loadConfig(prodEnv({ POLICY_ENFORCEMENT_DISABLED: "0" })).policyEnforcementDisabled).toBe(false);
+    expect(loadConfig(prodEnv({ POLICY_ENFORCEMENT_DISABLED: "1" })).policyEnforcementDisabled).toBe(true);
+    expect(problemsOf(prodEnv({ POLICY_ENFORCEMENT_DISABLED: "true" }))[0]).toMatch(/^POLICY_ENFORCEMENT_DISABLED:/u);
+  });
+
   it("reports every missing required variable by name", () => {
     const issues = problemsOf({ NODE_ENV: "production" });
     for (const name of ["RP_CANONICAL_ORIGIN", "DATABASE_URL", "RP_STORAGE_DIR", "RP_INSTALLATION_ID", "RP_DATA_KEYRING", "RP_INDEX_KEY", "RP_PSEUDONYM_KEY", "RP_TOKEN_HASH_KEY", "RP_AUDIT_CHAIN_KEY"]) {

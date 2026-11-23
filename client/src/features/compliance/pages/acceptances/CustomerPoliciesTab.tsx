@@ -12,6 +12,7 @@ import {
   Skeleton,
   type Column,
 } from "@/ui";
+import { EndPolicySessionsAction } from "../../policyUpdates/PolicyEnforcementCards";
 import { AcceptanceEvidenceDialog } from "./AcceptanceEvidenceDialog";
 import {
   FreshnessBadge,
@@ -179,6 +180,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
         aria-label="Policy status per document"
         title="Status per policy"
         description="Standing against every published customer-facing policy."
+        actions={<EndPolicySessionsAction userPublicId={customerId} />}
         flush
       >
         <div className="p-4 sm:p-5">

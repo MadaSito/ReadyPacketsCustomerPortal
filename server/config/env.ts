@@ -63,6 +63,7 @@ export const ENV_VARIABLES: readonly EnvVariable[] = [
   { name: "RP_FFMPEG_PATH", secret: false, required: false, description: "Absolute path to the operator-managed FFmpeg executable (default /usr/bin/ffmpeg)" },
   { name: "PROTECTION_MMDB_PATH", secret: false, required: false, description: "Absolute path to an optional local IP-to-country MMDB file; no network lookup" },
   { name: "PROTECTION_DISABLED", secret: false, required: false, description: "0 (default) or 1 (emergency application Protection bypass; does not bypass authorization)" },
+  { name: "POLICY_ENFORCEMENT_DISABLED", secret: false, required: false, description: "0 (default) or 1 (emergency policy session enforcement bypass; does not bypass existing policy acceptance gates)" },
   { name: "PROTECTION_COUNTRY_HEADER", secret: false, required: false, description: "Optional x-readypackets-country header supplied and overwritten by an explicitly trusted custom direct proxy" },
   // Read and validated by the owning module (documented here so the doctor recognizes them).
   { name: "RP_BACKUP_KEY", secret: true, required: false, consumer: "backup", description: "Backup encryption keyring JSON or 32-byte key; prefer RP_BACKUP_KEY_FILE (0600)" },
@@ -175,6 +176,7 @@ const configSchema = z.object({
   ffmpegPath: absoluteFilePath,
   protectionMmdbPath: absoluteFilePath.optional(),
   protectionDisabled: z.enum(["0", "1"]).transform((value) => value === "1"),
+  policyEnforcementDisabled: z.enum(["0", "1"]).transform((value) => value === "1"),
   protectionCountryHeader: z.literal("x-readypackets-country").optional(),
 });
 
@@ -216,6 +218,7 @@ const FIELD_TO_VARIABLE: Record<string, string> = {
   ffmpegPath: "RP_FFMPEG_PATH",
   protectionMmdbPath: "PROTECTION_MMDB_PATH",
   protectionDisabled: "PROTECTION_DISABLED",
+  policyEnforcementDisabled: "POLICY_ENFORCEMENT_DISABLED",
   protectionCountryHeader: "PROTECTION_COUNTRY_HEADER",
 };
 
@@ -347,6 +350,7 @@ function evaluate(env: Env, options: LoadOptions): Evaluation {
     ffmpegPath: env.RP_FFMPEG_PATH || "/usr/bin/ffmpeg",
     protectionMmdbPath: env.PROTECTION_MMDB_PATH || undefined,
     protectionDisabled: env.PROTECTION_DISABLED || "0",
+    policyEnforcementDisabled: env.POLICY_ENFORCEMENT_DISABLED || "0",
     protectionCountryHeader: env.PROTECTION_COUNTRY_HEADER || undefined,
   };
 
