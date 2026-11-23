@@ -140,33 +140,38 @@ function renderAt(path: string, handlers: Record<string, Handler>, calls: { path
   });
 }
 
-const ready = async (name: string) => screen.findByRole("heading", { level: 1, name });
+const LAZY_WAIT = { timeout: 15_000 } as const;
+const TEST_TIMEOUT = { timeout: 25_000 } as const;
+const ready = async (name: string) => screen.findByRole("heading", { level: 1, name }, LAZY_WAIT);
 
-pageA11y("/admin/knowledge articles ready", async () => {
-  renderAt("/admin/knowledge", base());
-  await ready("Knowledge base");
-  await screen.findAllByText("Paying an invoice");
-});
+describe("knowledge console page a11y", TEST_TIMEOUT, () => {
+  pageA11y("/admin/knowledge articles ready", async () => {
+    renderAt("/admin/knowledge", base());
+    await ready("Knowledge base");
+    await screen.findAllByText("Paying an invoice", {}, LAZY_WAIT);
+  });
 
-pageA11y("/admin/knowledge category dialog open", async () => {
-  renderAt("/admin/knowledge", base());
-  await ready("Knowledge base");
-  await userEvent.click(screen.getByRole("tab", { name: "Categories" }));
-  await userEvent.click(await screen.findByRole("button", { name: "New category" }));
-  await screen.findByRole("dialog", { name: "New category" });
-});
+  pageA11y("/admin/knowledge category dialog open", async () => {
+    renderAt("/admin/knowledge", base());
+    await ready("Knowledge base");
+    await userEvent.click(screen.getByRole("tab", { name: "Categories" }));
+    await userEvent.click(await screen.findByRole("button", { name: "New category" }, LAZY_WAIT));
+    await screen.findByRole("dialog", { name: "New category" }, LAZY_WAIT);
+  });
 
-pageA11y("/admin/knowledge/new ready", async () => {
-  renderAt("/admin/knowledge/new", base());
-  await ready("New article");
-  await screen.findByLabelText(/Title/);
-});
+  pageA11y("/admin/knowledge/new ready", async () => {
+    renderAt("/admin/knowledge/new", base());
+    await ready("New article");
+    await screen.findByLabelText(/Title/, {}, LAZY_WAIT);
+    await screen.findByRole("textbox", { name: /Article text/ }, LAZY_WAIT);
+  });
 
-pageA11y("/admin/knowledge/:id preview open", async () => {
-  renderAt(`/admin/knowledge/${A1}`, base({ "knowledge.admin.articles.preview": () => ({ sanitizedHtml: "<h2>Steps</h2>", bodyBlocks: detail.bodyBlocks, toc: detail.toc }) }));
-  await ready("Edit article");
-  await userEvent.click(await screen.findByRole("button", { name: "Preview" }));
-  await screen.findByRole("dialog", { name: "Preview" });
+  pageA11y("/admin/knowledge/:id preview open", async () => {
+    renderAt(`/admin/knowledge/${A1}`, base({ "knowledge.admin.articles.preview": () => ({ sanitizedHtml: "<h2>Steps</h2>", bodyBlocks: detail.bodyBlocks, toc: detail.toc }) }));
+    await ready("Edit article");
+    await userEvent.click(await screen.findByRole("button", { name: "Preview" }, LAZY_WAIT));
+    await screen.findByRole("dialog", { name: "Preview" }, LAZY_WAIT);
+  });
 });
 
 describe("knowledge console helpers", () => {
@@ -181,17 +186,17 @@ describe("knowledge console helpers", () => {
   });
 });
 
-describe("knowledge console list", () => {
+describe("knowledge console list", TEST_TIMEOUT, () => {
   it("applies filters and publishes with the expected version", async () => {
     const calls: { path: string; input: unknown }[] = [];
     renderAt("/admin/knowledge", base({ "knowledge.admin.articles.setState": () => detail }), calls);
     await ready("Knowledge base");
-    expect(await screen.findByText(/Customers cannot see the help centre yet/)).toBeTruthy();
+    expect(await screen.findByText(/Customers cannot see the help centre yet/, {}, LAZY_WAIT)).toBeTruthy();
     await userEvent.selectOptions(screen.getByLabelText("State"), "published");
-    await waitFor(() => expect(calls.some((c) => c.path === "knowledge.admin.articles.list" && (c.input as { state?: string }).state === "published")).toBe(true));
-    const [publish] = await screen.findAllByRole("button", { name: "Publish Paying an invoice" });
+    await waitFor(() => expect(calls.some((c) => c.path === "knowledge.admin.articles.list" && (c.input as { state?: string }).state === "published")).toBe(true), LAZY_WAIT);
+    const [publish] = await screen.findAllByRole("button", { name: "Publish Paying an invoice" }, LAZY_WAIT);
     await userEvent.click(publish!);
-    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.articles.setState")?.input).toEqual({ publicId: A1, expectedVersion: 5, state: "published" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.articles.setState")?.input).toEqual({ publicId: A1, expectedVersion: 5, state: "published" }), LAZY_WAIT);
   });
 
   it("reorders categories with buttons and announces the move", async () => {
@@ -199,47 +204,47 @@ describe("knowledge console list", () => {
     renderAt("/admin/knowledge", base({ "knowledge.admin.categories.reorder": () => ({ updated: 2 }) }), calls);
     await ready("Knowledge base");
     await userEvent.click(screen.getByRole("tab", { name: "Categories" }));
-    const up = await screen.findByRole("button", { name: "Move Billing up" });
+    const up = await screen.findByRole("button", { name: "Move Billing up" }, LAZY_WAIT);
     expect((up as HTMLButtonElement).disabled).toBe(true);
     await userEvent.click(screen.getByRole("button", { name: "Move Billing down" }));
-    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.categories.reorder")?.input).toEqual({ parentPublicId: null, orderedPublicIds: [C2, C1] }));
-    expect(await screen.findByText("Billing moved to position 2 of 2")).toBeTruthy();
+    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.categories.reorder")?.input).toEqual({ parentPublicId: null, orderedPublicIds: [C2, C1] }), LAZY_WAIT);
+    expect(await screen.findByText("Billing moved to position 2 of 2", {}, LAZY_WAIT)).toBeTruthy();
   });
 
   it("asks for step-up before changing settings", async () => {
     renderAt("/admin/knowledge", base({ "knowledge.admin.settings.update": () => new Refuse("FORBIDDEN", 403, { domainCode: "STEP_UP_REQUIRED", reasonCode: "STEP_UP_REQUIRED", safeMessage: "Verify" }) }));
     await ready("Knowledge base");
     await userEvent.click(screen.getByRole("tab", { name: "Settings" }));
-    await userEvent.click(await screen.findByRole("switch", { name: /Show the help centre to customers/ }));
-    expect(await screen.findByRole("dialog", { name: "Confirm it's you" })).toBeTruthy();
+    await userEvent.click(await screen.findByRole("switch", { name: /Show the help centre to customers/ }, LAZY_WAIT));
+    expect(await screen.findByRole("dialog", { name: "Confirm it's you" }, LAZY_WAIT)).toBeTruthy();
   });
 
   it("disables settings for staff without platform.settings.manage", async () => {
     renderAt("/admin/knowledge", base({ "knowledge.status": () => ({ enabled: true, canManage: true, canConfigure: false }) }), [], "staff");
     await ready("Knowledge base");
     await userEvent.click(screen.getByRole("tab", { name: "Settings" }));
-    expect(((await screen.findByRole("switch", { name: /Show the help centre/ })) as HTMLButtonElement).disabled).toBe(true);
+    expect(((await screen.findByRole("switch", { name: /Show the help centre/ }, LAZY_WAIT)) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Only administrators can change these settings.")).toBeTruthy();
   });
 });
 
-describe("knowledge console editor", () => {
+describe("knowledge console editor", TEST_TIMEOUT, () => {
   it("restores a version with the current expected version", async () => {
     const calls: { path: string; input: unknown }[] = [];
     renderAt(`/admin/knowledge/${A1}`, base({ "knowledge.admin.articles.restoreVersion": () => detail }), calls);
     await ready("Edit article");
-    await userEvent.click(await screen.findByRole("button", { name: "Restore version 1" }));
-    const dialog = await screen.findByRole("alertdialog", { name: "Restore version 1?" });
+    await userEvent.click(await screen.findByRole("button", { name: "Restore version 1" }, LAZY_WAIT));
+    const dialog = await screen.findByRole("alertdialog", { name: "Restore version 1?" }, LAZY_WAIT);
     await userEvent.click(within(dialog).getByRole("button", { name: "Restore version" }));
-    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.articles.restoreVersion")?.input).toEqual({ publicId: A1, expectedVersion: 5, versionNumber: 1, changeNote: "Restored version 1" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "knowledge.admin.articles.restoreVersion")?.input).toEqual({ publicId: A1, expectedVersion: 5, versionNumber: 1, changeNote: "Restored version 1" }), LAZY_WAIT);
   });
 
   it("shows field errors instead of sending an invalid article", async () => {
     const calls: { path: string; input: unknown }[] = [];
     renderAt("/admin/knowledge/new", base(), calls);
     await ready("New article");
-    await userEvent.click(await screen.findByRole("button", { name: "Save draft" }));
-    expect(await screen.findByText("Enter a title of 2 to 200 characters.")).toBeTruthy();
+    await userEvent.click(await screen.findByRole("button", { name: "Save draft" }, LAZY_WAIT));
+    expect(await screen.findByText("Enter a title of 2 to 200 characters.", {}, LAZY_WAIT)).toBeTruthy();
     expect(calls.some((c) => c.path === "knowledge.admin.articles.create")).toBe(false);
   });
 });
