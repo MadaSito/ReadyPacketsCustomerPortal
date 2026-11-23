@@ -80,7 +80,7 @@ const END_BATCH = 1000;
 export const OPS_SESSION_MARKER = "ops:demo_seed";
 const OPS_SESSION_TTL_MS = 10 * 60 * 1000;
 /** Steps an ops session for a not-yet-enrolled demo_seed account may skip (the human enrols at first sign-in). */
-const OPS_WAIVABLE_STEPS: ReadonlySet<TransitionStep> = new Set(["enroll_mfa", "acknowledge_recovery_codes", "change_password"]);
+const OPS_WAIVABLE_STEPS: ReadonlySet<TransitionStep> = new Set(["enroll_mfa", "acknowledge_recovery_codes", "change_password", "accept_policy"]);
 const csrfAad = (publicId: string) => `user_sessions.csrf:${publicId}`;
 const ipAad = (publicId: string) => `user_sessions.ip:${publicId}`;
 

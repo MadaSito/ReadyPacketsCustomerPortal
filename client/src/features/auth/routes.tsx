@@ -16,6 +16,7 @@ export const authFeature: FeatureRoutes = {
     { path: "/mfa/enrol", access: "transition", title: "Set up two-step verification", component: lazy(() => import("./pages/MfaEnrolPage")) },
     { path: "/mfa/recovery-codes", access: "transition", title: "Recovery codes", component: lazy(() => import("./pages/RecoveryCodesPage")) },
     { path: "/change-password", access: "transition", title: "Set a new password", component: lazy(() => import("./pages/ChangePasswordPage")) },
+    { path: "/accept-policy", access: "transition", title: "Review and accept updated policy", component: lazy(() => import("./pages/AcceptPolicyPage")) },
   ],
   nav: [],
 };

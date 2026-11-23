@@ -7,9 +7,15 @@
  *
  * MFA is mandatory for every role in this rebuild (local TOTP via assurance).
  */
-import type { ModuleDeps } from "../../container.js";
+import type { ModuleDeps, Services } from "../../container.js";
 import type { DbOrTx } from "../../core/types.js";
-import { TRANSITION_STEPS, type AuthMethod, type TransitionStep } from "../../../shared/domain.js";
+import { TRANSITION_STEPS, type AuthMethod, type TransitionStep, type UserRole } from "../../../shared/domain.js";
+
+/** Increment 06 D13 port (owner assurance_engineer, `server/modules/compliance/policyEnforcement*.ts`). */
+export interface PolicyEnforcementPort {
+  /** One cheap indexed query. false for unpublished / mode none / break-glass. Throws on DB failure (fail closed). */
+  requiresRemediation(userId: number, role: UserRole, tx?: DbOrTx): Promise<boolean>;
+}
 
 export interface TransitionFacts {
   emailVerified: boolean;
@@ -24,6 +30,8 @@ export interface TransitionFacts {
    * (host recovery), which always requires local enrolment.
    */
   entraMfaSession?: boolean;
+  /** Increment 06 D13: the compliance enforcement port says a required policy must be accepted to continue. */
+  policyAcceptanceRequired?: boolean;
 }
 
 /** Pure derivation — every ordering is unit tested. Output order always follows TRANSITION_STEPS. */
@@ -35,19 +43,33 @@ export function deriveSteps(facts: TransitionFacts): TransitionStep[] {
   if (!facts.mfaEnrolled && !entraWaiver) pending.add("enroll_mfa");
   if (facts.mfaEnrolled && !facts.recoveryCodesAcknowledged && !entraWaiver) pending.add("acknowledge_recovery_codes");
   if (facts.mustChangePassword) pending.add("change_password");
+  if (facts.policyAcceptanceRequired === true) pending.add("accept_policy");
   return TRANSITION_STEPS.filter((step) => pending.has(step));
 }
 
 export function createTransitionService(deps: ModuleDeps) {
+  async function requiresPolicyAcceptance(user: { id: number; role?: UserRole }, tx?: DbOrTx): Promise<boolean> {
+    const compliance = deps.services.compliance as (Services["compliance"] & { policyEnforcement?: PolicyEnforcementPort }) | undefined;
+    if (!compliance) return false;
+    const enforcement = compliance.policyEnforcement;
+    if (!enforcement) throw new Error("identity.transitions: compliance.policyEnforcement is not mounted");
+    if (!user.role) throw new Error("identity.transitions: role required for the policy enforcement check");
+    return enforcement.requiresRemediation(user.id, user.role, tx);
+  }
   return {
     async facts(
-      user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean },
+      user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean; role: UserRole },
       session: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod } | undefined,
       tx?: DbOrTx,
     ): Promise<TransitionFacts> {
       // Fail closed: if assurance state cannot be read, this throws and the caller refuses the session/action.
       const assurance = await deps.services.assurance.getAssuranceState(user.id, tx);
+      // D13: fail closed. A mounted compliance module WITHOUT the enforcement port (mount/wiring regression), a
+      // missing role, or a failing port all throw ⇒ the caller refuses the session/action. Only a container with no
+      // compliance module at all (isolated unit harnesses; the real container always mounts it) skips the step.
+      const policyAcceptanceRequired = await requiresPolicyAcceptance(user, tx);
       return {
+        policyAcceptanceRequired,
         emailVerified: user.emailVerifiedAt !== null,
         mustChangePassword: user.mustChangePassword,
         mfaEnrolled: assurance.mfaEnrolled === true,
@@ -57,7 +79,7 @@ export function createTransitionService(deps: ModuleDeps) {
       };
     },
     async derive(
-      user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean },
+      user: { id: number; emailVerifiedAt: Date | null; mustChangePassword: boolean; role: UserRole },
       session: { mfaVerifiedAt: Date | null; authMethod?: AuthMethod } | undefined,
       tx?: DbOrTx,
     ): Promise<TransitionStep[]> {

@@ -57,6 +57,17 @@ describe("transition derivation", () => {
 
   it("fully satisfied facts yield no steps", () => expect(deriveSteps(base)).toEqual([]));
 
+  it("D13: accept_policy appears only when required and always last", () => {
+    expect(TRANSITION_STEPS.at(-1)).toBe("accept_policy");
+    expect(deriveSteps({ ...base, policyAcceptanceRequired: true })).toEqual(["accept_policy"]);
+    expect(deriveSteps({ ...base, policyAcceptanceRequired: false })).toEqual([]);
+    for (const facts of all()) {
+      const steps = deriveSteps({ ...facts, policyAcceptanceRequired: true });
+      expect(steps.at(-1)).toBe("accept_policy");
+      expect(deriveSteps(facts)).not.toContain("accept_policy");
+    }
+  });
+
   it("every combination yields a subsequence of the canonical order with the expected members", () => {
     for (const facts of all()) {
       const steps = deriveSteps(facts);
