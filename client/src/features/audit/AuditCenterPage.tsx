@@ -35,7 +35,11 @@ export default function AuditCenterPage() {
   const [appliedActor, setAppliedActor] = useState<string | undefined>(undefined);
   const [override, setOverride] = useState<Override | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(() => {
+    // `?event=<id>`: open one event's drawer (links from security incidents).
+    const id = readParam(search, "event");
+    return id && ULID.test(id) ? id : null;
+  });
   const [dialog, setDialog] = useState<"save" | "export" | "case" | null>(null);
 
   // `?saved=<id>`: load a saved search once the list is available.
@@ -49,6 +53,16 @@ export default function AuditCenterPage() {
     const found = saved.data?.find((q) => q.id === savedId);
     if (found) setOverride({ query: found.query, source: `Saved search “${found.name}”` });
     else setSavedMissing(true);
+  }
+
+  // `?incident=<id>`: show the ready-made search of one security incident (D7), once.
+  const incidentId = readParam(search, "incident");
+  const incidentOk = Boolean(incidentId && ULID.test(incidentId));
+  const incident = useQuery({ ...trpc.audit.incidents.get.queryOptions({ publicId: incidentOk && incidentId ? incidentId : "" }), enabled: incidentOk, retry: false });
+  const [incidentHandled, setIncidentHandled] = useState<string | null>(null);
+  if (incidentOk && incidentId && incidentHandled !== incidentId && (incident.data || incident.error)) {
+    setIncidentHandled(incidentId);
+    if (incident.data) setOverride({ query: incident.data.auditQuery, source: `Events of incident “${incident.data.ruleLabel}”` });
   }
 
   const query = override?.query ?? applied.query;

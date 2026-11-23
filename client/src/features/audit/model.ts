@@ -1,5 +1,5 @@
 /** Audit center client model: field catalogue, labels and query construction. Mirrors server/modules/audit/query.ts. */
-import type { AuditModule, AuditEnvelope, AuditQuery, AuditQueryGroup, AuditQueryTerm } from "@server/modules/audit/index";
+import type { AuditModule, AuditEnvelope, AuditQuery, AuditQueryGroup, AuditQueryTerm, IncidentSeverity as Sev, IncidentStatus as Status } from "@server/modules/audit/index";
 import type { OperationState } from "@shared/domain";
 import type { Tone } from "@/ui";
 
@@ -195,4 +195,65 @@ export function readParam(search: string, name: string): string | null {
   const hash = window.location.hash;
   const q = hash.indexOf("?");
   return q >= 0 ? new URLSearchParams(hash.slice(q + 1)).get(name) : null;
+}
+
+/* ---------------------------------------------------------------- D7: security incidents */
+export type { CorrelationConfig, IncidentDetail, IncidentSeverity, IncidentStatus, IncidentSummary, IncidentTimelineItem, RuleKey, RuleParams, RulesView } from "@server/modules/audit/index";
+export type IncidentPage = Awaited<ReturnType<AuditModule["listIncidents"]>>;
+
+/** Mirrors server constants (the client imports server types only). */
+export const INCIDENT_STATUS_LIST = ["open", "acknowledged", "closed"] as const satisfies readonly Status[];
+export const INCIDENT_SEVERITY_LIST = ["low", "medium", "high", "critical"] as const satisfies readonly Sev[];
+export const CLOSE_REASON_OPTIONS = [
+  { value: "resolved", label: "Resolved" },
+  { value: "false_positive", label: "False positive" },
+  { value: "duplicate", label: "Duplicate" },
+  { value: "accepted_risk", label: "Accepted risk" },
+] as const;
+export const BAN_DURATION_OPTIONS = [
+  { value: "15", label: "15 minutes" },
+  { value: "60", label: "1 hour" },
+  { value: "1440", label: "1 day" },
+  { value: "10080", label: "7 days" },
+  { value: "permanent", label: "Permanent (until released)" },
+] as const;
+/** Mirrors server BOUNDS in correlation/rules.ts. */
+export const RULE_BOUNDS = { threshold: { min: 1, max: 10_000 }, windowMinutes: { min: 1, max: 1_440 }, distinct: { min: 1, max: 1_000 }, mergeMinutes: { min: 5, max: 1_440 } } as const;
+
+export const STATUS_META: Record<Status, { label: string; tone: Tone }> = {
+  open: { label: "Open", tone: "danger" },
+  acknowledged: { label: "Acknowledged", tone: "warning" },
+  closed: { label: "Closed", tone: "neutral" },
+};
+export const SEVERITY_META: Record<Sev, { label: string; tone: Tone }> = {
+  low: { label: "Low", tone: "info" },
+  medium: { label: "Medium", tone: "warning" },
+  high: { label: "High", tone: "danger" },
+  critical: { label: "Critical", tone: "danger" },
+};
+export const SUBJECT_LABELS: Record<string, string> = { account: "One account", address: "One address", user: "One person", global: "Many accounts" };
+export const TIMELINE_LABELS: Record<string, string> = {
+  opened: "Incident opened",
+  events_added: "New evidence added",
+  escalated: "Severity raised",
+  acknowledged: "Acknowledged",
+  closed: "Closed",
+  action_ban_ip: "Address banned",
+  action_end_sessions: "Sessions ended",
+};
+export const closeReasonLabel = (r: string | null): string => CLOSE_REASON_OPTIONS.find((o) => o.value === r)?.label ?? "—";
+
+/** Parses a ban duration option; null = permanent; undefined = invalid. */
+export function banDurationOf(value: string): number | null | undefined {
+  if (value === "permanent") return null;
+  return BAN_DURATION_OPTIONS.some((o) => o.value === value) ? Number(value) : undefined;
+}
+/** Mirrors the server's ban reason check: 3–240 characters, no control characters. */
+export const banReasonError = (reason: string): string | null => (/^\P{Cc}{3,240}$/u.test(reason.trim()) ? null : "Enter a reason of 3 to 240 characters.");
+
+/** Validates one edited rule field; returns an error message or null. */
+export function boundError(kind: keyof typeof RULE_BOUNDS, raw: string): string | null {
+  const b = RULE_BOUNDS[kind];
+  const n = Number(raw);
+  return raw.trim() !== "" && Number.isInteger(n) && n >= b.min && n <= b.max ? null : `Enter a whole number from ${b.min} to ${b.max.toLocaleString()}.`;
 }

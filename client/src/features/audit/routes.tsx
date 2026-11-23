@@ -13,6 +13,8 @@ export const auditFeature: FeatureRoutes = {
     { ...admin, path: "/admin/audit/cases", title: "Investigation cases", component: lazy(() => import("./CasesPage")) },
     { access: "admin", capability: "audit.export", path: "/admin/audit/exports", title: "Audit exports", component: lazy(() => import("./ExportsPage")) },
     { ...admin, path: "/admin/audit/integrity", title: "Audit integrity", component: lazy(() => import("./IntegrityPage")) },
+    { access: "admin", capability: "security.incidents.read", path: "/admin/audit/incidents", title: "Security incidents", component: lazy(() => import("./IncidentsPage")) },
+    { access: "admin", capability: "security.incidents.read", path: "/admin/audit/incidents/:publicId", title: "Security incident", component: lazy(() => import("./IncidentDetailPage")) },
     { access: "admin", capability: "audit.retention.manage", path: "/admin/audit/retention", title: "Audit retention", component: lazy(() => import("./RetentionPage")) },
   ],
   widgets: [{ key: "audit.integrity", area: "console", access: "admin", capability: "audit.read", order: 40, span: 4, component: lazy(() => import("./widgets/IntegrityWidget")) }],
