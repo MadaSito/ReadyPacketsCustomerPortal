@@ -13,6 +13,12 @@ import { knowledgeFeature } from "../routes";
 import { moveItem, slugify } from "./AdminKnowledgeListPage";
 import { validateArticle } from "./AdminKnowledgeEditorPage";
 
+/** Queries every full-session shell makes (policy enforcement prompt, increment 06); empty = no prompt. */
+const SHELL_PROMPT_HANDLERS: Record<string, () => unknown> = {
+  "compliance.policies.enforcement.pending": () => [],
+  "compliance.policies.myStatus": () => ({ pendingRequired: [] }),
+};
+
 vi.mock("@/app/slots", () => ({
   NotificationSlot: () => null,
   GlobalSearchSlot: () => null,
@@ -108,7 +114,7 @@ function renderAt(path: string, handlers: Record<string, Handler>, calls: { path
           const paths = url.pathname.slice("/rpc/".length).split(",");
           const result = await Promise.all(
             paths.map(async (p, index) => {
-              const respond = handlers[p];
+              const respond = handlers[p] ?? SHELL_PROMPT_HANDLERS[p];
               if (!respond) throw new Error(`Unexpected test request: ${p}`);
               const input = data[index] === undefined ? undefined : superjson.deserialize(data[index]!);
               calls.push({ path: p, input });

@@ -11,6 +11,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CookieConsentSlot, CustomerMaintenanceSlot, GlobalSearchSlot, NotificationSlot } from "../slots";
+import { PolicyPromptSlot } from "../policyPromptSlot";
 import { AccountMenu, Footer, navPlacement, MaintenanceBanner, PreviewBanner, SkipLink, ThemeToggle, useCurrentNav, useEnabledNav, visibleNav } from "./common";
 
 function groupNav(items: NavItem[]): Array<{ group: string; items: NavItem[] }> {
@@ -66,6 +67,7 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
       {/* The consent banner sits above the sidebar row, never as a flex sibling that squeezes the content column. */}
       <CookieConsentSlot />
       <SkipLink />
+      <PolicyPromptSlot />
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar (always navy; uses on-navy tokens and the dark logo set) */}
         <aside aria-label="Console navigation" className={cn("rp-nav-panel rp-nav-edge sticky top-0 hidden h-dvh shrink-0 flex-col rp-on-navy lg:flex", collapsed ? "w-20" : "w-64")}>

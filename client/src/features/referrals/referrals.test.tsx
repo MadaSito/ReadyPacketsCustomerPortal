@@ -21,6 +21,12 @@ import type {
 } from "./model";
 import { referralsFeature } from "./routes";
 
+/** Queries every full-session shell makes (policy enforcement prompt, increment 06); empty = no prompt. */
+const SHELL_PROMPT_HANDLERS: Record<string, () => unknown> = {
+  "compliance.policies.enforcement.pending": () => [],
+  "compliance.policies.myStatus": () => ({ pendingRequired: [] }),
+};
+
 vi.mock("@/app/slots", () => ({
   NotificationSlot: () => null,
   GlobalSearchSlot: () => null,
@@ -286,7 +292,7 @@ function renderReferralsRoute(options: {
           const paths = url.pathname.slice("/rpc/".length).split(",");
           const result = await Promise.all(
             paths.map(async (path, index) => {
-              const respond = handlers[path];
+              const respond = handlers[path] ?? SHELL_PROMPT_HANDLERS[path];
               if (!respond) throw new Error(`Unexpected test tRPC request: ${path}`);
               const input = data[index] === undefined ? undefined : superjson.deserialize(data[index]!);
               calls.push({ path, input });

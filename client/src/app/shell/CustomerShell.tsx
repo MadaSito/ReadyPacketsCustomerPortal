@@ -14,6 +14,7 @@ import type { NavItem } from "@/lib/routes";
 import { BrandLogo, Drawer, IconButton, ThemeControl, Tooltip } from "@/ui";
 import { cn } from "@/ui/cn";
 import { CartBadgeSlot, CookieConsentSlot, NotificationSlot } from "../slots";
+import { PolicyPromptSlot } from "../policyPromptSlot";
 import {
   AccountMenu,
   CUSTOMER_SECTIONS,
@@ -101,6 +102,7 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
     <div className="flex min-h-dvh flex-col bg-surface-soft">
       <CookieConsentSlot />
       <SkipLink />
+      <PolicyPromptSlot />
       <PreviewBanner />
       <MaintenanceBanner />
       <header className="sticky top-0 z-40 border-b border-line bg-surface/95 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-surface/85">
