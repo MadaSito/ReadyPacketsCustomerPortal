@@ -1149,7 +1149,7 @@ function ConsoleOrderAutomationPanel({
                       <div className="flex flex-wrap items-center gap-2">
                         <Link
                           href={auditCorrelationHref(row.correlationId)}
-                          aria-label={`Audit correlation ${row.correlationId}`}
+                          aria-label={`${shortPublicId(row.correlationId)}, audit correlation ${row.correlationId}`}
                           className="inline-flex min-h-9 items-center font-mono text-xs font-semibold text-action underline underline-offset-4"
                         >
                           {shortPublicId(row.correlationId)}
