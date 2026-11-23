@@ -1,6 +1,7 @@
 /** Pieces shared by both shells: theme toggle, account menu, footer, banners, nav filtering. */
 import { useQuery } from "@tanstack/react-query";
-import { LogOut, Monitor, Moon, Settings, ShieldCheck, Sun, UserRound } from "lucide-react";
+import { useState } from "react";
+import { Download, LogOut, Monitor, Moon, Settings, ShieldCheck, Sun, UserRound } from "lucide-react";
 import { Link, useLocation } from "wouter";
 import type { UserRole } from "@shared/domain";
 import type { NavItem } from "@/lib/routes";
@@ -10,6 +11,7 @@ import { useConsent } from "@/lib/consent";
 import { Callout, DropdownMenu, IconButton, useTheme, type ThemePreference } from "@/ui";
 import { cn } from "@/ui/cn";
 import { RUNTIME } from "@/lib/runtime";
+import { PwaInstallDialog, usePwaInstall } from "@/app/PwaInstallEntry";
 
 export const LEGAL_NAME = "Ready Packets Consulting LLC";
 export const PUBLIC_SITE_URL = "https://www.readypackets.com";
@@ -178,7 +180,16 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
   const signOut = useSignOut();
   const staff = user.role !== "customer";
   const entries = accountItems ?? DEFAULT_ACCOUNT_NAV;
+  const pwa = usePwaInstall();
+  // The install dialog lives outside the menu so it survives the menu closing and returns focus normally.
+  const [installOpen, setInstallOpen] = useState(false);
+  const install = () => {
+    void pwa.prompt().then((result) => {
+      if (result === "unavailable") setInstallOpen(true);
+    });
+  };
   return (
+    <>
     <DropdownMenu
       header={
         <div className="min-w-0">
@@ -204,10 +215,13 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
           ),
         })),
         ...(staff ? [area === "console" ? { label: "Customer view", icon: <UserRound aria-hidden="true" />, asChild: <Link href="/">Customer view</Link> } : { label: "Console", icon: <Settings aria-hidden="true" />, asChild: <Link href="/admin">Console</Link> }] : []),
+        ...(pwa.available && !pwa.installed ? [{ label: "Install app", icon: <Download aria-hidden="true" />, onSelect: install }] : []),
         "separator" as const,
         { label: "Sign out", icon: <LogOut aria-hidden="true" />, onSelect: () => void signOut() },
       ]}
     />
+    <PwaInstallDialog open={installOpen} onOpenChange={setInstallOpen} />
+    </>
   );
 }
 
