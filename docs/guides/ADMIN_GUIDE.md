@@ -718,7 +718,9 @@ Payment receipts, policy update notices and policy enforcement warnings are edit
 
 **Receipt PDF:**
 
-- The PDF the server generates (up to 2 MiB) is attached only to the customer's copy. It is left out of the audit copy, retained mail and development capture.
+- A receipt PDF of up to 690 KiB is attached to the customer's copy only.
+- A larger PDF is not attached. The customer still gets the e-mail, with a secure link to Invoices where they can download it.
+- Attachment bytes are never put in the audit copy, retained mail, development capture or logs.
 - A retry of the receipt reuses the same send intent, so the customer gets one receipt.
 - An authorised **Send again** creates its own audited resend.
 
