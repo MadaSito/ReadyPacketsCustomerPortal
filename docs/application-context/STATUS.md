@@ -408,6 +408,7 @@ Defects found in lead QA and fixed before merge:
 - **Prompt re-opening:** the policy prompt re-opened on every navigation after "Later" (`39fb16e`).
 - **Notice copy:** singular and plural in the notice dialog (`7a39164`).
 - **CodeQL on PR #13:** two findings at or above the gate were fixed before merge: table-cell escaping in the document importer and a check-then-read race on the brand logo file (`a10cc50`, with an escape-aware table reader shared by the policy renderer and the Markdown importer). Policy links now also refuse backslash-prefixed paths (`d14a34c`). All four workflows (ci, security, container, native-install) passed at `d14a34c`.
+- **After the merge (PR #14):** the `ci` run on `main` at `ee40772` failed on one client test (`CheckoutPages.test.tsx`, agreement retry at checkout). The agreement dialog enables its controls one animation frame after it opens and the test clicked without waiting, so it lost the race on a slower runner. The test now waits for the control (`2cd30fe`); no product code changed for it. The same PR moved the install-dismissed preference to a guarded storage helper (`410cae4`). All four workflows passed at `2cd30fe` before PR #14 was merged.
 - **Test timeouts:** hardened (`0e63c94`, `4614c02`).
 - **Layout and focus:** the PageHeader wrap and the install dialog focus (`751fccc`, `80af96e`).
 
