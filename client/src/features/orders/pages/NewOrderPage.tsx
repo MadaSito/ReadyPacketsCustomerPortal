@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { PackageOpen } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
+import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredDetails } from "@/lib/agreementGate";
 import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 // Increment 05 (C3): shared discount code field, imported here by /root's direction (audit_engineer owns it).
@@ -46,6 +47,10 @@ export default function NewOrderPage() {
   const [, navigate] = useLocation();
   const catalog = useQuery(trpc.orders.catalog.list.queryOptions());
   const create = useMutation(trpc.orders.create.mutationOptions());
+  // Increment 06 (D14): the order agreement gate. The server refuses with AGREEMENT_REQUIRED; the customer reviews and
+  // accepts in place, then the same submission (same idempotency key) is retried once.
+  const [agreement, setAgreement] = useState<AgreementRequiredDetails | null>(null);
+
   // Increment 04: with the cart feature on, the wizard fills the cart and checkout creates the order.
   const cartEnabled = useFeatureEnabled("cart");
   const addToCart = useMutation(trpc.cart.addItems.mutationOptions());
@@ -258,6 +263,11 @@ export default function NewOrderPage() {
       toast.show({ tone: "success", title: "Order submitted", description: `Reference ${result.reference}` });
       navigate(`/orders/${result.publicId}`);
     } catch (err) {
+      const agreementDetails = parseAgreementRequiredDetails(err);
+      if (agreementDetails) {
+        setAgreement(agreementDetails);
+        return;
+      }
       const safe = safeError(err);
       if (safe?.reasonCode === "POLICY_ACCEPTANCE_REQUIRED") {
         setPolicyBlocked(true);
@@ -272,6 +282,21 @@ export default function NewOrderPage() {
   return (
     <>
       {header}
+      {agreement ? (
+        <AgreementDialog
+          open
+          policyPublicId={agreement.policyPublicId}
+          signatureMode={agreement.signatureMode}
+          onAccepted={async () => {
+            setAgreement(null);
+            await submit();
+          }}
+          onClose={() => {
+            setAgreement(null);
+            setError("Your order was not submitted. Accept the order agreement to place it.");
+          }}
+        />
+      ) : null}
       <ol aria-label="Progress" className="mb-6 flex flex-col gap-2 sm:flex-row sm:gap-6">
         {STEPS.map((label, index) => (
           <li

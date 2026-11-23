@@ -127,7 +127,7 @@ describe("order page rules", () => {
     expect(within(rail).getByText("Intake")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Needed before the next step (Intake)" })).toBeInTheDocument();
     expect(screen.getByText("0 of 2 done")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Upload Signed contract" })).toHaveAttribute("href", `/orders/${ORDER_ID}/files`);
+    expect(screen.getByRole("link", { name: "Upload Signed contract" })).toHaveAttribute("href", `/orders/${ORDER_ID}/files?slot=contract`);
     expect(screen.getByRole("button", { name: "Read and accept: Synthetic terms" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
@@ -228,6 +228,125 @@ describe("order page rules", () => {
     await user.click(within(dialog).getByRole("button", { name: "Unlock" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(calls.find((c) => c.path === "orders.phases.unlock")?.input).toEqual({ orderId: ORDER_ID, phaseKey: "intake", reason: "short but now long enough", notifyCustomer: false });
+  });
+});
+
+describe("customer tasks (increment 06, D8)", () => {
+  const DOC_SHA = "b".repeat(64);
+  const contractDoc = { key: "contract", label: "Contract", hint: "Review and sign.", required: true, responseModes: ["upload_reply", "acknowledge"], allowedTypes: ["docx"], replySlotKey: "contract_reply", sourceCount: 1, replyCount: 0, acknowledged: false, textSha256: DOC_SHA, met: false, waived: false, canStaffUpload: false, canReply: true, canEdit: false, canAcknowledge: true };
+  const tasks = (overrides: Record<string, unknown> = {}) =>
+    rules({
+      uploads: [{ key: "voice", label: "Voice note", hint: null, kind: "audio", minCount: 1, maxCount: 1, allowedTypes: ["mp3"], uploadedBy: ["customer"], count: 0, met: false, canUpload: true, waived: false, taskKind: "record", capture: "record", maxMinutes: 5 }],
+      acknowledgements: [{ key: "brief_note", title: "Your brief", body: "Please confirm the brief.", acceptedBy: "customer", requireTypedName: false, source: "order_note", textSha256: HASH, met: false, acceptedAt: null, canAccept: true, waived: false, orderNote: "Synthetic note: two pages.", canEditNote: false }],
+      documents: [contractDoc],
+      canWaive: false,
+      agreementPending: null,
+      ...overrides,
+    }) as ReturnType<typeof rules> & { documents: (typeof contractDoc)[] };
+  const renderConsole = () =>
+    renderUi(
+      <Route path="/admin/orders/:orderId/:tab">
+        <AdminOrderDetailPage />
+      </Route>,
+      { path: `/admin/orders/${ORDER_ID}/phases` },
+    );
+  const asStaff = () => {
+    session.role = "staff";
+    handlers.set("orders.admin.get", () => ({ ...detail, accessRole: "staff", transitions: [] }));
+    handlers.set("orders.admin.referenceHistory", () => []);
+  };
+
+  it("customer: record link opens the recorder, document links go to the right slot, note shows in the dialog", async () => {
+    handlers.set("orders.requirements.forOrder", () => tasks());
+    handlers.set("orders.requirements.acknowledge", () => ({ acknowledgementId: "x" }));
+    const user = userEvent.setup();
+    renderCustomerOrder();
+    const record = await screen.findByRole("link", { name: "Record Voice note" });
+    expect(record).toHaveAttribute("href", `/orders/${ORDER_ID}/files?slot=voice&mode=record`);
+    expect(screen.getByText(/Record in the portal \(up to 5 minutes\)/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Upload reply: Contract" })).toHaveAttribute("href", `/orders/${ORDER_ID}/files?slot=contract_reply`);
+    expect(screen.getByRole("link", { name: "View document: Contract" })).toHaveAttribute("href", `/orders/${ORDER_ID}/files?slot=contract`);
+    await user.click(screen.getByRole("button", { name: "Read and accept: Your brief" }));
+    const dialog = await screen.findByRole("dialog", { name: "Your brief" });
+    expect(within(dialog).getByRole("region", { name: "Full text: Your brief" }).textContent).toContain("Synthetic note: two pages.");
+    await user.click(within(dialog).getByRole("checkbox"));
+    await user.click(within(dialog).getByRole("button", { name: "Accept" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.requirements.acknowledge")?.input).toEqual({ orderId: ORDER_ID, statusKey: "intake", ackKey: "brief_note", textSha256: HASH }));
+  });
+
+  it("customer: acknowledging a document sends its hash; waiting states are described in words", async () => {
+    handlers.set("orders.requirements.forOrder", () => tasks());
+    handlers.set("orders.requirements.acknowledge", () => ({ acknowledgementId: "x" }));
+    const user = userEvent.setup();
+    renderCustomerOrder();
+    await user.click(await screen.findByRole("button", { name: "Acknowledge: Contract" }));
+    const dialog = await screen.findByRole("dialog", { name: "Contract" });
+    expect(within(dialog).getByRole("link", { name: /Open the document/ })).toHaveAttribute("href", `/orders/${ORDER_ID}/files?slot=contract`);
+    await user.click(within(dialog).getByRole("checkbox", { name: /I have read this document/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Accept" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.requirements.acknowledge")?.input).toEqual({ orderId: ORDER_ID, statusKey: "intake", ackKey: "contract", textSha256: DOC_SHA }));
+  });
+
+  it("customer: not-yet-shared document and missing note are explained, with no action", async () => {
+    const base = tasks();
+    handlers.set("orders.requirements.forOrder", () =>
+      tasks({
+        acknowledgements: [{ ...base.acknowledgements[0], orderNote: null, canAccept: false }],
+        documents: [{ ...base.documents[0], sourceCount: 0, canReply: false, canAcknowledge: false }],
+      }),
+    );
+    renderCustomerOrder();
+    expect(await screen.findByText("Our team is preparing this note")).toBeInTheDocument();
+    expect(screen.getByText("Our team is preparing this document")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Acknowledge: Contract" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Read and accept: Your brief/ })).not.toBeInTheDocument();
+  });
+
+  it("customer: a pending agreement pauses tasks and offers the agreement", async () => {
+    handlers.set("orders.requirements.forOrder", () => tasks({ agreementPending: { policyPublicId: "01JTESTPOL0000000000000000", signatureMode: "checkbox" } }));
+    renderCustomerOrder();
+    expect(await screen.findByText("Your tasks are paused until you accept the agreement.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Record Voice note" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Review and accept the agreement" })).toBeInTheDocument();
+  });
+
+  it("console: staff write the order note and waive a task with a reason", async () => {
+    asStaff();
+    const base = tasks();
+    handlers.set("orders.requirements.forOrder", () =>
+      tasks({ canWaive: true, acknowledgements: [{ ...base.acknowledgements[0], orderNote: null, canAccept: false, canEditNote: true }], documents: [{ ...base.documents[0], canStaffUpload: true, canReply: false, canAcknowledge: false }] }),
+    );
+    handlers.set("orders.requirements.setTaskNote", () => ({ notePublicId: "n", version: 1, textSha256: HASH }));
+    handlers.set("orders.requirements.waive", () => ({ waiverId: "w", waivedAt: now.toISOString() }));
+    const user = userEvent.setup();
+    renderConsole();
+    expect(await screen.findByRole("link", { name: "Manage document: Contract" })).toHaveAttribute("href", `/admin/orders/${ORDER_ID}/files?slot=contract`);
+    await user.click(screen.getByRole("button", { name: "Write note: Your brief" }));
+    const noteDialog = await screen.findByRole("dialog", { name: /Note for the customer/ });
+    await user.click(within(noteDialog).getByRole("button", { name: "Save note" }));
+    expect(await within(noteDialog).findByText("Write the note the customer must read.")).toBeInTheDocument();
+    expect(within(noteDialog).getByLabelText(/^Note/)).toHaveAccessibleDescription(/Write the note the customer must read/);
+    await user.type(within(noteDialog).getByLabelText(/^Note/), "Synthetic brief text.");
+    await user.click(within(noteDialog).getByRole("button", { name: "Save note" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(calls.find((c) => c.path === "orders.requirements.setTaskNote")?.input).toEqual({ orderId: ORDER_ID, statusKey: "intake", ackKey: "brief_note", body: "Synthetic brief text." });
+    await user.click(screen.getByRole("button", { name: "Waive Voice note" }));
+    const waive = await screen.findByRole("dialog", { name: /Waive “Voice note”/ });
+    await expectNoAxeViolations(waive);
+    await user.type(within(waive).getByLabelText(/Reason/), "short");
+    await user.click(within(waive).getByRole("button", { name: "Waive task" }));
+    expect(await within(waive).findByText(/at least 10 characters/)).toBeInTheDocument();
+    await user.type(within(waive).getByLabelText(/Reason/), " but sent by post");
+    await user.click(within(waive).getByRole("button", { name: "Waive task" }));
+    await waitFor(() => expect(calls.find((c) => c.path === "orders.requirements.waive")?.input).toEqual({ orderId: ORDER_ID, statusKey: "intake", taskKey: "voice", reason: "short but sent by post" }));
+  });
+
+  it("waived tasks read as done and offer no actions", async () => {
+    const base = tasks();
+    handlers.set("orders.requirements.forOrder", () => tasks({ uploads: [{ ...base.uploads[0], waived: true, met: true }] }));
+    renderCustomerOrder();
+    expect(await screen.findByText("Waived by our team")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Record Voice note" })).not.toBeInTheDocument();
   });
 });
 

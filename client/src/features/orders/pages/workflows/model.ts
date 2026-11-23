@@ -110,7 +110,8 @@ const STEP_OF_CODE: Record<string, WizardStepId> = {
   GATE_STEP_UNKNOWN: "rules",
   GATE_STEP_TERMINAL: "rules",
 };
-export const stepOfIssue = (issue: WorkflowIssue): WizardStepId => STEP_OF_CODE[issue.code] ?? "review";
+export const stepOfIssue = (issue: WorkflowIssue): WizardStepId =>
+  STEP_OF_CODE[issue.code] ?? (/^(RECORD_|DOC_|ACK_NOTE_)/.test(issue.code) || /\.requirements\./.test(issue.path) || /^phases\./.test(issue.path) ? "rules" : "review");
 export const errorsOf = (issues: readonly WorkflowIssue[]) => issues.filter((issue) => issue.severity === "error");
 
 /** First error message for an exact field path (e.g. `states.2.key`), for a Field's `error` prop. */
@@ -207,6 +208,65 @@ export type DraftPhase = NonNullable<DraftDefinition["phases"]>[number];
 export type DraftRequirements = NonNullable<DraftState["requirements"]>;
 export type DraftUpload = DraftRequirements["uploads"][number];
 export type DraftAcknowledgement = DraftRequirements["acknowledgements"][number];
+export type DraftDocumentTask = NonNullable<DraftRequirements["documents"]>[number];
+
+/* ------------------------------------------------------------------ customer tasks (increment 06, D8) */
+
+/** File type presets (the server's accepted extensions). The Files picker filters by the chosen types. */
+export const TYPE_PRESETS = [
+  { id: "word", label: "Word", types: ["docx"] },
+  { id: "pdf", label: "PDF", types: ["pdf"] },
+  { id: "images", label: "Images", types: ["png", "jpg"] },
+  { id: "audio", label: "Audio", types: ["mp3", "m4a", "wav", "ogg", "webm", "mp4", "aac"] },
+] as const;
+export type TypePresetId = (typeof TYPE_PRESETS)[number]["id"];
+/** A preset is on when every one of its types is allowed. */
+export const presetOn = (types: readonly string[], id: TypePresetId) => TYPE_PRESETS.find((preset) => preset.id === id)!.types.every((type) => types.includes(type));
+export function togglePreset(types: readonly string[], id: TypePresetId, on: boolean): string[] {
+  const preset = TYPE_PRESETS.find((candidate) => candidate.id === id)!.types as readonly string[];
+  const rest = types.filter((type) => !preset.includes(type));
+  return on ? [...rest, ...preset] : rest;
+}
+export const CAPTURE_OPTIONS = [
+  { value: "either", label: "Record in the portal or upload a file" },
+  { value: "record", label: "Record in the portal only" },
+  { value: "upload", label: "Upload a recording only" },
+];
+export const RESPONSE_MODES = [
+  { value: "edit_in_portal", label: "Edit in the portal", description: "The customer edits the Word document in the browser. Needs Word (docx) in the accepted types." },
+  { value: "upload_reply", label: "Upload a reply", description: "The customer uploads their own file in reply." },
+  { value: "acknowledge", label: "Acknowledge", description: "The customer confirms they have read the document." },
+] as const;
+export type TaskKind = "upload" | "record" | "acknowledge" | "respond_document";
+export const TASK_KIND_OPTIONS: { value: TaskKind; label: string; description: string }[] = [
+  { value: "upload", label: "Upload files", description: "The customer uploads one or more files." },
+  { value: "record", label: "Record audio", description: "The customer records or uploads audio, with a time limit." },
+  { value: "acknowledge", label: "Acknowledge text", description: "The customer reads and accepts fixed text, or a note your team writes on each order." },
+  { value: "respond_document", label: "Respond to a document", description: "Your team shares a document; the customer edits it, uploads a reply or acknowledges it." },
+];
+export function newDocumentTask(state: DraftState): DraftDocumentTask {
+  const taken = new Set([...(requirementsOf(state).documents ?? []).map((doc) => doc.key), ...requirementsOf(state).uploads.map((upload) => upload.key)]);
+  return { key: keyFromLabel("document", taken), label: "", responseModes: ["upload_reply"], required: true, allowedTypes: ["docx", "pdf"] };
+}
+export function newRecordTask(state: DraftState): DraftUpload {
+  const taken = new Set(requirementsOf(state).uploads.map((upload) => upload.key));
+  return { key: keyFromLabel("recording", taken), label: "Recording", kind: "audio", minCount: 1, maxCount: 1, allowedTypes: [...TYPE_PRESETS[3].types], uploadedBy: ["customer"], capture: "either", maxMinutes: 10 };
+}
+/** Adds a task of the chosen kind to a state's requirements. */
+export function addTask(state: DraftState, kind: TaskKind): Partial<DraftState> {
+  return withRequirements(state, (current) =>
+    kind === "upload"
+      ? { ...current, uploads: [...current.uploads, newUpload(state)] }
+      : kind === "record"
+        ? { ...current, uploads: [...current.uploads, newRecordTask(state)] }
+        : kind === "acknowledge"
+          ? { ...current, acknowledgements: [...current.acknowledgements, newAcknowledgement(state)] }
+          : { ...current, documents: [...(current.documents ?? []), newDocumentTask(state)] },
+  );
+}
+
+/** DOM id of the control for a validation path (designer findings jump here). */
+export const issueFieldId = (path: string) => `wf-field-${path.replace(/[^A-Za-z0-9_-]+/g, "-")}`;
 export const UPLOAD_KIND_OPTIONS = [
   { value: "document", label: "Document" },
   { value: "audio", label: "Audio" },
@@ -254,7 +314,10 @@ const requirementsOf = (state: DraftState): DraftRequirements => state.requireme
 /** Patch for a state's requirements (drops the object when both lists are empty). */
 export function withRequirements(state: DraftState, next: (current: DraftRequirements) => DraftRequirements): Partial<DraftState> {
   const requirements = next(requirementsOf(state));
-  return { requirements: requirements.uploads.length || requirements.acknowledgements.length ? requirements : undefined };
+  const documents = requirements.documents ?? [];
+  const { documents: _documents, ...rest } = requirements;
+  const kept = documents.length ? { ...rest, documents } : rest;
+  return { requirements: requirements.uploads.length || requirements.acknowledgements.length || documents.length ? kept : undefined };
 }
 export function newUpload(state: DraftState): DraftUpload {
   const taken = new Set(requirementsOf(state).uploads.map((upload) => upload.key));

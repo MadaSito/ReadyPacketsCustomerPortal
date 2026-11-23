@@ -2,6 +2,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Route } from "wouter";
+import type * as agreementGateModule from "@/lib/agreementGate";
 import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminCatalogPage, { parseAmountToMinor, parseDeliverables, parsePacketNumbers } from "./pages/AdminCatalogPage";
@@ -49,6 +50,18 @@ function proxy(path: string[]): unknown {
 }
 
 vi.mock("@/lib/trpc", async (original) => ({ ...(await original<typeof trpcModule>()), useTRPC: () => proxy([]), useTRPCClient: () => proxy([]) }));
+// The shared agreement dialog (compliance) is stubbed: these tests cover how the order page reacts to AGREEMENT_REQUIRED.
+vi.mock("@/lib/agreementGate", async (original) => ({
+  ...(await original<typeof agreementGateModule>()),
+  AgreementDialog: ({ open, policyPublicId, onAccepted, onClose }: { open: boolean; policyPublicId: string; onAccepted: () => void; onClose: () => void }) =>
+    open ? (
+      <div role="dialog" aria-label="Order agreement">
+        <p>{`Agreement ${policyPublicId}`}</p>
+        <button type="button" onClick={onAccepted}>Accept agreement</button>
+        <button type="button" onClick={onClose}>Not now</button>
+      </div>
+    ) : null,
+}));
 vi.mock("@/lib/session", () => ({ useSession: () => ({ me: { state: "full", user: { role: session.role } }, view: { status: "full", role: session.role } }) }));
 vi.mock("@/app/registry", () => ({
   FEATURES: [
@@ -289,6 +302,39 @@ describe("new order wizard", () => {
     const keys = calls.filter((c) => c.path === "orders.create").map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
     expect(keys).toHaveLength(2);
     expect(keys[1]).toBe(keys[0]);
+  });
+
+  it("D14 order agreement: AGREEMENT_REQUIRED opens the agreement, accepting retries once with the same key; Not now explains", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    let attempts = 0;
+    const agreementError = () =>
+      Object.assign(new Error("agreement"), {
+        data: { safe: { domainCode: "CONFLICT", reasonCode: "AGREEMENT_REQUIRED", safeMessage: "Accept the order agreement first.", requestId: "r1", details: { policyPublicId: "01JTESTPOL0000000000000000", signatureMode: "checkbox" } } },
+      });
+    handlers.set("orders.create", () => {
+      attempts += 1;
+      if (attempts <= 2) throw agreementError();
+      return { publicId: ORDER_ID, reference: "RP-2026-000001", created: true };
+    });
+    const user = userEvent.setup();
+    const { location } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByText("Synthetic A");
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "1");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Agreement first");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.click(await screen.findByRole("button", { name: "Submit order" }));
+    const dialog = await screen.findByRole("dialog", { name: "Order agreement" });
+    expect(within(dialog).getByText("Agreement 01JTESTPOL0000000000000000")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Not now" }));
+    expect(await screen.findByText("Your order was not submitted. Accept the order agreement to place it.")).toBeInTheDocument();
+    expect(location.history?.at(-1)).toBe("/orders/new");
+    await user.click(screen.getByRole("button", { name: "Submit order" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Order agreement" })).getByRole("button", { name: "Accept agreement" }));
+    await waitFor(() => expect(location.history?.at(-1)).toBe(`/orders/${ORDER_ID}`));
+    const keys = calls.filter((c) => c.path === "orders.create").map((c) => (c.input as { idempotencyKey: string }).idempotencyKey);
+    expect(keys).toHaveLength(3);
+    expect(new Set(keys).size).toBe(1);
   });
 
   it("C3 discount code: Apply and Enter only quote (never submit the order), total is announced, code is sent on create", async () => {

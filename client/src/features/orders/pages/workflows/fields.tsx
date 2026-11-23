@@ -86,7 +86,7 @@ export function TransitionNoticeFields({ definition, transition, index, issues, 
 }
 
 /** Server issues as a list; errors first. `title` names the section, e.g. "Problems to fix in this step". */
-export function IssueList({ issues, title, live }: { issues: readonly WorkflowIssue[]; title: string; live?: boolean }) {
+export function IssueList({ issues, title, live, onJump }: { issues: readonly WorkflowIssue[]; title: string; live?: boolean; onJump?: (issue: WorkflowIssue) => void }) {
   if (issues.length === 0) return null;
   const errors = issues.filter((issue) => issue.severity === "error");
   const warnings = issues.filter((issue) => issue.severity === "warning");
@@ -96,10 +96,20 @@ export function IssueList({ issues, title, live }: { issues: readonly WorkflowIs
         {[...errors, ...warnings].map((issue, i) => (
           <li key={`${issue.code}-${issue.path}-${i}`} className="flex items-start gap-2">
             {issue.severity === "error" ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" /> : <AlertTriangle aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}
-            <span>
+            <span className="min-w-0 flex-1 break-words">
               <span className="sr-only">{issue.severity === "error" ? "Error: " : "Warning: "}</span>
               {issue.message}
             </span>
+            {onJump ? (
+              <button
+                type="button"
+                onClick={() => onJump(issue)}
+                aria-label={`Show: ${issue.message}`}
+                className="inline-flex min-h-6 shrink-0 items-center rounded px-1 text-sm font-semibold text-link underline underline-offset-2 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 pointer-coarse:min-h-11"
+              >
+                Show
+              </button>
+            ) : null}
           </li>
         ))}
       </ul>

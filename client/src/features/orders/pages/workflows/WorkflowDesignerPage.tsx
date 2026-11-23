@@ -40,6 +40,7 @@ import {
   edgeId,
   errorsOf,
   indexOfId,
+  issueFieldId,
   KIND_LABEL,
   moveState,
   newTransition,
@@ -198,6 +199,30 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
     goTo(WIZARD_STEPS[stepIndex + 1]!.id);
   };
 
+  /**
+   * Increment 06: findings jump to the field. Opens the wizard step that owns the problem, then focuses the exact
+   * control (by its path id), or a control whose error text matches, or that step's problem list.
+   */
+  const [findingsOpen, setFindingsOpen] = useState(false);
+  const jump = (issue: WorkflowIssue) => {
+    setTab("wizard");
+    goTo(stepOfIssue(issue));
+    const focusTarget = (attempt: number) => {
+      const exact = issue.path ? document.getElementById(issueFieldId(issue.path)) : null;
+      const byMessage = exact
+        ? null
+        : Array.from(document.querySelectorAll<HTMLElement>("[aria-invalid='true']")).find((element) =>
+            (element.getAttribute("aria-describedby") ?? "").split(" ").some((id) => id && document.getElementById(id)?.textContent?.includes(issue.message)),
+          );
+      const target = exact ?? byMessage ?? document.getElementById("wf-step-problems");
+      if (!target && attempt < 5) return void window.setTimeout(() => focusTarget(attempt + 1), 30);
+      if (!target) return;
+      target.scrollIntoView?.({ block: "center", behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+      target.focus({ preventScroll: true });
+    };
+    window.setTimeout(() => focusTarget(0), 0);
+  };
+
   const busy = save.isPending || publish.isPending;
   const saveButton = (
     <Button variant="ghost" onClick={() => void onSaveClick()} loading={save.isPending} disabled={busy}>
@@ -221,13 +246,23 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
           <div className="flex flex-wrap items-center gap-2">
             <Badge tone="neutral">{initial.workflowKey}</Badge>
             {dirty ? <Badge tone="warning">Unsaved changes</Badge> : <Badge tone="neutral">Saved</Badge>}
-            {errorCount ? <Badge tone="danger">{`${errorCount} to fix`}</Badge> : <Badge tone="success">No problems</Badge>}
+            {errorCount ? (
+              <Button size="sm" variant="secondary" aria-expanded={findingsOpen} aria-controls="wf-findings" onClick={() => setFindingsOpen((open) => !open)}>
+                <Badge tone="danger">{`${errorCount} to fix`}</Badge>
+                <span>{findingsOpen ? "Hide problems" : "Show problems"}</span>
+              </Button>
+            ) : (
+              <Badge tone="success">No problems</Badge>
+            )}
             {warningCount ? <Badge tone="warning">{`${warningCount} warning${warningCount === 1 ? "" : "s"}`}</Badge> : null}
           </div>
         }
         actions={saveButton}
       />
       <div className="flex flex-col gap-6">
+        <div id="wf-findings" hidden={!findingsOpen || issues.length === 0}>
+          {findingsOpen ? <IssueList issues={issues} title={`Problems in this draft (${issues.length}). Choose Show to go to each one.`} onJump={jump} /> : null}
+        </div>
         {problem ? (
           <Callout tone="danger" live="assertive">
             {problem}
@@ -271,6 +306,7 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
                     setChangeNote={setChangeNote}
                     publishable={publishable && !dirty}
                     dirty={dirty}
+                    onJump={jump}
                   />
                 </Wizard>
               ),
@@ -297,6 +333,7 @@ interface StepBodyProps {
   setChangeNote: (value: string) => void;
   publishable: boolean;
   dirty: boolean;
+  onJump?: (issue: WorkflowIssue) => void;
 }
 
 function StepBody(props: StepBodyProps) {
@@ -312,11 +349,14 @@ function StepBody(props: StepBodyProps) {
   };
   const problems =
     step === "review" ? null : (
-      <IssueList
-        issues={stepIssues}
-        live={blocked}
-        title={blocked ? "Fix these problems to continue" : "Problems found when the draft was last saved"}
-      />
+      <div id="wf-step-problems" tabIndex={-1} className="outline-none">
+        <IssueList
+          issues={stepIssues}
+          live={blocked}
+          title={blocked ? "Fix these problems to continue" : "Problems found when the draft was last saved"}
+          onJump={props.onJump}
+        />
+      </div>
     );
   const noTransitions = definition.transitions.length === 0 && step !== "statuses" && step !== "transitions" && step !== "rules" && step !== "review";
 
@@ -430,11 +470,11 @@ function StepBody(props: StepBodyProps) {
   );
 }
 
-function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, setChangeNote, publishable, dirty }: StepBodyProps) {
+function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, setChangeNote, publishable, dirty, onJump }: StepBodyProps) {
   const { definition } = work;
   return (
     <>
-      <IssueList issues={issues} title={errorsOf(issues).length ? "Fix these problems before publishing" : "Warnings (publishing is still allowed)"} />
+      <IssueList issues={issues} title={errorsOf(issues).length ? "Fix these problems before publishing" : "Warnings (publishing is still allowed)"} onJump={onJump} />
       {publishable ? <Callout tone="success">The draft has no problems and is ready to publish.</Callout> : null}
       {dirty ? <Callout tone="info">You have unsaved changes. Publishing saves them first.</Callout> : null}
       <DefinitionTables definition={definition} />
