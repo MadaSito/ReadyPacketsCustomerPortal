@@ -61,6 +61,7 @@ const cart = (items: ReturnType<typeof line>[], extra: Record<string, unknown> =
   promotionsEnabled: false,
   promoNotice: null,
   upsells: [],
+  smallTotalEvaluation: null,
   paymentProvider: "none",
   onlinePaymentEnabled: false,
   updatedAt: null,

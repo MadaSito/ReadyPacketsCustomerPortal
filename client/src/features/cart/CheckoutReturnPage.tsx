@@ -23,14 +23,21 @@ export function readCheckoutTarget(search: string): CheckoutTarget | null {
 const stateCopy = {
   pending_confirmation: { title: "Waiting for payment confirmation", text: "Returning from checkout does not confirm payment. This page checks for confirmation automatically for a short time. Avoid submitting another payment while you wait.", tone: "info" },
   paid: { title: "Payment confirmed", text: "Your payment is recorded on your ReadyPackets invoice.", tone: "success" },
-  no_payment_due: { title: "Nothing to pay - your discount covers this order", text: "Your order is placed and your zero-balance invoice is settled. No payment was needed.", tone: "success" },
+  no_payment_due: { title: "Nothing to pay — your discount covers this order.", text: "Your order is placed and your zero-balance invoice is settled. No payment was needed.", tone: "success" },
   invoice_issued: { title: "Order placed and invoice issued", text: "No online payment was collected. Open your invoice for the balance and payment instructions.", tone: "success" },
   cancelled: { title: "Checkout cancelled", text: "No payment is confirmed for this checkout. If you believe a charge was made, verify it before paying again.", tone: "warning" },
   failed: { title: "Payment could not be confirmed", text: "Check your invoice and verify any charge with the provider before trying again.", tone: "warning" },
 } as const;
 
 function CheckoutResult({ data, cancelRoute, actions }: { data: CheckoutStatus; cancelRoute: boolean; actions?: ReactNode }) {
-  const state = stateCopy[data.confirmationState];
+  const waivedSmallTotal = data.paymentMode === "waived_small_total" || data.waivedMinor > 0;
+  const state = waivedSmallTotal && (data.confirmationState === "no_payment_due" || data.confirmationState === "paid")
+    ? {
+        title: "Order placed — remaining balance waived",
+        text: "Your remaining balance below the online payment minimum was waived automatically and your invoice is settled.",
+        tone: "success" as const,
+      }
+    : stateCopy[data.confirmationState];
   const cancelledPending = cancelRoute && data.confirmationState === "pending_confirmation";
   return <div className="grid gap-4">
     <div aria-live="polite" aria-atomic="true">
@@ -43,6 +50,9 @@ function CheckoutResult({ data, cancelRoute, actions }: { data: CheckoutStatus; 
         <div><dt className="font-semibold">Order reference</dt><dd className="break-all">{data.orderReference}</dd></div>
         <div><dt className="font-semibold">Invoice number</dt><dd className="break-all">{data.invoiceNumber ?? "Not assigned"}</dd></div>
         <div><dt className="font-semibold">Order total</dt><dd><Money value={{ amountMinor: data.totalMinor, currency: data.currency }} /></dd></div>
+        {data.waivedMinor > 0 ? (
+          <div><dt className="font-semibold">Amount waived</dt><dd><Money value={{ amountMinor: data.waivedMinor, currency: data.currency }} /></dd></div>
+        ) : null}
         <div><dt className="font-semibold">Invoice balance</dt><dd><Money value={{ amountMinor: data.balanceDueMinor, currency: data.currency }} /></dd></div>
       </dl>
       {data.confirmationState !== "cancelled" ? <div className="mt-4 flex flex-wrap gap-3">

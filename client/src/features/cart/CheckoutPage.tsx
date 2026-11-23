@@ -2,9 +2,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
+import {
+  AgreementDialog,
+  parseAgreementRequiredDetails,
+  SafePolicyText,
+  type AgreementRequiredDetails,
+} from "@/lib/agreementGate";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, EmptyState, ErrorState, Field, Input, Money, PageHeader, Skeleton, Textarea } from "@/ui";
-import { SafePolicyText } from "../compliance/shared";
 import type { CartViewData } from "./CartPage";
 
 const emptyBilling = {
@@ -109,12 +114,22 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
   const [submitting, setSubmitting] = useState(false);
   const [failure, setFailure] = useState<{ message: string; checkStatus: boolean }>();
   const [reconfirmNotice, setReconfirmNotice] = useState<string | null>(null);
+  const [agreementPrompt, setAgreementPrompt] = useState<AgreementRequiredDetails | null>(null);
   const reconfirmRef = useRef<HTMLDivElement>(null);
   const request = useRef<{ version: number; key: string } | null>(null);
   const inFlight = useRef(false);
   const statusHref = `/checkout/return?cart=${encodeURIComponent(cart.cartPublicId)}`;
+  const currency = cart.totals.currency!;
   const noPaymentDue = cart.totals.totalMinor === 0;
-  const online = !noPaymentDue && cart.onlinePaymentEnabled && cart.paymentProvider !== "none";
+  const smallEval = cart.smallTotalEvaluation;
+  const waivedSmallTotal = !noPaymentDue && smallEval?.smallTotalAction === "waive";
+  const blockedSmallTotal = !noPaymentDue && smallEval?.smallTotalAction === "block";
+  const online =
+    !noPaymentDue &&
+    !waivedSmallTotal &&
+    !blockedSmallTotal &&
+    cart.onlinePaymentEnabled &&
+    cart.paymentProvider !== "none";
 
   function updatePolicy(policy: Policy, update: Partial<PolicyDraft>) {
     const key = policyKey(policy);
@@ -138,8 +153,7 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     setFailure(undefined);
   }
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function performCheckout() {
     if (inFlight.current) return;
     if (!projectName.trim() || billingFields.some((field) => field.required && !billing[field.key].trim()) ||
         !/^[A-Za-z]{2}$/u.test(billing.country.trim())) {
@@ -177,6 +191,12 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       }
       navigate(`/checkout/return?cart=${encodeURIComponent(result.cartPublicId)}`, { replace: true });
     } catch (error) {
+      const agreementDetails = parseAgreementRequiredDetails(error);
+      if (agreementDetails) {
+        request.current = null;
+        setAgreementPrompt(agreementDetails);
+        return;
+      }
       const code = safeError(error);
       if (code?.reasonCode === "PROMO_RECONFIRM_TOTAL" || code?.reasonCode === "TOTAL_CHANGED_RECONFIRM") {
         request.current = null;
@@ -205,13 +225,19 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     }
   }
 
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await performCheckout();
+  }
+
+  const noCardCharge = noPaymentDue || waivedSmallTotal;
   const submitLabel = reconfirmNotice
-    ? noPaymentDue
+    ? noCardCharge
       ? "Confirm new total and place order"
       : online
         ? "Confirm new total and continue to payment"
         : "Confirm new total and receive invoice"
-    : noPaymentDue
+    : noCardCharge
       ? "Place order"
       : online
         ? "Place order and continue to payment"
@@ -245,7 +271,11 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
               </details>
               <Checkbox label={`I have read and agree to ${policy.title} (version ${policy.versionNumber}).`}
                 checked={draft.accepted} onCheckedChange={(accepted) => updatePolicy(policy, { accepted })} disabled={submitting} />
-              {policy.requiresTypedSignature ? <Field label={`Type your full name to sign ${policy.title}`} hint="Use the name on your ReadyPackets profile." required>
+              {policy.requiresTypedSignature ? <Field
+                label={`Type your full name to sign ${policy.title}`}
+                hint={<span>Use the name on your ReadyPackets profile (<Link href="/account" className="text-action underline">update name in profile</Link>).</span>}
+                required
+              >
                 <Input value={draft.signerName} onChange={(e) => updatePolicy(policy, { signerName: e.target.value })} maxLength={160} required disabled={submitting} />
               </Field> : null}
             </div>;
@@ -255,8 +285,13 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
     </form>
     <div className="grid min-w-0 gap-4">
       <CheckoutSummary cart={cart} submitting={submitting} onApplyPromo={handleApplyPromo} onRemovePromo={handleRemovePromo} />
-      {noPaymentDue ? <Callout tone="success" title="Nothing to pay - your discount covers this order">
+      {noPaymentDue ? <Callout tone="success" title="Nothing to pay — your discount covers this order.">
         We’ll place your order and issue a settled zero-balance invoice. No payment is collected.
+      </Callout> : waivedSmallTotal && smallEval ? <Callout tone="success" title="Remaining balance will be waived">
+        Your remaining balance (<Money value={{ amountMinor: cart.totals.totalMinor, currency }} />) is below the online payment minimum (
+        <Money value={{ amountMinor: smallEval.minimumMinor, currency }} />) and will be waived automatically. No card payment is collected.
+      </Callout> : blockedSmallTotal && smallEval ? <Callout tone="warning" title="Total below online payment minimum">
+        Online card payments require at least <Money value={{ amountMinor: smallEval.minimumMinor, currency }} />. Add another item in your cart or remove the discount code before placing your order.
       </Callout> : online ? <Callout tone={cart.paymentEnvironment === "test" ? "warning" : "info"} title={cart.paymentEnvironment === "test" ? "Test checkout" : "Secure hosted payment"}>
         {cart.paymentEnvironment === "test" ? "This checkout uses a test environment. No real money is collected." :
           "You’ll continue to the payment provider. ReadyPackets never collects your card details."}
@@ -272,6 +307,18 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
       </Callout> : null}
       <Button type="submit" form={checkoutFormId} size="lg" loading={submitting} disabled={submitting}>{submitLabel}</Button>
     </div>
+
+    <AgreementDialog
+      open={agreementPrompt !== null}
+      policyPublicId={agreementPrompt?.policyPublicId ?? ""}
+      signatureMode={agreementPrompt?.signatureMode ?? "typed_name"}
+      onClose={() => setAgreementPrompt(null)}
+      onAccepted={async () => {
+        setAgreementPrompt(null);
+        request.current = null;
+        await performCheckout();
+      }}
+    />
   </div>;
 }
 

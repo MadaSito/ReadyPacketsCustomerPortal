@@ -28,6 +28,7 @@ import {
   computeCartBundlePricing,
   createCartActorCheck,
   isPromotionsEnabledForCart,
+  PROMO_SPECIFIC_REASON_CODES,
   promoNotApplicable,
   requireCartPromotionsPort,
   type CartPromotionContext,
@@ -377,8 +378,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         } catch (err) {
           const reasonCode = err instanceof DomainError ? err.reasonCode : "PROMO_NOT_APPLICABLE";
           const specificSafe =
-            err instanceof DomainError &&
-            (err.reasonCode === "PROMO_MIN_SUBTOTAL" || err.reasonCode === "PROMO_NOT_ELIGIBLE_ITEMS")
+            err instanceof DomainError && PROMO_SPECIFIC_REASON_CODES.has(err.reasonCode)
               ? err.safeMessage
               : "Your previously applied discount code is no longer valid and was removed from the total.";
           promoNotice = {
@@ -501,15 +501,20 @@ export function createCartService(deps: ModuleDeps): CartModule {
     );
 
     const availableLines = computed.lines.filter((l) => l.available);
-    const upsells = await upsellService.computeForOpenCart({
-      openCart,
-      availableLines,
-      catalogGroups,
-      catalogMap,
-      bundleRule,
-      dbOrTx,
-      recordImpressions: Boolean(opts?.recordImpressions && !tx),
-    });
+    const [upsells, smallTotalEvaluation] = await Promise.all([
+      upsellService.computeForOpenCart({
+        openCart,
+        availableLines,
+        catalogGroups,
+        catalogMap,
+        bundleRule,
+        dbOrTx,
+        recordImpressions: Boolean(opts?.recordImpressions && !tx),
+      }),
+      computed.totals.currency
+        ? paymentsSvc.evaluateCheckoutAmount(computed.totals.totalMinor, computed.totals.currency, dbOrTx)
+        : Promise.resolve(null),
+    ]);
 
     const itemCount = computed.lines.reduce((sum, l) => sum + l.quantity, 0);
 
@@ -531,6 +536,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
       paymentProvider: paymentConfig.provider,
       paymentEnvironment: paymentConfig.mode,
       onlinePaymentEnabled: onlineEnabled,
+      smallTotalEvaluation,
       pendingPolicies,
       updatedAt: openCart?.updatedAt ?? null,
     };
@@ -692,6 +698,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
         type: CART_JOB_EXPIRE_ABANDONED,
         everyMs: 60 * 60 * 1000,
         payload: {},
+      });
+      void upsellService.seedOnStartup().catch((err: unknown) => {
+        deps.logger.warn("cart starter upsell seed skipped on startup", {
+          errorName: err instanceof Error ? err.name : "unknown",
+        });
       });
     },
 
@@ -1389,6 +1400,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         invoiceNumber: string;
         currency: string;
         totalMinor: number;
+        waivedMinor: number;
         afterCommit?: () => Promise<void>;
       };
 
@@ -1411,6 +1423,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
           invoiceNumber: existingByIdem.checkoutInvoiceNumber,
           currency: existingByIdem.checkedOutCurrency,
           totalMinor: existingByIdem.checkedOutTotalMinor,
+          waivedMinor: existingByIdem.checkedOutWaivedMinor ?? 0,
         };
       } else {
         let deniedOtherCustomerCart = false;
@@ -1463,7 +1476,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               throw validation("CART_EMPTY", "Add at least one packet or item to your cart before checking out.");
             }
 
-            // Record any checkout policy acceptances before order creation (orders re-asserts compliance inside tx)
+            // Record any checkout policy acceptances before order creation (orders re-asserts compliance & placeOrder gate inside tx)
             if (input.policyAcceptances.length > 0) {
               await complianceSvc.recordCheckoutAcceptances(
                 {
@@ -1474,6 +1487,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
               );
             }
             await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
+
+            // Decision D14: assert `orders.gates.placeOrder` early inside `tx` before promo redemption or order/invoice creation.
+            await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
 
             // Recompute live catalogue prices, bundle discount & promo redemption via orders.createOrderFromCheckoutInTx
             const createdOrder = await ordersSvc.createOrderFromCheckoutInTx(
@@ -1533,6 +1549,26 @@ export function createCartService(deps: ModuleDeps): CartModule {
               );
             }
 
+            // Decision D5 (`payments.small_totals`): evaluate provider minimum inside `tx` so `"block"` rolls back cleanly without orphan orders/invoices.
+            const amountEval = await paymentsSvc.evaluateCheckoutAmount(
+              issuedInvoice.totalMinor,
+              issuedInvoice.currency,
+              tx,
+            );
+            if (amountEval.smallTotalAction === "block") {
+              const minFormatted = (amountEval.minimumMinor / 100).toFixed(2);
+              throw new DomainError(
+                "CONFLICT",
+                "AMOUNT_BELOW_PROVIDER_MINIMUM",
+                `Online card payments require a minimum charge of ${issuedInvoice.currency} ${minFormatted}. Add another item or remove the discount code to continue.`,
+                {
+                  minimumMinor: amountEval.minimumMinor,
+                  totalMinor: issuedInvoice.totalMinor,
+                  currency: issuedInvoice.currency,
+                },
+              );
+            }
+
             const now = deps.clock.now();
 
             // Persist authoritative billed snapshots onto cart_items for auditability & cancel-restoration display
@@ -1555,13 +1591,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
             const promoDiscountMinor = createdOrder.promoDiscountMinor ?? 0;
             const promoLabel = createdOrder.promoLabel ?? null;
             const zeroTotal = issuedInvoice.totalMinor === 0;
+            const waivedSmallTotal = amountEval.smallTotalAction === "waive" && issuedInvoice.totalMinor > 0;
+            const initialWaivedMinor = waivedSmallTotal ? issuedInvoice.totalMinor : 0;
 
             const nextVersion = targetCart.version + 1;
             const [casUpdate] = await tx
               .update(carts)
               .set({
                 activeOwnerSlot: null,
-                status: zeroTotal ? "checked_out" : "awaiting_payment",
+                status: zeroTotal || waivedSmallTotal ? "checked_out" : "awaiting_payment",
                 paymentMode: null,
                 paymentAttemptPublicId: null,
                 projectName: input.projectName,
@@ -1588,6 +1626,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 checkedOutTaxRateBps: taxQuote.taxRateBps,
                 checkedOutTaxMinor: issuedInvoice.taxMinor,
                 checkedOutTotalMinor: issuedInvoice.totalMinor,
+                checkedOutWaivedMinor: initialWaivedMinor,
                 lastActivityAt: now,
                 checkedOutAt: now,
                 version: nextVersion,
@@ -1607,7 +1646,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
                 attributes: {
                   order_public_id: createdOrder.publicId,
                   invoice_public_id: issuedInvoice.invoicePublicId,
-                  ...(zeroTotal ? { payment_mode: "no_payment_due" } : {}),
+                  ...(zeroTotal
+                    ? { payment_mode: "no_payment_due" }
+                    : waivedSmallTotal
+                      ? { payment_mode: "waived_small_total", waived_minor: initialWaivedMinor }
+                      : {}),
                   currency: issuedInvoice.currency,
                   subtotal_minor: issuedInvoice.subtotalMinor,
                   discount_minor: issuedInvoice.discountMinor,
@@ -1631,6 +1674,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               invoiceNumber: issuedInvoice.invoiceNumber,
               currency: issuedInvoice.currency,
               totalMinor: issuedInvoice.totalMinor,
+              waivedMinor: initialWaivedMinor,
               afterCommit: createdOrder.afterCommit,
             };
           });
@@ -1639,14 +1683,13 @@ export function createCartService(deps: ModuleDeps): CartModule {
             await denyCartAuthz(principal, "NOT_CART_OWNER", { type: "cart", publicId: input.cartPublicId });
             throw err;
           }
-          // Decision D3: if an applied code stopped being valid before checkout completed, DO NOT place the order;
-          // clear the invalid code on the cart and surface the updated total for customer re-confirmation.
+          // Decisions D3 & D5: if an applied code stopped being valid (or hit a lowered platform discount limit)
+          // before checkout completed, DO NOT place the order; clear the invalid code and surface the updated total.
           if (
             hadAppliedPromoOnCart &&
             err instanceof DomainError &&
             (err.reasonCode === "PROMO_NOT_APPLICABLE" ||
-              err.reasonCode === "PROMO_MIN_SUBTOTAL" ||
-              err.reasonCode === "PROMO_NOT_ELIGIBLE_ITEMS" ||
+              PROMO_SPECIFIC_REASON_CODES.has(err.reasonCode) ||
               err.code === "RATE_LIMITED")
           ) {
             await deps.db.transaction(async (cleanupTx) => {
@@ -1719,9 +1762,33 @@ export function createCartService(deps: ModuleDeps): CartModule {
         }
       }
 
-      // Zero-total checkout (e.g. 100% discount): invoice is already issued as paid (`totalMinor === 0`);
-      // never invoke `payments.startCheckout` (which rejects `INVOICE_ALREADY_PAID`), and return idempotently on replay.
+      // Zero-total checkout (e.g. 100% discount or $0 set_total): issue zero-total receipt via payments when Wave-2
+      // settled receipts are supported, never create a hosted payment session, and return idempotently on replay.
       if (committed.totalMinor === 0) {
+        let zeroReceiptPublicId: string | undefined;
+        if (paymentsSvc.supportsSettledReceipts) {
+          try {
+            const settledZero = await paymentsSvc.startCheckout(
+              committed.invoicePublicId,
+              {
+                successPath: "/checkout/return",
+                cancelPath: "/checkout/cancel",
+              },
+              {
+                principal,
+                cartPublicId: committed.cartPublicId,
+                idempotencyKey: input.idempotencyKey,
+              },
+            );
+            if (settledZero.mode === "settled" && settledZero.receiptPublicId) {
+              zeroReceiptPublicId = settledZero.receiptPublicId;
+            }
+          } catch (err) {
+            if (!(err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID")) {
+              throw err;
+            }
+          }
+        }
         if (existingByIdem && existingByIdem.status !== "checked_out") {
           await deps.db.transaction(async (tx) => {
             const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
@@ -1748,10 +1815,42 @@ export function createCartService(deps: ModuleDeps): CartModule {
           invoiceNumber: committed.invoiceNumber,
           currency: committed.currency,
           totalMinor: 0,
+          ...(zeroReceiptPublicId ? { receiptPublicId: zeroReceiptPublicId } : {}),
         } satisfies CheckoutCartResult;
       }
 
-      // Start hosted payment session or settle into pay-by-invoice mode OUTSIDE the DB transaction
+      // Idempotent replay of an already-waived small-total checkout.
+      if (existingByIdem && committed.waivedMinor > 0 && existingByIdem.status === "checked_out") {
+        let waivedReceiptPublicId: string | undefined;
+        try {
+          const replayStart = await paymentsSvc.startCheckout(
+            committed.invoicePublicId,
+            { successPath: "/checkout/return", cancelPath: "/checkout/cancel" },
+            { principal, cartPublicId: committed.cartPublicId, idempotencyKey: input.idempotencyKey },
+          );
+          if (replayStart.mode === "settled" && replayStart.receiptPublicId) {
+            waivedReceiptPublicId = replayStart.receiptPublicId;
+          }
+        } catch (err) {
+          if (!(err instanceof DomainError && err.reasonCode === "INVOICE_ALREADY_PAID")) {
+            throw err;
+          }
+        }
+        return {
+          mode: "waived_small_total",
+          cartPublicId: committed.cartPublicId,
+          orderPublicId: committed.orderPublicId,
+          orderReference: committed.orderReference,
+          invoicePublicId: committed.invoicePublicId,
+          invoiceNumber: committed.invoiceNumber,
+          currency: committed.currency,
+          totalMinor: committed.totalMinor,
+          waivedMinor: committed.waivedMinor,
+          ...(waivedReceiptPublicId ? { receiptPublicId: waivedReceiptPublicId } : {}),
+        } satisfies CheckoutCartResult;
+      }
+
+      // Start hosted payment session, waive sub-minimum balance, or settle into pay-by-invoice mode OUTSIDE `tx`
       const paymentStart = await paymentsSvc.startCheckout(
         committed.invoicePublicId,
         {
@@ -1764,6 +1863,77 @@ export function createCartService(deps: ModuleDeps): CartModule {
           idempotencyKey: input.idempotencyKey,
         },
       );
+
+      if (paymentStart.mode === "settled") {
+        const settledWaivedMinor =
+          paymentStart.settlementKind === "waived_small_total"
+            ? (paymentStart.waivedMinor ?? committed.totalMinor)
+            : 0;
+
+        await deps.db.transaction(async (tx) => {
+          const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
+          if (!locked) return;
+          const now = deps.clock.now();
+          await tx
+            .update(carts)
+            .set({
+              status: "checked_out",
+              paymentMode: null,
+              paymentAttemptPublicId: null,
+              checkedOutWaivedMinor: settledWaivedMinor,
+              version: locked.version + 1,
+              updatedAt: now,
+            })
+            .where(eq(carts.id, locked.id));
+
+          await deps.audit.record(
+            {
+              category: "business",
+              eventName: "cart.checkout_payment_started",
+              action: "transition",
+              outcome: "completed",
+              actor: { userId: principal.userId, role: principal.role },
+              resource: { type: "cart", publicId: committed.cartPublicId },
+              attributes: {
+                order_public_id: committed.orderPublicId,
+                invoice_public_id: committed.invoicePublicId,
+                payment_mode:
+                  paymentStart.settlementKind === "waived_small_total" ? "waived_small_total" : "no_payment_due",
+                waived_minor: settledWaivedMinor,
+                receipt_public_id: paymentStart.receiptPublicId ?? null,
+              },
+            },
+            tx,
+          );
+        });
+
+        if (paymentStart.settlementKind === "waived_small_total") {
+          return {
+            mode: "waived_small_total",
+            cartPublicId: committed.cartPublicId,
+            orderPublicId: committed.orderPublicId,
+            orderReference: committed.orderReference,
+            invoicePublicId: committed.invoicePublicId,
+            invoiceNumber: committed.invoiceNumber,
+            currency: committed.currency,
+            totalMinor: committed.totalMinor,
+            waivedMinor: settledWaivedMinor,
+            receiptPublicId: paymentStart.receiptPublicId,
+          } satisfies CheckoutCartResult;
+        }
+
+        return {
+          mode: "no_payment_due",
+          cartPublicId: committed.cartPublicId,
+          orderPublicId: committed.orderPublicId,
+          orderReference: committed.orderReference,
+          invoicePublicId: committed.invoicePublicId,
+          invoiceNumber: committed.invoiceNumber,
+          currency: committed.currency,
+          totalMinor: 0,
+          receiptPublicId: paymentStart.receiptPublicId,
+        } satisfies CheckoutCartResult;
+      }
 
       await deps.db.transaction(async (tx) => {
         const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
@@ -1870,11 +2040,15 @@ export function createCartService(deps: ModuleDeps): CartModule {
             : {}),
       });
 
+      const waivedMinor = cartRow.checkedOutWaivedMinor ?? 0;
+      const isWaivedSmallTotal = waivedMinor > 0 && cartRow.paymentMode === null;
       const isNoPaymentDue =
-        (cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor) === 0 && cartRow.paymentMode === null;
+        !isWaivedSmallTotal &&
+        (cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor) === 0 &&
+        cartRow.paymentMode === null;
       const attempt = paymentStatus.attempt;
       let confirmationState: CheckoutConfirmationState;
-      if (isNoPaymentDue && paymentStatus.invoiceStatus === "paid") {
+      if ((isNoPaymentDue || isWaivedSmallTotal) && paymentStatus.invoiceStatus === "paid") {
         confirmationState = "no_payment_due";
       } else if (paymentStatus.invoiceStatus === "paid") {
         confirmationState = "paid";
@@ -1891,13 +2065,18 @@ export function createCartService(deps: ModuleDeps): CartModule {
       const alreadyRestored = cartRow.status === "restored";
       const canRestoreToCart =
         !alreadyRestored &&
+        !isWaivedSmallTotal &&
         paymentStatus.invoiceStatus !== "paid" &&
         cartRow.paymentMode === "redirect";
 
       return {
         cartPublicId: cartRow.publicId,
         confirmationState,
-        paymentMode: isNoPaymentDue ? "no_payment_due" : (cartRow.paymentMode ?? "invoice"),
+        paymentMode: isNoPaymentDue
+          ? "no_payment_due"
+          : isWaivedSmallTotal
+            ? "waived_small_total"
+            : (cartRow.paymentMode ?? "invoice"),
         provider: attempt?.provider ?? paymentStatus.providerConfigured,
         attemptPublicId: attempt?.attemptPublicId ?? cartRow.paymentAttemptPublicId ?? null,
         attemptStatus: attempt?.status ?? null,
@@ -1916,7 +2095,9 @@ export function createCartService(deps: ModuleDeps): CartModule {
         taxRateBps: cartRow.checkedOutTaxRateBps ?? 0,
         taxMinor: cartRow.checkedOutTaxMinor ?? 0,
         totalMinor: cartRow.checkedOutTotalMinor ?? paymentStatus.amountMinor,
+        waivedMinor,
         balanceDueMinor: paymentStatus.balanceDueMinor,
+        receiptPublicId: paymentStatus.receiptPublicId ?? null,
         canRestoreToCart,
         alreadyRestored,
         checkedOutAt: cartRow.checkedOutAt ?? null,
@@ -1975,7 +2156,10 @@ export function createCartService(deps: ModuleDeps): CartModule {
             throw conflict("CART_NOT_RESTORABLE", "This cart cannot be restored.");
           }
 
-          if (sourceCart.checkedOutTotalMinor === 0 && sourceCart.status === "checked_out") {
+          if (
+            (sourceCart.checkedOutTotalMinor === 0 || (sourceCart.checkedOutWaivedMinor ?? 0) > 0) &&
+            sourceCart.status === "checked_out"
+          ) {
             throw conflict("CHECKOUT_ALREADY_PAID", "Payment has already been confirmed for this order.");
           }
 
@@ -2329,8 +2513,28 @@ export function createCartService(deps: ModuleDeps): CartModule {
       return upsellService.adminSetUpsellOfferActive(principal, input);
     },
 
+    adminSetUpsellFeature(principal, input) {
+      return upsellService.adminSetUpsellFeature(principal, input);
+    },
+
+    adminSetAllUpsellOffersActive(principal, input) {
+      return upsellService.adminSetAllUpsellOffersActive(principal, input);
+    },
+
+    adminSeedSuggestedUpsellOffers(principal) {
+      return upsellService.adminSeedSuggestedUpsellOffers(principal);
+    },
+
+    adminDuplicateUpsellOffer(principal, input) {
+      return upsellService.adminDuplicateUpsellOffer(principal, input);
+    },
+
     adminDeleteUpsellOffer(principal, input) {
       return upsellService.adminDeleteUpsellOffer(principal, input);
+    },
+
+    ensureDefaultUpsellOffers() {
+      return upsellService.seedOnStartup();
     },
 
     expireAbandonedCarts(options) {
