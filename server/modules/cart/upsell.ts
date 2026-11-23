@@ -422,7 +422,7 @@ export interface CartUpsellServiceDeps {
     now: Date,
     extra?: Partial<typeof carts.$inferInsert>,
   ) => Promise<number>;
-  hydrateOpenCartForUser: (userId: number, tx?: Tx, opts?: { recordImpressions?: boolean }) => Promise<CartView>;
+  hydrateOpenCartForUser: (principal: SessionPrincipal, tx?: Tx, opts?: { recordImpressions?: boolean }) => Promise<CartView>;
   computeLiveLines: (
     cartId: number,
     catalogMap: ReadonlyMap<string, IndexedCatalogEntry>,
@@ -1097,7 +1097,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async dismissUpsell(
@@ -1200,7 +1200,7 @@ export function createCartUpsellService(ctx: CartUpsellServiceDeps) {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async adminListUpsellOffers(principal: SessionPrincipal): Promise<AdminCartUpsellsListResult> {

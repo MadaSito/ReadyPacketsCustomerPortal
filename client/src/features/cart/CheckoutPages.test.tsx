@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { CheckoutCartResult } from "@server/modules/cart/types";
@@ -207,6 +207,186 @@ it("handles D14 AGREEMENT_REQUIRED at checkout by opening AgreementDialog, accep
     expect(mocks.checkout).toHaveBeenCalledTimes(2);
     expect(location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
   });
+}, 10_000);
+
+it("D14 live QA regression: renders inline typed-name field once (in both requiresTypedSignature worlds), shows SIGNER_NAME_MISMATCH next to the field, and falls back to AgreementDialog on stale/prior-checkbox views", async () => {
+  const user = userEvent.setup();
+  const qaMndaCheckboxPolicy: CartViewData["pendingPolicies"][number] = {
+    documentPublicId: mndaDocId,
+    slug: "qa-mutual-nda",
+    title: "QA Mutual NDA",
+    audience: "customer",
+    requiresAcceptance: true,
+    requiresTypedSignature: false,
+    versionPublicId: mndaVersionId,
+    versionNumber: 1,
+    versionLabel: "1.0",
+    contentFormat: "plain_text",
+    bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+    contentHash: "b".repeat(64),
+    changeSummary: null,
+    effectiveAt: date,
+    publishedAt: date,
+  };
+
+  mocks.policyMyStatus.mockResolvedValue({
+    expectedSignerName: "Synthetic Customer",
+    published: [
+      {
+        documentPublicId: mndaDocId,
+        title: "QA Mutual NDA",
+        versionPublicId: mndaVersionId,
+        versionNumber: 1,
+        versionLabel: "1.0",
+        effectiveAt: date,
+        contentFormat: "plain_text",
+        bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+        contentHash: "b".repeat(64),
+        requiresTypedSignature: true,
+      },
+    ],
+    accepted: [],
+  });
+
+  // 1. Fresh checkout view (works identically whether `requiresTypedSignature` is false + `placeOrderAgreement`
+  // or `requiresTypedSignature: true` from compliance): renders ONE inline typed-name field, shows
+  // SIGNER_NAME_MISMATCH error right next to the field, and places the order in one step without opening AgreementDialog!
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [qaMndaCheckboxPolicy],
+    placeOrderAgreement: {
+      required: true,
+      met: false,
+      policyPublicId: mndaDocId,
+      signatureMode: "typed_name",
+    },
+  });
+  mocks.checkout
+    .mockRejectedValueOnce(
+      Object.assign(new Error("The typed signature must match your account profile name."), {
+        data: {
+          safe: {
+            domainCode: "VALIDATION",
+            reasonCode: "SIGNER_NAME_MISMATCH",
+            safeMessage: "The typed signature must match your account profile name.",
+            details: { expectedName: "Synthetic Customer", profilePath: "/account" },
+          },
+        },
+      }),
+    )
+    .mockResolvedValueOnce(invoice);
+
+  const { location, unmount } = review();
+  const inlineCheckbox = await screen.findByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i });
+  const inlineSignerInput = screen.getByRole("textbox", { name: /Type your full name to sign QA Mutual NDA/i });
+
+  await user.click(inlineCheckbox);
+  await user.type(inlineSignerInput, "Wrong Person");
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  // Name-mismatch error is rendered directly next to the field (`aria-invalid="true"` + field error text)
+  expect(
+    await screen.findByText(
+      "The typed signature must match your account profile name. Expected account name: Synthetic Customer.",
+    ),
+  ).toBeInTheDocument();
+  expect(inlineSignerInput).toHaveAttribute("aria-invalid", "true");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+  // Typing clears the field error; submitting the matching name completes in ONE step without asking twice!
+  await user.clear(inlineSignerInput);
+  await user.type(inlineSignerInput, "Synthetic Customer");
+  expect(inlineSignerInput).not.toHaveAttribute("aria-invalid");
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  await waitFor(() => {
+    expect(mocks.checkout).toHaveBeenCalledTimes(2);
+    expect(mocks.policyAccept).not.toHaveBeenCalled();
+    expect(location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
+  });
+  expect(mocks.checkout.mock.calls[1]?.[0]?.policyAcceptances).toEqual([
+    {
+      versionPublicId: mndaVersionId,
+      contentHash: "b".repeat(64),
+      signerName: "Synthetic Customer",
+    },
+  ]);
+  unmount();
+}, 10_000);
+
+it("D14 live QA regression: opens AgreementDialog when server raises AGREEMENT_REQUIRED on a stale checkbox-only view or prior checkbox acceptance, then completes checkout once signed", async () => {
+  const user = userEvent.setup();
+  const qaMndaCheckboxPolicy: CartViewData["pendingPolicies"][number] = {
+    documentPublicId: mndaDocId,
+    slug: "qa-mutual-nda",
+    title: "QA Mutual NDA",
+    audience: "customer",
+    requiresAcceptance: true,
+    requiresTypedSignature: false,
+    versionPublicId: mndaVersionId,
+    versionNumber: 1,
+    versionLabel: "1.0",
+    contentFormat: "plain_text",
+    bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+    contentHash: "b".repeat(64),
+    changeSummary: null,
+    effectiveAt: date,
+    publishedAt: date,
+  };
+  mocks.policyMyStatus.mockResolvedValue({
+    expectedSignerName: "Synthetic Customer",
+    published: [
+      {
+        documentPublicId: mndaDocId,
+        title: "QA Mutual NDA",
+        versionPublicId: mndaVersionId,
+        versionNumber: 1,
+        versionLabel: "1.0",
+        effectiveAt: date,
+        contentFormat: "plain_text",
+        bodyText: "Short QA Mutual NDA text that fits without scrolling.",
+        contentHash: "b".repeat(64),
+        requiresTypedSignature: false,
+      },
+    ],
+    accepted: [],
+  });
+  mocks.cart.mockResolvedValue({
+    ...cart,
+    pendingPolicies: [qaMndaCheckboxPolicy],
+  });
+  mocks.checkout
+    .mockRejectedValueOnce(
+      Object.assign(new Error("Please read and accept the agreement to continue."), {
+        data: {
+          safe: {
+            domainCode: "CONFLICT",
+            reasonCode: "AGREEMENT_REQUIRED",
+            safeMessage: "Please read and accept the agreement to continue.",
+            details: { policyPublicId: mndaDocId, signatureMode: "typed_name" },
+          },
+        },
+      }),
+    )
+    .mockResolvedValueOnce(invoice);
+
+  const staleRender = review();
+  await user.click(await screen.findByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i }));
+  await user.click(screen.getByRole("button", { name: "Place order and receive invoice" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Review and accept QA Mutual NDA" });
+  const dialogCheckbox = within(dialog).getByRole("checkbox", { name: /I have read and agree to QA Mutual NDA/i });
+  await waitFor(() => expect(dialogCheckbox).not.toBeDisabled());
+  await user.click(dialogCheckbox);
+  await user.type(within(dialog).getByRole("textbox", { name: /Type your full name/i }), "Synthetic Customer");
+  await user.click(within(dialog).getByRole("button", { name: "Accept and continue" }));
+
+  await waitFor(() => {
+    expect(mocks.policyAccept).toHaveBeenCalledTimes(1);
+    expect(mocks.checkout).toHaveBeenCalledTimes(2);
+    expect(staleRender.location.history?.at(-1)).toBe(`/checkout/return?cart=${cartId}`);
+  });
+  expect(mocks.checkout.mock.calls[1]?.[0]?.policyAcceptances).toEqual([]);
 }, 10_000);
 
 it("renders D5 small-total waive and block callouts and shows waived amount on CheckoutReturnPage", async () => {

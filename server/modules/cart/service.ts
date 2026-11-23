@@ -443,10 +443,11 @@ export function createCartService(deps: ModuleDeps): CartModule {
   let upsellService: ReturnType<typeof createCartUpsellService>;
 
   async function hydrateOpenCartForUser(
-    userId: number,
+    principal: SessionPrincipal,
     tx?: Tx,
     opts?: { recordImpressions?: boolean },
   ): Promise<CartView> {
+    const userId = principal.userId;
     const dbOrTx: DbOrTx = tx ?? deps.db;
     const ordersSvc = cartOrdersPort(deps.services);
     const complianceSvc = cartCompliancePort(deps.services);
@@ -466,15 +467,40 @@ export function createCartService(deps: ModuleDeps): CartModule {
           .orderBy(asc(cartItems.position), asc(cartItems.id))
       : [];
 
-    const [catalogGroups, bundleRule, paymentConfig, onlineEnabled, pendingPolicies, promotionsEnabled] =
-      await Promise.all([
-        ordersSvc.listActiveCatalog(tx),
-        ordersSvc.getBundleRule(tx),
-        paymentsSvc.getPublicCheckoutConfig(dbOrTx),
-        paymentsSvc.isOnlineCheckoutEnabled(dbOrTx),
-        complianceSvc.requiredAcceptancesFor(userId, { audience: "customer", ...(tx ? { tx } : {}) }),
-        isPromotionsEnabledForCart(deps.services, dbOrTx),
-      ]);
+    const [
+      catalogGroups,
+      bundleRule,
+      paymentConfig,
+      onlineEnabled,
+      rawPendingPolicies,
+      promotionsEnabled,
+      placeOrderAgreement,
+    ] = await Promise.all([
+      ordersSvc.listActiveCatalog(tx),
+      ordersSvc.getBundleRule(tx),
+      paymentsSvc.getPublicCheckoutConfig(dbOrTx),
+      paymentsSvc.isOnlineCheckoutEnabled(dbOrTx),
+      complianceSvc.requiredAcceptancesFor(userId, { audience: "customer", ...(tx ? { tx } : {}) }),
+      isPromotionsEnabledForCart(deps.services, dbOrTx),
+      ordersSvc.getPlaceOrderAgreementStatus(principal, dbOrTx),
+    ]);
+
+    // Decision D14: when `orders.agreement_gate` governs a policy at `placeOrder` with
+    // `signatureMode === "typed_name"`, ensure `requiresTypedSignature` is `true` on that
+    // pending policy (matching compliance's effective `requiresTypedSignature` semantics in
+    // both worlds) so `/cart/checkout` renders the typed-name field inline instead of a
+    // checkbox-only dead end, and signing inline satisfies `assertCustomerMayPlaceOrder`
+    // in one step without prompting a second time.
+    const pendingPolicies =
+      placeOrderAgreement.required &&
+      placeOrderAgreement.signatureMode === "typed_name" &&
+      placeOrderAgreement.policyPublicId !== null
+        ? rawPendingPolicies.map((policy) =>
+            policy.documentPublicId === placeOrderAgreement.policyPublicId && !policy.requiresTypedSignature
+              ? { ...policy, requiresTypedSignature: true }
+              : policy,
+          )
+        : rawPendingPolicies;
 
     const catalogMap = indexCatalog(catalogGroups);
     const billing = openCart ? decryptBilling(openCart.billingEnc, openCart.publicId) : null;
@@ -538,6 +564,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
       onlinePaymentEnabled: onlineEnabled,
       smallTotalEvaluation,
       pendingPolicies,
+      placeOrderAgreement,
       updatedAt: openCart?.updatedAt ?? null,
     };
   }
@@ -751,7 +778,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
     async getMyCart(principal) {
       await assertCustomerPrecheck(principal);
       await assertCartEnabled();
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async addItems(principal, input) {
@@ -911,7 +938,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async updateItem(principal, input) {
@@ -1005,7 +1032,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async removeItem(principal, input) {
@@ -1043,7 +1070,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async clearCart(principal, input) {
@@ -1080,7 +1107,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async saveDraftDetails(principal, input) {
@@ -1128,7 +1155,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async applyCode(principal, input) {
@@ -1166,7 +1193,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         if (existingCode?.trim().toUpperCase() !== normalizedInputCode) {
           throw conflict("IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different discount code.");
         }
-        return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+        return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
       }
 
       const itemRows = await deps.db
@@ -1311,7 +1338,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     async removeCode(principal, input) {
@@ -1364,7 +1391,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         );
       });
 
-      return hydrateOpenCartForUser(principal.userId, undefined, { recordImpressions: true });
+      return hydrateOpenCartForUser(principal, undefined, { recordImpressions: true });
     },
 
     acceptUpsell(principal, input) {
@@ -1474,20 +1501,65 @@ export function createCartService(deps: ModuleDeps): CartModule {
               throw validation("CART_EMPTY", "Add at least one packet or item to your cart before checking out.");
             }
 
-            // Record any checkout policy acceptances before order creation (orders re-asserts compliance & placeOrder gate inside tx)
-            if (input.policyAcceptances.length > 0) {
+            // Decision D14: evaluate `orders.gates.placeOrder` BEFORE inline `recordCheckoutAcceptances`
+            // when the gate requires a typed signature (`signatureMode === "typed_name"`), unless
+            // `input.policyAcceptances` already supplies a non-empty `signerName` for that policy version.
+            // This ensures customers (including stale tabs submitting a checkbox-only acceptance for a
+            // policy with document-level `requiresTypedSignature === false`, or customers who previously
+            // accepted by checkbox in the general prompt) receive `CONFLICT` / `AGREEMENT_REQUIRED` with
+            // `{ policyPublicId, signatureMode }` so `AgreementDialog` opens instead of a 400 validation error.
+            const placeOrderAgreement = await ordersSvc.getPlaceOrderAgreementStatus(principal, tx);
+            let acceptancesToRecord = input.policyAcceptances;
+            if (
+              placeOrderAgreement.required &&
+              placeOrderAgreement.signatureMode === "typed_name" &&
+              placeOrderAgreement.policyPublicId !== null
+            ) {
+              const currentlyPending = await complianceSvc.requiredAcceptancesFor(principal.userId, {
+                audience: "customer",
+                tx,
+              });
+              const gatePending = currentlyPending.find(
+                (policy) => policy.documentPublicId === placeOrderAgreement.policyPublicId,
+              );
+              if (!placeOrderAgreement.met) {
+                const hasInlineTypedSignatureForGate = gatePending
+                  ? input.policyAcceptances.some(
+                      (item) =>
+                        item.versionPublicId === gatePending.versionPublicId &&
+                        Boolean(item.signerName && item.signerName.trim().length > 0),
+                    )
+                  : input.policyAcceptances.some((item) => Boolean(item.signerName && item.signerName.trim().length > 0));
+                if (!hasInlineTypedSignatureForGate) {
+                  await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
+                }
+              } else {
+                // Gate is already satisfied (e.g. customer just signed via `AgreementDialog` and retried
+                // from a tab whose cached `pendingPolicies` still listed an unsigned entry for that policy).
+                const pendingVersionIds = new Set(currentlyPending.map((policy) => policy.versionPublicId));
+                acceptancesToRecord = input.policyAcceptances.filter(
+                  (item) =>
+                    pendingVersionIds.has(item.versionPublicId) ||
+                    Boolean(item.signerName && item.signerName.trim().length > 0),
+                );
+              }
+            }
+
+            // Record any remaining checkout policy acceptances before order creation (orders re-asserts compliance & placeOrder gate inside tx)
+            if (acceptancesToRecord.length > 0) {
               await complianceSvc.recordCheckoutAcceptances(
                 {
                   principal,
-                  items: input.policyAcceptances,
+                  items: acceptancesToRecord,
                 },
                 tx,
               );
             }
-            await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
 
-            // Decision D14: assert `orders.gates.placeOrder` early inside `tx` before promo redemption or order/invoice creation.
+            // Decision D14: assert `orders.gates.placeOrder` before `assertRequiredPoliciesAccepted` and before
+            // promo redemption or order/invoice creation so an unsatisfied gate always raises `AGREEMENT_REQUIRED`.
             await ordersSvc.assertCustomerMayPlaceOrder(principal, tx);
+            await complianceSvc.assertRequiredPoliciesAccepted(principal.userId, { audience: "customer", tx });
 
             // Recompute live catalogue prices, bundle discount & promo redemption via orders.createOrderFromCheckoutInTx
             const createdOrder = await ordersSvc.createOrderFromCheckoutInTx(
@@ -1724,7 +1796,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
               );
             });
 
-            const refreshed = await hydrateOpenCartForUser(principal.userId);
+            const refreshed = await hydrateOpenCartForUser(principal);
             const reconfirmData: Record<string, string | number | boolean | readonly string[]> = {
               promoReasonCode: err.reasonCode,
               newTotalMinor: refreshed.totals.totalMinor,
@@ -1945,9 +2017,22 @@ export function createCartService(deps: ModuleDeps): CartModule {
         } satisfies CheckoutCartResult;
       }
 
+      let preservedSettledOutcome: { kind: "waived_small_total" | "no_payment_due"; waivedMinor: number } | null = null;
       await deps.db.transaction(async (tx) => {
         const [locked] = await tx.select().from(carts).where(eq(carts.id, committed.cartId)).for("update").limit(1);
         if (!locked) return;
+        // Preserve an authoritative terminal settlement already reconciled by a concurrent completion.
+        if (locked.status === "checked_out" && locked.paymentMode === null) {
+          const existingWaived = locked.checkedOutWaivedMinor ?? 0;
+          if (existingWaived > 0) {
+            preservedSettledOutcome = { kind: "waived_small_total", waivedMinor: existingWaived };
+            return;
+          }
+          if (locked.checkedOutTotalMinor === 0) {
+            preservedSettledOutcome = { kind: "no_payment_due", waivedMinor: 0 };
+            return;
+          }
+        }
         const nextStatus = paymentStart.mode === "invoice" ? "checked_out" : "awaiting_payment";
         const nextAttemptPublicId = paymentStart.mode === "redirect" ? paymentStart.attemptPublicId : null;
         const alreadyReconciled =
@@ -1989,6 +2074,36 @@ export function createCartService(deps: ModuleDeps): CartModule {
           tx,
         );
       });
+
+      const preserved = preservedSettledOutcome as {
+        kind: "waived_small_total" | "no_payment_due";
+        waivedMinor: number;
+      } | null;
+      if (preserved) {
+        if (preserved.kind === "waived_small_total") {
+          return {
+            mode: "waived_small_total",
+            cartPublicId: committed.cartPublicId,
+            orderPublicId: committed.orderPublicId,
+            orderReference: committed.orderReference,
+            invoicePublicId: committed.invoicePublicId,
+            invoiceNumber: committed.invoiceNumber,
+            currency: committed.currency,
+            totalMinor: committed.totalMinor,
+            waivedMinor: preserved.waivedMinor,
+          } satisfies CheckoutCartResult;
+        }
+        return {
+          mode: "no_payment_due",
+          cartPublicId: committed.cartPublicId,
+          orderPublicId: committed.orderPublicId,
+          orderReference: committed.orderReference,
+          invoicePublicId: committed.invoicePublicId,
+          invoiceNumber: committed.invoiceNumber,
+          currency: committed.currency,
+          totalMinor: 0,
+        } satisfies CheckoutCartResult;
+      }
 
       if (paymentStart.mode === "invoice") {
         return {
@@ -2060,9 +2175,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
       });
 
       const waivedMinor =
-        paymentStatus.invoiceStatus === "paid"
-          ? (paymentStatus.waivedMinor ?? (cartRow.paymentMode === null ? (cartRow.checkedOutWaivedMinor ?? 0) : 0))
-          : 0;
+        paymentStatus.invoiceStatus === "paid" ? (paymentStatus.waivedMinor ?? 0) : 0;
       const isWaivedSmallTotal = waivedMinor > 0;
       const isNoPaymentDue =
         !isWaivedSmallTotal &&
@@ -2302,7 +2415,7 @@ export function createCartService(deps: ModuleDeps): CartModule {
         throw err;
       }
 
-      const cartView = await hydrateOpenCartForUser(principal.userId);
+      const cartView = await hydrateOpenCartForUser(principal);
       return {
         restored: !alreadyRestoredFlag,
         alreadyRestored: alreadyRestoredFlag,

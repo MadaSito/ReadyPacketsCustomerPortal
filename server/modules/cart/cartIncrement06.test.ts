@@ -190,6 +190,11 @@ class Wave2PaymentsFake implements CartPaymentsPort {
       invoiceNumber: inv!.invoiceNumber,
       invoiceStatus: inv!.status,
       amountMinor: inv!.totalMinor,
+      waivedMinor:
+        inv!.status === "paid" &&
+        this.settledCalls.some((c) => c.invoicePublicId === inv!.publicId && c.kind === "waived_small_total")
+          ? inv!.totalMinor
+          : 0,
       balanceDueMinor: inv!.status === "paid" ? 0 : inv!.totalMinor,
       currency: inv!.currency,
       providerConfigured: this.provider,
@@ -917,6 +922,239 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
     expect(placed.orderPublicId).toBeTruthy();
   });
 
+  it("D14 live QA regression: policy with requiresAcceptance=true and requiresTypedSignature=false governed by typed_name order agreement gate exposes effective requiresTypedSignature=true, completes in one inline step (with SIGNER_NAME_MISMATCH details), falls back to AGREEMENT_REQUIRED on unsigned/prior-checkbox submissions, and leaves staff orders unaffected", async () => {
+    paymentsFake.provider = "none";
+    const bob = await insertUser(h, t.db, { role: "customer" });
+    const carol = await insertUser(h, t.db, { role: "customer" });
+    const aliceCaller = callerFor(alice.principal);
+    const bobCaller = callerFor(bob.principal);
+    const carolCaller = callerFor(carol.principal);
+
+    // Exact live QA setup: policy "QA Mutual NDA" (audience customer, requiresAcceptance ON, document-level requiresTypedSignature OFF)
+    const qaMndaDoc = await complianceMod.policies.admin.createDocument(admin.principal, {
+      slug: "qa-mutual-nda",
+      title: "QA Mutual NDA",
+      audience: "customer",
+      requiresAcceptance: true,
+      requiresTypedSignature: false,
+      versionLabel: "1.0",
+      contentFormat: "plain_text",
+      bodyText: "QA Mutual NDA body text requiring typed signature via order agreement gate.",
+      effectiveAt: new Date(h.clock.now().getTime() - 60_000),
+    });
+    const qaMndaPublished = await complianceMod.policies.admin.publishVersion(admin.principal, {
+      versionPublicId: qaMndaDoc.draftVersionPublicId,
+      effectiveAt: new Date(h.clock.now().getTime() - 60_000),
+    });
+
+    // Scenario (a) setup for Bob: Bob accepts "QA Mutual NDA" by checkbox in the general policy prompt
+    // BEFORE the typed-name order agreement gate is enabled.
+    await complianceMod.policies.accept(bob.principal, {
+      versionPublicId: qaMndaPublished.versionPublicId,
+      contentHash: qaMndaPublished.contentHash,
+      method: "portal_checkbox",
+    });
+
+    // Admin enables Order Agreement Gate on "QA Mutual NDA" with signatureMode "typed_name" at placing an order.
+    await ordersMod.agreementGate.update(admin.principal, {
+      setting: {
+        enabled: true,
+        policyPublicId: qaMndaDoc.documentPublicId,
+        applyTo: { placeOrder: true, workOnOrder: true },
+        signatureMode: "typed_name",
+        askAgainOnNewVersion: true,
+      },
+    });
+
+    // Scenario (b): Staff-created order on behalf of an unsigned customer (`bob`) is completely unaffected.
+    const staffCreatedOrder = await ordersMod.orders.create(admin.principal, {
+      onBehalfOfCustomerPublicId: bob.publicId,
+      projectName: "Staff Created Engagement",
+      items: [{ productPublicId: p1Basic, quantity: 1 }],
+      idempotencyKey: "idem-d14-staff-order-0001",
+    });
+    expect(staffCreatedOrder.publicId).toBeTruthy();
+
+    // Main live QA scenario (`alice` has never accepted "QA Mutual NDA"):
+    // 1. `cart.get` / `addItems` exposes effective `requiresTypedSignature: true` on "QA Mutual NDA"
+    //    (in both worlds) and reports `placeOrderAgreement`.
+    const aliceCart = await aliceCaller.cart.addItems({
+      items: [{ productPublicId: p1Basic, quantity: 1 }],
+    });
+    const aliceGatePolicy = aliceCart.pendingPolicies.find(
+      (p) => p.documentPublicId === qaMndaDoc.documentPublicId,
+    );
+    expect(aliceGatePolicy).toBeDefined();
+    expect(aliceGatePolicy?.requiresTypedSignature).toBe(true);
+    expect(aliceCart.placeOrderAgreement).toEqual({
+      required: true,
+      met: false,
+      policyPublicId: qaMndaDoc.documentPublicId,
+      signatureMode: "typed_name",
+    });
+
+    // 2. Submitting a mismatched inline typed name returns SIGNER_NAME_MISMATCH with `details.expectedName`.
+    const aliceProfile = await h.services.identity.getUser(alice.id);
+    let mismatchErr: unknown;
+    try {
+      await aliceCaller.cart.checkout({
+        cartPublicId: aliceCart.cartPublicId!,
+        expectedVersion: aliceCart.version,
+        projectName: "Alice Live QA Order",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [
+          {
+            versionPublicId: qaMndaPublished.versionPublicId,
+            contentHash: qaMndaPublished.contentHash,
+            signerName: "Wrong Signer Name",
+          },
+        ],
+        idempotencyKey: "idem-d14-qa-alice-mismatch-01",
+      });
+    } catch (err) {
+      mismatchErr = err;
+    }
+    expect(extractCodes(mismatchErr)).toMatchObject({
+      trpcCode: "BAD_REQUEST",
+      reasonCode: "SIGNER_NAME_MISMATCH",
+      details: expect.objectContaining({
+        expectedName: aliceProfile!.name!,
+      }),
+    });
+
+    // 3. Submitting the matching profile name inline completes checkout in ONE step (does NOT raise AGREEMENT_REQUIRED a second time)!
+    const alicePlaced = await aliceCaller.cart.checkout({
+      cartPublicId: aliceCart.cartPublicId!,
+      expectedVersion: aliceCart.version,
+      projectName: "Alice Live QA Order",
+      note: "",
+      billing: sampleBilling,
+      policyAcceptances: [
+        {
+          versionPublicId: qaMndaPublished.versionPublicId,
+          contentHash: qaMndaPublished.contentHash,
+          signerName: aliceProfile!.name!,
+        },
+      ],
+      idempotencyKey: "idem-d14-qa-alice-inline-02",
+    });
+    expect(alicePlaced.mode).toBe("invoice");
+    expect(alicePlaced.orderPublicId).toBeTruthy();
+
+    // Stale-tab defense (`carol` submits an unsigned checkbox entry in `policyAcceptances`):
+    // Server raises CONFLICT / AGREEMENT_REQUIRED (NOT 400 TYPED_SIGNATURE_REQUIRED), then succeeds after signing!
+    const carolCart = await carolCaller.cart.addItems({
+      items: [{ productPublicId: p1Basic, quantity: 1 }],
+    });
+    let staleTabErr: unknown;
+    try {
+      await carolCaller.cart.checkout({
+        cartPublicId: carolCart.cartPublicId!,
+        expectedVersion: carolCart.version,
+        projectName: "Carol Stale Tab Order",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [
+          {
+            versionPublicId: qaMndaPublished.versionPublicId,
+            contentHash: qaMndaPublished.contentHash,
+          },
+        ],
+        idempotencyKey: "idem-d14-qa-carol-stale-01",
+      });
+    } catch (err) {
+      staleTabErr = err;
+    }
+    expect(extractCodes(staleTabErr)).toMatchObject({
+      trpcCode: "CONFLICT",
+      reasonCode: "AGREEMENT_REQUIRED",
+      details: {
+        policyPublicId: qaMndaDoc.documentPublicId,
+        signatureMode: "typed_name",
+      },
+    });
+    const carolProfile = await h.services.identity.getUser(carol.id);
+    await complianceMod.policies.accept(carol.principal, {
+      versionPublicId: qaMndaPublished.versionPublicId,
+      contentHash: qaMndaPublished.contentHash,
+      method: "typed_signature",
+      signerName: carolProfile!.name!,
+    });
+    const carolPlaced = await carolCaller.cart.checkout({
+      cartPublicId: carolCart.cartPublicId!,
+      expectedVersion: carolCart.version,
+      projectName: "Carol Stale Tab Order",
+      note: "",
+      billing: sampleBilling,
+      policyAcceptances: [
+        {
+          versionPublicId: qaMndaPublished.versionPublicId,
+          contentHash: qaMndaPublished.contentHash,
+        },
+      ],
+      idempotencyKey: "idem-d14-qa-carol-retry-02",
+    });
+    expect(carolPlaced.mode).toBe("invoice");
+
+    // Scenario (a) verification (`bob` already accepted "QA Mutual NDA" by checkbox in the general prompt):
+    // 1. Bob still gets CONFLICT / AGREEMENT_REQUIRED when submitting without a typed signature.
+    const bobCart = await bobCaller.cart.addItems({
+      items: [{ productPublicId: p1Basic, quantity: 1 }],
+    });
+    expect(bobCart.placeOrderAgreement).toEqual({
+      required: true,
+      met: false,
+      policyPublicId: qaMndaDoc.documentPublicId,
+      signatureMode: "typed_name",
+    });
+
+    let bobGateErr: unknown;
+    try {
+      await bobCaller.cart.checkout({
+        cartPublicId: bobCart.cartPublicId!,
+        expectedVersion: bobCart.version,
+        projectName: "Bob Upgraded Signature Order",
+        note: "",
+        billing: sampleBilling,
+        policyAcceptances: [],
+        idempotencyKey: "idem-d14-qa-bob-01",
+      });
+    } catch (err) {
+      bobGateErr = err;
+    }
+    expect(extractCodes(bobGateErr)).toMatchObject({
+      trpcCode: "CONFLICT",
+      reasonCode: "AGREEMENT_REQUIRED",
+      details: {
+        policyPublicId: qaMndaDoc.documentPublicId,
+        signatureMode: "typed_name",
+      },
+    });
+
+    // 2. Bob signs with his typed full name (upgrading his checkbox acceptance) and completes checkout!
+    const bobProfile = await h.services.identity.getUser(bob.id);
+    const bobUpgrade = await complianceMod.policies.accept(bob.principal, {
+      versionPublicId: qaMndaPublished.versionPublicId,
+      contentHash: qaMndaPublished.contentHash,
+      method: "typed_signature",
+      signerName: bobProfile!.name!,
+    });
+    expect(bobUpgrade.duplicate).toBe(false);
+
+    const bobPlaced = await bobCaller.cart.checkout({
+      cartPublicId: bobCart.cartPublicId!,
+      expectedVersion: bobCart.version,
+      projectName: "Bob Upgraded Signature Order",
+      note: "",
+      billing: sampleBilling,
+      policyAcceptances: [],
+      idempotencyKey: "idem-d14-qa-bob-02",
+    });
+    expect(bobPlaced.mode).toBe("invoice");
+    expect(bobPlaced.orderPublicId).toBeTruthy();
+  });
+
   it("D5 regression: never stores predictive waiver before settlement, reconciles Phase 2 failures and settings/provider flips against the actual ledger", async () => {
     const prevPayments = h.services.payments;
     const aliceCaller = callerFor(alice.principal);
@@ -1340,6 +1578,26 @@ describe("Increment 06 Package D — Seeded upsells (D3), D5 totals & small_tota
       expect(status4AfterReconcile.paymentMode).toBe("waived_small_total");
       expect(status4AfterReconcile.waivedMinor).toBe(40);
       expect(status4AfterReconcile.canRestoreToCart).toBe(false);
+
+      // Even if provider subsequently flips to `"none"` (`startCheckout` -> `"invoice"`), a replay
+      // preserves the already-reconciled terminal waiver and never overwrites `checkedOutWaivedMinor`!
+      await h.settings.set(PAYMENTS_CONFIG_SETTING.key, {
+        provider: "none",
+        mode: "test",
+      });
+      const replayAfterProviderNone = await aliceCaller.cart.checkout(payload4);
+      expect(replayAfterProviderNone).toMatchObject({
+        mode: "waived_small_total",
+        cartPublicId: cart4.cartPublicId,
+        totalMinor: 40,
+        waivedMinor: 40,
+      });
+      const [cart4AfterProviderFlip] = await t.db
+        .select()
+        .from(cartTables.carts)
+        .where(eq(cartTables.carts.publicId, cart4.cartPublicId!));
+      expect(cart4AfterProviderFlip?.paymentMode).toBeNull();
+      expect(cart4AfterProviderFlip?.checkedOutWaivedMinor).toBe(40);
     } finally {
       h.services.payments = prevPayments;
       h.settings.values.delete(PAYMENTS_CONFIG_SETTING.key);

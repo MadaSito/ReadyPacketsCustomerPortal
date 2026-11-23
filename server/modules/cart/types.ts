@@ -381,6 +381,13 @@ export interface CartSmallTotalEvaluationView {
   smallTotalAction: "none" | "zero_total" | "waive" | "block";
 }
 
+export interface CartPlaceOrderAgreementView {
+  required: boolean;
+  met: boolean;
+  policyPublicId: string | null;
+  signatureMode: "checkbox" | "typed_name";
+}
+
 export interface CartView {
   cartPublicId: string | null;
   version: number;
@@ -401,6 +408,7 @@ export interface CartView {
   onlinePaymentEnabled: boolean;
   smallTotalEvaluation: CartSmallTotalEvaluationView | null;
   pendingPolicies: PublishedPolicyView[];
+  placeOrderAgreement?: CartPlaceOrderAgreementView;
   updatedAt: Date | null;
 }
 

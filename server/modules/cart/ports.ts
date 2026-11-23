@@ -107,9 +107,18 @@ export interface CreatedCheckoutOrder {
   afterCommit: () => Promise<void>;
 }
 
+export interface CartPlaceOrderAgreementStatus {
+  required: boolean;
+  met: boolean;
+  policyPublicId: string | null;
+  signatureMode: "checkbox" | "typed_name";
+}
+
 export interface CartOrdersPort {
   listActiveCatalog(tx?: Tx, opts?: { forShare?: boolean }): Promise<CatalogGroupView[]>;
   getBundleRule(tx?: Tx): Promise<BundleRule>;
+  /** Increment 06 (D14): read-only status of the `placeOrder` account-level agreement gate. */
+  getPlaceOrderAgreementStatus(principal: SessionPrincipal, tx?: DbOrTx): Promise<CartPlaceOrderAgreementStatus>;
   /** Increment 06 (D14): early account-level order agreement (MNDA) gate check inside checkout `tx`. */
   assertCustomerMayPlaceOrder(principal: SessionPrincipal, tx: Tx): Promise<void>;
   createOrderFromCheckoutInTx(
@@ -133,6 +142,13 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
 
   const listActiveCatalog = method<CartOrdersPort["listActiveCatalog"]>(catalogHolder, "listActive");
   const getBundleRule = method<CartOrdersPort["getBundleRule"]>(catalogHolder, "getBundleRule");
+  const agreementFor = method<
+    (input: {
+      tx?: DbOrTx;
+      actor: SessionPrincipal;
+      scope: "placeOrder" | "workOnOrder";
+    }) => Promise<CartPlaceOrderAgreementStatus>
+  >(gatesHolder, "agreementFor");
   const assertGatePlaceOrder = method<(input: { tx: DbOrTx; actor: SessionPrincipal }) => Promise<void>>(
     gatesHolder,
     "assertCustomerMayPlaceOrder",
@@ -147,6 +163,17 @@ export function cartOrdersPort(services: Services): CartOrdersPort {
   return {
     listActiveCatalog,
     getBundleRule,
+    async getPlaceOrderAgreementStatus(principal, tx) {
+      if (!agreementFor) {
+        return {
+          required: false,
+          met: true,
+          policyPublicId: null,
+          signatureMode: "typed_name",
+        };
+      }
+      return agreementFor({ ...(tx ? { tx } : {}), actor: principal, scope: "placeOrder" });
+    },
     async assertCustomerMayPlaceOrder(principal, tx) {
       if (assertGatePlaceOrder) {
         await assertGatePlaceOrder({ tx, actor: principal });
