@@ -3,8 +3,9 @@
 ## Increment 06 PWA, migration and file routes
 
 - **Offline verification**: Nine migration bundle and digest fixtures, three file-route edge fixtures, three existing workflow edge fixtures and 41 PWA routing, install detection and static response cases passed. Scoped ESLint, ShellCheck and syntax checks passed. Nginx 1.28.3 accepted both profiles via `nginx -t` in an isolated configuration; Caddy 2.11.9 accepted its configuration via `adapt --validate` with the expected file-route and default caps.
+- **Actual migration**: The release validator accepted the committed `0006_increment_06` SQL and its single journal entry at index 6. Four migration tests passed against isolated schemas on the existing sandbox MySQL: schema parity, journal idempotence, upgrade with existing orders and catalog data, and required-column checks. No running deployment was migrated.
 - **Deployment checks**: Fresh native installs and Compose startup/restart require `0006`; native upgrade CI requires journal hashes for `0003` through `0006`. Native and Compose smoke probes verify the worker, manifest and offline document and their cache headers.
-- **Not verified here**: No local app build, listener, installer, database migration, browser, or backup/restore ran for this package. Use the [upgrade runbook](../docs/operations/UPGRADE.md#increment-06-and-migration-0006) for staging rehearsal.
+- **Not verified here**: No local app build, new listener, installer, browser, or backup/restore ran for this package. Use the [upgrade runbook](../docs/operations/UPGRADE.md#increment-06-and-migration-0006) for staging rehearsal.
 
 ## Increment 05 migration packaging
 
