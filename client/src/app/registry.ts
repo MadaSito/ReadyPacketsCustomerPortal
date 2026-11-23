@@ -29,6 +29,7 @@ import { communityFeature } from "@/features/community/routes";
 import { cartFeature } from "@/features/cart/routes";
 import { knowledgeFeature } from "@/features/knowledge/routes";
 import { promotionsFeature } from "@/features/promotions/routes";
+import { reportsFeature } from "@/features/reports/routes";
 
 export const FEATURES: readonly FeatureRoutes[] = [
   authFeature,
@@ -59,6 +60,7 @@ export const FEATURES: readonly FeatureRoutes[] = [
   cartFeature,
   knowledgeFeature,
   promotionsFeature,
+  reportsFeature,
 ];
 
 export const ROUTE_WRAPPERS: readonly RouteWrapper[] = FEATURES.flatMap((feature) => feature.routeWrappers ?? []).sort((a, b) => a.order - b.order);

@@ -22,6 +22,7 @@ import { publicApiRouter } from "../modules/publicApi/router.js";
 import { communityRouter } from "../modules/community/router.js";
 import { referralsRouter } from "../modules/referrals/router.js";
 import { promotionsRouter } from "../modules/promotions/router.js";
+import { reportsRouter } from "../modules/reports/router.js";
 import { cartRouter } from "../modules/cart/router.js";
 import { knowledgeRouter } from "../modules/knowledge/router.js";
 import { paymentsRouter } from "../modules/payments/router.js";
@@ -49,6 +50,7 @@ export const appRouter = router({
   community: communityRouter,
   referrals: referralsRouter,
   promotions: promotionsRouter,
+  reports: reportsRouter,
   cart: cartRouter,
   knowledge: knowledgeRouter,
   payments: paymentsRouter,
