@@ -66,6 +66,34 @@ beforeEach(() => {
   handlers.clear();
   calls.length = 0;
   session.role = "admin";
+  handlers.set("orders.admin.agreementGate.get", () => ({
+    enabled: false,
+    policyPublicId: null,
+    applyTo: { placeOrder: true, workOnOrder: true },
+    signatureMode: "typed_name",
+    askAgainOnNewVersion: true,
+    policy: null,
+    choices: [],
+  }));
+  handlers.set("compliance.policies.admin.signatureNameCheck.get", () => ({ mode: "require" }));
+  handlers.set("compliance.policies.enforcement.defaultStatus", () => ({
+    disabledByHost: false,
+    warningText: "Review {policy} before {deadline} ({timeLeft} left).",
+  }));
+  handlers.set("compliance.policies.enforcement.status", () => ({
+    disabledByHost: false,
+    canEnable: true,
+    mode: "none",
+    graceHours: 72,
+    warningText: null,
+    expectedVersion: 1,
+    affectedCount: 0,
+  }));
+  handlers.set("compliance.policies.notices.status", () => ({
+    delayHours: 24,
+    notice: null,
+  }));
+  handlers.set("compliance.receipts.admin.forOrder", () => []);
 });
 
 describe("registry exports", () => {
@@ -202,6 +230,69 @@ describe("policies", () => {
       { versionPublicId: "b", versionLabel: "2.0", versionNumber: 2, count: 1, typed: 1 },
       { versionPublicId: "a", versionLabel: "1.0", versionNumber: 1, count: 2, typed: 1 },
     ]);
+  });
+
+  it("configures D14 Order agreement (MNDA), D11 signature check, and D12 Markdown import without auto-publishing", async () => {
+    handlers.set("compliance.policies.admin.listDocuments", () => [summary]);
+    handlers.set("orders.admin.agreementGate.get", () => ({
+      enabled: false,
+      policyPublicId: null,
+      applyTo: { placeOrder: true, workOnOrder: true },
+      signatureMode: "typed_name",
+      askAgainOnNewVersion: true,
+      policy: null,
+      choices: [{ publicId: DOC, title: "Mutual NDA", versionLabel: "1.0" }],
+    }));
+    handlers.set("orders.admin.agreementGate.update", (input) => ({
+      ...(input as { setting: Record<string, unknown> }).setting,
+      policy: { publicId: DOC, title: "Mutual NDA", versionLabel: "1.0" },
+      choices: [{ publicId: DOC, title: "Mutual NDA", versionLabel: "1.0" }],
+    }));
+    handlers.set("compliance.policies.admin.signatureNameCheck.update", (input) => input);
+
+    const user = userEvent.setup();
+    const { container } = renderUi(<PoliciesAdminPage />, { path: "/admin/policies" });
+    const agreementSection = await screen.findByRole("region", { name: "Order agreement (MNDA)" });
+    const enableCheckbox = await within(agreementSection).findByRole("checkbox", { name: /Require order agreement/ });
+    expect(enableCheckbox).toBeDisabled();
+
+    await user.selectOptions(within(agreementSection).getByLabelText(/^Agreement policy/), DOC);
+    expect(enableCheckbox).toBeEnabled();
+    await user.click(enableCheckbox);
+    await user.click(within(agreementSection).getByRole("button", { name: "Save order agreement" }));
+    await waitFor(() =>
+      expect(callsTo("orders.admin.agreementGate.update")[0]?.input).toMatchObject({
+        expectedEnabled: false,
+        setting: {
+          enabled: true,
+          policyPublicId: DOC,
+          signatureMode: "typed_name",
+          askAgainOnNewVersion: true,
+          applyTo: { placeOrder: true, workOnOrder: true },
+        },
+      }),
+    );
+
+    await user.selectOptions(screen.getByLabelText("Signature verification mode"), "warn");
+    await user.click(screen.getByRole("button", { name: "Save signature check" }));
+    await waitFor(() =>
+      expect(callsTo("compliance.policies.admin.signatureNameCheck.update")[0]?.input).toEqual({ mode: "warn" }),
+    );
+    await expectNoAxeViolations(container);
+
+    // D12: importing a Markdown file fills the draft editor without auto-publishing
+    await user.click(screen.getByRole("button", { name: "New policy" }));
+    const dialog = await screen.findByRole("dialog");
+    const fileInput = dialog.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    const mdFile = new File(["# Imported NDA\n\nConfidentiality obligations apply."], "mnda.md", {
+      type: "text/markdown",
+    });
+    await user.upload(fileInput, mdFile);
+    await waitFor(() =>
+      expect((within(dialog).getByLabelText(/^Policy text/) as HTMLTextAreaElement).value).toContain("# Imported NDA"),
+    );
+    expect(callsTo("compliance.policies.admin.publishVersion")).toHaveLength(0);
   });
 });
 
@@ -530,5 +621,104 @@ describe("invoices", () => {
     renderUi(<OrderInvoicesTab orderId={ORDER} area="console" />);
     expect(await screen.findByRole("link", { name: "INV-2026-0001" })).toHaveAttribute("href", `/admin/invoices/${INV}`);
     expect(screen.queryByRole("link", { name: "New invoice for this order" })).not.toBeInTheDocument();
+  });
+
+  it("shows staff order receipts with Send again and saves company billing profile on InvoicesAdminPage", async () => {
+    const user = userEvent.setup();
+    const RECEIPT = "01JTESTRECEIPT000000000001";
+    handlers.set("compliance.invoices.listForOrder", () => ({
+      orderPublicId: ORDER,
+      orderReference: "RP-2026-000001",
+      lockState: "none",
+      onlinePaymentConfigured: true,
+      items: [summary],
+    }));
+    handlers.set("compliance.receipts.admin.forOrder", () => [
+      {
+        receiptPublicId: RECEIPT,
+        receiptNumber: "RPR-2026-000001",
+        settlementKind: "provider_online",
+        invoicePublicId: INV,
+        paymentPublicId: PAY,
+        orderPublicId: ORDER,
+        orderReference: "RP-2026-000001",
+        customerRef: "CUST-1",
+        currency: "USD",
+        subtotalMinor: 5000,
+        discountMinor: 0,
+        bundleDiscountMinor: 0,
+        promoDiscountMinor: 0,
+        promoLabel: null,
+        taxMinor: 0,
+        amountWaivedMinor: 0,
+        amountPaidMinor: 5000,
+        refundedMinor: 0,
+        refundState: "none",
+        paymentMethod: "provider_online",
+        paymentMethodBrand: "visa",
+        paymentMethodLast4: "4242",
+        paymentMethodSummary: "Visa ending in 4242",
+        provider: "stripe",
+        providerReference: "pi_123",
+        issuedAt: now,
+        emailedAt: now,
+        lastResentAt: null,
+        resendCount: 0,
+        origin: "portal",
+        refundNotes: [],
+      },
+    ]);
+    handlers.set("compliance.receipts.admin.resend", () => ({
+      receiptPublicId: RECEIPT,
+      receiptNumber: "RPR-2026-000001",
+      resendCount: 1,
+      lastResentAt: now,
+    }));
+
+    const receiptView = renderUi(
+      <>
+        <h1>Order RP-2026-000001</h1>
+        <OrderInvoicesTab orderId={ORDER} area="console" />
+      </>,
+    );
+    expect(await screen.findByRole("link", { name: "RPR-2026-000001" })).toHaveAttribute("href", `/admin/receipts/${RECEIPT}`);
+    await user.click(screen.getByRole("button", { name: "Send again (RPR-2026-000001)" }));
+    await waitFor(() =>
+      expect(callsTo("compliance.receipts.admin.resend")[0]?.input).toEqual({ receiptPublicId: RECEIPT }),
+    );
+    await expectNoAxeViolations(receiptView.container);
+    receiptView.unmount();
+
+    handlers.set("compliance.invoices.admin.list", () => ({ items: [summary], nextCursor: null }));
+    handlers.set("compliance.invoices.admin.companyProfile.get", () => ({
+      issuerName: "ReadyPackets LLC",
+      issuerAddress: "100 Main St",
+      issuerContact: "billing@example.test",
+      issuerTaxId: "EIN-12-3456789",
+      issuerLogo: {
+        mode: "brand" as const,
+        brandPath: "/brand/readypackets-approved-header-wordmark-light.png" as const,
+      },
+      paymentInstructions: "Pay by wire within 30 days.",
+    }));
+    handlers.set("compliance.invoices.admin.companyProfile.update", (input) => input);
+
+    renderUi(<InvoicesAdminPage />, { path: "/admin/invoices" });
+    await user.click(await screen.findByRole("button", { name: "Company profile" }));
+    const dialog = await screen.findByRole("dialog", { name: "Company billing profile" });
+    const nameInput = await within(dialog).findByLabelText(/^Legal company name/);
+    await user.clear(nameInput);
+    await user.type(nameInput, "ReadyPackets Inc.");
+    await user.click(within(dialog).getByRole("button", { name: "Save company profile" }));
+    await waitFor(() =>
+      expect(callsTo("compliance.invoices.admin.companyProfile.update")[0]?.input).toMatchObject({
+        issuerName: "ReadyPackets Inc.",
+        issuerTaxId: "EIN-12-3456789",
+        issuerLogo: {
+          mode: "brand",
+          brandPath: "/brand/readypackets-approved-header-wordmark-light.png",
+        },
+      }),
+    );
   });
 });

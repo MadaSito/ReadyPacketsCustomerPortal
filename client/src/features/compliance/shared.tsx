@@ -99,17 +99,10 @@ export function SafePolicyText({
   return <SharedSafePolicyText bodyText={bodyText} format={format} />;
 }
 
-/**
- * Downloads a private invoice PDF through `sessionFetch` so both HttpOnly cookie sessions
- * and sandboxed preview header sessions work identically.
- */
-export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber: string | null): Promise<void> {
-  const response = await sessionFetch(
-    apiUrl(`/api/compliance/invoices/${encodeURIComponent(invoicePublicId)}/pdf`),
-    { method: "GET" },
-  );
+async function downloadCompliancePdf(path: string, fallbackMessage: string, baseFilename: string): Promise<void> {
+  const response = await sessionFetch(apiUrl(path), { method: "GET" });
   if (!response.ok) {
-    let message = "Unable to download invoice PDF.";
+    let message = fallbackMessage;
     try {
       const json = (await response.json()) as { error?: { message?: string } };
       if (json?.error?.message) message = json.error.message;
@@ -119,7 +112,7 @@ export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber:
     throw new Error(message);
   }
   const blob = await response.blob();
-  const safeName = `${(invoiceNumber ?? `invoice-${invoicePublicId}`).replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`;
+  const safeName = `${baseFilename.replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`;
   const url = URL.createObjectURL(blob);
   try {
     const anchor = document.createElement("a");
@@ -131,4 +124,75 @@ export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber:
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * Downloads a private invoice PDF through `sessionFetch` so both HttpOnly cookie sessions
+ * and sandboxed preview header sessions work identically.
+ */
+export async function downloadInvoicePdf(invoicePublicId: string, invoiceNumber: string | null): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/invoices/${encodeURIComponent(invoicePublicId)}/pdf`,
+    "Unable to download invoice PDF.",
+    invoiceNumber ?? `invoice-${invoicePublicId}`,
+  );
+}
+
+export async function downloadReceiptPdf(receiptPublicId: string, receiptNumber: string): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/receipts/${encodeURIComponent(receiptPublicId)}/pdf`,
+    "Unable to download payment receipt PDF.",
+    receiptNumber || `receipt-${receiptPublicId}`,
+  );
+}
+
+export async function downloadRefundNotePdf(notePublicId: string, noteNumber: string): Promise<void> {
+  return downloadCompliancePdf(
+    `/api/compliance/refund-notes/${encodeURIComponent(notePublicId)}/pdf`,
+    "Unable to download refund note PDF.",
+    noteNumber || `refund-note-${notePublicId}`,
+  );
+}
+
+export type ReceiptRefundState = "none" | "partially_refunded" | "refunded";
+
+export function ReceiptRefundBadge({ state }: { state: ReceiptRefundState }) {
+  switch (state) {
+    case "refunded":
+      return <Badge tone="warning">Refunded</Badge>;
+    case "partially_refunded":
+      return <Badge tone="info">Partially refunded</Badge>;
+    case "none":
+      return (
+        <Badge tone="success" icon={<CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />}>
+          Confirmed
+        </Badge>
+      );
+  }
+}
+
+export function formatReceiptMethodSummary(item: {
+  settlementKind: "provider_online" | "manual_payment" | "zero_total" | "waived_small_total";
+  paymentMethod: string;
+  paymentMethodBrand: string | null;
+  paymentMethodLast4: string | null;
+}): string {
+  if (item.settlementKind === "zero_total") return "Discount covered full order ($0.00)";
+  if (item.settlementKind === "waived_small_total") return "Small balance waived";
+  if (item.paymentMethodBrand && item.paymentMethodLast4) {
+    const brand = item.paymentMethodBrand.charAt(0).toUpperCase() + item.paymentMethodBrand.slice(1);
+    return `${brand} ending in ${item.paymentMethodLast4}`;
+  }
+  if (item.paymentMethodLast4) return `Card ending in ${item.paymentMethodLast4}`;
+  const labels: Record<string, string> = {
+    provider_online: "Online card payment",
+    bank_transfer: "Bank transfer",
+    wire: "Wire transfer",
+    ach: "ACH",
+    check: "Check",
+    card_manual: "Manual card",
+    waiver: "Waived",
+    other: "Recorded payment",
+  };
+  return labels[item.paymentMethod] ?? "Confirmed payment";
 }

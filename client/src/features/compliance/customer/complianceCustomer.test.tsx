@@ -16,7 +16,8 @@ import { LegalPage, MyPoliciesPage } from "./PolicyPages";
 
 const mocks = vi.hoisted(() => ({
   policyStatus: vi.fn(), published: vi.fn(), accept: vi.fn(), intakeList: vi.fn(), history: vi.fn(),
-  save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(), fetch: vi.fn(),
+  save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(),
+  receiptList: vi.fn(), orderReceipts: vi.fn(), receipt: vi.fn(), fetch: vi.fn(),
 }));
 vi.mock("@/lib/sessionTransport", async (load) => ({ ...await load<typeof sessionModule>(), sessionFetch: mocks.fetch }));
 vi.mock("@/lib/trpc", async (load) => {
@@ -44,6 +45,11 @@ vi.mock("@/lib/trpc", async (load) => {
         invoices: {
           listMine: query("invoices", mocks.invoiceList), get: query("invoice", mocks.invoice),
           listForOrder: query("order-invoices", mocks.orderInvoices),
+        },
+        receipts: {
+          myList: query("receipts", mocks.receiptList),
+          forOrder: query("order-receipts", mocks.orderReceipts),
+          get: query("receipt", mocks.receipt),
         },
       },
     }),
@@ -102,6 +108,8 @@ beforeEach(() => {
   mocks.invoiceList.mockResolvedValue({ items: [invoice], nextCursor: null });
   mocks.orderInvoices.mockResolvedValue({ items: [invoice] });
   mocks.invoice.mockResolvedValue(invoice);
+  mocks.receiptList.mockResolvedValue({ items: [], nextCursor: null });
+  mocks.orderReceipts.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -343,5 +351,102 @@ describe("customer invoices", () => {
     await waitFor(() => expect(click).toHaveBeenCalledOnce());
     expect(objectUrl).toHaveBeenCalledOnce();
     expect(revokeUrl).toHaveBeenCalledWith("blob:synthetic-invoice");
+  });
+
+  it("renders customer payment receipts with refund notes and hides order receipts for non-billing collaborators", async () => {
+    const user = userEvent.setup();
+    const receiptId = publicId("C");
+    const noteId = publicId("D");
+    const sampleReceipt = {
+      receiptPublicId: receiptId,
+      receiptNumber: "RPR-2026-000001",
+      settlementKind: "provider_online" as const,
+      invoicePublicId: invoice.invoicePublicId,
+      paymentPublicId: publicId("8"),
+      orderPublicId: orderId,
+      orderReference: "RP-123",
+      customerRef: "CUST-1",
+      currency: "USD",
+      subtotalMinor: 10000,
+      discountMinor: 0,
+      bundleDiscountMinor: 0,
+      promoDiscountMinor: 0,
+      promoLabel: null,
+      taxMinor: 0,
+      amountWaivedMinor: 0,
+      amountPaidMinor: 10000,
+      refundedMinor: 1000,
+      refundState: "partially_refunded" as const,
+      paymentMethod: "provider_online" as const,
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+      paymentMethodSummary: "Visa ending in 4242",
+      provider: "stripe",
+      issuedAt: date,
+      origin: "portal" as const,
+      refundNotes: [
+        {
+          notePublicId: noteId,
+          noteNumber: "RPRN-2026-000001",
+          receiptPublicId: receiptId,
+          refundPublicId: publicId("9"),
+          orderPublicId: orderId,
+          currency: "USD",
+          refundAmountMinor: 1000,
+          cumulativeRefundedMinor: 1000,
+          resultingRefundState: "partially_refunded" as const,
+          reasonCode: "ADJUSTMENT",
+          reference: "Refund ABC",
+          issuedAt: date,
+        },
+      ],
+    };
+    mocks.receiptList.mockResolvedValue({ items: [sampleReceipt], nextCursor: null });
+
+    const { container, unmount } = renderUi(<InvoicesPage />, { path: "/invoices" });
+    await user.click(await screen.findByRole("tab", { name: "Receipts" }));
+    expect(await screen.findByRole("link", { name: "RPR-2026-000001" })).toHaveAttribute("href", `/receipts/${receiptId}`);
+    expect(screen.getByText("Visa ending in 4242")).toBeVisible();
+    expect(screen.getByText("RPRN-2026-000001")).toBeVisible();
+    await expectNoAxeViolations(container);
+    unmount();
+
+    // Non-billing collaborator receiving FORBIDDEN sees invoices cleanly without receipt leakage or error crash.
+    mocks.orderReceipts.mockRejectedValue({
+      message: "Receipts are available only to the buyer.",
+      data: { safe: { message: "Receipts are available only to the buyer.", domainCode: "FORBIDDEN", reasonCode: "NOT_RECEIPT_BUYER_OR_BILLING" } },
+    });
+    renderUi(<OrderInvoicesTab orderId={orderId} area="customer" />);
+    expect(await screen.findByRole("link", { name: "RP-INV-123" })).toBeVisible();
+    expect(screen.queryByText("Payment receipts")).not.toBeInTheDocument();
+  });
+
+  it("shows expected account name and link to /account on SIGNER_NAME_MISMATCH", async () => {
+    const user = userEvent.setup();
+    const pending = { ...document, requiresTypedSignature: true };
+    mocks.policyStatus.mockResolvedValue({
+      published: [pending],
+      pendingRequired: [pending],
+      acceptances: [],
+      expectedSignerName: "Ada Lovelace",
+    });
+    mocks.accept.mockRejectedValue({
+      message: "Typed signature must match your account name.",
+      data: {
+        safe: {
+          message: "Typed signature must match your account name.",
+          domainCode: "VALIDATION_ERROR",
+          reasonCode: "SIGNER_NAME_MISMATCH",
+          details: { expectedName: "Ada Lovelace" },
+        },
+      },
+    });
+    renderUi(<RequiredPolicyGate><button>Start the wizard</button></RequiredPolicyGate>);
+    expect(await screen.findByText(/Expected account name: Ada Lovelace/)).toBeVisible();
+    await user.click(screen.getByRole("checkbox", { name: /I have read and agree/ }));
+    await user.type(screen.getByLabelText(/Type your full name to sign/), "Grace Hopper");
+    await user.click(screen.getByRole("button", { name: "Accept this version" }));
+    const profileLink = await screen.findByRole("link", { name: "Update your profile name" });
+    expect(profileLink).toHaveAttribute("href", "/account");
   });
 });

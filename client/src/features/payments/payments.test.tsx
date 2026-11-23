@@ -116,3 +116,32 @@ it("renders safe receipt outcomes and validates the exact invoice filter", async
   await user.type(invoice, "not-a-valid-id{Enter}");
   expect(await screen.findByText("Enter a valid 26-character invoice public ID.")).toBeInTheDocument();
 });
+
+it("submits D5 small-total mode and D15 payment receipt preferences", async () => {
+  const user = userEvent.setup();
+  const save = vi.fn<(input: PaymentSettingsInput) => Promise<void>>().mockResolvedValue(undefined);
+  renderUi(
+    <PaymentSettings
+      settings={{
+        ...config,
+        smallTotals: { belowProviderMinimum: "waive" },
+        receipts: { enabled: true, emailCustomer: true, footerText: "" },
+      }}
+      saving={false}
+      onSave={save}
+    />,
+  );
+  await user.selectOptions(screen.getByLabelText("Totals below provider minimum"), "block");
+  await user.type(screen.getByLabelText("Receipt footer note"), "Thank you for your business.");
+  await user.click(screen.getByRole("button", { name: "Save payment settings" }));
+  expect(save).toHaveBeenCalledWith(
+    expect.objectContaining({
+      smallTotals: { belowProviderMinimum: "block" },
+      receipts: {
+        enabled: true,
+        emailCustomer: true,
+        footerText: "Thank you for your business.",
+      },
+    }),
+  );
+});

@@ -1,3 +1,4 @@
+import { lazy } from "react";
 import type {
   CustomerTab,
   DashboardWidget,
@@ -9,6 +10,13 @@ import type {
   RouteWrapper,
 } from "@/lib/routes";
 import { acceptanceOrderBanners, acceptanceOrderTabs, acceptanceRoutes } from "./acceptance";
+
+const AdminReceiptDetailPage = lazy(() =>
+  import("./receipts/ReceiptViews").then((m) => ({ default: m.AdminReceiptDetailPage })),
+);
+const CustomerReceiptsTab = lazy(() =>
+  import("./receipts/ReceiptViews").then((m) => ({ default: m.CustomerReceiptsTab })),
+);
 
 interface ComplianceCustomerModule {
   complianceCustomerRoutes?: RouteDef[];
@@ -51,6 +59,13 @@ export const routes: RouteDef[] = [
   ...(adminMod?.complianceAdminRoutes ?? []),
   ...(acceptanceLogMod?.acceptanceLogRoutes ?? []),
   ...acceptanceRoutes,
+  {
+    path: "/admin/receipts/:receiptId",
+    title: "Payment Receipt",
+    access: "staff",
+    capability: "invoices.read_all",
+    component: AdminReceiptDetailPage,
+  },
 ];
 
 function normalizeCustomerNav(items: NavItem[]): NavItem[] {
@@ -80,6 +95,13 @@ export const orderTabs: OrderTab[] = [
 export const orderBanners: OrderBanner[] = [...acceptanceOrderBanners];
 
 export const customerTabs: CustomerTab[] = [
+  {
+    key: "receipts",
+    label: "Receipts",
+    access: "staff",
+    order: 35,
+    component: CustomerReceiptsTab,
+  },
   ...(acceptanceLogMod?.acceptanceLogCustomerTabs ?? []),
 ];
 

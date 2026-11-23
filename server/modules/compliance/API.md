@@ -626,3 +626,32 @@ export interface AcceptanceLogExportResult {
   - `promoLabel: string | null` (customer-facing promo label from `order.promoLabel`; never the raw code)
 - Rendered as separate labelled rows on customer `/invoices/:invoiceId`, console `/admin/invoices/:invoiceId`, and `GET /api/compliance/invoices/:invoicePublicId/pdf`.
 
+---
+
+## 10. Increment 06 — Package M (D5, D11, D12, D14, D15)
+
+### 10.1 D11 Typed-Signature Name Check (`compliance.signature_name_check`)
+
+- Setting `compliance.signature_name_check`: `{ mode: "require" | "warn" | "off" }` (default `"require"`, backward-compatible parse with defaults).
+- Shared normalization (`server/modules/compliance/signatureNameCheck.ts`): NFC, collapse whitespace, trim, Unicode case-fold, strip leading/trailing punctuation (`.,'-`). Empty/whitespace-only account names fail closed when `mode === "require"` (`SIGNER_NAME_MISMATCH`).
+- Enforced behind both `policies.accept` (`policiesService.ts`) and workflow/order agreement gates (`acceptance/service.ts`), persisting `signatureMatch: "matched" | "mismatch_accepted" | "unchecked" | null` on `compliance_policy_acceptances` and `compliance_policy_gate_acceptances` and surfacing it in `policies.admin.acceptanceLog.{list,detail,forCustomer,export}` and the Acceptance Log Centre UI (`PolicyAcceptancesPage`).
+- Customer surfaces (`PolicyAcceptance.tsx`, `AcceptanceGate.tsx`, and `@/lib/agreementGate/AgreementDialog.tsx`) show only the signed-in user's own account name and link to `/account` for self-service name updates; `SIGNER_NAME_MISMATCH` errors include `details.expectedName` only for the authenticated signer's own user row.
+
+### 10.2 D12 Document Import & D14 Order Agreement (MNDA) Admin Card + Shared Gate
+
+- `CreatePolicyDialog` (`PoliciesAdminPage.tsx`) and `DraftDialog` (`PolicyDetailPage.tsx`) mount `DocumentImportButton` (`integrations_engineer`) to fill `safe_markdown` draft text without auto-publishing; all client and server surfaces are designed and tested against WCAG 2.2 AA.
+- `PoliciesAdminPage.tsx` mounts `#order-agreement` (`OrderAgreementCard`) reading/updating `orders.admin.agreementGate.{get,update}` (`orders_engineer`) with step-up MFA challenge when disabling an active gate (`expectedEnabled`).
+- Shared client agreement gate (`client/src/lib/agreementGate/{index.ts,AgreementDialog.tsx}`) exports `agreementStatus`, `useAgreementStatus`, `extractAgreementRequiredDetails`, and `AgreementDialog` for `cart`, `orders`, and `files`.
+
+### 10.3 D15 Payment Receipts, Refund Notes & Company Billing Profile
+
+- Tables (`server/modules/compliance/schema.ts`): `compliance_payment_receipts` (`RPR-<year>-<6 digits>` via `compliance_sequences`, immutable `snapshotJson`, `settlementKind: "provider_online" | "zero_total" | "waived_below_minimum" | "manual"`, `resendCount`, `lastResentAt`) and `compliance_refund_notes` (`RPRN-<year>-<6 digits>`, immutable `snapshotJson`).
+- Settings:
+  - Company billing profile (`compliance.invoices.issuer_name`, `issuer_address`, `issuer_contact`, `issuer_tax_id`, `issuer_logo`, `payment_instructions`) via `compliance.invoices.admin.companyProfile.{get,update}` (`invoices.manage`, step-up MFA on `update`).
+  - `payments.receipts`: `{ enabled: boolean, emailCustomer: boolean, footerText: string }` (default `{ enabled: true, emailCustomer: true, footerText: "" }`).
+- One receipt per settled payment (webhook-confirmed provider capture, `$0.00` settlement, waived sub-minimum settlement, or staff manual payment), idempotent by `(invoiceId, paymentId)` or `(invoiceId, settlementKind)`. Waived amounts (`waivedMinor`) settle invoice balance without inflating `grossPaidMinor` or refundable balances.
+- Outbound mail enqueues `mail.send_template` with `templateKey: "payment_receipt"` and the rendered receipt PDF attached; staff `"Send again"` (`compliance.receipts.admin.resend`, `invoices.read_all`) enforces a DB-durable 3-per-hour rolling window in `compliance_sequences`.
+- Strict receipt & refund-note ACL (`assertCustomerReceiptAccess`): only the order buyer (`order.customerId === userId`), an active explicit billing grant (`billing` / `billing_viewer` / `payer` / `finance`), or staff with `invoices.read_all` may list, view, or download receipts and refund notes (`/api/compliance/receipts/:receiptPublicId/pdf`, `/api/compliance/refund-notes/:notePublicId/pdf`). Generic order collaborators receive a detail-free `404 NOT_FOUND` on direct ID/PDF routes and `FORBIDDEN` on `listForOrder` (gracefully hidden in `CustomerOrderReceiptsSection`).
+- Routes & UI: customer `/invoices` (`"Invoices"` | `"Receipts"` tabs), `/receipts/:receiptId`, Console `/admin/receipts/:receiptId`, Console order billing `"Payment receipts"` section, customer profile `"Receipts"` tab (`CustomerReceiptsTab`), and `CompanyProfileDialog` on `/admin/invoices`.
+
+

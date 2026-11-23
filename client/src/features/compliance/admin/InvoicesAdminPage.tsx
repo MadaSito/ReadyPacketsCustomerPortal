@@ -1,10 +1,11 @@
 /** Console invoices list (/admin/invoices) with status/order filters. Owner: orders_engineer (compliance admin UI). */
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { Plus, Receipt } from "lucide-react";
+import { Building2, Plus, Receipt } from "lucide-react";
 import { useState } from "react";
 import { Link, useSearch } from "wouter";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Callout, DataTable, DateTime, EmptyState, Field, FilterBar, LoadMore, Money, PageHeader, Select } from "@/ui";
+import { CompanyProfileDialog } from "../receipts/ReceiptViews";
 import { InvoiceStatusBadge, type InvoiceStatus } from "../shared";
 import { useCan } from "./common";
 import { InvoiceEditor } from "./InvoiceEditor";
@@ -26,6 +27,7 @@ export default function InvoicesAdminPage() {
   const [orderId, setOrderId] = useState(ULID.test(initialOrder) ? initialOrder : "");
   const [orderError, setOrderError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [editingProfile, setEditingProfile] = useState(false);
   const list = useInfiniteQuery(
     trpc.compliance.invoices.admin.list.infiniteQueryOptions({ status: status || undefined, orderPublicId: orderId || undefined, limit: 25 }, { getNextPageParam: (page) => page.nextCursor ?? undefined }),
   );
@@ -38,9 +40,14 @@ export default function InvoicesAdminPage() {
         description="Create and issue invoices for orders and record payments received outside the portal. Online payments and refunds are handled from the order's Refund tab and Payments settings."
         actions={
           canManage ? (
-            <Button leadingIcon={<Plus aria-hidden />} onClick={() => setCreating(true)}>
-              New invoice
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" leadingIcon={<Building2 aria-hidden />} onClick={() => setEditingProfile(true)}>
+                Company profile
+              </Button>
+              <Button leadingIcon={<Plus aria-hidden />} onClick={() => setCreating(true)}>
+                New invoice
+              </Button>
+            </div>
           ) : undefined
         }
       />
@@ -114,6 +121,7 @@ export default function InvoicesAdminPage() {
         {rows ? <LoadMore hasMore={Boolean(list.hasNextPage)} loading={list.isFetchingNextPage} onLoadMore={() => void list.fetchNextPage()} summary={`Showing ${rows.length} invoices`} /> : null}
       </div>
       {creating ? <InvoiceEditor invoice={null} defaultOrderId={orderId} onClose={() => setCreating(false)} /> : null}
+      {editingProfile ? <CompanyProfileDialog onClose={() => setEditingProfile(false)} /> : null}
     </>
   );
 }

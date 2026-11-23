@@ -8,6 +8,7 @@ export const complianceCustomerRoutes: RouteDef[] = [
   { path: "/policies", title: "Policies & Agreements", access: "customer", component: lazy(() => import("./PolicyPages").then((m) => ({ default: m.MyPoliciesPage }))) },
   { path: "/invoices", title: "Invoices", access: "customer", component: lazy(() => import("./InvoicePages").then((m) => ({ default: m.InvoicesPage }))) },
   { path: "/invoices/:invoiceId", title: "Invoice", access: "customer", component: lazy(() => import("./InvoicePages").then((m) => ({ default: m.InvoiceDetailPage }))) },
+  { path: "/receipts/:receiptId", title: "Payment Receipt", access: "customer", component: lazy(() => import("../receipts/ReceiptViews").then((m) => ({ default: m.ReceiptDetailPage }))) },
 ];
 
 export const complianceCustomerNav: NavItem[] = [

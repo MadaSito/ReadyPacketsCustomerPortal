@@ -4,8 +4,9 @@ import { useState, type ReactNode } from "react";
 import { Link, useParams } from "wouter";
 import type { InvoiceDetailView, InvoicePaymentView, InvoiceSummaryView } from "@server/modules/compliance/invoicesService";
 import { useTRPC } from "@/lib/trpc";
-import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton } from "@/ui";
+import { Breadcrumbs, Button, Callout, Card, DateTime, EmptyState, ErrorState, KeyValueList, LoadMore, Money, PageHeader, Section, Skeleton, Tabs } from "@/ui";
 import { useCan } from "../admin/common";
+import { ConsoleOrderReceiptsSection, CustomerOrderReceiptsSection, CustomerReceiptsPanel } from "../receipts/ReceiptViews";
 import { downloadInvoicePdf, InvoiceStatusBadge } from "../shared";
 
 function Amount({ minor, currency }: { minor: number; currency: string }) {
@@ -58,16 +59,23 @@ export function InvoicesPage() {
     getNextPageParam: (page) => page.nextCursor ?? undefined,
   }));
   const items = invoices.data?.pages.flatMap((page) => page.items.filter((invoice) => invoice.issuedAt !== null)) ?? [];
+  const invoicesContent = invoices.isPending ? <Skeleton lines={4} /> : invoices.isError && !invoices.data
+    ? <ErrorState title="We couldn't load invoices" onRetry={() => void invoices.refetch()} />
+    : <div className="space-y-4">
+      <InvoiceList items={items} showOrder />
+      {invoices.isFetchNextPageError ? <Callout tone="danger" live="polite">Couldn&apos;t load more invoices. Try again.</Callout> : null}
+      <LoadMore hasMore={invoices.hasNextPage} loading={invoices.isFetchingNextPage} onLoadMore={() => void invoices.fetchNextPage()} label="Load more invoices" />
+    </div>;
   return (
     <>
-      <PageHeader title="Invoices" description="See issued invoices and their payment status." />
-      {invoices.isPending ? <Skeleton lines={4} /> : invoices.isError && !invoices.data
-        ? <ErrorState title="We couldn't load invoices" onRetry={() => void invoices.refetch()} />
-        : <div className="space-y-4">
-          <InvoiceList items={items} showOrder />
-          {invoices.isFetchNextPageError ? <Callout tone="danger" live="polite">Couldn't load more invoices. Try again.</Callout> : null}
-          <LoadMore hasMore={invoices.hasNextPage} loading={invoices.isFetchingNextPage} onLoadMore={() => void invoices.fetchNextPage()} label="Load more invoices" />
-        </div>}
+      <PageHeader title="Invoices" description="See issued invoices, confirmed payment receipts, and their payment status." />
+      <Tabs
+        label="Billing documents"
+        items={[
+          { value: "invoices", label: "Invoices", content: invoicesContent },
+          { value: "receipts", label: "Receipts", content: <CustomerReceiptsPanel /> },
+        ]}
+      />
     </>
   );
 }
@@ -102,6 +110,7 @@ function ConsoleOrderInvoicesTab({ orderId }: { orderId: string }) {
           ) : undefined
         }
       />
+      <ConsoleOrderReceiptsSection orderId={orderId} />
     </div>
   );
 }
@@ -116,7 +125,12 @@ function CustomerOrderInvoicesTab({ orderId }: { orderId: string }) {
   const invoices = useQuery(trpc.compliance.invoices.listForOrder.queryOptions({ orderPublicId: orderId }));
   if (invoices.isPending) return <Skeleton lines={4} />;
   if (invoices.isError) return <ErrorState title="We couldn't load the order's invoices" onRetry={() => void invoices.refetch()} />;
-  return <InvoiceList items={invoices.data.items.filter((invoice) => invoice.issuedAt !== null)} showOrder={false} />;
+  return (
+    <div className="space-y-6">
+      <InvoiceList items={invoices.data.items.filter((invoice) => invoice.issuedAt !== null)} showOrder={false} />
+      <CustomerOrderReceiptsSection orderId={orderId} />
+    </div>
+  );
 }
 
 const paymentLabels: Record<InvoicePaymentView["method"], string> = {
@@ -167,6 +181,7 @@ function InvoiceDetail({ invoice }: { invoice: InvoiceDetailView }) {
               ]),
           { label: "Tax", value: amount(invoice.taxMinor) },
           { label: "Total", value: amount(invoice.totalMinor) },
+          ...((invoice.waivedMinor ?? 0) > 0 ? [{ label: "Amount waived", value: amount(invoice.waivedMinor) }] : []),
           { label: "Net paid", value: amount(invoice.netPaidMinor) },
           { label: "Outstanding balance", value: invoice.status === "void" ? "Not payable" : amount(invoice.balanceDueMinor) },
           ...(invoice.memo ? [{ label: "Invoice note", value: <p className="whitespace-pre-wrap">{invoice.memo}</p>, wide: true }] : []),
