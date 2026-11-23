@@ -34,6 +34,7 @@ import {
   versionColumn,
 } from "../../db/columns.js";
 import { users } from "../identity/schema.js";
+import { SIGNATURE_NAME_MATCH_RESULTS } from "./acceptanceSchema.js";
 
 /* ---------------------------------------------------------------- policies */
 
@@ -146,6 +147,8 @@ export const policyAcceptances = mysqlTable(
     context: mysqlEnum("context", POLICY_ACCEPTANCE_CONTEXTS),
     /** Optional AES-256-GCM encrypted typed signature (`policy_acceptances.signer_name:<publicId>`). */
     signerNameEnc: text("signer_name_enc"),
+    /** Increment 06 D11: server-side typed-name match outcome (`null` for checkbox or pre-06/imported rows). */
+    signerNameMatch: mysqlEnum("signer_name_match", SIGNATURE_NAME_MATCH_RESULTS),
     /** Optional internal order id when accepted in an order context (no cross-module FK). */
     orderId: refColumn("order_id"),
     orderPublicId: char("order_public_id", { length: 26 }),
@@ -503,9 +506,15 @@ export const complianceInvoicePayments = mysqlTable(
     method: mysqlEnum("method", PAYMENT_METHODS).notNull(),
     status: mysqlEnum("status", PAYMENT_RECORD_STATUSES).notNull().default("succeeded"),
     amountMinor: amountMinorColumn("amount_minor").notNull(),
+    /** Increment 06 D5/D15: minor units settled via small-total waiver (`0` for paid settlements). */
+    waivedMinor: amountMinorColumn("waived_minor").notNull().default(0),
     currency: currencyColumn("currency").notNull(),
     /** Staff-entered payment reference or provider charge/payment-intent reference (non-secret). */
     reference: varchar("reference", { length: 128 }).notNull(),
+    /** Increment 06 D15: card/network brand when supplied by provider (never full card number). */
+    paymentMethodBrand: varchar("payment_method_brand", { length: 32 }),
+    /** Increment 06 D15: last 4 digits when supplied by provider (never full card number). */
+    paymentMethodLast4: varchar("payment_method_last4", { length: 4 }),
     /** Optional AES-256-GCM encrypted staff notes (`compliance_invoice_payments.notes:<publicId>`). */
     notesEnc: text("notes_enc"),
     receivedAt: utcDateTime("received_at").notNull(),
@@ -604,6 +613,177 @@ export const complianceProviderEvents = mysqlTable(
       foreignColumns: [complianceInvoices.id],
     }),
     uniqueIndex("cmp_pevt_prov_evt_uq").on(t.provider, t.providerEventId),
+  ],
+);
+
+/* ------------------------------------------- payment receipts & refund notes */
+
+export const RECEIPT_SETTLEMENT_KINDS = [
+  "provider_online",
+  "manual_payment",
+  "waived_small_total",
+  "zero_total",
+] as const;
+export type ReceiptSettlementKind = (typeof RECEIPT_SETTLEMENT_KINDS)[number];
+
+export const RECEIPT_REFUND_STATES = [
+  "none",
+  "partially_refunded",
+  "refunded",
+] as const;
+export type ReceiptRefundState = (typeof RECEIPT_REFUND_STATES)[number];
+
+export const RECEIPT_NOTE_REFUND_STATES = [
+  "partially_refunded",
+  "refunded",
+] as const;
+export type ReceiptNoteRefundState = (typeof RECEIPT_NOTE_REFUND_STATES)[number];
+
+/**
+ * Increment 06 D15: One immutable receipt per confirmed payment or zero/waived checkout settlement.
+ * `snapshot_enc` and `pdf_enc` are encrypted with AES-256-GCM and NEVER altered after creation;
+ * refunds only advance `refunded_minor` / `refund_state` and append a row to `compliance_receipt_refund_notes`.
+ */
+export const compliancePaymentReceipts = mysqlTable(
+  "compliance_payment_receipts",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    /** Sequential human-facing number (`RPR-<year>-<6 digits>`, e.g. `RPR-2026-000001`). */
+    receiptNumber: varchar("receipt_number", { length: 32 }).notNull(),
+    sequenceNumber: int("sequence_number", { unsigned: true }).notNull(),
+    /** Idempotency key (`payment:<paymentId>` or `zero_invoice:<invoiceId>`). */
+    settlementKey: varchar("settlement_key", { length: 96 }).notNull(),
+    settlementKind: mysqlEnum("settlement_kind", RECEIPT_SETTLEMENT_KINDS).notNull(),
+    invoiceId: refColumn("invoice_id").notNull(),
+    invoicePublicId: char("invoice_public_id", { length: 26 }).notNull(),
+    /** Nullable only for `$0.00` zero-total settlements where no payment ledger row exists. */
+    paymentId: refColumn("payment_id"),
+    paymentPublicId: char("payment_public_id", { length: 26 }),
+    orderId: refColumn("order_id").notNull(),
+    orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+    orderReference: varchar("order_reference", { length: 48 }).notNull(),
+    customerUserId: refColumn("customer_user_id").notNull(),
+    customerRefSnapshot: varchar("customer_ref_snapshot", { length: 32 }),
+    currency: currencyColumn("currency").notNull(),
+    subtotalMinor: amountMinorColumn("subtotal_minor").notNull(),
+    discountMinor: amountMinorColumn("discount_minor").notNull().default(0),
+    bundleDiscountMinor: amountMinorColumn("bundle_discount_minor").notNull().default(0),
+    promoDiscountMinor: amountMinorColumn("promo_discount_minor").notNull().default(0),
+    promoLabelSnapshot: varchar("promo_label_snapshot", { length: 160 }),
+    taxMinor: amountMinorColumn("tax_minor").notNull().default(0),
+    amountWaivedMinor: amountMinorColumn("amount_waived_minor").notNull().default(0),
+    amountPaidMinor: amountMinorColumn("amount_paid_minor").notNull(),
+    refundedMinor: amountMinorColumn("refunded_minor").notNull().default(0),
+    refundState: mysqlEnum("refund_state", RECEIPT_REFUND_STATES).notNull().default("none"),
+    paymentMethod: mysqlEnum("payment_method", PAYMENT_METHODS).notNull(),
+    paymentMethodBrand: varchar("payment_method_brand", { length: 32 }),
+    paymentMethodLast4: varchar("payment_method_last4", { length: 4 }),
+    provider: varchar("provider", { length: 32 }),
+    providerReference: varchar("provider_reference", { length: 128 }),
+    issuedAt: utcDateTime("issued_at").notNull(),
+    emailedAt: utcDateTime("emailed_at"),
+    lastResentAt: utcDateTime("last_resent_at"),
+    resendCount: int("resend_count", { unsigned: true }).notNull().default(0),
+    /** AES-256-GCM encrypted JSON snapshot (`compliance_payment_receipts.snapshot:<publicId>`). */
+    snapshotEnc: mediumtext("snapshot_enc").notNull(),
+    /** AES-256-GCM encrypted PDF bytes (`compliance_payment_receipts.pdf:<publicId>`). */
+    pdfEnc: mediumtext("pdf_enc").notNull(),
+    pdfSha256: char("pdf_sha256", { length: 64 }).notNull(),
+    pdfByteSize: int("pdf_byte_size", { unsigned: true }).notNull(),
+    origin: mysqlEnum("origin", RECORD_ORIGINS).notNull().default("portal"),
+    importId: varchar("import_id", { length: 64 }),
+    sourceInstallationId: varchar("source_installation_id", { length: 128 }),
+    sourcePublicId: varchar("source_public_id", { length: 64 }),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    foreignKey({
+      name: "cmp_rcpt_inv_fk",
+      columns: [t.invoiceId],
+      foreignColumns: [complianceInvoices.id],
+    }),
+    foreignKey({
+      name: "cmp_rcpt_pmt_fk",
+      columns: [t.paymentId],
+      foreignColumns: [complianceInvoicePayments.id],
+    }),
+    foreignKey({
+      name: "cmp_rcpt_cust_fk",
+      columns: [t.customerUserId],
+      foreignColumns: [users.id],
+    }),
+    uniqueIndex("cmp_rcpt_number_uq").on(t.receiptNumber),
+    uniqueIndex("cmp_rcpt_settle_uq").on(t.settlementKey),
+    uniqueIndex("cmp_rcpt_pmt_uq").on(t.paymentId),
+    uniqueIndex("cmp_rcpt_imp_uq").on(t.sourceInstallationId, t.sourcePublicId),
+    index("cmp_rcpt_cust_issued_idx").on(t.customerUserId, t.issuedAt, t.id),
+    index("cmp_rcpt_ord_pub_idx").on(t.orderPublicId, t.issuedAt),
+    index("cmp_rcpt_inv_idx").on(t.invoiceId),
+    index("cmp_rcpt_issued_idx").on(t.issuedAt, t.id),
+  ],
+);
+
+/**
+ * Increment 06 D15: Append-only refund notes generated when a payment receipt is refunded or partially refunded.
+ */
+export const complianceReceiptRefundNotes = mysqlTable(
+  "compliance_receipt_refund_notes",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    /** Sequential human-facing number (`RPRN-<year>-<6 digits>`, e.g. `RPRN-2026-000001`). */
+    noteNumber: varchar("note_number", { length: 32 }).notNull(),
+    sequenceNumber: int("sequence_number", { unsigned: true }).notNull(),
+    receiptId: refColumn("receipt_id").notNull(),
+    receiptPublicId: char("receipt_public_id", { length: 26 }).notNull(),
+    refundId: refColumn("refund_id").notNull(),
+    refundPublicId: char("refund_public_id", { length: 26 }).notNull(),
+    orderId: refColumn("order_id").notNull(),
+    orderPublicId: char("order_public_id", { length: 26 }).notNull(),
+    customerUserId: refColumn("customer_user_id").notNull(),
+    currency: currencyColumn("currency").notNull(),
+    refundAmountMinor: amountMinorColumn("refund_amount_minor").notNull(),
+    cumulativeRefundedMinor: amountMinorColumn("cumulative_refunded_minor").notNull(),
+    resultingRefundState: mysqlEnum("resulting_refund_state", RECEIPT_NOTE_REFUND_STATES).notNull(),
+    reasonCode: varchar("reason_code", { length: 64 }).notNull(),
+    reference: varchar("reference", { length: 128 }).notNull(),
+    issuedAt: utcDateTime("issued_at").notNull(),
+    /** AES-256-GCM encrypted JSON snapshot (`compliance_receipt_refund_notes.snapshot:<publicId>`). */
+    snapshotEnc: mediumtext("snapshot_enc").notNull(),
+    /** AES-256-GCM encrypted PDF bytes (`compliance_receipt_refund_notes.pdf:<publicId>`). */
+    pdfEnc: mediumtext("pdf_enc").notNull(),
+    pdfSha256: char("pdf_sha256", { length: 64 }).notNull(),
+    pdfByteSize: int("pdf_byte_size", { unsigned: true }).notNull(),
+    origin: mysqlEnum("origin", RECORD_ORIGINS).notNull().default("portal"),
+    importId: varchar("import_id", { length: 64 }),
+    sourceInstallationId: varchar("source_installation_id", { length: 128 }),
+    sourcePublicId: varchar("source_public_id", { length: 64 }),
+    createdAt: createdAtColumn(),
+  },
+  (t) => [
+    foreignKey({
+      name: "cmp_rrn_rcpt_fk",
+      columns: [t.receiptId],
+      foreignColumns: [compliancePaymentReceipts.id],
+    }),
+    foreignKey({
+      name: "cmp_rrn_rfd_fk",
+      columns: [t.refundId],
+      foreignColumns: [complianceInvoiceRefunds.id],
+    }),
+    foreignKey({
+      name: "cmp_rrn_cust_fk",
+      columns: [t.customerUserId],
+      foreignColumns: [users.id],
+    }),
+    uniqueIndex("cmp_rrn_number_uq").on(t.noteNumber),
+    uniqueIndex("cmp_rrn_rfd_uq").on(t.refundId),
+    uniqueIndex("cmp_rrn_imp_uq").on(t.sourceInstallationId, t.sourcePublicId),
+    index("cmp_rrn_rcpt_idx").on(t.receiptId, t.issuedAt),
+    index("cmp_rrn_ord_pub_idx").on(t.orderPublicId, t.issuedAt),
+    index("cmp_rrn_cust_idx").on(t.customerUserId, t.issuedAt),
   ],
 );
 
