@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useId, useRef, useState, type FormEvent, type Ref } from "react";
 import { useLocation } from "wouter";
 import { useRefreshSession, useSession } from "@/lib/session";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
@@ -161,23 +161,110 @@ export function PolicyEnforcementRemediation() {
   );
 }
 
-function GraceDialog({ item, onElapsed }: { item: Pending; onElapsed: () => void }) {
+const snoozeFallback = new Map<string, number>();
+const SNOOZE_PREFIX = "rp:policy-snooze:";
+
+function snoozeStorage() {
+  // eslint-disable-next-line no-restricted-properties -- Approved by /root for tab-scoped policy snoozing: opaque public ids in the key and a numeric checkpoint only; no policy text, profile fields, or credentials.
+  return window.sessionStorage;
+}
+
+function usePolicySnooze(key: string, checkpoint = 0) {
+  const [dismissedAt, setDismissedAt] = useState<number | null>(() => {
+    const memory = snoozeFallback.get(key);
+    if (memory !== undefined) return memory;
+    try {
+      const value = snoozeStorage().getItem(key);
+      return value !== null && /^[0-3]$/u.test(value) ? Number(value) : null;
+    } catch { return null; }
+  });
+  const [reviewing, setReviewing] = useState(false);
+  const reminderButton = useRef<HTMLButtonElement>(null);
+  function dismiss() {
+    setReviewing(false);
+    setDismissedAt(checkpoint);
+    try {
+      snoozeStorage().setItem(key, String(checkpoint));
+      snoozeFallback.delete(key);
+    } catch { snoozeFallback.set(key, checkpoint); }
+    requestAnimationFrame(() => {
+      if (document.activeElement === document.body) reminderButton.current?.focus();
+    });
+  }
+  return {
+    open: reviewing || dismissedAt === null || checkpoint > dismissedAt,
+    hasDismissed: dismissedAt !== null,
+    reminderButton,
+    dismiss,
+    review: () => setReviewing(true),
+  };
+}
+
+// After "Later", reopen once at each closer deadline milestone: one hour, 15 minutes, one minute.
+// Crossing several milestones while the tab is inactive opens only one dialog at the latest one.
+const GRACE_MILESTONES_MS = [3_600_000, 900_000, 60_000] as const;
+function graceCheckpoint(deadline: number) {
+  return GRACE_MILESTONES_MS.filter((milestone) => deadline - Date.now() <= milestone).length;
+}
+
+function useGraceCheckpoint(deadline: number) {
+  const [checkpoint, setCheckpoint] = useState(() => graceCheckpoint(deadline));
+  useEffect(() => {
+    let timer: number | undefined;
+    const update = () => {
+      window.clearTimeout(timer);
+      const phase = graceCheckpoint(deadline);
+      setCheckpoint(phase);
+      const next = GRACE_MILESTONES_MS[phase];
+      if (next !== undefined) timer = window.setTimeout(update, Math.min(2_147_483_647, Math.max(1, deadline - next - Date.now())));
+    };
+    update();
+    window.addEventListener("focus", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [deadline]);
+  return checkpoint;
+}
+
+function PolicyReminder({ item, onReview, reviewRef }: { item?: Pending; onReview: () => void; reviewRef: Ref<HTMLButtonElement> }) {
+  return (
+    <section aria-label="Policy review reminder" className="border-b border-line bg-surface">
+      <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2">
+        <p className="min-w-0 break-words text-sm text-body">
+          {item ? <>Accept {item.title} to keep using the portal. Time remaining:{" "}
+            <Countdown to={item.deadline} label={`Deadline to accept ${item.title}`} announce="off" elapsedText="Deadline reached" />.</>
+            : "Updated policies are ready for your review."}
+        </p>
+        <Button ref={reviewRef} size="sm" variant="secondary" onClick={onReview}>Review policies</Button>
+      </div>
+    </section>
+  );
+}
+
+function GraceDialog({ item, snoozeKey, onElapsed }: { item: Pending; snoozeKey: string; onElapsed: () => void }) {
   const api = useTRPC().compliance.policies.enforcement;
   const refreshSession = useRefreshSession();
   const decline = useMutation(api.decline.mutationOptions());
-  const [later, setLater] = useState(false);
+  const checkpoint = useGraceCheckpoint(item.deadline.getTime());
+  const snooze = usePolicySnooze(snoozeKey, checkpoint);
   const [reading, setReading] = useState(false);
   const [confirmDecline, setConfirmDecline] = useState(false);
   const [error, setError] = useState<string>();
   const readerHeading = useRef<HTMLHeadingElement>(null);
+  const dismiss = () => { setReading(false); snooze.dismiss(); };
   return (
     <>
-      <Dialog open={!later && !confirmDecline} onOpenChange={(open) => { if (!open) setLater(true); }}
+      {snooze.hasDismissed ? <PolicyReminder item={item} onReview={snooze.review} reviewRef={snooze.reminderButton} /> : null}
+      <Dialog open={snooze.open && !confirmDecline} onOpenChange={(open) => { if (!open) dismiss(); }}
         title={reading ? "Read and accept the policy" : "An updated policy needs your attention"}
         description={reading ? "Review the exact version before accepting." : "You can review now or return before the deadline."}
         size="lg" footer={
           <div className="flex min-w-0 flex-wrap gap-2">
-            <Button variant="secondary" onClick={() => setLater(true)}>Later</Button>
+            <Button variant="secondary" onClick={dismiss}>Later</Button>
             <Button variant="secondary" onClick={() => setConfirmDecline(true)}>I do not accept</Button>
             {!reading ? <Button onClick={() => { setReading(true); requestAnimationFrame(() => readerHeading.current?.focus()); }}>Read and accept</Button> : null}
           </div>
@@ -187,7 +274,7 @@ function GraceDialog({ item, onElapsed }: { item: Pending; onElapsed: () => void
           {reading ? (
             <div>
               <h2 tabIndex={-1} ref={readerHeading} className="sr-only">Policy text and acceptance</h2>
-              <AcceptanceForm item={item} onAccepted={() => setLater(true)} />
+              <AcceptanceForm item={item} onAccepted={dismiss} />
             </div>
           ) : item.changeSummary ? <p className="break-words"><strong>What changed:</strong> {item.changeSummary}</p> : null}
         </div>
@@ -198,7 +285,7 @@ function GraceDialog({ item, onElapsed }: { item: Pending; onElapsed: () => void
           setError(undefined);
           try {
             await decline.mutateAsync({ versionPublicId: item.versionPublicId });
-            setLater(true);
+            snooze.dismiss();
             await refreshSession();
           } catch (cause) { setError(errorMessage(cause)); throw cause; }
         }}>
@@ -208,20 +295,25 @@ function GraceDialog({ item, onElapsed }: { item: Pending; onElapsed: () => void
   );
 }
 
-function RequiredUpdateDialog({ policies }: { policies: NonNullable<ReturnType<typeof usePolicyStatus>["data"]>["pendingRequired"] }) {
-  const [open, setOpen] = useState(true);
-  if (policies.length === 0) return null;
+function RequiredUpdateDialog({ policies, snoozeKey }: {
+  policies: NonNullable<ReturnType<typeof usePolicyStatus>["data"]>["pendingRequired"];
+  snoozeKey: string;
+}) {
+  const snooze = usePolicySnooze(snoozeKey);
   return (
-    <Dialog open={open} onOpenChange={setOpen} title="Updated policies need your review"
-      description="Review the latest required versions. You can read and accept them here, or return later."
-      size="lg" footer={<Button variant="secondary" onClick={() => setOpen(false)}>Later</Button>}>
-      <div className="min-w-0 space-y-4">
-        {policies.filter((item) => item.changeSummary).map((item) => (
-          <p key={item.versionPublicId} className="break-words"><strong>{item.title}, what changed:</strong> {item.changeSummary}</p>
-        ))}
-        <RequiredPolicyForms policies={policies} />
-      </div>
-    </Dialog>
+    <>
+      {snooze.hasDismissed ? <PolicyReminder onReview={snooze.review} reviewRef={snooze.reminderButton} /> : null}
+      <Dialog open={snooze.open} onOpenChange={(open) => { if (!open) snooze.dismiss(); }} title="Updated policies need your review"
+        description="Review the latest required versions. You can read and accept them here, or return later."
+        size="lg" footer={<Button variant="secondary" onClick={snooze.dismiss}>Later</Button>}>
+        <div className="min-w-0 space-y-4">
+          {policies.filter((item) => item.changeSummary).map((item) => (
+            <p key={item.versionPublicId} className="break-words"><strong>{item.title}, what changed:</strong> {item.changeSummary}</p>
+          ))}
+          <RequiredPolicyForms policies={policies} />
+        </div>
+      </Dialog>
+    </>
   );
 }
 
@@ -230,6 +322,7 @@ export function PolicyEnforcementPrompt() {
   const pending = usePendingEnforcement();
   const required = usePolicyStatus();
   const refreshSession = useRefreshSession();
+  const { me } = useSession();
   const [location] = useLocation();
   const refetchEnforcement = pending.refetch;
   const refetchRequired = required.refetch;
@@ -251,8 +344,13 @@ export function PolicyEnforcementPrompt() {
     schedule();
     return () => window.clearTimeout(timer);
   }, [deadline, refreshSession]);
-  if (item) return <GraceDialog key={item.versionPublicId} item={item} onElapsed={() => { void refreshSession(); }} />;
+  if (!me) return null;
+  if (item) {
+    const snoozeKey = `${SNOOZE_PREFIX}${me.user.publicId}:grace:${item.versionPublicId}:${deadline}`;
+    return <GraceDialog key={snoozeKey} snoozeKey={snoozeKey} item={item} onElapsed={() => { void refreshSession(); }} />;
+  }
   if (pending.isPending || pending.isError) return null;
   const policies = required.data?.pendingRequired ?? [];
-  return policies.length > 0 ? <RequiredUpdateDialog key={`${location}:${policies.map((policy) => policy.versionPublicId).join(":")}`} policies={policies} /> : null;
+  const snoozeKey = `${SNOOZE_PREFIX}${me.user.publicId}:update:${[...new Set(policies.map((policy) => policy.versionPublicId))].sort().join(":")}`;
+  return policies.length > 0 ? <RequiredUpdateDialog key={snoozeKey} snoozeKey={snoozeKey} policies={policies} /> : null;
 }

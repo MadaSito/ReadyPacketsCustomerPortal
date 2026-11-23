@@ -1,7 +1,7 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, type ReactNode } from "react";
-import { expect, it } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { pageA11y } from "@/test/a11y";
 import { renderWithTrpc } from "../acceptance/testkit";
 import { EndPolicySessionsAction } from "./PolicyEnforcementCards";
@@ -15,15 +15,27 @@ const item = {
   warningText: "Review {policy}. Time left: {timeLeft}.", requiresTypedSignature: true, blocking: false,
 };
 
+// eslint-disable-next-line no-restricted-properties -- Test-only inspection of the tab-scoped policy snooze preference.
+const testStorage = window.sessionStorage;
+beforeEach(() => { testStorage.clear(); });
+
 function Host({ children }: { children: ReactNode }) {
   useEffect(() => { document.title = "Policies | ReadyPackets"; }, []);
   return <main><h1>Policies</h1><button type="button">Portal control</button>{children}</main>;
 }
 
-function grace() {
+function grace(policy = item) {
   return renderWithTrpc(<Host><PolicyEnforcementPrompt /></Host>, {
-    "compliance.policies.enforcement.pending": () => [item],
+    "compliance.policies.enforcement.pending": () => [policy],
     "compliance.policies.myStatus": () => ({ pendingRequired: [] }),
+  }, { role: "customer" });
+}
+
+const informationalPolicy = { ...item, versionNumber: 2, effectiveAt: new Date("2026-11-20T12:00:00Z") };
+function informational(current: () => (typeof informationalPolicy)[]) {
+  return renderWithTrpc(<Host><PolicyEnforcementPrompt /></Host>, {
+    "compliance.policies.enforcement.pending": () => [],
+    "compliance.policies.myStatus": () => ({ pendingRequired: current() }),
   }, { role: "customer" });
 }
 
@@ -54,6 +66,92 @@ it("enters the grace dialog, moves keyboard focus into policy review, and dismis
   expect(within(dialog).getByRole("button", { name: "Accept this version" })).toBeDisabled();
   await userEvent.keyboard("{Escape}");
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+});
+
+it("snoozes the same exact informational versions across navigation and remounts, but prompts for a new version", async () => {
+  const second = { ...informationalPolicy, title: "Privacy policy", versionPublicId: "01JD0000000000000000000410" };
+  let versions = [informationalPolicy, second];
+  const first = informational(() => versions);
+  const title = "Updated policies need your review";
+  const dialog = await screen.findByRole("dialog", { name: title });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Later" }));
+  const banner = await screen.findByRole("region", { name: "Policy review reminder" });
+  expect(banner).not.toHaveAttribute("aria-live");
+  expect(screen.queryByRole("dialog", { name: title })).not.toBeInTheDocument();
+  expect(testStorage.key(0)).toContain(":01JD0000000000000000000001:update:");
+
+  const queryCount = first.calls.filter(({ path }) => path === "compliance.policies.myStatus").length;
+  versions = [second, informationalPolicy];
+  await act(async () => first.location.navigate("/orders/synthetic/files"));
+  await waitFor(() => expect(first.calls.filter(({ path }) => path === "compliance.policies.myStatus").length).toBeGreaterThan(queryCount));
+  expect(screen.queryByRole("dialog", { name: title })).not.toBeInTheDocument();
+  expect(screen.getByRole("region", { name: "Policy review reminder" })).toBe(banner);
+  await userEvent.click(within(banner).getByRole("button", { name: "Review policies" }));
+  expect(await screen.findByRole("dialog", { name: title })).toBeInTheDocument();
+  await userEvent.keyboard("{Escape}");
+  expect(await screen.findByRole("button", { name: "Review policies" })).toHaveFocus();
+  first.unmount();
+
+  const secondView = informational(() => versions);
+  expect(await screen.findByRole("region", { name: "Policy review reminder" })).toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: title })).not.toBeInTheDocument();
+  versions = [second, { ...informationalPolicy, versionPublicId: "01JD0000000000000000000412", versionLabel: "3.0" }];
+  await act(async () => secondView.location.navigate("/orders/synthetic/overview"));
+  expect(await screen.findByRole("dialog", { name: title })).toHaveTextContent("Version 2 · 3.0");
+});
+
+it("remembers an Escape dismissal in memory when storage writes are blocked", async () => {
+  const version = { ...informationalPolicy, versionPublicId: "01JD0000000000000000000413" };
+  const write = Storage.prototype.setItem;
+  const mocked = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+    if (this === testStorage && key.startsWith("rp:policy-snooze:")) throw new DOMException("Storage disabled");
+    write.call(this, key, value);
+  });
+  try {
+    const first = informational(() => [version]);
+    await screen.findByRole("dialog", { name: "Updated policies need your review" });
+    await userEvent.keyboard("{Escape}");
+    await screen.findByRole("region", { name: "Policy review reminder" });
+    expect(testStorage.length).toBe(0);
+    first.unmount();
+    informational(() => [version]);
+    expect(await screen.findByRole("region", { name: "Policy review reminder" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  } finally {
+    mocked.mockRestore();
+  }
+});
+
+it("keeps a grace countdown visible on navigation and alerts once per crossed checkpoint", async () => {
+  const now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+  const policy = { ...item, deadline: new Date(now + 90 * 60_000) };
+  try {
+    const view = grace(policy);
+    const title = "An updated policy needs your attention";
+    await userEvent.click(within(await screen.findByRole("dialog", { name: title })).getByRole("button", { name: "Later" }));
+    const banner = await screen.findByRole("region", { name: "Policy review reminder" });
+    expect(banner).toHaveTextContent("Time remaining:");
+    expect(banner.querySelector("time")).toHaveAttribute("datetime", policy.deadline.toISOString());
+    const queryCount = view.calls.filter(({ path }) => path === "compliance.policies.enforcement.pending").length;
+    await act(async () => view.location.navigate("/orders/synthetic/files"));
+    await waitFor(() => expect(view.calls.filter(({ path }) => path === "compliance.policies.enforcement.pending").length).toBeGreaterThan(queryCount));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Policy review reminder" })).toBe(banner);
+    clock.mockReturnValue(now + 30 * 60_000 + 1);
+    fireEvent(document, new Event("visibilitychange"));
+    await userEvent.click(within(await screen.findByRole("dialog", { name: title })).getByRole("button", { name: "Later" }));
+    fireEvent(document, new Event("visibilitychange"));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    clock.mockReturnValue(now + 76 * 60_000);
+    fireEvent(document, new Event("visibilitychange"));
+    await userEvent.click(within(await screen.findByRole("dialog", { name: title })).getByRole("button", { name: "Later" }));
+    clock.mockReturnValue(now + 89 * 60_000 + 1);
+    fireEvent(document, new Event("visibilitychange"));
+    expect(await screen.findByRole("dialog", { name: title })).toBeInTheDocument();
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 it("requires review and consent, focuses the missing signature, then submits the exact version and hash", async () => {
