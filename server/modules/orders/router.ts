@@ -6,7 +6,7 @@ import { z } from "zod";
 import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS, WORKFLOW_DRAFT_SOURCES } from "./schema.js";
-import { bundleRuleSchema } from "./settings.js";
+import { AGREEMENT_SIGNATURE_MODES, bundleRuleSchema } from "./settings.js";
 
 const id = z.string().regex(ULID_PATTERN);
 const nfc = (min: number, max: number) =>
@@ -97,6 +97,11 @@ const catalogAdmin = router({
 /* ---- increment 05 (A1): workflow export / import. Bodies travel in POST (http caps these two paths). ---- */
 const transferPackageText = z.string().min(1).max(2_097_152);
 const workflowTransfer = router({
+  /** Increment 06 (D10): the on-page switch (audited). */
+  setEnabled: adminProcedure
+    .use(requireCapability("workflows.manage"))
+    .input(z.strictObject({ enabled: z.boolean() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.setEnabled(ctx.session, input)),
   status: adminProcedure.use(requireCapability("workflows.manage")).query(({ ctx }) => ctx.services.orders.workflowTransfer.status(ctx.session)),
   export: adminProcedure
     .use(requireCapability("workflows.export"))
@@ -126,6 +131,22 @@ const workflowTransfer = router({
       }),
     )
     .mutation(({ ctx, input }) => ctx.services.orders.workflowTransfer.applyImport(ctx.session, input)),
+});
+
+/* ---- increment 06 (D14): order agreement (MNDA) — the compliance admin card calls these. ---- */
+const agreementSettingInput = z.strictObject({
+  enabled: z.boolean(),
+  policyPublicId: id.nullable(),
+  applyTo: z.strictObject({ placeOrder: z.boolean(), workOnOrder: z.boolean() }),
+  signatureMode: z.enum(AGREEMENT_SIGNATURE_MODES),
+  askAgainOnNewVersion: z.boolean(),
+});
+const agreementGateAdmin = router({
+  get: adminProcedure.use(requireCapability("policies.manage")).query(({ ctx }) => ctx.services.orders.agreementGate.get(ctx.session)),
+  update: adminProcedure
+    .use(requireCapability("policies.manage"))
+    .input(z.strictObject({ setting: agreementSettingInput, expectedEnabled: z.boolean().optional() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.agreementGate.update(ctx.session, input)),
 });
 
 const workflowsAdmin = router({
@@ -259,7 +280,14 @@ export const ordersRouter = router({
       .input(z.strictObject({ orderId: id, expectedVersion: version, name: z.string().max(400) }))
       .mutation(({ ctx, input }) => ctx.services.orders.orders.rename(ctx.session, input)),
   }),
+  /** Increment 06 (D14): the signed-in user's own agreement state (display only; writes re-check). */
+  agreement: router({
+    status: protectedProcedure
+      .input(z.strictObject({ scope: z.enum(["placeOrder", "workOnOrder"]) }))
+      .query(({ ctx, input }) => ctx.services.orders.agreementGate.status(ctx.session, input)),
+  }),
   admin: router({
+    agreementGate: agreementGateAdmin,
     list: staffProcedure
       .use(requireCapability("orders.read_all"))
       .input(
@@ -362,6 +390,16 @@ export const ordersRouter = router({
         }),
       )
       .mutation(({ ctx, input }) => ctx.services.orders.requirements.acknowledge(ctx.session, input)),
+    /** Increment 06 (D8): staff write the per-order note of an `order_note` acknowledgement task. */
+    setTaskNote: staffProcedure
+      .use(requireCapability("orders.manage"))
+      .input(z.strictObject({ orderId: id, statusKey, ackKey: statusKey, body: z.string().min(1).max(4000), expectedVersion: version.optional() }))
+      .mutation(({ ctx, input }) => ctx.services.orders.requirements.setTaskNote(ctx.session, input)),
+    /** Increment 06 (D8): staff waive one customer task with a reason (audited). */
+    waive: staffProcedure
+      .use(requireCapability("orders.phase.unlock"))
+      .input(z.strictObject({ orderId: id, statusKey, taskKey: statusKey, reason: nfc(10, 500) }))
+      .mutation(({ ctx, input }) => ctx.services.orders.requirements.waiveTask(ctx.session, input)),
   }),
   phases: router({
     unlock: staffProcedure

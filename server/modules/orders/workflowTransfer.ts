@@ -14,6 +14,7 @@ import { z } from "zod";
 import { validation } from "../../core/errors.js";
 import {
   draftAcknowledgementSchema,
+  draftDocumentTaskSchema,
   draftStateSchema,
   draftTransitionSchema,
   draftUploadSchema,
@@ -29,7 +30,10 @@ import {
 import { FOLDER_TEMPLATE_MAX, GATE_SIGNATURE_MODES, MAX_ACCEPTANCE_GATES, MAX_PHASES, usesWorkflowRules, workflowDefinitionSchema } from "./workflowTypes.js";
 
 export const TRANSFER_FORMAT = "readypackets.workflows";
-export const TRANSFER_FORMAT_VERSION = 1;
+/** Increment 06 (D8): version 2 adds customer tasks (record options, order-note acknowledgements, documents). */
+export const TRANSFER_FORMAT_VERSION = 2;
+/** Versions this installation can import. Version 1 files are a subset of version 2. */
+export const TRANSFER_READABLE_VERSIONS: readonly number[] = [1, 2];
 export const TRANSFER_MAX_BYTES = 2 * 1024 * 1024;
 export const TRANSFER_MAX_WORKFLOWS = 50;
 export const TRANSFER_MAX_DEPTH = 24;
@@ -60,7 +64,11 @@ const packageDefinitionSchema = z.strictObject({
       z.strictObject({
         ...draftStateSchema.shape,
         requirements: z
-          .strictObject({ uploads: z.array(draftUploadSchema).max(10), acknowledgements: z.array(draftAcknowledgementSchema).max(5) })
+          .strictObject({
+            uploads: z.array(draftUploadSchema).max(10),
+            acknowledgements: z.array(draftAcknowledgementSchema).max(5),
+            documents: z.array(draftDocumentTaskSchema).max(5).optional(),
+          })
           .optional(),
       }),
     )
@@ -94,7 +102,7 @@ export type PackagePolicy = z.output<typeof packagePolicySchema>;
 
 const packageSchema = z.strictObject({
   format: z.literal(TRANSFER_FORMAT),
-  formatVersion: z.literal(TRANSFER_FORMAT_VERSION),
+  formatVersion: z.union([z.literal(1), z.literal(TRANSFER_FORMAT_VERSION)]),
   exportedAt: z.string().max(40).refine((value) => !Number.isNaN(Date.parse(value)), "Use an ISO date."),
   source: z.strictObject({ release: z.string().max(80), label: z.string().max(120) }),
   // Bounded far above the product limit so "51 workflows" is reported as a plain blocking error, not a schema dump.
@@ -195,7 +203,7 @@ export function parsePackage(packageText: string): ParsedPackage {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw refuse("PACKAGE_INVALID", "The file is not a workflow export.");
   const head = raw as Record<string, unknown>;
   if (head.format !== TRANSFER_FORMAT) throw refuse("PACKAGE_FORMAT_UNSUPPORTED", "The file is not a ReadyPackets workflow export.");
-  if (head.formatVersion !== TRANSFER_FORMAT_VERSION)
+  if (typeof head.formatVersion !== "number" || !TRANSFER_READABLE_VERSIONS.includes(head.formatVersion))
     throw refuse("PACKAGE_FORMAT_UNSUPPORTED", "The file was made by a version of ReadyPackets this installation cannot read. Update this installation or export again.");
   const parsed = packageSchema.safeParse(raw);
   if (!parsed.success) {

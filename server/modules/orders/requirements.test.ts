@@ -198,7 +198,7 @@ describe("requirements block transitions until met", () => {
     expect(view.uploads[0]).toMatchObject({ key: "brief", count: 0, met: false, canUpload: true });
     expect(view.acknowledgements[0]).toMatchObject({ key: "terms", textSha256: termsSha, met: false, canAccept: true });
     const refused = await expectError(move(alice, orderId, "in_review"), "VALIDATION:REQUIREMENTS_UNMET");
-    expect(refused.details).toEqual({ uploads: ["brief"], acknowledgements: ["terms"] });
+    expect(refused.details).toEqual({ uploads: ["brief"], acknowledgements: ["terms"], documents: [] });
     await expectError(move(staff, orderId, "in_review"), "VALIDATION:REQUIREMENTS_UNMET");
   });
 
@@ -237,7 +237,18 @@ describe("requirements block transitions until met", () => {
   it("files ports expose writable slots per actor side", async () => {
     expect(await mod.getFileUploadSlots(alice.principal, orderId)).toEqual({
       statusKey: "submitted",
-      slots: [{ key: "brief", label: "Project brief", kind: "document", maxCount: 2, allowedTypes: ["pdf", "docx"] }],
+      slots: [
+        {
+          key: "brief",
+          label: "Project brief",
+          kind: "document",
+          maxCount: 2,
+          allowedTypes: ["pdf", "docx"],
+          task: { kind: "upload", taskKey: "brief" },
+          acceptsUpload: true,
+          acceptsEdit: false,
+        },
+      ],
     });
     expect((await mod.getFileUploadSlots(staff.principal, orderId)).slots).toEqual([]);
     await expectError(mod.getFileUploadSlots(bob.principal, orderId), "NOT_FOUND:ORDER_NOT_FOUND");

@@ -10,7 +10,8 @@
  *   key and fresh step-up, and only ever creates DRAFTS (nothing is published, no default changes, no order is
  *   touched). Audit `workflow.imported`. A replay with the same key and the same request returns the first
  *   result; a different request under the same key is refused (IDEMPOTENCY_KEY_REUSED).
- * - Off by default: setting `orders.workflow_transfer.enabled`.
+ * - Setting `orders.workflow_transfer.enabled`: ON by default since increment 06 (D10). When off, administrators
+ *   with `workflows.manage` turn it back on from the Workflows page (`setEnabled`, audited).
  */
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { roleHasCapability } from "../../../shared/capabilities.js";
@@ -53,6 +54,8 @@ export interface WorkflowTransferDeps {
   actorCheck: ActorCheck;
   /** `orders.workflow_transfer.enabled`. */
   enabled: (tx?: Tx) => Promise<boolean>;
+  /** Writes `orders.workflow_transfer.enabled` inside `tx` (the settings store audits the change too). */
+  writeEnabled: (value: boolean, tx: Tx) => Promise<void>;
   /** `orders.workflow_rules.enabled` (only for the RULES_DISABLED warning). */
   rulesEnabled: (tx?: Tx) => Promise<boolean>;
   release: string;
@@ -64,6 +67,8 @@ export type TransferSelection = { all: true } | { workflowKeys: string[] };
 
 export interface TransferStatus {
   enabled: boolean;
+  /** Increment 06 (D10): may this administrator switch the feature on or off from the Workflows page? */
+  canToggle: boolean;
   canExport: boolean;
   canImport: boolean;
   maxBytes: number;
@@ -116,7 +121,7 @@ interface LocalPolicy {
   audience: string;
 }
 
-const DISABLED = () => new DomainError("FORBIDDEN", "WORKFLOW_TRANSFER_DISABLED", "Workflow export and import are switched off. An administrator can turn them on in Settings.");
+const DISABLED = () => new DomainError("FORBIDDEN", "WORKFLOW_TRANSFER_DISABLED", "Workflow export and import are switched off. An administrator can turn them on from the Workflows page.");
 const GATE_AUDIENCES = new Set(["all", "customer"]);
 
 function isDuplicateEntry(error: unknown): boolean {
@@ -264,11 +269,36 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
     async status(principal: SessionPrincipal): Promise<TransferStatus> {
       return {
         enabled: await deps.enabled(),
+        canToggle: principal.role === "admin" && roleHasCapability(principal.role, "workflows.manage"),
         canExport: principal.role === "admin" && roleHasCapability(principal.role, "workflows.export"),
         canImport: principal.role === "admin" && roleHasCapability(principal.role, "workflows.import"),
         maxBytes: TRANSFER_MAX_BYTES,
         maxWorkflows: TRANSFER_MAX_WORKFLOWS,
       };
+    },
+
+    /** Increment 06 (D10): the on-page switch. Admin + `workflows.manage`, re-checked in-tx; audited. */
+    async setEnabled(principal: SessionPrincipal, input: { enabled: boolean }): Promise<{ enabled: boolean; changed: boolean }> {
+      return deps.db.transaction(async (tx) => {
+        const current = await deps.actorCheck(principal, tx, "workflows.manage");
+        if (current.role !== "admin") throw new DomainError("FORBIDDEN", "ACTOR_NOT_AUTHORIZED", "You do not have permission to perform this action.");
+        const before = await deps.enabled(tx);
+        if (before === input.enabled) return { enabled: before, changed: false };
+        await deps.writeEnabled(input.enabled, tx);
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "workflow.transfer_setting_changed",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "platform_setting" },
+            attributes: { setting_key: "orders.workflow_transfer.enabled", from_value: String(before), to_value: String(input.enabled), via: "workflows_page" },
+          },
+          tx,
+        );
+        return { enabled: input.enabled, changed: true };
+      });
     },
 
     async exportPackage(principal: SessionPrincipal, input: { selection: TransferSelection }): Promise<{ fileName: string; packageText: string }> {

@@ -41,6 +41,18 @@ export const MAX_SLOT_COUNT = 20;
 export const ACK_BODY_MAX = 8000;
 
 export const MAX_ACCEPTANCE_GATES = 10;
+/** Increment 06 (D8) customer tasks. */
+export const CAPTURE_MODES = ["record", "upload", "either"] as const;
+export type CaptureMode = (typeof CAPTURE_MODES)[number];
+export const MAX_RECORD_MINUTES = 120;
+export const ACK_SOURCES = ["definition", "order_note"] as const;
+export const DOCUMENT_RESPONSE_MODES = ["edit_in_portal", "upload_reply", "acknowledge"] as const;
+export type DocumentResponseMode = (typeof DOCUMENT_RESPONSE_MODES)[number];
+export const MAX_DOCUMENT_TASKS = 5;
+/** Leaves room for the `_reply` suffix inside the 48-character slot key. */
+export const DOCUMENT_TASK_KEY_MAX = 42;
+export const DOCUMENT_REPLY_SUFFIX = "_reply";
+export const TASK_NOTE_MAX = 4000;
 export const GATE_SIGNATURE_MODES = ["checkbox", "typed_name"] as const;
 export const FOLDER_TEMPLATE_MAX = 400;
 
@@ -73,8 +85,16 @@ export const uploadRequirementSchema = z
     allowedTypes: z.array(z.string().regex(/^[a-z0-9]{1,10}$/, "Use a lowercase extension without a dot.")).max(20),
     uploadedBy: z.array(z.enum(WORKFLOW_ACTORS)).min(1).max(4),
     storageFolder: storageFolderSchema.optional(),
+    /** Increment 06 (D8): audio tasks only — how the customer provides it (record task). Absent ⇒ "either". */
+    capture: z.enum(CAPTURE_MODES).optional(),
+    /** Increment 06 (D8): audio tasks only — longest accepted recording, in minutes. */
+    maxMinutes: z.number().int().min(1).max(MAX_RECORD_MINUTES).optional(),
   })
-  .refine((slot) => slot.minCount <= slot.maxCount, { message: "Minimum cannot exceed maximum.", path: ["minCount"] });
+  .refine((slot) => slot.minCount <= slot.maxCount, { message: "Minimum cannot exceed maximum.", path: ["minCount"] })
+  .refine((slot) => slot.kind === "audio" || (slot.capture === undefined && slot.maxMinutes === undefined), {
+    message: "Recording options apply to audio tasks only.",
+    path: ["capture"],
+  });
 
 export const acknowledgementRequirementSchema = z.strictObject({
   key,
@@ -82,11 +102,32 @@ export const acknowledgementRequirementSchema = z.strictObject({
   body: plainText(ACK_BODY_MAX),
   acceptedBy: z.enum(ACK_SIDES),
   requireTypedName: z.boolean(),
+  /**
+   * Increment 06 (D8): `order_note` ⇒ staff write a note per order and step; the acknowledged text is the title,
+   * this body (an introduction) and the note. Absent ⇒ "definition".
+   */
+  source: z.enum(ACK_SOURCES).optional(),
+});
+
+/** Increment 06 (D8): respond_document — staff upload a document; the customer edits it, uploads a reply or acknowledges it. */
+export const documentTaskSchema = z.strictObject({
+  key: z
+    .string()
+    .min(2)
+    .max(DOCUMENT_TASK_KEY_MAX)
+    .regex(/^[a-z][a-z0-9_]*$/, "Use lowercase letters, digits and underscores."),
+  label,
+  hint: z.string().trim().max(200).optional(),
+  responseModes: z.array(z.enum(DOCUMENT_RESPONSE_MODES)).min(1).max(3),
+  required: z.boolean(),
+  allowedTypes: z.array(z.string().regex(/^[a-z0-9]{1,10}$/, "Use a lowercase extension without a dot.")).max(20),
 });
 
 export const stateRequirementsSchema = z.strictObject({
   uploads: z.array(uploadRequirementSchema).max(MAX_UPLOAD_SLOTS),
   acknowledgements: z.array(acknowledgementRequirementSchema).max(MAX_ACKNOWLEDGEMENTS),
+  /** Increment 06 (D8). Absent in older definitions. */
+  documents: z.array(documentTaskSchema).max(MAX_DOCUMENT_TASKS).optional(),
 });
 
 export const workflowStateSchema = z.strictObject({
@@ -154,6 +195,16 @@ export const workflowDefinitionSchema = z
       if (!req) continue;
       const slotKeys = new Set(req.uploads.map((slot) => slot.key));
       if (slotKeys.size !== req.uploads.length) ctx.addIssue({ code: "custom", message: `Duplicate upload slot in ${state.key}.`, path: ["states"] });
+      const taskKeys = new Set([...slotKeys, ...req.acknowledgements.map((ack) => ack.key)]);
+      for (const doc of req.documents ?? []) {
+        for (const slotKey of [doc.key, documentReplySlotKey(doc.key)]) {
+          if (taskKeys.has(slotKey))
+            ctx.addIssue({ code: "custom", message: `Task key ${slotKey} is used twice in ${state.key}.`, path: ["states"] });
+          taskKeys.add(slotKey);
+        }
+        if (new Set(doc.responseModes).size !== doc.responseModes.length)
+          ctx.addIssue({ code: "custom", message: `Document task ${doc.key} lists a response twice.`, path: ["states"] });
+      }
       const ackKeys = new Set(req.acknowledgements.map((ack) => ack.key));
       if (ackKeys.size !== req.acknowledgements.length)
         ctx.addIssue({ code: "custom", message: `Duplicate acknowledgement in ${state.key}.`, path: ["states"] });
@@ -167,13 +218,24 @@ export type WorkflowPhase = NonNullable<WorkflowDefinition["phases"]>[number];
 export type UploadRequirement = z.output<typeof uploadRequirementSchema>;
 export type AcknowledgementRequirement = z.output<typeof acknowledgementRequirementSchema>;
 export type AcceptanceGate = z.output<typeof acceptanceGateSchema>;
+export type DocumentTask = z.output<typeof documentTaskSchema>;
+
+/** Slot key of the customer's reply to a respond_document task. */
+export function documentReplySlotKey(taskKey: string): string {
+  return `${taskKey}${DOCUMENT_REPLY_SUFFIX}`;
+}
+
+/** D8 task kind of an upload requirement: audio with a capture mode or length limit is a record task. */
+export function uploadTaskKind(slot: UploadRequirement): "upload" | "record" {
+  return slot.kind === "audio" && (slot.capture !== undefined || slot.maxMinutes !== undefined) ? "record" : "upload";
+}
 
 /** True when a definition uses increment-04 rules (phases or any requirement). */
 export function usesWorkflowRules(definition: WorkflowDefinition): boolean {
   return (
     (definition.phases?.length ?? 0) > 0 ||
     (definition.acceptanceGates?.length ?? 0) > 0 ||
-    definition.states.some((state) => state.phase !== undefined || (state.requirements && (state.requirements.uploads.length > 0 || state.requirements.acknowledgements.length > 0)))
+    definition.states.some((state) => state.phase !== undefined || (state.requirements && (state.requirements.uploads.length > 0 || state.requirements.acknowledgements.length > 0 || (state.requirements.documents?.length ?? 0) > 0)))
   );
 }
 
@@ -182,8 +244,8 @@ export function phaseOf(definition: WorkflowDefinition, stateKey: string): strin
 }
 
 /** Exact text whose SHA-256 an acknowledgement record pins. */
-export function acknowledgementText(ack: { title: string; body: string }): string {
-  return `${ack.title}\n\n${ack.body}`;
+export function acknowledgementText(ack: { title: string; body: string }, orderNote?: string): string {
+  return orderNote === undefined ? `${ack.title}\n\n${ack.body}` : `${ack.title}\n\n${ack.body}\n\n${orderNote}`;
 }
 
 export function initialState(definition: WorkflowDefinition): WorkflowState {
