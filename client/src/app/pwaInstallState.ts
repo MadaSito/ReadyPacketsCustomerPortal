@@ -25,10 +25,20 @@ let installed = false;
 let standalone: MediaQueryList | undefined;
 let busy = false;
 
-function readDismissal(): boolean {
+/** Device preference store. Not used in the preview profile, where browser storage is unavailable. */
+function preferenceStorage(): Storage | null {
+  if (RUNTIME.preview || typeof window === "undefined") return null;
   try {
     // eslint-disable-next-line no-restricted-properties -- approved device preference only, never session material.
-    return window.localStorage.getItem(preferenceKey) === "1";
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readDismissal(): boolean {
+  try {
+    return preferenceStorage()?.getItem(preferenceKey) === "1";
   } catch {
     return false;
   }
@@ -48,8 +58,7 @@ export function dismissInstall() {
   dismissed = true;
   native = null;
   try {
-    // eslint-disable-next-line no-restricted-properties -- approved device preference only, never session material.
-    window.localStorage.setItem(preferenceKey, "1");
+    preferenceStorage()?.setItem(preferenceKey, "1");
   } catch {
     // Browsers that deny storage still remember dismissal for this page.
   }
