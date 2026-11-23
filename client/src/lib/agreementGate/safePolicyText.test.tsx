@@ -29,10 +29,11 @@ describe("imported table round trip", () => {
   it("renders cells containing pipes and backslashes exactly as authored", () => {
     const html =
       "<table><tr><th>Key</th><th>Value</th></tr><tr><td>A | B</td><td>C:\\temp\\</td></tr></table>";
-    const markdown = htmlToMarkdown(html);
-    expect(markdown).toContain("A \\| B");
-    expect(markdown).toContain("C:\\\\temp\\\\ |");
-    render(<SafePolicyText bodyText={markdown} format="safe_markdown" />);
+    // The literal is asserted against the importer's output and then rendered, so both halves of the
+    // round trip are pinned to the same text.
+    const expected = "| Key | Value |\n| --- | --- |\n| A \\| B | C:\\\\temp\\\\ |";
+    expect(htmlToMarkdown(html)).toBe(expected);
+    render(<SafePolicyText bodyText={expected} format="safe_markdown" />);
     const cells = screen.getAllByRole("cell").map((cell) => cell.textContent);
     expect(cells).toEqual(["A | B", "C:\\temp\\"]);
     expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual(["Key", "Value"]);
