@@ -11,10 +11,10 @@ import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { registerAutomationTrigger } from "../automations/contracts.js";
 import { readSetting, writeSetting } from "../platform/settingsRegistry.js";
 import type { PublicApiProviders } from "../publicApi/ports.js";
-import { acceptsDeclaredType, allowedExtensions, classifyFile, displayExtension, sanitizeDisplayName, type FileClassification, type FileExtension } from "./classification.js";
-import { audioJob, AudioConversionError, convertAudio, maxAudioOutputBytes, probeAudioBinary } from "./audio.js";
+import { acceptsDeclaredType, allowedExtensions, audioExtensions, classifyFile, displayExtension, documentExtensions, docxMime, sanitizeDisplayName, type FileClassification, type FileExtension } from "./classification.js";
+import { audioJob, AudioConversionError, convertAudio, maxAudioOutputBytes, measureTaskAudio, probeAudioBinary } from "./audio.js";
 import { fileAccessLog, fileDownloadTickets, orderFiles, type FileCategory, type FileVisibility } from "./schema.js";
-import { audioRulesSchema, audioRulesSetting, fileRulesSetting, hardMaxFileBytes, hardMaxFiles, hardMaxRequestBytes, slotKeySchema, transcriptSchema, type AudioRules, type FileRules } from "./settings.js";
+import { audioRulesSchema, audioRulesSetting, documentEditingRulesSchema, documentEditingSetting, fileRulesSetting, hardMaxFileBytes, hardMaxFiles, hardMaxRequestBytes, slotKeySchema, transcriptSchema, type AudioRules, type DocumentEditingRules, type FileRules } from "./settings.js";
 import type { LocalObjectStorage } from "./storage.js";
 
 export type { FileCategory, FileVisibility } from "./schema.js";
@@ -37,6 +37,7 @@ export interface FileRecord {
   statusKey: string | null;
   slotKey: string | null;
   derivedFromPublicId: string | null;
+  derivedFromFileId?: string | null;
   conversionState: "converting" | "converted" | "failed" | null;
   conversionReason: string | null;
   durationSeconds: number | null;
@@ -58,6 +59,7 @@ export interface ListOptions {
   limit?: number;
   includeVersions?: boolean;
   includeDeleted?: boolean;
+  preferConvertedAudio?: boolean;
 }
 type Page<T> = { items: T[]; nextCursor: string | null };
 export type PortableStoredFile = FileRecord & { storageKey: string; orderId: number; ownerUserId: number; ownerPublicId: string };
@@ -79,8 +81,17 @@ export interface AdoptVerifiedObjectInput {
   createdAt?: Date;
 }
 
-export type FileUploadSlot = { key: string; label: string; kind: "document" | "audio"; maxCount: number; allowedTypes: readonly string[] };
-export type UploadOptions = { category: FileCategory; visibility: FileVisibility; versionOf?: string; slotKey?: string; statusKey?: string; source?: "recording" };
+export type FileUploadSlot = {
+  key: string; label: string; kind: "document" | "audio"; maxCount: number; allowedTypes: readonly string[];
+  capture?: "record" | "upload" | "either"; maxMinutes?: number;
+  acceptsUpload?: boolean; acceptsEdit?: boolean; sourceSlotKey?: string;
+  task?: { kind: "upload" | "record" | "document_source" | "document_reply"; taskKey: string };
+};
+export type RecordingPreflightStatus = {
+  enabled: boolean; conversionAvailable: boolean; maxMinutes: number; maxBytes: number; acceptedTypes: string[];
+};
+export type DocumentLocator = { orderPublicId: string; filePublicId: string; taskKey?: string };
+export type UploadOptions = { category: FileCategory; visibility: FileVisibility; versionOf?: string; slotKey?: string; statusKey?: string; source?: "recording" | "document_edit" };
 export type UploadAuthorization = UploadOptions & {
   orderId: number;
   orderPublicId: string;
@@ -88,6 +99,7 @@ export type UploadAuthorization = UploadOptions & {
   statusKey: string;
   rules: FileRules;
   slot?: FileUploadSlot;
+  taskKey?: string;
 };
 export type StagedUpload = { info: StoredObjectInfo; classification: FileClassification; displayName: string };
 export type Download = { file: FileRecord; stream: Readable };
@@ -103,6 +115,15 @@ export interface FilesModule extends ModuleLifecycle {
   commitUpload(principal: SessionPrincipal, upload: UploadAuthorization, staged: StagedUpload, transcript?: string): Promise<FileRecord>;
   rejectUpload(principal: SessionPrincipal, orderPublicId: string, reason: string): Promise<void>;
   cleanUpload(staged: StagedUpload): Promise<void>;
+  recordingPreflight(principal: SessionPrincipal, orderPublicId: string, slotKey?: string): Promise<RecordingPreflightStatus>;
+  documentStatus(principal: SessionPrincipal, locator: DocumentLocator): Promise<{
+    enabled: boolean; maxBytes: number; canEdit: boolean; disabledReason: string | null;
+    agreementPolicyPublicId: string | null; agreementSignatureMode: "typed_name" | "checkbox" | null; file: FileRecord;
+  }>;
+  listDocumentVersions(principal: SessionPrincipal, locator: DocumentLocator): Promise<FileRecord[]>;
+  openDocumentForEditing(principal: SessionPrincipal, locator: DocumentLocator): Promise<Download>;
+  beginEditedVersion(principal: SessionPrincipal, locator: DocumentLocator): Promise<UploadAuthorization>;
+  saveEditedVersion(principal: SessionPrincipal, upload: UploadAuthorization, staged: StagedUpload): Promise<FileRecord>;
   list(principal: SessionPrincipal, orderPublicId: string, options: ListOptions): Promise<Page<FileRecord> & {
     canUpload: boolean; uploadPolicy: UploadPolicy | null; uploadSlots: { statusKey: string; slots: FileUploadSlot[] } | null;
     audio: { enabled: boolean; maxMinutes: number } | null;
@@ -123,9 +144,11 @@ export interface FilesModule extends ModuleLifecycle {
     rules: FileRules; storedFiles: number; storedBytes: string; retainedFiles: number; antivirus: "not_configured" | "configured";
     supported: UploadPolicy;
     audioRules: AudioRules; audioVersion: string | null;
+    documentEditingRules: DocumentEditingRules;
   }>;
   setTypeRules(principal: SessionPrincipal, rules: FileRules): Promise<FileRules>;
   setAudioRules(principal: SessionPrincipal, rules: AudioRules): Promise<AudioRules>;
+  setDocumentEditingRules(principal: SessionPrincipal, rules: DocumentEditingRules): Promise<DocumentEditingRules>;
   revokeTicketsForOrder(orderId: number, tx?: Tx): Promise<void>;
   reassignOrderFiles(orderId: number, ownerUserId: number, tx: Tx): Promise<void>;
   validatePortableObject(input: { stagedObject: StoredObjectInfo; displayName: string; category: FileCategory; contentType?: string }, tx?: Tx): Promise<{ extension: string; contentType: string }>;
@@ -258,7 +281,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     }
   }
 
-  function output(row: FileRow): FileRecord {
+  function output(row: FileRow, sourcePublicId?: string | null): FileRecord {
     return {
       publicId: row.publicId, logicalPublicId: row.logicalPublicId, orderPublicId: row.orderPublicId, phasePublicId: row.phasePublicId,
       slotKey: row.slotKey, derivedFromPublicId: row.derivedFromPublicId, conversionState: row.conversionState,
@@ -267,7 +290,15 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       category: row.category, visibility: row.visibility, size: row.byteSize,
       sha256: row.sha256, contentType: row.contentType, extension: row.extension, version: row.version,
       createdAt: row.createdAt, supersededAt: row.supersededAt, deletedAt: row.deletedAt,
+      ...(sourcePublicId !== undefined ? { derivedFromFileId: sourcePublicId } : {}),
     };
+  }
+
+  function copyDisplayName(row: Pick<FileRow, "displayNameEnc" | "publicId" | "extension" | "contentType" | "conversionState">) {
+    const original = crypto.decrypt(row.displayNameEnc, `order_files.display_name:${row.publicId}`);
+    if (row.conversionState !== "failed" && !(row.contentType.startsWith("audio/") && row.contentType !== "audio/webm")) return original;
+    const basename = Array.from(original.replace(/\.[^.]+$/u, "")).slice(0, 72).join("");
+    return `${basename} (unconverted).${row.extension}`;
   }
 
   async function countFilesInSlot(orderId: number, slotKey: string, tx?: Tx, options?: { statusKey?: string }) {
@@ -291,8 +322,24 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
 
   function slotAllows(slot: FileUploadSlot, classification: FileClassification) {
     const correctKind = slot.kind === "audio" ? classification.mime.startsWith("audio/") :
-      ["application/pdf", "image/png", "image/jpeg"].includes(classification.mime);
+      ["application/pdf", "image/png", "image/jpeg", docxMime].includes(classification.mime);
     return correctKind && (!slot.allowedTypes.length || slot.allowedTypes.includes(classification.extension));
+  }
+
+  function eligibleExtensions(policy: FileRules, slot?: FileUploadSlot, source?: UploadOptions["source"]) {
+    const category: readonly string[] = source === "document_edit" ? ["docx"] :
+      source === "recording" || slot?.kind === "audio" ? audioExtensions :
+        slot?.kind === "document" ? documentExtensions : allowedExtensions;
+    return policy.extensions.filter((extension) => category.includes(extension) &&
+      (!slot?.allowedTypes.length || slot.allowedTypes.includes(extension)));
+  }
+
+  function assertSlotCapture(slot: FileUploadSlot | undefined, source: UploadOptions["source"]) {
+    if (!slot) return;
+    if (source === "document_edit" ? !slot.acceptsEdit : slot.acceptsUpload === false ||
+      (slot.capture === "record" && source !== "recording") || (slot.capture === "upload" && source === "recording")) {
+      throw validation("UPLOAD_TASK_METHOD", "Use the file or recording action allowed by this task.");
+    }
   }
 
   function slotRoomError() {
@@ -339,8 +386,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       try {
         await deps.services.orders.gates.assertCustomerMayWork({ tx, orderId: order.id, actor: principal, action: "upload", statusKey: null });
       } catch (error) {
-        if (!(error instanceof DomainError) || !["ORDER_ACCEPTANCE_REQUIRED", "ORDER_GATES_UNAVAILABLE"].includes(error.reasonCode)) throw error;
-        canUpload = false;
+        if (!(error instanceof DomainError) || !["AGREEMENT_REQUIRED", "ORDER_ACCEPTANCE_REQUIRED", "ORDER_GATES_UNAVAILABLE"].includes(error.reasonCode)) throw error;
+        // Keep the launcher available for the new MNDA: the write still fails before streaming,
+        // allowing the UI to open the agreement and replay the explicit request upon acceptance.
+        if (error.reasonCode !== "AGREEMENT_REQUIRED") canUpload = false;
       }
     }
     const rows = await tx.select().from(orderFiles).where(and(
@@ -348,11 +397,13 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       isNull(orderFiles.purgedAt),
       options.includeDeleted ? undefined : isNull(orderFiles.deletedAt),
       options.includeVersions ? undefined : isNull(orderFiles.supersededAt),
+      options.preferConvertedAudio && !staff && !options.includeVersions
+        ? sql`(${orderFiles.conversionState} IS NULL OR ${orderFiles.conversionState} <> 'converted')` : undefined,
       staff ? undefined : eq(orderFiles.visibility, "customer_visible"),
       after ? gt(orderFiles.publicId, after) : undefined,
     )).orderBy(orderFiles.publicId).limit(limit + 1).for("update");
     return {
-      items: rows.slice(0, limit).map(output),
+      items: rows.slice(0, limit).map((row) => output(row)),
       nextCursor: rows.length > limit ? encodeCursor(rows[limit - 1]!.publicId) : null,
       canUpload,
     };
@@ -383,10 +434,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         }
         return Buffer.concat(chunks, size);
       }, info.size);
-    if (!classification || classification.extension !== extension) {
+    if (!classification || (classification.extension !== extension &&
+        !(extension === "mp4" && classification.extension === "m4a" && classification.mime === "audio/mp4"))) {
       throw validation("FILE_TYPE_MISMATCH", "The file contents do not match an approved file type and extension.");
     }
-    return classification;
+    return { ...classification, extension };
   }
 
   async function validatePortable(input: Parameters<FilesModule["validatePortableObject"]>[0], tx?: Tx) {
@@ -440,26 +492,28 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     publicId?: string; orderPublicId: string; orderId: number; ownerUserId: number; phasePublicId?: string | null;
     statusKey: string; category: FileCategory; visibility: FileVisibility; staged: StagedUpload; storageKey: string;
     previous?: FileRow; imported?: boolean; createdAt?: Date; slotKey?: string; transcript?: string; convertAudio?: boolean;
-    source?: "recording";
+    source?: UploadOptions["source"]; durationMs?: number; replyBranch?: boolean; conversionDisabled?: boolean;
   }) {
     const now = clock.now();
     const publicId = input.publicId ?? ulid(now.getTime());
     await tx.insert(orderFiles).values({
       publicId,
-      logicalPublicId: input.previous?.logicalPublicId ?? publicId,
+      logicalPublicId: input.replyBranch ? publicId : input.previous?.logicalPublicId ?? publicId,
       previousVersionId: input.previous?.id,
       orderPublicId: input.orderPublicId, orderId: input.orderId, ownerUserId: input.ownerUserId, phasePublicId: input.phasePublicId,
       statusKey: input.statusKey,
       slotKey: input.slotKey,
       transcriptEnc: input.transcript ? crypto.encrypt(input.transcript, `order_files.transcript:${publicId}`) : null,
-      conversionState: input.convertAudio ? "converting" : null,
+      conversionState: input.convertAudio ? "converting" : input.conversionDisabled ? "failed" : null,
+      conversionReason: input.conversionDisabled ? "AUDIO_CONVERSION_DISABLED" : null,
+      durationMs: input.durationMs,
       uploadedByUserId: principal.userId, storageKey: input.storageKey,
       displayNameEnc: crypto.encrypt(input.staged.displayName, `order_files.display_name:${publicId}`),
       category: input.category, visibility: input.visibility, byteSize: input.staged.info.size,
       sha256: input.staged.info.sha256, contentType: input.staged.classification.mime, extension: input.staged.classification.extension,
-      version: (input.previous?.version ?? 0) + 1, createdAt: input.createdAt ?? now,
+      version: input.replyBranch ? 1 : (input.previous?.version ?? 0) + 1, createdAt: input.createdAt ?? now,
     });
-    if (input.previous) {
+    if (input.previous && !input.replyBranch) {
       await tx.update(orderFiles).set({ supersededAt: now }).where(or(eq(orderFiles.id, input.previous.id),
         eq(orderFiles.derivedFromPublicId, input.previous.publicId)));
     }
@@ -468,7 +522,86 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       ...(!input.imported ? { orderPublicId: input.orderPublicId, attributes: {
         order_public_id: input.orderPublicId, file_visibility: input.visibility, file_source: input.source ?? "upload",
       } } : {}) }, tx);
-    return output(await findFile(publicId, tx, true));
+    if (input.source === "document_edit") {
+      await audit.record({ ...event(principal, "file.edited_version_created", "edit_document", "completed", publicId),
+        orderPublicId: input.orderPublicId, attributes: { source_file_public_id: input.previous?.publicId ?? "" } }, tx);
+    }
+    return output(await findFile(publicId, tx, true), input.source === "document_edit" ? input.previous?.publicId ?? null : undefined);
+  }
+
+  async function documentRules(tx?: Tx) {
+    return readSetting(settings, documentEditingSetting, tx);
+  }
+
+  function isDocx(row: FileRow) {
+    return row.extension === "docx" && row.contentType === docxMime && !row.derivedFromPublicId;
+  }
+
+  async function resolveDocumentEdit(principal: SessionPrincipal, locator: DocumentLocator, tx: Tx) {
+    const order = await deps.services.orders.assertCanWriteOrder(principal, locator.orderPublicId, { kind: "file", tx, forUpdate: true });
+    await requireCurrent(principal, tx);
+    await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+    const row = await findFile(locator.filePublicId, tx, true);
+    if (row.orderId !== order.id || row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
+    enforceVisibility(row, principal, order.ownerUserId);
+    if (!isDocx(row)) throw validation("DOCUMENT_NOT_EDITABLE", "Only supported Word documents can be edited in the portal.");
+    if (row.supersededAt) throw conflict("FILE_VERSION_CHANGED", "This file already has a newer version.");
+    if (row.slotKey && row.statusKey !== order.statusKey) {
+      throw conflict("UPLOAD_SLOT_STATUS_CHANGED", "The document is not part of the current task.");
+    }
+    const [edit, policy] = await Promise.all([documentRules(tx), rules(tx)]);
+    const maxBytes = Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024);
+    if (!edit.enabled || !policy.extensions.includes("docx")) throw forbidden("DOCUMENT_EDITING_DISABLED");
+    if (row.byteSize > maxBytes) throw validation("DOCUMENT_TOO_LARGE", "This Word document exceeds the editor size limit.");
+    let slot: FileUploadSlot | undefined;
+    let replyBranch = false;
+    if (principal.role === "customer") {
+      if (order.ownerUserId !== principal.userId) throw forbidden("DOCUMENT_OWNER_REQUIRED");
+      await deps.services.orders.gates.assertCustomerMayWork({
+        tx, orderId: order.id, actor: principal, action: "edit_document", statusKey: order.statusKey,
+      });
+      if (row.slotKey || locator.taskKey) {
+        if (row.statusKey !== order.statusKey) throw conflict("UPLOAD_SLOT_STATUS_CHANGED", "The document is not part of the current customer task.");
+        const available = await deps.services.orders.getFileUploadSlots(principal, order.publicId, tx);
+        const candidates = available.statusKey === order.statusKey ? available.slots.filter((item) =>
+          item.kind === "document" && item.acceptsEdit && (!locator.taskKey || item.task?.taskKey === locator.taskKey) &&
+          (item.key === row.slotKey || (!!row.slotKey && item.sourceSlotKey === row.slotKey))) : [];
+        if (candidates.length !== 1) throw forbidden("DOCUMENT_TASK_EDIT_UNAVAILABLE");
+        [slot] = candidates;
+        replyBranch = slot!.key !== row.slotKey;
+        if (replyBranch) {
+          const branchRoots = tx.select({ logicalPublicId: orderFiles.logicalPublicId }).from(orderFiles).where(and(
+            eq(orderFiles.previousVersionId, row.id), eq(orderFiles.orderId, order.id), eq(orderFiles.ownerUserId, order.ownerUserId),
+            eq(orderFiles.statusKey, order.statusKey), eq(orderFiles.slotKey, slot!.key),
+          ));
+          const [existing] = await tx.select({ id: orderFiles.id }).from(orderFiles).where(and(
+            inArray(orderFiles.logicalPublicId, branchRoots), eq(orderFiles.orderId, order.id), eq(orderFiles.ownerUserId, order.ownerUserId),
+            isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt), isNull(orderFiles.supersededAt),
+          )).limit(1);
+          if (existing) throw conflict("DOCUMENT_REPLY_EXISTS", "A response already exists. Edit the current response instead.");
+          if (await countFilesInSlot(order.id, slot!.key, tx, { statusKey: order.statusKey }) >= slot!.maxCount) throw slotRoomError();
+        }
+      } else if (row.category === "deliverable") {
+        // A deliverable can only be edited by a customer as a response to an explicit document task.
+        throw forbidden("DOCUMENT_TASK_EDIT_UNAVAILABLE");
+      }
+    } else {
+      fullCapability(principal, "files.manage");
+      if (row.statusKey && row.statusKey !== order.statusKey) {
+        await deps.services.orders.assertFileStatusWritable(principal, order.publicId, row.statusKey, tx);
+      }
+    }
+    if (slot && !slotAllows(slot, { extension: "docx", mime: docxMime })) throw forbidden("DOCUMENT_TASK_EDIT_UNAVAILABLE");
+    return { row, order, slot, replyBranch, policy: { ...policy, maxFileBytes: maxBytes,
+      maxRequestBytes: Math.min(policy.maxRequestBytes, maxBytes + 16 * 1024), maxFiles: 1, extensions: ["docx"] as FileExtension[] } };
+  }
+
+  async function documentOutput(row: FileRow, principal: SessionPrincipal, tx: Tx) {
+    const [previous] = row.previousVersionId ? await tx.select().from(orderFiles).where(and(eq(orderFiles.id, row.previousVersionId),
+      eq(orderFiles.orderId, row.orderId), eq(orderFiles.ownerUserId, row.ownerUserId))).limit(1) : [];
+    const source = previous && !previous.deletedAt && !previous.purgedAt &&
+      (previous.visibility === "customer_visible" || roleHasCapability(principal.role, "files.read_all")) ? previous.publicId : null;
+    return output(row, source);
   }
 
   /** Object-level write denials raised inside the write transaction (review F-1): recorded durably AFTER it has
@@ -595,7 +728,9 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   });
   deps.jobs.registerSchedule({ name: retentionJob, type: retentionJob, everyMs: 60 * 60_000 });
 
-  const conversionPayload = z.strictObject({ filePublicId: z.string().length(26).regex(ULID_PATTERN) });
+  const conversionPayload = z.strictObject({
+    filePublicId: z.string().length(26).regex(ULID_PATTERN), taskMaxMinutes: z.number().int().min(1).max(120).optional(),
+  });
   function audioAudit(job: ClaimedJob, tx: Tx, row: FileRow, outcome: "attempted" | "completed" | "failed", reasonCode?: string) {
     return audit.record({ category: "file", eventName: "file.audio.conversion", action: "convert", outcome,
       actor: { role: "system" }, resource: { type: "file", publicId: row.publicId }, orderPublicId: row.orderPublicId,
@@ -604,7 +739,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   deps.jobs.register(audioJob, async (job): Promise<JobResult> => {
     const args = conversionPayload.safeParse(job.payload);
     if (!args.success) return { outcome: "failed", reasonCode: "AUDIO_JOB_INVALID", retryable: false };
-    const { filePublicId } = args.data;
+    const { filePublicId, taskMaxMinutes } = args.data;
     const unavailable = (reasonCode: string) => ({ outcome: "failed" as const, reasonCode, retryable: false });
     const [initial] = await db.select().from(orderFiles).where(eq(orderFiles.publicId, filePublicId)).limit(1);
     if (!initial || initial.conversionState !== "converting") return { outcome: "completed" };
@@ -612,26 +747,30 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       await job.assertStillOwned(tx);
       const order = await deps.services.orders.getOrderRefById(initial!.orderId, tx, { forUpdate: true });
       const row = await findFile(filePublicId, tx, true);
-      const valid = order && order.publicId === row.orderPublicId && row.orderId === initial!.orderId &&
+      const valid = !!order && order.publicId === row.orderPublicId && row.orderId === initial!.orderId &&
         order.ownerUserId === row.ownerUserId && row.ownerUserId === initial!.ownerUserId && order.lockState === "none" &&
-        (!row.statusKey || !await deps.services.orders.isStatusPhaseLocked(order.id, order.workflowVersionId, row.statusKey, tx)) &&
         !row.derivedFromPublicId && !row.deletedAt && !row.purgedAt &&
         !row.supersededAt && row.storageKey === initial!.storageKey && row.sha256 === initial!.sha256 && row.contentType.startsWith("audio/");
+      // A derivative is a system artifact of an already admitted file, not additional customer work.
+      // The phase can finish while this job waits; retain its captured status and slot for custody.
       return { row, valid };
     }
-    async function stop(row: FileRow, reason: string, tx: Tx) {
+    async function stop(row: FileRow, reason: string, tx: Tx, copyable: boolean) {
       await tx.update(orderFiles).set({ conversionState: "failed", conversionReason: reason }).where(eq(orderFiles.id, row.id));
       await audioAudit(job, tx, row, "failed", reason);
+      if (copyable && reason !== "AUDIO_SOURCE_INTEGRITY" && reason !== "FILE_BYTES_UNAVAILABLE") {
+        await deps.services.storageConnections?.stageOrderFile(row.publicId, tx, { orderPublicId: row.orderPublicId });
+      }
       return unavailable(reason);
     }
     const prepared = await currentTx(async (tx) => {
       const { row, valid } = await lockSource(tx);
       if (row.conversionState !== "converting") return { result: { outcome: "completed" as const } };
-      if (!valid) return { result: await stop(row, "AUDIO_SOURCE_INACTIVE", tx) };
+      if (!valid) return { result: await stop(row, "AUDIO_SOURCE_INACTIVE", tx, false) };
       const policy = await audioRules(tx);
-      if (!policy.enabled) return { result: await stop(row, "AUDIO_CONVERSION_DISABLED", tx) };
+      if (!policy.enabled) return { result: await stop(row, "AUDIO_CONVERSION_DISABLED", tx, valid) };
       await audioAudit(job, tx, row, "attempted");
-      return { row, policy };
+      return { row, policy: { ...policy, maxMinutes: taskMaxMinutes ?? policy.maxMinutes } };
     });
     if (prepared.result) return prepared.result;
     const staging = storage.newKey("staging");
@@ -653,10 +792,10 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       return await currentTx(async (tx) => {
         const { row, valid } = await lockSource(tx);
         if (row.conversionState !== "converting") return { outcome: "completed" };
-        if (!valid) return stop(row, "AUDIO_SOURCE_INACTIVE", tx);
+        if (!valid) return stop(row, "AUDIO_SOURCE_INACTIVE", tx, false);
         const policy = await audioRules(tx);
-        if (!policy.enabled || policy.maxMinutes !== prepared.policy.maxMinutes || policy.bitrateKbps !== prepared.policy.bitrateKbps) {
-          return stop(row, "AUDIO_POLICY_CHANGED", tx);
+        if (!policy.enabled || (taskMaxMinutes ?? policy.maxMinutes) !== prepared.policy.maxMinutes || policy.bitrateKbps !== prepared.policy.bitrateKbps) {
+          return stop(row, "AUDIO_POLICY_CHANGED", tx, valid);
         }
         const publicId = ulid(clock.now().getTime());
         const displayName = sanitizeDisplayName(`${output(row).displayName.replace(/\.[^.]+$/u, "").slice(0, 120)} (WebM).webm`);
@@ -689,8 +828,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (!safeReason && job.attempt < maxAudioJobAttempts) throw error;
       const reason = safeReason ?? "AUDIO_CONVERSION_FAILED";
       return currentTx(async (tx) => {
-        const { row } = await lockSource(tx);
-        return row.conversionState === "converting" ? stop(row, reason, tx) : { outcome: "completed" };
+        const { row, valid } = await lockSource(tx);
+        return row.conversionState === "converting" ? stop(row, reason, tx, valid) : { outcome: "completed" };
       });
     } finally { await cleanup(staging); }
   }, { retrySafe: true });
@@ -748,12 +887,14 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     async beginUpload(principal, orderPublicId, options) {
       try {
         requireFull(principal);
+        if (options.source === "document_edit") throw validation("DOCUMENT_EDIT_ROUTE_REQUIRED", "Use the document editor to save a new version.");
         if (principal.role === "customer" && (options.category === "deliverable" || options.visibility === "staff_only")) {
           throw forbidden("FILE_STAFF_ONLY");
         }
         if (principal.role !== "customer") fullCapability(principal, "files.manage");
         return await currentTx(async (tx) => {
           const order = await deps.services.orders.assertCanWriteOrder(principal, orderPublicId, { kind: "file", tx });
+          await requireCurrent(principal, tx);
           await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
           if ((options.slotKey === undefined) !== (options.statusKey === undefined) ||
             (options.statusKey !== undefined && options.statusKey !== order.statusKey)) {
@@ -764,13 +905,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           });
           if (options.slotKey && options.visibility !== "customer_visible") throw validation("UPLOAD_SLOT_PRIVATE", "Workflow slot files must be customer-visible.");
           const slot = await resolveSlot(principal, order.publicId, order.statusKey, options.slotKey, tx);
+          assertSlotCapture(slot, options.source);
           const fullPolicy = await rules(tx);
-          const typePolicy = !slot ? fullPolicy : { ...fullPolicy, extensions: fullPolicy.extensions.filter((ext) =>
-            (!slot.allowedTypes.length || slot.allowedTypes.includes(ext)) &&
-            (slot.kind === "audio" ? ["wav", "webm", "ogg", "m4a"].includes(ext) : ["pdf", "png", "jpg"].includes(ext))) };
-          const policy = options.source === "recording" ? {
-            ...typePolicy, maxFiles: 1, extensions: typePolicy.extensions.filter((ext) => ["wav", "webm", "ogg", "m4a"].includes(ext)),
-          } : typePolicy;
+          if (options.source === "recording" && !(await audioRules(tx)).enabled) throw forbidden("RECORDING_DISABLED");
+          const policy = { ...fullPolicy, extensions: eligibleExtensions(fullPolicy, slot, options.source),
+            maxFiles: options.source || options.versionOf ? 1 : fullPolicy.maxFiles };
           return { ...options, orderPublicId: order.publicId, orderId: order.id, ownerUserId: order.ownerUserId,
             statusKey: order.statusKey, rules: policy, slot };
         });
@@ -798,6 +937,116 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     },
     rejectUpload: orderEvent,
     cleanUpload: (staged) => cleanup(staged.info.key),
+    async recordingPreflight(principal, orderPublicId, slotKey) {
+      requireFull(principal);
+      if (principal.role !== "customer") fullCapability(principal, "files.manage");
+      const status = await currentTx(async (tx) => {
+        const order = await deps.services.orders.assertCanWriteOrder(principal, orderPublicId, { kind: "file", tx });
+        await requireCurrent(principal, tx);
+        await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
+        if (principal.role === "customer") await deps.services.orders.gates.assertCustomerMayWork({
+          tx, orderId: order.id, actor: principal, action: "record", statusKey: slotKey ? order.statusKey : null,
+        });
+        const slot = await resolveSlot(principal, order.publicId, order.statusKey, slotKey, tx);
+        const [policy, audio] = await Promise.all([rules(tx), audioRules(tx)]);
+        const acceptedTypes = eligibleExtensions(policy, slot, "recording");
+        return {
+          enabled: audio.enabled && acceptedTypes.length > 0 && slot?.capture !== "upload" &&
+            slot?.acceptsUpload !== false && (!slot || slot.kind === "audio"),
+          maxMinutes: slot?.maxMinutes ?? audio.maxMinutes,
+          maxBytes: Math.min(policy.maxFileBytes, policy.maxRequestBytes - 1024),
+          acceptedTypes,
+        };
+      });
+      return { ...status, conversionAvailable: status.enabled && !!await audioVersion() };
+    },
+    async documentStatus(principal, locator) {
+      return currentTx(async (tx) => {
+        const row = await readFile(principal, locator.filePublicId, locator.orderPublicId, tx);
+        await requireCurrent(principal, tx);
+        const [edit, policy, file] = await Promise.all([documentRules(tx), rules(tx), documentOutput(row, principal, tx)]);
+        const enabled = edit.enabled && policy.extensions.includes("docx");
+        const maxBytes = Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024);
+        let disabledReason: string | null = null;
+        let agreementPolicyPublicId: string | null = null;
+        let agreementSignatureMode: "typed_name" | "checkbox" | null = null;
+        try { await resolveDocumentEdit(principal, locator, tx); }
+        catch (error) {
+          if (!(error instanceof DomainError) || !["CONFLICT", "FORBIDDEN", "VALIDATION", "LOCKED", "NOT_FOUND"].includes(error.code)) throw error;
+          if (error.reasonCode === "AGREEMENT_REQUIRED") {
+            const policyId = error.details?.policyPublicId;
+            if (typeof policyId === "string" && publicIdShape(policyId)) agreementPolicyPublicId = policyId;
+            const mode = error.details?.signatureMode;
+            if (mode === "typed_name" || mode === "checkbox") agreementSignatureMode = mode;
+          }
+          disabledReason = error.safeMessage;
+        }
+        return { enabled, maxBytes, canEdit: disabledReason === null, disabledReason, agreementPolicyPublicId, agreementSignatureMode, file };
+      });
+    },
+    async listDocumentVersions(principal, locator) {
+      return currentTx(async (tx) => {
+        const row = await readFile(principal, locator.filePublicId, locator.orderPublicId, tx);
+        await requireCurrent(principal, tx);
+        if (!isDocx(row)) throw notFound("FILE_NOT_FOUND");
+        const staff = roleHasCapability(principal.role, "files.read_all");
+        const visibleVersions = await tx.select({ id: orderFiles.id, previousVersionId: orderFiles.previousVersionId })
+          .from(orderFiles).where(and(eq(orderFiles.logicalPublicId, row.logicalPublicId),
+            eq(orderFiles.orderId, row.orderId), eq(orderFiles.ownerUserId, row.ownerUserId), isNull(orderFiles.deletedAt),
+            isNull(orderFiles.purgedAt), staff ? undefined : eq(orderFiles.visibility, "customer_visible"))).limit(100);
+        const sourceIds = visibleVersions.flatMap((version) => version.previousVersionId ? [version.previousVersionId] : []);
+        const branchRoots = tx.select({ logicalPublicId: orderFiles.logicalPublicId }).from(orderFiles).where(and(
+          inArray(orderFiles.previousVersionId, visibleVersions.map((version) => version.id)),
+          eq(orderFiles.orderId, row.orderId), eq(orderFiles.ownerUserId, row.ownerUserId),
+          isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt), staff ? undefined : eq(orderFiles.visibility, "customer_visible"),
+        ));
+        const rows = await tx.select().from(orderFiles).where(and(
+          eq(orderFiles.orderId, row.orderId), eq(orderFiles.ownerUserId, row.ownerUserId), eq(orderFiles.contentType, docxMime),
+          or(eq(orderFiles.logicalPublicId, row.logicalPublicId), inArray(orderFiles.logicalPublicId, branchRoots),
+            sourceIds.length ? inArray(orderFiles.id, sourceIds) : undefined),
+          isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt), staff ? undefined : eq(orderFiles.visibility, "customer_visible"),
+        )).orderBy(orderFiles.createdAt, orderFiles.publicId).limit(100);
+        return Promise.all(rows.map((version) => documentOutput(version, principal, tx)));
+      });
+    },
+    async openDocumentForEditing(principal, locator) {
+      let stream: Readable | undefined;
+      try {
+        return await currentTx(async (tx) => {
+          const row = await readFile(principal, locator.filePublicId, locator.orderPublicId, tx);
+          await requireCurrent(principal, tx);
+          const [edit, policy] = await Promise.all([documentRules(tx), rules(tx)]);
+          if (!edit.enabled || !policy.extensions.includes("docx")) throw forbidden("DOCUMENT_EDITING_DISABLED");
+          if (!isDocx(row)) throw notFound("FILE_NOT_FOUND");
+          if (row.byteSize > Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024)) throw validation("DOCUMENT_TOO_LARGE", "This Word document exceeds the editor size limit.");
+          await access(principal, "attempted", tx, row.publicId);
+          stream = await readObject(row);
+          return { file: await documentOutput(row, principal, tx), stream };
+        });
+      } catch (error) {
+        stream?.destroy();
+        await recordWriteDenied(principal, locator.filePublicId, "open_document", error);
+        throw error;
+      }
+    },
+    async beginEditedVersion(principal, locator) {
+      try {
+        return await currentTx(async (tx) => {
+          const { order, row, slot, policy, replyBranch } = await resolveDocumentEdit(principal, locator, tx);
+          // A response is a new customer-visible supporting file, not a replacement for the staff source.
+          return { orderId: order.id, orderPublicId: order.publicId, ownerUserId: order.ownerUserId, statusKey: order.statusKey,
+            versionOf: row.publicId, category: replyBranch ? "supporting" : row.category, visibility: row.visibility,
+            source: "document_edit", slot, slotKey: slot?.key ?? row.slotKey ?? undefined, taskKey: locator.taskKey, rules: policy };
+        });
+      } catch (error) {
+        if (error instanceof DomainError && error.code !== "AUDIT_UNAVAILABLE") await orderEvent(principal, locator.orderPublicId, error.reasonCode);
+        throw error;
+      }
+    },
+    async saveEditedVersion(principal, upload, staged) {
+      if (upload.source !== "document_edit" || !upload.versionOf) throw validation("DOCUMENT_NOT_EDITABLE", "Choose a Word document to edit.");
+      return service.commitUpload(principal, upload, staged);
+    },
     async commitUpload(principal, request, staged, transcript) {
       requireFull(principal);
       if (!stagingKey.test(staged.info.key)) throw validation("INVALID_FILE_REFERENCE", "The staged file reference is invalid.");
@@ -808,10 +1057,33 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const policy = await rules();
       const isAudio = staged.classification.mime.startsWith("audio/");
       if (request.source === "recording" && !isAudio) throw validation("UPLOAD_RECORDING_TYPE", "A recording must be a supported audio file.");
+      const editing = request.source === "document_edit";
+      if (editing && (!request.versionOf || staged.classification.mime !== docxMime || staged.classification.extension !== "docx" || transcript !== undefined)) {
+        throw validation("DOCUMENT_NOT_EDITABLE", "Upload one supported Word document as the new version.");
+      }
       const parsedTranscript = transcript === undefined ? undefined : transcriptSchema.safeParse(transcript);
       if (parsedTranscript && (!parsedTranscript.success || !isAudio)) throw validation("INVALID_AUDIO_TRANSCRIPT", "Supply an optional transcript only for one audio upload.");
       if (!policy.extensions.includes(staged.classification.extension as FileExtension) || staged.info.size > policy.maxFileBytes) {
         throw validation("FILE_POLICY_CHANGED", "The file no longer meets the current upload rules.");
+      }
+      let durationMs: number | undefined;
+      if (isAudio && request.slot?.maxMinutes) {
+        let stream: Readable | undefined;
+        try {
+          if (!local.withConversionDirectory) throw new AudioConversionError("AUDIO_CONVERSION_UNAVAILABLE");
+          stream = await storage.get(staged.info.key);
+          const input = stream;
+          const maxMinutes = request.slot.maxMinutes;
+          durationMs = await local.withConversionDirectory((directory) => measureTaskAudio({
+            binary: ffmpegBinary(), directory, input, size: staged.info.size, sha256: staged.info.sha256,
+            extension: staged.classification.extension, maxMinutes,
+          }));
+        } catch (error) {
+          if (error instanceof AudioConversionError && error.reasonCode === "AUDIO_DURATION_EXCEEDED") {
+            throw validation("AUDIO_DURATION_EXCEEDED", `Audio for this task must be ${request.slot.maxMinutes} minutes or shorter.`);
+          }
+          throw validation("AUDIO_DURATION_UNVERIFIED", "The recording length could not be verified for this task. Try a different audio file or contact support.");
+        } finally { stream?.destroy(); }
       }
       const storageKey = storage.newKey("files");
       let placementAttempted = false;
@@ -823,41 +1095,59 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
             throw conflict("ORDER_ACCESS_CHANGED", "The order changed during upload. Please reload and try again.");
           }
           await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
-          if (principal.role === "customer") await deps.services.orders.gates.assertCustomerMayWork({
+          if (principal.role === "customer" && !editing) await deps.services.orders.gates.assertCustomerMayWork({
             tx, orderId: order.id, actor: principal, action: request.source === "recording" ? "record" : "upload",
             statusKey: request.slotKey ? order.statusKey : null,
           });
-          const previous = request.versionOf ? await findFile(request.versionOf, tx, true) : undefined;
+          const edit = editing ? await resolveDocumentEdit(principal, {
+            orderPublicId: order.publicId, filePublicId: request.versionOf!, taskKey: request.taskKey,
+          }, tx) : undefined;
+          if (edit && (staged.info.size > edit.policy.maxFileBytes ||
+              (edit.slot?.key ?? edit.row.slotKey ?? undefined) !== request.slotKey)) {
+            throw conflict("DOCUMENT_EDIT_RULES_CHANGED", "The document editing rules changed. Reload the order and try again.");
+          }
+          const previous = edit?.row ?? (request.versionOf ? await findFile(request.versionOf, tx, true) : undefined);
           if (previous) {
             if (previous.orderId !== order.id || previous.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
             enforceVisibility(previous, principal, order.ownerUserId);
             if (previous.supersededAt) throw conflict("FILE_VERSION_CHANGED", "This file already has a newer version.");
-            if (previous.category !== request.category || previous.visibility !== request.visibility) {
+            if ((edit?.replyBranch ? "supporting" : previous.category) !== request.category || previous.visibility !== request.visibility) {
               throw validation("FILE_VERSION_SCOPE", "A new version must preserve its file category and visibility.");
             }
-            if (previous.derivedFromPublicId || (previous.slotKey ?? undefined) !== request.slotKey ||
-                (previous.slotKey && previous.statusKey !== order.statusKey)) {
+            if (!edit && (previous.derivedFromPublicId || (previous.slotKey ?? undefined) !== request.slotKey ||
+                (previous.slotKey && previous.statusKey !== order.statusKey))) {
               throw validation("FILE_VERSION_SCOPE", "A new version must preserve its original workflow slot.");
             }
             if (previous.statusKey && previous.statusKey !== order.statusKey) {
               await deps.services.orders.assertFileStatusWritable(principal, order.publicId, previous.statusKey, tx);
             }
           }
-          const slot = await resolveSlot(principal, order.publicId, order.statusKey, request.slotKey, tx);
+          const slot = editing ? edit?.slot : await resolveSlot(principal, order.publicId, order.statusKey, request.slotKey, tx);
+          if (!editing || principal.role === "customer") assertSlotCapture(slot, request.source);
+          if (slot?.maxMinutes && (durationMs === undefined || durationMs > slot.maxMinutes * 60_000 + 25)) {
+            throw validation("AUDIO_DURATION_EXCEEDED", `Audio for this task must be ${slot.maxMinutes} minutes or shorter.`);
+          }
+          const currentPolicy = await rules(tx);
+          if (!eligibleExtensions(currentPolicy, slot, request.source).some((extension) => extension === staged.classification.extension) ||
+              staged.info.size > currentPolicy.maxFileBytes) throw validation("FILE_POLICY_CHANGED", "The file no longer meets the current upload rules.");
           if (slot) {
             if (request.visibility !== "customer_visible" || !slotAllows(slot, staged.classification)) {
               throw validation("UPLOAD_SLOT_FILE_TYPE", "This file type or visibility does not meet the workflow slot requirements.");
             }
             if (!previous && await countFilesInSlot(order.id, slot.key, tx, { statusKey: order.statusKey }) >= slot.maxCount) throw slotRoomError();
           }
-          const convert = isAudio && (await audioRules(tx)).enabled;
+          const audio = isAudio ? await audioRules(tx) : null;
+          if (request.source === "recording" && !audio?.enabled) throw forbidden("RECORDING_DISABLED");
+          const needsConversion = isAudio && (staged.classification.mime !== "audio/webm" || staged.classification.requiresReencode === true);
+          const convert = needsConversion && !!audio?.enabled;
           const file = await insertVersion(tx, principal, { ...request, staged, storageKey, previous,
-            transcript: parsedTranscript?.data, convertAudio: convert });
+            transcript: parsedTranscript?.data, convertAudio: convert, conversionDisabled: needsConversion && !convert,
+            durationMs, replyBranch: edit?.replyBranch });
           placementAttempted = true;
           await storage.move(staged.info.key, storageKey);
-          await deps.services.storageConnections?.stageOrderFile(file.publicId, tx, { orderPublicId: order.publicId });
+          if (!convert) await deps.services.storageConnections?.stageOrderFile(file.publicId, tx, { orderPublicId: order.publicId });
           if (convert) {
-            await deps.jobs.enqueue(audioJob, { filePublicId: file.publicId }, {
+            await deps.jobs.enqueue(audioJob, { filePublicId: file.publicId, ...(slot?.maxMinutes ? { taskMaxMinutes: slot.maxMinutes } : {}) }, {
               maxAttempts: maxAudioJobAttempts, idempotencyKey: `file-audio:${file.publicId}`, correlationId: getRequestContext()?.correlationId,
             }, tx);
           }
@@ -993,6 +1283,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       }).from(orderFiles).where(isNull(orderFiles.purgedAt));
       const conversion = await audioRules();
       return { rules: await rules(), audioRules: conversion, audioVersion: conversion.enabled ? await audioVersion() : null,
+        documentEditingRules: await documentRules(),
         storedFiles: row?.storedFiles ?? 0, storedBytes: String(row?.storedBytes ?? 0),
         retainedFiles: Number(row?.retainedFiles ?? 0), antivirus: scanner ? "configured" : "not_configured",
         supported: { extensions: [...allowedExtensions], maxFileBytes: hardMaxFileBytes, maxRequestBytes: hardMaxRequestBytes, maxFiles: hardMaxFiles } };
@@ -1021,6 +1312,21 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         await writeSetting(settings, audioRulesSetting, checked.data, tx);
         await audit.record({ ...event(principal, "file.audio.rules.changed", "update", "completed"),
           attributes: { enabled: checked.data.enabled, max_minutes: checked.data.maxMinutes, bitrate_kbps: checked.data.bitrateKbps } }, tx);
+        return checked.data;
+      });
+    },
+    async setDocumentEditingRules(principal, value) {
+      fullCapability(principal, "platform.settings.manage", true);
+      if (principal.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
+      const checked = documentEditingRulesSchema.safeParse(value);
+      if (!checked.success) throw validation("INVALID_DOCUMENT_EDITING_RULES", "Choose a valid Word editor size limit.");
+      return currentTx(async (tx) => {
+        const current = await requireCurrent(principal, tx);
+        fullCapability({ ...principal, role: current.role, stepUpAt: current.stepUpAt }, "platform.settings.manage", true);
+        if (current.role !== "admin") throw forbidden("CAPABILITY_NOT_GRANTED");
+        await writeSetting(settings, documentEditingSetting, checked.data, tx);
+        await audit.record({ ...event(principal, "file.document.rules.changed", "update", "completed"),
+          attributes: { enabled: checked.data.enabled, max_bytes: checked.data.maxBytes } }, tx);
         return checked.data;
       });
     },
@@ -1102,7 +1408,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           row.ownerUserId !== owner.id || row.deletedAt || row.purgedAt) throw unavailable();
       return {
         storageKey: row.storageKey, size: row.byteSize, sha256: row.sha256, contentType: row.contentType,
-        displayName: output(row).displayName, extension: row.extension, visibility: row.visibility,
+        displayName: copyDisplayName(row), extension: row.extension, visibility: row.visibility,
         currentVersion: row.supersededAt === null, ownerUserId: owner.id,
         customerName: owner.name, customerReference: owner.customerRef ?? owner.publicId,
         customerPublicId: owner.publicId, orderReference: order.reference, orderPublicId: order.publicId, orderName: order.name,
@@ -1121,10 +1427,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const rows = await tx.select({
         publicId: orderFiles.publicId, displayNameEnc: orderFiles.displayNameEnc, statusKey: orderFiles.statusKey,
         slotKey: orderFiles.slotKey, deletedAt: orderFiles.deletedAt, purgedAt: orderFiles.purgedAt,
+        conversionState: orderFiles.conversionState, extension: orderFiles.extension, contentType: orderFiles.contentType,
       }).from(orderFiles).where(and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
         eq(orderFiles.ownerUserId, order.ownerUserId), inArray(orderFiles.publicId, [...new Set(filePublicIds)])));
       return rows.map((row) => ({
-        filePublicId: row.publicId, displayName: crypto.decrypt(row.displayNameEnc, `order_files.display_name:${row.publicId}`),
+        filePublicId: row.publicId, displayName: copyDisplayName(row),
         statusKey: row.statusKey, slotKey: row.slotKey, sourceAvailable: canCopy && !row.deletedAt && !row.purgedAt,
       }));
     },
@@ -1133,12 +1440,24 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       if (!order || order.lockState !== "none") return null;
       const owner = await deps.services.identity.getUser(order.ownerUserId, { tx, forUpdate: true });
       if (!owner || owner.status !== "active") return null;
+      const scope = and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
+        eq(orderFiles.ownerUserId, order.ownerUserId), isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt),
+        eq(orderFiles.visibility, "customer_visible"), isNull(orderFiles.supersededAt));
+      if (filePublicId) {
+        const [file] = await tx.select({ state: orderFiles.conversionState, reason: orderFiles.conversionReason }).from(orderFiles)
+          .where(and(scope, eq(orderFiles.publicId, filePublicId))).limit(1);
+        if (!file) return null;
+        if (file.state === "converting") return []; // The conversion worker stages the first copy.
+        if (file.reason === "AUDIO_SOURCE_INTEGRITY" || file.reason === "FILE_BYTES_UNAVAILABLE") return null;
+        if (file.state !== "converted") return [filePublicId];
+        const [derivative] = await tx.select({ publicId: orderFiles.publicId }).from(orderFiles)
+          .where(and(scope, eq(orderFiles.derivedFromPublicId, filePublicId))).limit(1);
+        return derivative ? [derivative.publicId] : null;
+      }
       const rows = await tx.select({ publicId: orderFiles.publicId }).from(orderFiles)
-        .where(and(eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId),
-          eq(orderFiles.ownerUserId, order.ownerUserId), isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt),
-          eq(orderFiles.visibility, "customer_visible"), isNull(orderFiles.supersededAt),
-          filePublicId ? eq(orderFiles.publicId, filePublicId) : undefined)).orderBy(orderFiles.publicId).limit(51);
-      if (filePublicId && rows.length === 0) return null;
+        .where(and(scope, sql`(${orderFiles.conversionState} IS NULL OR ${orderFiles.conversionState} = 'failed')`,
+          sql`(${orderFiles.conversionReason} IS NULL OR ${orderFiles.conversionReason} NOT IN ('AUDIO_SOURCE_INTEGRITY', 'FILE_BYTES_UNAVAILABLE'))`))
+        .orderBy(orderFiles.publicId).limit(51);
       return rows.map(({ publicId }) => publicId);
     },
     async getUploadAutomationContext(filePublicId, handle) {

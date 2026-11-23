@@ -14,17 +14,20 @@ import { newRequestContext } from "../../core/requestContext.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
 import { setHttpState } from "../../http/requestState.js";
 import { registerFilesHttpRoutes } from "./http.js";
-import { createFilesModule, type FilesModule, type UploadOptions } from "./index.js";
+import { createFilesModule, type FilesModule, type FileUploadSlot, type UploadOptions } from "./index.js";
 import type { ApiCaller, PublicApiProviders } from "../publicApi/ports.js";
 import { createObjectStorage } from "./storage.js";
 import { fileAccessLog, fileDownloadTickets, orderFiles } from "./schema.js";
-import { examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
+import { exampleDocx, exampleMp4, examplePdf, exampleWav, exampleWebm } from "./fixtures.test-support.js";
 
 const orderPublicId = `01JTEST${"0".repeat(19)}`;
 const userPublicId = `01JTEST${"0".repeat(18)}1`;
 const orderId = 201;
 const upload: UploadOptions = { category: "supporting", visibility: "customer_visible" };
-const voiceSlot = { key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav", "webm"] };
+const voiceSlot: FileUploadSlot = {
+  key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav", "webm"],
+  task: { kind: "upload", taskKey: "voice_evidence" }, acceptsUpload: true, acceptsEdit: false,
+};
 let t: TestDb;
 let h: TestHarness;
 let files: FilesModule;
@@ -43,6 +46,8 @@ let holdAtPurgeLock: boolean;
 let slotEnabled: boolean;
 let phaseLocked: boolean;
 let acceptanceRequired: boolean;
+let agreementRequired: boolean;
+let extraSlots: FileUploadSlot[];
 let gateActions: { action: string; statusKey: string | null }[];
 
 beforeAll(async () => {
@@ -69,6 +74,8 @@ beforeEach(async () => {
   slotEnabled = false;
   phaseLocked = false;
   acceptanceRequired = false;
+  agreementRequired = false;
+  extraSlots = [];
   gateActions = [];
   const read = async (principal: SessionPrincipal, id: number | string) => {
     if (id !== orderPublicId && id !== orderId) throw notFound("ORDER_NOT_FOUND");
@@ -93,6 +100,8 @@ beforeEach(async () => {
     gates: {
       async assertCustomerMayWork({ action, statusKey }: { action: string; statusKey: string | null }) {
         gateActions.push({ action, statusKey });
+        if (agreementRequired) throw new DomainError("CONFLICT", "AGREEMENT_REQUIRED", "Accept the order agreement.",
+          { policyPublicId: userPublicId, signatureMode: "checkbox" });
         if (acceptanceRequired) throw new DomainError("CONFLICT", "ORDER_ACCEPTANCE_REQUIRED", "Accept the required order policy.");
       },
     },
@@ -107,8 +116,8 @@ beforeEach(async () => {
     },
     async getFileUploadSlots(principal: SessionPrincipal, id: string) {
       await write(principal, id);
-      return { statusKey: orderStage, slots: !slotEnabled || phaseLocked || principal.role !== "customer" ? [] :
-        [voiceSlot] };
+      return { statusKey: orderStage, slots: phaseLocked ? [] :
+        [...(slotEnabled && principal.role === "customer" ? [voiceSlot] : []), ...extraSlots] };
     },
     async assertFileStatusWritable() {
       if (phaseLocked) throw new DomainError("FORBIDDEN", "PHASE_LOCKED", "This phase is locked.");
@@ -147,14 +156,104 @@ function appFor(principal: SessionPrincipal) {
   // Test harness deliberately leaves shared production middleware and its tests to HTTP Security.
   const errors: express.ErrorRequestHandler = (error: unknown, _req, res, _next) => {
     if (error instanceof DomainError) {
-      const status = error.code === "AUDIT_UNAVAILABLE" ? 503 : error.code === "NOT_FOUND" ? 404 : 400;
-      res.status(status).json({ reason: error.reasonCode });
+      const status = error.code === "AUDIT_UNAVAILABLE" ? 503 : error.code === "NOT_FOUND" ? 404 : error.code === "CONFLICT" ? 409 : 400;
+      res.status(status).json({ reason: error.reasonCode, details: error.details });
     } else res.status(500).json({ reason: "INTERNAL" });
   };
   return app.use(errors);
 }
 
 describe("private file admission and authorization", () => {
+  it("enforces recording task capture, detected audio, duration and platform intersection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "rp-files-record-task-"));
+    try {
+      h.deps.storage = createObjectStorage({ config: { storageDir: root }, logger: h.deps.logger });
+      h.deps.config = { ...h.deps.config, ffmpegPath: join(root, "missing-ffmpeg") };
+      files = createFilesModule(h.deps);
+      h.services.files = files;
+      const slot: FileUploadSlot = {
+        ...voiceSlot, task: { kind: "record", taskKey: voiceSlot.key }, capture: "record", maxMinutes: 1, allowedTypes: ["wav", "mp4"],
+      };
+      extraSlots = [slot];
+      const options = { ...upload, slotKey: slot.key, statusKey: "intake" };
+      await expect(files.beginUpload(owner, orderPublicId, options)).rejects.toMatchObject({ reasonCode: "UPLOAD_TASK_METHOD" });
+      await expect(files.recordingPreflight(owner, orderPublicId, slot.key)).resolves.toMatchObject({
+        enabled: true, conversionAvailable: false, acceptedTypes: ["wav", "mp4"], maxMinutes: 1,
+      });
+      const path = `/api/files/upload/${orderPublicId}?slotKey=${slot.key}&statusKey=intake&source=recording`;
+      const video = await request(appFor(owner)).post(path).attach("files", exampleMp4("video"), "video.mp4").expect(200);
+      expect(video.body.results[0]).toMatchObject({ outcome: "refused", reason: "UPLOAD_RECORDING_TYPE" });
+      const tooLong = await request(appFor(owner)).post(path).attach("files", exampleWav(61 * 8000), "long.wav").expect(200);
+      expect(tooLong.body.results[0]).toMatchObject({ outcome: "refused", reason: "AUDIO_DURATION_EXCEEDED" });
+      const admissible = await request(appFor(owner)).post(path).attach("files", exampleWav(8000), "short.wav").expect(200);
+      expect(admissible.body.results[0]).toMatchObject({ outcome: "completed", file: { durationSeconds: 1, conversionState: "converting" } });
+      const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
+      const { rules } = await files.adminOverview(admin);
+      await files.setTypeRules(admin, { ...rules, extensions: ["mp4"] });
+      await expect(files.recordingPreflight(owner, orderPublicId, slot.key)).resolves.toMatchObject({ acceptedTypes: ["mp4"] });
+      await expect(files.countFilesInSlot(orderId, slot.key, undefined, { statusKey: "intake" })).resolves.toBe(1);
+    } finally { await rm(root, { force: true, recursive: true }); }
+  });
+
+  it("opens authorised Word blobs and saves immutable, linked versions under the current owner, phase and agreement", async () => {
+    const initial = await request(appFor(owner)).post(`/api/files/upload/${orderPublicId}`).attach("files", exampleDocx(), "sample.docx").expect(200);
+    const source = initial.body.results[0].file.publicId as string;
+    const locator = { orderPublicId, filePublicId: source };
+    const path = `/api/files/orders/${orderPublicId}/${source}/document`;
+    await request(appFor(stranger)).get(path).expect(404);
+    const blob = await request(appFor(owner)).get(path).expect(200).expect("Cache-Control", "no-store");
+    expect(blob.headers["content-disposition"]).toContain("attachment;");
+    expect(Number(blob.headers["content-length"])).toBe(exampleDocx().length);
+    grant = "contributor";
+    await expect(files.documentStatus(grantee, locator)).resolves.toMatchObject({ canEdit: false });
+    agreementRequired = true;
+    await expect(files.documentStatus(owner, locator)).resolves.toMatchObject({
+      canEdit: false, agreementPolicyPublicId: userPublicId, agreementSignatureMode: "checkbox",
+    });
+    await request(appFor(owner)).post(path).attach("files", exampleDocx("Refused"), "edited.docx").expect(409);
+    agreementRequired = false;
+    await request(appFor(owner)).post(path).attach("files", exampleWav(), "misleading.docx").expect(400);
+    await request(appFor(owner)).post(path).field("transcript", "not a document field").attach("files", exampleDocx(), "edited.docx").expect(400);
+    const result = await request(appFor(owner)).post(path).attach("files", exampleDocx("Edited text"), "edited.docx").expect(200);
+    expect(result.body).toMatchObject({ version: 2, derivedFromFileId: source, extension: "docx", visibility: "customer_visible" });
+    const versions = await files.listDocumentVersions(owner, locator);
+    expect(versions).toHaveLength(2);
+    expect(versions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ publicId: source, supersededAt: expect.any(Date) }),
+      expect.objectContaining({ publicId: result.body.publicId, derivedFromFileId: source, supersededAt: null }),
+    ]));
+    const original = await files.openDocumentForEditing(owner, locator);
+    expect(await buffer(original.stream)).toEqual(exampleDocx());
+    await request(appFor(owner)).post(path).attach("files", exampleDocx(), "stale.docx").expect(409);
+    expect(h.audit.named("file.edited_version_created")).toHaveLength(1);
+    expect(gateActions).toContainEqual({ action: "edit_document", statusKey: "intake" });
+  });
+
+  it("keeps a staff task source current when the customer creates a Word response", async () => {
+    const task = "review_document";
+    const reply = `${task}_reply`;
+    extraSlots = [
+      { key: task, kind: "document", label: "Source", maxCount: 1, allowedTypes: ["docx"], task: { kind: "document_source", taskKey: task } },
+      { key: reply, kind: "document", label: "Reply", maxCount: 5, allowedTypes: ["docx"], acceptsUpload: false, acceptsEdit: true,
+        sourceSlotKey: task, task: { kind: "document_reply", taskKey: task } },
+    ];
+    const initial = await request(appFor(staff)).post(`/api/files/upload/${orderPublicId}?category=deliverable&slotKey=${task}&statusKey=intake`)
+      .attach("files", exampleDocx(), "source.docx").expect(200);
+    const id = initial.body.results[0].file.publicId as string;
+    const plan = await files.beginEditedVersion(owner, { orderPublicId, filePublicId: id, taskKey: task });
+    const staged = await files.stageUpload("reply.docx", Readable.from([exampleDocx("Reply")]), plan.rules);
+    agreementRequired = true;
+    await expect(files.saveEditedVersion(owner, plan, staged)).rejects.toMatchObject({ reasonCode: "AGREEMENT_REQUIRED" });
+    agreementRequired = false;
+    const saved = await files.saveEditedVersion(owner, plan, staged).finally(() => files.cleanUpload(staged));
+    expect(saved).toMatchObject({ category: "supporting", slotKey: reply, version: 1, derivedFromFileId: id });
+    await expect(files.assertCanReadFile(owner, id)).resolves.toMatchObject({ supersededAt: null });
+    await expect(files.listDocumentVersions(owner, { orderPublicId, filePublicId: id, taskKey: task })).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ publicId: saved.publicId, derivedFromFileId: id })]));
+    await expect(files.beginEditedVersion(owner, { orderPublicId, filePublicId: id, taskKey: task })).rejects.toMatchObject({ reasonCode: "DOCUMENT_REPLY_EXISTS" });
+    await expect(files.countFilesInSlot(orderId, reply, undefined, { statusKey: "intake" })).resolves.toBe(1);
+  });
+
   it("enforces scope, actor, classified slot kind, capacity and phase policy before and after staging", async () => {
     slotEnabled = true;
     const slot = { ...upload, statusKey: "intake", slotKey: "voice_evidence" } as const;
@@ -169,8 +268,8 @@ describe("private file admission and authorization", () => {
     await expect(files.commitUpload(owner, plan, staged)).rejects.toMatchObject({ reasonCode: "PHASE_LOCKED" });
     phaseLocked = false;
     const original = await files.commitUpload(owner, plan, staged);
-    expect(original).toMatchObject({ slotKey: "voice_evidence", statusKey: "intake", conversionState: null });
-    expect(h.jobs.enqueued).toHaveLength(0);
+    expect(original).toMatchObject({ slotKey: "voice_evidence", statusKey: "intake", conversionState: "converting" });
+    expect(h.jobs.enqueued).toContainEqual(expect.objectContaining({ type: "files.audio_conversion", payload: { filePublicId: original.publicId } }));
     await expect(files.countFilesInSlot(orderId, "voice_evidence", undefined, { statusKey: "intake" })).resolves.toBe(1);
     await expect(files.countFilesInSlot(orderId, "voice_evidence", undefined, { statusKey: "new_status" })).resolves.toBe(0);
     await expect(add(owner, slot)).rejects.toMatchObject({ reasonCode: "UPLOAD_SLOT_FULL" });
@@ -233,7 +332,10 @@ describe("private file admission and authorization", () => {
       const result = await request(appFor(owner)).post(`/api/files/upload/${orderPublicId}?statusKey=intake&slotKey=voice_evidence&source=recording`)
         .field("transcript", "Synthetic audio transcript").attach("files", exampleWav(8000), "source.wav").expect(200);
       const id = result.body.results[0].file.publicId as string;
-      expect(stageOrderFile).toHaveBeenCalledExactlyOnceWith(id, expect.anything(), { orderPublicId });
+      expect(stageOrderFile).not.toHaveBeenCalled();
+      await t.db.transaction(async (tx) => {
+        await expect(files.listOrderFileCopyCandidates(orderPublicId, tx, id)).resolves.toEqual([]);
+      });
       expect(gateActions).toEqual([{ action: "record", statusKey: "intake" }, { action: "record", statusKey: "intake" }]);
       expect(h.audit.named("file.uploaded")).toContainEqual(expect.objectContaining({
         orderPublicId, attributes: expect.objectContaining({ file_source: "recording", file_visibility: "customer_visible" }),
@@ -262,13 +364,27 @@ describe("private file admission and authorization", () => {
         await expect(execute({ ...claim, assertStillOwned: async () => {} })).rejects.toThrow("synthetic audit interruption");
       } finally { record.mockRestore(); }
       expect((await files.list(owner, orderPublicId, {})).items).toHaveLength(1);
+      phaseLocked = true;
       await expect(h.jobs.runAll("files.audio_conversion")).resolves.toEqual([{ outcome: "completed", safeCounts: { converted: 1 } }]);
+      phaseLocked = false;
       await expect(execute({ ...claim, assertStillOwned: async () => {} })).resolves.toEqual({ outcome: "completed" });
       const found = await files.list(owner, orderPublicId, {});
       const derived = found.items.find((item) => item.derivedFromPublicId === id)!;
       expect(derived).toMatchObject({ contentType: "audio/webm", extension: "webm", slotKey: "voice_evidence" });
       expect(stageOrderFile.mock.calls.map(([publicId]) => publicId).filter((publicId) => publicId === derived.publicId)).toHaveLength(1);
+      expect(stageOrderFile.mock.calls.map(([publicId]) => publicId)).not.toContain(id);
       expect(found.items.find((item) => item.publicId === id)).toMatchObject({ extension: "wav", conversionState: "converted" });
+      await expect(files.list(owner, orderPublicId, { preferConvertedAudio: true })).resolves.toMatchObject({ items: [expect.objectContaining({ publicId: derived.publicId })] });
+      await t.db.transaction(async (tx) => {
+        await expect(files.listOrderFileCopyCandidates(orderPublicId, tx, id)).resolves.toEqual([derived.publicId]);
+        await expect(files.listOrderFileCopyCandidates(orderPublicId, tx)).resolves.toEqual([derived.publicId]);
+        await expect(files.listOrderFileCopyMetadata(orderPublicId, [id, derived.publicId], tx)).resolves.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ filePublicId: id, displayName: expect.stringContaining("(unconverted)") }),
+            expect.objectContaining({ filePublicId: derived.publicId, displayName: expect.stringContaining("(WebM)") }),
+          ]),
+        );
+      });
       await expect(files.countFilesInSlot(orderId, "voice_evidence")).resolves.toBe(1);
       await expect(files.remove(staff, derived.publicId)).rejects.toMatchObject({ reasonCode: "AUDIO_DERIVATIVE_READ_ONLY" });
       await files.setVisibility(staff, id, "staff_only");
@@ -289,23 +405,34 @@ describe("private file admission and authorization", () => {
       files = createFilesModule(h.deps);
       const admin = fakePrincipal({ role: "admin", stepUpAt: h.clock.now() });
       await files.setAudioRules(admin, { enabled: true, maxMinutes: 1, bitrateKbps: 48, keepOriginal: true });
+      const stageOrderFile = vi.fn();
+      h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
       expect(await files.health?.()).toContainEqual(expect.objectContaining({ component: "files.audio", state: "degraded" }));
       const original = await add(owner);
+      expect(stageOrderFile).not.toHaveBeenCalled();
       await expect(h.jobs.runAll("files.audio_conversion")).resolves.toEqual([
         { outcome: "failed", reasonCode: "AUDIO_CONVERSION_UNAVAILABLE", retryable: false },
       ]);
       const list = await files.list(owner, orderPublicId, {});
       expect(list.items).toHaveLength(1);
       expect(list.items[0]).toMatchObject({ publicId: original.publicId, conversionState: "failed", conversionReason: "AUDIO_CONVERSION_UNAVAILABLE" });
+      expect(stageOrderFile).toHaveBeenCalledExactlyOnceWith(original.publicId, expect.anything(), { orderPublicId });
+      await t.db.transaction(async (tx) => {
+        await expect(files.getOrderFileCopySource(original.publicId, tx)).resolves.toMatchObject({ displayName: expect.stringContaining("(unconverted)") });
+        await expect(files.listOrderFileCopyCandidates(orderPublicId, tx)).resolves.toEqual([original.publicId]);
+      });
       const { ticket } = await files.issueDownloadTicket(owner, original.publicId);
       const download = await files.redeemDownloadTicket(owner, ticket);
       expect(await buffer(download.stream)).toEqual(exampleWav());
     } finally { await rm(root, { force: true, recursive: true }); }
   });
   it("admits only current customer-visible file versions to automation copy batches", async () => {
+    await files.setAudioRules(fakePrincipal({ role: "admin", stepUpAt: h.clock.now() }),
+      { enabled: false, maxMinutes: 30, bitrateKbps: 128, keepOriginal: true });
     const first = await add();
     const latest = await add(owner, { ...upload, versionOf: first.publicId });
     const privateFile = await add(staff, { ...upload, visibility: "staff_only" });
+    expect(latest).toMatchObject({ conversionState: "failed", conversionReason: "AUDIO_CONVERSION_DISABLED" });
     expect(h.audit.named("file.uploaded").map((event) => sanitiseAttribute("file_visibility", event.attributes?.file_visibility)))
       .toEqual(["customer_visible", "customer_visible", "staff_only"]);
     await expect(files.getUploadAutomationContext(privateFile.publicId, t.db)).resolves.toBeNull();
@@ -325,7 +452,9 @@ describe("private file admission and authorization", () => {
       throw new Error("synthetic outbox failure");
     });
     h.services.storageConnections = { stageOrderFile } as unknown as TestHarness["services"]["storageConnections"];
-    await expect(add()).rejects.toThrow("synthetic outbox failure");
+    const plan = await files.beginUpload(owner, orderPublicId, upload);
+    const staged = await files.stageUpload("synthetic.pdf", Readable.from([examplePdf()]), plan.rules);
+    await expect(files.commitUpload(owner, plan, staged).finally(() => files.cleanUpload(staged))).rejects.toThrow("synthetic outbox failure");
     expect(stageOrderFile).toHaveBeenCalledOnce();
     expect(await t.db.select().from(orderFiles)).toEqual([]);
     expect(h.storage.objects.size).toBe(0);

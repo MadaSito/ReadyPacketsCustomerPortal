@@ -1,15 +1,21 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileRecord, UploadPolicy } from "@server/modules/files/index";
 import type * as transportModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
+import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { FileUploadPanel } from "./FileUploadPanel";
 import { FilesAdminContent } from "./FilesAdminPage";
 import OrderFilesTab from "./OrderFilesTab";
+import { RecordingPreflight } from "./RecordingPreflight";
 
 const { fetchMock, view } = vi.hoisted(() => ({ fetchMock: vi.fn(), view: vi.fn() }));
+vi.mock("@/lib/agreementGate", () => ({
+  AgreementDialog: ({ onAccepted }: { onAccepted: () => Promise<void> }) => <button type="button" onClick={() => { void onAccepted(); }}>Accept test agreement</button>,
+  parseAgreementRequiredDetails: () => null,
+}));
 vi.mock("@/lib/sessionTransport", async (original) => ({
   ...await original<typeof transportModule>(),
   sessionFetch: fetchMock,
@@ -29,6 +35,9 @@ vi.mock("@/lib/trpc", async (original) => ({
           }),
           pathKey: () => ["file-tabs"],
         },
+        recording: { preflight: { queryOptions: () => ({ queryKey: ["preflight"], queryFn: async () => ({
+          enabled: true, conversionAvailable: false, maxMinutes: 2, maxBytes: policy.maxFileBytes, acceptedTypes: ["wav"],
+        }) }) } },
         remove: mutation, restore: mutation, setVisibility: mutation,
       },
     };
@@ -110,9 +119,112 @@ describe("file upload", () => {
     expect(await screen.findByText("Unknown outcome")).toBeInTheDocument();
     expect(screen.getByText("0 of 1 uploads confirmed.")).toBeInTheDocument();
   });
+
+  it("uses the device capture control for a recording-only task when the browser has no recorder", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    renderUi(<FileUploadPanel orderId={orderId} staff={false} policy={policy}
+      slot={{ key: "voice_evidence", statusKey: "intake", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"], capture: "record", maxMinutes: 2 }}
+      audio={{ enabled: true, maxMinutes: 30 }} onChanged={vi.fn()} />);
+    expect(screen.queryByLabelText("Choose files")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Record", exact: true }));
+    const dialog = screen.getByRole("dialog", { name: "Check your recording setup" });
+    expect(await within(dialog).findByText(/Limit: 2 minutes/u)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Warning: browser recorder unavailable/u)).toBeInTheDocument();
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Use device recorder" }));
+    const capture = screen.getByLabelText("Record with your device");
+    expect(capture).toHaveAttribute("accept", "audio/*");
+    expect(capture).toHaveAttribute("capture");
+    await user.upload(capture, new File(["synthetic"], "audio.wav", { type: "audio/wav" }));
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("source=recording&slotKey=voice_evidence"), expect.anything());
+  });
+
+  it("keeps keyboard focus on the microphone test through cancel and local playback", async () => {
+    class TestRecorder extends EventTarget {
+      static isTypeSupported = () => false;
+      state: RecordingState = "inactive";
+      mimeType = "audio/wav";
+      start = vi.fn((timeslice: number) => { expect(timeslice).toBe(1000); this.state = "recording"; });
+      stop() {
+        this.state = "inactive";
+        this.dispatchEvent(Object.assign(new Event("dataavailable"), { data: new Blob(["synthetic"], { type: this.mimeType }) }));
+        this.dispatchEvent(new Event("stop"));
+      }
+    }
+    const previous = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+    const trackStop = vi.fn();
+    const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:recording-test");
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.stubGlobal("MediaRecorder", TestRecorder);
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop: trackStop }] }),
+      enumerateDevices: async () => [{ deviceId: "default", kind: "audioinput", label: "Sandbox microphone" }],
+    } });
+    const { unmount } = renderUi(<RecordingPreflight orderId={orderId} deviceId="" onDevice={vi.fn()} onClose={vi.fn()}
+      onContinue={vi.fn()} onAgreementRequired={vi.fn()} />);
+    try {
+      const button = await screen.findByRole("button", { name: "Test microphone" });
+      vi.useFakeTimers();
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      button.focus();
+      await user.keyboard("{Enter}");
+      expect(screen.getByRole("button", { name: "Cancel microphone test" })).toHaveFocus();
+      await user.keyboard("{Enter}");
+      expect(screen.getByRole("button", { name: "Test microphone" })).toHaveFocus();
+      await user.keyboard("{Enter}");
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(screen.getByRole("button", { name: "Test again" })).toHaveFocus();
+      expect(screen.getByLabelText("Play your microphone test")).toHaveAttribute("src", "blob:recording-test");
+      expect(trackStop).toHaveBeenCalledTimes(2);
+      expect(create).toHaveBeenCalledOnce();
+      expect(fetchMock).not.toHaveBeenCalled();
+      unmount();
+      expect(revoke).toHaveBeenCalledWith("blob:recording-test");
+    } finally {
+      vi.useRealTimers();
+      create.mockRestore();
+      revoke.mockRestore();
+      vi.unstubAllGlobals();
+      if (previous) Object.defineProperty(navigator, "mediaDevices", previous);
+      else Reflect.deleteProperty(navigator, "mediaDevices");
+    }
+  });
+
+  it("replays only files that the agreement gate refused, never earlier confirmed files", async () => {
+    const user = userEvent.setup();
+    fetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: [
+        { index: 0, outcome: "completed" },
+        { index: 1, outcome: "refused", reason: "AGREEMENT_REQUIRED", details: { policyPublicId: orderId, signatureMode: "checkbox" } },
+      ] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const { container } = renderUi(<FileUploadPanel orderId={orderId} staff={false} policy={policy} onChanged={vi.fn()} />);
+    await user.upload(container.querySelector("input[type=file]")!, [
+      new File(["first"], "first.pdf", { type: "application/pdf" }), new File(["second"], "second.pdf", { type: "application/pdf" }),
+    ]);
+    await user.click(screen.getByRole("button", { name: "Upload 2 files" }));
+    await user.click(await screen.findByRole("button", { name: "Accept test agreement" }));
+    expect(await screen.findByText("2 of 2 uploads confirmed.")).toBeInTheDocument();
+    expect((fetchMock.mock.calls[1]![1].body as FormData).getAll("files")).toEqual([expect.objectContaining({ name: "second.pdf" })]);
+  });
 });
 
 describe("order file tab", () => {
+  it("preselects a task from the Files tab link and focuses the task heading", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy,
+      uploadSlots: { statusKey: "intake", slots: [
+        { key: "voice_evidence", label: "Voice task", kind: "audio", maxCount: 1, allowedTypes: ["wav"], capture: "either" },
+      ] }, audio: { enabled: true, maxMinutes: 30 } });
+    renderUi(<OrderFilesTab orderId={orderId} area="customer" />, { path: `/orders/${orderId}/files?slot=voice_evidence` });
+    const heading = await screen.findByRole("heading", { name: "Voice task" });
+    expect(heading).toContainElement(document.activeElement as HTMLElement);
+    expect(screen.getByLabelText("Upload to")).toHaveValue("voice_evidence");
+    expect(screen.getByRole("button", { name: "Record", exact: true })).toBeInTheDocument();
+  });
+
   it("renders a read-only attachment access path without staff controls", async () => {
     const { container } = renderUi(<><h1>Example order</h1><OrderFilesTab orderId={orderId} area="customer" /></>);
     expect(await screen.findByText("File changes unavailable")).toBeInTheDocument();
@@ -127,11 +239,13 @@ describe("file administration", () => {
   it("labels the rules, identifies unconfigured scanning, validates inputs, and sends bounded changes", async () => {
     const onSave = vi.fn(async () => {});
     const user = userEvent.setup();
-    const { container } = renderUi(<FilesAdminContent onSave={onSave} saving={false} audioSaving={false} onSaveAudio={vi.fn()} overview={{
+    const { container } = renderUi(<FilesAdminContent onSave={onSave} saving={false} audioSaving={false} onSaveAudio={vi.fn()}
+      documentSaving={false} onSaveDocument={vi.fn()} overview={{
       rules: { ...policy, retentionDays: 30 },
       supported: { ...policy, maxFileBytes: 100 * 1024 * 1024, maxRequestBytes: 256 * 1024 * 1024, maxFiles: 12 },
       storedBytes: "1024", storedFiles: 4, retainedFiles: 2, antivirus: "not_configured",
       audioRules: { enabled: false, maxMinutes: 5, bitrateKbps: 48, keepOriginal: true }, audioVersion: null,
+      documentEditingRules: { enabled: true, maxBytes: 10 * 1024 * 1024 },
     }} />);
     expect(screen.getByRole("heading", { level: 1, name: "File administration" })).toBeInTheDocument();
     expect(screen.getByText("Not configured")).toBeInTheDocument();
@@ -147,4 +261,11 @@ describe("file administration", () => {
     await user.click(screen.getByRole("button", { name: "Save file rules" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ maxFiles: 5, extensions: ["pdf", "jpg"] })));
   });
+});
+
+pageA11y("Recording setup dialog", async () => {
+  document.title = "Order recordings · ReadyPackets";
+  renderUi(<main><h1>Order recordings</h1><RecordingPreflight orderId={orderId} deviceId="" onDevice={vi.fn()} onClose={vi.fn()}
+    onContinue={vi.fn()} onAgreementRequired={vi.fn()} /></main>);
+  expect(await screen.findByRole("button", { name: "Use device recorder" })).toBeInTheDocument();
 });

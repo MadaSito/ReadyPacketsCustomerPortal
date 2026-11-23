@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { FolderLock, ShieldAlert } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { FilesModule, UploadPolicy } from "@server/modules/files/index";
-import type { AudioRules, FileRules } from "@server/modules/files/settings";
+import type { AudioRules, DocumentEditingRules, FileRules } from "@server/modules/files/settings";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import {
   Badge, Button, Callout, Card, Checkbox, ErrorState, Field, Input, KeyValueList, PageHeader,
@@ -18,9 +18,13 @@ const formatLabels: Record<UploadPolicy["extensions"][number], string> = {
   jpg: "JPEG image",
   wav: "WAV audio",
   webm: "WebM audio or video",
-  mp4: "MP4 video",
+  mp4: "MP4 audio or video",
   m4a: "M4A audio",
   ogg: "Ogg audio or video",
+  docx: "Word document",
+  mp3: "MP3 audio",
+  aac: "AAC audio",
+  caf: "CAF audio",
 };
 
 export function FileRulesEditor({ initial, supported, onSave, busy }: {
@@ -108,8 +112,8 @@ function AudioRulesEditor({ initial, busy, version, onSave }: {
     event.preventDefault();
     setNotice(null);
     const value = { enabled, maxMinutes: Number(minutes), bitrateKbps: Number(bitrate), keepOriginal: true as const };
-    if (!Number.isInteger(value.maxMinutes) || value.maxMinutes < 1 || value.maxMinutes > 20 ||
-      !Number.isInteger(value.bitrateKbps) || value.bitrateKbps < 24 || value.bitrateKbps > 128) {
+    if (!Number.isInteger(value.maxMinutes) || value.maxMinutes < 1 || value.maxMinutes > 120 ||
+      !Number.isInteger(value.bitrateKbps) || value.bitrateKbps < 24 || value.bitrateKbps > 256) {
       setNotice("Enter whole numbers within the given duration and bitrate limits.");
       return;
     }
@@ -117,24 +121,53 @@ function AudioRulesEditor({ initial, busy, version, onSave }: {
     catch (error) { if (!(error instanceof StepUpCancelledError)) setNotice(errorMessage(error, "Audio settings could not be saved.")); }
   }
   return <form className="grid min-w-0 gap-4" onSubmit={(event) => { void submit(event); }} noValidate>
-    <p className="text-sm text-body">{!initial.enabled ? "Recording and conversion are off. Ordinary file uploads remain available." :
-      version ? `FFmpeg ${version} is available.` : "Conversion not available. Original audio can still be uploaded."}</p>
-    <Checkbox label="Enable microphone recording and WebM conversion" checked={enabled} onCheckedChange={setEnabled} disabled={busy} />
-    <Field label="Maximum recording length (minutes)" hint="Between 1 and 20 minutes." required>
-      <Input type="number" min={1} max={20} step={1} value={minutes} onChange={(event) => setMinutes(event.target.value)} disabled={busy} />
+    {!initial.enabled || version ? <p className="text-sm text-body">{!initial.enabled ? "Recording and conversion are off. Ordinary file uploads remain available." :
+      `FFmpeg ${version} is available.`}</p> :
+      <Callout tone="warning" title="FFmpeg unavailable">Original audio can still be uploaded. Re-encoding and tasks that require duration verification may be unavailable.</Callout>}
+    <Checkbox label="Enable microphone recording and WebM/Opus conversion" checked={enabled} onCheckedChange={setEnabled} disabled={busy} />
+    <Field label="Maximum recording length (minutes)" hint="Between 1 and 120 minutes. A workflow recording task can set its own duration." required>
+      <Input type="number" min={1} max={120} step={1} value={minutes} onChange={(event) => setMinutes(event.target.value)} disabled={busy} />
     </Field>
-    <Field label="WebM bitrate (kbps)" hint="Between 24 and 128 kbps." required>
-      <Input type="number" min={24} max={128} step={1} value={bitrate} onChange={(event) => setBitrate(event.target.value)} disabled={busy} />
+    <Field label="WebM bitrate (kbps)" hint="Between 24 and 256 kbps." required>
+      <Input type="number" min={24} max={256} step={1} value={bitrate} onChange={(event) => setBitrate(event.target.value)} disabled={busy} />
     </Field>
-    <p className="text-sm text-body">Keep original: always on. Conversion creates a separate copy; it never replaces the original.</p>
+    <p className="text-sm text-body">Keep original: always on. Re-encoding creates a separate WebM/Opus file. It is not bit-identical to the original.</p>
     {notice ? <Callout tone="danger" live="assertive" title="Check audio settings">{notice}</Callout> : null}
     <div><Button type="submit" disabled={!changed} loading={busy}>Save audio settings</Button></div>
   </form>;
 }
 
-export function FilesAdminContent({ overview, saving, onSave, audioSaving, onSaveAudio }: {
+function DocumentRulesEditor({ initial, busy, onSave }: {
+  initial: DocumentEditingRules; busy: boolean; onSave: (rules: DocumentEditingRules) => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [size, setSize] = useState(String(initial.maxBytes / mebibyte));
+  const [error, setError] = useState<string | null>(null);
+  const maxBytes = Math.round(Number(size) * mebibyte);
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1024 || maxBytes > 10 * mebibyte) {
+      setError("Enter a document size between 1 KiB and 10 MiB.");
+      return;
+    }
+    try { await onSave({ enabled, maxBytes }); }
+    catch (cause) { if (!(cause instanceof StepUpCancelledError)) setError(errorMessage(cause, "Editor settings could not be saved.")); }
+  }
+  return <form className="grid min-w-0 gap-4" noValidate onSubmit={(event) => { void submit(event); }}>
+    <Checkbox label="Allow editing Word documents in the portal" checked={enabled} disabled={busy} onCheckedChange={setEnabled} />
+    <Field label="Maximum editor file size (MiB)" hint="Up to 10 MiB. The platform upload limit still applies." required>
+      <Input type="number" min={1024 / mebibyte} max={10} step="any" value={size} disabled={busy} onChange={(event) => setSize(event.target.value)} />
+    </Field>
+    {error ? <Callout tone="danger" live="assertive" title="Check editor settings">{error}</Callout> : null}
+    <div><Button type="submit" loading={busy} disabled={enabled === initial.enabled && maxBytes === initial.maxBytes}>Save editor settings</Button></div>
+  </form>;
+}
+
+export function FilesAdminContent({ overview, saving, onSave, audioSaving, onSaveAudio, documentSaving, onSaveDocument }: {
   overview: Overview; saving: boolean; onSave: (rules: FileRules) => Promise<void>;
   audioSaving: boolean; onSaveAudio: (rules: AudioRules) => Promise<void>;
+  documentSaving: boolean; onSaveDocument: (rules: DocumentEditingRules) => Promise<void>;
 }) {
   return (
     <>
@@ -147,6 +180,10 @@ export function FilesAdminContent({ overview, saving, onSave, audioSaving, onSav
           <Card title="Audio recording and conversion" description="Control browser recording and the worker’s WebM/Opus output.">
             <AudioRulesEditor initial={overview.audioRules} version={overview.audioVersion} key={JSON.stringify(overview.audioRules)}
               busy={audioSaving} onSave={onSaveAudio} />
+          </Card>
+          <Card title="Word document editing" description="An editor save creates a new version and keeps the source file.">
+            <DocumentRulesEditor key={JSON.stringify(overview.documentEditingRules)} initial={overview.documentEditingRules}
+              busy={documentSaving} onSave={onSaveDocument} />
           </Card>
           <Card title="Recorded storage usage" description="Includes active versions and files retained in trash. Staging and export artifacts are excluded.">
             <KeyValueList columns={1} items={[
@@ -176,6 +213,7 @@ export default function FilesAdminPage() {
   const overview = useQuery(trpc.files.admin.get.queryOptions());
   const save = useMutation(trpc.files.admin.setTypeRules.mutationOptions());
   const saveAudio = useMutation(trpc.files.admin.setAudioRules.mutationOptions());
+  const saveDocument = useMutation(trpc.files.admin.setDocumentEditingRules.mutationOptions());
   const [verifying, setVerifying] = useState(false);
 
   async function change(rules: FileRules) {
@@ -196,6 +234,14 @@ export default function FilesAdminPage() {
       toast.show({ tone: "success", title: "Audio settings saved" });
     } finally { setVerifying(false); }
   }
+  async function changeDocument(rules: DocumentEditingRules) {
+    setVerifying(true);
+    try {
+      await stepUp.run(() => saveDocument.mutateAsync(rules), { reason: "Changing the Word editor requires a fresh identity check." });
+      await queryClient.invalidateQueries({ queryKey: trpc.files.pathKey() });
+      toast.show({ tone: "success", title: "Editor settings saved" });
+    } finally { setVerifying(false); }
+  }
 
   if (!overview.data) {
     return <>
@@ -206,5 +252,6 @@ export default function FilesAdminPage() {
     </>;
   }
   return <FilesAdminContent overview={overview.data} onSave={change} saving={save.isPending || verifying}
-    onSaveAudio={changeAudio} audioSaving={saveAudio.isPending || verifying} />;
+    onSaveAudio={changeAudio} audioSaving={saveAudio.isPending || verifying}
+    onSaveDocument={changeDocument} documentSaving={saveDocument.isPending || verifying} />;
 }

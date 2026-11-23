@@ -2,11 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Mic } from "lucide-react";
 import { Button, Callout } from "@/ui";
 import { formatBytes } from "./format";
-
-const types = [
-  ["audio/webm;codecs=opus", "webm"], ["audio/webm", "webm"],
-  ["audio/ogg;codecs=opus", "ogg"], ["audio/mp4", "m4a"],
-] as const;
+import { activeRecordingType, extensionForRecording, microphoneConstraints, microphoneHelp, pickRecorderFormat } from "./recordingDevice";
 
 export function formatDuration(seconds: number) {
   const value = Math.max(0, Math.floor(seconds));
@@ -14,11 +10,12 @@ export function formatDuration(seconds: number) {
 }
 
 type State = "ready" | "permission" | "recording" | "paused" | "stopping" | "review";
-type Capture = { stream: MediaStream; recorder: MediaRecorder; context?: AudioContext; timer?: number };
+type Capture = { stream: MediaStream; recorder: MediaRecorder; context?: AudioContext; timer?: number; deadline?: number; wakeLock?: WakeLockSentinel };
 type Review = { file: File; url: string; duration: number };
 
-export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
+export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose, deviceId = "", onUnavailable }: {
   maxSeconds: number; maxBytes: number; extensions: readonly string[]; onChoose: (file: File) => void;
+  deviceId?: string; onUnavailable?: () => void;
 }) {
   const titleId = useId();
   const hintId = useId();
@@ -34,14 +31,15 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
   const [elapsed, setElapsed] = useState(0);
   const [level, setLevel] = useState(0);
   const [review, setReview] = useState<Review | null>(null);
-  const selectedType = typeof MediaRecorder !== "undefined" && typeof MediaRecorder.isTypeSupported === "function"
-    ? types.find(([mime, ext]) => extensions.includes(ext) && MediaRecorder.isTypeSupported(mime)) : undefined;
-  const supported = !!selectedType && typeof navigator.mediaDevices?.getUserMedia === "function";
+  const selectedType = pickRecorderFormat(extensions);
+  const supported = selectedType !== null && typeof navigator.mediaDevices?.getUserMedia === "function";
 
   function release(capture: Capture) {
     if (capture.timer !== undefined) window.clearInterval(capture.timer);
+    if (capture.deadline !== undefined) window.clearTimeout(capture.deadline);
     capture.stream.getTracks().forEach((track) => track.stop());
     void capture.context?.close().catch(() => {});
+    void capture.wakeLock?.release().catch(() => {});
   }
 
   useEffect(() => () => {
@@ -63,7 +61,7 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
   }, [state, error]);
 
   async function start() {
-    if (!selectedType || activeRequest.current || active.current) return;
+    if (selectedType === null || activeRequest.current || active.current) return;
     setError(null);
     setElapsed(0);
     setLevel(0);
@@ -72,13 +70,12 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
     activeRequest.current = request;
     let stream: MediaStream | undefined;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream = await navigator.mediaDevices.getUserMedia(microphoneConstraints(deviceId));
       if (activeRequest.current !== request) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
-      const [mime, ext] = selectedType;
-      const recorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 48_000 });
+      const recorder = new MediaRecorder(stream, { ...(selectedType ? { mimeType: selectedType } : {}), audioBitsPerSecond: 48_000 });
       const capture: Capture = { stream, recorder };
       active.current = capture;
       const chunks: Blob[] = [];
@@ -94,12 +91,19 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
         setState("stopping");
         recorder.stop();
       };
+      const armDeadline = () => {
+        if (capture.deadline !== undefined) window.clearTimeout(capture.deadline);
+        // Leave room for encoder padding and scheduling around the verified server limit.
+        capture.deadline = window.setTimeout(stop, Math.max(0, maxSeconds * 1000 - duration() - 150));
+      };
       recorder.addEventListener("pause", () => {
         completedMs += performance.now() - started;
+        if (capture.deadline !== undefined) window.clearTimeout(capture.deadline);
         if (active.current === capture) setState("paused");
       });
       recorder.addEventListener("resume", () => {
         started = performance.now();
+        armDeadline();
         if (active.current === capture) setState("recording");
       });
       recorder.addEventListener("dataavailable", (event) => {
@@ -119,6 +123,7 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
         active.current = null;
         release(capture);
         setError("The recording failed. Try again or choose an audio file.");
+        onUnavailable?.();
         setState("ready");
       });
       recorder.addEventListener("stop", () => {
@@ -130,7 +135,15 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
           setState("ready");
           return;
         }
-        const file = new File(chunks, `recording.${ext}`, { type: recorder.mimeType || mime });
+        const mime = activeRecordingType(recorder, chunks, selectedType);
+        const ext = extensionForRecording(mime, extensions);
+        if (!ext) {
+          setError("This device recorded a format the order does not accept. Try the device recorder or an approved audio file.");
+          onUnavailable?.();
+          setState("ready");
+          return;
+        }
+        const file = new File(chunks, `recording.${ext}`, { type: mime });
         const url = URL.createObjectURL(file);
         preview.current = url;
         setReview({ file, url, duration: (finishMs ?? Math.max(completedMs, performance.now() - started)) / 1000 });
@@ -147,7 +160,13 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
         context.createMediaStreamSource(stream).connect(analyser);
         sample = new Float32Array(analyser.fftSize);
       } catch { /* The browser may record without a level meter. */ }
-      recorder.start(250);
+      recorder.start(1000);
+      started = performance.now();
+      armDeadline();
+      void navigator.wakeLock?.request("screen").then((lock) => {
+        if (active.current === capture) capture.wakeLock = lock;
+        else void lock.release().catch(() => {});
+      }).catch(() => {});
       setState("recording");
       capture.timer = window.setInterval(() => {
         if (recorder.state !== "recording") return;
@@ -166,8 +185,9 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
       if (active.current) { release(active.current); active.current = null; }
       else stream?.getTracks().forEach((track) => track.stop());
       setError(cause instanceof DOMException && cause.name === "NotAllowedError"
-        ? "Microphone access was denied. Change your browser permissions or choose an audio file."
+        ? `Microphone access was denied. ${microphoneHelp(navigator.userAgent)}`
         : "The microphone could not be started. Try again or choose an audio file.");
+      onUnavailable?.();
       setState("ready");
     } finally { if (activeRequest.current === request) activeRequest.current = null; }
   }
@@ -197,7 +217,7 @@ export function AudioRecorder({ maxSeconds, maxBytes, extensions, onChoose }: {
         activeRequest.current = null; setState("ready"); window.requestAnimationFrame(() => startButton.current?.focus());
       }}>Cancel microphone request</Button></div> : null}
       {state === "recording" || state === "paused" ? <>
-        <p className="font-mono text-sm tabular-nums text-ink" aria-hidden="true">{formatDuration(elapsed)}</p>
+        <p className="font-mono text-sm tabular-nums text-ink">{formatDuration(elapsed)} elapsed · {formatDuration(maxSeconds - elapsed)} remaining</p>
         {state === "recording" ? <div className="grid gap-1">
           <meter className="w-full" aria-label="Microphone level" min={0} max={100} value={level} />
           <p className="text-sm text-muted">Microphone level: {level > 65 ? "High" : level > 15 ? "Moderate" : "Quiet or unavailable"}</p>

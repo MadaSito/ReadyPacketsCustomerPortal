@@ -1,11 +1,14 @@
 import { useId, useRef, useState } from "react";
-import { Upload } from "lucide-react";
+import { Mic, Upload } from "lucide-react";
 import type { FileCategory, FileUploadSlot, FileVisibility, UploadPolicy } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
+import { AgreementDialog, type AgreementSignatureMode } from "@/lib/agreementGate";
 import { sessionFetch } from "@/lib/sessionTransport";
 import { Button, Callout, Field, FileDropzone, Select, StatusBadge, Textarea } from "@/ui";
 import { AudioRecorder } from "./AudioRecorder";
 import { formatBytes } from "./format";
+import { RecordingPreflight } from "./RecordingPreflight";
+import { audioFileExtensions, extensionForRecording, pickRecorderFormat } from "./recordingDevice";
 
 export const categoryLabels: Record<FileCategory, string> = {
   supporting: "Supporting document",
@@ -18,28 +21,40 @@ export const visibilityLabels: Record<FileVisibility, string> = {
 };
 
 export type UploadOutcome = { index: number; outcome: "completed" | "refused" | "unknown"; message?: string };
+type Agreement = { policyPublicId: string; signatureMode: AgreementSignatureMode };
+type PendingAgreement = Agreement & ({ indices: number[] } | { preflight: "record" | "check" });
+
+function readAgreement(reason: unknown, details: unknown): Agreement | null {
+  if (reason !== "AGREEMENT_REQUIRED" || !details || typeof details !== "object" ||
+      !("policyPublicId" in details) || !("signatureMode" in details) ||
+      typeof details.policyPublicId !== "string" || !/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/u.test(details.policyPublicId) ||
+      (details.signatureMode !== "checkbox" && details.signatureMode !== "typed_name")) return null;
+  return { policyPublicId: details.policyPublicId, signatureMode: details.signatureMode };
+}
 
 const uploadRefusals = new Map([
   ["UPLOAD_REQUEST_TOO_LARGE", "The total upload exceeds the request limit. Choose fewer or smaller files."],
   ["TOO_MANY_FILES", "This batch exceeds the file count limit."],
   ["ORDER_LOCKED", "This order is locked for file changes."],
   ["ORDER_ACCEPTANCE_REQUIRED", "Accept the order's required policy before uploading files or saving a recording."],
+  ["AGREEMENT_REQUIRED", "Accept the order agreement before uploading files or saving a recording."],
   ["PHASE_LOCKED", "This phase is locked for file changes."],
   ["UPLOAD_SLOT_STATUS_CHANGED", "The order status changed. Reload to see the current upload slots."],
   ["UPLOAD_SLOT_UNAVAILABLE", "This upload slot is no longer available to you."],
   ["AUDIT_WRITE_FAILED", "A security record could not be saved. Reload the list to confirm which files were saved."],
 ]);
 
-function decodeResults(data: unknown, count: number): UploadOutcome[] {
+function decodeResults(data: unknown, count: number): (UploadOutcome & { agreement: Agreement | null })[] {
   if (!data || typeof data !== "object" || !("results" in data) || !Array.isArray(data.results)) return [];
   const seen = new Set<number>();
-  const results: UploadOutcome[] = [];
+  const results: (UploadOutcome & { agreement: Agreement | null })[] = [];
   for (const item of data.results as unknown[]) {
     if (!item || typeof item !== "object" || !("index" in item) || !("outcome" in item) ||
         typeof item.index !== "number" || !Number.isInteger(item.index) || item.index < 0 || item.index >= count ||
         seen.has(item.index) || (item.outcome !== "refused" && item.outcome !== "completed" && item.outcome !== "unknown")) continue;
     seen.add(item.index);
     results.push({ index: item.index, outcome: item.outcome,
+      agreement: item.outcome === "refused" ? readAgreement("reason" in item ? item.reason : undefined, "details" in item ? item.details : undefined) : null,
       message: "message" in item && typeof item.message === "string" ? item.message.slice(0, 300) : undefined });
   }
   return results;
@@ -52,32 +67,47 @@ export interface FileUploadPanelProps {
   replace?: { id: string; category: FileCategory; visibility: FileVisibility };
   slot?: FileUploadSlot & { statusKey: string };
   audio?: { enabled: boolean; maxMinutes: number } | null;
+  launchRecording?: boolean;
   onChanged: () => void | Promise<void>;
 }
 
-export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, onChanged }: FileUploadPanelProps) {
+export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, launchRecording = false, onChanged }: FileUploadPanelProps) {
   const hintId = useId();
+  const captureId = useId();
+  const recordButton = useRef<HTMLButtonElement>(null);
+  const checkButton = useRef<HTMLButtonElement>(null);
   const transcriptInput = useRef<HTMLTextAreaElement>(null);
   const [category, setCategory] = useState<FileCategory>(replace?.category ?? "supporting");
   const [visibility, setVisibility] = useState<FileVisibility>(replace?.visibility ?? "customer_visible");
   const [selection, setSelection] = useState<File[]>([]);
   const [recording, setRecording] = useState(false);
   const [results, setResults] = useState<UploadOutcome[]>([]);
+  const [agreement, setAgreement] = useState<PendingAgreement | null>(null);
   const [running, setRunning] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [transcript, setTranscript] = useState("");
+  const [checking, setChecking] = useState<"record" | "check" | null>(() =>
+    launchRecording && audio?.enabled && slot?.kind === "audio" && slot.capture !== "upload" ? "record" : null);
+  const [preflightComplete, setPreflightComplete] = useState(false);
+  const [deviceId, setDeviceId] = useState("");
+  const [showRecorder, setShowRecorder] = useState(false);
+  const [showCapture, setShowCapture] = useState(false);
   const maxFiles = replace ? 1 : Math.min(policy.maxFiles, slot?.maxCount ?? policy.maxFiles);
   const extensions = slot ? policy.extensions.filter((extension) => {
     if (slot.allowedTypes.length && !slot.allowedTypes.includes(extension)) return false;
-    return (slot.kind === "audio" ? ["wav", "webm", "ogg", "m4a"] : ["pdf", "png", "jpg"]).includes(extension);
+    return (slot.kind === "audio" ? (audioFileExtensions as readonly string[]) : ["pdf", "png", "jpg", "docx"]).includes(extension);
   }) : policy.extensions;
+  const canPick = slot?.acceptsUpload !== false && slot?.capture !== "record";
+  const canRecord = audio?.enabled && slot?.acceptsUpload !== false && slot?.capture !== "upload" &&
+    slot?.kind !== "document" && audioFileExtensions.some((extension) => extensions.includes(extension));
   const allowsTranscript = selection.length === 1 && (slot?.kind === "audio" ||
-    /^(?:audio\/)|\.(?:wav|ogg|webm|m4a)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
+    /^(?:audio\/)|\.(?:wav|ogg|webm|m4a|mp4|mp3|aac|caf)$/iu.test(`${selection[0]?.type} ${selection[0]?.name}`));
   const categories = (Object.keys(categoryLabels) as FileCategory[]).filter((key) => staff || key !== "deliverable");
 
   function choose(files: File[], isRecording = false) {
     setMessage(null);
     setResults([]);
+    setAgreement(null);
     setTranscript("");
     setRecording(isRecording);
     if (files.length > maxFiles) {
@@ -93,11 +123,31 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     setSelection(files);
   }
 
-  async function upload() {
-    if (!selection.length || running) return;
+  function chooseRecording(file: File) {
+    const suffix = file.name.split(".").at(-1)?.toLowerCase();
+    const extension = suffix && (audioFileExtensions as readonly string[]).includes(suffix)
+      ? (extensions.includes(suffix as typeof extensions[number]) ? suffix : undefined)
+      : extensionForRecording(file.type, extensions);
+    if (!extension) { setMessage("This recording format is not accepted by this order. Choose an approved audio format."); return; }
+    choose([suffix === extension ? file : new File([file], `recording.${extension}`, { type: file.type })], true);
+    window.requestAnimationFrame(() => transcriptInput.current?.focus());
+  }
+
+  function openRecorder(fallback = false) {
+    if (fallback || pickRecorderFormat(extensions) === null || window.isSecureContext === false || !navigator.mediaDevices?.getUserMedia) {
+      setShowCapture(true);
+      setShowRecorder(false);
+    } else setShowRecorder(true);
+  }
+
+  async function upload(indices = selection.map((_, index) => index)) {
+    if (!indices.length || running) return;
     setRunning(true);
     setMessage(null);
-    setResults([]);
+    setAgreement(null);
+    function update(outcomes: UploadOutcome[]) {
+      setResults((prior) => [...prior.filter((result) => !indices.includes(result.index)), ...outcomes]);
+    }
     const query = new URLSearchParams({ category, visibility: slot ? "customer_visible" : visibility });
     if (recording) query.set("source", "recording");
     if (slot) {
@@ -106,7 +156,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     }
     if (replace) query.set("versionOf", replace.id);
     const payload = new FormData();
-    for (const file of selection) payload.append("files", file);
+    for (const index of indices) payload.append("files", selection[index]!);
     if (allowsTranscript && transcript.trim()) payload.append("transcript", transcript.trim());
     try {
       const response = await sessionFetch(apiUrl(`/api/files/upload/${encodeURIComponent(orderId)}?${query.toString()}`), {
@@ -116,17 +166,29 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       if (!response.ok) {
         const safe = body && typeof body === "object" && "safe" in body ? body.safe : null;
         const reason = safe && typeof safe === "object" && "reasonCode" in safe && typeof safe.reasonCode === "string" ? safe.reasonCode : "";
+        const pending = readAgreement(reason, safe && typeof safe === "object" && "details" in safe ? safe.details : undefined);
+        if (pending) {
+          setAgreement({ ...pending, indices });
+          return;
+        }
         setMessage(uploadRefusals.get(reason) ?? "The upload was not confirmed. Reload the file list before retrying.");
         if ([401, 403, 404, 409, 413, 429].includes(response.status) || uploadRefusals.has(reason) && reason !== "AUDIT_WRITE_FAILED") {
-          setResults(selection.map((_, index) => ({ index, outcome: "refused" })));
-        } else setResults(selection.map((_, index) => ({ index, outcome: "unknown" })));
+          update(indices.map((index) => ({ index, outcome: "refused" })));
+        } else update(indices.map((index) => ({ index, outcome: "unknown" })));
       } else {
-        const outcomes = decodeResults(body, selection.length);
-        setResults(selection.map((_, index) => outcomes.find((item) => item.index === index) ?? { index, outcome: "unknown" }));
+        const outcomes = decodeResults(body, indices.length);
+        const pending = outcomes.find((result) => result.agreement !== null)?.agreement;
+        const retryIndices: number[] = [];
+        update(indices.map((index, position) => {
+          const result = outcomes.find((item) => item.index === position);
+          if (pending && result?.agreement?.policyPublicId === pending.policyPublicId && result.agreement.signatureMode === pending.signatureMode) retryIndices.push(index);
+          return { index, outcome: result?.outcome ?? "unknown", message: result?.message };
+        }));
+        if (pending && retryIndices.length) setAgreement({ ...pending, indices: retryIndices });
       }
     } catch {
       setMessage("The connection ended before the uploads were confirmed. Reload the file list before retrying.");
-      setResults(selection.map((_, index) => ({ index, outcome: "unknown" })));
+      update(indices.map((index) => ({ index, outcome: "unknown" })));
     } finally {
       setRunning(false);
       void onChanged();
@@ -148,15 +210,54 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
         </Field> : null}
       </div> : null}
       {slot ? <p className="text-sm text-body">Files in this slot are visible to authorized order readers.</p> : null}
-      {extensions.length ? <FileDropzone onFiles={choose} accept={accept} multiple={maxFiles !== 1} maxSize={policy.maxFileBytes}
+      {canPick && extensions.length ? <FileDropzone onFiles={choose} accept={accept} multiple={maxFiles !== 1} maxSize={policy.maxFileBytes}
         disabled={running} label={replace ? "Choose replacement file" : "Choose files"}
         hint={`Approved formats: ${extensions.map((ext) => ext.toUpperCase()).join(", ")}. Up to ${maxFiles} per upload.`} /> :
-        <Callout tone="warning" title="Uploads paused">No file formats are enabled. Existing files remain available to authorized readers.</Callout>}
-      {audio?.enabled && !running && !selection.length && slot?.kind !== "document" ?
-        <AudioRecorder extensions={extensions} maxSeconds={audio.maxMinutes * 60}
+        canPick ? <Callout tone="warning" title="Uploads paused">No file formats are enabled. Existing files remain available to authorized readers.</Callout> : null}
+      {canRecord ? <div className="flex flex-wrap gap-2">
+        <Button ref={recordButton} leadingIcon={<Mic aria-hidden />} disabled={running || selection.length > 0} onClick={() => {
+          if (preflightComplete) openRecorder();
+          else setChecking("record");
+        }}>Record</Button>
+        <Button ref={checkButton} variant="ghost" disabled={running || showRecorder} onClick={() => setChecking("check")}>Check microphone</Button>
+      </div> : null}
+      {checking && canRecord ? <RecordingPreflight orderId={orderId} slotKey={slot?.key} deviceId={deviceId} onDevice={setDeviceId}
+        onAgreementRequired={(pending) => { setAgreement({ ...pending, preflight: checking }); setChecking(null); }}
+        onClose={() => {
+          const trigger = checking === "record" ? recordButton : checkButton;
+          setChecking(null);
+          window.requestAnimationFrame(() => trigger.current?.focus());
+        }}
+        onContinue={(fallback) => {
+          setChecking(null); setPreflightComplete(true); openRecorder(fallback);
+          window.requestAnimationFrame(() => document.getElementById(fallback ? captureId : `${captureId}-recorder`)?.focus());
+        }} /> : null}
+      {canRecord && showRecorder && !running && !selection.length ?
+        <div id={`${captureId}-recorder`} tabIndex={-1} className="min-w-0">
+          <AudioRecorder extensions={extensions} maxSeconds={(slot?.maxMinutes ?? audio.maxMinutes) * 60}
           maxBytes={Math.min(policy.maxFileBytes, policy.maxRequestBytes - 1024)}
-          onChoose={(file) => { choose([file], true); window.requestAnimationFrame(() => transcriptInput.current?.focus()); }} /> : null}
+          deviceId={deviceId} onUnavailable={() => setShowCapture(true)} onChoose={chooseRecording} />
+          <Button className="mt-2" variant="ghost" onClick={() => { setShowRecorder(false); window.requestAnimationFrame(() => recordButton.current?.focus()); }}>Close recorder</Button>
+        </div> : null}
+      {canRecord && showCapture && !running && !selection.length ? <div className="grid min-w-0 gap-2">
+        <label className="font-medium text-ink" htmlFor={captureId}>Record with your device</label>
+        <input className="w-full min-w-0 rounded-md border border-line bg-surface p-2 text-sm text-ink" id={captureId} aria-describedby={`${captureId}-hint`}
+          type="file" accept="audio/*" capture onChange={(event) => {
+            const [file] = Array.from(event.currentTarget.files ?? []);
+            event.currentTarget.value = "";
+            if (file) chooseRecording(file);
+          }} />
+        <p id={`${captureId}-hint`} className="text-sm text-body">Some devices open a file picker instead. The server checks the selected file and enforces the task’s recording limits.</p>
+      </div> : null}
+      {!canPick && !canRecord ? <Callout tone="info" title="Recording unavailable">This task requires a recording, but browser recording is disabled or no audio formats are enabled.</Callout> : null}
       {message ? <Callout tone="warning" title="Upload notice" live="polite">{message}</Callout> : null}
+      {agreement ? <AgreementDialog open policyPublicId={agreement.policyPublicId} signatureMode={agreement.signatureMode}
+        onClose={() => { setAgreement(null); setMessage("Accept the order agreement before uploading or recording."); }}
+        onAccepted={() => {
+          if ("indices" in agreement) return upload(agreement.indices);
+          setAgreement(null);
+          setChecking(agreement.preflight);
+        }} /> : null}
       {selection.length ? <>
         <ul className="grid min-w-0 divide-y divide-line rounded-[var(--radius-card)] border border-line bg-surface px-3" aria-label="Selected files and upload results">
           {selection.map((file, index) => {
