@@ -76,3 +76,8 @@ bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.tes
 bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1289
 bdefe7069660e6ddd15c556075c33484fdf4a8d4:server/modules/cart/cartIncrement06.test.ts:stripe-access-token:1009
 f17c9c41b15deb040cb73926cd239982b6bf2158:server/modules/compliance/receiptsAndSmallTotals.test.ts:generic-api-key:702
+# 8243000: synthetic idempotency keys in cart tests (reviewed by lead, increment 06 QA fixes)
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:974
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1013
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1064
+82430006150dff06ea7c7745d4555115c100eeb7:server/modules/cart/cartIncrement06.test.ts:generic-api-key:1152
