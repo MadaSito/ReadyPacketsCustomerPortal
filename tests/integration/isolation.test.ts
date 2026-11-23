@@ -8,12 +8,13 @@
  */
 import type { AnyTRPCProcedure } from "@trpc/server";
 import { eq } from "drizzle-orm";
+import superjson from "superjson";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { carts } from "../../server/modules/cart/schema.js";
 import type { CartView, CheckoutCartResult } from "../../server/modules/cart/types.js";
-import { complianceInvoicePayments, complianceInvoices } from "../../server/modules/compliance/schema.js";
+import { complianceInvoices } from "../../server/modules/compliance/schema.js";
 import { DEFAULT_COMMUNITY_CONFIG } from "../../server/modules/community/settings.js";
-import { exampleWav } from "../../server/modules/files/fixtures.test-support.js";
+import { exampleDocx, exampleWav } from "../../server/modules/files/fixtures.test-support.js";
 import { integrationProductionDispatches } from "../../server/modules/integrations/schema.js";
 import { knowledgeArticleAttachments, knowledgeArticles, knowledgeCategories } from "../../server/modules/knowledge/schema.js";
 import { orderNameHistory, orders } from "../../server/modules/orders/schema.js";
@@ -42,9 +43,13 @@ const owned = {
   ackHash: "", categoryId: "", staffCategoryId: "", topicId: "", postId: "", sharedTopicId: "",
   cartId: "", cartItemId: "", checkedOutCartId: "", paymentInvoiceId: "", attemptId: "", staffArticleId: "", staffAttachmentId: "",
   policyVersionId: "", policyHash: "", receiptId: "", copyAttemptId: "", refundPaymentId: "", dispatchId: "",
-  customerPublicId: "", productId: "",
+  customerPublicId: "", productId: "", documentFileId: "", paymentReceiptId: "",
+  enforcementDocumentId: "", enforcementVersionId: "", staffPolicyVersionId: "", staffPolicyHash: "", policyNoticeId: "",
 };
 let cartVersion = 0;
+let policyNoticeRevision = 0;
+let policyNoticePending = 0;
+let enforcementConfigVersion = 0;
 const transcript = "Synthetic private audio transcript";
 const pendingTitle = "Pending isolation discussion";
 const pendingText = "Synthetic reviewhold text from A";
@@ -84,11 +89,20 @@ const NOT_A_FOREIGN_RESOURCE = new Set(["recoverySetId", "challengeId", "upToMes
 /** Every probe customer B runs, keyed by procedure path. Inputs are otherwise valid so only ownership decides. */
 type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "FILTERED" }; alternateInputs?: () => unknown[] };
 
+const documentLocator = (orderPublicId = owned.orderId) => ({ orderPublicId, filePublicId: owned.documentFileId });
+
 function probes(): Record<string, Probe> {
   const o = owned;
   const key = (tag: string) => `isolation-${tag}-0000000000`;
   const consoleOnly = { code: "FORBIDDEN", reason: "ROLE_NOT_PERMITTED" } as const;
+  const capabilityOnly = { code: "FORBIDDEN", reason: "CAPABILITY_NOT_GRANTED" } as const;
   const productionOrder = "integrations.production.order";
+  const policyNotices = "compliance.policies.notices";
+  const enforcement = "compliance.policies.enforcement";
+  const policyDocument = () => ({ documentPublicId: o.enforcementDocumentId });
+  const notice = () => ({ noticePublicId: o.policyNoticeId, revision: policyNoticeRevision });
+  const noticeAudience = () => ({ ...notice(), confirmedCount: policyNoticePending });
+  const enforcementTarget = () => ({ userPublicId: o.customerPublicId, versionPublicId: o.enforcementVersionId });
   return {
     "orders.get": { kind: "query", input: () => ({ orderId: o.orderId }) },
     // Pricing "for a customer" is a console action: a customer naming another customer is refused before any lookup.
@@ -144,6 +158,9 @@ function probes(): Record<string, Probe> {
     "files.list": { kind: "query", input: () => ({ orderId: o.orderId }) },
     "files.issueDownloadTicket": { kind: "mutation", input: () => ({ fileId: o.fileId }) },
     "files.readTranscript": { kind: "mutation", input: () => ({ fileId: o.fileId }) },
+    "files.recording.preflight": { kind: "query", input: () => ({ orderPublicId: o.orderId, slotKey: "voice_evidence" }) },
+    "files.document.status": { kind: "query", input: () => documentLocator(), alternateInputs: () => [documentLocator(bOrderId)] },
+    "files.document.versions": { kind: "query", input: () => documentLocator(), alternateInputs: () => [documentLocator(bOrderId)] },
     "storage.copies.forOrder": {
       kind: "query", input: () => ({ orderPublicId: o.orderId }), denial: { code: "FORBIDDEN", reason: "ROLE_NOT_PERMITTED" },
     },
@@ -208,12 +225,38 @@ function probes(): Record<string, Probe> {
     "compliance.intake.submit": { kind: "mutation", input: () => ({ orderPublicId: o.orderId, questionnairePublicId: o.orderId, answers: {} }) },
     "compliance.invoices.listForOrder": { kind: "query", input: () => ({ orderPublicId: o.orderId }) },
     "compliance.invoices.get": { kind: "query", input: () => ({ invoicePublicId: o.invoiceId }) },
+    "compliance.receipts.forOrder": { kind: "query", input: () => ({ orderPublicId: o.orderId }) },
+    "compliance.receipts.get": { kind: "query", input: () => ({ receiptPublicId: o.paymentReceiptId }) },
     "identity.sessions.revoke": { kind: "mutation", input: () => ({ sessionId: o.sessionId }) },
     // Unknown-id probes (README: a cross-account passkey fixture is it.todo).
     "assurance.renamePasskey": { kind: "mutation", input: () => ({ publicId: o.orderId, name: "Intruder key" }) },
     "assurance.removePasskey": { kind: "mutation", input: () => ({ publicId: o.orderId }) },
     "compliance.policies.accept": {
       kind: "mutation", input: () => ({ versionPublicId: o.policyVersionId, contentHash: o.policyHash, orderPublicId: o.orderId }),
+    },
+    [`${policyNotices}.status`]: { kind: "query", input: policyDocument, denial: capabilityOnly },
+    [`${policyNotices}.setDelay`]: {
+      kind: "mutation", input: () => ({ ...policyDocument(), delayHours: 6 }), denial: capabilityOnly,
+    },
+    [`${policyNotices}.reschedule`]: {
+      kind: "mutation", input: () => ({ ...notice(), scheduledAt: new Date(sys.clock.now().getTime() + 3_600_000) }), denial: capabilityOnly,
+    },
+    [`${policyNotices}.cancel`]: { kind: "mutation", input: notice, denial: capabilityOnly },
+    [`${policyNotices}.sendNow`]: { kind: "mutation", input: noticeAudience, denial: capabilityOnly },
+    [`${policyNotices}.remind`]: { kind: "mutation", input: noticeAudience, denial: capabilityOnly },
+    [`${enforcement}.status`]: { kind: "query", input: policyDocument, denial: capabilityOnly },
+    [`${enforcement}.configure`]: {
+      kind: "mutation", input: () => ({
+        ...policyDocument(), expectedVersion: enforcementConfigVersion, mode: "none", graceHours: 24, warningText: null,
+      }), denial: capabilityOnly,
+    },
+    [`${enforcement}.forTarget`]: { kind: "query", input: enforcementTarget, denial: capabilityOnly },
+    [`${enforcement}.endNow`]: { kind: "mutation", input: enforcementTarget, denial: capabilityOnly },
+    // A version is shared, but A's pending enforcement item is not. B already accepted this version.
+    [`${enforcement}.decline`]: { kind: "mutation", input: () => ({ versionPublicId: o.enforcementVersionId }) },
+    // Acceptance has no target user field; a real staff-only version is outside B's audience.
+    [`${enforcement}.accept`]: {
+      kind: "mutation", input: () => ({ versionPublicId: o.staffPolicyVersionId, contentHash: o.staffPolicyHash }),
     },
     "compliance.acceptance.forOrder": { kind: "query", input: () => ({ orderId: o.orderId }) },
     "compliance.acceptance.accept": {
@@ -229,8 +272,14 @@ function probes(): Record<string, Probe> {
   };
 }
 
-const call = (browser: Browser, kind: "query" | "mutation", path: string, input: unknown): Promise<TrpcResult> =>
-  kind === "query" ? browser.query(path, input) : browser.mutate(path, input);
+async function call(browser: Browser, kind: "query" | "mutation", path: string, input: unknown): Promise<TrpcResult> {
+  if (kind === "query") return browser.query(path, input);
+  if (path !== "compliance.policies.notices.reschedule") return browser.mutate(path, input);
+  // The harness's generic mutation helper only wraps JSON; this route takes a SuperJSON Date.
+  const res = await browser.raw("post", `/api/trpc/${path}`).send(superjson.serialize(input));
+  return { res, status: res.status, requestId: String(res.headers["x-request-id"]),
+    data: res.body?.result?.data?.json, error: res.body?.error?.json?.data };
+}
 
 async function installRequirementsWorkflow(policyPublicId: string) {
   const workflow = "orders.admin.workflows.drafts";
@@ -261,19 +310,48 @@ async function installRequirementsWorkflow(policyPublicId: string) {
   Browser.ok(await admin.browser.mutate(`${workflow}.publish`, { draftId: publicId, expectedVersion: 2, makeDefault: true }));
 }
 
-async function publishGatePolicy() {
+async function publishPolicy(slug: string, title: string, audience: "customer" | "staff", requiresAcceptance: boolean) {
   const policyAdmin = "compliance.policies.admin";
   const policy = Browser.ok(await admin.browser.mutate<{
     documentPublicId: string; draftVersionPublicId: string; contentHash: string;
   }>(`${policyAdmin}.createDocument`, {
-    slug: "isolation-project-policy", title: "Isolation project policy", audience: "customer",
-    requiresAcceptance: false, requiresTypedSignature: false, versionLabel: "1.0",
-    contentFormat: "plain_text", bodyText: "Synthetic order policy used by the isolation suite.",
+    slug, title, audience, requiresAcceptance, requiresTypedSignature: false, versionLabel: "1.0",
+    contentFormat: "plain_text", bodyText: "Synthetic policy used by the isolation suite.",
   }));
   Browser.ok(await admin.browser.mutate(`${policyAdmin}.publishVersion`, { versionPublicId: policy.draftVersionPublicId }));
-  owned.policyVersionId = policy.draftVersionPublicId;
-  owned.policyHash = policy.contentHash;
-  return policy.documentPublicId;
+  return policy;
+}
+
+async function seedPolicyEnforcement() {
+  const staffPolicy = await publishPolicy("isolation-staff-policy", "Staff isolation policy", "staff", false);
+  owned.staffPolicyVersionId = staffPolicy.draftVersionPublicId;
+  owned.staffPolicyHash = staffPolicy.contentHash;
+
+  const policy = await publishPolicy("isolation-enforcement-policy", "Enforcement isolation policy", "customer", true);
+  owned.enforcementDocumentId = policy.documentPublicId;
+  owned.enforcementVersionId = policy.draftVersionPublicId;
+  // B can accept the shared version for itself. This must not satisfy A's separate obligation.
+  Browser.ok(await b.browser.mutate("compliance.policies.enforcement.accept", {
+    versionPublicId: owned.enforcementVersionId, contentHash: policy.contentHash,
+  }));
+
+  const document = { documentPublicId: owned.enforcementDocumentId };
+  const { notice } = Browser.ok(await admin.browser.query<{
+    notice: { publicId: string; revision: number; pending: number; state: string };
+  }>("compliance.policies.notices.status", document));
+  expect(notice).toMatchObject({ state: "scheduled", pending: 1 });
+  ({ publicId: owned.policyNoticeId, revision: policyNoticeRevision, pending: policyNoticePending } = notice);
+
+  const status = Browser.ok(await admin.browser.query<{
+    expectedVersion: number; affectedCount: number;
+  }>("compliance.policies.enforcement.status", document));
+  expect(status.affectedCount).toBe(1);
+  ({ version: enforcementConfigVersion } = Browser.ok(await admin.browser.mutate<{ version: number }>(
+    "compliance.policies.enforcement.configure", {
+      ...document, expectedVersion: status.expectedVersion, mode: "required_to_continue", graceHours: 24,
+      warningText: null, confirmedCount: status.affectedCount,
+    },
+  )));
 }
 
 async function seedCommunity() {
@@ -352,14 +430,14 @@ async function seedOrderCopyAndPayment() {
   const [copy] = await sys.t.db.select().from(storageCopyAttempts).where(eq(storageCopyAttempts.jobPublicId, jobPublicId));
   owned.copyAttemptId = copy!.publicId;
 
-  const [invoice] = await sys.t.db.select().from(complianceInvoices).where(eq(complianceInvoices.publicId, owned.invoiceId));
-  const idempotencyKey = "synthetic-isolation-manual-payment";
-  await sys.t.db.insert(complianceInvoicePayments).values({
-    invoiceId: invoice!.id, method: "check", status: "succeeded", amountMinor: 100, currency: "USD",
-    reference: "Synthetic manual payment", receivedAt: sys.clock.now(), idempotencyKey,
-  });
-  const [payment] = await sys.t.db.select().from(complianceInvoicePayments).where(eq(complianceInvoicePayments.idempotencyKey, idempotencyKey));
-  owned.refundPaymentId = payment!.publicId;
+  const payment = Browser.ok(await admin.browser.mutate<{ paymentPublicId: string }>("compliance.invoices.admin.recordManualPayment", {
+    invoicePublicId: owned.invoiceId, method: "check", amountMinor: 1500, currency: "USD",
+    reference: "Synthetic manual payment", idempotencyKey: "synthetic-isolation-manual-payment",
+  }));
+  owned.refundPaymentId = payment.paymentPublicId;
+  const receipts = Browser.ok(await a.browser.query<{ receiptPublicId: string }[]>("compliance.receipts.forOrder", { orderPublicId: owned.orderId }));
+  expect(receipts).toHaveLength(1);
+  owned.paymentReceiptId = receipts[0]!.receiptPublicId;
 }
 
 async function seedProductionDispatch(ownerUserId: number) {
@@ -386,7 +464,10 @@ beforeAll(async () => {
   await settings.set("community.config", { ...DEFAULT_COMMUNITY_CONFIG, newMemberReviewPosts: 0, heldWords: ["reviewhold"] });
   for (const feature of ["community", "cart", "knowledge"]) await settings.setFeature(feature, true);
   Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
-  await installRequirementsWorkflow(await publishGatePolicy());
+  const gatePolicy = await publishPolicy("isolation-project-policy", "Isolation project policy", "customer", false);
+  owned.policyVersionId = gatePolicy.draftVersionPublicId;
+  owned.policyHash = gatePolicy.contentHash;
+  await installRequirementsWorkflow(gatePolicy.documentPublicId);
   const productId = await seedProduct(admin);
   owned.productId = productId;
   a = await registerCustomer(sys, "alice.isolation@example.test", "Alice Isolation");
@@ -410,6 +491,11 @@ beforeAll(async () => {
     .field("transcript", transcript).attach("files", exampleWav(8000), "private.wav");
   expect(upload.status).toBe(200);
   owned.fileId = upload.body.results[0].file.publicId as string;
+  const document = await a.browser.raw("post", `/api/files/upload/${owned.orderId}`)
+    .attach("files", exampleDocx(), "private.docx");
+  expect(document.status).toBe(200);
+  expect(document.body.results[0]).toMatchObject({ outcome: "completed", file: { extension: "docx" } });
+  owned.documentFileId = document.body.results[0].file.publicId as string;
   const { acknowledgements } = Browser.ok(await a.browser.query<{ acknowledgements: { key: string; textSha256: string; canAccept: boolean }[] }>("orders.requirements.forOrder", { orderId: owned.orderId }));
   expect(acknowledgements).toEqual([expect.objectContaining({ key: "terms", canAccept: true })]);
   owned.ackHash = acknowledgements[0]!.textSha256;
@@ -448,6 +534,7 @@ beforeAll(async () => {
   await seedKnowledge(adminUser!.userId);
   await seedOrderCopyAndPayment();
   await seedProductionDispatch(aUser!.userId);
+  await seedPolicyEnforcement();
   ({ version: aOrderVersion } = Browser.ok(await a.browser.query<{ version: number }>("orders.get", { orderId: owned.orderId })));
 
   for (const [name, value] of Object.entries(owned)) expect(value, name).not.toBe("");
@@ -472,6 +559,20 @@ describe("cross-customer isolation (assembled system)", () => {
     });
     Browser.ok(await a.browser.mutate("compliance.policies.accept", { versionPublicId: owned.policyVersionId, contentHash: owned.policyHash, orderPublicId: owned.orderId }));
     Browser.ok(await a.browser.query("compliance.invoices.get", { invoicePublicId: owned.invoiceId }));
+    expect(Browser.ok(await a.browser.query("compliance.receipts.get", { receiptPublicId: owned.paymentReceiptId })))
+      .toMatchObject({ receiptPublicId: owned.paymentReceiptId });
+    expect(Browser.ok(await a.browser.query("files.recording.preflight", { orderPublicId: owned.orderId, slotKey: "voice_evidence" })))
+      .toMatchObject({ acceptedTypes: ["wav"] });
+    expect(Browser.ok(await a.browser.query("files.document.status", documentLocator())))
+      .toMatchObject({ file: { publicId: owned.documentFileId } });
+    expect(Browser.ok(await a.browser.query("files.document.versions", documentLocator())))
+      .toEqual([expect.objectContaining({ publicId: owned.documentFileId })]);
+    expect(Browser.ok(await a.browser.query("compliance.policies.enforcement.pending")))
+      .toEqual([expect.objectContaining({ versionPublicId: owned.enforcementVersionId })]);
+    expect(Browser.ok(await b.browser.query("compliance.policies.enforcement.pending"))).toEqual([]);
+    expect(Browser.ok(await admin.browser.query("compliance.policies.enforcement.forTarget", {
+      userPublicId: owned.customerPublicId, versionPublicId: owned.enforcementVersionId,
+    }))).toEqual({ canEndSessions: true });
     Browser.ok(await a.browser.mutate("files.issueDownloadTicket", { fileId: owned.fileId }));
     expect(Browser.ok(await a.browser.mutate("files.readTranscript", { fileId: owned.fileId }))).toEqual({ transcript });
     expect(Browser.ok(await a.browser.query("community.topics.get", { topicPublicId: owned.topicId }))).toEqual(expect.objectContaining({
@@ -570,6 +671,12 @@ describe("cross-customer isolation (assembled system)", () => {
     expect(detail).not.toContain("Not my order.");
     const sessions = Browser.ok(await a.browser.query<{ items: { sessionId: string }[] }>("identity.sessions.list"));
     expect(sessions.items.map((s) => s.sessionId)).toContain(owned.sessionId);
+    expect(Browser.ok(await a.browser.query("compliance.policies.enforcement.pending")))
+      .toEqual([expect.objectContaining({ versionPublicId: owned.enforcementVersionId })]);
+    expect(Browser.ok(await admin.browser.query("compliance.policies.enforcement.status", { documentPublicId: owned.enforcementDocumentId })))
+      .toMatchObject({ expectedVersion: enforcementConfigVersion, mode: "required_to_continue" });
+    expect(Browser.ok(await admin.browser.query("compliance.policies.notices.status", { documentPublicId: owned.enforcementDocumentId })))
+      .toMatchObject({ delayHours: 24, notice: { publicId: owned.policyNoticeId, revision: policyNoticeRevision, state: "scheduled" } });
     const messages = JSON.stringify(Browser.ok(await a.browser.query("engagement.messages.listByOrder", { orderId: owned.orderId })));
     expect(messages).not.toContain("Intrusion.");
     const cart = Browser.ok(await a.browser.query<CartView>("cart.get"));
