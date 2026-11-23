@@ -244,9 +244,10 @@ export const TIMELINE_LABELS: Record<string, string> = {
 export const closeReasonLabel = (r: string | null): string => CLOSE_REASON_OPTIONS.find((o) => o.value === r)?.label ?? "—";
 
 /** Parses a ban duration option; null = permanent; undefined = invalid. */
-export function banDurationOf(value: string): number | null | undefined {
-  if (value === "permanent") return null;
-  return BAN_DURATION_OPTIONS.some((o) => o.value === value) ? Number(value) : undefined;
+export type BanMinutes = 15 | 60 | 1440 | 10080 | null;
+const BAN_MINUTES = new Map<string, BanMinutes>([["15", 15], ["60", 60], ["1440", 1440], ["10080", 10080], ["permanent", null]]);
+export function banDurationOf(value: string): BanMinutes | undefined {
+  return BAN_MINUTES.get(value);
 }
 /** Mirrors the server's ban reason check: 3–240 characters, no control characters. */
 export const banReasonError = (reason: string): string | null => (/^\P{Cc}{3,240}$/u.test(reason.trim()) ? null : "Enter a reason of 3 to 240 characters.");

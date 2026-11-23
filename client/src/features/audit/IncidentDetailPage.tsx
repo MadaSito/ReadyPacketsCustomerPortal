@@ -12,7 +12,7 @@ import { AuditNav } from "./AuditNav";
 import { IncidentSeverityBadge, IncidentStatusBadge } from "./IncidentsPage";
 import {
   BAN_DURATION_OPTIONS, banDurationOf, banReasonError, CLOSE_REASON_OPTIONS, closeReasonLabel, SEVERITY_META, SUBJECT_LABELS, TIMELINE_LABELS,
-  type IncidentDetail, type IncidentTimelineItem,
+  type BanMinutes, type IncidentDetail, type IncidentTimelineItem,
 } from "./model";
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -203,7 +203,7 @@ export function CloseDialog({ open, onCancel, onSubmit, busy }: { open: boolean;
   );
 }
 
-export function BanDialog({ open, onCancel, onSubmit, busy }: { open: boolean; onCancel: () => void; onSubmit: (durationMinutes: number | null, reason: string) => Promise<void>; busy: boolean }) {
+export function BanDialog({ open, onCancel, onSubmit, busy }: { open: boolean; onCancel: () => void; onSubmit: (durationMinutes: BanMinutes, reason: string) => Promise<void>; busy: boolean }) {
   const [duration, setDuration] = useState("60");
   const [reason, setReason] = useState("");
   const [errors, setErrors] = useState<{ duration?: string; reason?: string }>({});
