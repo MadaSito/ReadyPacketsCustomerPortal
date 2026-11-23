@@ -78,7 +78,9 @@ procedure.
 
 - **Totals below the card minimum.** Stripe refuses card charges below its minimum (0.50 USD or the equivalent). `payments.small_totals` defaults to `waive`: the amount is recorded as waived and shown on the receipt. Set it to `block` to refuse such orders instead.
 - **Migration `0006_increment_06`**: additive. Details: _placeholder — /root to supply table and column counts._
-- **Upgrade notes:** see `docs/operations/UPGRADE.md` (increment 06). They cover the nginx service-worker headers and the upload size for longer recordings. _Placeholder — section anchor confirmed with portable_ops_engineer._
+- **Upgrade notes:** [UPGRADE.md — increment 06 and migration 0006](docs/operations/UPGRADE.md#increment-06-and-migration-0006). They cover the service-worker and manifest headers, and the upload size for recordings and file uploads.
+  - On managed Nginx or Caddy, the multipart limit stays at 256 MiB. Legacy Nginx rises from 55 MiB to 256 MiB.
+  - Uploaded or captured audio sources follow the Files hard maximum, which is 100 MiB and configurable.
 
 ## Increment 05
 

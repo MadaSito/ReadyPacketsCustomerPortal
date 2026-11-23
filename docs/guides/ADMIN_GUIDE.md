@@ -49,6 +49,7 @@ Use these chapters alongside the existing console guide. Installing a dependency
 - [Media and country database setup](../operations/MEDIA_AND_GEOIP.md): FFmpeg availability, optional country database setup and rotation, and the host-level Protection recovery switch.
 - [Native upgrade and migration `0003`](../operations/UPGRADE.md#increment-04-and-migration-0003): the pre-upgrade backup, traffic fence, and recovery after a partially applied migration.
 - [Files and media](../../server/modules/files/ADMIN_GUIDE.md): configure uploads and review file and media behavior.
+- [Upgrade to increment 06 and migration `0006`](../operations/UPGRADE.md#increment-06-and-migration-0006): new headers for the installable app, and larger upload limits for recordings.
 - [Cart suggestions](#cart-suggestions), [Discount codes](#discount-codes) and [Policy acceptances](#policy-acceptances) (increment 05): see the sections below.
 - [Workflow export and import](./WORKFLOW_TRANSFER.md) (increment 05): move workflows between portals as drafts; enable `orders.workflow_transfer.enabled` first.
 - [Workflow phases, requirements and console order actions](../../server/modules/orders/ADMIN_GUIDE_WORKFLOW_RULES.md): configure order phases, requirements and staff actions.
@@ -710,6 +711,21 @@ automations:
 - **Inert preview & Send test to me:** Preview renders sample variables inside a sandboxed structure-only frame with no
   scripts, outbound links, or external image requests. **Send test to me** queues a `[TEST]`-prefixed message addressed
   solely to the signed-in administrator's own account.
+
+### Receipts and policy notices (increment 06)
+
+Payment receipts, policy update notices and policy enforcement warnings are editable system templates, each with HTML and plain text.
+
+**Receipt PDF:**
+
+- The PDF the server generates (up to 2 MiB) is attached only to the customer's copy. It is left out of the audit copy, retained mail and development capture.
+- A retry of the receipt reuses the same send intent, so the customer gets one receipt.
+- An authorised **Send again** creates its own audited resend.
+
+**Policy notice counts:**
+
+- **Sent** means the mail provider accepted the message. It does not mean the message was delivered or that the policy was accepted.
+- **Failed** includes messages whose outcome was not confirmed or is unknown. A failure never triggers an automatic resend.
 
 ## Installing as an app (PWA)
 
