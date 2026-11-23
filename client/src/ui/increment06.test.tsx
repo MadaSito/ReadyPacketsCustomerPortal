@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChartFrame, ConfirmSwitch, Countdown, formatRemaining, useChartIds } from "@/ui";
+import { AccountMenu } from "@/app/shell/common";
 import { expectNoAxeViolations, renderUi } from "./testing";
 
 describe("Countdown", () => {
@@ -157,5 +158,28 @@ describe("ChartFrame", () => {
       </ChartFrame>,
     );
     expect(screen.getByText("No data for this selection")).toBeInTheDocument();
+  });
+});
+
+vi.mock("@/app/PwaInstallEntry", async () => {
+  const { Dialog } = await import("@/ui");
+  return {
+    usePwaInstall: () => ({ available: true, installed: false, prompt: async () => "unavailable" as const }),
+    PwaInstallDialog: ({ open, onOpenChange }: { open: boolean; onOpenChange(open: boolean): void }) => (
+      <Dialog open={open} onOpenChange={onOpenChange} size="sm" title="Install ReadyPackets"><p>Steps</p></Dialog>
+    ),
+  };
+});
+
+describe("AccountMenu install entry", () => {
+  it("returns focus to the account menu trigger when the manual install dialog closes", async () => {
+    renderUi(<AccountMenu area="customer" user={{ publicId: "u1", role: "customer", name: "Avery Example", email: "a@example.test", status: "active" }} />);
+    const trigger = screen.getByRole("button", { name: /account menu for avery example/i });
+    const user = userEvent.setup();
+    await user.click(trigger);
+    await user.click(await screen.findByRole("menuitem", { name: "Install app" }));
+    expect(await screen.findByRole("dialog", { name: "Install ReadyPackets" })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await vi.waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 });

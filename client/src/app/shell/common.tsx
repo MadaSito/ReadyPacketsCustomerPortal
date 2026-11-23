@@ -1,6 +1,6 @@
 /** Pieces shared by both shells: theme toggle, account menu, footer, banners, nav filtering. */
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Download, LogOut, Monitor, Moon, Settings, ShieldCheck, Sun, UserRound } from "lucide-react";
 import { Link, useLocation } from "wouter";
 import type { UserRole } from "@shared/domain";
@@ -183,6 +183,12 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
   const pwa = usePwaInstall();
   // The install dialog lives outside the menu so it survives the menu closing and returns focus normally.
   const [installOpen, setInstallOpen] = useState(false);
+  // The menu item that opened the dialog has unmounted by the time it closes, so focus returns to the trigger.
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const onInstallOpenChange = (open: boolean) => {
+    setInstallOpen(open);
+    if (!open) requestAnimationFrame(() => triggerRef.current?.focus());
+  };
   const install = () => {
     void pwa.prompt().then((result) => {
       if (result === "unavailable") setInstallOpen(true);
@@ -198,7 +204,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
         </div>
       }
       trigger={
-        <button type="button" aria-label={`${initials(user.name)}, account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
+        <button ref={triggerRef} type="button" aria-label={`${initials(user.name)}, account menu for ${user.name}`} className="inline-flex size-11 items-center justify-center rounded-full">
           <span aria-hidden="true" className="inline-flex size-9 items-center justify-center rounded-full bg-action text-sm font-semibold text-on-action">
             {initials(user.name)}
           </span>
@@ -220,7 +226,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
         { label: "Sign out", icon: <LogOut aria-hidden="true" />, onSelect: () => void signOut() },
       ]}
     />
-    <PwaInstallDialog open={installOpen} onOpenChange={setInstallOpen} />
+    <PwaInstallDialog open={installOpen} onOpenChange={onInstallOpenChange} />
     </>
   );
 }
