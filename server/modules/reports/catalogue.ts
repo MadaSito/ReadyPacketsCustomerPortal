@@ -9,7 +9,10 @@ import { eq, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type { AnyMySqlColumn, MySqlTable } from "drizzle-orm/mysql-core";
 import { USER_ROLES } from "../../../shared/domain.js";
 import { carts, CART_STATUSES } from "../cart/schema.js";
-import { complianceInvoicePayments, complianceInvoiceRefunds, complianceInvoices, INVOICE_STATUSES, PAYMENT_METHODS, PAYMENT_RECORD_STATUSES } from "../compliance/schema.js";
+import {
+  complianceInvoicePayments, complianceInvoiceRefunds, complianceInvoices, compliancePaymentReceipts, INVOICE_STATUSES, PAYMENT_METHODS,
+  PAYMENT_RECORD_STATUSES, RECEIPT_REFUND_STATES, RECEIPT_SETTLEMENT_KINDS,
+} from "../compliance/schema.js";
 import { engagementSupportTickets } from "../engagement/schema.js";
 import { TICKET_CATEGORIES, TICKET_PRIORITIES, TICKET_STATUSES } from "../engagement/types.js";
 import { audioConversionStates, fileCategories, fileVisibilities, orderFiles } from "../files/schema.js";
@@ -187,6 +190,28 @@ const DATASETS: readonly DatasetDef[] = [
       f("currency", "Currency", "string", complianceInvoicePayments.currency),
       f("amount", "Amount", "money", complianceInvoicePayments.amountMinor),
       f("receivedAt", "Received", "datetime", complianceInvoicePayments.receivedAt),
+    ],
+  },
+  {
+    key: "receipts",
+    label: "Payment receipts",
+    description: "Issued payment receipts (paid, waived and refunded amounts). Card brand, last four digits, provider references and receipt documents are never reported.",
+    from: compliancePaymentReceipts,
+    joins: [],
+    timeField: "issuedAt",
+    fields: [
+      f("receiptNumber", "Receipt number", "string", compliancePaymentReceipts.receiptNumber),
+      f("orderPublicId", "Order ID", "string", compliancePaymentReceipts.orderPublicId),
+      f("orderReference", "Order reference", "string", compliancePaymentReceipts.orderReference),
+      e("settlementKind", "Settlement", compliancePaymentReceipts.settlementKind, RECEIPT_SETTLEMENT_KINDS),
+      e("paymentMethod", "Method", compliancePaymentReceipts.paymentMethod, PAYMENT_METHODS),
+      f("provider", "Provider", "string", sql<string>`COALESCE(${compliancePaymentReceipts.provider}, ${compliancePaymentReceipts.paymentMethod})`),
+      e("refundState", "Refund state", compliancePaymentReceipts.refundState, RECEIPT_REFUND_STATES),
+      f("currency", "Currency", "string", compliancePaymentReceipts.currency),
+      f("amountPaid", "Amount paid", "money", compliancePaymentReceipts.amountPaidMinor),
+      f("amountWaived", "Amount waived", "money", compliancePaymentReceipts.amountWaivedMinor),
+      f("refunded", "Refunded", "money", compliancePaymentReceipts.refundedMinor),
+      f("issuedAt", "Issued", "datetime", compliancePaymentReceipts.issuedAt),
     ],
   },
   {
