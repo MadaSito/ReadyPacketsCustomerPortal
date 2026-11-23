@@ -93,10 +93,10 @@ describe("order acceptance gateway (MySQL)", () => {
     );
   }
 
-  async function makeUser(role: UserRole = "customer"): Promise<SessionPrincipal> {
+  async function makeUser(role: UserRole = "customer", customName?: string): Promise<SessionPrincipal> {
     userSeq += 1;
     const publicId = ulid();
-    const name = `Synthetic Signer ${userSeq}`;
+    const name = customName ?? `Synthetic Signer ${userSeq}`;
     const now = h.clock.now();
     const [res] = await db.db.insert(users).values({
       publicId, emailEnc: `enc:${publicId}`, emailIndex: randomBytes(32).toString("hex"), nameEnc: h.deps.crypto.encrypt(name, nameAad(publicId)),
@@ -173,7 +173,7 @@ describe("order acceptance gateway (MySQL)", () => {
   });
 
   it("named-step gate applies only on that step (typed signature required and stored encrypted)", async () => {
-    const owner = await makeUser();
+    const owner = await makeUser("customer", "Synthetic Signer");
     const policy = await makePolicy("Release terms for review.");
     const order = makeOrder(owner, [gate(policy.documentPublicId, { key: "release", point: { stepKey: "review" }, signatureMode: "typed_name" })]);
     await mayWork(order, owner, "intake");
@@ -185,7 +185,24 @@ describe("order acceptance gateway (MySQL)", () => {
     expect(done.receipt.signatureMode).toBe("typed_name");
     const [row] = await db.db.select().from(orderPolicyAcceptances).where(eq(orderPolicyAcceptances.publicId, done.receipt.receiptId));
     expect(row!.typedNameEnc).not.toContain("Synthetic");
+    expect(row!.typedNameMatch).toBe("exact");
     await mayWork(order, owner, "review");
+  });
+
+  it("D11 signature_name_check: refuses a mismatched typed name under require and records mismatch_warn under warn", async () => {
+    const owner = await makeUser("customer", "Ada Augusta Lovelace");
+    const policy = await makePolicy("Order release agreement.");
+    const order = makeOrder(owner, [gate(policy.documentPublicId, { key: "release", point: { stepKey: "review" }, signatureMode: "typed_name" })]);
+
+    await rejects(acceptCurrent(owner, order, "release", "Grace Hopper"), "VALIDATION", "SIGNER_NAME_MISMATCH");
+
+    await h.settings.set("compliance.signature_name_check", { mode: "warn" });
+    const done = await acceptCurrent(owner, order, "release", "Grace Hopper");
+    expect(done.receipt.typedName).toBe("Grace Hopper");
+    const [row] = await db.db.select().from(orderPolicyAcceptances).where(eq(orderPolicyAcceptances.publicId, done.receipt.receiptId));
+    expect(row!.typedNameMatch).toBe("mismatch_warn");
+    const page = await svc.evidencePage({ userIds: [owner.userId], limit: 10 });
+    expect(page.items[0]!.typedNameMatch).toBe("mismatch_warn");
   });
 
   it("cross-customer probe: another customer can't read gates, accept or read the receipt (NOT_FOUND)", async () => {
@@ -332,7 +349,7 @@ describe("order acceptance gateway (MySQL)", () => {
     await mayWork(order, owner);
   });
   it("evidencePage (acceptance log read port): filters, newest-first keyset across equal times, pseudonymised address, encrypted names", async () => {
-    const a = await makeUser();
+    const a = await makeUser("customer", "Synthetic Signer");
     const b = await makeUser();
     const terms = await makePolicy("Log terms.");
     const typed = await makePolicy("Log signature policy.");

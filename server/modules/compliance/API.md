@@ -634,7 +634,7 @@ export interface AcceptanceLogExportResult {
 
 - Setting `compliance.signature_name_check`: `{ mode: "require" | "warn" | "off" }` (default `"require"`, backward-compatible parse with defaults).
 - Shared normalization (`server/modules/compliance/signatureNameCheck.ts`): NFC, collapse whitespace, trim, Unicode case-fold, strip leading/trailing punctuation (`.,'-`). Empty/whitespace-only account names fail closed when `mode === "require"` (`SIGNER_NAME_MISMATCH`).
-- Enforced behind both `policies.accept` (`policiesService.ts`) and workflow/order agreement gates (`acceptance/service.ts`), persisting `signatureMatch: "matched" | "mismatch_accepted" | "unchecked" | null` on `compliance_policy_acceptances` and `compliance_policy_gate_acceptances` and surfacing it in `policies.admin.acceptanceLog.{list,detail,forCustomer,export}` and the Acceptance Log Centre UI (`PolicyAcceptancesPage`).
+- Enforced behind both `policies.accept` (`policiesService.ts`) and workflow/order agreement gates (`acceptance.ts`), persisting `"exact" | "first_last" | "mismatch_warn" | "unchecked" | null` on `compliance_policy_acceptances` and `order_policy_acceptances` and surfacing `signatureMatch` in `policies.admin.acceptanceLog.{list,detail,forCustomer,export}` and the Acceptance Log Centre UI (`PolicyAcceptancesPage`).
 - Customer surfaces (`PolicyAcceptance.tsx`, `AcceptanceGate.tsx`, and `@/lib/agreementGate/AgreementDialog.tsx`) show only the signed-in user's own account name and link to `/account` for self-service name updates; `SIGNER_NAME_MISMATCH` errors include `details.expectedName` only for the authenticated signer's own user row.
 
 ### 10.2 D12 Document Import & D14 Order Agreement (MNDA) Admin Card + Shared Gate
