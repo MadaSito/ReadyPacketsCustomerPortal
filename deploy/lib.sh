@@ -121,13 +121,22 @@ render_site() {
     chmod 0644 -- "$temp"
     mv -fT -- "$temp" "$dest"
 }
+node_version_supported() {
+    # Keep in sync with package.json engines; accept only stable releases in the Node 22 line.
+    [[ $1 =~ ^v22\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] >= 13 ))
+}
+require_node_runtime() {
+    local runtime=$1 installed=''
+    installed=$("$runtime" --version 2>/dev/null) || installed=''
+    node_version_supported "$installed" ||
+        die "Node.js ${installed:-not runnable} at $runtime is unsupported. Update $runtime to Node.js 22.13.0 or later in the Node 22 series, then retry."
+}
 check_host() {
     case $(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID") in
         ubuntu:24.04|ubuntu:26.04) ;;
         *) die 'this kit supports Ubuntu 24.04 LTS and 26.04 LTS' ;;
     esac
-    "$node" -e 'const [major,minor]=process.versions.node.split(".").map(Number);process.exit(major===22&&minor>=12?0:1)' ||
-        die 'install Node.js 22.12 or later in the Node 22 series at /usr/local/bin/node'
+    require_node_runtime "$node"
     mysql --version | grep -Eiq '\b(Ver[[:space:]]+8\.4\.|Distrib[[:space:]]+8\.4\.)' ||
         die 'install the Oracle MySQL 8.4 client'
     mysqldump --version | grep -Eiq '\b(Ver[[:space:]]+8\.4\.|Distrib[[:space:]]+8\.4\.)' ||
