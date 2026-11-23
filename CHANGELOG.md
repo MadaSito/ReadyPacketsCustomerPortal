@@ -18,6 +18,68 @@ procedure.
 
 - The owner confirmed the redelivery and retry rules of ADR 0041 (no code change).
 
+## Increment 06
+
+<!-- platform_engineer: drafted from INCREMENT_06_CONTRACT.md; corrected against owners' API.md as packages land. Verification facts come from /root. -->
+
+### Added
+
+- **Recording on orders** ([ADR 0047](docs/adr/0047-recording-and-preflight.md)): a Record button wherever audio is accepted.
+  - **Formats.** The browser picks its best format at runtime. Without a recorder, the device's own recorder or an upload is offered.
+  - **Preflight.** The check covers the microphone, the level meter and a 5-second test that never leaves the device.
+  - **Conversion.** The server converts recordings to WebM/Opus. This is a high-quality re-encode, not a bit-identical copy, and the original is kept.
+  - **Defaults.** On by default: 128 kbps, 30 minutes.
+- **Installable app (PWA)** ([ADR 0048](docs/adr/0048-pwa.md)):
+  - an "Install app" entry, with steps for iOS, iPadOS and macOS Safari;
+  - shortcuts and maskable icons;
+  - a service worker that caches only public static files.
+- **Reports** (`/admin/reports`, [ADR 0049](docs/adr/0049-reports.md)):
+  - built-in reports for orders, customers, referrals, support, payments and discounts, carts, files and sign-ins;
+  - custom reports for administrators from whitelisted datasets, with no free-form SQL;
+  - CSV export with step-up.
+- **Phase tasks** ([ADR 0051](docs/adr/0051-phase-tasks.md)):
+  - four task kinds: upload, acknowledge (including an order note), record, and respond to a document;
+  - file types restricted per task and checked on the server;
+  - workflow package `formatVersion` 2.
+- **Word documents in the portal** ([ADR 0052](docs/adr/0052-word-editing-in-portal.md)): documents are edited in the browser, and each save is a new version.
+  - Headers, footers, tracked changes, comments, text boxes, footnotes, complex fields and exact layout are not kept in the edited version.
+  - The original is never changed.
+- **Policies** ([ADR 0053](docs/adr/0053-policy-notices-and-enforcement.md)):
+  - import from Word, Markdown or PDF (PDF is text only);
+  - an update notice with a countdown and "Send notice to everyone now";
+  - optional enforcement that ends sessions after a warning and grace period (off by default);
+  - a typed-name check against the account name (on by default);
+  - an order agreement (MNDA) gate (off by default).
+- **Receipts** ([ADR 0054](docs/adr/0054-receipts.md)):
+  - one receipt per confirmed payment, as a branded PDF;
+  - e-mailed and listed under Invoices → Receipts;
+  - refunds add a refund note.
+- **Discount limits:**
+  - the percentage can be set from 0.01 % to 100 %, with two decimals;
+  - a new "Set order total to" kind for $0.00 and $0.01 test orders;
+  - limits are editable on the Discount codes page.
+- **Cart suggestions:** a starter set built from the catalogue is seeded disabled, with a switch at the top of the page and "Enable all" / "Disable all".
+- **Workflow export and import:** on by default, with Export, Export selected, Export all and Import on the Workflows page.
+- **Side panel:** a stronger accent in both themes.
+
+### Security
+
+- **Sign-in bans** ([ADR 0050](docs/adr/0050-signin-bans-backoff-correlation.md)):
+  - automatic, escalating IP bans for repeated sign-in failures;
+  - loopback, trusted proxies and allow-listed entries are never banned, and nothing is banned while client addresses cannot be determined;
+  - a break-glass command clears bans.
+- **Back-off:** progressive rate-limit back-off, with `Retry-After`.
+- **Correlated incidents** (`/admin/audit/incidents`):
+  - covers brute force, spraying, stuffing, MFA fatigue, ban evasion and similar patterns;
+  - incidents are forwarded to the SIEM as `security.incident.*` and `security.ban.*`.
+- **Document conversion:** runs in the browser only, with size, page and ZIP-ratio guards, and the CSP keeps no `unsafe-eval`.
+
+### Operations
+
+- **Totals below the card minimum.** Stripe refuses card charges below its minimum (0.50 USD or the equivalent). `payments.small_totals` defaults to `waive`: the amount is recorded as waived and shown on the receipt. Set it to `block` to refuse such orders instead.
+- **Migration `0006_increment_06`**: additive. Details: _placeholder — /root to supply table and column counts._
+- **Upgrade notes:** see `docs/operations/UPGRADE.md` (increment 06). They cover the nginx service-worker headers and the upload size for longer recordings. _Placeholder — section anchor confirmed with portable_ops_engineer._
+
 ## Increment 05
 
 ### Added
