@@ -96,6 +96,12 @@ export const CAPABILITIES = [
   "promotions.manage",
   "policies.acceptances.read",
   "policies.acceptances.export",
+  // increment 06: reporting, policy notices and enforcement, security incidents
+  "reports.read",
+  "reports.manage",
+  "reports.export",
+  "policies.notices.send",
+  "security.incidents.read",
   // portable / backup
   "portable.export",
   "portable.import",
@@ -135,6 +141,7 @@ const STAFF_CAPABILITIES: readonly Capability[] = [
   "orders.automations.run",
   "promotions.read",
   "policies.acceptances.read",
+  "reports.read",
 ];
 
 /** Default role grants. Staff least-privilege by assignment is a recorded ADR target, not yet implemented. */
@@ -186,6 +193,8 @@ export const STEP_UP_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>
   "workflows.import",
   "promotions.manage",
   "policies.acceptances.export",
+  "reports.export",
+  "policies.notices.send",
   "portable.export",
   "portable.import",
   "backup.run",
