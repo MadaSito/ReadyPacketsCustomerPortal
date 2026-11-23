@@ -194,7 +194,7 @@ Verification status:
   - receipt e-mail delivery;
   - physical Apple, Android and Windows devices;
   - live automatic bans.
-- **Gate numbers and merge SHA:** PENDING-LEAD.
+- **Gates:** type check clean, lint clean (zero warnings), full suite 203 of 203 files and 2,599 tests passed (4 todo) at `8243000`, `pnpm audit --prod` clean, gitleaks clean at `84f7379`. Merged through PR #13.
 
 | Area | What it does | Switch and guard |
 | --- | --- | --- |

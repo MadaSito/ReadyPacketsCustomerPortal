@@ -20,7 +20,7 @@ procedure.
 
 ## Increment 06
 
-<!-- platform_engineer: from INCREMENT_06_CONTRACT.md and the owners' handoffs. Verification is recorded in docs/application-context/STATUS.md; PR and merge SHA: PENDING-LEAD. -->
+<!-- platform_engineer: from INCREMENT_06_CONTRACT.md and the owners' handoffs. Verification is recorded in docs/application-context/STATUS.md; PR #13. -->
 
 ### Added
 

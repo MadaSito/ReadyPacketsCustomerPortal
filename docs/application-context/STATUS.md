@@ -398,13 +398,13 @@ The lead checked these live in a real Chromium browser, against a QA build with 
 - **D13 enforcement:** with 0 h grace, the next sign-in landed on `/accept-policy`, and every other API call was refused until the policy was accepted.
 - **D14 order agreement:** working on an order went upload → agreement dialog → typed name → upload resumed automatically.
 - **D15 receipts:** receipts `RPR-2026-000001` and `-000002` with a branded PDF, the portal Receipts tab, and the receipt e-mail queued.
-- **Gates:** type check, lint and test counts _PENDING-LEAD_. PR _PENDING-LEAD_. Merge SHA _PENDING-LEAD_.
+- **Gates (lead's own run, quiet machine):** type check clean, lint clean (zero warnings), full suite 203 of 203 files and 2,599 tests passed (4 todo) at `8243000`, `pnpm audit --prod` clean, gitleaks clean at `84f7379`. PR #13. The merge commit is the PR #13 merge on `main` (see `git log --merges main`).
 
 Defects found in lead QA and fixed before merge:
 
 - **Receipts deep link:** fixed to `/invoices?tab=receipts` (`36a486e`).
-- **Checkout dead end:** checkout stopped when the gate policy used a typed name (recovery_ops_engineer, _PENDING-LEAD_ hash).
-- **Tick box shown for a typed-name gate:** `/accept-policy` and the policy prompt showed only a tick box when the gate required a typed name, so the customer could not accept (compliance_engineer, _PENDING-LEAD_ hash; UI feedback `7a39164`).
+- **Checkout dead end:** checkout stopped when the gate policy used a typed name (recovery_ops_engineer, `8243000`; rechecked live by the lead: one inline typed-name field, mismatch message beside it, order placed).
+- **Tick box shown for a typed-name gate:** `/accept-policy` and the policy prompt showed only a tick box when the gate required a typed name, so the customer could not accept (compliance_engineer, `672e900`; UI feedback `7a39164` and `4810201`; rechecked live by the lead).
 - **Prompt re-opening:** the policy prompt re-opened on every navigation after "Later" (`39fb16e`).
 - **Notice copy:** singular and plural in the notice dialog (`7a39164`).
 - **Test timeouts:** hardened (`0e63c94`, `4614c02`).
