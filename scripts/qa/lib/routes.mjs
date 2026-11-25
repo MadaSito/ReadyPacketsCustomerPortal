@@ -209,7 +209,7 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     const topSwitch = page.getByRole("banner").getByRole("link", { name: "Customer portal", exact: true });
     const mobile = await page.evaluate(() => !window.matchMedia("(min-width: 48rem)").matches);
     if (mobile) {
-      await page.getByRole("button", { name: "Open console navigation", exact: true }).press("Enter", { timeout: 10_000 });
+      await page.getByRole("button", { name: "Open console navigation", exact: true }).click({ timeout: 10_000 });
       await page.getByRole("dialog", { name: "Console navigation" })
         .getByRole("link", { name: "Customer portal", exact: true }).press("Enter", { timeout: 10_000 });
     } else await topSwitch.press("Enter", { timeout: 10_000 });
@@ -233,7 +233,7 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
     for (const step of scenario.steps) {
       let control = step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
-        page.getByRole(step.role, { name: step.name, exact: true });
+        page.getByRole(step.role, { name: step.name, exact: step.namePrefix !== true });
       if (step.first === true) control = control.first();
       if (typeof step.text === "string") await control.pressSequentially(step.text, { timeout: 5_000 });
       else await control.press(step.key ?? "Enter", { timeout: 5_000 });

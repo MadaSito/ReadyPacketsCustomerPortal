@@ -41,7 +41,8 @@ lands anywhere else. Any other redirect still fails the case.
 
 An explicit admin or staff case on a customer route can use `enterViaCustomerPortal: true` to exercise
 the visible Customer portal switch before checking the target path. For form states, a `steps` item may
-use an exact `label` (or `labelPrefix: true`), `key` (default `Enter`), or synthetic `text` input.
+use an exact `label` (or `labelPrefix: true`), a role and `name` (or `namePrefix: true`), `key`
+(default `Enter`), or synthetic `text` input.
 Use `first: true` only when any matching control can advance the fixture, such as the first catalog item.
 
 ## Rate limits
