@@ -228,7 +228,7 @@ export function PhaseForm({ stage, index, onChange, statusOptions, takenStatuses
                 checked={checked}
                 disabled={disabled || (!checked && (Boolean(takenBy) || stage.statusKeys.length >= MAX_STAGE_STATUSES))}
                 label={option.label}
-                description={takenBy ? `In ${takenBy}` : option.retired ? "Retired" : undefined}
+                description={takenBy ? `Used by phase: ${takenBy}` : option.retired ? "Retired" : undefined}
                 onCheckedChange={(on) => set("statusKeys", on
                   ? workflowStatusKeys.length
                     ? [...stage.statusKeys, option.key].sort((a, b) => order(a) - order(b))

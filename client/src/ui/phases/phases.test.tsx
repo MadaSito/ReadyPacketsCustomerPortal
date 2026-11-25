@@ -1,4 +1,4 @@
-import { act, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -45,6 +45,19 @@ describe("PhaseEditor canvas", () => {
     expect(screen.getByText("Review moved to position 1 of 3.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Move Review up" })).toBeDisabled();
     await expectNoAxeViolations();
+  });
+
+  it("reorders by dragging the grip onto another card", () => {
+    const onChange = vi.fn();
+    renderUi(<Harness initial={stages(["Intake", "Review", "Delivery"])} onChange={onChange} />);
+    const cards = screen.getByRole("list", { name: "Phases in order" }).querySelectorAll(":scope > li");
+    const grip = cards[0]!.querySelector("[title='Drag to reorder']")!;
+    const dataTransfer = { setData: vi.fn(), setDragImage: vi.fn(), effectAllowed: "", dropEffect: "" };
+    expect(grip).toHaveAttribute("draggable", "true");
+    fireEvent.dragStart(grip, { dataTransfer });
+    fireEvent.dragOver(cards[2]!, { dataTransfer });
+    fireEvent.drop(cards[2]!, { dataTransfer });
+    expect(onChange.mock.lastCall?.[0].map((s: WorkflowStage) => s.key)).toEqual(["review", "delivery", "intake"]);
   });
 
   it("adds a phase and removes one after confirmation", async () => {

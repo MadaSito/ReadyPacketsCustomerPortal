@@ -65,7 +65,6 @@ export function PhaseEditor({
   const [ownIds, setIds] = useState<string[]>(() => value.map(() => nextId()));
   const ids = alignIds(ownIds, value.length);
   const [originalKeys] = useState<ReadonlyMap<string, string>>(() => new Map(ownIds.map((cardId, index) => [cardId, value[index]?.key ?? ""])));
-  const [armedId, setArmedId] = useState<string | null>(null);
   const [ownView, setOwnView] = useState<PhaseDesignerView>(defaultView);
   const view = controlledView ?? ownView;
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set(ownIds.slice(0, value.length <= 3 ? value.length : 1)));
@@ -145,17 +144,22 @@ export function PhaseEditor({
   }
 
   // Pointer drag (mouse / pen) from the grip only; keyboard and touch users use Up / Down.
-  const dragProps = (index: number, cardId: string) => ({
-    draggable: !disabled && armedId === cardId,
-    onDragStart: (event: DragEvent<HTMLLIElement>) => {
-      if (armedId !== cardId) { event.preventDefault(); return; }
+  /** Only the grip is draggable (inputs inside a draggable card would lose mouse text selection); the card is the drag image. */
+  const gripProps = (index: number, cardId: string) => ({
+    draggable: !disabled,
+    onDragStart: (event: DragEvent<HTMLSpanElement>) => {
+      if (disabled) { event.preventDefault(); return; }
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", cardId);
+      const card = event.currentTarget.closest("li");
+      if (card) event.dataTransfer.setDragImage(card, 24, 24);
       setDragFrom(index);
     },
+    onDragEnd: () => { setDragFrom(null); setDragOver(null); },
+  });
+  const dragProps = (index: number) => ({
     onDragOver: (event: DragEvent<HTMLLIElement>) => { if (dragFrom === null) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; if (dragOver !== index) setDragOver(index); },
-    onDrop: (event: DragEvent<HTMLLIElement>) => { event.preventDefault(); if (dragFrom !== null) moveCard(dragFrom, index, "drag"); setDragFrom(null); setDragOver(null); setArmedId(null); },
-    onDragEnd: () => { setDragFrom(null); setDragOver(null); setArmedId(null); },
+    onDrop: (event: DragEvent<HTMLLIElement>) => { event.preventDefault(); if (dragFrom !== null) moveCard(dragFrom, index, "drag"); setDragFrom(null); setDragOver(null); },
   });
 
   const listError = errors.stages;
@@ -194,7 +198,7 @@ export function PhaseEditor({
             const name = label(stage, index);
             const bodyId = `${uid}-${cardId}-body`;
             return (
-              <li key={cardId} {...dragProps(index, cardId)}
+              <li key={cardId} {...dragProps(index)}
                 className={cn(
                   "rp-phase-card min-w-0 rounded-[var(--radius-card)] border bg-surface shadow-sm rp-forced-border",
                   errorCount ? "border-danger" : "border-line",
@@ -203,8 +207,7 @@ export function PhaseEditor({
                 )}>
                 <div className="flex min-w-0 items-start gap-2 p-3 @md:gap-3 @md:p-4">
                   <div className="flex shrink-0 flex-col items-center gap-1 pt-1">
-                    <span aria-hidden="true" title="Drag to reorder" className={cn("hidden cursor-grab touch-none text-muted @md:inline-flex", disabled && "cursor-not-allowed opacity-50")}
-                      onPointerDown={() => setArmedId(cardId)} onPointerUp={() => { if (dragFrom === null) setArmedId(null); }}>
+                    <span aria-hidden="true" title="Drag to reorder" className={cn("hidden cursor-grab touch-none text-muted @md:inline-flex", disabled && "cursor-not-allowed opacity-50")} {...gripProps(index, cardId)}>
                       <GripVertical className="size-5" />
                     </span>
                     <span aria-hidden="true" className="flex size-7 items-center justify-center rounded-full bg-action text-xs font-semibold text-on-action">{index + 1}</span>
