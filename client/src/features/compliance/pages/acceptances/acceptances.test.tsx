@@ -833,6 +833,69 @@ describe("Package D2 — Policy Acceptance Log Centre & Customer Policies Tab", 
       );
     }
     coverageView.unmount();
+
+    // 3. /admin/customers/:customerId#policies (admin role — both nested Status per policy and Acceptance history cards)
+    const customerPoliciesView = renderWithTrpc(
+      <CustomerDetailHost customerId={CUST_CARA} />,
+      baseFixtures("admin", {
+        "compliance.policies.enforcement.forTarget": () => ({ canEndSessions: true }),
+      }),
+      {
+        path: `/admin/customers/${CUST_CARA}`,
+        role: "admin",
+      },
+    );
+    await screen.findByText("Status per policy");
+    expect(await screen.findByRole("button", { name: "End sessions now" })).toBeInTheDocument();
+
+    const statusSection = screen.getByRole("region", { name: "Policy status per document" });
+    expect(statusSection.className.split(/\s+/)).toContain("min-w-0");
+    const statusPhoneList = screen.getByRole("list", { name: "Customer policy status" });
+    const statusTableWrapper = statusPhoneList.parentElement;
+    expect(statusTableWrapper).not.toBeNull();
+    expect(statusTableWrapper!.parentElement!.className.split(/\s+/)).toContain("min-w-0");
+    expect(statusTableWrapper!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        "max-[320px]:[&_li]:min-w-0",
+        "max-[320px]:[&_dl]:grid-cols-1",
+        "max-[320px]:[&_dt]:break-words",
+      ]),
+    );
+    const statusBadges = [
+      ...statusPhoneList.querySelectorAll<HTMLElement>('[title="Accepted current version"], [title="Update pending"]'),
+    ];
+    expect(statusBadges.length).toBeGreaterThanOrEqual(2);
+    for (const badge of statusBadges) {
+      expect(badge.className.split(/\s+/)).toEqual(
+        expect.arrayContaining(["min-w-0", "max-w-full", "flex-wrap"]),
+      );
+    }
+
+    const historySection = screen.getByRole("region", { name: "Full policy acceptance history" });
+    expect(historySection.className.split(/\s+/)).toContain("min-w-0");
+    const historyPhoneList = screen.getByRole("list", {
+      name: "Customer policy acceptance history",
+    });
+    const historyTableWrapper = historyPhoneList.parentElement;
+    expect(historyTableWrapper).not.toBeNull();
+    expect(historyTableWrapper!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        "max-[320px]:[&_li]:min-w-0",
+        "max-[320px]:[&_dl]:grid-cols-1",
+        "max-[320px]:[&_dt]:break-words",
+      ]),
+    );
+    const sourceCells = [...historyPhoneList.querySelectorAll<HTMLElement>("span")].filter(
+      (el) => el.textContent === "Order gate",
+    );
+    expect(sourceCells.length).toBeGreaterThan(0);
+    for (const sourceLabel of sourceCells) {
+      expect(sourceLabel.className.split(/\s+/)).toContain("break-words");
+      expect(sourceLabel.parentElement!.className.split(/\s+/)).toEqual(
+        expect.arrayContaining(["flex", "min-w-0", "max-w-full", "flex-col"]),
+      );
+    }
+    customerPoliciesView.unmount();
   });
 });
 

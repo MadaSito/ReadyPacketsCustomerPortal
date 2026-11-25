@@ -34,13 +34,13 @@ const POLICY_STATUS_COLUMNS: readonly Column<CustomerPolicyStatusRow>[] = [
     header: "Policy",
     primary: true,
     cell: (row) => (
-      <div className="flex min-w-0 flex-col gap-0.5">
+      <div className="flex min-w-0 max-w-full flex-col gap-0.5">
         <span className="font-semibold break-words text-ink">{row.title}</span>
         <span className="font-mono text-xs break-all text-muted">{row.slug}</span>
         <Link
           href={`/admin/policy-acceptances/versions/${row.currentVersionPublicId}`}
           aria-label={`Current v${row.currentVersionLabel} text for ${row.title}`}
-          className="text-xs font-medium text-action underline underline-offset-2"
+          className="text-xs font-medium break-words text-action underline underline-offset-2"
         >
           Current v{row.currentVersionLabel} text
         </Link>
@@ -60,7 +60,7 @@ const POLICY_STATUS_COLUMNS: readonly Column<CustomerPolicyStatusRow>[] = [
         <Link
           href={`/admin/policy-acceptances/versions/${row.acceptedVersionPublicId}`}
           aria-label={`Version ${row.acceptedVersionLabel} text for ${row.title}`}
-          className="font-medium text-action underline underline-offset-2"
+          className="font-medium break-words text-action underline underline-offset-2"
         >
           Version {row.acceptedVersionLabel} text
         </Link>
@@ -96,7 +96,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
         header: "Policy & version",
         primary: true,
         cell: (row) => (
-          <div className="flex min-w-0 flex-col items-start gap-1">
+          <div className="flex min-w-0 max-w-full flex-col items-start gap-1">
             <span className="font-semibold break-words text-ink">
               {row.policyTitle} · v{row.versionLabel}
             </span>
@@ -126,13 +126,13 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
         key: "sourceMethod",
         header: "Source & method",
         cell: (row) => (
-          <div className="flex flex-col gap-0.5">
-            <span className="font-medium text-ink">{formatAcceptanceSource(row.source)}</span>
-            <span className="text-xs text-muted">{formatAcceptanceMethod(row.method)}</span>
+          <div className="flex min-w-0 max-w-full flex-col gap-0.5">
+            <span className="font-medium break-words text-ink">{formatAcceptanceSource(row.source)}</span>
+            <span className="text-xs break-words text-muted">{formatAcceptanceMethod(row.method)}</span>
             {row.orderPublicId && row.orderReference ? (
               <Link
                 href={`/admin/orders/${row.orderPublicId}`}
-                className="font-mono text-xs text-action underline underline-offset-2"
+                className="font-mono text-xs break-all text-action underline underline-offset-2"
               >
                 Order {row.orderReference}
               </Link>
@@ -147,7 +147,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
           <Link
             href={`/admin/policy-acceptances/versions/${row.versionPublicId}`}
             aria-label={`View version ${row.versionLabel} text for ${row.policyTitle}`}
-            className="font-medium text-action underline underline-offset-2"
+            className="font-medium break-words text-action underline underline-offset-2"
           >
             View version {row.versionLabel} text
           </Link>
@@ -179,13 +179,15 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
     <div className="flex min-w-0 flex-col gap-6">
       <Card
         as="section"
+        className="min-w-0"
         aria-label="Policy status per document"
         title="Status per policy"
         description="Standing against every published customer-facing policy."
         actions={<EndPolicySessionsAction userPublicId={customerId} />}
         flush
       >
-        <div className="p-4 sm:p-5">
+        <div className="min-w-0 p-4 sm:p-5">
+          {/* Nested Card + DataTable card leaves 148 px below 320 px; stack <dt>/<dd> below 320 px while keeping 320+ unchanged. */}
           <DataTable<CustomerPolicyStatusRow>
             caption="Customer policy status"
             className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
@@ -206,6 +208,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
 
       <Card
         as="section"
+        className="min-w-0"
         aria-label="Full policy acceptance history"
         title="Acceptance history"
         description="Complete append-only log of account, checkout, and order-gate acceptances for this customer."
