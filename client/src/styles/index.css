@@ -272,6 +272,17 @@ html:not(.dark) {
   .prose-rp th, .prose-rp td { border-bottom: 1px solid var(--color-line); padding: 0.5rem; text-align: left; }
 }
 
+/* Increment 07 D3: OrderProgress. Width comes from --rp-progress (set through CSSOM by the component). */
+.rp-progress-fill { width: var(--rp-progress, 0%); }
+.rp-progress-animate { transition: width 700ms cubic-bezier(0.22, 1, 0.36, 1); }
+.rp-progress-fill:not(.rp-progress-fill-canceled) {
+  background-image: linear-gradient(90deg, transparent 40%, color-mix(in oklab, var(--color-on-action) 22%, transparent));
+}
+.rp-progress-step-current > :first-child > span:first-child { box-shadow: 0 0 0 4px var(--color-action-soft); }
+@media (prefers-reduced-motion: reduce) {
+  .rp-progress-animate { transition: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -283,6 +294,9 @@ html:not(.dark) {
 
 @media (forced-colors: active) {
   :focus-visible { outline: 3px solid CanvasText; }
+  .rp-progress-fill { forced-color-adjust: none; background: Highlight; }
+  .rp-progress-fill-canceled { background: GrayText; }
+  .rp-progress-step[data-state="current"] { outline: 2px solid Highlight; outline-offset: 2px; border-radius: 0.375rem; }
   .rp-forced-border { border: 1px solid CanvasText; }
   .rp-nav-edge { border-right: 1px solid CanvasText; }
   .rp-nav-bar-top { border-top: 1px solid CanvasText; }
