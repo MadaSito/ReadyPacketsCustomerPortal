@@ -42,8 +42,9 @@ vi.mock("./StageQuestions", () => ({
 vi.mock("../../files/PhaseFiles", () => ({
   PhaseUploadPanel: (p: { stageKey: string; intent: string; readOnly?: boolean; onPendingChange?: (count: number) => void }) => {
     if (p.onPendingChange) uploadPending.set(`${p.stageKey}:${p.intent}`, p.onPendingChange);
-    return <p>{`upload ${p.intent} ${p.stageKey} ro=${String(p.readOnly)}`}</p>;
+    return <p>{`upload ${p.intent} ${p.stageKey} ro=${String(Boolean(p.readOnly))}`}</p>;
   },
+  PhaseUploadedFiles: (p: { stageKey: string; intent: string; headingLevel?: number }) => <p>{`uploaded ${p.intent} ${p.stageKey} h${p.headingLevel}`}</p>,
   PhaseTeamFiles: (p: { stageKey: string }) => <p>{`team ${p.stageKey}`}</p>,
 }));
 vi.mock("../../files/archives/ArchiveAction", () => ({ PhaseArchiveAction: (p: { stageKey: string }) => <p>{`zip ${p.stageKey}`}</p> }));
@@ -173,6 +174,21 @@ describe("CustomerPhaseWizard", () => {
     expect(await screen.findByText("This order was updated. The current phase is now Review.")).toBeInTheDocument();
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["orders.get"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["orders.list"] });
+  });
+
+  it("lists the phase's own uploads under each editable form, audio once; locked phases show the list alone", async () => {
+    const both = { ...actions, answerQuestions: false, recordAudio: true, uploadAudio: true };
+    handlers["orders.stages.workspace"] = () => ws({ stages: [stage({ actions: both })] });
+    const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByText("uploaded document intake h5")).toBeInTheDocument();
+    expect(screen.getByText("uploaded prerecorded_audio intake h5")).toBeInTheDocument();
+    expect(screen.queryByText(/uploaded recording/)).toBeNull();
+    expect(screen.getByText("Recordings are listed under Upload audio.")).toBeInTheDocument();
+    view.unmount();
+    handlers["orders.stages.workspace"] = () => ws({ stages: [stage({ state: "submitted", locked: true, canNext: false, actions: { ...actions, answerQuestions: false } })] });
+    renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByText("upload document intake ro=true")).toBeInTheDocument();
+    expect(screen.queryByText(/^uploaded /)).toBeNull();
   });
 
   it("offers the phase ZIP only where the phase lists files", () => {

@@ -13,7 +13,7 @@ import { safeError, useTRPC } from "@/lib/trpc";
 import { Link } from "wouter";
 import { Skeleton } from "@/ui";
 import { PhaseArchiveAction } from "../../files/archives/ArchiveAction";
-import { PhaseTeamFiles, PhaseUploadPanel } from "../../files/PhaseFiles";
+import { PhaseTeamFiles, PhaseUploadPanel, PhaseUploadedFiles } from "../../files/PhaseFiles";
 import { PhaseWizard, type UnansweredQuestion } from "./PhaseWizard";
 import { StageQuestions } from "./StageQuestions";
 import {
@@ -21,6 +21,7 @@ import {
 } from "./wizardModel";
 
 export const WORKSPACE_REFRESH_MS = 30_000;
+export const AUDIO_LISTED_BELOW = "Recordings are listed under Upload audio.";
 type UploadIntent = "document" | "recording" | "prerecorded_audio";
 
 export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fallback?: ReactNode }) {
@@ -52,6 +53,15 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
     (stageKey: string) => Object.entries(pending).reduce((sum, [key, n]) => (key.startsWith(`${stageKey}:`) ? sum + n : sum), 0),
     [pending],
   );
+
+  // Each read of the workspace (30 s, focus, after an action) also refreshes the phase file lists.
+  const readAt = workspaceQuery.dataUpdatedAt;
+  const firstRead = useRef(true);
+  useEffect(() => {
+    if (!readAt) return;
+    if (firstRead.current) { firstRead.current = false; return; }
+    void client.invalidateQueries({ queryKey: trpc.files.list.pathKey() });
+  }, [readAt, client, trpc]);
 
   // Changes found by a later read (not caused by this page's own Next / Submit) are announced politely.
   const data: WizardWorkspace | undefined = workspaceQuery.data;
@@ -117,12 +127,27 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
 
   const renderAction = (action: StageActionKey, stage: WizardStage, readOnly: boolean): ReactNode => {
     const scope = { orderId, stageKey: stage.key };
-    const changed = () => void client.invalidateQueries({ queryKey: trpc.orders.stages.workspace.queryKey({ orderId }) });
+    const changed = () => {
+      void client.invalidateQueries({ queryKey: trpc.orders.stages.workspace.queryKey({ orderId }) });
+      void client.invalidateQueries({ queryKey: trpc.files.list.pathKey() });
+    };
+    // Editable: the upload form, then "Uploaded in this phase". Locked: PhaseUploadPanel(readOnly) is that list alone.
+    // Recordings and uploaded audio share one list (files keeps the media type, not the intent), shown once.
+    const upload = (intent: UploadIntent, list: boolean) => (
+      <div className="flex min-w-0 flex-col gap-4">
+        {readOnly
+          ? (list ? <PhaseUploadPanel {...scope} intent={intent} readOnly /> : null)
+          : <PhaseUploadPanel {...scope} intent={intent} onChanged={changed} onPendingChange={onPendingFor(stage.key, intent)} />}
+        {!readOnly && list ? <PhaseUploadedFiles {...scope} intent={intent} headingLevel={5} /> : null}
+        {!list ? <p className="text-sm text-body">{AUDIO_LISTED_BELOW}</p> : null}
+      </div>
+    );
+    const audioListHere = (intent: UploadIntent) => intent === "prerecorded_audio" || !stage.actions.uploadAudio;
     switch (action) {
       case "answerQuestions": return <StageQuestions {...scope} readOnly={readOnly} headingLevel={4} />;
-      case "uploadDocuments": return <PhaseUploadPanel {...scope} intent="document" readOnly={readOnly} onChanged={changed} onPendingChange={onPendingFor(stage.key, "document")} />;
-      case "recordAudio": return <PhaseUploadPanel {...scope} intent="recording" readOnly={readOnly} onChanged={changed} onPendingChange={onPendingFor(stage.key, "recording")} />;
-      case "uploadAudio": return <PhaseUploadPanel {...scope} intent="prerecorded_audio" readOnly={readOnly} onChanged={changed} onPendingChange={onPendingFor(stage.key, "prerecorded_audio")} />;
+      case "uploadDocuments": return upload("document", true);
+      case "recordAudio": return upload("recording", audioListHere("recording"));
+      case "uploadAudio": return upload("prerecorded_audio", true);
       case "teamFileReview": return <PhaseTeamFiles {...scope} />;
     }
   };
