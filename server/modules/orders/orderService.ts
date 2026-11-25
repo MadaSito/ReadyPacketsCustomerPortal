@@ -24,6 +24,9 @@ import { priceOrder, type OrderPricing } from "./pricing.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import type { RequirementsService } from "./requirements.js";
 import type { OrderGatesService } from "./gates.js";
+import type { StageRuntime } from "./stageRuntime.js";
+import { stageIndexOfStatus, stageModelOf } from "./stageModel.js";
+import type { OrderAttention, OrderPaymentState as OrderPaymentStateV7 } from "./schema.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
 export interface OrderServiceDeps {
@@ -46,6 +49,8 @@ export interface OrderServiceDeps {
   gates: Pick<OrderGatesService, "assertCustomerMayWork" | "assertSystemMayWork" | "assertCustomerMayPlaceOrder">;
   /** Part B (B1): console payment badge; registered by compliance at init. Null ⇒ badge hidden. */
   paymentSummary: () => OrderPaymentSummaryProvider | null;
+  /** Increment 07 (D1/D2/D3): stage progress, progress percent and attention, in the same tx as every status write. */
+  stageRuntime?: Pick<StageRuntime, "afterStatusChangeInTx" | "fillForRead">;
 }
 
 export type OrderPaymentState = "unpaid" | "paid" | "partially_refunded" | "refunded" | "void";
@@ -116,6 +121,16 @@ export interface OrderListItem {
   ownerName?: string;
   createdAt: Date;
   updatedAt: Date;
+  /** Increment 07 (D3): shown progress (0–100); frozen with `progressCanceled` on a canceled order. */
+  progressPercent: number;
+  progressCanceled: boolean;
+  /** Current phase (customer label for customers, staff label for staff); index 0-based, null when none. */
+  phaseLabel: string | null;
+  phaseIndex: number | null;
+  phaseTotal: number;
+  /** Increment 07 (D9 / D2). */
+  paymentState: OrderPaymentStateV7;
+  attention: OrderAttention;
 }
 
 export function createOrderService(deps: OrderServiceDeps) {
@@ -345,6 +360,8 @@ export function createOrderService(deps: OrderServiceDeps) {
       createdByUserId: principal?.userId ?? null,
       createKey: input.idempotencyKey,
       submittedAt: now,
+      // Increment 07 (D9): a new order with something to pay starts unpaid; existing orders are never re-gated.
+      paymentState: totalMinor > 0 ? "unpaid" : "not_required",
       createdAt: now,
       updatedAt: now,
     });
@@ -387,6 +404,7 @@ export function createOrderService(deps: OrderServiceDeps) {
       noteId: note?.id ?? null,
       occurredAt: now,
     });
+    await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId, bound: workflow, fromStatus: null, toStatus: initial.key });
     const inherited = await deps.access.onOrderCreated(tx, { orderId, ownerUserId, now });
     await deps.audit.record(
       {
@@ -435,9 +453,15 @@ export function createOrderService(deps: OrderServiceDeps) {
       }
     }
     const items: OrderListItem[] = [];
+    // Increment 07 (D3): old orders get their progress cache filled on first read.
+    const unfilled = rows.filter((row) => row.progressPercent === null).map((row) => row.id);
+    const filled = unfilled.length && deps.stageRuntime ? await deps.stageRuntime.fillForRead(unfilled) : new Map<number, number>();
     for (const row of rows) {
       const status = await statusPresentation(row.workflowVersionId, row.statusKey);
       const staffSide = principal.role !== "customer";
+      const model = stageModelOf((await workflows.byVersionId(deps.db, row.workflowVersionId)).definition);
+      const phaseIndex = stageIndexOfStatus(model, row.statusKey);
+      const phase = phaseIndex >= 0 ? model.stages[phaseIndex]! : null;
       items.push({
         publicId: row.publicId,
         reference: row.reference,
@@ -452,6 +476,13 @@ export function createOrderService(deps: OrderServiceDeps) {
         ...(withOwner ? { ownerPublicId: ownerViews.get(row.ownerUserId)?.publicId, ownerName: ownerViews.get(row.ownerUserId)?.name } : {}),
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
+        progressPercent: row.progressPercent ?? filled.get(row.id) ?? 0,
+        progressCanceled: row.statusKey.includes("cancel"),
+        phaseLabel: phase ? (staffSide ? phase.staffLabel : phase.customerLabel) : null,
+        phaseIndex: phase ? phaseIndex : null,
+        phaseTotal: model.stages.length,
+        paymentState: row.paymentState,
+        attention: row.attention,
       });
     }
     return items;
@@ -616,7 +647,18 @@ export function createOrderService(deps: OrderServiceDeps) {
 
     async adminList(
       principal: SessionPrincipal,
-      input: { cursor?: string; limit?: number; status?: string; customerPublicId?: string; from?: Date; to?: Date; referencePrefix?: string; lockState?: OrderLockState },
+      input: {
+        cursor?: string;
+        limit?: number;
+        status?: string;
+        customerPublicId?: string;
+        from?: Date;
+        to?: Date;
+        referencePrefix?: string;
+        lockState?: OrderLockState;
+        /** Increment 07 (D2): attention filter. */
+        attention?: "staff_review" | "customer_response";
+      },
     ): Promise<{ items: OrderListItem[]; nextCursor: string | null }> {
       if (principal.role === "customer" || !roleHasCapability(principal.role, "orders.read_all")) throw forbidden("CAPABILITY_NOT_GRANTED");
       const limit = Math.min(Math.max(input.limit ?? 25, 1), MAX_PAGE);
@@ -635,6 +677,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             before !== null ? lt(orders.id, before) : undefined,
             input.status ? eq(orders.statusKey, input.status) : undefined,
             input.lockState ? eq(orders.lockState, input.lockState) : undefined,
+            input.attention ? eq(orders.attention, input.attention) : undefined,
             ownerId !== undefined ? eq(orders.ownerUserId, ownerId) : undefined,
             input.from ? gte(orders.createdAt, input.from) : undefined,
             input.to ? lte(orders.createdAt, input.to) : undefined,
@@ -968,6 +1011,136 @@ export function createOrderService(deps: OrderServiceDeps) {
       return { publicId: result.note.publicId };
     },
 
+    /* ------------------------------------------------- increment 07: in-tx status writes */
+
+    /**
+     * Increment 07 (D1/D5/D9, trusted — caller authorised and locked nothing else first). A status change inside the
+     * caller's transaction. `transition`: an allowed transition for `actor` in the pinned version (requirements, phase
+     * locks and gates apply exactly as in `transition`). `override`: administrator only, audited with a reason; skips
+     * the transition graph and the forward requirement check, never the order lock.
+     */
+    async applyStatusInTx(
+      tx: Tx,
+      input: {
+        orderId: number;
+        toStatus: string;
+        principal: SessionPrincipal | null;
+        actor: WorkflowActor;
+        mode: "transition" | "override";
+        reasonCode: string;
+        overrideReason?: string;
+        expectedVersion?: number;
+        correlationId?: string;
+      },
+    ): Promise<{ fromStatus: string; toStatus: string; version: number; notify: boolean; view: OrderAccessView; bound: BoundWorkflow }> {
+      const [row] = await tx.select().from(orders).where(eq(orders.id, input.orderId)).limit(1).for("update");
+      if (!row) throw ORDER_NOT_FOUND();
+      if (row.lockState !== "none") throw orderLocked(row.lockState);
+      if (input.expectedVersion !== undefined && row.version !== input.expectedVersion) throw staleVersion();
+      const bound = await workflows.byVersionId(tx, row.workflowVersionId);
+      if (!findState(bound.definition, input.toStatus)) throw validation("STATUS_UNKNOWN", "That status is not part of this order's workflow.");
+      let notify = false;
+      if (input.mode === "transition") {
+        const transition = transitionsFrom(bound.definition, row.statusKey, input.actor).find((candidate) => candidate.to === input.toStatus);
+        if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
+        notify = transition.notifyCustomer;
+        if (!isCancelTarget(bound, transition.to)) {
+          if (input.actor === "customer" && input.principal)
+            await deps.gates.assertCustomerMayWork({ tx, orderId: row.id, actor: input.principal, action: "phase_submit", statusKey: row.statusKey });
+          else if (input.actor === "api" || !input.principal) await deps.gates.assertSystemMayWork({ tx, orderId: row.id, action: "phase_submit", statusKey: row.statusKey });
+        }
+      } else {
+        if (input.principal?.role !== "admin") throw new DomainError("FORBIDDEN", "OVERRIDE_ADMIN_ONLY", "Only an administrator can move an order outside its workflow.");
+        if (!input.overrideReason || input.overrideReason.trim().length < 10) throw validation("REASON_REQUIRED", "Please give a reason of at least 10 characters.");
+      }
+      const owner = await identityPort(deps.services).getUser(row.ownerUserId, { tx });
+      const view: OrderAccessView = {
+        id: row.id,
+        publicId: row.publicId,
+        reference: row.reference,
+        ownerUserId: row.ownerUserId,
+        ownerPublicId: owner?.publicId ?? "",
+        statusKey: row.statusKey,
+        lockState: row.lockState,
+        locked: false,
+        readOnlyImported: false,
+        accessRole: input.actor === "customer" ? "owner" : input.actor === "admin" ? "admin" : "staff",
+        canWrite: true,
+        origin: row.origin,
+        version: row.version,
+        workflowVersionId: row.workflowVersionId,
+        discountMinor: row.discountMinor,
+        discountLabel: row.discountLabel,
+        promoDiscountMinor: row.promoDiscountMinor,
+        promoLabel: row.promoLabel,
+        bundleDiscountMinor: Math.max(0, row.discountMinor - row.promoDiscountMinor),
+      };
+      await deps.requirements.onTransition(tx, input.principal, view, bound, input.toStatus, { skipRequirements: input.mode === "override" });
+      const now = deps.clock.now();
+      const result = await tx
+        .update(orders)
+        .set({ statusKey: input.toStatus, version: row.version + 1, updatedAt: now })
+        .where(and(eq(orders.id, row.id), eq(orders.version, row.version)));
+      if (affectedRows(result) !== 1) throw staleVersion();
+      if (isCancelTarget(bound, input.toStatus)) await releasePromotionOnCancel(tx, row.id);
+      await tx.insert(orderStatusHistory).values({
+        publicId: ulid(now.getTime()),
+        orderId: row.id,
+        fromStatus: row.statusKey,
+        toStatus: input.toStatus,
+        actorUserId: input.principal?.userId ?? null,
+        actorRole: input.principal ? (input.actor === "customer" ? "customer" : input.principal.role) : "system",
+        reasonCode: input.reasonCode,
+        noteId: null,
+        occurredAt: now,
+      });
+      const actor = input.principal ? actorOf(input.principal) : { role: "system" as const };
+      await deps.audit.record(
+        {
+          category: "business",
+          eventName: "order.status.changed",
+          action: "transition",
+          outcome: "completed",
+          actor,
+          ...(input.correlationId ? { correlationId: input.correlationId } : {}),
+          resource: { type: "order", publicId: row.publicId },
+          reasonCode: input.reasonCode,
+          attributes: { from_status: row.statusKey, to_status: input.toStatus, workflow_version: bound.versionNumber, mode: input.mode },
+        },
+        tx,
+      );
+      if (input.mode === "override") {
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "order.stage.status_overridden",
+            action: "override",
+            outcome: "completed",
+            severity: "WARN",
+            actor,
+            resource: { type: "order", publicId: row.publicId },
+            reasonCode: input.reasonCode,
+            attributes: { from_status: row.statusKey, to_status: input.toStatus, reason_length: String(input.overrideReason?.trim().length ?? 0) },
+          },
+          tx,
+        );
+      }
+      await emitChange(tx, { orderId: row.id, orderPublicId: row.publicId, kind: "status_changed" });
+      await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: input.toStatus });
+      return { fromStatus: row.statusKey, toStatus: input.toStatus, version: row.version + 1, notify, view: { ...view, statusKey: input.toStatus, version: row.version + 1 }, bound };
+    },
+
+    /** Increment 07: the customer notice for a status write made by `applyStatusInTx` (call after commit). */
+    async notifyStatusChanged(input: { view: OrderAccessView; bound: BoundWorkflow; toStatus: string; version: number; actorUserId: number | null }) {
+      const state = findState(input.bound.definition, input.toStatus);
+      const statusLabel = state?.customerLabel ?? input.toStatus;
+      await notifyParticipants(input.view, input.actorUserId, "order.status_changed", `${input.view.reference}: ${statusLabel}`, `Your order status is now “${statusLabel}”.`, {
+        template: "orders.status_changed",
+        vars: { reference: input.view.reference, statusLabel, link: `/orders/${input.view.publicId}` },
+        idempotencyKey: `order-status:${input.view.publicId}:${input.version}`,
+      });
+    },
+
     /* ------------------------------------------------------------ transition */
     async transition(principal: SessionPrincipal, input: { orderId: string; expectedVersion: number; toStatus: string; note?: string; noteVisibility?: NoteVisibility }) {
       let outcome: { view: OrderAccessView; bound: BoundWorkflow; notify: boolean; from: string };
@@ -1007,6 +1180,7 @@ export function createOrderService(deps: OrderServiceDeps) {
             noteId: note?.id ?? null,
             occurredAt: now,
           });
+          await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: view.id, bound, fromStatus: view.statusKey, toStatus: transition.to });
           await deps.audit.record(
             {
               category: "business",
@@ -1114,6 +1288,7 @@ export function createOrderService(deps: OrderServiceDeps) {
           noteId: note?.id ?? null,
           occurredAt: now,
         });
+        await deps.stageRuntime?.afterStatusChangeInTx(tx, { orderId: row.id, bound, fromStatus: row.statusKey, toStatus: transition.to });
         await deps.audit.record(
           {
             category: "business",

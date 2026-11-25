@@ -9,6 +9,7 @@ import { ulid } from "../../core/ids.js";
 import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersionLayouts, orderWorkflowVersions, type WorkflowDraftSource } from "./schema.js";
+import { compileRuntimeDefinition } from "./stageModel.js";
 import { DEFAULT_WORKFLOW, usesWorkflowRules, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
 import {
   BLANK_DRAFT,
@@ -63,7 +64,8 @@ export function createWorkflowService(deps: WorkflowDeps) {
       workflowKey: row.workflowKey,
       versionId: row.version.id,
       versionNumber: row.version.versionNumber,
-      definition: workflowDefinitionSchema.parse(row.version.definition),
+      // Increment 07 (D1): format 3 compiles onto phases / phase locks (stored definition is unchanged).
+      definition: compileRuntimeDefinition(workflowDefinitionSchema.parse(row.version.definition)),
     };
     versionCache.set(versionId, bound);
     return bound;
