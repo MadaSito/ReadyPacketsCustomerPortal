@@ -9,6 +9,7 @@ import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS, WORKFL
 import { AGREEMENT_SIGNATURE_MODES, bundleRuleSchema } from "./settings.js";
 // ── increment 07 router imports (other owners: one import line each, below this anchor; orders_engineer owns the file) ──
 import { adminTasksRouter, questionsRouter } from "./questionsRouter.js";
+import { statusCatalogRouter } from "./statusCatalogRouter.js";
 // ── end increment 07 router imports ──
 
 const id = z.string().regex(ULID_PATTERN);
@@ -412,5 +413,6 @@ export const ordersRouter = router({
   }),
   // ── increment 07 mounts (other owners: one line each, below this anchor, e.g. `questions: questionsRouter,`) ──
   questions: questionsRouter, adminTasks: adminTasksRouter,
+  statusCatalog: statusCatalogRouter,
   // ── end increment 07 mounts ──
 });
