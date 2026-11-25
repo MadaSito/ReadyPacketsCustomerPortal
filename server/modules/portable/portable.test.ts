@@ -168,7 +168,19 @@ describe("portable transfer across isolated MySQL installations", () => {
         const recordData = JSON.stringify(records);
         expect(recordData).not.toContain(AUTH_MARKER);
         expect(recordData).not.toContain(PASSPHRASE);
-        expect(recordData).not.toMatch(/password|mfa|session|storageKey/i);
+        // Auth material is checked by field name and record type. Matching the whole serialized text is unreliable:
+        // random identifiers such as a customer number can spell "MFA" by chance.
+        const fieldNames = new Set<string>();
+        const collectFieldNames = (value: unknown): void => {
+          if (Array.isArray(value)) { value.forEach(collectFieldNames); return; }
+          if (value !== null && typeof value === "object") {
+            for (const [name, child] of Object.entries(value)) { fieldNames.add(name); collectFieldNames(child); }
+          }
+        };
+        collectFieldNames(records);
+        const authMaterial = /password|mfa|session|storageKey/i;
+        expect([...fieldNames].filter((name) => authMaterial.test(name))).toEqual([]);
+        expect(records.map((entry) => entry.type).filter((type) => authMaterial.test(type))).toEqual([]);
         expect(Buffer.concat(await collect(await pkg.openObject(FILE_HASH) as AsyncIterable<Buffer>))).toEqual(PDF);
       } finally { await pkg.close(); }
     });
