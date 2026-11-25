@@ -1,5 +1,6 @@
 /** Increment 07 QA: the console order list's Phase column (label, n of m, compact progress). Owner: orders_engineer. */
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as trpcModule from "@/lib/trpc";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
@@ -75,3 +76,25 @@ describe("console order list Phase column", () => {
     await expectNoAxeViolations(container);
   });
 });
+
+describe("07.1 D5: /admin/orders?new=1", () => {
+  it("opens the New order for a customer dialog with focus inside; closing removes the parameter and returns focus to the button", async () => {
+    handlers.set("orders.catalog.list", () => []);
+    const user = userEvent.setup();
+    const { container, location } = renderUi(<AdminOrdersPage />, { path: "/admin/orders?new=1" });
+    const dialog = await screen.findByRole("dialog", { name: "New order for a customer" });
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    await expectNoAxeViolations(container);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(location.history?.at(-1)).toBe("/admin/orders");
+    await waitFor(() => expect(screen.getByRole("button", { name: "New order for a customer" })).toHaveFocus());
+  });
+
+  it("without the parameter the dialog stays closed", async () => {
+    renderUi(<AdminOrdersPage />, { path: "/admin/orders" });
+    await screen.findByRole("table");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+});
+

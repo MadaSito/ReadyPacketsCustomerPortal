@@ -3,12 +3,15 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import { Package, Plus } from "lucide-react";
 import { useState } from "react";
 import { Link } from "wouter";
+import { NewOrderForCustomerLink, useIsStaffViewer } from "@/app/portal";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Button, Card, DataTable, DateTime, EmptyState, LoadMore, Money, PageHeader, useToast } from "@/ui";
 import { ACCESS_ROLE_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 import { OrderListProgress } from "../stages/OrderListProgress";
 
 export default function OrdersListPage() {
+  // Increment 07.1 (D4): staff/admin cannot place customer orders here; their buttons lead to the console dialog.
+  const staffViewer = useIsStaffViewer();
   const trpc = useTRPC();
   const list = useInfiniteQuery(trpc.orders.list.infiniteQueryOptions({ limit: 25 }, { getNextPageParam: (page) => page.nextCursor ?? undefined }));
   const rows = list.data?.pages.flatMap((page) => page.items);
@@ -18,9 +21,13 @@ export default function OrdersListPage() {
         title="Orders"
         description="Track the status of every order you own or that has been shared with you."
         actions={
-          <Button asChild leadingIcon={<Plus aria-hidden />}>
-            <Link href="/orders/new">New order</Link>
-          </Button>
+          staffViewer ? (
+            <NewOrderForCustomerLink />
+          ) : (
+            <Button asChild leadingIcon={<Plus aria-hidden />}>
+              <Link href="/orders/new">New order</Link>
+            </Button>
+          )
         }
       />
       <div className="flex flex-col gap-6">
@@ -67,9 +74,13 @@ export default function OrdersListPage() {
               title="No orders yet"
               description="When you place an order, or someone shares one with you, it appears here."
               action={
-                <Button asChild>
-                  <Link href="/orders/new">Start an order</Link>
-                </Button>
+                staffViewer ? (
+                  <NewOrderForCustomerLink variant="secondary" />
+                ) : (
+                  <Button asChild>
+                    <Link href="/orders/new">Start an order</Link>
+                  </Button>
+                )
               }
             />
           }

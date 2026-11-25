@@ -4,8 +4,8 @@
  * (capabilities, step-up for grants, feature flag); the UI only hides what the role cannot do.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useId, useState, type FormEvent } from "react";
-import { Link, useLocation } from "wouter";
+import { useEffect, useId, useRef, useState, type FormEvent, type RefObject } from "react";
+import { Link, useLocation, useSearch } from "wouter";
 import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
 import { useFeatureEnabled } from "@/lib/features";
@@ -84,12 +84,12 @@ export function CustomerPicker({ value, onChange, label = "Customer" }: { value:
 }
 
 /** New order on behalf of a customer (staff + orders.manage). `customer` fixes the customer (customer tab). */
-export function NewOrderForCustomerDialog({ open, ...rest }: { open: boolean; onClose: () => void; customer?: PickedCustomer | null }) {
+export function NewOrderForCustomerDialog({ open, ...rest }: { open: boolean; onClose: () => void; customer?: PickedCustomer | null; returnFocusRef?: RefObject<HTMLElement | null> }) {
   // Mounted only while open, so every opening starts with a fresh form and a fresh idempotency key.
   return open ? <NewOrderDialogBody {...rest} /> : null;
 }
 
-function NewOrderDialogBody({ onClose, customer: fixed }: { onClose: () => void; customer?: PickedCustomer | null }) {
+function NewOrderDialogBody({ onClose, customer: fixed, returnFocusRef }: { onClose: () => void; customer?: PickedCustomer | null; returnFocusRef?: RefObject<HTMLElement | null> }) {
   const open = true;
   const trpc = useTRPC();
   const queryClient = useQueryClient();
@@ -145,6 +145,7 @@ function NewOrderDialogBody({ onClose, customer: fixed }: { onClose: () => void;
       description="The customer owns the order and is notified. Prices come from the current catalog."
       size="lg"
       dismissible={!create.isPending}
+      returnFocusRef={returnFocusRef}
       footer={
         <>
           <Button variant="secondary" onClick={onClose} disabled={create.isPending}>
@@ -341,16 +342,38 @@ export function AccessDialog({ open, onClose, scope, subject }: { open: boolean;
   );
 }
 
-/** "New order" button for the console Orders list. */
+/**
+ * "New order" button for the console Orders list. Increment 07.1 (D5): `?new=1` (the customer-portal handoff links
+ * here) opens the dialog on arrival; closing it removes the parameter and returns focus to this button.
+ */
 export function NewOrderForCustomerButton() {
   const { me } = useSession();
   const role = me?.user.role;
-  const [open, setOpen] = useState(false);
+  const search = useSearch();
+  const [location, navigate] = useLocation();
+  const requested = new URLSearchParams(search).get("new") === "1";
+  const [open, setOpen] = useState(requested);
+  const button = useRef<HTMLButtonElement>(null);
+  // Arriving on ?new=1 while already mounted (same-page link) also opens it: adjust state during render, not in an effect.
+  const [seenRequested, setSeenRequested] = useState(requested);
+  if (requested !== seenRequested) {
+    setSeenRequested(requested);
+    if (requested) setOpen(true);
+  }
   if (!role || role === "customer" || !roleHasCapability(role, "orders.manage")) return null;
+  const close = () => {
+    setOpen(false);
+    if (requested) {
+      const params = new URLSearchParams(search);
+      params.delete("new");
+      const rest = params.toString();
+      navigate(rest ? `${location}?${rest}` : location, { replace: true });
+    }
+  };
   return (
     <>
-      <Button onClick={() => setOpen(true)}>New order for a customer</Button>
-      <NewOrderForCustomerDialog open={open} onClose={() => setOpen(false)} />
+      <Button ref={button} onClick={() => setOpen(true)}>New order for a customer</Button>
+      <NewOrderForCustomerDialog open={open} onClose={close} returnFocusRef={button} />
     </>
   );
 }
