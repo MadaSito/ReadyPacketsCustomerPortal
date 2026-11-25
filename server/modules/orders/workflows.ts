@@ -612,6 +612,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
             createdAt: version.createdAt,
             changeNote: version.changeNote ?? null,
             stateCount: definition.states.length,
+            stageCount: definition.stages?.length ?? 0,
             transitionCount: definition.transitions.length,
             orderCount: byId.get(version.id) ?? 0,
           };

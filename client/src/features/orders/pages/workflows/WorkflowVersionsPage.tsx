@@ -53,7 +53,12 @@ export default function WorkflowVersionsPage() {
             ),
           },
           { key: "created", header: "Published", cell: (version) => <DateTime value={version.createdAt} /> },
-          { key: "shape", header: "Statuses and transitions", hideOnMobile: true, cell: (version) => `${version.stateCount} statuses, ${version.transitionCount} transitions` },
+          {
+            key: "shape",
+            header: "Shape",
+            hideOnMobile: true,
+            cell: (version) => `${version.stageCount ? `${version.stageCount} phase${version.stageCount === 1 ? "" : "s"}, ` : ""}${version.stateCount} statuses, ${version.transitionCount} transitions`,
+          },
           { key: "orders", header: "Orders on it", align: "end", cell: (version) => version.orderCount },
           { key: "note", header: "Change note", hideOnMobile: true, cell: (version) => version.changeNote ?? "—" },
         ]}

@@ -7,7 +7,8 @@ import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
 import AdminWorkflowsPage, { resetPhasesNoticeForTests } from "../AdminWorkflowsPage";
-import WorkflowDesignerPage, { startPhases } from "./WorkflowDesignerPage";
+import { RulesReviewSummary } from "./rulesFields";
+import WorkflowDesignerPage, { addCatalogStatuses, startPhases } from "./WorkflowDesignerPage";
 import WorkflowVersionPage from "./WorkflowVersionPage";
 import WorkflowVersionsPage from "./WorkflowVersionsPage";
 
@@ -212,6 +213,53 @@ describe("designer phases-first", () => {
     expect(tabs.map((tab) => tab.textContent)).toEqual(["Phases", "Statuses wizard", "Canvas"]);
     expect(tabs[0]).toHaveAttribute("aria-selected", "true");
     expect(await screen.findByRole("button", { name: "Start phases from statuses" })).toBeInTheDocument();
+  });
+
+  it("phase status choices: this workflow's statuses with its labels, then catalogue statuses; ticking one adds it", async () => {
+    const stage = {
+      key: "intake", customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["submitted"], progression: "submit_lock",
+      actions: { uploadDocuments: true, answerQuestions: false, recordAudio: false, uploadAudio: false, teamFileReview: false },
+      folders: { documents: "{phase_key}/Docs", audio: "{phase_key}/Audio" }, fileSync: { originals: null, conversionStaging: null, intakeDelivery: null },
+      acknowledgement: { policy: "none" }, adminTasks: [], completesOn: "manual", weight: 1,
+    };
+    handlers.set("orders.admin.workflows.drafts.get", () => ({ ...draftView([transition], []), definition: { states, transitions: [transition], stages: [stage] } }));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    handlers.set("orders.statusCatalog.list", () => [
+      { key: "submitted", staffLabel: "Catalogue submitted", customerLabel: "Submitted", tone: "info", category: "start", retired: false },
+      { key: "intake_open", staffLabel: "Intake open", customerLabel: "Upload your materials", tone: "warning", category: "working", retired: false },
+      { key: "old_one", staffLabel: "Old status", customerLabel: "Old", tone: "neutral", category: "working", retired: true },
+    ]);
+    const user = userEvent.setup();
+    designer();
+    expect(await screen.findByRole("checkbox", { name: "Submitted" })).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: /Catalogue submitted/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /Old status/ })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("checkbox", { name: "Intake open (not in this workflow yet)" }));
+    expect(await screen.findByText("Intake open: added to this workflow's statuses. Add its transitions in the Statuses wizard.")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Intake open" })).toBeChecked();
+
+  });
+
+  it("Review summary lists format-3 phases (not the classic groups)", async () => {
+    const stage = { key: "intake", customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["submitted", "completed"], progression: "submit_lock" };
+    renderUi(<RulesReviewSummary definition={{ states, transitions: [transition], stages: [stage] } as unknown as Parameters<typeof RulesReviewSummary>[0]["definition"]} />, { path: "/" });
+    const summary = await screen.findByRole("region", { name: "Phases, requirements, acceptance and storage" });
+    expect(within(summary).getByText(/1 phase\./)).toBeInTheDocument();
+    expect(within(summary).getByText(/2 statuses; submit and lock/)).toBeInTheDocument();
+    expect(within(summary).queryByText("No phases. Orders show statuses only.")).not.toBeInTheDocument();
+  });
+
+  it("addCatalogStatuses adds catalogue statuses named by a phase (no transitions) and ignores retired or unknown keys", () => {
+    const catalog = [
+      { key: "delivered", staffLabel: "Delivered", customerLabel: "Delivered", tone: "success", category: "done", retired: false },
+      { key: "old_one", staffLabel: "Old", customerLabel: "Old", tone: "neutral", category: "working", retired: true },
+    ];
+    const draft = { states, transitions: [transition], stages: [{ key: "a", statusKeys: ["submitted", "delivered", "old_one", "nope"] }] } as unknown as Parameters<typeof addCatalogStatuses>[0];
+    const result = addCatalogStatuses(draft, catalog);
+    expect(result.added).toEqual(["delivered"]);
+    expect(result.definition.states.at(-1)).toMatchObject({ key: "delivered", label: "Delivered", kind: "terminal", tone: "success" });
+    expect(result.definition.transitions).toHaveLength(1);
+    expect(addCatalogStatuses(result.definition, catalog).added).toEqual([]);
   });
 
   it("starting phases from classic status groups removes the groups (a draft may not use both)", () => {
@@ -561,14 +609,16 @@ describe("published versions", () => {
     handlers.set("orders.admin.workflows.versions", () => ({
       workflow: { publicId: WF, workflowKey: "standard", name: "Standard", isDefault: true },
       versions: [
-        { publicId: VERSION, versionNumber: 2, isCurrent: true, createdAt: now, changeNote: "Customers may finish", stateCount: 2, transitionCount: 1, orderCount: 0 },
-        { publicId: "01JTESTWFV000000000000000B", versionNumber: 1, isCurrent: false, createdAt: now, changeNote: null, stateCount: 2, transitionCount: 1, orderCount: 7 },
+        { publicId: VERSION, versionNumber: 2, isCurrent: true, createdAt: now, changeNote: "Customers may finish", stateCount: 2, stageCount: 1, transitionCount: 1, orderCount: 0 },
+        { publicId: "01JTESTWFV000000000000000B", versionNumber: 1, isCurrent: false, createdAt: now, changeNote: null, stateCount: 2, stageCount: 0, transitionCount: 1, orderCount: 7 },
       ],
     }));
     const { container } = renderUi(<Route path="/admin/workflows/:workflowId/versions"><WorkflowVersionsPage /></Route>, { path: `/admin/workflows/${WF}/versions` });
     expect((await screen.findAllByRole("link", { name: "Version 2" }))[0]).toHaveAttribute("href", `/admin/workflows/versions/${VERSION}`);
     expect(screen.getAllByText("Current").length).toBeGreaterThan(0);
     expect(screen.getAllByText("7").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("1 phase, 2 statuses, 1 transitions").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("2 statuses, 1 transitions").length).toBeGreaterThan(0);
     await expectNoAxeViolations(container);
   });
 

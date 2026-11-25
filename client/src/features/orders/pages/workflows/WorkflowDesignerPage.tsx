@@ -334,21 +334,61 @@ export function startPhases(definition: DraftDefinition): DraftDefinition {
   return { ...rest, states: definition.states.map(({ phase: _group, ...state }) => state), stages } as DraftDefinition;
 }
 
+type CatalogStatus = { key: string; staffLabel: string; customerLabel: string; tone: string; category: string; retired: boolean };
+
+/**
+ * Increment 07 QA: a phase that names a catalogue status the draft does not have adds that status to the draft
+ * (labels and tone from the catalogue, no transitions). Publishing still reports it until it has transitions.
+ * Exported for tests.
+ */
+export function addCatalogStatuses(definition: DraftDefinition, catalog: readonly CatalogStatus[]): { definition: DraftDefinition; added: string[] } {
+  const have = new Set(definition.states.map((state) => state.key));
+  const wanted = ((definition.stages ?? []) as { statusKeys?: string[] }[]).flatMap((stage) => stage.statusKeys ?? []);
+  const added: string[] = [];
+  const states = [...definition.states];
+  for (const key of wanted) {
+    if (have.has(key)) continue;
+    const entry = catalog.find((item) => item.key === key && !item.retired);
+    if (!entry) continue;
+    have.add(key);
+    added.push(key);
+    const kind = entry.category === "done" || entry.category === "canceled" ? "terminal" : "active";
+    states.push({ key, label: entry.staffLabel, customerLabel: entry.customerLabel, kind, tone: entry.tone } as DraftDefinition["states"][number]);
+  }
+  return { definition: added.length ? ({ ...definition, states } as DraftDefinition) : definition, added };
+}
+
 /** Increment 07 (D1): the phase editor (package A) over `definition.stages`; the server validates on save. */
 function PhasesView(props: { definition: DraftDefinition; issues: WorkflowIssue[]; disabled: boolean; setDefinition: (definition: DraftDefinition) => void }) {
   const { definition, issues, disabled, setDefinition } = props;
   const trpc = useTRPC();
   const catalog = useQuery(trpc.orders.statusCatalog.list.queryOptions({ includeRetired: true }, { retry: false, staleTime: 60_000 }));
   const stages = (definition.stages ?? []) as WorkflowStage[];
+  // This workflow's statuses first, with this workflow's labels; then catalogue statuses the workflow does not have
+  // yet. Ticking one of those adds it to the draft (see addCatalogStatuses), so saving never fails on it.
+  const catalogItems = catalog.data ?? [];
+  const catalogByKey = new Map(catalogItems.map((entry) => [entry.key, entry]));
   const used = new Set(definition.states.map((state) => state.key));
-  const statusOptions: PhaseStatusOption[] = catalog.data
-    ? catalog.data
-        .filter((entry) => !entry.retired || used.has(entry.key))
-        .map((entry) => ({ key: entry.key, label: entry.staffLabel, category: entry.category, retired: entry.retired }))
-    : definition.states.map((state) => ({ key: state.key, label: state.label || state.key }));
+  const statusOptions: PhaseStatusOption[] = [
+    ...definition.states
+      .filter((state) => state.key.trim())
+      .map((state) => {
+        const entry = catalogByKey.get(state.key);
+        return { key: state.key, label: state.label.trim() || entry?.staffLabel || state.key, ...(entry ? { category: entry.category, retired: entry.retired } : {}) };
+      }),
+    ...catalogItems
+      .filter((entry) => !entry.retired && !used.has(entry.key))
+      .map((entry) => ({ key: entry.key, label: `${entry.staffLabel} (not in this workflow yet)`, category: entry.category })),
+  ];
+  const [added, setAdded] = useState<string[]>([]);
   const errors: Record<string, string> = {};
   for (const issue of issues) if (issue.severity === "error" && /^stages(\.|$)/.test(issue.path) && !errors[issue.path]) errors[issue.path] = issue.message;
-  const setStages = (next: WorkflowStage[]) => setDefinition({ ...definition, stages: next } as DraftDefinition);
+  const setStages = (next: WorkflowStage[]) => {
+    const result = addCatalogStatuses({ ...definition, stages: next } as DraftDefinition, catalogItems);
+    if (result.added.length) setAdded((prior) => [...prior, ...result.added.filter((key) => !prior.includes(key))]);
+    setDefinition(result.definition);
+  };
+  const addedLabels = added.filter((key) => used.has(key)).map((key) => definition.states.find((state) => state.key === key)?.label || key);
   if (!stages.length)
     return (
       <Card>
@@ -368,7 +408,11 @@ function PhasesView(props: { definition: DraftDefinition; issues: WorkflowIssue[
     );
   return (
     <div className="flex flex-col gap-3">
-      {catalog.isError ? <Callout tone="warning">The status catalogue could not be loaded; showing this draft's statuses instead.</Callout> : null}
+      <div aria-live="polite">
+        {addedLabels.length ? (
+          <Callout tone="info">{`${addedLabels.join(", ")}: added to this workflow's statuses. Add its transitions in the Statuses wizard.`}</Callout>
+        ) : null}
+      </div>
       <PhaseEditor
         value={stages}
         onChange={setStages}
