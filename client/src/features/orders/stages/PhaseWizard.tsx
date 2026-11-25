@@ -3,7 +3,7 @@
  * (`CustomerPhaseWizard`) supplies the workspace, the mutations and the action panels of other owners
  * (questions: assurance; files: files_engineer). The server enforces every rule; the client only shows them.
  */
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { StageActionKey } from "@shared/workflowStages";
 import { SafePolicyText } from "@/lib/agreementGate";
 import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, OrderProgress, type Tone } from "@/ui";
@@ -30,7 +30,13 @@ export interface PhaseWizardProps {
 export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, error }: PhaseWizardProps) {
   const current = currentStage(workspace);
   const [viewKey, setViewKey] = useState<string | null>(null);
+  /** Bumped when the shown phase changes without a route change, so focus moves to the new heading. */
+  const [focusToken, setFocusToken] = useState(0);
+  const show = (key: string | null) => { setViewKey(key); setFocusToken((n) => n + 1); };
+  const doneRef = useRef<HTMLDivElement>(null);
+  const after = (action: Promise<void>) => action.then(() => show(null));
   const viewed = workspace.stages.find((s) => s.key === viewKey && s.viewable) ?? current;
+  useEffect(() => { if (focusToken && !viewed) doneRef.current?.focus(); }, [focusToken, viewed]);
   const total = workspace.stages.length;
   const headingId = useId();
 
@@ -44,7 +50,7 @@ export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, e
             stages={progressStages(workspace)}
             currentIndex={workspace.progress.currentIndex}
             canceled={workspace.progress.canceled}
-            onStageSelect={(key) => setViewKey(key === workspace.currentStageKey ? null : key)}
+            onStageSelect={(key) => show(key === workspace.currentStageKey ? null : key)}
           />
         </div>
       </Card>
@@ -58,35 +64,42 @@ export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, e
           stage={viewed}
           total={total}
           isCurrent={viewed.key === workspace.currentStageKey}
-          onBackToCurrent={current && viewed.key !== current.key ? () => setViewKey(null) : undefined}
+          onBackToCurrent={current && viewed.key !== current.key ? () => show(null) : undefined}
+          focusToken={focusToken}
           renderAction={renderAction}
-          onNext={onNext}
-          onSubmit={onSubmit}
+          onNext={(stage) => after(onNext(stage))}
+          onSubmit={(stage, ack) => after(onSubmit(stage, ack))}
           busy={busy}
           error={error}
         />
       ) : (
-        <Callout tone="success" title="All phases are complete">There is nothing more to do here. We'll let you know when your order moves on.</Callout>
+        <div ref={doneRef} tabIndex={-1} className="outline-none">
+          <Callout tone="success" title="All phases are complete">There is nothing more to do here. We'll let you know when your order moves on.</Callout>
+        </div>
       )}
     </section>
   );
 }
 
-function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, renderAction, onNext, onSubmit, busy, error }: {
-  workspace: WizardWorkspace; stage: WizardStage; total: number; isCurrent: boolean; onBackToCurrent?: () => void;
+function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focusToken, renderAction, onNext, onSubmit, busy, error }: {
+  workspace: WizardWorkspace; stage: WizardStage; total: number; isCurrent: boolean; onBackToCurrent?: () => void; focusToken: number;
 } & Omit<PhaseWizardProps, "workspace">) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { if (focusToken) headingRef.current?.focus(); }, [focusToken]);
   const writable = isWritable(workspace, stage);
   const readOnly = !writable;
   const [ackOpen, setAckOpen] = useState(false);
   const actions = enabledActions(stage);
 
   return (
-    <Card
-      headingLevel={3}
-      title={`Phase ${stage.index + 1} of ${total}: ${stage.customerLabel}`}
-      actions={<Badge tone={STATE_TONE[stage.state]}>{STATE_LABEL[stage.state]}</Badge>}
-    >
+    <Card>
       <div className="flex min-w-0 flex-col gap-4 p-4 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 ref={headingRef} tabIndex={-1} className="min-w-0 break-words text-lg font-semibold text-ink outline-none">
+            {`Phase ${stage.index + 1} of ${total}: ${stage.customerLabel}`}
+          </h3>
+          <Badge tone={STATE_TONE[stage.state]}>{STATE_LABEL[stage.state]}</Badge>
+        </div>
         {onBackToCurrent ? (
           <div>
             <Button variant="link" onClick={onBackToCurrent}>Back to the current phase</Button>
@@ -102,7 +115,7 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, rende
         ) : null}
         {stage.review?.outcome === "changes_requested" ? (
           <Callout tone="warning" title="Changes requested">
-            {stage.review.note ? <p className="whitespace-pre-line break-words">{stage.review.note}</p> : <p>Our team asked for changes in this phase.</p>}
+            {stage.review.note ? <p className="ph-no-capture whitespace-pre-line break-words" data-clarity-mask="true">{stage.review.note}</p> : <p>Our team asked for changes in this phase.</p>}
             {stage.locked ? <p className="mt-1">An administrator will reopen the phase so you can make them.</p> : null}
           </Callout>
         ) : null}
@@ -120,7 +133,8 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, rende
         {actions.length ? (
           actions.map((a) => (
             <div key={a.key} className="min-w-0 border-t border-line pt-4">
-              <h4 className="mb-2 text-base font-semibold text-ink">{a.title}</h4>
+              {/* The questions panel brings its own heading (level 4, set by the container). */}
+              {a.key === "answerQuestions" ? null : <h4 className="mb-2 text-base font-semibold text-ink">{a.title}</h4>}
               {renderAction(a.key, stage, readOnly)}
             </div>
           ))
@@ -164,21 +178,28 @@ export function AcknowledgementDialog({ open, stage, busy, onCancel, onConfirm }
   const policy = stage.acknowledgement.policy;
   const [checked, setChecked] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const checkboxId = `ack-${useId().replace(/:/g, "")}`;
   const hash = stage.acknowledgement.textSha256;
+  const cancel = () => { setChecked(false); setError(null); onCancel(); };
   const confirm = async () => {
-    if (policy === "required" && !checked) return setError("Please tick the box to confirm.");
+    if (policy === "required" && !checked) {
+      setError("Please tick the box to confirm.");
+      document.getElementById(checkboxId)?.focus();
+      return;
+    }
     setError(null);
     await onConfirm(policy !== "none" && checked && hash ? { accepted: true, textSha256: hash } : undefined);
   };
   return (
     <Dialog
       open={open}
-      onOpenChange={(next) => { if (!next) { setChecked(false); setError(null); onCancel(); } }}
+      onOpenChange={(next) => { if (!next) cancel(); }}
+      dismissible={!busy}
       title={`Submit and lock “${stage.customerLabel}”?`}
       description="After you submit, this phase is locked for changes."
       footer={
         <>
-          <Button variant="secondary" onClick={onCancel} disabled={busy}>Cancel</Button>
+          <Button variant="secondary" onClick={cancel} disabled={busy}>Cancel</Button>
           <Button onClick={() => void confirm()} loading={busy}>Submit and lock</Button>
         </>
       }
@@ -187,6 +208,7 @@ export function AcknowledgementDialog({ open, stage, busy, onCancel, onConfirm }
         <p className="whitespace-pre-line break-words text-body">{ackText(stage)}</p>
         {policy !== "none" ? (
           <Checkbox
+            id={checkboxId}
             label={policy === "required" ? "I have read and accept this" : "I have read this (optional)"}
             checked={checked}
             onCheckedChange={(v) => { setChecked(v === true); setError(null); }}
@@ -194,6 +216,7 @@ export function AcknowledgementDialog({ open, stage, busy, onCancel, onConfirm }
             error={error ?? undefined}
           />
         ) : null}
+        <p role="alert" className="sr-only">{error ?? ""}</p>
       </div>
     </Dialog>
   );

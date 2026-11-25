@@ -93,12 +93,12 @@ describe("PhaseWizard", () => {
     setup(workspace());
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /Intake/ }));
-    expect(screen.getByRole("heading", { name: "Phase 1 of 3: Intake" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Phase 1 of 3: Intake" })).toHaveFocus();
     expect(screen.getByText(/This phase is complete/)).toBeInTheDocument();
     expect(screen.getByTestId("action-uploadDocuments")).toHaveTextContent("(read only)");
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Back to the current phase" }));
-    expect(screen.getByRole("heading", { name: "Phase 2 of 3: Synthesis" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Phase 2 of 3: Synthesis" })).toHaveFocus();
   });
 
   it("Submit and lock with a required acknowledgement needs the box and sends the server's text hash", async () => {
@@ -112,12 +112,31 @@ describe("PhaseWizard", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("I confirm my story is true.")).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Submit and lock" }));
-    expect(within(dialog).getByText("Please tick the box to confirm.")).toBeInTheDocument();
+    expect(within(dialog).getByRole("alert")).toHaveTextContent("Please tick the box to confirm.");
+    expect(within(dialog).getByRole("checkbox")).toHaveFocus();
     expect(props.onSubmit).not.toHaveBeenCalled();
     await user.click(within(dialog).getByRole("checkbox"));
     await user.click(within(dialog).getByRole("button", { name: "Submit and lock" }));
     expect(props.onSubmit).toHaveBeenCalledWith(expect.objectContaining({ key: "phase_1" }), { accepted: true, textSha256: HASH });
     await expectNoAxeViolations();
+  });
+
+  it("Cancel resets the acknowledgement; the review note is masked for analytics", async () => {
+    const ws = workspace({ currentStageKey: "phase_1" }, [
+      stage(0, { state: "reopened", viewable: true, progression: "submit_lock", canSubmit: true, acknowledgement: { policy: "required", message: null, textSha256: HASH },
+        review: { outcome: "changes_requested", note: "Add page two.", at: "2026-11-21T10:00:00.000Z" } }),
+    ]);
+    setup(ws);
+    expect(screen.getByText("Add page two.")).toHaveAttribute("data-clarity-mask", "true");
+    expect(screen.getByText("Add page two.")).toHaveClass("ph-no-capture");
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Submit and lock" }));
+    let dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("checkbox"));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "Submit and lock" }));
+    dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("checkbox")).not.toBeChecked();
   });
 
   it("policy none shows the standard warning and sends no acknowledgement", async () => {
