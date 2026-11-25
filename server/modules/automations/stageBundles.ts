@@ -45,9 +45,9 @@ import type {
 import { orderCompletionJobs, orderStageRuns } from "./schema.js";
 import { AUTOMATIONS_CONFIG } from "./settings.js";
 
-const STAGE_KEY_RE = /^[a-z][a-z0-9_]{1,39}$/;
+const STAGE_KEY_RE = /^[a-z][a-z0-9_]{1,47}$/;
 const BUNDLE_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9:_-]{8,64}$/;
-const CONFIRMATION_TOKEN_RE = /^[0-9a-f]{64}$/;
+const CONFIRMATION_TOKEN_RE = /^stgc1_[0-9a-f]{64}$/;
 
 export function computeStageConfirmationToken(
   fieldCrypto: FieldCrypto,
@@ -85,7 +85,7 @@ export function computeStageConfirmationToken(
       warning: s.warning,
     })),
   });
-  return fieldCrypto.blindIndex(canonical, "automations.stage_confirmation");
+  return `stgc1_${fieldCrypto.blindIndex(canonical, "automations.stage_confirmation")}`;
 }
 
 export const STAGE_BUNDLES_DISABLED_MESSAGE =
@@ -684,11 +684,11 @@ export async function executeOrderStageBundle(
       bundle,
       slots: liveSlotPreviews.slots,
     });
+    const expectedBuf = Buffer.from(liveConfirmationToken, "utf8");
+    const candidateBuf = Buffer.from(confirmationToken, "utf8");
     if (
-      !timingSafeEqual(
-        Buffer.from(liveConfirmationToken, "hex"),
-        Buffer.from(confirmationToken, "hex"),
-      )
+      expectedBuf.length !== candidateBuf.length ||
+      !timingSafeEqual(expectedBuf, candidateBuf)
     ) {
       throw conflict(
         "STALE_STAGE_CONFIRMATION",
