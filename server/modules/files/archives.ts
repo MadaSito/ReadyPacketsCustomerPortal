@@ -481,19 +481,20 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
     },
   };
 
-  /** The requester's LIVE session, rebuilt for the build job. An ended or downgraded session fails the build. */
+  /** The requester's LIVE session, rebuilt for the build job by Identity (real CSRF secret, auth facts and
+   * derived steps, so the Files selector's assertCurrent accepts it). Ended, downgraded or pending: refused. */
   async function principalFor(row: ArchiveRow): Promise<SessionPrincipal> {
-    const identity = deps.services.identity;
-    const state = await identity?.sessions.getState(row.sessionId);
-    if (!identity || !state || !state.live || state.revokedAt || state.userStatus !== "active" || state.userId !== row.requestedByUserId) {
+    const sessions = deps.services.identity?.sessions;
+    if (!sessions?.principalForJob) throw new DomainError("FORBIDDEN", "ARCHIVE_SESSION_ENDED", "The session that requested this archive has ended.");
+    try {
+      const principal = await sessions.principalForJob(row.sessionId, row.requestedByUserId);
+      if (principal.userId !== row.requestedByUserId || principal.sessionId !== row.sessionId || principal.state !== "full" || principal.pendingSteps.length) {
+        throw new Error("principal mismatch");
+      }
+      return principal;
+    } catch {
       throw new DomainError("FORBIDDEN", "ARCHIVE_SESSION_ENDED", "The session that requested this archive has ended.");
     }
-    const pendingSteps = await identity.transitions.derive(state.userId, { mfaVerifiedAt: state.mfaVerifiedAt, authMethod: state.authMethod });
-    if (pendingSteps.length) throw new DomainError("FORBIDDEN", "ARCHIVE_SESSION_ENDED", "The session that requested this archive has ended.");
-    return {
-      sessionId: state.sessionId, userId: state.userId, userPublicId: state.userPublicId, role: state.role, state: "full", pendingSteps,
-      authMethod: state.authMethod, authenticatedAt: row.createdAt, mfaVerifiedAt: state.mfaVerifiedAt, stepUpAt: state.stepUpAt, csrfSecret: "",
-    };
   }
 
   deps.jobs.register<{ archiveId: string }>(ARCHIVE_BUILD_JOB, async (job) => {

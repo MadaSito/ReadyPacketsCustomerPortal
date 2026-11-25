@@ -9,7 +9,7 @@ Owner: portable_contract_engineer. These files live in `server/modules/files` by
 - **Built by a job** (`files.archive.build`) from a fixed manifest captured when the archive is requested: file public id, version, size, sha256 and the entry name the server derives. Members come from Files' deliverable selector only, so placeholders, removed rows and superseded versions are never included.
 - **Re-authorised three times:**
   - At request, by the live session, the capability and the selector.
-  - At build, by `openDeliverableFile` for every entry, as the requester's live session (rebuilt from `identity.sessions.getState`; an ended session fails the build with `ARCHIVE_SESSION_ENDED`). If any entry is no longer eligible, the build fails with `ARCHIVE_STALE` and nothing old is exported silently.
+  - At build, by `openDeliverableFile` for every entry, as the requester's live session (the real principal from `identity.sessions.principalForJob`, which must be the same user and session, in state full with no pending steps; any refusal fails the build with `ARCHIVE_SESSION_ENDED`). If any entry is no longer eligible, the build fails with `ARCHIVE_STALE` and nothing old is exported silently.
   - At download, by the live session, the same session as the request, the capability and step-up again, and the selector for every member (count and versions must still match).
 - **Caps:** 250 files and 500 MiB uncompressed. Larger sets are refused with `ARCHIVE_TOO_LARGE`, and nothing is cut silently. Each account can have one active archive (queued, building or ready) across processes.
 - **Expiry:** archives expire 30 minutes after they are requested. The object is deleted on expiry, revocation or failure.
@@ -77,11 +77,12 @@ Both are short-lived operational rows. They are not in portable packages (manife
 
 ## Verification (increment 07)
 
-- **Tested (`archives.test.ts`, 12 cases, real MySQL with a fake Files selector, fake identity and in-memory storage):**
+- **Tested (`archives.test.ts`, 15 cases, real MySQL and in-memory storage):**
   - Entry names: traversal, reserved names and separators; case-insensitive dedupe; 30 duplicates at maximum length terminate, stay unique, ≤120 characters with the extension kept.
   - Caps: 251 files, more than 500 MiB and empty sets are refused.
   - Requests: same-request reuse and a busy slot; whole-order ZIP needs admin and step-up; another user's archive and an archive after access is lost are hidden.
   - Build: a ZIP read back with yauzl; a hash mismatch fails the build; an ended session fails the build.
+  - Real Identity sessions (real `createIdentityModule`, and the fake Files port calls the real `sessions.assertCurrent`): a customer phase ZIP builds and downloads; an admin whole-order ZIP after a fresh step-up is ready with 2 files; a revoked session fails the build with `ARCHIVE_SESSION_ENDED` and stores no object. These cover the earlier `SESSION_NOT_CURRENT` failure from live QA.
   - Tickets and lifetime: single use; another session's ticket is refused without burning it; expiry; a manifest change before download revokes the archive; the expire job purges the object.
 - **Client (`ArchiveAction.test.tsx`, jsdom, 2 cases):** queued → ready under StrictMode submits one native form POST with only `ticket` + `csrf`, makes no fetch, removes the form, keeps focus on the button and passes axe; a refused download (archive revoked as stale) is reported in the polite status line.
 - **Type-checked and linted, not run:** `archivesRouter.ts` and `archivesHttp.ts` (including the 204 answer to a refused form POST). No real browser, mobile or screen-reader run.

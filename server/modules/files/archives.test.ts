@@ -5,13 +5,15 @@
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import yauzl from "yauzl";
+import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
-import type { SessionPrincipal } from "../../core/types.js";
-import { users } from "../identity/schema.js";
+import type { SessionPrincipal, Tx } from "../../core/types.js";
+import { createIdentityModule, type IdentityModule } from "../identity/index.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
 import { archiveEntryNames, isSafeEntryName, sanitiseSegment } from "./archiveNames.js";
 import { ARCHIVE_BUILD_JOB, ARCHIVE_LIMITS, createFileArchivesModule, type DeliverableFile, type FileArchivesModule } from "./archives.js";
@@ -100,6 +102,11 @@ beforeEach(async () => {
       assertCurrent: async (p: SessionPrincipal) => {
         if (!liveSessions.has(p.sessionId)) throw new DomainError("UNAUTHENTICATED", "SESSION_ENDED", "Signed out.");
         return { role: p.role, stepUpAt: p.stepUpAt, pendingSteps: [], mfaVerifiedAt: p.mfaVerifiedAt };
+      },
+      principalForJob: async (sessionId: string, userId: number) => {
+        const p = principals.get(sessionId);
+        if (!p || p.userId !== userId || !liveSessions.has(sessionId)) throw new DomainError("UNAUTHENTICATED", "SESSION_NOT_CURRENT", "Signed out.");
+        return p;
       },
       getState: async (sessionId: string) => {
         const p = principals.get(sessionId);
@@ -227,5 +234,107 @@ describe("build and download", () => {
     expect(await mod.expire()).toBe(1);
     expect((await mod.status(customer, id)).state).toBe("expired");
     expect(h.storage.objects.size).toBe(0);
+  });
+});
+
+/* Real Identity sessions: the build job must rebuild a principal that Identity's assertCurrent accepts (the Files
+ * selector checks it on every list/open). The Files port here is a fake that calls the REAL assertCurrent. */
+describe("build with real Identity sessions", () => {
+  const PW = "copper lantern drifts beyond quiet harbor";
+  let rdb: TestDb;
+  let rh: TestHarness;
+  let identity: IdentityModule;
+  let archivesMod: FileArchivesModule;
+  let rOrderId: string;
+  let seq = 0;
+  const content = [file("brief.pdf", "alpha"), file("plan.pdf", "beta", null)];
+
+  async function account(role: "customer" | "admin") {
+    seq += 1;
+    const email = `zip${seq}.${Date.now().toString(36)}@example.test`;
+    const created = await rdb.db.transaction((tx) => identity.auth.insertUser(tx as Tx, {
+      email, name: `Synthetic Zip${seq}`, role, status: "active", origin: "test", emailVerifiedAt: rh.clock.now(),
+    }));
+    await identity.setPassword(created.id, PW, { mustChange: false });
+    return { ...created, email };
+  }
+  async function signedIn(email: string, stepUp = false): Promise<SessionPrincipal> {
+    const signed = await identity.auth.signIn({ email, password: PW }, { userAgent: "vitest" });
+    let issued = await identity.sessions.markMfaVerified(signed.sessionId);
+    if (stepUp) issued = await identity.sessions.markStepUp(signed.sessionId);
+    const principal = await identity.sessionResolver.resolve({ token: issued.token, transport: "cookie" });
+    expect(principal?.state).toBe("full");
+    return principal!;
+  }
+
+  beforeAll(async () => {
+    rdb = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, orders, fileArchives, fileArchiveTickets } });
+  });
+  afterAll(() => rdb?.cleanup());
+
+  beforeEach(async () => {
+    rh = createTestDeps({ db: rdb.db });
+    rh.services.assurance = {
+      getAssuranceState: async () => ({ mfaEnrolled: true, recoveryCodesAcknowledged: true, passkeyCount: 0, totpEnrolled: true }),
+      lockLocalAdministratorPolicy: async () => {},
+      assertLocalAdministratorMayLoseAccess: async () => {},
+    } as never;
+    identity = createIdentityModule(rh.deps);
+    rh.services.identity = identity;
+    const owner = await account("customer");
+    rOrderId = ulid();
+    await rdb.db.insert(orders).values({
+      publicId: rOrderId, reference: rOrderId, projectName: "Synthetic order", ownerUserId: owner.id,
+      workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD",
+    } as never);
+    const current = async (p: SessionPrincipal, tx?: Tx) => {
+      if (tx) await identity.sessions.assertCurrent(p, tx);
+      else await rdb.db.transaction((t) => identity.sessions.assertCurrent(p, t as Tx));
+    };
+    rh.services.files = {
+      async listDeliverableFiles(p: SessionPrincipal, scope: { stageKey?: string }, tx?: Tx) {
+        await current(p, tx);
+        return { items: content.filter((f) => !scope.stageKey || f.stageKey === scope.stageKey).map(({ bytes: _b, ...rest }) => rest), nextCursor: null };
+      },
+      async openDeliverableFile(p: SessionPrincipal, scope: { filePublicId: string }, tx?: Tx) {
+        await current(p, tx);
+        const f = content.find((x) => x.publicId === scope.filePublicId)!;
+        const { bytes, ...rest } = f;
+        return { file: rest, stream: Readable.from([bytes]) };
+      },
+    } as never;
+    archivesMod = createFileArchivesModule(rh.deps);
+    (rh as unknown as { owner: typeof owner }).owner = owner;
+  });
+
+  it("builds a phase ZIP for the signed-in customer and downloads it", async () => {
+    const owner = (rh as unknown as { owner: { email: string } }).owner;
+    const customerSession = await signedIn(owner.email);
+    const view = await archivesMod.request(customerSession, { orderId: rOrderId, stageKey: "design" });
+    await rh.jobs.runAll(ARCHIVE_BUILD_JOB);
+    expect((await archivesMod.status(customerSession, view.archiveId)).state).toBe("ready");
+    const { ticket } = await archivesMod.issueDownloadTicket(customerSession, view.archiveId);
+    const dl = await archivesMod.redeemDownloadTicket(customerSession, ticket);
+    expect([...(await readZip(await drain(dl.stream))).keys()]).toEqual(["brief.pdf"]);
+  });
+
+  it("builds a whole-order ZIP for an administrator with a fresh step-up", async () => {
+    const adminUser = await account("admin");
+    const adminSession = await signedIn(adminUser.email, true);
+    const view = await archivesMod.request(adminSession, { orderId: rOrderId, stageKey: null });
+    await rh.jobs.runAll(ARCHIVE_BUILD_JOB);
+    const status = await archivesMod.status(adminSession, view.archiveId);
+    expect(status).toMatchObject({ state: "ready", scope: "order", fileCount: 2 });
+  });
+
+  it("fails the build with ARCHIVE_SESSION_ENDED when the requesting session is revoked", async () => {
+    const owner = (rh as unknown as { owner: { email: string } }).owner;
+    const customerSession = await signedIn(owner.email);
+    const view = await archivesMod.request(customerSession, { orderId: rOrderId, stageKey: "design" });
+    await identity.sessions.revoke(customerSession.sessionId, "test_revoked");
+    await rh.jobs.runAll(ARCHIVE_BUILD_JOB);
+    const [row] = await rdb.db.select().from(fileArchives).where(eq(fileArchives.publicId, view.archiveId));
+    expect(row).toMatchObject({ state: "failed", reasonCode: "ARCHIVE_SESSION_ENDED" });
+    expect(rh.storage.objects.size).toBe(0);
   });
 });
