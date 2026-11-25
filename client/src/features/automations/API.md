@@ -39,10 +39,12 @@ export default function OrderWorkflowStageActionsPanel(
 ): JSX.Element | null;
 ```
 
-**Capabilities & step-up:**
+**Capabilities, preview-to-confirm token & step-up:**
 - Renders `null` when the signed-in staff/admin principal lacks both `orders.stage.run` and `orders.automations.run`.
-- Running a phase bundle requires `orders.stage.run` (step-up capability; wrapped in `useStepUp()`) and an idempotency key per confirmed execution. When `stageActions.setStatusKey` is configured on the phase, the preview dialog explicitly notes the target status transition (`orders.transition` enforced server-side).
-- Canceling a `scheduled` completion job requires administrator capability (`orders.stage.run` / `automations.manage` per server guard) with an explicit `ConfirmDialog`.
+- Opening a phase preview queries `trpc.automations.orderStageActions.previewBundle({ orderPublicId, stageKey })`, which returns slot-by-slot previews, status transition metadata (`requiresAdminOverrideReason`), and a 64-character SHA-256 `confirmationToken` bound to the pinned workflow and live order state.
+- Confirming a phase run wraps `trpc.automations.orderStageActions.runBundle({ orderPublicId, stageKey, idempotencyKey, confirmationToken, statusOverrideReason? })` inside `useStepUp()` (`orders.stage.run`). If the server rejects with `STALE_STAGE_CONFIRMATION`, the dialog automatically refetches `previewBundle` and prompts the operator to confirm the updated preview.
+- Canceling a `scheduled` completion job calls `trpc.automations.orderStageActions.cancelCompletionJob({ completionJobPublicId, reason? })` inside `useStepUp()` after an explicit `ConfirmDialog`.
+- Phase bundle run history (`listBundleRuns`) and completion updates (`listCompletionJobs`) seed from `orderStageActions.get` and paginate on demand.
 
 ### 1.2 `PhaseActionsSlot` (`./phaseSlots.tsx`)
 

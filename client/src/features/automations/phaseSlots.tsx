@@ -19,6 +19,8 @@ import { Callout, Field, Input, Select, Textarea } from "@/ui";
 import type { PhaseActionsSlotValue, PhaseSlotProps } from "@/ui/phases/slotTypes";
 import { formatMinutes } from "./model";
 
+export type { PhaseActionsSlotValue };
+
 interface PhaseMailTemplateOption {
   templateKey: string;
   name: string;
@@ -65,14 +67,17 @@ function humanizeKey(key: string): string {
   return words ? words.charAt(0).toUpperCase() + words.slice(1) : key;
 }
 
+const EMPTY_ERRORS: Readonly<Record<string, string>> = {};
+const EMPTY_STATUS_KEYS: readonly string[] = [];
+
 export function PhaseActionsSlot({
   value,
   onChange,
-  workflowStatusKeys,
-  idPrefix,
-  disabled,
-  headingLevel,
-  errors,
+  workflowStatusKeys = EMPTY_STATUS_KEYS,
+  idPrefix = "phase-actions",
+  disabled = false,
+  headingLevel = 3,
+  errors = EMPTY_ERRORS,
 }: PhaseSlotProps<PhaseActionsSlotValue>) {
   const trpc = useTRPC() as unknown as PhaseActionLookupBridge;
   const templatesQuery = useQuery(
