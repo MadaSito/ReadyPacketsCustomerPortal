@@ -143,10 +143,48 @@ describe("integrations journey (assembled system)", () => {
     expect(Browser.ok(await admin.browser.query<{ passwordConfigured: boolean }>("integrations.admin.smtp.get")).passwordConfigured).toBe(false);
   });
 
-  it("reports scaffolds as not available and refuses to enable Stripe", async () => {
-    const providers = Browser.ok(await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string }[]>("integrations.admin.providers"));
-    for (const key of ["stripe", "saml", "sharepoint"]) expect(providers.find((p) => p.key === key)).toMatchObject({ scaffoldOnly: true });
-    const enable = await admin.browser.mutate("integrations.admin.stripe.update", { enabled: true, publishableKey: "" });
-    expect(enable.error?.safe?.reasonCode).toBe("STRIPE_NOT_AVAILABLE_IN_RELEASE");
+  it("reports Stripe, SAML, and SharePoint as available-but-disabled adapters and refuses to enable Stripe before setup prerequisites", async () => {
+    const providers = Browser.ok(
+      await admin.browser.query<{ key: string; scaffoldOnly: boolean; state: string; verified: boolean }[]>(
+        "integrations.admin.providers",
+      ),
+    );
+    for (const key of ["stripe", "saml", "sharepoint"]) {
+      expect(providers.find((p) => p.key === key)).toMatchObject({
+        scaffoldOnly: false,
+        state: "disabled",
+        verified: false,
+      });
+    }
+
+    const legacyScaffoldEnable = await admin.browser.mutate("integrations.admin.stripe.update", {
+      enabled: true,
+      publishableKey: "",
+    });
+    expect(legacyScaffoldEnable.error?.safe?.reasonCode).toBe("STRIPE_NOT_AVAILABLE_IN_RELEASE");
+
+    const readiness = Browser.ok(
+      await admin.browser.query<{
+        provider: string;
+        onlineEnabled: boolean;
+        checklist: { key: string; ready: boolean }[];
+      }>("payments.admin.readiness"),
+    );
+    expect(readiness.provider).toBe("none");
+    expect(readiness.onlineEnabled).toBe(false);
+    expect(readiness.checklist.find((item) => item.key === "stripe_secret_key")?.ready).toBe(false);
+    expect(readiness.checklist.find((item) => item.key === "stripe_webhook_secret")?.ready).toBe(false);
+
+    Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
+    const enableWithoutSetup = await admin.browser.mutate("payments.admin.updateSettings", {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
+    });
+    expect(enableWithoutSetup.error?.safe?.reasonCode).toBe("FRESH_CREDENTIALS_REQUIRED");
   });
 });
