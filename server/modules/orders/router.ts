@@ -10,6 +10,8 @@ import { AGREEMENT_SIGNATURE_MODES, bundleRuleSchema } from "./settings.js";
 // ── increment 07 router imports (other owners: one import line each, below this anchor; orders_engineer owns the file) ──
 import { adminTasksRouter, questionsRouter } from "./questionsRouter.js";
 import { statusCatalogRouter } from "./statusCatalogRouter.js";
+import { ORDER_ATTENTION, STAGE_REVIEW_OUTCOMES } from "./schema.js";
+import { stageKeySchema } from "../../../shared/workflowStages.js";
 // ── end increment 07 router imports ──
 
 const id = z.string().regex(ULID_PATTERN);
@@ -227,6 +229,28 @@ const sharing = router({
 /** Increment 05: raw code text; promotions normalises it. Bounded and printable only; never logged. */
 const promoCode = z.string().trim().min(1).max(64).regex(/^[\x21-\x7E ]+$/);
 
+/** Increment 07 (D1/D3): the phase runtime. Owner-only next/submit are enforced server-side (stages.ts). */
+const stageRef = { orderId: id, stageKey: stageKeySchema, expectedVersion: version };
+const stagesRouter = router({
+  workspace: protectedProcedure.input(z.strictObject({ orderId: id })).query(({ ctx, input }) => ctx.services.orders.stages.workspace(ctx.session, input)),
+  next: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject(stageRef))
+    .mutation(({ ctx, input }) => ctx.services.orders.stages.next(ctx.session, input)),
+  submit: protectedProcedure
+    .meta({ rateLimit: "form_submission" })
+    .input(z.strictObject({ ...stageRef, ack: z.strictObject({ accepted: z.literal(true), textSha256: z.string().regex(/^[a-f0-9]{64}$/) }).optional() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.stages.submit(ctx.session, input)),
+  review: staffProcedure
+    .use(requireCapability("orders.stage.review"))
+    .input(z.strictObject({ ...stageRef, outcome: z.enum(STAGE_REVIEW_OUTCOMES), note: nfc(1, 2000).optional() }))
+    .mutation(({ ctx, input }) => ctx.services.orders.stages.review(ctx.session, input)),
+  reopen: adminProcedure
+    .use(requireCapability("orders.stage.reopen"))
+    .input(z.strictObject({ ...stageRef, reason: nfc(10, 500), confirm: z.literal(true) }))
+    .mutation(({ ctx, input }) => ctx.services.orders.stages.reopen(ctx.session, input)),
+});
+
 export const ordersRouter = router({
   catalog: router({
     list: protectedProcedure.query(({ ctx }) => ctx.services.orders.catalog.listActive()),
@@ -304,6 +328,8 @@ export const ordersRouter = router({
           from: z.date().optional(),
           to: z.date().optional(),
           referencePrefix: z.string().regex(/^[A-Za-z0-9-]{1,32}$/).optional(),
+          /** Increment 07 (D2): attention filter. */
+          attention: z.enum(ORDER_ATTENTION).exclude(["none"]).optional(),
         }),
       )
       .query(({ ctx, input }) => ctx.services.orders.orders.adminList(ctx.session, input)),
@@ -414,5 +440,6 @@ export const ordersRouter = router({
   // ── increment 07 mounts (other owners: one line each, below this anchor, e.g. `questions: questionsRouter,`) ──
   questions: questionsRouter, adminTasks: adminTasksRouter,
   statusCatalog: statusCatalogRouter,
+  stages: stagesRouter,
   // ── end increment 07 mounts ──
 });
