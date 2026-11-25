@@ -37,16 +37,17 @@ import {
 import { useProductionClient, useProductionTRPC } from "./api";
 import {
   auditCorrelationHref,
-  DISPATCH_STATE_META,
+  DISPATCH_FILTER_STATE_OPTIONS,
   formatMaskedUrl,
   formatTriggerSource,
+  getDispatchStateMeta,
   HEADER_NAME_RE,
   PHASE_LABELS,
   RUN_MODE_RE,
   SETTINGS_STATE_META,
   type ProductionDestinationTestResult,
+  type ProductionDispatchFilterState,
   type ProductionDispatchItem,
-  type ProductionDispatchState,
   type ProductionPhase,
   type ProductionSettingsView,
   type WorkflowAutoQueueItemView,
@@ -213,7 +214,7 @@ export default function ProductionPipelinePage() {
   const [searchInput, setSearchInput] = useState("");
   const [orderReference, setOrderReference] = useState("");
   const [phaseFilter, setPhaseFilter] = useState<"" | ProductionPhase>("");
-  const [stateFilter, setStateFilter] = useState<"" | ProductionDispatchState>("");
+  const [stateFilter, setStateFilter] = useState<"" | ProductionDispatchFilterState>("");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
 
@@ -998,18 +999,9 @@ export default function ProductionPipelinePage() {
                 <Select
                   value={stateFilter}
                   onChange={(e) =>
-                    setStateFilter(e.target.value as "" | ProductionDispatchState)
+                    setStateFilter(e.target.value as "" | ProductionDispatchFilterState)
                   }
-                  options={[
-                    { value: "", label: "All states" },
-                    { value: "queued", label: DISPATCH_STATE_META.queued.label },
-                    { value: "sending", label: DISPATCH_STATE_META.sending.label },
-                    { value: "delivered", label: DISPATCH_STATE_META.delivered.label },
-                    { value: "failed", label: DISPATCH_STATE_META.failed.label },
-                    { value: "dead", label: DISPATCH_STATE_META.dead.label },
-                    { value: "stopped", label: DISPATCH_STATE_META.stopped.label },
-                    { value: "unknown", label: DISPATCH_STATE_META.unknown.label },
-                  ]}
+                  options={[...DISPATCH_FILTER_STATE_OPTIONS]}
                 />
               </Field>
               <Field label="From date">
@@ -1096,13 +1088,18 @@ export default function ProductionPipelinePage() {
                   key: "state",
                   header: "State",
                   cell: (row) => {
-                    const meta = DISPATCH_STATE_META[row.state];
+                    const meta = getDispatchStateMeta(row);
                     return (
                       <div>
                         <Badge tone={meta.tone}>{meta.label}</Badge>
                         <div className="mt-1 tabular-nums text-xs text-muted">
                           Attempts: {row.attemptCount} of {row.maxAttempts}
                         </div>
+                        {row.state === "queued" && row.attemptCount > 0 && row.nextAttemptAt ? (
+                          <div className="mt-0.5 tabular-nums text-xs text-muted">
+                            Next attempt <DateTime value={row.nextAttemptAt} />
+                          </div>
+                        ) : null}
                       </div>
                     );
                   },

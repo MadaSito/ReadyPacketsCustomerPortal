@@ -410,7 +410,7 @@ describe("integrations module — DB-backed integration suite", () => {
       ["mail.graph", "not_configured"],
       ["integrations.clarity", "not_configured"],
       ["integrations.posthog", "not_configured"],
-      ["integrations.stripe", "disabled"],
+      ["integrations.stripe", "not_configured"],
       ["integrations.saml", "not_configured"],
       ["integrations.sharepoint", "disabled"],
       ["integrations.production", "disabled"],
@@ -1122,22 +1122,54 @@ describe("integrations module — DB-backed integration suite", () => {
     expect(await mod.providers.getStatus("sharepoint")).toMatchObject({ state: "failing", verified: false });
     expect((await mod.health()).find((c) => c.component === "integrations.sharepoint")?.state).toBe("failing");
 
-    // 3. Stripe card reflects live payments readiness when configured in Payment Setup
+    // 3. Stripe card distinguishes unstaged (`not_configured`), staged-while-off (`disabled`), and active (`configured`)
+    expect(await mod.providers.getStatus("stripe")).toMatchObject({
+      state: "not_configured",
+      verified: false,
+      scaffoldOnly: false,
+    });
+
     const verifiedIso = new Date(now.getTime() - 15_000).toISOString();
+    let paymentsConfigOverride: Record<string, unknown> = {
+      provider: "none",
+      mode: "test",
+      stripeSecretKeyLast4: "4242",
+      stripeWebhookSecretLast4: "9999",
+      stripeLastApiVerifiedAt: null,
+      stripeLastSelfTestAt: null,
+    };
     const origGet = h.deps.settings.get.bind(h.deps.settings);
     h.deps.settings.get = (async (key: string, parse: (raw: unknown) => unknown, fallback: unknown, tx?: Tx) => {
       if (key === "payments.config") {
-        return parse({
-          provider: "stripe",
-          mode: "test",
-          stripeSecretKeyLast4: "4242",
-          stripeWebhookSecretLast4: "9999",
-          stripeLastApiVerifiedAt: verifiedIso,
-          stripeLastSelfTestAt: verifiedIso,
-        });
+        return parse(paymentsConfigOverride);
       }
       return origGet(key, parse, fallback, tx);
     }) as typeof h.deps.settings.get;
+    (h.services as unknown as { payments: unknown }).payments = {
+      healthCounts: async () => ({
+        provider: "none",
+        onlineEnabled: false,
+        redirectedAttempts: 0,
+        retryPendingWebhooks: 0,
+      }),
+    };
+    const stripeStaged = await mod.providers.getStatus("stripe");
+    expect(stripeStaged).toMatchObject({
+      state: "disabled",
+      verified: false,
+      scaffoldOnly: false,
+      summary: "Stripe credentials are staged in Payment Setup, with Stripe online checkout switched off.",
+    });
+    expect((await mod.health()).find((c) => c.component === "integrations.stripe")?.state).toBe("disabled");
+
+    paymentsConfigOverride = {
+      provider: "stripe",
+      mode: "test",
+      stripeSecretKeyLast4: "4242",
+      stripeWebhookSecretLast4: "9999",
+      stripeLastApiVerifiedAt: verifiedIso,
+      stripeLastSelfTestAt: verifiedIso,
+    };
     (h.services as unknown as { payments: unknown }).payments = {
       healthCounts: async () => ({
         provider: "stripe",

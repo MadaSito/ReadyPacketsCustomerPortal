@@ -32,6 +32,7 @@ import { createAuditEmitter } from "../../audit/emitter.js";
 import { createAuditModule } from "../../audit/index.js";
 import { createJobsModule, type OutboxJobDisposition } from "../../jobs/index.js";
 import { createJobQueue } from "../../jobs/queue.js";
+import { jobRuns } from "../../jobs/schema.js";
 import { STEP_UP_MAX_AGE_MS } from "../../../trpc/trpc.js";
 import { createTestDeps, fakePrincipal, type TestHarness } from "../../../../tests/helpers/fakes.js";
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
@@ -1068,9 +1069,66 @@ describe("integrations.production — settings, strict egress, P101/P201 outbox,
     });
     expect(filtered.items).toHaveLength(1);
     expect(filtered.items[0]?.publicId).toBe(d2.publicId);
+    expect(filtered.items[0]?.nextAttemptAt).toBeNull();
     expect(filtered.items[0]?.responseSummary).toBe(
       "HTTP 422 — Rejected by production pipeline (client error; not retried).",
     );
+
+    // 4. Retryable 502 with scheduled job_runs row exposes `nextAttemptAt` and filters under `state: "retrying"` (not `"failed"` or `"queued"`)
+    const o3 = seedOrderAndCustomer({
+      orderId: 503,
+      orderPublicId: "01JORDER000000000000000503",
+      reference: "ORD-502-RETRY",
+      packets: [{ packetNumber: 3, tier: "Premium" }],
+    });
+    const d3 = await staffCaller.production.order.requestP101({ orderPublicId: o3.orderPublicId });
+    nextHttpHandler = async () => ({
+      status: 502,
+      headers: {},
+      body: Buffer.from("upstream gateway timeout", "utf8"),
+    });
+    const [r3] = await h.jobs.runAll(PRODUCTION_DELIVERY_JOB);
+    expect(r3).toEqual({
+      outcome: "failed",
+      reasonCode: "PRODUCTION_HTTP_5XX",
+      retryable: true,
+    });
+    const [row3] = await tdb.db
+      .select()
+      .from(integrationProductionDispatches)
+      .where(eq(integrationProductionDispatches.publicId, d3.publicId));
+    expect(row3?.state).toBe("queued");
+    expect(row3?.attemptCount).toBe(1);
+
+    const scheduledRetryAt = new Date(h.clock.now().getTime() + 60_000);
+    await tdb.db.insert(jobRuns).values({
+      publicId: row3!.jobPublicId,
+      type: PRODUCTION_DELIVERY_JOB,
+      state: "queued",
+      correlationId: d3.correlationId,
+      attempt: 1,
+      maxAttempts: PRODUCTION_MAX_ATTEMPTS,
+      runAt: scheduledRetryAt,
+    });
+
+    const retryingList = await adminCaller.production.admin.listDispatches({ state: "retrying" });
+    expect(retryingList.items.map((item) => item.publicId)).toEqual([d3.publicId]);
+    expect(retryingList.items[0]?.nextAttemptAt).toEqual(scheduledRetryAt);
+
+    const history3 = await staffCaller.production.order.history({ orderPublicId: o3.orderPublicId });
+    expect(history3.items[0]?.nextAttemptAt).toEqual(scheduledRetryAt);
+
+    const queuedOnlyList = await adminCaller.production.admin.listDispatches({
+      state: "queued",
+      orderReference: "ORD-502-RETRY",
+    });
+    expect(queuedOnlyList.items).toHaveLength(0);
+
+    const failedOnlyList = await adminCaller.production.admin.listDispatches({
+      state: "failed",
+      orderReference: "ORD-502-RETRY",
+    });
+    expect(failedOnlyList.items).toHaveLength(0);
   });
 
   it("reconciles interrupted sending and stalled queued dispatches on bounded timeouts, scrubs payload_enc, and unblocks resend without auto-replay (PW-02)", async () => {

@@ -702,7 +702,15 @@ function deriveStripeCardStatus(
     };
   }
 
-  if (paymentsCfg?.stripeSecretKeyLast4 || paymentsCfg?.stripeWebhookSecretLast4) {
+  const hasStagedStripeCredentials = Boolean(
+    paymentsCfg?.stripeSecretKeyLast4 ||
+      paymentsCfg?.stripeWebhookSecretLast4 ||
+      stripeView.secretKeyConfigured ||
+      stripeView.webhookSecretConfigured ||
+      stripeView.publishableKey,
+  );
+
+  if (hasStagedStripeCredentials) {
     return {
       state: "disabled",
       verified: false,
@@ -714,18 +722,29 @@ function deriveStripeCardStatus(
     };
   }
 
+  if (stripeView.state !== "disabled") {
+    return {
+      state: stripeView.state,
+      verified: stripeView.verified,
+      lastCheckedAt: stripeView.lastCheckedAt,
+      summary: stripeView.summary,
+    };
+  }
+
+  if (stripePresetEnabled) {
+    return {
+      state: "configured",
+      verified: false,
+      lastCheckedAt: stripeView.lastCheckedAt,
+      summary: "Outbound api.stripe.com:443 preset is enabled — manage keys, webhooks and readiness in Payment Setup.",
+    };
+  }
+
   return {
-    state:
-      stripeView.state !== "disabled"
-        ? stripeView.state
-        : stripePresetEnabled
-          ? "configured"
-          : "disabled",
-    verified: stripeView.verified,
+    state: "not_configured",
+    verified: false,
     lastCheckedAt: stripeView.lastCheckedAt,
-    summary: stripePresetEnabled
-      ? "Outbound api.stripe.com:443 preset is enabled — manage keys, webhooks and readiness in Payment Setup."
-      : "Outbound api.stripe.com:443 preset is switched off — open Payment Setup or Outbound connections to enable Stripe.",
+    summary: "No Stripe credentials configured — open Payment Setup to configure online checkout.",
   };
 }
 

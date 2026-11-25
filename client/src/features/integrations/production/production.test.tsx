@@ -74,6 +74,7 @@ const {
     p401Delivered: false,
     hasRedeliveryRow: false,
     hasQueuedSendingStoppedRows: false,
+    hasTerminal405AndRetryingRows: false,
     signingSecretConfigured: true,
     signingEnabled: true,
     ineligibleOrder: false,
@@ -428,7 +429,7 @@ vi.mock("@/lib/trpc", () => {
     bundleScopeManifest: null,
     httpStatus: null,
     responseSummary: null,
-    triggerSource: "phase1_locked",
+    triggerSource: "lifecycle_phase1_locked",
     stageKey: "intake",
     deliveredAt: null,
     finalizedAt: null,
@@ -475,6 +476,41 @@ vi.mock("@/lib/trpc", () => {
     finalizedAt: laterAt,
     createdAt: laterAt,
     updatedAt: laterAt,
+  };
+
+  const terminal405Dispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZM4",
+    phase: "P101",
+    state: "failed",
+    attemptCount: 1,
+    maxAttempts: 5,
+    httpStatus: 405,
+    responseSummary: "HTTP 405 — Rejected by production pipeline (client error; not retried).",
+    lastReasonCode: "PRODUCTION_HTTP_4XX",
+    triggerSource: "lifecycle_payment_confirmed",
+    deliveredAt: null,
+    finalizedAt: laterAt,
+    nextAttemptAt: null,
+  };
+
+  const retrying502Dispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZM5",
+    phase: "P201",
+    state: "queued",
+    attemptCount: 1,
+    maxAttempts: 5,
+    packet: null,
+    tier: null,
+    bundleScopeManifest: null,
+    httpStatus: 502,
+    responseSummary: "HTTP 502 — Upstream server error (retry scheduled).",
+    lastReasonCode: "PRODUCTION_HTTP_5XX",
+    triggerSource: "lifecycle_phase1_locked",
+    deliveredAt: null,
+    finalizedAt: null,
+    nextAttemptAt: "2026-11-20T12:15:00.000Z",
   };
 
   const makeHistoryItems = (): ProductionDispatchItem[] => {
@@ -557,11 +593,18 @@ vi.mock("@/lib/trpc", () => {
             ? []
             : mockState.p101Unknown
               ? [unknownDispatch]
-              : mockState.hasQueuedSendingStoppedRows
-                ? [stoppedP401Dispatch, sampleDispatch]
-                : mockState.hasRedeliveryRow
-                  ? [redeliveredDispatch, sampleDispatch]
-                  : [sampleDispatch],
+              : mockState.hasTerminal405AndRetryingRows
+                ? [
+                    terminal405Dispatch,
+                    retrying502Dispatch,
+                    sendingP301Dispatch,
+                    { ...sampleDispatch, triggerSource: "operator" },
+                  ]
+                : mockState.hasQueuedSendingStoppedRows
+                  ? [stoppedP401Dispatch, sampleDispatch]
+                  : mockState.hasRedeliveryRow
+                    ? [redeliveredDispatch, sampleDispatch]
+                    : [sampleDispatch],
         };
       }),
     },
@@ -663,6 +706,7 @@ beforeEach(() => {
   mockState.p401Delivered = false;
   mockState.hasRedeliveryRow = false;
   mockState.hasQueuedSendingStoppedRows = false;
+  mockState.hasTerminal405AndRetryingRows = false;
   mockState.signingSecretConfigured = true;
   mockState.signingEnabled = true;
   mockState.ineligibleOrder = false;
@@ -1391,7 +1435,7 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
     expect(
       within(historyTable).queryByRole("button", { name: "Stop Phase III start (P301)" }),
     ).toBeNull();
-    expect(within(historyTable).getByText(/Auto-queued on Phase 1 lock/)).toBeVisible();
+    expect(within(historyTable).getByText(/Automatic — Phase 1 locked/)).toBeVisible();
     expect(within(historyTable).getByText(/Stopped: Hold while verifying packet scope/)).toBeVisible();
 
     await user.click(within(historyTable).getByRole("button", { name: "Stop Phase II start (P201)" }));
@@ -1413,5 +1457,65 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
       orderPublicId,
       dispatchPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMT",
     });
+  });
+
+  it("distinguishes terminal 4xx Failed from scheduled Failed (retrying), aligns State filter labels, and renders human trigger labels", async () => {
+    const user = userEvent.setup();
+    mockState.hasTerminal405AndRetryingRows = true;
+
+    renderUi(<ProductionPipelinePage />, {
+      path: "/admin/integrations/production",
+      api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+    });
+
+    const dispatchTable = await screen.findByRole("table", {
+      name: "Production webhook dispatches",
+    });
+
+    const rows = within(dispatchTable).getAllByRole("row");
+    const row405 = rows.find((row) => row.textContent?.includes("HTTP 405"));
+    const row502 = rows.find((row) => row.textContent?.includes("HTTP 502"));
+    expect(row405).toBeDefined();
+    expect(row502).toBeDefined();
+
+    // Terminal HTTP 405 shows "Failed" without "Failed (retrying)" or "Next attempt"
+    expect(within(row405!).getByText("Failed")).toBeVisible();
+    expect(within(row405!).queryByText("Failed (retrying)")).toBeNull();
+    expect(within(row405!).queryByText(/Next attempt/)).toBeNull();
+    expect(within(row405!).getByText(/Automatic — payment confirmed/)).toBeVisible();
+
+    // Scheduled 502 retry shows "Failed (retrying)" and "Next attempt <time>"
+    expect(within(row502!).getByText("Failed (retrying)")).toBeVisible();
+    expect(within(row502!).getByText(/Next attempt/)).toBeVisible();
+    expect(within(row502!).getByText(/Automatic — Phase 1 locked/)).toBeVisible();
+
+    // Stage action and manual operator trigger labels
+    expect(within(dispatchTable).getByText(/Phase action/)).toBeVisible();
+    expect(within(dispatchTable).getByText(/Manual operator trigger/)).toBeVisible();
+
+    // State filter options match badge labels and send exact state values
+    const stateSelect = screen.getByLabelText("State");
+    const optionLabels = Array.from(stateSelect.querySelectorAll("option")).map((o) => o.textContent);
+    expect(optionLabels).toEqual([
+      "All states",
+      "Queued",
+      "Sending",
+      "Delivered",
+      "Failed (retrying)",
+      "Failed",
+      "Dead-lettered",
+      "Stopped",
+      "Outcome unknown",
+    ]);
+
+    await user.selectOptions(stateSelect, "retrying");
+    await waitFor(() =>
+      expect(listDispatchesSpy).toHaveBeenCalledWith(expect.objectContaining({ state: "retrying" })),
+    );
+
+    await user.selectOptions(stateSelect, "failed");
+    await waitFor(() =>
+      expect(listDispatchesSpy).toHaveBeenCalledWith(expect.objectContaining({ state: "failed" })),
+    );
   });
 });

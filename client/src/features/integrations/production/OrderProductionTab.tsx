@@ -52,6 +52,7 @@ import {
   auditCorrelationHref,
   DISPATCH_STATE_META,
   formatTriggerSource,
+  getDispatchStateMeta,
   PHASE_LABELS,
   PHASE_START_LABELS,
   PRODUCTION_PIPELINE_PATH,
@@ -1152,13 +1153,18 @@ function ConsoleOrderAutomationPanel({
                   key: "state",
                   header: "State",
                   cell: (row) => {
-                    const meta = DISPATCH_STATE_META[row.state];
+                    const meta = getDispatchStateMeta(row);
                     return (
                       <div>
                         <Badge tone={meta.tone}>{meta.label}</Badge>
                         <div className="mt-1 tabular-nums text-xs text-muted">
                           Attempts: {row.attemptCount} of {row.maxAttempts}
                         </div>
+                        {row.state === "queued" && row.attemptCount > 0 && row.nextAttemptAt ? (
+                          <div className="mt-0.5 tabular-nums text-xs text-muted">
+                            Next attempt <DateTime value={row.nextAttemptAt} />
+                          </div>
+                        ) : null}
                       </div>
                     );
                   },

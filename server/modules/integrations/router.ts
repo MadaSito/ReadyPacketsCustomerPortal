@@ -118,7 +118,16 @@ const setEgressPresetSchema = z.strictObject({
 });
 
 const productionPhaseSchema = z.enum(["P101", "P201", "P301", "P401"]);
-const productionDispatchStateSchema = z.enum(["queued", "sending", "delivered", "failed", "dead", "stopped", "unknown"]);
+const productionDispatchFilterStateSchema = z.enum([
+  "queued",
+  "sending",
+  "delivered",
+  "retrying",
+  "failed",
+  "dead",
+  "stopped",
+  "unknown",
+]);
 
 const updateProductionSettingsSchema = z.strictObject({
   enabled: z.boolean(),
@@ -216,7 +225,7 @@ const productionOrderHistorySchema = z.strictObject({
 
 const listProductionDispatchesSchema = z.strictObject({
   phase: productionPhaseSchema.optional(),
-  state: productionDispatchStateSchema.optional(),
+  state: productionDispatchFilterStateSchema.optional(),
   orderReference: z.string().trim().max(64).optional(),
   fromDate: z.date().optional(),
   toDate: z.date().optional(),

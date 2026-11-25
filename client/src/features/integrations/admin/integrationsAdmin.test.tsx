@@ -76,7 +76,7 @@ const providers = [
   { key: "graph", name: "Microsoft Graph Mail & Cloud", state: "not_configured", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Not configured." },
   { key: "clarity", name: "Microsoft Clarity", state: "not_configured", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "No project ID saved." },
   { key: "posthog", name: "PostHog", state: "configured", verified: true, scaffoldOnly: false, lastCheckedAt: date, summary: "Sending page views." },
-  { key: "stripe", name: "Stripe Payments", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Outbound api.stripe.com:443 preset is switched off." },
+  { key: "stripe", name: "Stripe Payments", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Stripe credentials are staged in Payment Setup, with Stripe online checkout switched off." },
   { key: "saml", name: "Enterprise SAML 2.0 SSO", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Configure SAML 2.0 and Microsoft Entra single sign-on in Single Sign-On settings." },
   { key: "sharepoint", name: "Microsoft 365 / SharePoint Sync", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Microsoft 365 SharePoint & OneDrive sync is switched off." },
 ];
@@ -112,6 +112,7 @@ describe("integrations console registration", () => {
     expect(providerStatus({ state: "configured", verified: true }).label).toBe("Configured");
     expect(providerStatus({ state: "configured", verified: false }).label).toBe("Configured — not yet verified");
     expect(providerStatus({ state: "configured", verified: true, scaffoldOnly: true }).label).toBe("Not available in this release");
+    expect(providerStatus({ state: "disabled" }).label).toBe("Switched off");
     expect(providerStatus({ state: "not_configured" }).label).toBe("Not configured");
     expect(providerStatus({ state: "failing" }).tone).toBe("danger");
   });
@@ -141,6 +142,8 @@ describe("Integrations overview", () => {
 
     const stripeCard = await card("Stripe Payments");
     expect(within(stripeCard).queryByText("Not available in this release")).toBeNull();
+    expect(within(stripeCard).getByText("Switched off")).toBeInTheDocument();
+    expect(within(stripeCard).queryByText("Not configured (switched off)")).toBeNull();
     expect(within(stripeCard).getByRole("link", { name: /Payment setup/ })).toHaveAttribute("href", "/admin/payments/setup");
 
     const spCard = await card("Microsoft 365 / SharePoint Sync");

@@ -21,12 +21,13 @@
  *  - Controlled server-classified `resendReason` codes and never-secret, never-PII durable audit attributes
  */
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gt, gte, like, lte, or, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, like, lte, or, sql, type SQL } from "drizzle-orm";
 import type { ModuleDeps } from "../../../container.js";
 import { DomainError, conflict, forbidden, notFound, validation } from "../../../core/errors.js";
 import { ulid } from "../../../core/ids.js";
 import { getRequestContext } from "../../../core/requestContext.js";
 import type { ClaimedJob, JobResult, SafeAttributeValue, SessionPrincipal, Tx } from "../../../core/types.js";
+import { jobRuns } from "../../jobs/schema.js";
 import type { OrderLockState } from "../../orders/types.js";
 import { isSecretConfigured, readSecret, readSetting, writeSetting } from "../../platform/index.js";
 import { flagKey } from "../../platform/settingsRegistry.js";
@@ -274,6 +275,8 @@ export interface ProductionDispatchItem {
   updatedAt: Date;
   deliveredAt: Date | null;
   finalizedAt: Date | null;
+  /** Scheduled next attempt timestamp when a retryable failure is queued in `job_runs`, otherwise `null`. */
+  nextAttemptAt: Date | null;
 }
 
 export interface RequestP101Input {
@@ -336,9 +339,11 @@ export interface ResendProductionInput {
   phase1ArtifactsConfirmed?: boolean;
 }
 
+export type ProductionDispatchFilterState = ProductionDispatchState | "retrying";
+
 export interface ListProductionDispatchesInput {
   phase?: ProductionPhase;
-  state?: ProductionDispatchState;
+  state?: ProductionDispatchFilterState;
   orderReference?: string;
   fromDate?: Date;
   toDate?: Date;
@@ -562,7 +567,7 @@ function resolveRetryRootWireKey(targetRow: DispatchRow, existingRows: readonly 
   return toWireIdempotencyKey(resolveRetryRootRow(targetRow, existingRows).idempotencyKey);
 }
 
-function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
+function toDispatchItem(row: DispatchRow, nextAttemptAt: Date | null = null): ProductionDispatchItem {
   return {
     publicId: row.publicId,
     orderPublicId: row.orderPublicId,
@@ -599,7 +604,37 @@ function toDispatchItem(row: DispatchRow): ProductionDispatchItem {
     updatedAt: row.updatedAt,
     deliveredAt: row.deliveredAt ?? null,
     finalizedAt: row.finalizedAt ?? null,
+    nextAttemptAt,
   };
+}
+
+async function mapDispatchItemsWithScheduledRetries(
+  tx: Tx,
+  rows: readonly DispatchRow[],
+): Promise<ProductionDispatchItem[]> {
+  const retryingJobIds = [
+    ...new Set(
+      rows
+        .filter((row) => row.state === "queued" && row.attemptCount > 0)
+        .map((row) => row.jobPublicId),
+    ),
+  ];
+  const nextAttemptByJobId = new Map<string, Date>();
+  if (retryingJobIds.length > 0) {
+    const queuedJobs = await tx
+      .select({ publicId: jobRuns.publicId, runAt: jobRuns.runAt })
+      .from(jobRuns)
+      .where(and(inArray(jobRuns.publicId, retryingJobIds), eq(jobRuns.state, "queued")));
+    for (const jobRow of queuedJobs) {
+      nextAttemptByJobId.set(jobRow.publicId, jobRow.runAt);
+    }
+  }
+  return rows.map((row) =>
+    toDispatchItem(
+      row,
+      row.state === "queued" && row.attemptCount > 0 ? (nextAttemptByJobId.get(row.jobPublicId) ?? null) : null,
+    ),
+  );
 }
 
 function buildSafeDispatchAuditAttributes(
@@ -5458,7 +5493,7 @@ export function createProductionWebhookService(
           .where(eq(integrationProductionDispatches.orderId, access.id))
           .orderBy(desc(integrationProductionDispatches.id))
           .limit(200);
-        return { items: rows.map(toDispatchItem) };
+        return { items: await mapDispatchItemsWithScheduledRetries(tx, rows) };
       });
     },
 
@@ -5484,7 +5519,21 @@ export function createProductionWebhookService(
         if (input.phase) {
           conditions.push(eq(integrationProductionDispatches.phase, input.phase));
         }
-        if (input.state) {
+        if (input.state === "retrying") {
+          conditions.push(eq(integrationProductionDispatches.state, "queued"));
+          conditions.push(gt(integrationProductionDispatches.attemptCount, 0));
+          conditions.push(
+            sql`exists (select 1 from ${jobRuns} where ${jobRuns.publicId} = ${integrationProductionDispatches.jobPublicId} and ${jobRuns.state} = 'queued')`,
+          );
+        } else if (input.state === "queued") {
+          conditions.push(eq(integrationProductionDispatches.state, "queued"));
+          conditions.push(
+            or(
+              eq(integrationProductionDispatches.attemptCount, 0),
+              sql`not exists (select 1 from ${jobRuns} where ${jobRuns.publicId} = ${integrationProductionDispatches.jobPublicId} and ${jobRuns.state} = 'queued')`,
+            )!,
+          );
+        } else if (input.state) {
           conditions.push(eq(integrationProductionDispatches.state, input.state));
         }
         if (input.orderReference && input.orderReference.trim() !== "") {
@@ -5506,7 +5555,7 @@ export function createProductionWebhookService(
           .orderBy(desc(integrationProductionDispatches.id))
           .limit(limit);
 
-        return { items: rows.map(toDispatchItem) };
+        return { items: await mapDispatchItemsWithScheduledRetries(tx, rows) };
       });
     },
   };

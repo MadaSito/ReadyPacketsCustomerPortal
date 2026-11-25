@@ -281,6 +281,7 @@ export type ProviderState = "disabled" | "not_configured" | "configured" | "degr
     updatedAt: Date;
     deliveredAt: Date | null;
     finalizedAt: Date | null;
+    nextAttemptAt: Date | null;
   }
   ```
   - **tRPC procedures (`trpc.integrations.production.*`)**:
@@ -294,7 +295,7 @@ export type ProviderState = "disabled" | "not_configured" | "configured" | "degr
     - `order.retry` (`orders.production.trigger`, `{ orderPublicId, dispatchPublicId }`) -> `ProductionDispatchItem` (reconstructs exact original bytes matching `target.payloadSha256` or refuses with `ORDER_SCOPE_CHANGED` / `ORIGINAL_PAYLOAD_UNVERIFIABLE`; refuses with `CONFLICT` / `PRODUCTION_DESTINATION_CHANGED` if the live destination/auth fingerprint differs from the root dispatch; preserves the root delivery's wire `Idempotency-Key` across the `retryOf` chain — including retries of an undelivered `dead`/`failed` redelivery row — and emits `integration.production.dispatch.retried`).
     - `order.redeliver` (`orders.production.redeliver` admin step-up, `{ orderPublicId, dispatchPublicId, reason, confirmation, idempotencyKey }`) -> `ProductionDispatchItem` (server validates `confirmation === "REDELIVER"`, 3–280 char printable `reason`, and `8..64` char `idempotencyKey`; persists keyed intent dedupe so replays of the same `idempotencyKey` return the existing redelivery row without enqueuing a second run; refuses new intents when the latest redelivery for the phase is `dead` via `PRODUCTION_REDELIVERY_RETRY_REQUIRED` or `unknown` via `PRODUCTION_DISPATCH_UNCERTAIN`, when target is not `delivered`, or when exact original bytes cannot be verified against `target.payloadSha256`; creates a NEW queued delivery with `redeliveryOf: dispatchPublicId` + outbound `X-ReadyPackets-Redelivery-Of` header and emits `integration.production.dispatch.redelivered`).
     - `order.resend` (`orders.production.trigger` admin step-up, `{ orderPublicId, phase, reason, releaseStatus?, phase1ArtifactsConfirmed? }`) -> `ProductionDispatchItem` (preserved ONLY for undelivered `unknown`/`dead`/`failed` phase recovery; rejects any phase with a `delivered` row via `CONFLICT` / `PRODUCTION_ALREADY_DELIVERED`; reconstructs exact root payload bytes, reuses the root wire `Idempotency-Key`, and records `destination_changed` in `integration.production.dispatch.resent` without logging URLs).
-    - `admin.listDispatches` (`adminProcedure`, `{ phase?, state?, orderReference?, fromDate?, toDate?, limit? }`) -> `{ items: ProductionDispatchItem[] }`.
+    - `admin.listDispatches` (`adminProcedure`, `{ phase?, state?: ProductionDispatchState | "retrying", orderReference?, fromDate?, toDate?, limit? }`) -> `{ items: ProductionDispatchItem[] }`.
 
 ### 1.7 Outbound Webhook Subscriptions, Inbound Endpoints, Delivery Log & Re-Run (`services.integrations.webhooks`)
 

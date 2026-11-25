@@ -151,7 +151,7 @@ describe("integrations journey (assembled system)", () => {
     );
     expect(providers.find((p) => p.key === "stripe")).toMatchObject({
       scaffoldOnly: false,
-      state: "disabled",
+      state: "not_configured",
       verified: false,
     });
     const saml = providers.find((p) => p.key === "saml");
