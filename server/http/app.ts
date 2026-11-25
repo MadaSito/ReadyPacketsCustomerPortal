@@ -23,6 +23,7 @@ import type { Services } from "../container.js";
 import { DomainError, notFound, validation } from "../core/errors.js";
 import { getRequestContext, newRequestContext, runWithRequestContext, setRequestActor, traceFromHeader } from "../core/requestContext.js";
 import type { AuditEventInput, RateLimitCategory } from "../core/types.js";
+import { createSamlAcsHandler } from "../modules/identity/http.js";
 import * as integrationHttp from "../modules/integrations/http.js";
 import { createInboundWebhooksHttpRouter } from "../modules/integrations/webhooks/http.js";
 import { createPaymentReturnHttpRouter, createPaymentWebhooksHttpRouter } from "../modules/payments/http.js";
@@ -292,7 +293,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     }
     next();
   }, express.urlencoded({ extended: false, limit: JSON_LIMIT_BYTES, inflate: false, parameterLimit: 2 }),
-  options.samlAcs ?? (() => { throw notFound(); }), () => { throw notFound(); });
+  options.samlAcs ?? createSamlAcsHandler(services), () => { throw notFound(); });
 
   app.use((req, _res, next) => {
     const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");

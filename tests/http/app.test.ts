@@ -623,6 +623,27 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(seen).toHaveBeenCalledOnce();
   });
 
+  it("dispatches the isolated SAML POST to Identity by default and refuses an invalid form", async () => {
+    const h = harness();
+    const acs = vi.fn(async ({ samlResponse }: { samlResponse: unknown }) =>
+      samlResponse === undefined ? "/sso/refused?reason=SSO_FAILED" : "/sso/complete?attempt=synthetic-attempt");
+    h.services.identity = { sso: { acs } } as unknown as typeof h.services.identity;
+    const post = (form: string) => h.http.post("/api/identity/saml/acs").set("Host", HOST)
+      .set("Origin", "https://idp.example.test").set("Sec-Fetch-Site", "cross-site")
+      .set("Cookie", requestCookies(h.config, TOKEN_A)).type("form").send(form);
+    const accepted = await post("SAMLResponse=synthetic-assertion&RelayState=synthetic-state").expect(303)
+      .expect("Location", "/sso/complete?attempt=synthetic-attempt")
+      .expect("Cache-Control", "no-store").expect("Referrer-Policy", "no-referrer");
+    expect(accepted.headers["set-cookie"]).toBeUndefined();
+    expect(acs).toHaveBeenCalledWith({ samlResponse: "synthetic-assertion" });
+    expect(acs).toHaveBeenCalledOnce();
+    await post("RelayState=synthetic-state").expect(303).expect("Location", "/sso/refused?reason=SSO_FAILED");
+    expect(acs).toHaveBeenNthCalledWith(2, { samlResponse: undefined });
+    expect(acs).toHaveBeenCalledTimes(2);
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    expect(JSON.stringify(h.access.mock.calls)).not.toMatch(/synthetic-(?:assertion|state|attempt)/);
+  });
+
   it("isolates increment 04 routers, preserves signed bytes and refuses alias, preview and alternate methods", async () => {
     const inbound = vi.fn();
     const returns = vi.fn();
