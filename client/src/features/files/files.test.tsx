@@ -103,16 +103,19 @@ describe("phase uploader", () => {
     const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]')!;
     const evidence = new File(["synthetic"], "evidence.pdf", { type: "application/pdf" });
     await user.upload(fileInput, [evidence, new File(["synthetic"], "another.pdf", { type: "application/pdf" })]);
-    expect(pending).toHaveBeenLastCalledWith(2);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(2));
+    const queuedReports = pending.mock.calls.length;
     await user.click(screen.getByRole("button", { name: "Upload 2 files" }));
-    expect(pending).toHaveBeenLastCalledWith(2);
+    await screen.findByRole("progressbar", { name: "Sending and validating selected files…" });
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(2));
+    expect(pending.mock.calls.slice(queuedReports)).not.toContainEqual([0]);
     finish(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }, { index: 1, outcome: "refused" }] })));
     expect(await screen.findByText("1 of 2 uploads confirmed.")).toBeInTheDocument();
-    expect(pending).toHaveBeenLastCalledWith(0);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
     await user.upload(fileInput, evidence);
-    expect(pending).toHaveBeenLastCalledWith(1);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(1));
     unmount();
-    expect(pending).toHaveBeenLastCalledWith(0);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
   });
 
   it("shows the remaining audio allowance as hours and minutes", async () => {
@@ -188,9 +191,9 @@ describe("file upload", () => {
     await user.click(screen.getByRole("button", { name: "Upload file" }));
     expect(await screen.findByText("Unknown outcome")).toBeInTheDocument();
     expect(screen.getByText("0 of 1 uploads confirmed.")).toBeInTheDocument();
-    expect(pending).toHaveBeenLastCalledWith(1);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(1));
     await user.click(screen.getByRole("button", { name: "Clear results" }));
-    expect(pending).toHaveBeenLastCalledWith(0);
+    await waitFor(() => expect(pending).toHaveBeenLastCalledWith(0));
   });
 
   it("uses the device capture control for a recording-only task when the browser has no recorder", async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useId, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useId, useLayoutEffect, useRef, useState } from "react";
 import { Mic, Upload } from "lucide-react";
 import type { FileCategory, FileUploadSlot, FileVisibility, UploadIntent, UploadPolicy } from "@server/modules/files/index";
 import { apiUrl } from "@/lib/runtime";
@@ -122,8 +122,9 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
     return activeUpload.includes(index) || retryAfterAgreement.includes(index) || !outcome || outcome === "unknown";
   }).length;
   const reportPending = useEffectEvent((count: number) => onPendingChange?.(count));
-  useEffect(() => { reportPending(pendingCount); }, [pendingCount]);
-  useEffect(() => () => { reportPending(0); }, []);
+  // Let the wizard update its Next/Submit guard before the new uploader state becomes interactive.
+  useLayoutEffect(() => { reportPending(pendingCount); }, [pendingCount]);
+  useLayoutEffect(() => () => { reportPending(0); }, []);
 
   function choose(files: File[], isRecording = false) {
     setMessage(null);
