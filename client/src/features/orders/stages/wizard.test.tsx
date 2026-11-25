@@ -81,14 +81,29 @@ describe("phase wizard guards (lead QA rulings 5 and 3)", () => {
   it("keeps the current phase open while files are pending and says why", async () => {
     setup(workspace(), { pendingUploads: (key) => (key === "phase_2" ? 2 : 0) });
     await userEvent.setup().click(screen.getByRole("button", { name: /Intake.*review/ }));
-    expect(screen.getByRole("heading", { level: 3, name: /Phase 2 of 3/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: /Step 2 of 3/ })).toBeInTheDocument();
     expect(screen.getByText("2 files are selected but not uploaded yet. Upload them or clear the selection.")).toBeInTheDocument();
+  });
+  it("a reopened phase shows only the reopened notice, not the earlier acceptance", () => {
+    const ws = workspace();
+    ws.stages[1] = { ...ws.stages[1]!, state: "reopened", review: { outcome: "accepted", note: null, at: "2026-11-21T10:00:00.000Z" } };
+    setup(ws);
+    expect(screen.queryByText("Our team accepted this phase.")).toBeNull();
+    expect(screen.getAllByText("This phase was reopened. Make your changes, then continue.")).toHaveLength(1);
+  });
+  it("a reopened phase with changes requested shows one notice with the reviewer note", () => {
+    const ws = workspace();
+    ws.stages[1] = { ...ws.stages[1]!, state: "reopened", review: { outcome: "changes_requested", note: "Add page two.", at: "2026-11-21T10:00:00.000Z" } };
+    setup(ws);
+    expect(screen.getByText("Add page two.")).toBeInTheDocument();
+    expect(screen.getAllByText("This phase was reopened. Make your changes, then continue.")).toHaveLength(1);
   });
   it("a team phase shows the waiting text and no Next", () => {
     const ws = workspace();
-    ws.stages[1] = { ...ws.stages[1]!, canNext: false, waitingOn: "team" };
+    ws.stages[1] = { ...ws.stages[1]!, canNext: false, waitingOn: "team", actions: { ...noActions } };
     setup(ws);
-    expect(screen.getByText("Our team is working on this phase. Nothing is needed from you right now.")).toBeInTheDocument();
+    expect(screen.queryByText("There is nothing to upload or answer in this phase.")).toBeNull();
+    expect(screen.getByText("Our team is working on this step. Nothing is needed from you right now.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
   });
 });
@@ -97,7 +112,7 @@ describe("PhaseWizard", () => {
   it("shows progress, the current phase, safe instructions and only the enabled actions", () => {
     setup(workspace());
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "40");
-    expect(screen.getByRole("heading", { name: "Phase 2 of 3: Synthesis" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Step 2 of 3: Synthesis" })).toBeInTheDocument();
     expect(screen.getByText("record").tagName).toBe("STRONG");
     expect(screen.getByTestId("action-answerQuestions")).toHaveTextContent("answerQuestions for phase_2");
     expect(screen.getByTestId("action-recordAudio")).not.toHaveTextContent("read only");
@@ -120,12 +135,12 @@ describe("PhaseWizard", () => {
     setup(workspace());
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: /Intake/ }));
-    expect(screen.getByRole("heading", { name: "Phase 1 of 3: Intake" })).toHaveFocus();
+    expect(screen.getByRole("heading", { name: "Step 1 of 3: Intake" })).toHaveFocus();
     expect(screen.getByText(/This phase is complete/)).toBeInTheDocument();
     expect(screen.getByTestId("action-uploadDocuments")).toHaveTextContent("(read only)");
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Back to the current phase" }));
-    expect(screen.getByRole("heading", { name: "Phase 2 of 3: Synthesis" })).toHaveFocus();
+    expect(screen.getByRole("heading", { name: "Step 2 of 3: Synthesis" })).toHaveFocus();
   });
 
   it("Submit and lock with a required acknowledgement needs the box and sends the server's text hash", async () => {

@@ -63,9 +63,17 @@ export const FUTURE_REASON_LABEL: Partial<Record<NonNullable<WizardStage["future
 
 /** Panel text when the current phase has nothing for the customer to do (lead QA ruling 3). */
 export const WAITING_MESSAGE: Record<"payment" | "team", string> = {
-  payment: "Waiting for payment confirmation.",
-  team: "Our team is working on this phase. Nothing is needed from you right now.",
+  payment: "This step completes when your payment is confirmed.",
+  team: "Our team is working on this step. Nothing is needed from you right now.",
 };
+
+/** Shown under the payment message when no open invoice exists yet. */
+export const INVOICE_PREPARING_MESSAGE = "Your invoice is being prepared.";
+
+/** Panel heading, worded like OrderProgress ("Step n of m: label") so the step number and phase names don't clash. */
+export function stepHeading(stage: WizardStage, total: number): string {
+  return `Step ${stage.index + 1} of ${total}: ${stage.customerLabel}`;
+}
 
 /** Inline reason shown when Next / Submit is blocked by files that are selected but not uploaded (ruling 5). */
 export function pendingUploadMessage(count: number): string {

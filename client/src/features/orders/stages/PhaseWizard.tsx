@@ -8,7 +8,7 @@ import type { StageActionKey } from "@shared/workflowStages";
 import { SafePolicyText } from "@/lib/agreementGate";
 import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, OrderProgress, type Tone } from "@/ui";
 import {
-  STATE_LABEL, WAITING_MESSAGE, ackText, currentStage, enabledActions, isWritable, pendingUploadMessage, progressStages,
+  STATE_LABEL, WAITING_MESSAGE, ackText, stepHeading, currentStage, enabledActions, isWritable, pendingUploadMessage, progressStages,
   type WizardStage, type WizardWorkspace,
 } from "./wizardModel";
 
@@ -17,6 +17,8 @@ export interface UnansweredQuestion { questionId: string; prompt: string }
 
 /** Why Next / Submit (or leaving the phase) was refused on the client; the live data decides what is still shown. */
 type Blocker = "pending" | "questions" | null;
+
+const REOPENED_TEXT = "This phase was reopened. Make your changes, then continue.";
 
 const STATE_TONE: Record<WizardStage["state"], Tone> = {
   future: "neutral", open: "brand", submitted: "info", in_review: "info", accepted: "success", reopened: "warning",
@@ -37,7 +39,7 @@ export interface PhaseWizardProps {
   pendingUploads?: (stageKey: string) => number;
   /** Required questions without a saved answer in a phase. */
   unansweredRequired?: (stage: WizardStage) => readonly UnansweredQuestion[];
-  /** Link to pay an outstanding invoice, shown when the phase waits for payment. */
+  /** Shown when the phase waits for payment: the pay-invoice link, or that the invoice is being prepared. */
   paymentAction?: ReactNode;
   /** Polite announcement of changes found when the workspace was read again. */
   announcement?: string | null;
@@ -151,6 +153,7 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
     setBlocker(null);
     go();
   };
+  const reopened = stage.state === "reopened" && writable;
   const waiting = writable && !stage.canNext && !stage.canSubmit && stage.waitingOn ? stage.waitingOn : null;
 
   return (
@@ -158,7 +161,7 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
       <div className="flex min-w-0 flex-col gap-4 p-4 sm:p-6">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 ref={headingRef} tabIndex={-1} className="min-w-0 break-words text-lg font-semibold text-ink outline-none">
-            {`Phase ${stage.index + 1} of ${total}: ${stage.customerLabel}`}
+            {stepHeading(stage, total)}
           </h3>
           <Badge tone={STATE_TONE[stage.state]}>{STATE_LABEL[stage.state]}</Badge>
         </div>
@@ -179,10 +182,12 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
           <Callout tone="warning" title="Changes requested">
             {stage.review.note ? <p className="ph-no-capture whitespace-pre-line break-words" data-clarity-mask="true">{stage.review.note}</p> : <p>Our team asked for changes in this phase.</p>}
             {stage.locked ? <p className="mt-1">An administrator will reopen the phase so you can make them.</p> : null}
+            {reopened ? <p className="mt-1">{REOPENED_TEXT}</p> : null}
           </Callout>
         ) : null}
-        {stage.review?.outcome === "accepted" ? <Callout tone="success">Our team accepted this phase.</Callout> : null}
-        {stage.state === "reopened" && writable ? <Callout tone="warning">This phase was reopened. Make your changes, then continue.</Callout> : null}
+        {/* An earlier acceptance of a reopened phase belongs in the order history, not next to the reopened notice. */}
+        {stage.review?.outcome === "accepted" && stage.state !== "reopened" ? <Callout tone="success">Our team accepted this phase.</Callout> : null}
+        {reopened && stage.review?.outcome !== "changes_requested" ? <Callout tone="warning">{REOPENED_TEXT}</Callout> : null}
         {workspace.orderLocked ? <Callout tone="info">The order is locked, so nothing can be changed right now.</Callout> : null}
 
         {stage.contentMarkdown ? (
@@ -200,7 +205,7 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
               {renderAction(a.key, stage, readOnly)}
             </div>
           ))
-        ) : isCurrent ? (
+        ) : isCurrent && !waiting ? (
           <p className="text-body">There is nothing to upload or answer in this phase.</p>
         ) : null}
 

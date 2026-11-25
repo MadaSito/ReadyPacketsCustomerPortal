@@ -148,13 +148,18 @@ describe("CustomerPhaseWizard", () => {
       { invoicePublicId: "inv_open", invoiceNumber: "INV-2", status: "issued", issuedAt: new Date(), balanceDueMinor: 5000 },
     ] });
     const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
-    expect(await screen.findByText("Waiting for payment confirmation.")).toBeInTheDocument();
+    expect(await screen.findByText("This step completes when your payment is confirmed.")).toBeInTheDocument();
     expect(await screen.findByRole("link", { name: "Pay invoice INV-2" })).toHaveAttribute("href", "/invoices/inv_open");
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
     view.unmount();
+    handlers["compliance.invoices.listForOrder"] = () => ({ items: [] });
+    const none = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    expect(await screen.findByText("Your invoice is being prepared.")).toBeInTheDocument();
+    expect(screen.queryByText("There is nothing to upload or answer in this phase.")).toBeNull();
+    none.unmount();
     handlers["orders.stages.workspace"] = () => ws({ stages: [stage({ canNext: false, waitingOn: "team", actions: { ...actions, answerQuestions: false, uploadDocuments: false } })] });
     renderUi(<CustomerPhaseWizard orderId={ORDER} />);
-    expect(await screen.findByText("Our team is working on this phase. Nothing is needed from you right now.")).toBeInTheDocument();
+    expect(await screen.findByText("Our team is working on this step. Nothing is needed from you right now.")).toBeInTheDocument();
   });
 
   it("offers the phase ZIP only where the phase lists files", () => {

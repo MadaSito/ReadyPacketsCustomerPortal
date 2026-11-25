@@ -17,7 +17,7 @@ import { PhaseTeamFiles, PhaseUploadPanel } from "../../files/PhaseFiles";
 import { PhaseWizard, type UnansweredQuestion } from "./PhaseWizard";
 import { StageQuestions } from "./StageQuestions";
 import {
-  REFRESH_CODES, currentStage, describeWorkspaceChange, isWritable, wizardErrorMessage, type WizardStage, type WizardWorkspace,
+  INVOICE_PREPARING_MESSAGE, REFRESH_CODES, currentStage, describeWorkspaceChange, isWritable, wizardErrorMessage, type WizardStage, type WizardWorkspace,
 } from "./wizardModel";
 
 export const WORKSPACE_REFRESH_MS = 30_000;
@@ -142,7 +142,7 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
         <Link href={`/invoices/${encodeURIComponent(payable.invoicePublicId)}`} className="inline-flex min-h-11 items-center font-semibold text-action underline underline-offset-2">
           {payable.invoiceNumber ? `Pay invoice ${payable.invoiceNumber}` : "Pay the outstanding invoice"}
         </Link>
-      ) : null}
+      ) : invoices.isSuccess && waitsForPayment ? <p>{INVOICE_PREPARING_MESSAGE}</p> : null}
       onNext={(stage) => run(() => next.mutateAsync({ orderId, stageKey: stage.key, expectedVersion: workspace.version }))}
       onSubmit={(stage, ack) => run(() => submit.mutateAsync({ orderId, stageKey: stage.key, expectedVersion: workspace.version, ...(ack ? { ack } : {}) }))}
     />
