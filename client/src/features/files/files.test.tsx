@@ -172,6 +172,8 @@ describe("file upload", () => {
     ] }), { status: 200, headers: { "Content-Type": "application/json" } }));
     expect(await screen.findByText("1 of 2 uploads confirmed.")).toBeInTheDocument();
     expect(screen.getByText("Contents did not match the approved format.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Upload 2 files" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear results" })).toHaveFocus();
     expect(changed).toHaveBeenCalledOnce();
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining(`/api/files/upload/${orderId}?`),
       expect.objectContaining({ method: "POST", body: expect.any(FormData) }));

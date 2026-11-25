@@ -83,6 +83,9 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
   const captureId = useId();
   const recordButton = useRef<HTMLButtonElement>(null);
   const checkButton = useRef<HTMLButtonElement>(null);
+  const uploadButton = useRef<HTMLButtonElement>(null);
+  const clearButton = useRef<HTMLButtonElement>(null);
+  const restoreUploadFocus = useRef(false);
   const transcriptInput = useRef<HTMLTextAreaElement>(null);
   const [category, setCategory] = useState<FileCategory>(replace?.category ?? "supporting");
   const [visibility, setVisibility] = useState<FileVisibility>(replace?.visibility ?? "customer_visible");
@@ -216,6 +219,7 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
       setMessage("The connection ended before the uploads were confirmed. Reload the file list before retrying.");
       update(indices.map((index) => ({ index, outcome: "unknown" })));
     } finally {
+      restoreUploadFocus.current = document.activeElement === uploadButton.current;
       setActiveUpload([]);
       void onChanged();
     }
@@ -223,6 +227,14 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
 
   const accept = extensions.flatMap((ext) => ext === "jpg" ? [".jpg", ".jpeg"] : [`.${ext}`]).join(",");
   const finished = selection.length > 0 && results.length === selection.length;
+  const showUpload = running || !finished;
+  useEffect(() => {
+    if (!showUpload && restoreUploadFocus.current &&
+        (document.activeElement === document.body || document.activeElement === null)) {
+      clearButton.current?.focus();
+    }
+    if (!running) restoreUploadFocus.current = false;
+  }, [running, showUpload]);
   return (
     <div className="grid min-w-0 gap-4">
       {!replace && (staff || !phase) ? <div className="grid gap-4 sm:grid-cols-2">
@@ -304,11 +316,11 @@ export function FileUploadPanel({ orderId, staff, policy, replace, slot, audio, 
           <Textarea ref={transcriptInput} value={transcript} disabled={running || finished} maxLength={4000} onChange={(event) => setTranscript(event.target.value)} rows={3} />
         </Field> : null}
         <div className="flex flex-wrap items-center gap-2">
-          <Button leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }}
-            disabled={running || disabled || finished || !extensions.length} loading={running}>
+          {showUpload ? <Button ref={uploadButton} leadingIcon={<Upload aria-hidden />} onClick={() => { void upload(); }}
+            disabled={disabled || !extensions.length} loading={running}>
             {replace ? "Upload new version" : `Upload ${selection.length === 1 ? "file" : `${selection.length} files`}`}
-          </Button>
-          <Button variant="ghost" disabled={running} onClick={() => choose([])}>{finished ? "Clear results" : "Clear selection"}</Button>
+          </Button> : null}
+          <Button ref={clearButton} variant="ghost" disabled={running} onClick={() => choose([])}>{finished ? "Clear results" : "Clear selection"}</Button>
         </div>
       </> : null}
       {running ? <div className="grid gap-1" role="status">
