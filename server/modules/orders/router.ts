@@ -8,6 +8,7 @@ import { adminProcedure, protectedProcedure, requireCapability, router, staffPro
 import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS, WORKFLOW_DRAFT_SOURCES } from "./schema.js";
 import { AGREEMENT_SIGNATURE_MODES, bundleRuleSchema } from "./settings.js";
 // ── increment 07 router imports (other owners: one import line each, below this anchor; orders_engineer owns the file) ──
+import { adminTasksRouter, questionsRouter } from "./questionsRouter.js";
 // ── end increment 07 router imports ──
 
 const id = z.string().regex(ULID_PATTERN);
@@ -410,5 +411,6 @@ export const ordersRouter = router({
       .mutation(({ ctx, input }) => ctx.services.orders.requirements.unlockPhase(ctx.session, input)),
   }),
   // ── increment 07 mounts (other owners: one line each, below this anchor, e.g. `questions: questionsRouter,`) ──
+  questions: questionsRouter, adminTasks: adminTasksRouter,
   // ── end increment 07 mounts ──
 });
