@@ -41,6 +41,7 @@ import { sendSafeError, trpcRetryAfter } from "./errors.js";
 import { createIsolatedHttpRouter, isolatedRoutePrefix, type IsolatedRouterFactories } from "./isolatedRoutes.js";
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
+import { isSamlRouteFamily, SAML_ACS_PATH, SAML_METADATA_PATH, SAML_START_PATH } from "./providerPaths.js";
 import { getHttpState, setHttpState } from "./requestState.js";
 import { cookieCredentials, cookieTransport, readCookie, setCsrfCookie } from "./sessionTransport.js";
 import { assertSeparateStorage, registerStatic } from "./static.js";
@@ -55,6 +56,8 @@ export interface AppOptions {
   moduleRouter?: Router;
   signedWebhookRouter?: Router;
   isolatedRouters?: IsolatedRouterFactories;
+  /** Unauthenticated, already parsed SAML ACS; no browser session state is resolved. */
+  samlAcs?: RequestHandler;
 }
 
 const JSON_LIMIT_BYTES = 256 * 1024;
@@ -221,7 +224,16 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     }
     // Path-pattern test only (no lookup): provider callbacks exist on the canonical host and nowhere else.
     const isolated = isolatedRoutePrefix(req.path);
-    if ((!canonicalHost && (providerCallbackRoute(req.path) || isolated)) || (isolated && preview)) throw notFound();
+    const saml = isSamlRouteFamily(req.path);
+    if ((!canonicalHost && (providerCallbackRoute(req.path) || isolated)) || ((isolated || saml) && preview)) throw notFound();
+    if (saml && !((req.method === "GET" && (req.path === SAML_METADATA_PATH || req.path === SAML_START_PATH)) ||
+      (req.method === "POST" && req.originalUrl === SAML_ACS_PATH))) throw notFound();
+    if (saml && req.method === "GET") {
+      const length = req.get("Content-Length");
+      if (req.get("Transfer-Encoding") !== undefined || (length !== undefined && length !== "0")) {
+        throw validation("UNEXPECTED_REQUEST_BODY", "This endpoint does not accept a request body.");
+      }
+    }
     if (!accepted) {
       if (alias) {
         // Concatenate only an origin-form target to the known origin; never resolve a user-controlled URL.
@@ -271,6 +283,16 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     await applyRateLimit(req, "api", `ip:${currentAddress()}`);
     next();
   }));
+
+  // The only SAML browser-policy exemption: an exact, isolated POST. No session or cookies are read here.
+  app.post(SAML_ACS_PATH, async (req, _res, next) => {
+    await applyRateLimit(req, "auth_high_risk", `ip:${currentAddress()}`);
+    if (!req.is("application/x-www-form-urlencoded")) {
+      throw Object.assign(new Error("Unsupported ACS media type"), { type: "media.unsupported" });
+    }
+    next();
+  }, express.urlencoded({ extended: false, limit: JSON_LIMIT_BYTES, inflate: false, parameterLimit: 2 }),
+  options.samlAcs ?? (() => { throw notFound(); }), () => { throw notFound(); });
 
   app.use((req, _res, next) => {
     const bootstrap = req.path === "/api/csrf" && (req.method === "GET" || req.method === "HEAD");

@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 import type { Request } from "express";
 import { isolatedRoutePrefix } from "./isolatedRoutes.js";
+import { isSamlRouteFamily, SAML_ACS_PATH, SAML_METADATA_PATH, SAML_START_PATH } from "./providerPaths.js";
 
 const PROBE_PATHS = new Set(["/healthz", "/readyz"]);
 export const API_PATH = /^\/api(?:\/|$)/;
@@ -57,6 +58,8 @@ const MODULES = new Set([
 
 /** Only fixed labels are emitted; callback paths may carry credentials in their query. */
 export function providerCallbackRoute(path: string): string | undefined {
+  if (path === SAML_ACS_PATH || path === SAML_METADATA_PATH || path === SAML_START_PATH) return path;
+  if (isSamlRouteFamily(path)) return "/api/identity/saml/:route";
   if (/^\/api\/storage\/oauth\/callback(?:\/|$)/i.test(path)) return "/api/storage/oauth/callback/:provider";
   if (/^\/api\/identity\/sso\/callback\/?$/i.test(path)) return "/api/identity/sso/callback";
   return undefined;
@@ -70,6 +73,7 @@ export function routeTemplate(req: Request): string {
   if (isolated) return `${isolated}/:route`;
   if (PROBE_PATHS.has(path) || path === "/robots.txt" || path === "/api/csrf") return path;
   if (path === SIGNED_WEBHOOK_PATH || path.startsWith(`${SIGNED_WEBHOOK_PATH}/`)) return `${SIGNED_WEBHOOK_PATH}/:provider`;
+  if (/^\/api\/files\/playback(?:\/|$)/.test(path)) return "/api/files/playback/:grant";
   if (path === TRPC_PATH || path.startsWith(`${TRPC_PATH}/`)) return `${TRPC_PATH}/:procedures`;
   if (API_PATH.test(path)) {
     const module = path.split("/", 3)[2] ?? "";

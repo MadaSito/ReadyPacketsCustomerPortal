@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import { clientAddress, routeTemplate } from "../../http/edge.js";
+import { isStripeWebhookRequest } from "../../http/providerPaths.js";
 import { addressOf, inspectedHeaderNames, type RequestSignals } from "./policy.js";
 
 function normalize(text: string, max: number) {
@@ -34,6 +35,7 @@ export function requestSignals(req: Request, country: string | null): RequestSig
     country,
     oversize: req.originalUrl.length > 4096 || (req.is("application/json") === "application/json" && Number(rawLength) > 262_144),
     recovery: isRecoveryPath(path, req.method),
+    skipCountryAllowList: isStripeWebhookRequest(req.method, req.path),
   };
 }
 

@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Router } from "express";
+import { gzipSync } from "node:zlib";
+import { Router, type Request } from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -15,6 +16,9 @@ import { createApp, type AppOptions } from "../../server/http/app.js";
 import { sendPrivateDownload } from "../../server/http/downloads.js";
 import { EDGE_REQUESTS_PER_WINDOW, EDGE_STATIC_PER_WINDOW, edgeAdmissionBucket } from "../../server/http/edgeAdmission.js";
 import { getHttpState } from "../../server/http/requestState.js";
+import { compilePolicy, defaultPolicy, type ProtectionPolicy } from "../../server/modules/protection/policy.js";
+import { requestSignals } from "../../server/modules/protection/request.js";
+import { isSignInRequest } from "../../server/modules/protection/signInBans.js";
 import { ANONYMOUS_CSRF_MAX_AGE_MS, deriveSessionCsrfToken } from "../../server/security/csrf.js";
 import { protectedProcedure, publicProcedure, router } from "../../server/trpc/trpc.js";
 import {
@@ -517,6 +521,102 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
+  it("admits only the literal ACS POST without browser credentials and applies the form cap before dispatch", async () => {
+    const payload = vi.fn();
+    const h = harness({ samlAcs: (req, res) => {
+      payload(req.body);
+      expect(getRequestContext()?.actor).toBeUndefined();
+      res.redirect(303, "/sign-in");
+    } }, { aliasHosts: ["portal.readypackets.test"] });
+    const consume = vi.fn<RateLimiter["consume"]>(async () => ({ allowed: true, retryAfterSeconds: 0 }));
+    h.services.rateLimiter = { consume };
+    const path = "/api/identity/saml/acs";
+    const form = "SAMLResponse=assertion-marker&RelayState=state-marker";
+    const post = (url = path) => h.http.post(url).set("Host", HOST)
+      .set("Origin", "https://provider.example.test").set("Sec-Fetch-Site", "cross-site")
+      .set("User-Agent", "private-header-marker");
+    const success = await post().type("form").set("Cookie", requestCookies(h.config, TOKEN_A)).send(form)
+      .expect(303).expect("Cache-Control", "no-store").expect("Location", "/sign-in");
+    expect(success.headers["set-cookie"]).toBeUndefined();
+    expect(payload).toHaveBeenCalledWith({ SAMLResponse: "assertion-marker", RelayState: "state-marker" });
+    expect(consume.mock.calls[0]?.[0]).toBe("auth_high_risk");
+    for (const spelling of [`${path}/`, `${path}?RelayState=state-marker`, "/api/identity/saml/ACS", "/api/identity/saml/%61cs",
+      "/api/identity/saml/start", "/api/identity/saml/metadata"]) {
+      await post(spelling).type("form").send(form).expect(404);
+    }
+    await h.http.get(path).set("Host", HOST).expect(404);
+    const alias = await post().set("Host", "portal.readypackets.test").type("form").send(form).expect(404);
+    expect(alias.headers.location).toBeUndefined();
+    await post().type("json").send({}).expect(415);
+    await post().type("form").set("Content-Encoding", "gzip").send(gzipSync(form)).expect(415);
+    await post().type("form").send(`SAMLResponse=${"A".repeat(262_145)}`).expect(413);
+    await post().type("form").send(`${form}&extra=ignored`).expect(413);
+    await post("/api/mutate").type("form").send(form).expect(403);
+    await post("/api/identity/sso/complete").type("json").send({ attempt: "synthetic" }).expect(403);
+    expect(payload).toHaveBeenCalledOnce();
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+    const access = JSON.stringify(h.access.mock.calls);
+    for (const marker of ["assertion-marker", "state-marker", "private-header-marker"]) expect(access).not.toContain(marker);
+
+    const preview = harness({ samlAcs: vi.fn() }, { deploymentProfile: "preview" });
+    await preview.http.post(path).set("Host", HOST).type("form").send(form).expect(404);
+    expect(preview.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("keeps the credential ban and durable rate budget on the isolated ACS path", async () => {
+    const handler = vi.fn();
+    const h = harness({ samlAcs: handler });
+    let banned = true;
+    h.services.protection = {
+      credentialRetryAfter: async (req: Request) => banned && isSignInRequest(req) ? 85 : 0,
+      inspect: async () => ({ action: "allow" }), recordRateLimit: async () => undefined,
+    } as unknown as typeof h.services.protection;
+    h.services.rateLimiter = { consume: async () => ({ allowed: false, retryAfterSeconds: 30 }) };
+    const post = () => h.http.post("/api/identity/saml/acs").set("Host", HOST).type("form").send("SAMLResponse=synthetic");
+    await post().expect(429).expect("Retry-After", "85");
+    banned = false;
+    await post().expect(429).expect("Retry-After", "30");
+    expect(handler).not.toHaveBeenCalled();
+    expect(h.sessionResolver).not.toHaveBeenCalled();
+  });
+
+  it("exempts only the canonical Stripe POST from the built-in country allow-list", async () => {
+    const seen = vi.fn();
+    const paymentWebhooks = () => {
+      const r = Router({ caseSensitive: true, strict: true });
+      r.post("/stripe", (req, res) => { seen(req.body); res.status(204).end(); });
+      return r;
+    };
+    const h = harness({ isolatedRouters: { paymentWebhooks } }, { trustedProxies: ["127.0.0.1/32", "::1/128"] });
+    const policy: ProtectionPolicy = { ...defaultPolicy, mode: "enforce", countries: { mode: "allow", codes: ["CA"] } };
+    h.services.protection = {
+      inspect: async (req: Request) => {
+        const decision = compilePolicy(policy)(requestSignals(req, "US"), h.clock.now().getTime());
+        return { action: decision.action === "block" ? "block" : "allow" };
+      }, recordRateLimit: async () => undefined,
+    } as unknown as typeof h.services.protection;
+    const raw = '{\n "event":"synthetic"\n}';
+    const path = "/api/payments/webhooks/stripe";
+    const post = (url = path, body = raw) => h.http.post(url).set("Host", HOST)
+      .set("X-Forwarded-For", "192.0.2.7").type("json").send(body);
+    await post().expect(204);
+    expect(seen).toHaveBeenCalledWith(Buffer.from(raw));
+    await post(`${path}/`).expect(403);
+    await post("/api/payments/webhooks/Stripe").expect(403);
+    await post("/api/payments/webhooks/other").expect(403);
+    await h.http.get(path).set("Host", HOST).expect(403);
+    await post(path, JSON.stringify({ data: "A".repeat(262_145) })).expect(413);
+    policy.ipLists = [{ network: "192.0.2.7/32", action: "deny", reason: "Synthetic policy fixture", expiresAt: null }];
+    await post().expect(403);
+    policy.ipLists = [];
+    policy.countries = { mode: "deny", codes: ["US"] };
+    await post().expect(403);
+    policy.countries = { mode: "allow", codes: ["CA"] };
+    h.services.rateLimiter = { consume: async () => ({ allowed: false, retryAfterSeconds: 30 }) };
+    await post().expect(429).expect("Retry-After", "30");
+    expect(seen).toHaveBeenCalledOnce();
+  });
+
   it("isolates increment 04 routers, preserves signed bytes and refuses alias, preview and alternate methods", async () => {
     const inbound = vi.fn();
     const returns = vi.fn();
