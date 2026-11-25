@@ -17,6 +17,8 @@ import {
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
+// ── increment 07 panel imports (other owners: one import line each, below this anchor) ──
+// ── end increment 07 panel imports ──
 import { ACCESS_ROLE_LABELS, LOCK_DESCRIPTIONS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 type Area = "customer" | "console";
@@ -103,7 +105,9 @@ export function OrderDetailView({ area }: { area: Area }) {
         );
       })}
       {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
+      {/* ── increment 07 customer phase mount (audit_engineer replaces the next line only) ── */}
       {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      {/* ── end increment 07 customer phase mount ── */}
       <RouteTabs
         idBase="order-tabs"
         label="Order sections"
@@ -161,9 +165,11 @@ function orderTabItems(order: OrderDetail, area: Area): TabEntry[] {
   const lockState = order.lockState as LockState;
   const builtIn: TabEntry[] = [
     { order: BUILT_IN_TAB_ORDER.overview, value: "overview", label: "Overview", content: <Overview order={order} area={area} /> },
+    // ── increment 07 console phase mount (assurance_engineer replaces the `content` of the next entry only) ──
     ...(consoleArea
       ? [{ order: BUILT_IN_TAB_ORDER.phases, value: "phases", label: "Phases", content: <WorkflowRulesPanel orderId={order.publicId} area={area} /> }]
       : []),
+    // ── end increment 07 console phase mount ──
     { order: BUILT_IN_TAB_ORDER.notes, value: "notes", label: "Notes", content: <Activity order={order} area={area} /> },
     {
       order: BUILT_IN_TAB_ORDER.sharing,

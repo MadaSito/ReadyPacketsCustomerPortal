@@ -7,6 +7,8 @@ import { ULID_PATTERN } from "../../core/ids.js";
 import { adminProcedure, protectedProcedure, requireCapability, router, staffProcedure } from "../../trpc/trpc.js";
 import { GRANT_ROLES, NOTE_VISIBILITIES, ORDER_LOCK_STATES, PACKET_TIERS, WORKFLOW_DRAFT_SOURCES } from "./schema.js";
 import { AGREEMENT_SIGNATURE_MODES, bundleRuleSchema } from "./settings.js";
+// ── increment 07 router imports (other owners: one import line each, below this anchor; orders_engineer owns the file) ──
+// ── end increment 07 router imports ──
 
 const id = z.string().regex(ULID_PATTERN);
 const nfc = (min: number, max: number) =>
@@ -407,4 +409,6 @@ export const ordersRouter = router({
       .input(z.strictObject({ orderId: id, phaseKey: statusKey, reason: nfc(10, 500), notifyCustomer: z.boolean() }))
       .mutation(({ ctx, input }) => ctx.services.orders.requirements.unlockPhase(ctx.session, input)),
   }),
+  // ── increment 07 mounts (other owners: one line each, below this anchor, e.g. `questions: questionsRouter,`) ──
+  // ── end increment 07 mounts ──
 });

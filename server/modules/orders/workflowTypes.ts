@@ -3,6 +3,7 @@
  */
 import { z } from "zod";
 import { isOrderFileFolderTemplate } from "../../../shared/orderFileFolder.js";
+import { MAX_STAGES, validateStages, workflowStageSchema } from "../../../shared/workflowStages.js";
 
 /** `api` (increment 04): an integration calling /api/v1 with an `orders:write` key. */
 export const WORKFLOW_ACTORS = ["customer", "staff", "admin", "api"] as const;
@@ -157,6 +158,8 @@ export const workflowDefinitionSchema = z
     phases: z.array(workflowPhaseSchema).max(MAX_PHASES).optional(),
     acceptanceGates: z.array(acceptanceGateSchema).max(MAX_ACCEPTANCE_GATES).optional(),
     storageFolder: storageFolderSchema.optional(),
+    /** Increment 07 (D1): format 3. Absent = format 1/2 (derived stages). */
+    stages: z.array(workflowStageSchema).min(1).max(MAX_STAGES).optional(),
   })
   .superRefine((definition, ctx) => {
     const keys = new Set<string>();
@@ -209,6 +212,12 @@ export const workflowDefinitionSchema = z
       if (ackKeys.size !== req.acknowledgements.length)
         ctx.addIssue({ code: "custom", message: `Duplicate acknowledgement in ${state.key}.`, path: ["states"] });
     }
+    if (definition.stages) {
+      // Format 3: stages replace the format-2 phase groups (phase locks are keyed by stage key).
+      if ((definition.phases?.length ?? 0) > 0 || definition.states.some((state) => state.phase))
+        ctx.addIssue({ code: "custom", message: "A workflow with phases (format 3) cannot also use the older phase groups.", path: ["phases"] });
+      for (const issue of validateStages(definition.stages, keys)) ctx.addIssue({ code: "custom", message: issue.message, path: issue.path });
+    }
   });
 
 export type WorkflowDefinition = z.output<typeof workflowDefinitionSchema>;
@@ -219,6 +228,7 @@ export type UploadRequirement = z.output<typeof uploadRequirementSchema>;
 export type AcknowledgementRequirement = z.output<typeof acknowledgementRequirementSchema>;
 export type AcceptanceGate = z.output<typeof acceptanceGateSchema>;
 export type DocumentTask = z.output<typeof documentTaskSchema>;
+export type { WorkflowStage } from "../../../shared/workflowStages.js";
 
 /** Slot key of the customer's reply to a respond_document task. */
 export function documentReplySlotKey(taskKey: string): string {
