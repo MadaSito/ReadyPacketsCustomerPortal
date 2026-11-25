@@ -621,8 +621,7 @@ export async function executeOrderStageBundle(
               eq(orderCompletionJobs.sourcePublicId, existingRun.publicId),
             ),
           )
-          .limit(1)
-          .for("share");
+          .limit(1);
         const [jobView] = linkedJobRow
           ? await hydrateCompletionJobViews(tx, deps.crypto, [linkedJobRow])
           : [null];
