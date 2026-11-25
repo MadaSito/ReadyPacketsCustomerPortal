@@ -375,6 +375,31 @@ export function createManagedFileSync(deps: ModuleDeps, adapterFor: (row: Connec
         return { mode: input.mode };
       });
     },
+    /** Internal, read-only hub telemetry. Never returns connection or transfer identifiers. */
+    async statusSummary() {
+      const approved = sql`${connections.fileSyncMode} is not null`;
+      const writeTested = sql`${connections.fileSyncWriteTestVersion} <=> ${connections.destinationVersion}`;
+      const ready = sql`${connections.enabled} and ${approved} and (${writeTested}) and ${connections.credentialsEnc} is not null`;
+      const blocked = sql`${copies.state} in ('blocked', 'failed', 'unknown') or ${jobRuns.state} = 'unknown'`;
+      const [summary] = await db.select({
+        totalConnections: sql<number>`count(distinct ${connections.id})`.mapWith(Number),
+        enabledConnections: sql<number>`count(distinct case when ${connections.enabled} then ${connections.id} end)`.mapWith(Number),
+        approvedConnections: sql<number>`count(distinct case when ${approved} then ${connections.id} end)`.mapWith(Number),
+        writeTestedConnections: sql<number>`count(distinct case when ${writeTested} then ${connections.id} end)`.mapWith(Number),
+        readyConnections: sql<number>`count(distinct case when ${ready} then ${connections.id} end)`.mapWith(Number),
+        failingConnections: sql<number>`count(distinct case when ${connections.enabled} and (
+          ${connections.lastTestCode} <> 'OK' or (${approved} and not (${ready})) or
+          (${copies.destinationVersion} = ${connections.destinationVersion} and (${blocked}))
+        ) then ${connections.id} end)`.mapWith(Number),
+        blockedTransfers: sql<number>`count(case when ${blocked} then 1 end)`.mapWith(Number),
+        lastCheckedAt: sql<Date | null>`max(${connections.lastTestAt})`.mapWith(connections.lastTestAt),
+        lastSuccessAt: sql<Date | null>`max(case when ${copies.state} = 'copied' then ${copies.finishedAt} end)`.mapWith(copies.finishedAt),
+      }).from(connections).leftJoin(copies, eq(copies.connectionPublicId, connections.publicId))
+        .leftJoin(jobRuns, eq(jobRuns.publicId, copies.jobPublicId))
+        .where(inArray(connections.kind, ["sharepoint", "onedrive"]));
+      // Ungrouped SQL aggregates always return one row, including for an empty installation.
+      return summary!;
+    },
     health(principal: SessionPrincipal) {
       return transaction(async (tx) => {
         await assertCurrentStorageAdmin(deps, principal, tx);

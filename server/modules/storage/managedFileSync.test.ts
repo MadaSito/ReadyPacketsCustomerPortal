@@ -108,6 +108,25 @@ async function stage(opts: Partial<Awaited<ReturnType<TestHarness["services"]["f
 }
 
 describe("managed Microsoft 365 file sync", () => {
+  it("returns only Microsoft 365 aggregates without a session or contacting Graph", async () => {
+    expect(await storage.fileSync.statusSummary()).toEqual({
+      totalConnections: 0, enabledConnections: 0, approvedConnections: 0, writeTestedConnections: 0,
+      readyConnections: 0, failingConnections: 0, blockedTransfers: 0, lastCheckedAt: null, lastSuccessAt: null,
+    });
+    await approve();
+    await testDb.db.insert(storageConnections).values([
+      { kind: "onedrive", publicId: ulid(), name: "Private OneDrive label", config: {} },
+      { kind: "s3", publicId: ulid(), name: "Not Microsoft 365", config: {}, enabled: true },
+    ]);
+    const calls = graph.calls.length;
+    const summary = await storage.fileSync.statusSummary();
+    expect(summary).toEqual({
+      totalConnections: 2, enabledConnections: 1, approvedConnections: 1, writeTestedConnections: 1,
+      readyConnections: 1, failingConnections: 0, blockedTransfers: 0, lastCheckedAt: h.clock.now(), lastSuccessAt: null,
+    });
+    expect(graph.calls).toHaveLength(calls);
+  });
+
   it("fails closed on read-only credentials, requires explicit approval and contains destination options", async () => {
     const r = await createEnabled("Read only");
     const input = { publicId: r.publicId, expectedVersion: r.version };
@@ -145,6 +164,10 @@ describe("managed Microsoft 365 file sync", () => {
     expect(graph.findByPath(graph.libraryDrive, [`Synthetic Customer-${customerId}`, "ORDER-101", "intake", "Audio"])).not.toBeNull();
     expect(graph.findByPath(graph.libraryDrive, [`Renamed Customer-${customerId}`])).toBeNull();
     expect(await storage.fileSync.health(admin)).toEqual([expect.objectContaining({ lastSuccessAt: h.clock.now(), backlog: 0, blocked: 0 })]);
+    expect(await storage.fileSync.statusSummary()).toMatchObject({
+      totalConnections: 1, enabledConnections: 1, approvedConnections: 1, writeTestedConnections: 1,
+      readyConnections: 1, failingConnections: 0, blockedTransfers: 0, lastSuccessAt: h.clock.now(),
+    });
     expect(await storage.fileSync.forOrder(admin, { orderPublicId: orderId })).toMatchObject({ items: expect.arrayContaining([
       expect.objectContaining({ sourcePublicId: staff, role: "originals", state: "copied", fileName: "Synthetic.pdf" }),
     ]) });
@@ -181,11 +204,15 @@ describe("managed Microsoft 365 file sync", () => {
     await h.jobs.runAll(copyJob);
     const [blocked] = await testDb.db.select().from(storageManagedFileCopies).where(eq(storageManagedFileCopies.sourcePublicId, id));
     expect(blocked).toMatchObject({ state: "blocked", reasonCode: "STORAGE_COPY_SOURCE_INACTIVE" });
+    expect(await storage.fileSync.statusSummary()).toMatchObject({ failingConnections: 1, blockedTransfers: 1 });
     expect(graph.calls.filter((call) => call.kind === "upload" && call.method === "PUT")).toHaveLength(1);
     const current = await storage.connections.get(admin, { publicId: r.publicId });
     const rotated = await storage.connections.update(admin, { publicId: r.publicId, expectedVersion: current.version,
       credentials: { clientSecret: "new-synthetic-secret" } });
     expect(rotated.enabled).toBe(false);
+    expect(await storage.fileSync.statusSummary()).toMatchObject({
+      readyConnections: 0, failingConnections: 0, blockedTransfers: 1, lastCheckedAt: null,
+    });
     expect(await storage.fileSync.listTargets(admin)).toEqual([]);
     expect(await storage.fileSync.previewResync(admin, { scope: "target", publicId: r.publicId })).toMatchObject({ count: 0 });
   });
