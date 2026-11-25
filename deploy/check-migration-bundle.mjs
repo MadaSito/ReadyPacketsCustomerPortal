@@ -2,7 +2,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, read
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const requiredTag = "0006_increment_06";
+const requiredTags = ["0005_increment_05", "0006_increment_06", "0007_increment_07"];
 
 // A release must include both the journal entry and SQL; a file omitted from
 // the journal would otherwise be silently skipped by Drizzle.
@@ -31,7 +31,7 @@ export function checkMigrationBundle(dir) {
     if (!stat.isFile() || stat.size === 0) throw new Error("invalid migration SQL file");
     seen.add(tag);
   }
-  if (!seen.has(requiredTag)) throw new Error("required migration absent");
+  if (!requiredTags.every((tag) => seen.has(tag))) throw new Error("required migration absent");
   if (readdirSync(dir).some((name) => name.endsWith(".sql") && !seen.has(name.slice(0, -4)))) {
     throw new Error("migration SQL missing from journal");
   }

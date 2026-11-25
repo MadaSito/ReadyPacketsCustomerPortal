@@ -69,6 +69,9 @@ refuse_callback "OIDC callback on plain HTTP" "http://localhost/api/identity/sso
 refuse_callback "OIDC callback mixed-case trailing slash on plain HTTP" "http://localhost/API/identity/sso/callback/?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback "storage OAuth callback on plain HTTP" "http://localhost/api/storage/oauth/callback/dropbox?code=callback-canary-81a4&state=state-canary-92b5"
 refuse_callback "bare storage OAuth callback on plain HTTP" "http://localhost/API/storage/oauth/callback?code=callback-canary-81a4&state=state-canary-92b5"
+for callback in metadata start acs; do
+    refuse_callback "SAML $callback on plain HTTP" "http://localhost/api/identity/saml/$callback?marker=callback-canary-81a4"
+done
 expect "unknown host on port 80" "$(plain -o /dev/null -w '%{http_code}' -H 'Host: unknown.example' http://localhost/)" 421
 if web -o /dev/null --resolve unknown.example:443:127.0.0.1 https://unknown.example/ 2>/dev/null; then
     fail "an unknown name completed a TLS handshake"
@@ -78,6 +81,9 @@ step "oversized request bodies are refused"
 head -c 400000 /dev/zero | tr '\0' 'a' > "$work/large"
 expect "large body" "$(web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     --data-binary "@$work/large" "$origin/api/trpc/identity.signIn")" 413
+expect "oversized SAML ACS form" "$(web -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/x-www-form-urlencoded' --data-binary "@$work/large" "$origin/api/identity/saml/acs")" 413
+expect "wrong ACS method" "$(web -o /dev/null -w '%{http_code}' "$origin/api/identity/saml/acs")" 404
 
 step "proxy rules: other ports in Host, upload allowances only on the exact routes"
 docker exec readypackets-caddy-1 caddy version
@@ -142,8 +148,8 @@ query_release_journal() {
     docker exec readypackets-db-1 sh -c \
         'MYSQL_PWD="$(cat /run/rp-db-secrets/root_password)" mysql --protocol=socket -uroot -N -B --execute="$1"' sh "$1"
 }
-step "migration 0005 is applied exactly once"
-assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06
+step "release migrations are applied exactly once"
+assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06 0007_increment_07
 
 step "first administrator (non-interactive), refused the second time"
 ( umask 077; printf 'Ci-%s-Aa1\n' "$(openssl rand -hex 16)" > "$work/password" )
@@ -192,7 +198,7 @@ step "update in place: the portal is stopped, migrated and started again"
 wait_for_proxy
 expect "readyz after update" "$(web -o /dev/null -w '%{http_code}' "$origin/readyz")" 200
 expect "web restarted cleanly" "$(docker inspect -f '{{.State.Status}}' readypackets-web-1)" running
-assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06
+assert_release_migrations migrations query_release_journal 0005_increment_05 0006_increment_06 0007_increment_07
 
 step "restart keeps data, keys and settings"
 "$rp" down
