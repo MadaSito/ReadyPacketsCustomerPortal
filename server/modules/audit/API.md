@@ -227,3 +227,38 @@ Everything lives in `auditCenter` (no new module). Files: `correlation/rules.ts`
 - **tRPC** `audit.incidents.{list, get, acknowledge, close, banAddress, endSessions, rules, updateRules}` and `audit.banEventAddress` — admins with `security.incidents.read`; `banAddress`/`banEventAddress` add `security.firewall.manage` (step-up) and call `services.protection.manualSignInBan` outside any transaction with the address decrypted server-side; `endSessions` adds `sessions.revoke_any` (step-up) and calls `services.identity.centre.endForUser(…, "SECURITY_INCIDENT")`; `updateRules` adds `security.firewall.manage` + step-up. Acknowledge/close use `expectedVersion` (`INCIDENT_CHANGED`). Close reasons: resolved, false_positive, duplicate, accepted_risk. Ban durations 15/60/1440/10080 min or null (permanent); reason 3–240 characters without control characters. Bans refuse with `CLIENT_ADDRESS_UNDETERMINABLE` when `protection.clientAddressTrust().determinable` is false.
 - **Client** (`auditFeature`): `/admin/audit/incidents` (counts, filters, last run, address warning, rules card), `/admin/audit/incidents/:publicId` (summary, actions, correlated events, timeline). `/admin/audit?incident=<id>` opens the incident's ready-made search; `/admin/audit?event=<id>` opens one event.
 - **Tests**: `correlation/rules.test.ts` (22), `correlation/incidents.test.ts` (9, real MySQL), `client/src/features/audit/incidents.test.tsx` (14, axe in both themes).
+
+## Increment 07 — event names, order activity and triggers (package E)
+
+Audit owns the names; each owner emits its events (`deps.audit.record`, snake_case attributes, public ids only, no personal data, correlation id). Owners: tell audit_engineer about any change before you commit, because `orderActivity.ts` (customer timeline) and `triggerCatalogue.ts` are keyed on these names. Status: **proposed** unless marked confirmed.
+
+| Owner | Events | Key attributes |
+| --- | --- | --- |
+| orders (D1, D3, D9) | `order.stage.advanced` (Next), `order.stage.submitted` (Submit and lock), `order.stage.reviewed`, `order.stage.reopened`, `order.stage.status_overridden`, `order.progress.lowered` (only on reopen), `order.payment_state.changed` | `stage_key`, `stage_index`, `from_state`, `to_state`, `outcome` (accepted, changes_requested), `ack_policy`, `ack_text_hash`, `progress_percent`, `from_status`, `to_status`, `reason_code`, `payment_state` |
+| recovery_ops (D2) | `order.status_catalog.created`, `.updated`, `.reordered`, `.retired`, `.restored` | `status_key`, `category`, `attention` |
+| assurance (D4) — confirmed | `order.question.asked`, `order.question.withdrawn`, `order.question.answered`, `order.admin_task.checked`, `order.admin_task.unchecked` | `stage_key`, `question_public_id`, `version`, `task_key` |
+| engagement (D5) | `order.stage_run.completed`, `.partial_failed`, `.failed` (existing `order.stage_actions.run` stays readable), `order.completion.updated`, `.scheduled`, `.canceled`, `.superseded`, `.failed`, `automation.rules.reordered` | `stage_key`, `run_public_id`, `slot`, `result`, `completion_kind`, `percent`, `delay_minutes`, `completion_revision` |
+| jobs (D6) | `ops.alert.opened`, `.acknowledged`, `.resolved`, `ops.alert.reminders_changed`, `ops.attention.reminder_sent` | `alert_public_id`, `severity`, `source`, `reason_code`, `order_public_id` |
+| integrations (D7) | `integration.webhook.delivery_stopped`, `integration.webhook.retried` (existing `.redelivered` stays), `integration.webhook.lifecycle_queued`, `integration.webhook.lifecycle_refused`, `integration.webhook.signing_changed`, `integration.egress.preset_changed`, `integration.graph.write_checked` | `target_key`, `delivery_public_id`, `reason_code`, `preset` |
+| files (D8) — confirmed | `file.playback.ticket_issued`, `file.playback.grant_started`, `file.playback.access`, `file.playback.result`, `file.deliverable.open`; `file.uploaded` keeps its name and gains `stage_key`, `file_source` | `stage_key`, `file_source`, `bytes_sent` |
+| portable_contract (D8 ZIP) | `file.archive.requested`, `.built`, `.downloaded`, `.failed`, `.expired` | `archive_public_id`, `scope` (phase, order), `stage_key`, `file_count`, `total_bytes`, `reason_code` |
+| compliance (D9) | `payments.webhook.rejected` (existing), `payments.attempt.pending_async`, `payments.attempt.paid` (existing), `payments.attempt.failed` (existing), `payment.refund.flagged`, `payments.setup.self_test`, `payments.secret.rotated` | `reason_code`, `event_type`, `payment_state` |
+| identity (D10) | `identity.saml.config_changed`, `identity.saml.certificate_changed`, `identity.saml.mfa_mode_changed` (outcome warning for `entra`), `identity.saml.test_signin`, `auth.login.succeeded` / `auth.login.failed` with `method: "saml"` | `protocol`, `mfa_mode`, `reason_code`, `mfa_source` (entra_claim, portal, entra_managed) |
+| portable_ops (D12) | `file.sync.exported`, `.failed`, `.reconciled`, `.resync_requested`, `file.sync.target_tested`, `file.sync.plan_changed` | `target_role` (originals, staging, intake), `destination_key`, `reason_code`, `dry_run_count` |
+
+**Customer order timeline (`orderActivity.ts`)**: customer-visible are `order.stage.advanced` ("Phase completed"), `.submitted` ("Phase submitted"), `.reviewed` ("Phase reviewed"), `.reopened` ("Phase reopened"), `order.question.asked` / `.answered`, `order.payment_state.changed` ("Payment updated"). Staff-only: everything else above.
+
+**New triggers (`triggerCatalogue.ts`, D5)**:
+
+| Key | Event | Outcome or match |
+| --- | --- | --- |
+| `payment.succeeded` | `invoice.payment.recorded` | completed |
+| `payment.failed` | `payments.attempt.failed` | failed |
+| `payment.refunded` | `payment.refund.succeeded` | completed |
+| `intake.submitted` | `intake.submission.submitted` | completed |
+| `intake.reviewed` | `intake.submission.reviewed` | completed |
+| `order.stage_submitted` | `order.stage.submitted` | completed |
+
+Fields are safe attributes only: `stage_key`, `payment_state`, `questionnaire_slug`, `revision_number`, `order_public_id`. Intake answers are never fields. `automations.catalogue` gets the option lists (statuses, phases, payment outcomes) from the owners' resolvers (engagement).
+
+**Package E client (D4)**: the customer order page wizard composes `OrderProgress` and the stepper (ui_foundation), `StageQuestions` (assurance), `PhaseUploadPanel` and `PhaseTeamFiles` (files) on `orders.stages.{workspace,next,submit}` (orders). It has no server code and no schema.
