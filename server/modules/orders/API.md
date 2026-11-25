@@ -430,23 +430,25 @@ Files port: `FileUploadSlot` gains `task { kind: upload \| record \| document_so
 
 ## Increment 07 — phases-first workflows (D1), progress (D3), attention and payment state (package B)
 
-Status: **interfaces published first** (shapes may gain fields, never lose them). Words: the UI says "Phase"; code says `stage`.
+Status: **landed** (77cdfc3 service and ports, 6bc604b module wiring, 927c1eb router, 4e1db2a target checks and transfer v3). Shapes may gain fields, never lose them. Words: the UI says "Phase"; code says `stage`.
 
 ### Format 3 definition (`shared/workflowStages.ts`)
 
 - `workflowStageSchema`, `workflowStagesSchema`, types `WorkflowStage` / `WorkflowStageInput`, constants (`MAX_STAGES` 20, `STAGE_ACTION_KEYS`, `STAGE_ACK_POLICIES`, `STAGE_PROGRESSIONS`, `STAGE_ADMIN_TASKS`, `STAGE_COMPLETES_ON`, `STAGE_ALERT_SEVERITIES`, `STAGE_UPLOAD_INTENTS`, `STAGE_WEBHOOK_TARGET`), `validateStages(stages, statusKeys)` → `StageIssue[]` (`path` like `stages.2.statusKeys.0`, codes `STAGE_*`), `deriveStages(definition)` for formats 1/2, `computeProgress(...)` (pure D3 formula).
 - `workflowDefinitionSchema.stages` (optional, 1–20). A definition with `stages` is format 3 and must not also use `phases` / `state.phase`. Each status belongs to at most one stage; `stageActions.setStatusKey` must be a status of the workflow. At most one stage `completesOn: "payment"`.
 - Stage fields: `key`, `customerLabel`, `staffLabel`, `statusKeys[1..10]`, `actions {uploadDocuments, answerQuestions, recordAudio, uploadAudio, teamFileReview}`, `governance?` (D8, nullable ints: `documentCount`, `documentMaxBytes`, `audioCount`, `audioMaxBytes`, `recordingMaxSeconds`, `totalAudioMaxSeconds`), `folders? {documents?, audio?}`, `fileSync? {originals, conversionStaging, intakeDelivery}` (storage target public id or null = do not transfer; validated by portable_ops' port at save), `acknowledgement {policy, message?}`, `content? {markdown ≤ 4000}`, `progression`, `adminTasks[]`, `stageActions? {emailTemplateKey?, setStatusKey?, completion?, webhookTargetKey?, dashboardAlert?}`, `completesOn`, `weight`.
-- Transfer packages become `formatVersion: 3` when any exported definition has stages; import accepts 1–3.
+- Transfer packages become `formatVersion: 3` when any exported definition has stages; import accepts 1–3. On import, installation-local phase targets are cleared with a warning: `fileSync` targets (`STAGE_FILE_SYNC_CLEARED`) and managed webhook subscriptions (`STAGE_WEBHOOK_CLEARED`); canonical `production:P*01` targets are kept.
+- Draft save (phases that parse) and publish (all phases) call `integrations.workflowWebhooks.validateTargetKey` for each `stageActions.webhookTargetKey` and `storageConnections.validateStageFileSyncTargets(stages, tx)` when any `fileSync` target is set (`stageTargets.ts`). A missing port fails closed (`STAGE_WEBHOOK_TARGET_UNAVAILABLE`, `STAGE_FILE_SYNC_UNAVAILABLE`, or `STAGE_TARGETS_UNCHECKED` on publish).
+- Start-up job `orders.increment07.startup` (every 10 min, idempotent): a fresh install with no workflow and no order gets the format-3 "ReadyPackets standard workflow" (`readypackets_standard`) as default. Otherwise, when no published version or draft has phases, the default workflow gets one draft with phases derived from its statuses, ready to review and publish. Nothing is published automatically and no order is re-pinned.
 
 ### `orders.stages.*` (tRPC)
 
 | Procedure | Guard | Input ⇒ output |
 | --- | --- | --- |
 | `workspace` (query) | order access (customer: readable order; staff: `orders.read_all` or grant) | `{ orderId }` ⇒ `StageWorkspace` |
-| `next` | customer with edit access | `{ orderId, stageKey, expectedVersion }` ⇒ `{ version, currentStageKey, progressPercent }` |
-| `submit` | customer with edit access | `{ orderId, stageKey, ack?: { accepted: true, textSha256 }, expectedVersion }` ⇒ same |
-| `review` | staff, `orders.stage.review` | `{ orderId, stageKey, outcome: "accepted" \| "changes_requested", note?: ≤ 2000, expectedVersion }` ⇒ `{ version }` |
+| `next` | order owner only (`STAGE_OWNER_ONLY` otherwise) | `{ orderId, stageKey, expectedVersion }` ⇒ `{ version, currentStageKey, progressPercent }` |
+| `submit` | order owner only | `{ orderId, stageKey, ack?: { accepted: true, textSha256 }, expectedVersion }` ⇒ same |
+| `review` | staff, `orders.stage.review` | `{ orderId, stageKey, outcome: "accepted" \| "changes_requested", note?: ≤ 2000 (required for `changes_requested`: `NOTE_REQUIRED`), expectedVersion }` ⇒ `{ version }` |
 | `reopen` | admin, `orders.stage.reopen` (step-up) | `{ orderId, stageKey, reason: 10–500, confirm: true, expectedVersion }` ⇒ `{ version, progressPercent }` |
 
 `expectedVersion` is `StageWorkspace.version` (the order's row version). Errors: `STAGE_NOT_OPEN` (working ahead or a closed stage), `STAGE_LOCKED`, `STAGE_NOT_FOUND`, `ACK_REQUIRED`, `ACK_TEXT_CHANGED`, `QUESTIONS_UNANSWERED` (assurance's `assertStageQuestionsAnswered`), `REQUIREMENTS_UNMET`, `STAGE_NOT_SUBMITTED` (review), `STAGE_NOT_REOPENABLE`, `STALE_VERSION`, `AGREEMENT_REQUIRED` / `POLICY_ACCEPTANCE_REQUIRED` (gates are never bypassed).
@@ -470,9 +472,9 @@ type StageWorkspace = {
 };
 ```
 
-Rules: only the current stage is writable for the customer; earlier stages are viewable read-only; later stages are `future`. "Next" completes the stage without a lock; "Submit and lock" records the submission (acknowledgement evidence: policy, text hash, time, actor) and creates the `order_phase_locks` row keyed by the stage key (administrator unlock only, via `reopen`). When the next stage's first status is reachable by an allowed transition for the actor in the pinned version, the order moves there in the same transaction; otherwise the status waits for staff. `changes_requested` records the outcome and note; an administrator reopens to let the customer edit. Ack text hash = SHA-256 of the message shown (the standard warning when empty).
+Rules: only the current stage is writable for the customer; earlier stages are viewable read-only; later stages are `future`. "Next" completes the stage without a lock; "Submit and lock" records the submission (acknowledgement evidence: policy, text hash, time, actor) and creates the `order_phase_locks` row keyed by the stage key (administrator unlock only, via `reopen`). When the next stage's first status is reachable by an allowed transition for the actor in the pinned version, the order moves there in the same transaction; otherwise the status waits for staff. `changes_requested` records the outcome and note and sets the stage state to `in_review` (the lock stays); an administrator reopens to let the customer edit. Derived (format 1/2) workflows refuse `next` / `submit` / `review` / `reopen` with `STAGE_ACTION_OFF`. The legacy `orders.phases.unlock` refuses format-3 orders with `USE_STAGE_REOPEN`. Ack text hash = SHA-256 of the message shown (the standard warning when empty).
 
-List rows (`orders.list`, `orders.admin.list`, dashboard recent orders) gain `progressPercent`, `phaseLabel`, `phaseIndex`, `phaseTotal`, `paymentState`, `attention`. `orders.admin.list` accepts `attention?: "staff_review" | "customer_response"`.
+List rows (`orders.list`, `orders.admin.list`, dashboard recent orders) gain `progressPercent`, `progressCanceled`, `phaseLabel` (customer label for customers, staff label for staff), `phaseIndex` (0-based, null when the status is in no phase), `phaseTotal`, `paymentState`, `attention`. Rows with a null progress cache are filled on read. `orders.admin.list` accepts `attention?: "staff_review" | "customer_response"`.
 
 ### Ports (`services.orders.*`, all in the caller's transaction, order row locked `FOR UPDATE`)
 
@@ -494,6 +496,9 @@ stages.applyCompletionPercent(input: { orderPublicId: string; percent: number; e
   : Promise<{ applied: boolean; revision: number; progressPercent: number }>   // stale revision ⇒ applied: false (superseded), never throws for that
 payments.onInvoicePaidInTx(input: { orderPublicId: string; invoicePublicId: string; paidAt: Date; method: "stripe" | "manual"; amountMinor: number; currency: string }, tx)
   : Promise<{ paymentState: OrderPaymentState; stageCompleted: string | null; advancedTo: string | null }>   // history reason INVOICE_PAID
+stages.resolveQuestionStage(order: OrderAccessView, stageKey: string, db): Promise<ResolvedQuestionStage | null>   // assurance's D4 resolver (wired into phaseWork)
+stages.getOrderStageFileSync(input: { orderPublicId: string; stageKey: string }, tx): Promise<StageFileSyncPlan | null>   // portable_ops' D6 plan; null = unknown order/stage
+phaseWork.questions / phaseWork.adminTasks   // assurance's D4/D5 services, created with resolveQuestionStage + refreshAttentionInTx
 payments.onPaymentEventInTx(input: { orderPublicId: string; kind: "pending_async" | "failed" | "refunded" | "partially_refunded"; eventRef: string }, tx)
   : Promise<{ paymentState: OrderPaymentState }>
 ```
@@ -508,7 +513,7 @@ Attention = stage state first (`submitted` / `in_review` ⇒ `staff_review`; ope
 
 ### Audit events (names agreed with audit_engineer)
 
-`order.stage.advanced`, `order.stage.submitted`, `order.stage.reviewed`, `order.stage.reopened`, `order.stage.status_overridden`, `order.progress.lowered`, `order.payment_state.changed`.
+`order.stage.advanced`, `order.stage.submitted`, `order.stage.reviewed`, `order.stage.reopened`, `order.stage.status_overridden`, `order.progress.lowered`, `order.progress.completion_applied`, `order.payment_state.changed`; system events `workflow.changed` (reason `STANDARD_V3_INSTALLED`) and `workflow.draft.changed` (reason `PHASES_UPGRADE_DRAFT`) from the start-up job.
 
 ### Phase questions and checklist
 

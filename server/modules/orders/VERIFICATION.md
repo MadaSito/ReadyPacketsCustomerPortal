@@ -180,6 +180,25 @@ Run: `scripts/dev/test.sh` per file, `scripts/dev/tc.sh` (no errors under `order
 
 Not verified: a real browser (320 px, zoom, both themes, screen-reader reading of the findings jump and pause callout); the real `AgreementDialog` inside the order pages (stubbed in orders.test.tsx); the Files recorder and edit-in-portal end to end (files / integrations).
 
+## Increment 07 — package B: phases-first workflows (D1), progress (D3), attention and payment state
+
+| Requirement | Method | Evidence |
+| --- | --- | --- |
+| Old stored definitions (format 1/2) and old phase shapes parse; folders / fileSync / acknowledgement / progression get defaults | automated-test | stages.test.ts "stored shapes"; workflowDesigner.test.ts (20); requirements.test.ts (18) |
+| Foreign customer: `NOT_FOUND`; staff cannot `submit` for the owner; customer cannot `review`; staff cannot `reopen`; admin without fresh step-up: `STEP_UP_REQUIRED` | automated-test | stages.test.ts (end to end, real router + MySQL) |
+| Submit and lock: acknowledgement required and bound to the shown text (`ACK_REQUIRED`, `ACK_TEXT_CHANGED`); stale version refused; stage locked; attention `staff_review` | automated-test | stages.test.ts |
+| Review: `changes_requested` needs a note; accept moves to the next phase; progress never lowers except on reopen (audited `order.progress.lowered`) | automated-test | stages.test.ts; questions.test.ts (assurance) |
+| Payment port: paid completes the payment phase and advances once; a repeat is a no-op | automated-test | stages.test.ts |
+| List rows: progress, phase label / index / total, payment state, attention; `attention` filter on admin list; null progress filled on first read | automated-test | stages.test.ts |
+| Derived workflows refuse stage writes (`STAGE_ACTION_OFF`); legacy unlock refuses format 3 (`USE_STAGE_REOPEN`) | automated-test | stages.test.ts |
+| Start-up job installs the standard phases once on a fresh install; idempotent | automated-test | stages.test.ts |
+| Transfer: version 3 only when phases exist; import accepts 1–3; version 4 refused | automated-test | stages.test.ts; workflowTransfer.test.ts (17) |
+| Existing behaviour unchanged | automated-test | orders.test.ts (35), consoleOrder.test.ts (13), requirementsTasks.test.ts (8), client workflows.test.tsx (16) |
+
+Run: `scripts/dev/test.sh` per file, `scripts/dev/tc.sh` (no errors in orders-owned files), ESLint on changed paths.
+
+Not verified: the upgrade-draft branch of the start-up job and the phase target checks (webhook / file sync) have no automated test yet; a real browser for the designer's Phases view (keyboard, 320 px, both themes, screen reader); the paid backfill for existing orders is not implemented (existing orders keep `not_required`).
+
 ## Increment 07 D4: phase questions, checklist and submission panel
 
 See [D4 verification](./questions/VERIFICATION.md) for automated coverage and browser checks.
