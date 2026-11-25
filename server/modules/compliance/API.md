@@ -670,7 +670,7 @@ export interface AcceptanceLogExportResult {
   - Customer `/invoices` and `/invoices/:invoiceId` render a `"Pay online"` action on issued unpaid invoices (`balanceDueMinor > 0`) when `onlinePaymentConfigured === true`, invoking `trpc.payments.startInvoiceCheckout` with return paths `/invoices/:invoiceId`, and render a read-only return status banner when `?attempt=<ulid>&result=return|cancelled` is present (polling `trpc.payments.checkoutStatus` and linking to `/receipts/:receiptPublicId` once webhook-confirmed).
 - **D12 Microsoft 365 Receipt PDF Source Port (`services.compliance.receipts.getFileSyncPdf`)**:
   - `getFileSyncPdf(input: { receiptPublicId: string; orderPublicId: string }, tx: Tx): Promise<Buffer | null>`
-  - Verifies the `compliance_payment_receipts` row exists, matches `orderPublicId`, and has `origin === "portal"`, then decrypts `pdf_enc` with AAD `compliance_payment_receipts.pdf:<receiptPublicId>` and returns the raw PDF `Buffer` (or `null` when missing/mismatched/imported).
+  - Verifies the `compliance_payment_receipts` row exists, matches `orderPublicId`, and has `origin === "portal"`, decrypts `pdf_enc` with AAD `compliance_payment_receipts.pdf:<receiptPublicId>`, and returns the immutable PDF `Buffer` (or `null` when missing, mismatched, or imported).
 - **D5 Trigger Context Resolvers (`server/modules/compliance/automationTriggers.ts`)**:
   - Registers context resolvers (`order_owner`, `order_assignee`, `order_reference`, `order_status`, `recipient_name`, plus safe scalar fields) for `payment.succeeded`, `payment.failed`, `payment.refunded`, `intake.submitted`, and `intake.reviewed`.
 

@@ -9,7 +9,7 @@ import type * as sessionModule from "@/lib/sessionTransport";
 import type * as trpcModule from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { Route, useLocation, useSearch } from "wouter";
-import { InvoiceDetailPage, InvoicesPage, OrderInvoicesTab } from "./InvoicePages";
+import { InvoiceDetailPage, InvoicesPage, OrderInvoicesTab, invoiceCheckoutNavigation } from "./InvoicePages";
 import OrderIntakeTab from "./OrderIntakeTab";
 import PolicyAcceptanceWidget, { RequiredPolicyGate } from "./PolicyAcceptance";
 import { LegalPage, MyPoliciesPage } from "./PolicyPages";
@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   policyStatus: vi.fn(), published: vi.fn(), accept: vi.fn(), intakeList: vi.fn(), history: vi.fn(),
   save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(),
   receiptList: vi.fn(), orderReceipts: vi.fn(), receipt: vi.fn(), fetch: vi.fn(),
+  startInvoiceCheckout: vi.fn(), checkoutStatus: vi.fn(),
 }));
 vi.mock("@/lib/sessionTransport", async (load) => ({ ...await load<typeof sessionModule>(), sessionFetch: mocks.fetch }));
 vi.mock("@/lib/trpc", async (load) => {
@@ -51,6 +52,10 @@ vi.mock("@/lib/trpc", async (load) => {
           forOrder: query("order-receipts", mocks.orderReceipts),
           get: query("receipt", mocks.receipt),
         },
+      },
+      payments: {
+        startInvoiceCheckout: mutation(mocks.startInvoiceCheckout),
+        checkoutStatus: query("checkout-status", mocks.checkoutStatus),
       },
     }),
   };
@@ -547,5 +552,72 @@ describe("customer invoices", () => {
         signerName: "Ada Lovelace",
       }),
     );
+  });
+
+  it("starts hosted invoice checkout when online payment is configured and renders the read-only return banner", async () => {
+    const user = userEvent.setup();
+    const attemptId = publicId("C");
+    const receiptId = publicId("D");
+    const redirectSpy = vi
+      .spyOn(invoiceCheckoutNavigation, "redirectToHostedCheckout")
+      .mockImplementation(() => {});
+
+    mocks.invoice.mockResolvedValue({
+      ...invoice,
+      onlinePaymentConfigured: true,
+    });
+    mocks.startInvoiceCheckout.mockResolvedValue({
+      mode: "redirect",
+      provider: "stripe",
+      attemptPublicId: attemptId,
+      invoicePublicId: invoice.invoicePublicId,
+      redirectUrl: "https://checkout.stripe.com/c/pay/cs_test_01",
+      expiresAt: null,
+    });
+
+    const detailView = renderUi(
+      <Route path="/invoices/:invoiceId">
+        <InvoiceDetailPage />
+      </Route>,
+      { path: `/invoices/${invoice.invoicePublicId}` },
+    );
+    const payButton = await screen.findByRole("button", { name: "Pay online" });
+    await expectNoAxeViolations(detailView.container);
+    await user.click(payButton);
+    expect(mocks.startInvoiceCheckout.mock.calls[0]?.[0]).toEqual({
+      invoicePublicId: invoice.invoicePublicId,
+      successPath: `/invoices/${invoice.invoicePublicId}`,
+      cancelPath: `/invoices/${invoice.invoicePublicId}`,
+    });
+    expect(redirectSpy).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/cs_test_01");
+    detailView.unmount();
+    redirectSpy.mockRestore();
+
+    mocks.checkoutStatus.mockResolvedValue({
+      invoicePublicId: invoice.invoicePublicId,
+      invoiceStatus: "paid",
+      balanceDueMinor: 0,
+      currency: "USD",
+      attempt: {
+        attemptPublicId: attemptId,
+        provider: "stripe",
+        status: "paid",
+        failureReasonCode: null,
+        completedAt: date,
+      },
+      receiptPublicId: receiptId,
+      receiptNumber: "RPR-2026-000001",
+    });
+
+    const returnView = renderUi(<InvoicesPage />, {
+      path: `/invoices?attempt=${attemptId}&result=return`,
+    });
+    expect(await screen.findByText("Payment confirmed")).toBeVisible();
+    expect(screen.getByRole("link", { name: "View payment receipt" })).toHaveAttribute(
+      "href",
+      `/receipts/${receiptId}`,
+    );
+    await expectNoAxeViolations(returnView.container);
+    returnView.unmount();
   });
 });
