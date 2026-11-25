@@ -582,3 +582,5 @@ export const orderTaskWaivers = mysqlTable(
   },
   (t) => [uniqueIndex("order_task_waivers_task_uq").on(t.orderId, t.workflowVersionId, t.statusKey, t.taskKey), index("order_task_waivers_order_idx").on(t.orderId)],
 );
+
+export { orderAdminTasks, orderQuestionAnswers, orderQuestions } from "./questionsSchema.js";
