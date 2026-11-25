@@ -44,16 +44,17 @@ function SettingsEditor({ current, close, save }: {
 
 function SubscriptionEditor({ current, catalogue, close, save }: {
   current: WebhookSubscriptionView | null; catalogue: WebhookCatalogueEventView[]; close: () => void;
-  save: (input: { name: string; description: string | null; targetUrl: string; events: string[] }) => Promise<void>;
+  save: (input: { name: string; description: string | null; targetUrl: string; events: string[]; signingEnabled: boolean }) => Promise<void>;
 }) {
   const [name, setName] = useState(current?.name ?? "");
   const [description, setDescription] = useState(current?.description ?? "");
   const [targetUrl, setTargetUrl] = useState("");
+  const [signingEnabled, setSigningEnabled] = useState(current?.signingEnabled ?? true);
   const [events, setEvents] = useState(current?.events ?? []);
   const [eventError, setEventError] = useState(false);
   const [urlError, setUrlError] = useState(false);
   return <WebhookEditor title={current ? "Edit subscription" : "Create subscription"}
-    description={current ? "Review event selections and the outbound destination." : "New subscriptions start paused. Verify the destination, save its signing secret, then resume when ready."}
+    description={current ? "Review event selections, signing, and the outbound destination." : "New subscriptions start paused. Verify the destination, save its signing secret, then resume when ready."}
     close={close} submitLabel={current ? "Save subscription" : "Create subscription"} submit={async () => {
       setEventError(events.length < 1 || events.length > 200);
       if (targetUrl.trim()) {
@@ -63,7 +64,15 @@ function SubscriptionEditor({ current, catalogue, close, save }: {
         setUrlError(invalid);
         if (invalid) return;
       }
-      if (events.length >= 1 && events.length <= 200) await save({ name: name.trim(), description: description.trim() || null, targetUrl: targetUrl.trim(), events });
+      if (events.length >= 1 && events.length <= 200) {
+        await save({
+          name: name.trim(),
+          description: description.trim() || null,
+          targetUrl: targetUrl.trim(),
+          events,
+          signingEnabled,
+        });
+      }
     }}>
     <Field label="Name" required><Input required maxLength={120} value={name} onChange={(event) => setName(event.target.value)} /></Field>
     <Field label="Description"><Textarea rows={2} maxLength={280} value={description} onChange={(event) => setDescription(event.target.value)} /></Field>
@@ -72,6 +81,12 @@ function SubscriptionEditor({ current, catalogue, close, save }: {
       <Input type="url" required={!current} maxLength={2048} autoComplete="off" value={targetUrl}
         className="ph-no-capture" data-clarity-mask="true" onChange={(event) => { setTargetUrl(event.target.value); setUrlError(false); }} />
     </Field>
+    <Checkbox
+      label="Sign deliveries with HMAC-SHA256 (X-ReadyPackets-Signature)"
+      description="Recommended. Turn off only when the receiving endpoint cannot verify HMAC-SHA256 signatures."
+      checked={signingEnabled}
+      onCheckedChange={setSigningEnabled}
+    />
     <fieldset className="grid min-w-0 gap-2">
       <legend className="text-sm font-semibold">Events to deliver</legend>
       {eventError ? <Callout tone="danger" live="assertive">Select between 1 and 200 events.</Callout> : null}
@@ -152,6 +167,7 @@ export default function SubscriptionsPage() {
           </div> },
           { key: "destination", header: "Destination", cell: (row) => <span className="break-all">{row.targetUrlMasked}</span> },
           { key: "state", header: "Status", cell: (row) => <Badge tone={row.status === "active" ? "success" : row.status === "disabled_failing" ? "danger" : "neutral"}>{stateLabel[row.status]}</Badge> },
+          { key: "signing", header: "Signing", cell: (row) => <Badge tone={row.signingEnabled ? "info" : "neutral"}>{row.signingEnabled ? "Signed" : "Unsigned"}</Badge> },
           { key: "events", header: "Events", cell: (row) => row.events.length },
           { key: "secret", header: "Secret ending", cell: (row) => <span>{row.signingSecretLast4}{row.hasOverlapSecret ? <> · Overlap until <DateTime value={row.overlapExpiresAt} /></> : null}</span> },
           { key: "delivered", header: "Last delivered", cell: (row) => <DateTime value={row.lastDeliveredAt} /> },

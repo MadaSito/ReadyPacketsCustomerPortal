@@ -31,7 +31,7 @@ const stepUpResponse = {
 const settings = { enabled: false, retentionDays: 30, autoDisableThreshold: 5, deliveryTimeoutMs: 5000 };
 const subscription = {
   publicId: subscriptionId, name: "Fulfilment", targetUrlHost: "receiver.example.test", targetUrlMasked: "https://receiver.example.test/…",
-  description: null, status: "paused", events: ["order.created"], signingSecretLast4: "8765", hasOverlapSecret: false,
+  description: null, status: "paused", events: ["order.created"], signingEnabled: true, signingSecretLast4: "8765", hasOverlapSecret: false,
   overlapExpiresAt: null, consecutiveFailures: 0, lastDeliveredAt: null, lastFailedAt: null, lastFailureReason: null,
   autoDisabledAt: null, version: 1, createdAt: date, updatedAt: date,
 };
@@ -45,7 +45,9 @@ const delivery: WebhookDeliveryListItemView = {
   targetLabel: "Fulfilment", eventKey: "order.created", externalEventId: null, status: "failed",
   httpMethod: "POST", httpPath: "/deliveries", httpStatus: 503, durationMs: 45, requestBytes: 14, responseBytes: 14,
   attemptCount: 1, maxAttempts: 3, reasonCode: "HTTP_503", correlationId: "webhook_test", actorLabel: "System",
-  bodyTruncated: false, bodyPurged: false, isReplay: false, replayOfPublicId: null, isTest: false, canReplay: true,
+  bodyTruncated: false, bodyPurged: false, isReplay: false, replayOfPublicId: null, isTest: false,
+  canReplay: true, canRetry: false, canStop: false,
+  orderPublicId: null, stageKey: null, manualRetryCount: 0, stoppedAt: null, stoppedByPublicId: null, stopReason: null,
   expiresAt: date, completedAt: date, createdAt: date,
 };
 const detail: WebhookDeliveryDetailView = {
@@ -144,7 +146,7 @@ describe("Webhooks administration", () => {
     const secretDialog = await screen.findByRole("dialog", { name: "Signing secret" });
     expect(within(secretDialog).getByText(secret)).toBeVisible();
     expect(create).toHaveBeenCalledExactlyOnceWith({ name: "Fulfilment", description: null,
-      targetUrl: "https://receiver.example.test/hook", events: ["order.created"], paused: true });
+      targetUrl: "https://receiver.example.test/hook", events: ["order.created"], signingEnabled: true, paused: true });
     expect(view.queryClient.getMutationCache().getAll()).toHaveLength(0);
     expect(JSON.stringify(view.queryClient.getQueriesData({}))).not.toContain(secret);
     await user.click(within(secretDialog).getByRole("button", { name: "Done" }));
@@ -284,5 +286,114 @@ describe("Webhooks administration", () => {
     expect(await within(dialog).findByText(/enable webhooks under subscriptions/iu)).toBeVisible();
     expect(within(dialog).getByRole("table", { name: "Delivery attempts" })).toBeVisible();
     expect(within(dialog).queryByRole("button", { name: "Redeliver webhook" })).not.toBeInTheDocument();
+  });
+
+  it("supports toggling HMAC-SHA256 signing on subscription edit and renders Signed / Unsigned badges", async () => {
+    const user = userEvent.setup();
+    const update = vi.fn(() => ({ ...subscription, signingEnabled: false, version: 2 }));
+    renderWebhooks(<SubscriptionsPage />, "Webhook subscriptions", WEBHOOK_PATHS.subscriptions, {
+      "subscriptions.list": () => ({
+        items: [subscription, { ...subscription, publicId: "01JD0000000000000000000009", name: "Unsigned sink", signingEnabled: false }],
+        nextCursor: null,
+      }),
+      "subscriptions.update": update,
+    });
+    const table = await screen.findByRole("table", { name: "Outbound subscriptions" });
+    expect(within(table).getByText("Signed")).toBeVisible();
+    expect(within(table).getByText("Unsigned")).toBeVisible();
+
+    await user.click(within(table).getByRole("button", { name: `Edit ${subscription.name}` }));
+    const dialog = screen.getByRole("dialog", { name: "Edit subscription" });
+    const signingCheckbox = within(dialog).getByRole("checkbox", {
+      name: /Sign deliveries with HMAC-SHA256/iu,
+    });
+    expect(signingCheckbox).toBeChecked();
+    await user.click(signingCheckbox);
+    await user.click(within(dialog).getByRole("button", { name: "Save subscription" }));
+
+    expect(update).toHaveBeenCalledExactlyOnceWith({
+      publicId: subscriptionId,
+      expectedVersion: 1,
+      name: "Fulfilment",
+      description: null,
+      targetUrl: undefined,
+      events: ["order.created"],
+      signingEnabled: false,
+    });
+  });
+
+  it("filters deliveries by Order ID and Stopped status, stops queued deliveries, and retries eligible stopped records without creating a replay", async () => {
+    const user = userEvent.setup();
+    const orderPublicId = "01JD0000000000000000000077";
+    const queuedDetail: WebhookDeliveryDetailView = {
+      ...detail,
+      status: "queued",
+      canReplay: false,
+      canRetry: false,
+      canStop: true,
+      orderPublicId,
+      stageKey: "intake",
+    };
+    const stoppedDetail: WebhookDeliveryDetailView = {
+      ...queuedDetail,
+      status: "stopped",
+      canStop: false,
+      canRetry: true,
+      stoppedAt: date,
+      stoppedByPublicId: "01JD0000000000000000000055",
+      stopReason: "Operator paused receiver",
+    };
+    const retriedDetail: WebhookDeliveryDetailView = {
+      ...stoppedDetail,
+      status: "queued",
+      canStop: true,
+      canRetry: false,
+      manualRetryCount: 1,
+      stoppedAt: null,
+      stopReason: null,
+    };
+
+    const list = vi.fn(() => ({
+      items: [{ ...delivery, status: "stopped" as const, orderPublicId, stageKey: "intake", canReplay: false, canStop: true }],
+      nextCursor: null,
+    }));
+    const stop = vi.fn(() => stoppedDetail);
+    const retry = vi.fn(() => retriedDetail);
+    const redeliver = vi.fn();
+
+    renderWebhooks(<DeliveriesPage />, "Webhook deliveries", WEBHOOK_PATHS.deliveries, {
+      "settings.get": () => ({ ...settings, enabled: true }),
+      "deliveries.list": list,
+      "deliveries.get": () => queuedDetail,
+      "deliveries.stop": stop,
+      "deliveries.retry": retry,
+      "deliveries.redeliver": redeliver,
+    });
+
+    await user.type(screen.getByLabelText("Order ID"), orderPublicId);
+    await user.selectOptions(screen.getByLabelText("Status"), "stopped");
+    await user.click(screen.getByRole("button", { name: "Apply filters" }));
+    expect(list).toHaveBeenLastCalledWith(
+      expect.objectContaining({ orderPublicId, status: "stopped" }),
+    );
+
+    const table = await screen.findByRole("table", { name: "Webhook delivery records" });
+    expect(within(table).getByText("Stopped")).toBeVisible();
+    await user.click(within(table).getByRole("button", { name: `Details for delivery ${deliveryId}` }));
+
+    const dialog = screen.getByRole("dialog", { name: "Webhook delivery detail" });
+    await user.type(await within(dialog).findByLabelText("Stop reason (optional)"), "Operator paused receiver");
+    await expectNoAxeViolations(dialog);
+    await user.click(within(dialog).getByRole("button", { name: "Stop delivery" }));
+    expect(stop).toHaveBeenCalledExactlyOnceWith({
+      publicId: deliveryId,
+      reason: "Operator paused receiver",
+    });
+
+    const retryButton = await within(dialog).findByRole("button", { name: "Retry delivery" });
+    expect(within(dialog).queryByRole("button", { name: "Redeliver webhook" })).not.toBeInTheDocument();
+    await user.click(retryButton);
+    expect(retry).toHaveBeenCalledExactlyOnceWith({ publicId: deliveryId });
+    expect(redeliver).not.toHaveBeenCalled();
   });
 });
