@@ -46,7 +46,7 @@ export const WIZARD_STEPS = [
   { id: "transitions", label: "Transitions" },
   { id: "who", label: "Who may move" },
   { id: "notices", label: "Notices and notes" },
-  { id: "rules", label: "Phases and requirements" },
+  { id: "rules", label: "Status requirements" },
   { id: "review", label: "Review and publish" },
 ] as const;
 export type WizardStepId = (typeof WIZARD_STEPS)[number]["id"];

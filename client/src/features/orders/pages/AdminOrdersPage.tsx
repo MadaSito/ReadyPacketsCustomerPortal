@@ -8,6 +8,7 @@ import { useTRPC } from "@/lib/trpc";
 import { Button, DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
 import { NewOrderForCustomerButton } from "../ConsoleOrderTools";
 import { LOCK_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
+import { OrderListProgress } from "../stages/OrderListProgress";
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const STATUS_KEY = /^[a-z][a-z0-9_]{1,47}$/;
@@ -164,6 +165,29 @@ export default function AdminOrdersPage() {
                   <LockBadge state={order.lockState as LockState} />
                 </span>
               ),
+            },
+            {
+              key: "phase",
+              header: "Phase",
+              hideOnMobile: true,
+              // Increment 07 QA: current phase (label, n of m) and a compact progress bar; "—" without a phase model.
+              cell: (order) =>
+                order.phaseLabel && order.phaseIndex !== null && order.phaseTotal ? (
+                  <div className="grid min-w-[9rem] gap-1">
+                    <span className="text-sm break-words text-ink">{order.phaseLabel}</span>
+                    <span className="text-xs text-muted">{`Phase ${order.phaseIndex + 1} of ${order.phaseTotal}`}</span>
+                    <OrderListProgress
+                      name={order.reference}
+                      progressPercent={order.progressPercent}
+                      phaseLabel={order.phaseLabel}
+                      phaseIndex={order.phaseIndex}
+                      phaseTotal={order.phaseTotal}
+                      canceled={order.progressCanceled}
+                    />
+                  </div>
+                ) : (
+                  <span className="text-muted">—</span>
+                ),
             },
             { key: "createdAt", header: "Created", hideOnMobile: true, cell: (order) => <DateTime value={order.createdAt} format="date" /> },
             { key: "total", header: "Total", align: "end", cell: (order) => <Money value={money(order.totalMinor, order.currency)} /> },

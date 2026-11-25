@@ -1,6 +1,6 @@
 /**
  * Workflow designer — increment 04 fields: phases (whole workflow) and per-status requirements
- * (upload slots and acknowledgements). Shared by the wizard "Phases and requirements" step and the canvas
+ * (upload slots and acknowledgements). Shared by the wizard "Status requirements" step and the canvas
  * side panel. The server validates everything; these fields only edit the draft and show its issues.
  */
 import { useQuery } from "@tanstack/react-query";
@@ -152,9 +152,9 @@ export function PhasesEditor({ definition, issues, onChange }: { definition: Dra
   const phases = definition.phases ?? [];
   return (
     <fieldset className="flex min-w-0 flex-col gap-3 rounded-[var(--radius-card)] border border-line p-4">
-      <legend className="px-1 text-sm font-semibold text-ink">Phases</legend>
+      <legend className="px-1 text-sm font-semibold text-ink">Status groups (older workflows)</legend>
       <p className="text-sm text-body">
-        Optional. Group statuses into phases (for example Intake, Review, Delivery). Customers see the phases as a progress bar. When an order leaves a phase, that phase locks so its uploads and
+        Optional. For new workflows, use the Phases tab instead. Group statuses (for example Intake, Review, Delivery). Customers see the groups as a progress bar. When an order leaves a phase, that phase locks so its uploads and
         acceptances stay as reviewed; staff can unlock it with a reason.
       </p>
       {phases.length === 0 ? <p className="text-sm text-muted">No phases. Orders show statuses only.</p> : null}

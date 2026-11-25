@@ -6,8 +6,8 @@ import { Route } from "wouter";
 import type * as trpcModule from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
-import AdminWorkflowsPage from "../AdminWorkflowsPage";
-import WorkflowDesignerPage from "./WorkflowDesignerPage";
+import AdminWorkflowsPage, { resetPhasesNoticeForTests } from "../AdminWorkflowsPage";
+import WorkflowDesignerPage, { startPhases } from "./WorkflowDesignerPage";
 import WorkflowVersionPage from "./WorkflowVersionPage";
 import WorkflowVersionsPage from "./WorkflowVersionsPage";
 
@@ -94,6 +94,7 @@ const policyDocs = [{ documentPublicId: POLICY_A, slug: "order-terms", title: "S
 beforeEach(() => {
   handlers.clear();
   calls.length = 0;
+  resetPhasesNoticeForTests();
   handlers.set("compliance.policies.listPublished", () => policyDocs);
   handlers.set("orders.admin.workflows.transfer.status", () => ({ enabled: false, canExport: true, canImport: true, maxBytes: 2_097_152, maxWorkflows: 50 }));
 });
@@ -158,6 +159,72 @@ describe("workflows page", () => {
     await waitFor(() => expect(location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`));
     expect(calls.find((c) => c.path === "orders.admin.workflows.drafts.create")?.input).toEqual({ from: "blank", workflowKey: "rush", name: "Rush jobs" });
   });
+
+  it("new workflow dialog recommends the ReadyPackets phases and selects it by default", async () => {
+    handlers.set("orders.admin.workflows.list", () => [workflowRow]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    handlers.set("orders.admin.workflows.drafts.create", () => ({ publicId: DRAFT, rowVersion: 1 }));
+    const user = userEvent.setup();
+    const { location } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    await user.click(await screen.findByRole("button", { name: "New workflow" }));
+    const dialog = await screen.findByRole("dialog", { name: "New workflow" });
+    expect(within(dialog).getByRole("radio", { name: /ReadyPackets phases \(recommended\)/ })).toBeChecked();
+    expect(within(dialog).getByRole("radio", { name: /The standard workflow \(statuses\)/ })).not.toBeChecked();
+    await user.type(within(dialog).getByLabelText(/^Name/), "Packets");
+    await user.click(within(dialog).getByRole("button", { name: "Create draft" }));
+    await waitFor(() => expect(location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`));
+    expect(calls.find((c) => c.path === "orders.admin.workflows.drafts.create")?.input).toEqual({ from: "phases", workflowKey: "packets", name: "Packets" });
+  });
+
+  it("phases notice: shown while no published workflow has phases; add, convert (opens the existing draft) and dismiss", async () => {
+    handlers.set("orders.admin.workflows.list", () => [workflowRow]);
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    handlers.set("orders.admin.workflows.phases.addStandard", () => ({ draftId: "01JTESTWFD000000000000000C", created: true }));
+    handlers.set("orders.admin.workflows.phases.convertDefault", () => ({ draftId: DRAFT, created: false }));
+    const user = userEvent.setup();
+    const { container, location, unmount } = renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    const notice = await screen.findByRole("region", { name: "Your workflows do not use phases yet" });
+    await expectNoAxeViolations(container);
+    await user.click(within(notice).getByRole("button", { name: "Add the ReadyPackets phases workflow" }));
+    await waitFor(() => expect(location.history.at(-1)).toBe("/admin/workflows/drafts/01JTESTWFD000000000000000C"));
+    await user.click(within(notice).getByRole("button", { name: "Convert Standard to phases" }));
+    await waitFor(() => expect(location.history.at(-1)).toBe(`/admin/workflows/drafts/${DRAFT}`));
+    expect(await screen.findByText("Opening the existing draft")).toBeInTheDocument();
+    await user.click(within(notice).getByRole("button", { name: "Dismiss the phases notice" }));
+    expect(screen.queryByRole("region", { name: "Your workflows do not use phases yet" })).not.toBeInTheDocument();
+    unmount();
+
+    // A published workflow with phases: no notice.
+    resetPhasesNoticeForTests();
+    handlers.set("orders.admin.workflows.list", () => [{ ...workflowRow, definition: { ...workflowRow.definition, stages: [{ key: "intake" }] } }]);
+    renderUi(<AdminWorkflowsPage />, { path: "/admin/workflows" });
+    expect(await screen.findByRole("heading", { name: "Standard" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Your workflows do not use phases yet" })).not.toBeInTheDocument();
+  });
+});
+
+describe("designer phases-first", () => {
+  it("opens every draft on the Phases tab, first in the tab order", async () => {
+    handlers.set("orders.admin.workflows.drafts.get", () => draftView([transition], []));
+    handlers.set("orders.admin.workflows.drafts.list", () => []);
+    designer();
+    const tabs = await screen.findAllByRole("tab");
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Phases", "Statuses wizard", "Canvas"]);
+    expect(tabs[0]).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByRole("button", { name: "Start phases from statuses" })).toBeInTheDocument();
+  });
+
+  it("starting phases from classic status groups removes the groups (a draft may not use both)", () => {
+    const classic = {
+      states: [{ ...states[0]!, phase: "intake" }, states[1]!],
+      transitions: [transition],
+      phases: [{ key: "intake", label: "Intake" }],
+    } as unknown as Parameters<typeof startPhases>[0];
+    const next = startPhases(classic) as unknown as { phases?: unknown; states: { phase?: string }[]; stages: { key: string; statusKeys: string[] }[] };
+    expect(next.phases).toBeUndefined();
+    expect(next.states.every((state) => state.phase === undefined)).toBe(true);
+    expect(next.stages[0]).toMatchObject({ key: "intake", statusKeys: ["submitted"] });
+  });
 });
 
 describe("workflow designer", () => {
@@ -174,6 +241,7 @@ describe("workflow designer", () => {
     handlers.set("orders.admin.workflows.list", () => []);
     const user = userEvent.setup();
     const { container, location } = designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     expect(await screen.findByRole("heading", { level: 2, name: "Statuses" })).toBeInTheDocument();
     expect(screen.getAllByLabelText(/^Staff label/)).toHaveLength(2);
     await expectNoAxeViolations(container);
@@ -198,7 +266,7 @@ describe("workflow designer", () => {
     await user.click(screen.getByRole("checkbox", { name: /Require a note/ }));
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
     // Increment 04: phases and requirements step (optional; edits here are undone so the publish payload is unchanged).
-    expect(await screen.findByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 2, name: "Status requirements" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Add phase" }));
     expect(screen.getByLabelText(/Phase 1 name/)).toHaveValue("Phase 1");
     await user.click(screen.getAllByRole("button", { name: /^Add upload to / })[0]!);
@@ -227,6 +295,7 @@ describe("workflow designer", () => {
     });
     const user = userEvent.setup();
     designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await user.click(await screen.findByRole("button", { name: "Save and continue" }));
     expect(await screen.findByText("This draft was changed by someone else. Reload it and try again.")).toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 2, name: "Statuses" })).toBeInTheDocument();
@@ -238,6 +307,7 @@ describe("workflow designer", () => {
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     const { container } = designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await user.click(await screen.findByRole("tab", { name: "Canvas" }));
     expect(await screen.findByRole("button", { name: /Start: Submitted/ }, { timeout: 10000 })).toBeInTheDocument();
     const add = screen.getByRole("group", { name: "Add a transition" });
@@ -258,7 +328,7 @@ describe("workflow designer", () => {
     expect(saved.definition.transitions).toEqual([{ ...transition, requiresNote: true }]);
 
     // The wizard shows the same edit.
-    await user.click(screen.getByRole("tab", { name: "Wizard" }));
+    await user.click(screen.getByRole("tab", { name: "Statuses wizard" }));
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(await screen.findByRole("heading", { level: 2, name: "Transitions" })).toBeInTheDocument();
     expect(screen.getByText("Transition 1: Submitted to Completed")).toBeInTheDocument();
@@ -280,8 +350,9 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     const { container } = designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
-    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements"]) {
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Status requirements"]) {
       await user.click(screen.getByRole("button", { name: "Save and continue" }));
       expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
     }
@@ -299,7 +370,7 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     // Saving without a policy: the server's message appears at the field and the step is blocked.
     await user.click(screen.getByRole("button", { name: "Save and continue" }));
     expect(await screen.findAllByText("Acceptance gate 1: choose a policy from the policy centre.")).not.toHaveLength(0);
-    expect(screen.getByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "Status requirements" })).toBeInTheDocument();
 
     await user.selectOptions(policy, POLICY_A);
     await user.selectOptions(applies, "step:submitted");
@@ -342,6 +413,7 @@ describe("workflow designer — acceptance gates and storage folders (part B)", 
     });
     const user = userEvent.setup();
     designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
     for (let i = 0; i < 4; i += 1) await user.click(screen.getByRole("button", { name: "Save and continue" }));
     const gates = await screen.findByRole("group", { name: "Acceptance gates" });
@@ -356,7 +428,7 @@ describe("workflow designer — customer tasks and findings (increment 06, D8)",
   const toRules = async (user: ReturnType<typeof userEvent.setup>) => {
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
     for (let i = 0; i < 4; i += 1) await user.click(screen.getByRole("button", { name: "Save and continue" }));
-    await screen.findByRole("heading", { level: 2, name: "Phases and requirements" });
+    await screen.findByRole("heading", { level: 2, name: "Status requirements" });
   };
 
   it("adds a recording and a document task with presets and response modes; the saved definition carries them", async () => {
@@ -365,6 +437,7 @@ describe("workflow designer — customer tasks and findings (increment 06, D8)",
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     const { container } = designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await toRules(user);
 
     await user.click(screen.getAllByRole("button", { name: /^Add recording to / })[0]!);
@@ -402,6 +475,7 @@ describe("workflow designer — customer tasks and findings (increment 06, D8)",
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
     const toggle = screen.getByRole("button", { name: /1 to fix/ });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -409,7 +483,7 @@ describe("workflow designer — customer tasks and findings (increment 06, D8)",
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     const findings = document.getElementById("wf-findings")!;
     await user.click(within(findings).getByRole("button", { name: `Show: ${labelIssue.message}` }));
-    expect(await screen.findByRole("heading", { level: 2, name: "Phases and requirements" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 2, name: "Status requirements" })).toBeInTheDocument();
     await waitFor(() => expect(document.activeElement?.id).toBe("wf-field-states-0-requirements-uploads-0-label"));
     expect(document.activeElement).toHaveAttribute("aria-invalid", "true");
   });
@@ -419,6 +493,7 @@ describe("workflow designer — customer tasks and findings (increment 06, D8)",
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
     await user.click(screen.getByRole("button", { name: /1 to fix/ }));
     await user.click(within(document.getElementById("wf-findings")!).getByRole("button", { name: `Show: ${deadEnd.message}` }));
@@ -444,8 +519,9 @@ describe("workflow designer — review summary", () => {
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     const user = userEvent.setup();
     const { container } = designer();
+    await user.click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
-    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements", "Review and publish"]) {
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Status requirements", "Review and publish"]) {
       await user.click(screen.getByRole("button", { name: "Save and continue" }));
       expect(await screen.findByRole("heading", { level: 2, name: next })).toBeInTheDocument();
     }
@@ -469,8 +545,9 @@ describe("designer part B page accessibility", () => {
     handlers.set("orders.admin.workflows.drafts.list", () => []);
     document.title = "Workflow draft · Console";
     renderUi(<main><Route path="/admin/workflows/drafts/:draftId"><WorkflowDesignerPage /></Route></main>, { path: `/admin/workflows/drafts/${DRAFT}` });
+    await userEvent.setup().click(await screen.findByRole("tab", { name: "Statuses wizard" }));
     await screen.findByRole("heading", { level: 2, name: "Statuses" });
-    for (const next of ["Transitions", "Who may move", "Notices and notes", "Phases and requirements"]) {
+    for (const next of ["Transitions", "Who may move", "Notices and notes", "Status requirements"]) {
       fireEvent.click(screen.getByRole("button", { name: "Save and continue" }));
       await screen.findByRole("heading", { level: 2, name: next });
     }

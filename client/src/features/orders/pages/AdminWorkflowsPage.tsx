@@ -1,6 +1,7 @@
 /**
  * Console workflows (/admin/workflows). Owner: orders_engineer.
- * Lists workflows and open drafts; starts drafts (standard, blank, copy) that the designer edits. Publishing happens
+ * Lists workflows and open drafts; starts drafts (ReadyPackets phases, standard, blank, copy) that the designer edits.
+ * Increment 07 QA: while no published workflow has phases, a dismissible notice offers "add" and "convert" drafts. Publishing happens
  * in the designer and always creates a new version; orders stay bound to the version they started on.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -26,6 +27,9 @@ export default function AdminWorkflowsPage() {
   const [creating, setCreating] = useState(false);
   const [discarding, setDiscarding] = useState<DraftListRow | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [noticeDismissed, setNoticeDismissed] = useState(() => phasesNoticeDismissed);
+  const addPhases = useMutation(trpc.orders.admin.workflows.phases.addStandard.mutationOptions());
+  const convertDefault = useMutation(trpc.orders.admin.workflows.phases.convertDefault.mutationOptions());
 
   const refresh = () =>
     Promise.all([
@@ -58,6 +62,23 @@ export default function AdminWorkflowsPage() {
       if (typeof existing === "string") return navigate(`/admin/workflows/drafts/${existing}`);
       setProblem(errorMessage(err));
     }
+  };
+
+  const openPhases = (draftId: string) => navigate(`/admin/workflows/drafts/${draftId}`);
+  const startPhases = async (kind: "add" | "convert") => {
+    setProblem(null);
+    try {
+      const result = kind === "add" ? await addPhases.mutateAsync() : await convertDefault.mutateAsync();
+      if (!result.created) toast.show({ tone: "info", title: "Opening the existing draft" });
+      await refresh();
+      openPhases(result.draftId);
+    } catch (err) {
+      setProblem(errorMessage(err));
+    }
+  };
+  const dismissNotice = () => {
+    phasesNoticeDismissed = true;
+    setNoticeDismissed(true);
   };
 
   const header = (
@@ -93,6 +114,8 @@ export default function AdminWorkflowsPage() {
     );
   const rows = workflows.data;
   const draftRows = drafts.data ?? [];
+  const defaultWorkflow = rows.find((wf) => wf.isDefault && wf.currentVersionPublicId) ?? null;
+  const showPhasesNotice = rows.length > 0 && !noticeDismissed && !rows.some((wf) => (wf.definition?.stages?.length ?? 0) > 0);
   return (
     <>
       {header}
@@ -102,6 +125,32 @@ export default function AdminWorkflowsPage() {
           <Callout tone="danger" live="assertive">
             {problem}
           </Callout>
+        ) : null}
+        {showPhasesNotice ? (
+          <section aria-labelledby="phases-notice-title" className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line bg-surface p-4 sm:p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <h2 id="phases-notice-title" className="text-lg font-semibold text-ink">
+                Your workflows do not use phases yet
+              </h2>
+              <Button size="sm" variant="ghost" aria-label="Dismiss the phases notice" onClick={dismissNotice}>
+                Dismiss
+              </Button>
+            </div>
+            <p className="max-w-3xl text-body">
+              Phases group statuses into the steps a customer recognises, such as payment, intake, review and delivery. Customers see a progress bar, each phase can ask for uploads or answers, and staff
+              review and accept each phase. Both choices below only start a draft: nothing changes for orders until you publish, and existing orders keep the version they started on.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button loading={addPhases.isPending} disabled={convertDefault.isPending} onClick={() => void startPhases("add")}>
+                Add the ReadyPackets phases workflow
+              </Button>
+              {defaultWorkflow ? (
+                <Button variant="secondary" loading={convertDefault.isPending} disabled={addPhases.isPending} onClick={() => void startPhases("convert")}>
+                  {`Convert ${defaultWorkflow.name} to phases`}
+                </Button>
+              ) : null}
+            </div>
+          </section>
         ) : null}
         {rows.length === 0 ? (
           <EmptyState
@@ -199,6 +248,13 @@ export default function AdminWorkflowsPage() {
   );
 }
 
+/** No browser storage for portal data (lint rule): a dismissal lasts until the page is reloaded. */
+let phasesNoticeDismissed = false;
+/** Tests only. */
+export function resetPhasesNoticeForTests() {
+  phasesNoticeDismissed = false;
+}
+
 function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: WorkflowListRow[]; onClose: () => void; onCreated: (draftId: string) => void }) {
   const trpc = useTRPC();
   const create = useMutation(trpc.orders.admin.workflows.drafts.create.mutationOptions());
@@ -206,7 +262,7 @@ function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: Workf
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
   const [keyTouched, setKeyTouched] = useState(false);
-  const [from, setFrom] = useState<"standard" | "blank" | "copy">("standard");
+  const [from, setFrom] = useState<"phases" | "standard" | "blank" | "copy">("phases");
   const [copyFrom, setCopyFrom] = useState(copyable[0]?.currentVersionPublicId ?? "");
   const [errors, setErrors] = useState<{ name?: string; key?: string; copy?: string; form?: string }>({});
   const taken = new Set(workflows.map((wf) => wf.workflowKey));
@@ -281,7 +337,8 @@ function NewWorkflowDialog({ workflows, onClose, onCreated }: { workflows: Workf
           value={from}
           onValueChange={(value) => setFrom(value as typeof from)}
           options={[
-            { value: "standard", label: "The standard workflow", description: "Submitted, In review, Waiting on customer, Completed, Cancelled." },
+            { value: "phases", label: "ReadyPackets phases (recommended)", description: "Seven phases from payment to delivery, with customer uploads, review and a progress bar." },
+            { value: "standard", label: "The standard workflow (statuses)", description: "Submitted, In review, Waiting on customer, Completed, Cancelled. No phases." },
             { value: "blank", label: "Blank", description: "Only a start status and a final status." },
             { value: "copy", label: "A copy of an existing workflow", description: "Its current published version.", disabled: copyable.length === 0 },
           ]}

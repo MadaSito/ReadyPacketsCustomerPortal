@@ -107,8 +107,8 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
   const [publishable, setPublishable] = useState(initial.publishable);
   const [dirty, setDirty] = useState(false);
   const edits = useRef(0);
-  // Increment 07 (D1): a format-3 draft opens on its phases.
-  const [tab, setTab] = useState(initial.definition.stages?.length ? "phases" : "wizard");
+  // Increment 07 QA: every draft opens on Phases (phases-first); a draft without phases shows how to start them.
+  const [tab, setTab] = useState("phases");
   const [step, setStep] = useState<WizardStepId>("statuses");
   const [visited, setVisited] = useState<WizardStepId[]>([]);
   const [stepBlocked, setStepBlocked] = useState(false);
@@ -280,9 +280,10 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
           value={tab}
           onValueChange={setTab}
           items={[
+            { value: "phases", label: "Phases", content: <PhasesView definition={work.definition} issues={issues} disabled={busy} setDefinition={setDefinition} /> },
             {
               value: "wizard",
-              label: "Wizard",
+              label: "Statuses wizard",
               content: (
                 <Wizard
                   steps={WIZARD_STEPS.map((s) => ({ id: s.id, label: s.label }))}
@@ -316,12 +317,21 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
               ),
             },
             { value: "canvas", label: "Canvas", content: <CanvasView work={work} issues={issues} edit={edit} setDefinition={setDefinition} /> },
-            { value: "phases", label: "Phases", content: <PhasesView definition={work.definition} issues={issues} disabled={busy} setDefinition={setDefinition} /> },
           ]}
         />
       </div>
     </>
   );
+}
+
+/**
+ * Increment 07 QA: phases derived from the statuses (or their classic groups); the classic groups are removed in the
+ * same step, since a draft may not use both (STAGES_WITH_PHASES). Exported for tests.
+ */
+export function startPhases(definition: DraftDefinition): DraftDefinition {
+  const stages = deriveStages(definition);
+  const { phases: _classic, ...rest } = definition;
+  return { ...rest, states: definition.states.map(({ phase: _group, ...state }) => state), stages } as DraftDefinition;
 }
 
 /** Increment 07 (D1): the phase editor (package A) over `definition.stages`; the server validates on save. */
@@ -349,7 +359,7 @@ function PhasesView(props: { definition: DraftDefinition; issues: WorkflowIssue[
             then review each phase before you publish. Existing orders keep the version they started with.
           </p>
           <div>
-            <Button variant="secondary" disabled={disabled || definition.states.length === 0} onClick={() => setStages(deriveStages(definition))}>
+            <Button variant="secondary" disabled={disabled || definition.states.length === 0} onClick={() => setDefinition(startPhases(definition))}>
               Start phases from statuses
             </Button>
           </div>
@@ -398,7 +408,7 @@ function StepBody(props: StepBodyProps) {
     transitions: "Which moves are possible. Every status except a final one needs a way out.",
     who: "Who may make each move. The server enforces this for every request.",
     notices: "Whether the customer is told about each move, and whether the person moving it must write a note.",
-    rules: "Optional. Group statuses into phases and list what must be uploaded or accepted before an order can leave a status. Publishing these rules needs the workflow rules setting turned on in Settings.",
+    rules: "Optional. List what must be uploaded or accepted before an order can leave a status. Workflows without phases can also group statuses so a group locks when the order leaves it. Publishing these rules needs the workflow rules setting turned on in Settings.",
     review: "Check the summary, then publish. Orders already in progress keep the version they started on.",
   };
   const problems =
@@ -503,7 +513,11 @@ function StepBody(props: StepBodyProps) {
 
       {step === "rules" ? (
         <>
-          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          {definition.stages?.length ? (
+            <Callout tone="info">This workflow uses phases, so status groups and their locks are set on the Phases tab. The requirements below still apply to each status.</Callout>
+          ) : (
+            <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          )}
           <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
           <StorageFolderEditor definition={definition} issues={issues} onChange={setDefinition} />
           <ol className="flex flex-col gap-4">
@@ -688,9 +702,11 @@ function CanvasView({ work, issues, edit, setDefinition }: { work: Editable; iss
             <p className="text-body">Select a status or a transition on the canvas to edit it here. You can also use the forms below instead of dragging.</p>
           </Card>
         ) : null}
-        <Card title="Phases" headingLevel={2}>
-          <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
-        </Card>
+        {definition.stages?.length ? null : (
+          <Card title="Status groups (older workflows)" headingLevel={2}>
+            <PhasesEditor definition={definition} issues={issues} onChange={setDefinition} />
+          </Card>
+        )}
         <Card title="Acceptance and storage" headingLevel={2}>
           <div className="flex flex-col gap-4">
             <AcceptanceGatesEditor definition={definition} issues={issues} onChange={setDefinition} />
