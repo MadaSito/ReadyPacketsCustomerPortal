@@ -742,6 +742,22 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       }
     });
 
+    it("statusSummary: unprivileged read for status cards, no secrets or identifiers", async () => {
+      const before = await sso().statusSummary();
+      expect(before).toMatchObject({ enabled: false, protocol: "oidc", nearestCertificateExpiry: null, settingsPath: "/admin/sso" });
+      await configureSaml({ entraMfaMode: "portal" });
+      const user = await makeUser();
+      const id = oid();
+      await bind(user.publicId, id);
+      await (await samlSignIn(id)).finish();
+      const summary = await sso().statusSummary();
+      expect(summary).toMatchObject({ configured: true, enabled: true, complete: true, protocol: "saml", entraMfaMode: "portal", trustedCertificates: 1 });
+      expect(summary.nearestCertificateExpiry?.getTime()).toBeGreaterThan(h.clock.now().getTime());
+      expect(summary.lastSignInAt?.getTime()).toBe(h.clock.now().getTime());
+      const text = JSON.stringify(summary);
+      for (const secret of [TENANT, CLIENT, SECRET, id, user.publicId, "BEGIN CERTIFICATE"]) expect(text).not.toContain(secret);
+    });
+
     it("a protocol switch cancels pending attempts but keeps sessions", async () => {
       await configureSaml({ clientId: CLIENT, clientSecret: SECRET });
       const user = await makeUser();

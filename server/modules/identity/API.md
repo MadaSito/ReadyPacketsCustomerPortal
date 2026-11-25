@@ -406,6 +406,12 @@ New configurations default to `["admin","staff"]`; customers opt in. A disallowe
 `SSO_ROLE_NOT_ALLOWED`; narrowing revokes live Entra sessions of the removed roles. JIT never creates an administrator:
 `sso_role_mappings` (app-role value → staff | customer, ≤ 20; staff wins), plus the legacy `jit_staff_app_role`.
 
+### Status summary (service-internal, for other modules' status cards / health)
+`deps.services.identity.sso.statusSummary(tx?) → SsoStatusSummary` — unprivileged, read-only, not on tRPC/HTTP:
+`{ configured, enabled, complete, availableInThisDeployment, protocol, entraMfaMode, trustedCertificates,
+nearestCertificateExpiry (SAML only), metadataStatus, metadataCheckedAt, lastSignInAt, settingsPath: "/admin/sso" }`.
+Never contains secrets, tenant/client ids, certificate material or user identifiers. Callers must not audit it.
+
 ### tRPC (`trpc.identity.admin.sso.*`, admin + `identity.sso.manage`, step-up as before)
 - `get` → `SsoAdminView` + `protocol`, `entraMfaMode`, `acceptedAuthnContexts[]`, `allowedRoles[]`,
   `saml: { entityId, entityIdIsDefault, acsUrl, signOnUrl, metadataUrl, idpIssuer, requiredClaims[], metadataSourceUrl,

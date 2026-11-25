@@ -173,6 +173,25 @@ export interface SsoConfigInput {
   allowedRoles: UserRole[];
 }
 
+/** Unprivileged status summary (see statusSummary). */
+export interface SsoStatusSummary {
+  configured: boolean;
+  enabled: boolean;
+  complete: boolean;
+  availableInThisDeployment: boolean;
+  protocol: SsoProtocol;
+  entraMfaMode: EntraMfaMode;
+  trustedCertificates: number;
+  /** SAML only: earliest notAfter among trusted certificates. */
+  nearestCertificateExpiry: Date | null;
+  /** Safe outcome code of the last metadata/certificate check (OK, FETCH_FAILED, ROLLOVER_BLOCKED, …). */
+  metadataStatus: string | null;
+  metadataCheckedAt: Date | null;
+  /** Most recent successful Entra sign-in by any linked account. */
+  lastSignInAt: Date | null;
+  settingsPath: "/admin/sso";
+}
+
 export interface SsoAdminView {
   enabled: boolean;
   tenantId: string | null;
@@ -459,6 +478,34 @@ export function createSsoService(i: SsoInternals) {
     };
   }
 
+  /**
+   * Read-only, unprivileged status summary for other modules' status cards / health (integrations hub).
+   * Never contains secrets, tenant/client ids, certificate material or user identifiers. Not on tRPC/HTTP.
+   */
+  async function statusSummary(tx?: Tx): Promise<SsoStatusSummary> {
+    const row = await loadConfig(tx);
+    const certificates = await samlAdmin.listCertificates(tx);
+    const trusted = certificates.filter((c) => c.state === "trusted");
+    const nearest = trusted.reduce<Date | null>((min, c) => (min === null || c.notAfter < min ? c.notAfter : min), null);
+    const [last] = await (tx ?? deps.db).select({ at: sql<Date | null>`max(${ssoIdentities.lastSignInAt})` }).from(ssoIdentities).where(eq(ssoIdentities.provider, "entra"));
+    const lastAt = last?.at ? new Date(last.at) : null;
+    const protocol = row?.protocol ?? "oidc";
+    return {
+      configured: (row?.tenantId ?? null) !== null,
+      enabled: row?.enabled === true,
+      complete: isComplete(row) && (protocol !== "saml" || trusted.length > 0),
+      availableInThisDeployment: availableInDeployment(),
+      protocol,
+      entraMfaMode: mfaModeOf(row),
+      trustedCertificates: trusted.length,
+      nearestCertificateExpiry: protocol === "saml" ? nearest : null,
+      metadataStatus: row?.samlMetadataStatus ?? null,
+      metadataCheckedAt: row?.samlMetadataRefreshedAt ?? null,
+      lastSignInAt: lastAt && !Number.isNaN(lastAt.getTime()) ? lastAt : null,
+      settingsPath: "/admin/sso",
+    };
+  }
+
   /* ------------------------------------------------------------------ Entra I/O */
 
   async function postToken(row: SsoConfigurationRow & { tenantId: string; clientId: string; clientSecretEnc: string }, code: string, verifier: string): Promise<string> {
@@ -568,6 +615,7 @@ export function createSsoService(i: SsoInternals) {
   const service = {
     redirectUri,
     adminView,
+    statusSummary,
 
     async publicConfig(): Promise<{ enabled: boolean; buttonLabel: string; providerName: string; protocol: SsoProtocol; startPath: string; customersAllowed: boolean }> {
       const row = await loadConfig();
