@@ -4031,7 +4031,7 @@ export function createProductionWebhookService(
         return {
           outcome: "refused_precondition",
           dispatchPublicId: null,
-          reasonCode: prep.error.code,
+          reasonCode: prep.error.reasonCode,
           message: prep.error.message,
         };
       }

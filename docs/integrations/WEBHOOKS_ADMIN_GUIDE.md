@@ -52,7 +52,49 @@ Use **Rotate secret** on a subscription or inbound endpoint with an `overlapMinu
    - Duplicate signed `id` values for the same endpoint return `200 OK` with `{ "ok": true, "duplicate": true }` without firing duplicate automations.
    - Valid new events emit the durable `integration.webhook.inbound_received` audit event (`webhook.inbound_received` trigger for internal automations; inbound webhooks never fan out to outbound webhooks).
 
-## 4. Unified Delivery Log, Redaction & Replay
+## 4. Unified Delivery Log, Stop, Eligible Retry vs Redeliver & Order Filtering
 
 - **Redacted encrypted payloads**: Request and response headers and bodies are redacted (`Authorization`, `Cookie`, `Set-Cookie`, `X-ReadyPackets-Signature`, and sensitive JSON keys) and encrypted at rest via `FieldCrypto` (`AES-256-GCM`) up to `64 KiB`.
-- **Truncation & purge safety**: Payloads larger than `64 KiB` (`bodyTruncated = true`) or past their retention window (`bodyPurged = true`, swept hourly by `integrations.webhook.purge`) retain metadata for audit visibility but refuse `Redeliver` / `Reprocess` with `409 Conflict` so partial or missing bodies are never replayed.
+- **Order-scoped filtering (`orderPublicId`)**: Filter outbound deliveries on `/admin/integrations/webhooks` by order public ID (`01J...`) to inspect every phase-triggered or automation-triggered webhook associated with a specific order alongside its originating `stageKey`.
+- **Stopping queued or retrying deliveries (`Stop`)**: Administrators with `webhooks.manage` or `api.replay` can stop any `queued` or `retrying` outbound delivery (`status = "stopped"`), cancelling its pending background job under the job lease fence and recording a durable `integration.webhook.delivery_stopped` audit event.
+- **Eligible Retry vs Redeliver**:
+  - **Retry (`deliveries.retry`)**: Available only on undelivered `failed`, `dead`, or `stopped` outbound deliveries whose encrypted payload has not been truncated or purged. Re-queues the **same** delivery record (`manualRetryCount + 1`, preserving the original `X-ReadyPackets-Delivery` and `Idempotency-Key` with **no** `X-ReadyPackets-Replay` header) and records `integration.webhook.delivery_retried`.
+  - **Redeliver (`deliveries.redeliver`, MFA step-up)**: Creates a **new** replay delivery record (`replayOfPublicId` linked to the original) with `X-ReadyPackets-Replay: 1` for intentionally replaying a completed or historical event.
+  - **Truncation & purge safety**: Payloads larger than `64 KiB` (`bodyTruncated = true`) or past their retention window (`bodyPurged = true`, swept hourly by `integrations.webhook.purge`) retain metadata for audit visibility but refuse `Retry`, `Redeliver`, and `Reprocess` with `409 Conflict`.
+- **Operations Center alerts**: Exhausted dead-letter deliveries and subscriptions that cross `autoDisableThreshold` (`disabled_failing`) automatically emit deduplicated alerts in **Admin -> Operations -> Alerts** (`source = "webhook"`) and resolve automatically once healthy delivery resumes.
+
+## 5. Optional Signing & Workflow Phase Webhook Triggers
+
+- **Per-subscription signing toggle (`signingEnabled`)**: Outbound subscriptions enable `X-ReadyPackets-Signature` HMAC-SHA256 signing by default (`signingEnabled = true`). When integrating with a receiver that accepts HTTPS + allowlisted authentication headers without a custom HMAC verifier, administrators can set **Sign payloads (`X-ReadyPackets-Signature`)** to **Off** when creating or editing the subscription.
+- **Workflow Phases & Automation Rule Actions**:
+  - In **Admin -> Workflows** (Phase settings -> **Webhook trigger**) and **Admin -> Automations** (`webhook.enqueue_subscription`), staff and administrators select from a safe list of configured production phases (`production:P101` .. `production:P401`) and named outbound subscriptions (`subscription:<ULID>`) without exposing destination URLs or signing secrets.
+  - Workflow exports record portable logical references (`production:P101` .. `production:P401` or `subscription:<Subscription Name>`) and resolve them safely on import without overwriting existing orders.
+
+## 6. Outbound Egress Presets & Microsoft Graph `Sites.Selected` SharePoint Setup
+
+### One-Click Provider Egress Presets (`/admin/integrations/egress`)
+
+Open **Admin -> Integrations -> Egress Allowlist** to view and toggle built-in outbound host presets (fresh MFA step-up required when enabling a preset):
+- **Payment gateways**: `stripe`, `square`, `square_sandbox`
+- **Microsoft Entra & Graph / SharePoint**: `entra_oidc`, `microsoft_graph` (`login.microsoftonline.com` + `graph.microsoft.com`), `microsoft_graph_upload` (`*.sharepoint.com` + `*.files.1drv.com`)
+- **Cloud object storage**: `aws_s3`, `azure_blob`, `dropbox`, `google_drive`
+
+### Least-Privilege Microsoft Entra & SharePoint `Sites.Selected` Runbook
+
+ReadyPackets uses single-tenant Microsoft Entra client credentials (`common`, `organizations`, and `consumers` multi-tenant endpoints are refused) and recommends **least-privilege `Sites.Selected`** application permissions rather than tenant-wide `Sites.ReadWrite.All` or `Files.ReadWrite.All`:
+
+1. In **Microsoft Entra admin center -> App registrations**, register a single-tenant app in your organization's directory, record **Directory (tenant) ID** and **Application (client) ID**, and create a client secret.
+2. Under **API permissions -> Add a permission -> Microsoft Graph -> Application permissions**, grant **`Sites.Selected`** (plus `Mail.Send` only if using Graph Mail failover) and click **Grant admin consent**.
+3. Grant the app `write` access to the single target SharePoint site (using an administrative tool with `Sites.FullControl.All`, never granted to the portal app itself):
+   - **PowerShell (`Microsoft.Graph.Sites`)**:
+     ```powershell
+     Connect-MgGraph -Scopes "Sites.FullControl.All"
+     New-MgSitePermission -SiteId "<hostname>,<spsite-guid>,<spweb-guid>" `
+       -Roles @("write") `
+       -GrantedToIdentities @(@{ Application = @{ Id = "<PORTAL_ENTRA_CLIENT_ID>"; DisplayName = "ReadyPackets Portal" } })
+     ```
+   - **Microsoft Graph REST API**:
+     `POST https://graph.microsoft.com/v1.0/sites/{siteId}/permissions` with body `{"roles":["write"],"grantedToIdentities":[{"application":{"id":"<PORTAL_ENTRA_CLIENT_ID>","displayName":"ReadyPackets Portal"}}]}`.
+4. In **Admin -> Integrations -> Egress Allowlist**, enable both **`microsoft_graph`** and **`microsoft_graph_upload`**.
+5. In **Admin -> Integrations -> Microsoft Graph** (or **Admin -> Storage**), save your single-tenant credentials and run **Verify `Sites.Selected` Write Access** (`admin.graph.verifySitesSelectedWrite`). The portal verifies both egress presets, OAuth token acquisition, site/drive read access, and non-destructive write permission by opening a temporary `createUploadSession` and immediately cancelling it with `DELETE` (leaving zero marker files in SharePoint and never forwarding bearer tokens to SharePoint upload URLs).
+
