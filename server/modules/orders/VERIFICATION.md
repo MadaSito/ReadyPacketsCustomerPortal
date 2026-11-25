@@ -197,7 +197,9 @@ Not verified: a real browser (320 px, zoom, both themes, screen-reader reading o
 
 Run: `scripts/dev/test.sh` per file, `scripts/dev/tc.sh` (no errors in orders-owned files), ESLint on changed paths.
 
-Not verified: the upgrade-draft branch of the start-up job and the phase target checks (webhook / file sync) have no automated test yet; a real browser for the designer's Phases view (keyboard, 320 px, both themes, screen reader); the paid backfill for existing orders is not implemented (existing orders keep `not_required`).
+Verified (dd8895d, stages.test.ts 6/6): the start-up job's upgrade-draft branch, and the paid backfill. The backfill moves `not_required` orders with a total above 0 and no `paidAt` to `paid` only when the payments summary says so. It writes audit reason `PAYMENT_BACKFILL` and leaves the status alone.
+
+Not verified: the phase target checks (webhook / file sync) have no automated test yet; a real browser for the designer's Phases view (keyboard, 320 px, both themes, screen reader).
 
 ## Increment 07 D4: phase questions, checklist and submission panel
 
