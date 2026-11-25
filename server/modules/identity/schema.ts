@@ -185,6 +185,7 @@ export const ssoConfiguration = mysqlTable("sso_configuration", {
   /** Entra app-role value that qualifies for staff provisioning (jit_mode = staff). Never yields admin. */
   jitStaffAppRole: varchar("jit_staff_app_role", { length: 120 }),
   jitDailyLimit: int("jit_daily_limit", { unsigned: true }).notNull().default(25),
+  epoch: int("epoch", { unsigned: true }).notNull().default(1),
   /* increment 07 (D10): SAML 2.0 and the Entra MFA mode. All nullable or defaulted (additive). */
   /** Active protocol. Both resolve to the same identity (tenant id, object id). */
   protocol: mysqlEnum("protocol", SSO_PROTOCOLS).notNull().default("oidc"),
