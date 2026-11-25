@@ -160,6 +160,10 @@ export const customerRefHistory = mysqlTable(
 
 export const SSO_JIT_MODES = ["off", "customers", "staff"] as const;
 export type SsoJitMode = (typeof SSO_JIT_MODES)[number];
+export const SSO_PROTOCOLS = ["oidc", "saml"] as const;
+export type SsoProtocol = (typeof SSO_PROTOCOLS)[number];
+export const ENTRA_MFA_MODES = ["claim", "entra", "portal"] as const;
+export type EntraMfaMode = (typeof ENTRA_MFA_MODES)[number];
 
 /**
  * Single-row SSO configuration (id = 1). The client secret is encrypted (aad `sso_configuration.client_secret`)
@@ -181,7 +185,25 @@ export const ssoConfiguration = mysqlTable("sso_configuration", {
   /** Entra app-role value that qualifies for staff provisioning (jit_mode = staff). Never yields admin. */
   jitStaffAppRole: varchar("jit_staff_app_role", { length: 120 }),
   jitDailyLimit: int("jit_daily_limit", { unsigned: true }).notNull().default(25),
-  epoch: int("epoch", { unsigned: true }).notNull().default(1),
+  /* increment 07 (D10): SAML 2.0 and the Entra MFA mode. All nullable or defaulted (additive). */
+  /** Active protocol. Both resolve to the same identity (tenant id, object id). */
+  protocol: mysqlEnum("protocol", SSO_PROTOCOLS).notNull().default("oidc"),
+  /** SP Identifier (Entity ID). NULL = the derived default `<origin>/api/identity/saml/metadata`. */
+  samlEntityId: varchar("saml_entity_id", { length: 255 }),
+  /** Entra federation metadata URL (https, host login.microsoftonline.com only). */
+  samlMetadataUrl: varchar("saml_metadata_url", { length: 512 }),
+  samlMetadataRefreshedAt: utcDateTime("saml_metadata_refreshed_at"),
+  /** Safe outcome code of the last metadata refresh (e.g. OK, FETCH_FAILED, TENANT_MISMATCH). */
+  samlMetadataStatus: varchar("saml_metadata_status", { length: 40 }),
+  /**
+   * claim | entra | portal. NULL = a row written before increment 07: read as trust_entra_mfa ? claim : portal
+   * (trust_entra_mfa is kept, deprecated, and still written for compatibility).
+   */
+  entraMfaMode: mysqlEnum("entra_mfa_mode", ENTRA_MFA_MODES),
+  /** JSON array of accepted SAML AuthnContextClassRef URIs that prove MFA (claim mode). NULL = none. */
+  acceptedAuthnContexts: text("accepted_authn_contexts"),
+  /** JSON array of roles that may sign in with SSO. NULL = a pre-increment-07 row: every role (unchanged). */
+  allowedRoles: text("sso_allowed_roles"),
   updatedByUserId: refColumn("updated_by_user_id"),
   version: versionColumn(),
   createdAt: createdAtColumn(),
@@ -259,16 +281,75 @@ export const ssoAuthRequests = mysqlTable(
     expiresAt: utcDateTime("expires_at").notNull(),
     callbackAt: utcDateTime("callback_at"),
     completedAt: utcDateTime("completed_at"),
+    /* increment 07 (D10). For SAML, `state_hash` holds the hash of the AuthnRequest ID (InResponseTo). */
+    protocol: mysqlEnum("protocol", SSO_PROTOCOLS).notNull().default("oidc"),
+    /** SAML step-up / link: the AuthnRequest carried ForceAuthn="true". */
+    forceAuthn: boolean("force_authn").notNull().default(false),
+    /** Hash of the accepted assertion ID (replay defence in depth; unique while the row is kept, ≥ 24 h). */
+    assertionIdHash: char("assertion_id_hash", { length: 64 }),
     createdAt: createdAtColumn(),
   },
   (table) => [
     uniqueIndex("sso_auth_requests_state_uq").on(table.stateHash),
     uniqueIndex("sso_auth_requests_ticket_uq").on(table.ticketHash),
+    uniqueIndex("sso_auth_requests_assertion_uq").on(table.assertionIdHash),
     index("sso_auth_requests_browser_idx").on(table.browserHash, table.status),
     index("sso_auth_requests_expiry_idx").on(table.expiresAt),
   ],
 );
 export type SsoAuthRequestRow = typeof ssoAuthRequests.$inferSelect;
+
+export const SAML_CERT_SOURCES = ["manual", "metadata"] as const;
+export type SamlCertSource = (typeof SAML_CERT_SOURCES)[number];
+
+/**
+ * Pinned Entra SAML signing certificates (increment 07, D10). At most two are trusted at once (current + next
+ * for rollover); a retired row is kept for history and never trusted. Public certificates only — no keys.
+ */
+export const ssoSamlCertificates = mysqlTable(
+  "sso_saml_certificates",
+  {
+    id: idColumn(),
+    publicId: publicIdColumn(),
+    fingerprintSha256: char("fingerprint_sha256", { length: 64 }).notNull(),
+    certificatePem: text("certificate_pem").notNull(),
+    /** Display only (bounded, sanitized subject common name). */
+    subject: varchar("subject", { length: 255 }),
+    notBefore: utcDateTime("not_before").notNull(),
+    notAfter: utcDateTime("not_after").notNull(),
+    source: mysqlEnum("source", SAML_CERT_SOURCES).notNull(),
+    addedByUserId: refColumn("added_by_user_id"),
+    lastUsedAt: utcDateTime("last_used_at"),
+    retiredAt: utcDateTime("retired_at"),
+    retiredByUserId: refColumn("retired_by_user_id"),
+    createdAt: createdAtColumn(),
+  },
+  (table) => [
+    uniqueIndex("sso_saml_certificates_fp_uq").on(table.fingerprintSha256),
+    index("sso_saml_certificates_active_idx").on(table.retiredAt, table.notAfter),
+  ],
+);
+export type SsoSamlCertificateRow = typeof ssoSamlCertificates.$inferSelect;
+
+export const SSO_MAPPED_ROLES = ["staff", "customer"] as const;
+export type SsoMappedRole = (typeof SSO_MAPPED_ROLES)[number];
+
+/**
+ * Entra app-role value → portal role for just-in-time accounts (increment 07, D10). Never administrator.
+ * Up to 20 rows; staff mappings win over customer mappings when a user holds several app roles.
+ */
+export const ssoRoleMappings = mysqlTable(
+  "sso_role_mappings",
+  {
+    id: idColumn(),
+    appRoleValue: varchar("app_role_value", { length: 120 }).notNull(),
+    role: mysqlEnum("role", SSO_MAPPED_ROLES).notNull(),
+    createdByUserId: refColumn("created_by_user_id"),
+    createdAt: createdAtColumn(),
+  },
+  (table) => [uniqueIndex("sso_role_mappings_value_uq").on(table.appRoleValue)],
+);
+export type SsoRoleMappingRow = typeof ssoRoleMappings.$inferSelect;
 
 /* ------------------------------------------------------------------ increment 04: session centre (package D) */
 
