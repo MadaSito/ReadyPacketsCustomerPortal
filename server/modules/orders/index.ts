@@ -47,6 +47,11 @@ import { createWorkflowTransferService, type WorkflowTransferService } from "./w
 export type { TransferApplyInput, TransferApplyResult, TransferPreview, TransferSelection, TransferStatus } from "./workflowTransferService.js";
 import { createOrderStatusCatalogService, type OrderStatusCatalogService } from "./statusCatalog.js";
 export type { AttentionCountsView, OrderStatusCatalogService } from "./statusCatalog.js";
+import { createStageRuntime } from "./stageRuntime.js";
+import { createOrderPaymentsPort, createStagesService } from "./stages.js";
+export type { StageWorkspace, StageViewState } from "./stages.js";
+import { createPhaseWorkServices } from "./questionsRouter.js";
+import { createStageStartup, STAGE_STARTUP_JOB } from "./stageStartup.js";
 
 export type * from "./types.js";
 
@@ -118,6 +123,12 @@ export interface OrdersModule extends ModuleLifecycle {
   agreementGate: AgreementGateService;
   /** Increment 07 (D2): admin-managed order status catalogue (`orders.statusCatalog.*`). */
   statusCatalog: OrderStatusCatalogService;
+  /** Increment 07 (D1/D3/D8): `orders.stages.*` and the stage ports (resolveStageForUpload, listForOrder, ...). */
+  stages: ReturnType<typeof createStagesService>;
+  /** Increment 07 (D9): payment state writes (compliance calls these in its own tx). */
+  payments: ReturnType<typeof createOrderPaymentsPort>;
+  /** Increment 07 (D4/D5): phase questions and admin tasks (assurance). */
+  phaseWork: ReturnType<typeof createPhaseWorkServices>;
   orders: OrderService;
   sharing: SharingService;
 }
@@ -143,7 +154,40 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
   const requirements = createRequirementsService({ ...deps, policy, workflows, actorCheck, gates });
   const access = createAccessService({ ...deps, policy, actorCheck });
   let paymentProvider: OrderPaymentSummaryProvider | null = null;
-  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, paymentSummary: () => paymentProvider });
+  const stageRuntime = createStageRuntime({ db: deps.db, clock: deps.clock, services: deps.services, workflows });
+  const orders = createOrderService({ ...deps, policy, catalog, workflows, requirements, access, gates, stageRuntime, paymentSummary: () => paymentProvider });
+  const stages = createStagesService({
+    db: deps.db,
+    clock: deps.clock,
+    audit: deps.audit,
+    crypto: deps.crypto,
+    logger: deps.logger,
+    policy,
+    actorCheck,
+    workflows,
+    requirements,
+    gates,
+    orders,
+    runtime: stageRuntime,
+  });
+  const payments = createOrderPaymentsPort({ clock: deps.clock, audit: deps.audit, logger: deps.logger, workflows, orders, runtime: stageRuntime });
+  const phaseWork = createPhaseWorkServices({
+    db: deps.db,
+    audit: deps.audit,
+    clock: deps.clock,
+    crypto: deps.crypto,
+    policy,
+    actorCheck,
+    gates,
+    resolveStage: stages.resolveQuestionStage,
+    refreshAttentionInTx: stages.refreshAttentionInTx,
+  });
+  const stageStartup = createStageStartup({ db: deps.db, clock: deps.clock, audit: deps.audit, logger: deps.logger });
+  deps.jobs.register(STAGE_STARTUP_JOB, async (job) => {
+    await job.assertStillOwned();
+    return stageStartup.job();
+  });
+  deps.jobs.registerSchedule({ name: STAGE_STARTUP_JOB, type: STAGE_STARTUP_JOB, everyMs: 10 * 60_000 });
   const getOrderFileFolderRouting = createFolderRouting({ workflows });
   const sharing = createSharingService({ ...deps, policy });
   const portable = createPortableHooks({ ...deps, workflows });
@@ -216,6 +260,9 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     workflowTransfer,
     agreementGate,
     statusCatalog,
+    stages,
+    payments,
+    phaseWork,
     orders,
     sharing,
     async health(): Promise<ModuleHealth[]> {
