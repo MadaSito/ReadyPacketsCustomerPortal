@@ -41,6 +41,7 @@ Package L, as reported by the owner:
 - **Resync.** It is bounded to 100 existing failed or blocked intents, with a dry run first.
 - **Uncertain uploads.** They are inspected, not replayed.
 - **No backfill.** Files from before sync was switched on are not copied.
+- **Intake delivery scope (lead decision).** Intake delivery gets only customer-visible, admitted (scan-cleared) phase files and verified audio derivatives, on publication. Staff-only files and pending or unconverted originals go only to Originals. There is no phase-submit hook.
 - **OneDrive.** It needs tenant-wide application file permissions, so SharePoint with `Sites.Selected` is preferred.
 
 ## Consequences

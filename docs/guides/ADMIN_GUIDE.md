@@ -424,6 +424,11 @@ File sync copies order files from the portal to SharePoint, one way, phase by ph
 
    These selectors default to **off** ("Do not transfer").
 
+### What goes to each target
+
+- **Intake delivery** receives only customer-visible phase files that have cleared scanning (admitted), plus verified audio derivatives, and only when they are published. Nothing is sent when a phase is submitted.
+- **Originals** receives staff-only files and originals that are still pending or not yet converted. These never go to intake delivery.
+
 Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first two segments are fixed when an order is first exported.
 
 ### Running and repairing
