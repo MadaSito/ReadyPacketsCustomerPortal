@@ -135,7 +135,10 @@ function CodeCard({ promotion, canManage }: { promotion: PromotionView; canManag
         </div>
       ) : (
         <div className="space-y-4">
-          <p className="font-mono text-lg text-ink" aria-label={`Masked code ${promotion.codeMasked ?? ""}`}>{promotion.codeMasked ?? "—"}</p>
+          <p className="font-mono text-lg text-ink">
+            <span aria-hidden="true">{promotion.codeMasked ?? "—"}</span>
+            <span className="sr-only">Masked code {promotion.codeMasked ?? "unavailable"}</span>
+          </p>
           {canManage ? (
             <Button ref={showRef} variant="secondary" leadingIcon={<Eye className="size-4" aria-hidden />} loading={reveal.isPending} onClick={() => void show()}>Show code and link</Button>
           ) : <p className="text-sm text-muted">Only administrators can show the full code.</p>}

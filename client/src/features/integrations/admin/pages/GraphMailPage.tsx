@@ -585,7 +585,7 @@ export default function GraphMailPage() {
                       in {probeResult.durationMs} ms at <DateTime value={probeResult.checkedAt} />.
                     </p>
                   </Callout>
-                  <div className="flex min-w-0 flex-wrap gap-2" aria-label="Write check stages">
+                  <div className="flex min-w-0 flex-wrap gap-2" role="group" aria-label="Write check stages">
                     <StageBadge ok={probeResult.graphEgressEnabled} label="Graph egress" />
                     <StageBadge ok={probeResult.uploadEgressEnabled} label="Upload session egress" />
                     <StageBadge ok={probeResult.tokenAcquired} label="Entra token" />

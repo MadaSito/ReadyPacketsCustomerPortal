@@ -137,7 +137,7 @@ export function StorageConnectionWizardPage() {
     return (
       <>
         <PageHeader title="Edit storage connection" />
-        <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading storage connection">
+        <div className="flex flex-col gap-4" role="status" aria-busy="true" aria-label="Loading storage connection">
           <Skeleton className="h-56 w-full" />
         </div>
       </>

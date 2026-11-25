@@ -189,7 +189,7 @@ export function StorageConnectionsPage() {
           title="Storage connections"
           description="Configure external storage providers for order files, encrypted off-site backups, and SharePoint order sync."
         />
-        <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading storage connections">
+        <div className="flex flex-col gap-4" role="status" aria-busy="true" aria-label="Loading storage connections">
           <Skeleton className="h-44 w-full" />
           <Skeleton className="h-48 w-full" />
         </div>

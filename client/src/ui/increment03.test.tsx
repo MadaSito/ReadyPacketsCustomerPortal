@@ -86,7 +86,9 @@ describe("InertMailPreview", () => {
     expect(doc.indexOf("Content-Security-Policy")).toBeLessThan(doc.indexOf("<title>"));
     expect(screen.getByRole("tab", { name: "Structure preview" })).toHaveAttribute("aria-selected", "true");
     await userEvent.click(screen.getByRole("tab", { name: "Plain text" }));
-    expect(screen.getByLabelText("Preview of Password reset, plain text")).toHaveTextContent("Hello Body");
+    const plainText = screen.getByRole("region", { name: "Preview of Password reset, plain text" });
+    expect(plainText).toHaveTextContent("Hello Body");
+    expect(plainText).toHaveAttribute("tabindex", "0");
     await expectNoAxeViolations();
   });
   it("escapes the title inside the frame document and falls back to text without html", () => {

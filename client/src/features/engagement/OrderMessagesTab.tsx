@@ -220,7 +220,7 @@ export default function OrderMessagesTab({ orderId, area }: OrderMessagesSlotPro
                   <p className="mt-2 break-words whitespace-pre-wrap text-body">{msg.body}</p>
 
                   {msg.attachments.length > 0 ? (
-                    <div className="mt-3 flex flex-wrap gap-2" aria-label="Attached files">
+                    <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Attached files">
                       {msg.attachments.map((att) => (
                         <Badge
                           key={att.filePublicId}

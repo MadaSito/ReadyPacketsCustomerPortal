@@ -34,7 +34,7 @@ export function InertMailPreview({ title, html, text, height = "md" }: InertMail
   const textView = (
     // A scrollable region must be reachable by keyboard (WCAG 2.1.1), so the <pre> takes focus.
     // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-    <pre tabIndex={0} aria-label={`${title}, plain text`} className={cn("overflow-auto rounded-[var(--radius-card)] border border-line bg-surface-sunken p-4 font-mono text-sm break-words whitespace-pre-wrap text-body", heights[height])}>
+    <pre role="region" tabIndex={0} aria-label={`${title}, plain text`} className={cn("overflow-auto rounded-[var(--radius-card)] border border-line bg-surface-sunken p-4 font-mono text-sm break-words whitespace-pre-wrap text-body", heights[height])}>
       {text}
     </pre>
   );
