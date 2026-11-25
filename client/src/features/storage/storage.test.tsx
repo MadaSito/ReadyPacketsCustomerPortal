@@ -37,6 +37,7 @@ const {
   mockState: {
     broken: false,
     backfillFailed: false,
+    orderSyncGate: undefined as Promise<void> | undefined,
   },
   createConnection: vi.fn(),
   updateConnection: vi.fn(),
@@ -268,6 +269,7 @@ vi.mock("@/lib/trpc", () => {
               queryKey: ["sharepoint.admin.orderSync.get"] as const,
               queryFn: async () => {
                 failIfBroken();
+                if (mockState.orderSyncGate) await mockState.orderSyncGate;
                 return buildOrderSyncSettings();
               },
             }),
@@ -375,6 +377,7 @@ describe("Storage connections & SharePoint order sync UI", () => {
   beforeEach(async () => {
     mockState.broken = false;
     mockState.backfillFailed = false;
+    mockState.orderSyncGate = undefined;
     resetConsumedOAuthHandlesForTest();
     window.history.replaceState(null, "", "/");
     createConnection.mockReset();
@@ -650,6 +653,22 @@ describe("Storage connections & SharePoint order sync UI", () => {
       publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZNW",
       expectedVersion: 2,
     });
+  });
+
+  it("exposes a named busy status while SharePoint order sync loads and passes axe in that state", async () => {
+    let finishLoading = () => {};
+    mockState.orderSyncGate = new Promise<void>((resolve) => { finishLoading = resolve; });
+    const { container, unmount } = renderUi(<SharePointOrderSyncPage />, {
+      path: "/admin/sharepoint-sync",
+      api: fakeAuthApi({ me: async () => adminSession() }),
+    });
+    try {
+      expect(await screen.findByRole("status", { name: "Loading SharePoint order sync" })).toHaveAttribute("aria-busy", "true");
+      await expectNoAxeViolations(container);
+    } finally {
+      unmount();
+      finishLoading();
+    }
   });
 
   it("renders SharePointOrderSyncPage, supports Resume/Restart backfill, list creation, and passes axe", async () => {

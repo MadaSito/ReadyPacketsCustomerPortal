@@ -2,9 +2,10 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, it, vi } from "vitest";
 import type { CheckoutCartResult } from "@server/modules/cart/types";
+import type { MeResult, MeUser } from "@/lib/authApi";
 import type * as transport from "@/lib/trpc";
 import { pageA11y } from "@/test/a11y";
-import { renderUi } from "@/ui/testing";
+import { fakeAuthApi, renderUi } from "@/ui/testing";
 import { CheckoutPage, isHostedCheckoutUrl } from "./CheckoutPage";
 import { CheckoutReturnPage, readCheckoutTarget, type CheckoutStatus } from "./CheckoutReturnPage";
 import { CheckoutCancelPage } from "./CheckoutCancelPage";
@@ -461,6 +462,50 @@ it("never restores on return or on opening confirmation; restores once after exp
   await user.click(screen.getByRole("button", { name: "Restore items" }));
   expect(await screen.findByRole("link", { name: "Open restored cart" })).toHaveAttribute("href", "/cart");
   expect(mocks.restore).toHaveBeenCalledExactlyOnceWith({ attemptPublicId: attemptId });
+});
+
+const asRole = (role: MeUser["role"]) => ({
+  api: fakeAuthApi({
+    me: async (): Promise<MeResult> => ({
+      user: { publicId: `u_${role}`, role, name: "Synthetic Viewer", email: `${role}@example.test`, status: "active" },
+      state: "full",
+      pendingSteps: [],
+      nextStep: null,
+    }),
+  }),
+});
+
+pageA11y("/cart/checkout staff handoff", async () => {
+  renderUi(<main><title>Checkout · ReadyPackets</title><CheckoutPage /></main>, { path: "/cart/checkout", ...asRole("admin") });
+  await screen.findByRole("heading", { level: 1, name: "Checkout belongs to customer accounts" });
+});
+
+it("renders StaffOrderHandoff on /cart/checkout, /checkout/return, and /checkout/cancel for staff and admin without calling cart procedures", async () => {
+  for (const [role, portalLabel] of [["admin", "Admin portal"], ["staff", "Staff portal"]] as const) {
+    mocks.cart.mockClear();
+    mocks.status.mockClear();
+    mocks.restore.mockClear();
+    mocks.checkout.mockClear();
+
+    const checkoutView = renderUi(<CheckoutPage />, { path: "/cart/checkout", ...asRole(role) });
+    expect(await screen.findByRole("heading", { level: 1, name: "Checkout belongs to customer accounts" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
+    expect(screen.getByRole("link", { name: portalLabel })).toHaveAttribute("href", "/admin");
+    checkoutView.unmount();
+
+    const returnView = renderUi(<CheckoutReturnPage />, { path: `/checkout/return?attempt=${attemptId}`, ...asRole(role) });
+    expect(await screen.findByRole("heading", { level: 1, name: "Checkout belongs to customer accounts" })).toBeInTheDocument();
+    returnView.unmount();
+
+    const cancelView = renderUi(<CheckoutCancelPage />, { path: `/checkout/cancel?attempt=${attemptId}`, ...asRole(role) });
+    expect(await screen.findByRole("heading", { level: 1, name: "Checkout belongs to customer accounts" })).toBeInTheDocument();
+    cancelView.unmount();
+
+    expect(mocks.cart).not.toHaveBeenCalled();
+    expect(mocks.status).not.toHaveBeenCalled();
+    expect(mocks.restore).not.toHaveBeenCalled();
+    expect(mocks.checkout).not.toHaveBeenCalled();
+  }
 });
 
 it("never offers to restore a paid checkout and rejects ambiguous references or untrusted redirects", async () => {

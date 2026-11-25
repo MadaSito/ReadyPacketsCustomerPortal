@@ -1,12 +1,15 @@
 /** Customer dashboard widget: recent orders. Owner: orders_engineer. */
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
+import { NewOrderForCustomerLink, useIsStaffViewer } from "@/app/portal";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Card, DateTime, ErrorState, Skeleton } from "@/ui";
 import { OrderStatusBadge } from "./shared";
 import { OrderListProgress } from "./stages/OrderListProgress";
 
 export default function RecentOrdersWidget() {
+  // Increment 07.1 (D4): staff/admin are sent to the console's "New order for a customer" dialog.
+  const staffViewer = useIsStaffViewer();
   const trpc = useTRPC();
   const list = useQuery(trpc.orders.list.queryOptions({ limit: 5 }));
   return (
@@ -25,9 +28,13 @@ export default function RecentOrdersWidget() {
       ) : list.data.items.length === 0 ? (
         <div className="flex flex-col items-start gap-3">
           <p className="text-body">You have no orders yet.</p>
-          <Button asChild size="sm">
-            <Link href="/orders/new">Start an order</Link>
-          </Button>
+          {staffViewer ? (
+            <NewOrderForCustomerLink size="sm" />
+          ) : (
+            <Button asChild size="sm">
+              <Link href="/orders/new">Start an order</Link>
+            </Button>
+          )}
         </div>
       ) : (
         <ul className="flex flex-col divide-y divide-line">

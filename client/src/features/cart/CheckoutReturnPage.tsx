@@ -2,9 +2,11 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { Link, useSearch } from "wouter";
+import { StaffOrderHandoff } from "@/app/portal";
 import { useTRPC } from "@/lib/trpc";
 import { Button, Callout, Card, EmptyState, ErrorState, Money, PageHeader, Skeleton } from "@/ui";
 import type { ReactNode } from "react";
+import { useCartViewerGate } from "./viewerGate";
 
 export type CheckoutStatus = inferRouterOutputs<AppRouter>["cart"]["checkoutStatus"];
 export type CheckoutTarget = { attemptPublicId: string } | { cartPublicId: string };
@@ -101,7 +103,15 @@ export function CheckoutStatusPage({ cancelRoute = false, renderActions }: {
   cancelRoute?: boolean;
   renderActions?: ((data: CheckoutStatus, target: CheckoutTarget, onChanged: () => void) => ReactNode) | undefined;
 }) {
-  const target = readCheckoutTarget(useSearch());
+  const { pending, staffViewer } = useCartViewerGate();
+  const search = useSearch();
+  if (pending) {
+    return <div role="status" aria-label="Checking checkout status"><Skeleton lines={5} /></div>;
+  }
+  if (staffViewer) {
+    return <StaffOrderHandoff title="Checkout belongs to customer accounts" />;
+  }
+  const target = readCheckoutTarget(search);
   return <div className="grid gap-6">
     <PageHeader title={cancelRoute ? "Checkout recovery" : "Checkout status"}
       description={cancelRoute ? "Check the current status before returning items to your cart." : "Follow your order and invoice after checkout."}

@@ -124,7 +124,7 @@ export function SharePointOrderSyncPage() {
           title="SharePoint order sync"
           description="Mirror structured ReadyPackets order summaries to a Microsoft 365 SharePoint list."
         />
-        <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading SharePoint order sync">
+        <div className="flex flex-col gap-4" role="status" aria-busy="true" aria-label="Loading SharePoint order sync">
           <Skeleton className="h-44 w-full" />
           <Skeleton className="h-48 w-full" />
         </div>

@@ -680,7 +680,7 @@ export default function MailTemplateEditorPage() {
                           <span className="font-mono text-sm font-semibold text-ink">{`{{${v.name}}}`}</span>
                           <span className="text-sm text-body">{v.label}</span>
                           {v.required || v.sensitive ? <Badge tone="info">Required</Badge> : null}
-                          {v.sensitive ? <Badge tone="warning">Redacted in audit copies</Badge> : null}
+                          {v.sensitive ? <Badge tone="warning" className="max-[320px]:rounded-lg max-[320px]:whitespace-normal max-[320px]:[&>span]:overflow-visible max-[320px]:[&>span]:whitespace-normal">Redacted in audit copies</Badge> : null}
                         </div>
                       </div>
                       {data.kind === "custom" ? (

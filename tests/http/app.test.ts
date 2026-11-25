@@ -926,6 +926,36 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     expect(authenticated.headers["cache-control"]).toBe("no-store");
   });
 
+  it("nonces navigations to dotted mail-template identifiers without serving the shell for file probes", async () => {
+    const h = harness({ staticDir: STATIC });
+    const jobAdmin: Pick<typeof h.services.jobAdmin, "getBuiltinMailTemplates"> = {
+      getBuiltinMailTemplates: () => ["auth.password_reset", "orders.phase_update"]
+        .map((key) => ({ key, vars: [], subject: () => "", text: () => "" })),
+    };
+    Object.assign(h.services, { jobAdmin });
+    const get = (path: string) => h.http.get(path).set("Host", HOST).set("Accept", "text/html");
+    for (const path of [
+      "/admin/email-templates/auth.password_reset", "/admin/email-templates/auth%2Epassword_reset",
+      "/admin/email-templates/orders.phase_update", "/admin/email-templates/custom.order_followup",
+    ]) {
+      const shell = await get(path).set("Sec-Fetch-Mode", "navigate").expect(200).expect("Content-Type", /html/);
+      const nonce = /'nonce-([^']+)'/.exec(shell.headers["content-security-policy"] ?? "")?.[1];
+      expect(nonce).toMatch(/^[A-Za-z0-9_-]{24}$/u);
+      expect(shell.text).toContain(`src="/assets/app-A123b456.js" nonce="${nonce}"`);
+    }
+    for (const path of [
+      "/missing.png", "/admin/email-templates/x.png?check=1", "/admin/email-templates/auth.png",
+      "/admin/email-templates/x%2Epng", "/admin/email-templates/Auth.password_reset",
+      "/admin/email-templates/nested%2Fauth.password_reset", "/admin/email-templates-extra/auth.password_reset",
+      "/.env", "/%2Eenv", "/.git/config", "/foo.php", "/foo.php%2Fbar", "/wp-login.php", "/admin/x.js.map", "/sitemap.xml",
+    ]) {
+      const missing = await get(path).expect(404);
+      expect(missing.text, path).not.toContain("Synthetic portal shell");
+    }
+    await get("/admin/email-templates/auth.password_reset").set("Sec-Fetch-Mode", "cors").expect(404);
+    await h.http.get("/admin/email-templates/auth.password_reset").set("Host", HOST).expect(404);
+  });
+
   it("refuses static roots that overlap private storage even if the storage child does not yet exist", () => {
     expect(() => harness({ staticDir: STATIC }, { storageDir: `${STATIC}/future-private-data` })).toThrow(/must not overlap/);
     expect(() => harness({ staticDir: STATIC }, { storageDir: fileURLToPath(new URL(".", import.meta.url)) })).toThrow(/must not overlap/);

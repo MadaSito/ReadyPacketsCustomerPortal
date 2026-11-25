@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState, type FormEvent } from "react";
 import { Link, useLocation } from "wouter";
+import { StaffOrderHandoff } from "@/app/portal";
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import {
   AgreementDialog,
@@ -11,6 +12,7 @@ import {
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
 import { Button, Callout, Card, Checkbox, EmptyState, ErrorState, Field, Input, Money, PageHeader, Skeleton, Textarea } from "@/ui";
 import type { CartViewData } from "./CartPage";
+import { useCartViewerGate } from "./viewerGate";
 
 const emptyBilling = {
   fullName: "", company: "", email: "", country: "", region: "", addressLine1: "", addressLine2: "",
@@ -415,6 +417,17 @@ function CheckoutForm({ cart, reload }: { cart: CartViewData & { cartPublicId: s
 }
 
 export function CheckoutPage() {
+  const { pending, staffViewer } = useCartViewerGate();
+  if (pending) {
+    return <div role="status" aria-label="Loading checkout"><Skeleton lines={5} /></div>;
+  }
+  if (staffViewer) {
+    return <StaffOrderHandoff title="Checkout belongs to customer accounts" />;
+  }
+  return <CustomerCheckoutPage />;
+}
+
+function CustomerCheckoutPage() {
   const trpc = useTRPC();
   const cart = useQuery(trpc.cart.get.queryOptions(undefined, { refetchOnMount: "always" }));
   const data = cart.data;

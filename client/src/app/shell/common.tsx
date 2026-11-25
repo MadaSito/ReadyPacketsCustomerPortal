@@ -8,6 +8,7 @@ import type { NavItem } from "@/lib/routes";
 import { useAuthApi, type MeUser } from "@/lib/authApi";
 import { useSignOut } from "@/lib/signOut";
 import { useConsent } from "@/lib/consent";
+import { portalSwitchHref, portalSwitchLabel, setCustomerPortalChoice, type PortalArea } from "@/lib/portal";
 import { Callout, DropdownMenu, IconButton, useTheme, type ThemePreference } from "@/ui";
 import { cn } from "@/ui/cn";
 import { RUNTIME } from "@/lib/runtime";
@@ -16,9 +17,20 @@ import { PwaInstallDialog, usePwaInstall } from "@/app/PwaInstallEntry";
 export const LEGAL_NAME = "Ready Packets Consulting LLC";
 export const PUBLIC_SITE_URL = "https://www.readypackets.com";
 
+/**
+ * Customer-area entries that only a customer can use (07.1 D4): staff and admins do not own orders or carts, so
+ * "Create an order" and "Cart" (and anything under them) are hidden from them in the customer shell.
+ */
+export const CUSTOMER_ONLY_HREFS = ["/orders/new", "/cart"] as const;
+
+export function isCustomerOnlyHref(href: string): boolean {
+  return CUSTOMER_ONLY_HREFS.some((root) => href === root || href.startsWith(`${root}/`));
+}
+
 export function visibleNav(items: readonly NavItem[], area: NavItem["area"], role: UserRole): NavItem[] {
   return items.filter((item) => {
     if (item.area !== area) return false;
+    if (area === "customer" && role !== "customer" && isCustomerOnlyHref(item.href)) return false;
     if (item.access === "admin") return role === "admin";
     if (item.access === "staff") return role === "staff" || role === "admin";
     return item.access === "customer";
@@ -106,6 +118,16 @@ export interface CustomerNavSections {
 /** Preferred phone bottom-bar entries, in order; free slots are filled from the main section. */
 export const PHONE_BAR_HREFS = ["/", "/orders", "/orders/new", "/messages"] as const;
 
+/**
+ * 07.1: short labels for the phone bottom bar so five tabs fit at 320 px without an ellipsis. The visible text is
+ * the accessible name (WCAG 2.5.3); the full label stays in the sidebar, drawer and page heading.
+ */
+const PHONE_TAB_LABELS: Readonly<Record<string, string>> = { "/": "Home", "/orders": "Orders", "/orders/new": "New order" };
+
+export function phoneTabLabel(item: Pick<NavItem, "href" | "label">): string {
+  return PHONE_TAB_LABELS[item.href] ?? item.label;
+}
+
 export function customerNavSections(items: readonly NavItem[]): CustomerNavSections {
   const visible = [...items].filter((item) => navPlacement(item) !== "hidden").sort((a, b) => a.order - b.order);
   const out: CustomerNavSections = { main: [], Support: [], Account: [], phone: [] };
@@ -176,6 +198,21 @@ export function initials(name: string): string {
   return chosen.join("").toLocaleUpperCase() || "?";
 }
 
+/** Avatar-menu twin of the visible portal switch (same wording and the same tab-scoped choice). */
+function portalMenuItem(role: UserRole, area: PortalArea) {
+  const label = portalSwitchLabel(role, area);
+  const Icon = area === "console" ? UserRound : Settings;
+  return {
+    label,
+    icon: <Icon aria-hidden="true" />,
+    asChild: (
+      <Link href={portalSwitchHref(area)} onClick={() => setCustomerPortalChoice(area === "console")}>
+        {label}
+      </Link>
+    ),
+  };
+}
+
 export function AccountMenu({ user, area, items: accountItems }: { user: MeUser; area: "customer" | "console"; items?: readonly NavItem[] }) {
   const signOut = useSignOut();
   const staff = user.role !== "customer";
@@ -220,7 +257,7 @@ export function AccountMenu({ user, area, items: accountItems }: { user: MeUser;
             </Link>
           ),
         })),
-        ...(staff ? [area === "console" ? { label: "Customer view", icon: <UserRound aria-hidden="true" />, asChild: <Link href="/">Customer view</Link> } : { label: "Console", icon: <Settings aria-hidden="true" />, asChild: <Link href="/admin">Console</Link> }] : []),
+        ...(staff ? [portalMenuItem(user.role, area)] : []),
         ...(pwa.available && !pwa.installed ? [{ label: "Install app", icon: <Download aria-hidden="true" />, onSelect: install }] : []),
         "separator" as const,
         { label: "Sign out", icon: <LogOut aria-hidden="true" />, onSelect: () => void signOut() },
@@ -283,11 +320,11 @@ export function usePreviewProfile(): boolean {
 export function PreviewBanner() {
   if (!usePreviewProfile()) return null;
   return (
-    <div className="border-b border-info/40 bg-info-soft" data-testid="preview-banner">
+    <aside aria-label="Preview notice" className="border-b border-info/40 bg-info-soft" data-testid="preview-banner">
       <p className="mx-auto max-w-7xl px-4 py-2 text-center text-sm font-semibold text-ink sm:px-6 lg:px-8">
         Preview — synthetic data only. Do not enter real customer or personal information.
       </p>
-    </div>
+    </aside>
   );
 }
 
@@ -297,13 +334,13 @@ export function MaintenanceBanner() {
   const banner = useQuery({ queryKey: ["rp", "jobs", "maintenanceBanner"], queryFn: () => api.maintenanceBanner(), staleTime: 60_000, retry: false });
   if (!banner.data?.active) return null;
   return (
-    <div className="border-b border-warning/40 bg-warning-soft">
+    <aside aria-label="Maintenance notice" className="border-b border-warning/40 bg-warning-soft">
       <div className="mx-auto max-w-7xl px-4 py-1 sm:px-6 lg:px-8">
         <Callout tone="warning" live="polite" className="border-0 bg-transparent px-0 py-2">
           {banner.data.message ?? "Scheduled maintenance is in progress. Some actions may be temporarily unavailable."}
         </Callout>
       </div>
-    </div>
+    </aside>
   );
 }
 

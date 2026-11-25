@@ -40,13 +40,29 @@ export function SignatureMatchBadge({ match }: { match?: SignatureMatchKind | nu
   if (!match) return null;
   switch (match) {
     case "exact":
-      return <Badge tone="success">Matched (full name)</Badge>;
+      return (
+        <span className="inline-flex min-w-0 max-w-full" title="Matched (full name)">
+          <Badge tone="success">Matched (full name)</Badge>
+        </span>
+      );
     case "first_last":
-      return <Badge tone="success">Matched (first + last)</Badge>;
+      return (
+        <span className="inline-flex min-w-0 max-w-full" title="Matched (first + last)">
+          <Badge tone="success">Matched (first + last)</Badge>
+        </span>
+      );
     case "mismatch_warn":
-      return <Badge tone="warning">Name mismatch (warn)</Badge>;
+      return (
+        <span className="inline-flex min-w-0 max-w-full" title="Name mismatch (warn)">
+          <Badge tone="warning">Name mismatch (warn)</Badge>
+        </span>
+      );
     case "unchecked":
-      return <Badge tone="neutral">Name unchecked</Badge>;
+      return (
+        <span className="inline-flex min-w-0 max-w-full" title="Name unchecked">
+          <Badge tone="neutral">Name unchecked</Badge>
+        </span>
+      );
   }
 }
 
@@ -149,9 +165,9 @@ export function AcceptanceLogTab({
         key: "policy",
         header: "Policy & version",
         cell: (row) => (
-          <div className="flex min-w-0 flex-col items-start gap-1">
-            <div className="flex flex-wrap items-baseline gap-1.5">
-              <span className="font-medium text-ink">{row.policyTitle}</span>
+          <div className="flex min-w-0 max-w-full flex-col items-start gap-1">
+            <div className="flex min-w-0 max-w-full flex-wrap items-baseline gap-1.5">
+              <span className="font-medium break-words text-ink">{row.policyTitle}</span>
               <Link
                 href={`/admin/policy-acceptances/versions/${row.versionPublicId}`}
                 aria-label={`View v${row.versionLabel} of ${row.policyTitle}`}
@@ -164,8 +180,10 @@ export function AcceptanceLogTab({
               freshness={row.freshness}
               supersededByVersionLabel={row.supersededByVersionLabel}
             />
-            <span className="inline-flex items-center gap-1">
-              <code className="font-mono text-xs text-muted">{row.shortContentHash}</code>
+            <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1">
+              <code className="min-w-0 font-mono text-xs break-all text-muted">
+                {row.shortContentHash}
+              </code>
               <CopyButton
                 value={row.contentHash}
                 label={`Copy SHA-256 content hash for ${row.policyTitle} version ${row.versionLabel}`}
@@ -179,9 +197,9 @@ export function AcceptanceLogTab({
         key: "sourceMethod",
         header: "Source & method",
         cell: (row) => (
-          <div className="flex flex-col items-start gap-1">
-            <span className="font-medium text-ink">{formatAcceptanceSource(row.source)}</span>
-            <span className="text-xs text-muted">{formatAcceptanceMethod(row.method)}</span>
+          <div className="flex min-w-0 max-w-full flex-col items-start gap-1">
+            <span className="font-medium break-words text-ink">{formatAcceptanceSource(row.source)}</span>
+            <span className="text-xs break-words text-muted">{formatAcceptanceMethod(row.method)}</span>
             <SignatureMatchBadge match={row.signatureMatch} />
           </div>
         ),
@@ -193,12 +211,12 @@ export function AcceptanceLogTab({
           row.orderPublicId && row.orderReference ? (
             <Link
               href={`/admin/orders/${row.orderPublicId}`}
-              className="font-mono font-medium text-action underline underline-offset-2"
+              className="font-mono font-medium break-all text-action underline underline-offset-2"
             >
               {row.orderReference}
             </Link>
           ) : row.orderReference ? (
-            <span className="font-mono text-ink">{row.orderReference}</span>
+            <span className="font-mono break-all text-ink">{row.orderReference}</span>
           ) : (
             <span className="text-muted">—</span>
           ),
@@ -207,14 +225,16 @@ export function AcceptanceLogTab({
         key: "trace",
         header: "Address & correlation",
         cell: (row) => (
-          <div className="flex min-w-0 flex-col gap-1">
-            <span className="text-xs text-muted">
+          <div className="flex min-w-0 max-w-full flex-col gap-1">
+            <span className="text-xs break-words text-muted">
               Address:{" "}
               <code className="font-mono break-all text-ink">{row.addressPseudonym ?? "—"}</code>
             </span>
             {row.correlationId ? (
-              <span className="inline-flex flex-wrap items-center gap-1">
-                <code className="font-mono text-xs break-all text-muted">{row.correlationId}</code>
+              <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1">
+                <code className="min-w-0 font-mono text-xs break-all text-muted">
+                  {row.correlationId}
+                </code>
                 <CopyButton
                   value={row.correlationId}
                   label={`Copy correlation ID ${row.correlationId}`}
@@ -222,7 +242,7 @@ export function AcceptanceLogTab({
                 />
               </span>
             ) : (
-              <span className="text-xs text-muted">Correlation: —</span>
+              <span className="text-xs break-words text-muted">Correlation: —</span>
             )}
           </div>
         ),
@@ -234,6 +254,7 @@ export function AcceptanceLogTab({
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <FilterBar
+        className="min-w-0"
         search={filters.customerDraft}
         onSearchChange={(value) => onPatchFilters({ customerDraft: value })}
         onSearchSubmit={(value) => onPatchFilters({ customerQuery: value.trim() })}
@@ -274,6 +295,7 @@ export function AcceptanceLogTab({
         <Field label="From date">
           <Input
             type="date"
+            className="w-full min-w-0 max-w-full"
             value={filters.fromDate}
             onChange={(e) => onPatchFilters({ fromDate: e.target.value })}
           />
@@ -282,6 +304,7 @@ export function AcceptanceLogTab({
         <Field label="To date">
           <Input
             type="date"
+            className="w-full min-w-0 max-w-full"
             value={filters.toDate}
             onChange={(e) => onPatchFilters({ toDate: e.target.value })}
           />
@@ -325,8 +348,10 @@ export function AcceptanceLogTab({
         </Field>
       </FilterBar>
 
+      {/* Below 320 px, stack phone-card <dt>/<dd> pairs so wide column labels ("Address & correlation") do not squeeze <dd> to 22 px; 320+ layouts stay unchanged. */}
       <DataTable<AcceptanceLogItem>
         caption="Policy acceptance log"
+        className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
         columns={columns}
         rows={rows}
         rowKey={(row) => `${row.evidenceKind}:${row.publicId}`}

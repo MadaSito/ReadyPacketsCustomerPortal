@@ -2,12 +2,14 @@
 
 <!-- Discount codes are available only when the portal administrator has switched them on. -->
 
-You can use a discount code in your cart or in the last step of **Create an order**.
+You can use a discount code in your cart and at checkout. If your portal has no cart, you use it in the last step of **Create an order**.
 
 ## Enter a code
 
 - **In the cart:** in **Cart** (`/cart`) or **Checkout** (`/cart/checkout`), type the code under **Discount code** and select **Apply**. Select **Remove** to take it off.
-- **When creating an order:** in **Review**, type the code in **Discount code** and select **Apply**.
+- **The field appears once your cart has an item.** An empty cart shows "Have a discount code? Add an item first to apply it here or at checkout."
+- **When creating an order:** if your portal has a cart, the **Review** step shows "Have a discount code? You can enter it in your cart and at checkout." If your portal has no cart, type the code in **Discount code** in **Review** and select **Apply**.
+- **No field at all?** Discount codes may be switched off for your portal. Contact us.
 
 When the code applies, you see its name and the amount saved, and the new total is announced to screen readers. The code itself is not shown on your order or invoice; its name is shown instead. When you submit, the discount is fixed on your order.
 

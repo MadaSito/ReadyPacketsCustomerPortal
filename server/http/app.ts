@@ -512,7 +512,8 @@ export function createApp(services: Services, options: AppOptions = {}): Express
       }
       next();
     });
-    registerStatic(app, options.staticDir, publicPaths);
+    registerStatic(app, options.staticDir, publicPaths,
+      (key) => services.jobAdmin?.getBuiltinMailTemplates().some((template) => template.key === key) ?? false);
   }
   app.use(() => { throw notFound(); });
 

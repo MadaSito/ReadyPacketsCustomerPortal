@@ -236,6 +236,35 @@ The owner requested this on 2026-11-24 (prompt 26). The contract is [INCREMENT_0
 | Microsoft 365 sync (`storage`, `sharepoint`) | One-way per phase; three targets; write test; resync ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). | Targets off until configured. |
 | SAML (`identity`) | Entra SAML SP with mandatory checks and MFA modes ([ADR 0062](../adr/0062-saml-entra-id.md)). | Off until configured; `/admin/sso`. Upgraded configs start in `portal` MFA mode; `entra` needs `ENTRA MANAGES MFA`. |
 
+## Increment 07.1: staff ordering handoff, portal switch, discount code hints
+
+This is a fix pack (PR #19), mostly client-side, for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). It makes no server permission, schema or migration change, and the upgrade commands are unchanged. Verification is in [STATUS.md](STATUS.md#verification-for-increment-071).
+
+- **Portal separation rule.** Orders, carts and checkout belong to customer accounts. The server refuses them for staff and administrators, as zero-trust separation.
+  - The client now matches that rule. For staff and administrators, `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel` show a handoff panel instead of calling the server, and `visibleNav` hides **Create an order** and **Cart**.
+  - Staff place orders from the console, at `/admin/orders?new=1`. That opens the **New order for a customer** dialog, which accepts a discount code. The order then appears in that customer's portal.
+  - The components are in `client/src/app/portal.tsx`: `PortalSwitch`, `StaffPortalNotice`, `StaffOrderHandoff`, `NewOrderForCustomerLink` and `useIsStaffViewer`.
+- **Portal switch.**
+  - **Customer portal** is in the console top bar (medium screens and up) and drawer. **Admin portal** or **Staff portal** is in the customer shell top bar, drawer and a staff notice that cannot be dismissed.
+  - Staff and administrators opening `/` land on `/admin`, unless this browser tab chose the customer portal. That choice is kept in `sessionStorage` by `client/src/lib/portal.ts`, and is cleared on switching back, at sign-out and by `clearClientCaches()`.
+  - Customers never see the switch. The choice is a navigation preference only and grants nothing: the server still checks every request.
+- **Discount codes.** They need **Discount codes** on at `/admin/promotions` (`feature.promotions`, off when shipped). With **Cart** on at `/admin/settings/features` (`feature.cart`), the field is in the cart summary once the cart has an item, and at checkout.
+  - Hints appear on the empty cart and on the order form's Review step.
+  - With the cart off, the direct order form keeps the field on its Review step.
+- **Interface.** Both navigation rails have thin themed scrollbars, with a forced-colours fallback. The QA tools (`scripts/qa`) gained an opt-in context-reuse mode and deferred retries.
+- **Shell.** The portal switch is first in both mobile drawers. Phone tab labels are Home / Orders / New order / Messages / More. The staff notice shows its switch only below medium width. The staff, preview and maintenance notices are named complementary landmarks.
+- **Server: single-page app fallback (`server/http/static.ts`).** Deep links to mail template editors with dotted keys, such as `/admin/email-templates/auth.password_reset`, now serve the app's page. This applies to registered built-in keys and `custom.<slug>` only. Other dotted or extension paths and dotfiles still return 404. There is no permission, schema or migration change.
+- **Layout and accessibility fixes from the sweep.** These covered:
+  - narrow-width reflow on the orders list, the cart suggestion, policy acceptances, Graph & SharePoint, the production pipeline, the report builder, DataTable phone cards and the mail template badge;
+  - prohibited accessible names, now with a guard test;
+  - a flow canvas zoom floor of 0.8, which keeps targets above 24 px.
+- **Sweep.** Chromium, synthetic data: a 3,712-case responsive matrix, 1,392 axe cases, and confirmation runs with no known open failure in the checked set. Results are in [STATUS.md](STATUS.md#verification-for-increment-071).
+- **Limits.**
+  - Chromium only; no physical devices.
+  - No screen-reader pass.
+  - The axe incompletes, mainly contrast, were not reviewed by hand.
+  - 16 route states without a fixture were not checked.
+
 ## Deployment profiles
 
 | Profile | Purpose | Session transport | Routing |

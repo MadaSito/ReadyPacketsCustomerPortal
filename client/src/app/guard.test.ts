@@ -47,6 +47,18 @@ describe("route guard", () => {
     expect(decideRoute("admin", "/admin/siem", full("staff"))).toEqual({ kind: "not-found" });
     expect(decideRoute("admin", "/admin/siem", full("admin"))).toEqual({ kind: "render" });
   });
+  it("07.1 D2: staff/admin on the bare / go to the console unless this tab chose the customer portal", () => {
+    for (const role of ["staff", "admin"] as const) {
+      expect(decideRoute("customer", "/", full(role))).toEqual({ kind: "redirect", to: "/admin" });
+      expect(decideRoute("customer", "/", full(role), { customerPortalChosen: false })).toEqual({ kind: "redirect", to: "/admin" });
+      expect(decideRoute("customer", "/", full(role), { customerPortalChosen: true })).toEqual({ kind: "render" });
+      // Other customer routes stay reachable (staff may view customer pages); the console itself renders (no loop).
+      expect(decideRoute("customer", "/orders/01H", full(role))).toEqual({ kind: "render" });
+      expect(decideRoute("staff", "/admin", full(role))).toEqual({ kind: "render" });
+    }
+    expect(decideRoute("customer", "/", full("customer"))).toEqual({ kind: "render" });
+    expect(decideRoute("customer", "/", full("customer"), { customerPortalChosen: true })).toEqual({ kind: "render" });
+  });
   it("server unavailable never renders protected screens", () => {
     expect(decideRoute("customer", "/orders", { status: "error" })).toEqual({ kind: "unavailable" });
     expect(decideRoute("public", "/sign-in", { status: "error" })).toEqual({ kind: "render" });

@@ -143,14 +143,17 @@ export function CartUpsellSection({
 
           return (
             <Card key={item.offerPublicId} className="min-w-0">
-              <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div className="min-w-0 flex-1 space-y-1.5">
+              <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
+                <div className="min-w-0 flex-1 space-y-1.5 sm:basis-60">
                   <div className="flex flex-wrap items-center gap-2">
-                    <Badge tone={item.kind === "bundle_completion" ? "success" : "info"}>
+                    <Badge
+                      tone={item.kind === "bundle_completion" ? "success" : "info"}
+                      className="shrink-0 whitespace-nowrap"
+                    >
                       {kindBadgeLabel(item.kind)}
                     </Badge>
                     {item.savingMinor !== null && item.savingMinor > 0 ? (
-                      <Badge tone="success">
+                      <Badge tone="success" className="shrink-0 whitespace-nowrap">
                         Saves <Money value={{ amountMinor: item.savingMinor, currency: item.currency }} />
                       </Badge>
                     ) : null}
@@ -162,7 +165,7 @@ export function CartUpsellSection({
                   </p>
                 </div>
 
-                <div className="flex min-w-0 flex-col gap-2 sm:items-end">
+                <div className="flex max-w-full min-w-0 shrink-0 flex-col gap-2 sm:ml-auto sm:items-end">
                   <p className="text-base font-semibold whitespace-nowrap text-ink">
                     {pricePrefix}
                     <Money value={{ amountMinor: item.priceMinor, currency: item.currency }} />

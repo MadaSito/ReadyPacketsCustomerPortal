@@ -40,9 +40,15 @@ export function TimestampWithUtc({
   const date = typeof value === "string" ? new Date(value) : value;
   if (Number.isNaN(date.getTime())) return <span className="text-muted">—</span>;
   return (
-    <span className={inline ? "inline-flex flex-wrap items-baseline gap-x-2 gap-y-0.5" : "inline-flex flex-col gap-0.5"}>
-      <DateTime value={date} format="datetime" className="text-ink" />
-      <span className="font-mono text-xs text-muted">{formatUtcTimestamp(date)}</span>
+    <span
+      className={
+        inline
+          ? "inline-flex min-w-0 max-w-full flex-wrap items-baseline gap-x-2 gap-y-0.5"
+          : "flex min-w-0 max-w-full flex-col gap-0.5"
+      }
+    >
+      <DateTime value={date} format="datetime" className="break-words text-ink" />
+      <span className="font-mono text-xs break-words text-muted">{formatUtcTimestamp(date)}</span>
     </span>
   );
 }
@@ -115,13 +121,18 @@ export function FreshnessBadge({
 }) {
   if (freshness === "current") {
     return (
-      <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
-        Current
-      </Badge>
+      <span className="inline-flex min-w-0 max-w-full" title="Current version">
+        <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
+          Current
+        </Badge>
+      </span>
     );
   }
   return (
-    <span className="inline-flex flex-wrap items-center gap-1.5">
+    <span
+      className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
+      title="Superseded version"
+    >
       <Badge tone="warning" icon={<History className="size-3.5" aria-hidden="true" />}>
         Superseded
       </Badge>
@@ -138,7 +149,10 @@ export function RequirementStateBadge({ state }: { state: CustomerPolicyRequirem
   switch (state) {
     case "accepted_current":
       return (
-        <span className="inline-flex flex-wrap items-center gap-1.5">
+        <span
+          className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
+          title="Accepted current version"
+        >
           <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
             Accepted
           </Badge>
@@ -147,7 +161,10 @@ export function RequirementStateBadge({ state }: { state: CustomerPolicyRequirem
       );
     case "update_pending":
       return (
-        <span className="inline-flex flex-wrap items-center gap-1.5">
+        <span
+          className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
+          title="Update pending"
+        >
           <Badge tone="warning" icon={<AlertCircle className="size-3.5" aria-hidden="true" />}>
             Update pending
           </Badge>
@@ -156,7 +173,10 @@ export function RequirementStateBadge({ state }: { state: CustomerPolicyRequirem
       );
     case "not_accepted":
       return (
-        <span className="inline-flex flex-wrap items-center gap-1.5">
+        <span
+          className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
+          title="Pending acceptance"
+        >
           <Badge tone="warning" icon={<Clock className="size-3.5" aria-hidden="true" />}>
             Pending
           </Badge>
@@ -164,7 +184,11 @@ export function RequirementStateBadge({ state }: { state: CustomerPolicyRequirem
         </span>
       );
     case "not_required":
-      return <Badge tone="neutral">Not required</Badge>;
+      return (
+        <span className="inline-flex min-w-0 max-w-full" title="Not required">
+          <Badge tone="neutral">Not required</Badge>
+        </span>
+      );
   }
 }
 

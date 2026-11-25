@@ -24,7 +24,13 @@ import {
   Switch,
   buttonClasses,
 } from "@/ui";
-import { INTEGRATION_PATHS, IntegrationsCrumbs, ProviderStatusBadge, usePrivilegedAction } from "../shared";
+import {
+  INTEGRATION_PATHS,
+  IntegrationsCrumbs,
+  ProviderStatusBadge,
+  providerStatus,
+  usePrivilegedAction,
+} from "../shared";
 
 type Client = ReturnType<typeof useTRPCClient>;
 type GraphConfig = Awaited<ReturnType<Client["integrations"]["admin"]["graph"]["get"]["query"]>>;
@@ -224,7 +230,16 @@ export default function GraphMailPage() {
         breadcrumbs={<IntegrationsCrumbs current="Microsoft Graph & SharePoint" />}
         title="Microsoft Graph & SharePoint"
         description="Single-tenant Microsoft Entra application credentials for Graph mail delivery, cloud connectivity, and SharePoint Sites.Selected upload readiness."
-        meta={data ? <ProviderStatusBadge state={data.state} verified={data.verified} /> : undefined}
+        meta={
+          data ? (
+            <span
+              className="inline-flex min-w-0 max-w-full [&>span]:min-w-0"
+              title={providerStatus({ state: data.state, verified: data.verified }).label}
+            >
+              <ProviderStatusBadge state={data.state} verified={data.verified} />
+            </span>
+          ) : undefined
+        }
       />
 
       {config.error ? (
@@ -239,6 +254,7 @@ export default function GraphMailPage() {
         <div className="flex min-w-0 flex-col gap-6">
           <Card
             as="section"
+            className="min-w-0"
             title="Outbound preset readiness"
             description="Every connection to Microsoft Entra, Graph, and SharePoint upload sessions must pass the outbound allowlist over HTTPS port 443."
             footer={
@@ -248,26 +264,30 @@ export default function GraphMailPage() {
             }
           >
             <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
-              <div className="flex flex-col gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface-sunken p-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm font-semibold text-ink">Microsoft Graph & Entra Token</span>
+              <div className="flex min-w-0 flex-col gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface-sunken p-3">
+                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                  <span className="min-w-0 text-sm font-semibold wrap-anywhere text-ink">
+                    Microsoft Graph & Entra Token
+                  </span>
                   <PresetBadge enabled={data.egressPresetEnabled} />
                 </div>
-                <p className="text-xs text-muted">
-                  Hosts: <code>login.microsoftonline.com</code> and <code>graph.microsoft.com</code> (HTTPS:443).
-                  Required for token acquisition, mail delivery, and SharePoint API calls.
+                <p className="text-xs wrap-anywhere text-muted">
+                  Hosts: <code className="break-all">login.microsoftonline.com</code> and{" "}
+                  <code className="break-all">graph.microsoft.com</code> (HTTPS:443). Required for
+                  token acquisition, mail delivery, and SharePoint API calls.
                 </p>
               </div>
-              <div className="flex flex-col gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface-sunken p-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm font-semibold text-ink">
+              <div className="flex min-w-0 flex-col gap-1.5 rounded-[var(--radius-control)] border border-line bg-surface-sunken p-3">
+                <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                  <span className="min-w-0 text-sm font-semibold wrap-anywhere text-ink">
                     SharePoint & OneDrive Upload Sessions
                   </span>
                   <PresetBadge enabled={uploadPresetEnabled} />
                 </div>
-                <p className="text-xs text-muted">
-                  Hosts: <code>*.sharepoint.com</code> and <code>*.files.1drv.com</code> (HTTPS:443). Required
-                  for large-file resumable upload sessions and the Sites.Selected write probe.
+                <p className="text-xs wrap-anywhere text-muted">
+                  Hosts: <code className="break-all">*.sharepoint.com</code> and{" "}
+                  <code className="break-all">*.files.1drv.com</code> (HTTPS:443). Required for
+                  large-file resumable upload sessions and the Sites.Selected write probe.
                 </p>
               </div>
             </div>
@@ -283,21 +303,22 @@ export default function GraphMailPage() {
               <form
                 noValidate
                 onSubmit={(e) => void onSave(e)}
-                className="flex flex-col gap-4"
+                className="flex min-w-0 flex-col gap-4"
                 aria-label="Application credentials & sender mailbox"
               >
                 {errors.form ? (
                   <Callout tone="danger" live="assertive">
-                    {errors.form}
+                    <p className="wrap-anywhere">{errors.form}</p>
                   </Callout>
                 ) : null}
                 <Switch
-                  label="Enable Microsoft Graph mail & cloud API"
+                  className="min-w-0"
+                  label={<span className="wrap-anywhere">Enable Microsoft Graph mail & cloud API</span>}
                   description="When off, Graph mail and cloud probes remain paused until switched on."
                   checked={form.enabled}
                   onCheckedChange={(v) => set("enabled", v)}
                 />
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2">
                   <Field label="Tenant ID" required error={errors.tenantId}>
                     <Input
                       value={form.tenantId}
@@ -383,7 +404,7 @@ export default function GraphMailPage() {
               title="Connection & test message"
               description="Verify OAuth token acquisition and send a real test message from the configured sender mailbox."
             >
-              <div className="flex flex-col gap-4">
+              <div className="flex min-w-0 flex-col gap-4">
                 <KeyValueList
                   items={[
                     {
@@ -408,7 +429,7 @@ export default function GraphMailPage() {
                 </div>
                 {connError ? (
                   <Callout tone="danger" live="assertive">
-                    {connError}
+                    <p className="wrap-anywhere">{connError}</p>
                   </Callout>
                 ) : null}
                 {connResult ? (
@@ -421,9 +442,10 @@ export default function GraphMailPage() {
                     }
                     live="polite"
                   >
-                    <p>{connResult.safeMessage}</p>
-                    <p className="mt-1 text-xs text-muted">
-                      Reason: <code>{connResult.reasonCode}</code> · Completed in {connResult.durationMs} ms.
+                    <p className="wrap-anywhere">{connResult.safeMessage}</p>
+                    <p className="mt-1 text-xs wrap-anywhere text-muted">
+                      Reason: <code className="break-all">{connResult.reasonCode}</code> · Completed
+                      in {connResult.durationMs} ms.
                     </p>
                   </Callout>
                 ) : null}
@@ -431,7 +453,7 @@ export default function GraphMailPage() {
                 <form
                   noValidate
                   onSubmit={(e) => void onSendTest(e)}
-                  className="flex flex-col gap-3 border-t border-line pt-4"
+                  className="flex min-w-0 flex-col gap-3 border-t border-line pt-4"
                   aria-label="Send test message"
                 >
                   <Field label="Send test mail to" required error={mailError}>
@@ -454,9 +476,10 @@ export default function GraphMailPage() {
                     title={MAIL_TEST_TITLE[mailResult.outcome]}
                     live="polite"
                   >
-                    <p>{mailResult.safeMessage}</p>
-                    <p className="mt-1 text-xs text-muted">
-                      Recipient: {mailResult.recipientAddress} · Completed in {mailResult.durationMs} ms.
+                    <p className="wrap-anywhere">{mailResult.safeMessage}</p>
+                    <p className="mt-1 text-xs wrap-anywhere text-muted">
+                      Recipient: <span className="break-all">{mailResult.recipientAddress}</span> ·
+                      Completed in {mailResult.durationMs} ms.
                     </p>
                   </Callout>
                 ) : null}
@@ -466,10 +489,11 @@ export default function GraphMailPage() {
 
           <Card
             as="section"
+            className="min-w-0"
             title="SharePoint Sites.Selected write check"
             description="Verifies OAuth token acquisition, site/library read access, and resumable upload-session write permission. The probe opens an upload session and immediately cancels it with HTTP DELETE so zero marker files remain in SharePoint."
           >
-            <div className="flex flex-col gap-4">
+            <div className="flex min-w-0 flex-col gap-4">
               <KeyValueList
                 items={[
                   {
@@ -492,15 +516,15 @@ export default function GraphMailPage() {
               <form
                 noValidate
                 onSubmit={(e) => void onVerifyWrite(e)}
-                className="flex flex-col gap-4"
+                className="flex min-w-0 flex-col gap-4"
                 aria-label="SharePoint Sites.Selected write check"
               >
                 {probeError ? (
                   <Callout tone="danger" live="assertive">
-                    {probeError}
+                    <p className="wrap-anywhere">{probeError}</p>
                   </Callout>
                 ) : null}
-                <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-3">
                   <Field
                     label="SharePoint site URL or Graph site ID"
                     hint="Optional — defaults to configured storage site when omitted."
@@ -545,7 +569,7 @@ export default function GraphMailPage() {
               </form>
 
               {probeResult ? (
-                <div className="flex flex-col gap-3">
+                <div className="flex min-w-0 flex-col gap-3">
                   <Callout
                     tone={probeResult.outcome === "succeeded" ? "success" : "danger"}
                     title={
@@ -555,13 +579,13 @@ export default function GraphMailPage() {
                     }
                     live="polite"
                   >
-                    <p>{probeResult.safeMessage}</p>
-                    <p className="mt-1 text-xs text-muted">
-                      Reason: <code>{probeResult.reasonCode}</code> · Completed in {probeResult.durationMs} ms
-                      at <DateTime value={probeResult.checkedAt} />.
+                    <p className="wrap-anywhere">{probeResult.safeMessage}</p>
+                    <p className="mt-1 text-xs wrap-anywhere text-muted">
+                      Reason: <code className="break-all">{probeResult.reasonCode}</code> · Completed
+                      in {probeResult.durationMs} ms at <DateTime value={probeResult.checkedAt} />.
                     </p>
                   </Callout>
-                  <div className="flex flex-wrap gap-2" aria-label="Write check stages">
+                  <div className="flex min-w-0 flex-wrap gap-2" role="group" aria-label="Write check stages">
                     <StageBadge ok={probeResult.graphEgressEnabled} label="Graph egress" />
                     <StageBadge ok={probeResult.uploadEgressEnabled} label="Upload session egress" />
                     <StageBadge ok={probeResult.tokenAcquired} label="Entra token" />
@@ -575,6 +599,7 @@ export default function GraphMailPage() {
 
           <Card
             as="section"
+            className="min-w-0"
             title="Entra Sites.Selected runbook"
             description="Grant least-privilege site-scoped write access instead of tenant-wide SharePoint or OneDrive permissions."
           >
@@ -588,40 +613,59 @@ export default function GraphMailPage() {
               <Skeleton lines={4} />
             ) : (
               <div className="flex min-w-0 flex-col gap-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-medium text-ink">Required application permission:</span>
-                  <Badge tone="success">{runbook.data.requiredApplicationPermission}</Badge>
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium wrap-anywhere text-ink">
+                    Required application permission:
+                  </span>
+                  <span
+                    className="inline-flex min-w-0 max-w-full"
+                    title={runbook.data.requiredApplicationPermission}
+                  >
+                    <Badge className="min-w-0" tone="success">
+                      {runbook.data.requiredApplicationPermission}
+                    </Badge>
+                  </span>
                   {runbook.data.discouragedBroadPermissions.length > 0 ? (
                     <>
-                      <span className="text-sm font-medium text-ink">Avoid broad permissions:</span>
+                      <span className="text-sm font-medium wrap-anywhere text-ink">
+                        Avoid broad permissions:
+                      </span>
                       {runbook.data.discouragedBroadPermissions.map((perm) => (
-                        <Badge key={perm} tone="warning">
-                          {perm}
-                        </Badge>
+                        <span key={perm} className="inline-flex min-w-0 max-w-full" title={perm}>
+                          <Badge className="min-w-0" tone="warning">
+                            {perm}
+                          </Badge>
+                        </span>
                       ))}
                     </>
                   ) : null}
                 </div>
 
-                <ol className="list-decimal space-y-1.5 pl-5 text-sm text-body">
+                <ol className="min-w-0 list-decimal space-y-1.5 pl-5 text-sm wrap-anywhere text-body">
                   {runbook.data.steps.map((step, idx) => (
-                    <li key={idx}>{step}</li>
+                    <li key={idx} className="wrap-anywhere">
+                      {step}
+                    </li>
                   ))}
                 </ol>
 
                 <Callout tone="info" title="OneDrive & site scope note">
-                  {runbook.data.oneDriveNote}
+                  <p className="wrap-anywhere">{runbook.data.oneDriveNote}</p>
                 </Callout>
 
                 <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
                   <div className="flex min-w-0 flex-col gap-1.5">
-                    <h3 className="text-sm font-semibold text-ink">Graph site permission endpoint</h3>
+                    <h3 className="text-sm font-semibold wrap-anywhere text-ink">
+                      Graph site permission endpoint
+                    </h3>
                     <CodeBlock label="Graph site permission endpoint" language="HTTP" copyable wrap>
                       {runbook.data.siteGrantEndpointTemplate}
                     </CodeBlock>
                   </div>
                   <div className="flex min-w-0 flex-col gap-1.5">
-                    <h3 className="text-sm font-semibold text-ink">Grant payload example</h3>
+                    <h3 className="text-sm font-semibold wrap-anywhere text-ink">
+                      Grant payload example
+                    </h3>
                     <CodeBlock label="Grant payload example" language="JSON" copyable wrap>
                       {runbook.data.siteGrantPayloadExample}
                     </CodeBlock>
@@ -629,7 +673,9 @@ export default function GraphMailPage() {
                 </div>
 
                 <div className="flex min-w-0 flex-col gap-1.5">
-                  <h3 className="text-sm font-semibold text-ink">PnP / Microsoft Graph PowerShell example</h3>
+                  <h3 className="text-sm font-semibold wrap-anywhere text-ink">
+                    PnP / Microsoft Graph PowerShell example
+                  </h3>
                   <CodeBlock label="PowerShell site grant example" language="PowerShell" copyable wrap>
                     {runbook.data.powershellExample}
                   </CodeBlock>
@@ -644,25 +690,35 @@ export default function GraphMailPage() {
 }
 
 function PresetBadge({ enabled }: { enabled: boolean }) {
-  return enabled ? (
-    <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden />}>
-      Enabled
-    </Badge>
-  ) : (
-    <Badge tone="warning" icon={<CircleDashed className="size-3.5" aria-hidden />}>
-      Switched off
-    </Badge>
+  const label = enabled ? "Enabled" : "Switched off";
+  return (
+    <span className="inline-flex min-w-0 max-w-full" title={label}>
+      {enabled ? (
+        <Badge className="min-w-0" tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden />}>
+          {label}
+        </Badge>
+      ) : (
+        <Badge className="min-w-0" tone="warning" icon={<CircleDashed className="size-3.5" aria-hidden />}>
+          {label}
+        </Badge>
+      )}
+    </span>
   );
 }
 
 function StageBadge({ ok, label }: { ok: boolean; label: string }) {
-  return ok ? (
-    <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden />}>
-      {label}: passed
-    </Badge>
-  ) : (
-    <Badge tone="danger" icon={<XCircle className="size-3.5" aria-hidden />}>
-      {label}: not passed
-    </Badge>
+  const text = ok ? `${label}: passed` : `${label}: not passed`;
+  return (
+    <span className="inline-flex min-w-0 max-w-full" title={text}>
+      {ok ? (
+        <Badge className="min-w-0" tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden />}>
+          {text}
+        </Badge>
+      ) : (
+        <Badge className="min-w-0" tone="danger" icon={<XCircle className="size-3.5" aria-hidden />}>
+          {text}
+        </Badge>
+      )}
+    </span>
   );
 }

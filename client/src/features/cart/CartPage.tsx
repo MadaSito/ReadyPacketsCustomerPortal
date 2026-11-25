@@ -10,6 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ShoppingCart, Trash2 } from "lucide-react";
 import { useMemo, useRef, useState, type FormEvent } from "react";
 import { Link } from "wouter";
+import { StaffOrderHandoff } from "@/app/portal";
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import {
@@ -31,6 +32,7 @@ import {
   useToast,
 } from "@/ui";
 import { CartUpsellSection } from "./CartUpsellSection";
+import { useCartViewerGate } from "./viewerGate";
 
 export type CartViewData = inferRouterOutputs<AppRouter>["cart"]["get"];
 type CartLine = CartViewData["items"][number];
@@ -49,6 +51,22 @@ function money(amountMinor: number, currency: string | null) {
 }
 
 export function CartPage() {
+  const { pending, staffViewer } = useCartViewerGate();
+  if (pending) {
+    return (
+      <div role="status" aria-label="Loading cart" className="grid gap-3">
+        <Skeleton className="h-24" />
+        <Skeleton className="h-24" />
+      </div>
+    );
+  }
+  if (staffViewer) {
+    return <StaffOrderHandoff title="Carts belong to customer accounts" />;
+  }
+  return <CustomerCartPage />;
+}
+
+function CustomerCartPage() {
   const trpc = useTRPC();
   const queryClient = useQueryClient();
   const toast = useToast();
@@ -568,6 +586,10 @@ function SummaryCard({
               </p>
             ) : null}
           </div>
+        ) : cart.items.length === 0 && cart.promotionsEnabled && !cart.promoNotice ? (
+          <p className="mt-4 border-t border-line pt-4 text-xs text-muted">
+            Have a discount code? Add an item first to apply it here or at checkout.
+          </p>
         ) : null}
 
         {cart.promoNotice ? (

@@ -133,9 +133,10 @@ const nodeTypes = { rp: NodeCard };
 const edgeTypes = { rp: EdgeLine };
 const INSTANT = { duration: 0 } as const;
 // @xyflow/react 13 reads a bare number as pixels (0.2 → 0 px), so the margin is given as a percentage.
-// minZoom 0.75: fitting never shrinks the 32 px step/transition buttons below 24 px (WCAG 2.5.8); a larger graph
+// minZoom 0.8: fitting keeps the 32 px step/transition buttons at 25.6 px, clear of the 24 px minimum (WCAG 2.5.8)
+// with room for sub-pixel rounding (0.75 landed on exactly 24 px and failed intermittently); a larger graph
 // pans instead. People can still zoom out further themselves.
-const FIT = { padding: "8%", maxZoom: 1, minZoom: 0.75 } as const;
+const FIT = { padding: "8%", maxZoom: 1, minZoom: 0.8 } as const;
 
 function Canvas({ label, nodes, edges, selected = null, onSelect, onMove, onConnect, onArrange, onDelete, readOnly = false, height = "md" }: FlowCanvasProps) {
   const flow = useReactFlow<RpNode, RpEdge>();

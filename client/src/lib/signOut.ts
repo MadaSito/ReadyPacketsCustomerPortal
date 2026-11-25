@@ -6,10 +6,12 @@ import { useToast } from "@/ui/Toast";
 import { ME_QUERY_KEY, useAuthApi } from "./authApi";
 import { isUnauthenticated } from "./session";
 import { clearRecoveryBatch } from "./recoveryBatch";
+import { clearCustomerPortalChoice } from "./portal";
 
 /** Deletes Cache Storage entries created by the service worker (static shell only, but cleared anyway). */
 export async function clearClientCaches(): Promise<void> {
   clearRecoveryBatch();
+  clearCustomerPortalChoice();
   try {
     if (typeof caches === "undefined") return;
     const keys = await caches.keys();

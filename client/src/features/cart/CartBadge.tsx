@@ -5,13 +5,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { useFeatureEnabled } from "@/lib/features";
 import { useTRPC } from "@/lib/trpc";
+import { useCartViewerGate } from "./viewerGate";
 
 export function cartCountLabel(count: number): string {
   return `${count} ${count === 1 ? "item" : "items"} in cart`;
 }
 
 export function CartBadge() {
-  const enabled = useFeatureEnabled("cart");
+  const { pending, staffViewer } = useCartViewerGate();
+  const featureEnabled = useFeatureEnabled("cart");
+  const enabled = featureEnabled && !pending && !staffViewer;
   const trpc = useTRPC();
   const badge = useQuery({ ...trpc.cart.badgeCount.queryOptions(undefined, { enabled }), staleTime: 30_000 });
   const count = badge.data?.enabled ? badge.data.itemCount : 0;

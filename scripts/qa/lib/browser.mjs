@@ -1,7 +1,9 @@
-import { access, readdir } from "node:fs/promises";
+/* global window -- Used only inside Chromium init script evaluation. */
+import { access, readFile, readdir } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { routeQaContext } from "./routes.mjs";
 
 async function isExecutable(path) {
   try { await access(path, constants.X_OK); return true; } catch { return false; }
@@ -42,4 +44,58 @@ export async function launchQaBrowser() {
   const { chromium } = await import("playwright-core");
   const browser = await chromium.launch({ executablePath, headless: true });
   return { browser, baseUrl };
+}
+
+/** Fresh pages at every width; optionally retain the browser context only within one scenario/theme/input mode. */
+export function createQaPages(browser, baseUrl, reuse) {
+  let context;
+  let page;
+  let key;
+  let initialState;
+  async function finish(force = false) {
+    if (force || !reuse) {
+      await context?.close();
+      context = page = key = initialState = undefined;
+    } else {
+      await page?.close();
+      page = undefined;
+    }
+  }
+  return {
+    finish,
+    async open(scenario, theme, viewport, hasTouch = false) {
+      const nextKey = JSON.stringify([scenario.name, scenario.path, scenario.storageState, theme, hasTouch]);
+      if (key !== nextKey) await finish(true);
+      else await finish();
+      if (!context) {
+        initialState = reuse && scenario.storageState ? JSON.parse(await readFile(scenario.storageState, "utf8")) : undefined;
+        context = await browser.newContext({
+          colorScheme: theme, viewport, storageState: reuse ? initialState : scenario.storageState, hasTouch,
+          acceptDownloads: false, serviceWorkers: "block",
+        });
+        key = nextKey;
+        await routeQaContext(context, baseUrl);
+        if (reuse) {
+          const entries = initialState?.origins?.find(({ origin }) => origin === baseUrl)?.localStorage ?? [];
+          await context.addInitScript(({ origin, entries }) => {
+            if (window.location.origin !== origin) return;
+            window.localStorage.clear();
+            // This is a new tab for each measurement. Do not erase choices made by fixture setup during navigation.
+            for (const { name, value } of entries) window.localStorage.setItem(name, value);
+            window.history.scrollRestoration = "manual";
+            window.scrollTo(0, 0);
+          }, { origin: baseUrl, entries });
+        }
+      } else {
+        await context.clearCookies();
+        if (initialState?.cookies?.length) await context.addCookies(initialState.cookies);
+      }
+      page = await context.newPage();
+      if (reuse) {
+        await page.setViewportSize(viewport);
+        await page.emulateMedia({ colorScheme: theme });
+      }
+      return page;
+    },
+  };
 }

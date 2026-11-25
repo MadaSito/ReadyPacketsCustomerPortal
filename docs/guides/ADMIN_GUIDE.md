@@ -46,6 +46,13 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Increment 07: phases, payments and sign-in](#increment-07-phases-payments-and-sign-in)
 - [Alerts](#alerts)
 - [Microsoft 365 file sync](#microsoft-365-file-sync)
+- [Increment 07.1: ordering for customers and the portal switch](#increment-071-ordering-for-customers-and-the-portal-switch)
+  - [Placing an order for a customer](#placing-an-order-for-a-customer)
+  - [Switching between the admin and customer portals](#switching-between-the-admin-and-customer-portals)
+  - [Why admins cannot use the cart](#why-admins-cannot-use-the-cart)
+  - [Turning on discount codes](#turning-on-discount-codes)
+  - [Troubleshooting: "You do not have permission to perform this action"](#troubleshooting-you-do-not-have-permission-to-perform-this-action)
+  - [Troubleshooting: a mail template editor link returns 404](#troubleshooting-a-mail-template-editor-link-returns-404)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -224,6 +231,8 @@ Open **Operations → Discount codes** (`/admin/promotions`). The pages are `/ad
 ### Switching it on
 
 The **Discount codes** switch on the page (`feature.promotions`) is off by default. While it is off, no code can be applied anywhere, and existing orders keep their discounts.
+
+Customers also need the cart on to enter a code in the cart and at checkout. See [Turning on discount codes](#turning-on-discount-codes) for both prerequisites and where the field appears.
 
 ### Creating a code
 
@@ -497,6 +506,82 @@ Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first
 - **Resync.** **Dry run** first shows the count. Then queue a bounded resync of at most 100 existing failed or blocked items.
 - **Uncertain uploads.** An upload whose outcome is unknown is inspected and reconciled, never replayed blindly.
 - **Health and alerts.** Health shows the last success, the backlog and blocked items, and problems raise alerts on `/admin/alerts`. The order's **File sync** tab shows each file's role, destination and state.
+
+## Increment 07.1: ordering for customers and the portal switch
+
+These changes are mostly in the web app. Server permissions are unchanged. Background is in the [session log of 2026-11-25](../session-logs/2026-11-25-session-01.md).
+
+### Placing an order for a customer
+
+1. Open the dialog in one of two ways:
+   - in the console, open **Orders** (`/admin/orders`) and choose **New order for a customer**;
+   - or go straight to `/admin/orders?new=1`.
+   The dialog opens and the keyboard focus moves into it.
+2. Pick the customer, enter a project name, and set a quantity for each product.
+3. Optional:
+   - enter a discount code (shown when discount codes are on). The code is checked for that customer, and is removed again if you change the customer or the items;
+   - add a note for the customer.
+4. Create the order. It appears in that customer's portal.
+
+Closing the dialog removes `?new=1` from the address and returns focus to where you were.
+
+You need the `orders.manage` capability. Staff and administrators who open **Create an order** or the cart in the customer portal see the panel "Orders are placed for a customer". Its **New order for a customer** button brings them here.
+
+### Switching between the admin and customer portals
+
+- **In the console**, choose **Customer portal**. It is in the top bar on medium and larger screens. On small screens it is the first item in the menu drawer.
+- **In the customer portal**, choose **Admin portal** (administrators) or **Staff portal** (staff). It is in:
+  - the top bar on medium and larger screens;
+  - the menu drawer, as the first item;
+  - the notice at the top of every page, which shows the button below medium width: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts." The notice cannot be dismissed, so you always know which portal you are in.
+- **Landing page.** Staff and administrators who open `/` go to `/admin`, unless they chose the customer portal in this browser tab.
+  - The choice is per tab and is not shared with other tabs.
+  - It ends when you switch back or sign out.
+- **Customers** never see the switch.
+
+The switch changes only which screens you see. It grants nothing, and the server checks every request as before.
+
+### Why admins cannot use the cart
+
+Orders, carts and checkout belong to customer accounts. The server refuses them for staff and administrator accounts, on purpose: it keeps the people who run the portal separate from the people who buy through it (zero trust).
+
+- In the customer portal, staff and administrators see a handoff panel instead of the order form, cart or checkout. This applies on `/orders/new`, `/cart`, `/cart/checkout`, `/checkout/return` and `/checkout/cancel`.
+- No cart requests are made for them.
+- The customer menu hides **Create an order** and **Cart** for them.
+- To order on a customer's behalf, use [Placing an order for a customer](#placing-an-order-for-a-customer).
+- To try the customer journey yourself, sign in with a separate customer account. A test customer is suitable.
+
+### Turning on discount codes
+
+Customers can enter a code in the cart and at checkout only when both of these are on:
+
+1. **Discount codes** at **Operations → Discount codes** (`/admin/promotions`), in the **Settings** card (`feature.promotions`). It is off when shipped.
+2. **Cart** at **Settings → Features** (`/admin/settings/features`, `feature.cart`).
+
+Then:
+- **In the cart.** The field is in the cart summary once the cart has at least one item. An empty cart shows "Have a discount code? Add an item first to apply it here or at checkout."
+- **At checkout.** The field is also on the checkout page.
+- **On the order form.** The Review step shows "Have a discount code? You can enter it in your cart and at checkout."
+- **With the cart off.** The direct order form keeps its own code field on the Review step.
+- **In the console.** The **New order for a customer** dialog shows the field whenever discount codes are on.
+
+Create at least one active code ([Creating a code](#creating-a-code)). Otherwise every code entered is refused.
+
+### Troubleshooting: a mail template editor link returns 404
+
+On builds before 07.1, reloading or bookmarking a template editor whose key has a dot returned "Not found". An example is `/admin/email-templates/auth.password_reset`.
+- **On older builds**, open the template from **E-mail templates** instead.
+- **From 07.1**, such links work for built-in keys and `custom.<slug>` keys. Other paths with a file extension still return 404 by design.
+
+### Troubleshooting: "You do not have permission to perform this action"
+
+- **On older builds.** Before 07.1, an administrator or staff member in the customer portal saw this message on step 3 of **Create an order** or on the cart. This was the server refusing an order or cart for a staff account, as described in [Why admins cannot use the cart](#why-admins-cannot-use-the-cart).
+- **Fix.** Use the console instead: `/admin/orders?new=1`. Or upgrade with the normal steps in [UPGRADE.md](../operations/UPGRADE.md); the commands are unchanged for 07.1. After the upgrade, the handoff panel replaces the message.
+- **If a customer sees it**, check the following:
+  - the account's role is **Customer**;
+  - the account is not suspended;
+  - the feature in use is on at `/admin/settings/features`.
+  Then look up the request's correlation ID in the audit centre.
 
 ## Storage copy log
 

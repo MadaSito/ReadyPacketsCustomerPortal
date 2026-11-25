@@ -234,6 +234,41 @@ describe("customer order list", () => {
     await waitFor(() => expect(calls.find((c) => c.path === "orders.sharing.respond")?.input).toEqual({ grantId: "01JTESTGRANT0000000000000A", accept: true }));
   });
 
+  it("07.1 D4: New order and Start an order go to the wizard for customers and to the console dialog for staff/admin", async () => {
+    handlers.set("orders.list", () => ({ items: [], nextCursor: null }));
+    handlers.set("orders.sharing.myInvitations", () => []);
+    const first = renderUi(<OrdersListPage />, { path: "/orders" });
+    await screen.findByText("No orders yet");
+    expect(screen.getByRole("link", { name: "New order" })).toHaveAttribute("href", "/orders/new");
+    expect(screen.getByRole("link", { name: "Start an order" })).toHaveAttribute("href", "/orders/new");
+    first.unmount();
+    for (const role of ["staff", "admin"]) {
+      session.role = role;
+      const view = renderUi(<OrdersListPage />, { path: "/orders" });
+      await screen.findByText("No orders yet");
+      const links = screen.getAllByRole("link", { name: "New order for a customer" });
+      expect(links).toHaveLength(2);
+      for (const link of links) expect(link).toHaveAttribute("href", "/admin/orders?new=1");
+      expect(screen.queryByRole("link", { name: /^(New order|Start an order)$/ })).not.toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it("240 px reflow: the phone card's progress bar has no fixed minimum width (the 10rem floor is md+ table only)", async () => {
+    handlers.set("orders.list", () => ({ items: [{ ...listItem, progressPercent: 40, phaseLabel: "Payment", phaseIndex: 0, phaseTotal: 7, progressCanceled: false }], nextCursor: null }));
+    const { container } = renderUi(<OrdersListPage />, { path: "/orders" });
+    await screen.findAllByRole("link", { name: "Synthetic project" });
+    const cards = screen.getByRole("list", { name: "Your orders" });
+    const bars = [...container.querySelectorAll<HTMLElement>('[data-variant="compact"]')];
+    expect(bars.length).toBeGreaterThan(0);
+    expect(bars.some((bar) => cards.contains(bar))).toBe(true);
+    for (const bar of bars) {
+      const classes = bar.className.split(/\s+/);
+      expect(classes).not.toContain("min-w-40");
+      expect(classes).toContain("md:min-w-40");
+    }
+  });
+
   it("shows an error state when the list fails", async () => {
     handlers.set("orders.list", () => {
       throw new Error("boom");
@@ -358,6 +393,7 @@ describe("new order wizard", () => {
     // No nested forms: the discount field's form is outside the wizard form.
     expect(container.querySelectorAll("form form")).toHaveLength(0);
     const codeInput = await screen.findByLabelText("Discount code");
+    expect(screen.queryByText(/You can enter it in your cart and at checkout/)).not.toBeInTheDocument();
     // Enter with a wrong code: quote only, uniform refusal, no order.
     await user.type(codeInput, "WRONG1{Enter}");
     await waitFor(() => expect(calls.filter((c) => c.path === "orders.quoteWithPromo")).toHaveLength(1));
@@ -378,6 +414,37 @@ describe("new order wizard", () => {
     const create = calls.filter((c) => c.path === "orders.create");
     expect(create).toHaveLength(1);
     expect(create[0]!.input).toMatchObject({ promoCode: "SAVE10" });
+  });
+
+  it("07.1 D4: staff/admin on /orders/new get the handoff panel, not the wizard, and no customer queries run", async () => {
+    for (const role of ["staff", "admin"]) {
+      session.role = role;
+      calls.length = 0;
+      const view = renderUi(<NewOrderPage />, { path: "/orders/new" });
+      expect(screen.getByRole("heading", { level: 1, name: "Orders are placed for a customer" })).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
+      expect(screen.queryByRole("button", { name: "Continue" })).not.toBeInTheDocument();
+      expect(calls.filter((c) => c.path === "orders.catalog.list")).toHaveLength(0);
+      await expectNoAxeViolations(view.container);
+      view.unmount();
+    }
+  });
+
+  it("07.1 D6: with cart and promotions on, Review says a discount code goes in the cart and at checkout", async () => {
+    handlers.set("orders.catalog.list", () => catalog);
+    handlers.set("platform.bootstrap", () => ({ features: { promotions: true, cart: true }, consent: { enabled: false, policyVersion: 1, renewMonths: 12 } }));
+    const user = userEvent.setup();
+    const { container } = renderUi(<NewOrderPage />, { path: "/orders/new" });
+    await screen.findByText("Synthetic A");
+    await user.type(screen.getByLabelText("Quantity of Synthetic A"), "2");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await user.type(screen.getByLabelText(/Project name/), "Cart project");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByRole("heading", { level: 2, name: "Review" })).toBeInTheDocument();
+    expect(await screen.findByText("Have a discount code? You can enter it in your cart and at checkout.")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Discount code")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add to cart" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
   });
 
   it("C3 discount code dropped after a selection change stays removed when the selection is restored", async () => {
@@ -889,6 +956,16 @@ describe("dashboard widget and helpers", () => {
     const { container } = renderUi(<RecentOrdersWidget />);
     expect(await screen.findByRole("link", { name: "Synthetic project" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
+  });
+
+  it("07.1 D4: the empty widget's Start an order points staff/admin to the console dialog", async () => {
+    handlers.set("orders.list", () => ({ items: [], nextCursor: null }));
+    const first = renderUi(<RecentOrdersWidget />);
+    expect(await screen.findByRole("link", { name: "Start an order" })).toHaveAttribute("href", "/orders/new");
+    first.unmount();
+    session.role = "admin";
+    renderUi(<RecentOrdersWidget />);
+    expect(await screen.findByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
   });
 
   it("money parsing is exact and idempotency keys are random and well-formed", () => {

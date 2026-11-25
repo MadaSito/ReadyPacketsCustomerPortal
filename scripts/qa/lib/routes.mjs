@@ -1,4 +1,4 @@
-/* global document -- Used only inside Chromium callback evaluation. */
+/* global document, window -- Used only inside Chromium callback evaluation. */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -16,6 +16,7 @@ const roles = {
   admin: ["admin"],
 };
 const explicitStates = new Set(["/reset-password", "/activate", "/verify-email", "/sso/complete"]);
+const roleOrder = ["anonymous", "transition", "customer", "staff", "admin"];
 
 export async function qaRouteInventory() {
   const directory = await mkdtemp(join(tmpdir(), "rp-qa-routes-"));
@@ -63,7 +64,9 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
       } else input.push({ role });
     }
     for (const [index, item] of input.entries()) {
-      if (![...requiredRoles, ...(route.access === "public" ? ["customer", "staff", "admin"] : [])].includes(item.role)) {
+      const customerPortal = item.enterViaCustomerPortal === true && ["admin", "staff"].includes(item.role) &&
+        ["public", "customer"].includes(route.access);
+      if (!customerPortal && ![...requiredRoles, ...(route.access === "public" ? ["customer", "staff", "admin"] : [])].includes(item.role)) {
         throw new Error(`QA fixtures: unexpected role for ${route.id}.`);
       }
       const path = item.path ?? route.path;
@@ -87,6 +90,7 @@ export function resolveQaScenarios(inventory, config = {}, directory = process.c
       cases.push({
         name, path, redirectsTo: item.redirectsTo, role: item.role, title: item.title ?? route.title,
         heading: item.heading, ready: item.ready, tab: route.tab, steps: item.steps ?? [],
+        enterViaCustomerPortal: customerPortal,
         storageState: state ? resolve(directory, state) : undefined,
       });
     }
@@ -101,7 +105,9 @@ export async function qaRouteScenarios() {
   if (fixturePath) {
     try { config = JSON.parse(await readFile(fixturePath, "utf8")); } catch { throw new Error("QA_ROUTE_FIXTURES is unreadable or not valid JSON."); }
   }
-  return resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
+  const result = resolveQaScenarios(await qaRouteInventory(), config, fixturePath ? dirname(resolve(fixturePath)) : process.cwd(), process.env.QA_ROUTE_FILTER);
+  result.cases.sort((a, b) => roleOrder.indexOf(a.role) - roleOrder.indexOf(b.role));
+  return result;
 }
 
 const assetCache = new Map();
@@ -109,9 +115,9 @@ const HASHED_ASSET = /^\/(assets|fonts)\/[^/]+[.-][A-Za-z0-9_-]{8,}\.(js|css|wof
 
 /**
  * Same-origin routing for a fresh QA context: blocks other origins and serves immutable, content-hashed
- * /assets and /fonts files from a per-process memory cache after their first successful fetch. Every scan still
- * uses a fresh context, but chunks are not downloaded again for each one (the edge pre-gate counts every request
- * per IP). Navigations, API calls and unhashed files always go to the server.
+ * /assets and /fonts files from a per-process memory cache after their first successful fetch. Chunks are not
+ * downloaded again for each scan (the edge pre-gate counts every request per IP). Navigations, API calls and
+ * unhashed files always go to the server.
  */
 export async function routeQaContext(context, baseUrl) {
   await context.route("**/*", async (route) => {
@@ -121,12 +127,18 @@ export async function routeQaContext(context, baseUrl) {
     if (request.method() !== "GET" || url.search || !HASHED_ASSET.test(url.pathname)) return route.continue();
     const cached = assetCache.get(url.pathname);
     if (cached) return route.fulfill(cached);
-    const response = await route.fetch();
-    if (response.status() === 200) {
+    try {
+      const response = await route.fetch();
+      if (response.status() !== 200) return await route.fulfill({ response });
       const headers = response.headers();
-      assetCache.set(url.pathname, { status: 200, headers: { "content-type": headers["content-type"] ?? "application/octet-stream" }, body: await response.body() });
+      const asset = { status: 200, headers: { "content-type": headers["content-type"] ?? "application/octet-stream" }, body: await response.body() };
+      assetCache.set(url.pathname, asset);
+      await route.fulfill(asset);
+    } catch {
+      // The scan may close its page/context while a non-blocking asset response is still in flight.
+      // Treat failed cache fills as ordinary network requests when the page remains open.
+      await route.continue().catch(() => {});
     }
-    return route.fulfill({ response });
   });
 }
 
@@ -192,6 +204,17 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     await probe.dispose();
   }
   const expected = new URL(scenario.path, baseUrl);
+  if (scenario.enterViaCustomerPortal) {
+    await page.goto(new URL("/admin", baseUrl).href, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    const topSwitch = page.getByRole("banner").getByRole("link", { name: "Customer portal", exact: true });
+    const mobile = await page.evaluate(() => !window.matchMedia("(min-width: 48rem)").matches);
+    if (mobile) {
+      await page.getByRole("button", { name: "Open console navigation", exact: true }).click({ timeout: 10_000 });
+      await page.getByRole("dialog", { name: "Console navigation" })
+        .getByRole("link", { name: "Customer portal", exact: true }).press("Enter", { timeout: 10_000 });
+    } else await topSwitch.press("Enter", { timeout: 10_000 });
+    await page.waitForURL(new URL("/", baseUrl).href, { timeout: 10_000 });
+  }
   const response = await page.goto(expected.href, { waitUntil: "domcontentloaded", timeout: 15_000 });
   const notFoundProbe = expected.pathname === "/__qa_missing_route__";
   if (!response || (!response.ok() && !(notFoundProbe && response.status() === 404))) {
@@ -209,7 +232,11 @@ async function openQaRouteOnce(page, baseUrl, scenario, theme, beforeSteps) {
     await beforeSteps?.();
     if (scenario.tab) await page.getByRole("tab", { name: scenario.tab, exact: true }).click({ timeout: 5_000 });
     for (const step of scenario.steps) {
-      await page.getByRole(step.role, { name: step.name, exact: true }).press("Enter", { timeout: 5_000 });
+      let control = step.label ? page.getByLabel(step.label, { exact: step.labelPrefix !== true }) :
+        page.getByRole(step.role, { name: step.name, exact: step.namePrefix !== true });
+      if (step.first === true) control = control.first();
+      if (typeof step.text === "string") await control.pressSequentially(step.text, { timeout: 5_000 });
+      else await control.press(step.key ?? "Enter", { timeout: 5_000 });
     }
     if (scenario.ready) await page.locator(scenario.ready).waitFor({ state: "visible", timeout: 5_000 });
   } catch {

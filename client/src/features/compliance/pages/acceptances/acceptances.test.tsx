@@ -732,6 +732,171 @@ describe("Package D2 — Policy Acceptance Log Centre & Customer Policies Tab", 
       await screen.findByText("Showing 1 acceptance record"),
     ).toHaveAttribute("role", "status");
   });
+
+  it("240 px reflow: Log and Coverage phone cards stack sub-320 px definition lists and let timestamps, hashes, badges, and date inputs wrap/shrink", async () => {
+    // 1. /admin/policy-acceptances (staff role)
+    const logView = renderRoutes("/admin/policy-acceptances", "staff");
+    await screen.findAllByText("Cara Customer");
+
+    const logTabPanel = screen.getByRole("tabpanel");
+    expect(logTabPanel.className.split(/\s+/)).toContain("min-w-0");
+
+    const logPhoneList = screen.getByRole("list", { name: "Policy acceptance log" });
+    const logTableWrapper = logPhoneList.parentElement;
+    expect(logTableWrapper).not.toBeNull();
+    const logTableClasses = logTableWrapper!.className.split(/\s+/);
+    expect(logTableClasses).toContain("max-[320px]:[&_li]:min-w-0");
+    expect(logTableClasses).toContain("max-[320px]:[&_dl]:grid-cols-1");
+
+    // Hash + copy row inside phone card wraps instead of forcing an unbroken inline-flex row
+    const hashCodes = [...logPhoneList.querySelectorAll<HTMLElement>("code")].filter(
+      (el) => el.textContent === HASH_V2.slice(0, 12),
+    );
+    expect(hashCodes.length).toBeGreaterThan(0);
+    for (const code of hashCodes) {
+      expect(code.className.split(/\s+/)).toEqual(expect.arrayContaining(["min-w-0", "break-all"]));
+      const rowClasses = code.parentElement!.className.split(/\s+/);
+      expect(rowClasses).toEqual(expect.arrayContaining(["flex", "min-w-0", "max-w-full", "flex-wrap"]));
+      expect(rowClasses).not.toContain("inline-flex");
+    }
+
+    // TimestampWithUtc inside phone card is a shrinkable flex column, not an atomic inline-flex box
+    const utcNodes = [...logPhoneList.querySelectorAll<HTMLElement>("span")].filter(
+      (el) => el.className.includes("font-mono") && el.textContent?.endsWith(" UTC"),
+    );
+    expect(utcNodes.length).toBeGreaterThan(0);
+    for (const utc of utcNodes) {
+      const wrapperClasses = utc.parentElement!.className.split(/\s+/);
+      expect(wrapperClasses).toEqual(expect.arrayContaining(["flex", "min-w-0", "max-w-full", "flex-col"]));
+      expect(wrapperClasses).not.toContain("inline-flex");
+    }
+
+    // Native date inputs carry w-full min-w-0 max-w-full so browser date chrome never overflows narrow containers
+    for (const label of ["From date", "To date"]) {
+      const inputs = screen.getAllByLabelText(label);
+      expect(inputs.length).toBeGreaterThan(0);
+      for (const input of inputs) {
+        expect(input.className.split(/\s+/)).toEqual(
+          expect.arrayContaining(["w-full", "min-w-0", "max-w-full"]),
+        );
+      }
+    }
+    logView.unmount();
+
+    // 2. /admin/policy-acceptances/coverage (staff role — both prior-version and never-accepted customers)
+    const coverageView = renderRoutes("/admin/policy-acceptances/coverage", "staff", {
+      "compliance.policies.admin.acceptanceLog.coverage": () => ({
+        ...coverageFixture,
+        policies: [
+          {
+            ...coverageFixture.policies[0]!,
+            outstandingCount: 2,
+            outstandingCustomers: [
+              ...coverageFixture.policies[0]!.outstandingCustomers,
+              {
+                customer: {
+                  userPublicId: "01JD0000000000000000000099",
+                  name: "Nina Never",
+                  email: "nina@example.test",
+                  customerRef: "RP-CUST99",
+                },
+                lastAcceptedVersionPublicId: null,
+                lastAcceptedVersionNumber: null,
+                lastAcceptedVersionLabel: null,
+                lastAcceptedAt: null,
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    await screen.findAllByText("Omar Outstanding");
+    await screen.findAllByText("Nina Never");
+
+    const coverageSection = screen.getByRole("region", { name: "Production terms coverage" });
+    expect(coverageSection.className.split(/\s+/)).toContain("min-w-0");
+
+    const coveragePhoneList = screen.getByRole("list", {
+      name: "Outstanding customers for Production terms",
+    });
+    const coverageTableWrapper = coveragePhoneList.parentElement;
+    expect(coverageTableWrapper).not.toBeNull();
+    const coverageTableClasses = coverageTableWrapper!.className.split(/\s+/);
+    expect(coverageTableClasses).toContain("max-[320px]:[&_li]:min-w-0");
+    expect(coverageTableClasses).toContain("max-[320px]:[&_dl]:grid-cols-1");
+
+    const neverAccepted = [...coveragePhoneList.querySelectorAll<HTMLElement>('[title="No version accepted"]')];
+    expect(neverAccepted.length).toBeGreaterThan(0);
+    for (const el of neverAccepted) {
+      expect(el.className.split(/\s+/)).toEqual(
+        expect.arrayContaining(["min-w-0", "max-w-full", "flex-wrap"]),
+      );
+    }
+    coverageView.unmount();
+
+    // 3. /admin/customers/:customerId#policies (admin role — both nested Status per policy and Acceptance history cards)
+    const customerPoliciesView = renderWithTrpc(
+      <CustomerDetailHost customerId={CUST_CARA} />,
+      baseFixtures("admin", {
+        "compliance.policies.enforcement.forTarget": () => ({ canEndSessions: true }),
+      }),
+      {
+        path: `/admin/customers/${CUST_CARA}`,
+        role: "admin",
+      },
+    );
+    await screen.findByText("Status per policy");
+    expect(await screen.findByRole("button", { name: "End sessions now" })).toBeInTheDocument();
+
+    const statusSection = screen.getByRole("region", { name: "Policy status per document" });
+    expect(statusSection.className.split(/\s+/)).toContain("min-w-0");
+    const statusPhoneList = screen.getByRole("list", { name: "Customer policy status" });
+    const statusTableWrapper = statusPhoneList.parentElement;
+    expect(statusTableWrapper).not.toBeNull();
+    expect(statusTableWrapper!.parentElement!.className.split(/\s+/)).toContain("min-w-0");
+    expect(statusTableWrapper!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        "max-[320px]:[&_li]:min-w-0",
+        "max-[320px]:[&_dl]:grid-cols-1",
+        "max-[320px]:[&_dt]:break-words",
+      ]),
+    );
+    const statusBadges = [
+      ...statusPhoneList.querySelectorAll<HTMLElement>('[title="Accepted current version"], [title="Update pending"]'),
+    ];
+    expect(statusBadges.length).toBeGreaterThanOrEqual(2);
+    for (const badge of statusBadges) {
+      expect(badge.className.split(/\s+/)).toEqual(
+        expect.arrayContaining(["min-w-0", "max-w-full", "flex-wrap"]),
+      );
+    }
+
+    const historySection = screen.getByRole("region", { name: "Full policy acceptance history" });
+    expect(historySection.className.split(/\s+/)).toContain("min-w-0");
+    const historyPhoneList = screen.getByRole("list", {
+      name: "Customer policy acceptance history",
+    });
+    const historyTableWrapper = historyPhoneList.parentElement;
+    expect(historyTableWrapper).not.toBeNull();
+    expect(historyTableWrapper!.className.split(/\s+/)).toEqual(
+      expect.arrayContaining([
+        "max-[320px]:[&_li]:min-w-0",
+        "max-[320px]:[&_dl]:grid-cols-1",
+        "max-[320px]:[&_dt]:break-words",
+      ]),
+    );
+    const sourceCells = [...historyPhoneList.querySelectorAll<HTMLElement>("span")].filter(
+      (el) => el.textContent === "Order gate",
+    );
+    expect(sourceCells.length).toBeGreaterThan(0);
+    for (const sourceLabel of sourceCells) {
+      expect(sourceLabel.className.split(/\s+/)).toContain("break-words");
+      expect(sourceLabel.parentElement!.className.split(/\s+/)).toEqual(
+        expect.arrayContaining(["flex", "min-w-0", "max-w-full", "flex-col"]),
+      );
+    }
+    customerPoliciesView.unmount();
+  });
 });
 
 pageA11y("/admin/policy-acceptances (Log tab) ready", async () => {

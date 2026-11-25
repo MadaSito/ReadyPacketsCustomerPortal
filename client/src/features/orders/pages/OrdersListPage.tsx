@@ -3,12 +3,15 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tansta
 import { Package, Plus } from "lucide-react";
 import { useState } from "react";
 import { Link } from "wouter";
+import { NewOrderForCustomerLink, useIsStaffViewer } from "@/app/portal";
 import { errorMessage, useTRPC } from "@/lib/trpc";
 import { Button, Card, DataTable, DateTime, EmptyState, LoadMore, Money, PageHeader, useToast } from "@/ui";
 import { ACCESS_ROLE_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 import { OrderListProgress } from "../stages/OrderListProgress";
 
 export default function OrdersListPage() {
+  // Increment 07.1 (D4): staff/admin cannot place customer orders here; their buttons lead to the console dialog.
+  const staffViewer = useIsStaffViewer();
   const trpc = useTRPC();
   const list = useInfiniteQuery(trpc.orders.list.infiniteQueryOptions({ limit: 25 }, { getNextPageParam: (page) => page.nextCursor ?? undefined }));
   const rows = list.data?.pages.flatMap((page) => page.items);
@@ -18,9 +21,13 @@ export default function OrdersListPage() {
         title="Orders"
         description="Track the status of every order you own or that has been shared with you."
         actions={
-          <Button asChild leadingIcon={<Plus aria-hidden />}>
-            <Link href="/orders/new">New order</Link>
-          </Button>
+          staffViewer ? (
+            <NewOrderForCustomerLink />
+          ) : (
+            <Button asChild leadingIcon={<Plus aria-hidden />}>
+              <Link href="/orders/new">New order</Link>
+            </Button>
+          )
         }
       />
       <div className="flex flex-col gap-6">
@@ -56,7 +63,9 @@ export default function OrdersListPage() {
                 </span>
               ),
             },
-            { key: "progress", header: "Progress", cell: (order) => <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="min-w-40" /> },
+            // The 10rem floor only applies to the md+ table; in the phone card the bar shrinks to its cell (an unconditional
+            // min-w-40 forced +57 px of horizontal scroll at a 240 px viewport).
+            { key: "progress", header: "Progress", cell: (order) => <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="w-full md:min-w-40" /> },
             { key: "access", header: "Access", hideOnMobile: true, cell: (order) => ACCESS_ROLE_LABELS[order.accessRole] ?? order.accessRole },
             { key: "updatedAt", header: "Updated", cell: (order) => <DateTime value={order.updatedAt} format="relative" /> },
             { key: "total", header: "Total", align: "end", cell: (order) => <Money value={money(order.totalMinor, order.currency)} /> },
@@ -67,9 +76,13 @@ export default function OrdersListPage() {
               title="No orders yet"
               description="When you place an order, or someone shares one with you, it appears here."
               action={
-                <Button asChild>
-                  <Link href="/orders/new">Start an order</Link>
-                </Button>
+                staffViewer ? (
+                  <NewOrderForCustomerLink variant="secondary" />
+                ) : (
+                  <Button asChild>
+                    <Link href="/orders/new">Start an order</Link>
+                  </Button>
+                )
               }
             />
           }

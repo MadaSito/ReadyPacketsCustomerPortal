@@ -87,7 +87,7 @@ export default function AdminTicketsPage() {
       />
 
       {summaryQuery.isPending ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3" aria-label="Loading queue summary">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3" role="status" aria-label="Loading queue summary">
           <Card><Skeleton lines={2} /></Card>
           <Card><Skeleton lines={2} /></Card>
           <Card><Skeleton lines={2} /></Card>

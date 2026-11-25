@@ -10,6 +10,7 @@ import { Link, useLocation } from "wouter";
 import { AgreementDialog, parseAgreementRequiredDetails, type AgreementRequiredDetails } from "@/lib/agreementGate";
 import { useFeatureEnabled } from "@/lib/features";
 import { errorMessage, safeError, useTRPC, useTRPCClient } from "@/lib/trpc";
+import { StaffOrderHandoff, useIsStaffViewer } from "@/app/portal";
 // Increment 05 (C3): shared discount code field, imported here by /root's direction (audit_engineer owns it).
 import { PromoCodeField } from "@/features/promotions/PromoCodeField";
 import { Breadcrumbs, Button, Callout, Card, EmptyState, ErrorState, Field, Input, KeyValueList, Money, PageHeader, Skeleton, Textarea, useToast } from "@/ui";
@@ -38,7 +39,18 @@ const REASON_MESSAGES: Record<string, string> = {
 const STEPS = ["Choose items", "Details", "Review"] as const;
 const MAX_QUANTITY = 1000;
 
+/**
+ * Increment 07.1 (D4): staff/admin viewing the customer portal cannot place customer orders here (the server keeps
+ * refusing with CUSTOMER_ROLE_REQUIRED). They get the shared handoff panel instead of the wizard, and no customer-only
+ * queries are made.
+ */
 export default function NewOrderPage() {
+  const staffViewer = useIsStaffViewer();
+  if (staffViewer) return <StaffOrderHandoff />;
+  return <CustomerNewOrderWizard />;
+}
+
+function CustomerNewOrderWizard() {
   const trpc = useTRPC();
   const trpcClient = useTRPCClient();
   const wizardFormId = useId();
@@ -443,6 +455,10 @@ export default function NewOrderPage() {
               ]}
             />
             <p className="mt-4 text-sm text-muted">Prices are fixed when you submit. Later catalog changes do not affect this order.</p>
+            {/* Increment 07.1 (D6): with the cart on, discount codes live in the cart and at checkout. */}
+            {cartEnabled && promotionsEnabled ? (
+              <p className="mt-2 text-sm text-body">Have a discount code? You can enter it in your cart and at checkout.</p>
+            ) : null}
           </Card>
         ) : null}
       </form>

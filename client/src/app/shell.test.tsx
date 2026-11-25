@@ -9,6 +9,9 @@ import { ConsoleShell } from "./shell/ConsoleShell";
 import { CustomerShell } from "./shell/CustomerShell";
 import { currentNavHref, customerNavLayout, customerNavSections, initials, LEGAL_NAME, navPlacement, PUBLIC_SITE_URL } from "./shell/common";
 import { ALL_NAV } from "./registry";
+import { clearCustomerPortalChoice, readCustomerPortalChoice, setCustomerPortalChoice } from "@/lib/portal";
+import { phoneTabLabel, visibleNav } from "./shell/common";
+import axe from "axe-core";
 import type { NavItem } from "@/lib/routes";
 
 vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null, CookieConsentSlot: () => null, CustomerMaintenanceSlot: () => null, CartBadgeSlot: () => null, SsoSignInSlot: () => null }));
@@ -208,5 +211,166 @@ describe("customer shell page a11y (package N)", () => {
       { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
     );
     await screen.findByRole("navigation", { name: "Customer" });
+  });
+});
+
+describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
+  const openAccountMenu = async () => {
+    fireEvent.pointerDown(screen.getByRole("button", { name: /account menu for avery example/i }), { button: 0, pointerType: "mouse" });
+    return screen.findByRole("menu");
+  };
+
+  it("customer nav hides Create an order and Cart for staff and admin, keeps them for customers", () => {
+    const hrefs = (role: MeUser["role"]) => visibleNav(ALL_NAV, "customer", role).map((i) => i.href);
+    for (const role of ["staff", "admin"] as const) {
+      expect(hrefs(role)).not.toContain("/orders/new");
+      expect(hrefs(role)).not.toContain("/cart");
+      expect(hrefs(role)).toContain("/orders");
+    }
+    expect(hrefs("customer")).toContain("/orders/new");
+    expect(hrefs("customer")).toContain("/cart");
+  });
+
+  for (const [role, label] of [["admin", "Admin portal"], ["staff", "Staff portal"]] as const) {
+    it(`customer shell as ${role}: notice, visible "${label}" switch in the top bar and drawer, avatar entry renamed`, async () => {
+      const { container } = renderUi(
+        <CustomerShell user={user(role)}>
+          <h1>Page</h1>
+        </CustomerShell>,
+        { path: "/orders", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+      );
+      const notice = screen.getByTestId("staff-portal-notice");
+      // Named landmark (axe best-practice "region"), placed before the header, after the skip link; not a live region.
+      expect(screen.getByRole("complementary", { name: "Staff notice" })).toBe(notice);
+      expect(notice).not.toHaveAttribute("role");
+      expect(notice.compareDocumentPosition(screen.getByRole("banner")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(screen.getByRole("link", { name: /skip to/i }).compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(notice).toHaveTextContent(`You are viewing the customer portal as ${role === "admin" ? "an administrator" : "a staff member"}.`);
+      expect(within(notice).getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
+      // The notice repeats the switch only below md, where the top-bar switch is hidden (no duplicate at md+).
+      const noticeSwitch = within(notice).getByRole("link", { name: label });
+      expect(noticeSwitch).toHaveAttribute("href", "/admin");
+      expect(noticeSwitch.className).toContain("md:hidden");
+      const header = screen.getByRole("banner");
+      const topSwitch = within(header).getByRole("link", { name: label });
+      expect(topSwitch).toHaveAttribute("href", "/admin");
+      expect(topSwitch.className).toContain("md:inline-flex");
+      const side = screen.getByRole("navigation", { name: "Customer" });
+      const labels = [...side.querySelectorAll("a")].map((a) => a.textContent);
+      expect(labels).not.toContain("Create an order");
+      expect(labels).not.toContain("Cart");
+      fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+      const drawer = await screen.findByRole("dialog", { name: "Menu" });
+      const drawerSwitch = within(drawer).getByRole("link", { name: label });
+      expect(drawerSwitch).toHaveAttribute("href", "/admin");
+      // First thing in the drawer panel, before the section navigation.
+      const firstNav = within(drawer).getAllByRole("navigation")[0];
+      expect(drawerSwitch.compareDocumentPosition(firstNav!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      fireEvent.keyDown(drawer, { key: "Escape" });
+      const menu = await openAccountMenu();
+      expect(within(menu).getByRole("menuitem", { name: label })).toHaveAttribute("href", "/admin");
+      expect(within(menu).queryByRole("menuitem", { name: "Console" })).toBeNull();
+      await expectNoAxeViolations(container);
+    });
+  }
+
+  it("customer shell as admin passes axe best-practice \"region\" (all content inside landmarks)", async () => {
+    renderUi(
+      <CustomerShell user={user("admin")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    expect(screen.getByRole("complementary", { name: "Staff notice" })).toBeInTheDocument();
+    const result = await axe.run(document.body, { runOnly: { type: "rule", values: ["region", "landmark-unique", "landmark-complementary-is-top-level"] } });
+    expect(result.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`)).toEqual([]);
+    await expectNoAxeViolations(document.body);
+  });
+
+  it("customer shell for a customer: no notice and no portal switch", async () => {
+    const { container } = renderUi(
+      <CustomerShell user={user("customer")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    expect(screen.queryByTestId("staff-portal-notice")).toBeNull();
+    expect(container.querySelector("[data-portal-switch]")).toBeNull();
+    const menu = await openAccountMenu();
+    expect(within(menu).queryByRole("menuitem", { name: /portal/i })).toBeNull();
+  });
+
+  it("console shell: visible Customer portal switch (top bar and drawer) records the tab choice; avatar entry renamed", async () => {
+    clearCustomerPortalChoice();
+    const { container } = renderUi(
+      <ConsoleShell user={user("admin")}>
+        <h1>Page</h1>
+      </ConsoleShell>,
+      { path: "/admin" },
+    );
+    const header = screen.getByRole("banner");
+    const topSwitch = within(header).getByRole("link", { name: "Customer portal" });
+    expect(topSwitch).toHaveAttribute("href", "/");
+    fireEvent.click(screen.getByRole("button", { name: "Open console navigation" }));
+    const drawer = await screen.findByRole("dialog", { name: "Console navigation" });
+    const drawerSwitch = within(drawer).getByRole("link", { name: "Customer portal" });
+    expect(drawerSwitch).toHaveAttribute("href", "/");
+    expect(drawerSwitch.compareDocumentPosition(within(drawer).getAllByRole("navigation")[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.keyDown(drawer, { key: "Escape" });
+    const menu = await openAccountMenu();
+    expect(within(menu).getByRole("menuitem", { name: "Customer portal" })).toHaveAttribute("href", "/");
+    expect(within(menu).queryByRole("menuitem", { name: "Customer view" })).toBeNull();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    fireEvent.click(topSwitch);
+    expect(readCustomerPortalChoice()).toBe(true);
+    await expectNoAxeViolations(container);
+    clearCustomerPortalChoice();
+  });
+
+  it("phone bottom bar uses short labels that fit at 320 px, never an ellipsis", () => {
+    const tabs = customerNavSections(visibleNav(ALL_NAV, "customer", "customer")).phone.map(phoneTabLabel);
+    expect(tabs.slice(0, 3)).toEqual(["Home", "Orders", "New order"]);
+    for (const t of tabs) expect(t.length).toBeLessThanOrEqual(9);
+    renderUi(
+      <CustomerShell user={user("customer")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    const quick = screen.getByRole("navigation", { name: "Quick navigation" });
+    const home = within(quick).getByRole("link", { name: "Home" });
+    expect(home).toHaveAttribute("href", "/");
+    expect(home).toHaveAttribute("aria-current", "page");
+    expect(quick.querySelector(".truncate")).toBeNull();
+    for (const link of within(quick).getAllByRole("link")) expect(link.className).toContain("min-h-14");
+  });
+
+  it("navigation rails use the thin themed scrollbar", () => {
+    const { container } = renderUi(
+      <ConsoleShell user={user("admin")}>
+        <h1>Page</h1>
+      </ConsoleShell>,
+      { path: "/admin" },
+    );
+    expect(container.querySelector("aside[aria-label='Console navigation'] .rp-nav-scroll")).not.toBeNull();
+  });
+
+  it("router: admin on / lands in the console; after choosing the customer portal it stays; sign-out state clears it", async () => {
+    clearCustomerPortalChoice();
+    const a = renderUi(<AppRoutes routes={ROUTES} />, { path: "/", api: fakeAuthApi({ me: async () => full("admin") }) });
+    expect(await screen.findByRole("heading", { name: "Console page" })).toBeInTheDocument();
+    expect(a.location.history?.at(-1)).toBe("/admin");
+    a.unmount();
+    setCustomerPortalChoice(true);
+    renderUi(<AppRoutes routes={ROUTES} />, { path: "/", api: fakeAuthApi({ me: async () => full("admin") }) });
+    expect(await screen.findByRole("heading", { name: "Home page" })).toBeInTheDocument();
+    clearCustomerPortalChoice();
+  });
+
+  it("router: a session that ends clears the customer-portal choice", async () => {
+    setCustomerPortalChoice(true);
+    renderUi(<AppRoutes routes={ROUTES} />, { path: "/", api: fakeAuthApi({ me: unauth }) });
+    expect(await screen.findByRole("heading", { name: "Sign in page" })).toBeInTheDocument();
+    await waitFor(() => expect(readCustomerPortalChoice()).toBe(false));
   });
 });

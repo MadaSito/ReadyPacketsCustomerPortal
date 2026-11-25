@@ -647,10 +647,11 @@ function CustomReportBuilderForm({
                 />
               </Field>
 
-              <div className="flex flex-col gap-1.5">
+              <div className="flex min-w-0 flex-col gap-1.5">
                 <span className="text-sm font-medium text-ink">Query mode</span>
                 <div>
                   <SegmentedControl
+                    className="max-[320px]:flex max-[320px]:[&_[role=radiogroup]]:flex-col max-[320px]:[&_[role=radio]>span]:whitespace-normal"
                     label="Query mode"
                     value={mode}
                     onValueChange={handleModeChange}

@@ -12,6 +12,7 @@ For ReadyPackets team members with the **Staff** role. Administrators have every
 - [Console overview](#console-overview)
 - [Customers](#customers)
 - [Orders](#orders)
+- [Switching between the console and the customer portal](#switching-between-the-console-and-the-customer-portal)
 - [Starting Phase I and Phase II (production pipeline)](#starting-phase-i-and-phase-ii-production-pipeline)
 - [Order files](#order-files)
 - [System health](#system-health)
@@ -85,8 +86,23 @@ Staff cannot manage staff accounts, catalog imports or bundle rules, settings, t
   reading. Placing a legal hold or unlocking an imported order needs an administrator.
 - **Change order reference** and **Reassign order** are administrator actions and require you to verify it's you
   again (step-up).
-- Creating an order on behalf of a customer exists on the server (`orders.admin.createForCustomer`) but has **no
-  console screen yet**.
+- **New order for a customer** (needs `orders.manage`): on **Orders** choose **New order for a customer**, or open
+  `/admin/orders?new=1`. Pick the customer, products and quantities, and optionally a discount code (when discount
+  codes are on) and a note. The order appears in that customer's portal. Closing the dialog removes `?new=1` and
+  returns focus. Steps: [Admin guide — Placing an order for a customer](./ADMIN_GUIDE.md#placing-an-order-for-a-customer).
+- **You cannot order or use the cart as yourself.** Orders, carts and checkout belong to customer accounts, and the
+  server refuses them for staff (zero trust). In the customer portal, **Create an order** and **Cart** are hidden for
+  you, and those pages show the panel "Orders are placed for a customer", with a **New order for a customer** button.
+  On builds before 07.1 you saw "You do not have permission to perform this action" instead; see
+  [Admin guide — Troubleshooting](./ADMIN_GUIDE.md#troubleshooting-you-do-not-have-permission-to-perform-this-action).
+
+## Switching between the console and the customer portal
+
+- **From the console**, choose **Customer portal**. It is in the top bar on medium and larger screens, and first in the menu drawer.
+- **From the customer portal**, choose **Staff portal**. It is in the top bar, first in the menu drawer, and (below medium width) in the notice at the top of each page: "You are viewing the customer portal as {role}. Orders, carts and checkout belong to customer accounts."
+- **Landing page.** Opening `/` takes you to the console (`/admin`), unless you chose the customer portal in this browser tab. That choice lasts for the tab only and ends when you switch back or sign out.
+
+Switching grants nothing; the server checks every request. Details: [Admin guide — Switching between the admin and customer portals](./ADMIN_GUIDE.md#switching-between-the-admin-and-customer-portals).
 
 ## Starting Phase I and Phase II (production pipeline)
 
