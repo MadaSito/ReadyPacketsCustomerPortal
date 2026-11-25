@@ -147,7 +147,8 @@ export function StaffPortalNotice({ role: roleProp }: { role?: UserRole } = {}) 
   const role = roleProp ?? viewerRole;
   if (!role || !isStaffRole(role)) return null;
   return (
-    <div className="border-b border-info/40 bg-info-soft" data-testid="staff-portal-notice">
+    // Persistent (not a live region): a named complementary landmark so axe "region" passes and it is announced early.
+    <aside aria-label="Staff notice" className="border-b border-info/40 bg-info-soft" data-testid="staff-portal-notice">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-2 sm:px-6 lg:px-8">
         <p className="flex min-w-0 flex-[1_1_18rem] items-start gap-2 text-sm text-ink">
           <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-info" />
@@ -161,6 +162,6 @@ export function StaffPortalNotice({ role: roleProp }: { role?: UserRole } = {}) 
           <PortalSwitch area="customer" role={role} className="md:hidden" />
         </div>
       </div>
-    </div>
+    </aside>
   );
 }

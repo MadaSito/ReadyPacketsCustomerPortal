@@ -11,6 +11,7 @@ import { currentNavHref, customerNavLayout, customerNavSections, initials, LEGAL
 import { ALL_NAV } from "./registry";
 import { clearCustomerPortalChoice, readCustomerPortalChoice, setCustomerPortalChoice } from "@/lib/portal";
 import { phoneTabLabel, visibleNav } from "./shell/common";
+import axe from "axe-core";
 import type { NavItem } from "@/lib/routes";
 
 vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null, CookieConsentSlot: () => null, CustomerMaintenanceSlot: () => null, CartBadgeSlot: () => null, SsoSignInSlot: () => null }));
@@ -239,6 +240,11 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
         { path: "/orders", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
       );
       const notice = screen.getByTestId("staff-portal-notice");
+      // Named landmark (axe best-practice "region"), placed before the header, after the skip link; not a live region.
+      expect(screen.getByRole("complementary", { name: "Staff notice" })).toBe(notice);
+      expect(notice).not.toHaveAttribute("role");
+      expect(notice.compareDocumentPosition(screen.getByRole("banner")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(screen.getByRole("link", { name: /skip to/i }).compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(notice).toHaveTextContent(`You are viewing the customer portal as ${role === "admin" ? "an administrator" : "a staff member"}.`);
       expect(within(notice).getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
       // The notice repeats the switch only below md, where the top-bar switch is hidden (no duplicate at md+).
@@ -267,6 +273,19 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
       await expectNoAxeViolations(container);
     });
   }
+
+  it("customer shell as admin passes axe best-practice \"region\" (all content inside landmarks)", async () => {
+    renderUi(
+      <CustomerShell user={user("admin")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    expect(screen.getByRole("complementary", { name: "Staff notice" })).toBeInTheDocument();
+    const result = await axe.run(document.body, { runOnly: { type: "rule", values: ["region", "landmark-unique", "landmark-complementary-is-top-level"] } });
+    expect(result.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`)).toEqual([]);
+    await expectNoAxeViolations(document.body);
+  });
 
   it("customer shell for a customer: no notice and no portal switch", async () => {
     const { container } = renderUi(

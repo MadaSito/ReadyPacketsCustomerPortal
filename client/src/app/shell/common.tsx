@@ -320,11 +320,11 @@ export function usePreviewProfile(): boolean {
 export function PreviewBanner() {
   if (!usePreviewProfile()) return null;
   return (
-    <div className="border-b border-info/40 bg-info-soft" data-testid="preview-banner">
+    <aside aria-label="Preview notice" className="border-b border-info/40 bg-info-soft" data-testid="preview-banner">
       <p className="mx-auto max-w-7xl px-4 py-2 text-center text-sm font-semibold text-ink sm:px-6 lg:px-8">
         Preview — synthetic data only. Do not enter real customer or personal information.
       </p>
-    </div>
+    </aside>
   );
 }
 
@@ -334,13 +334,13 @@ export function MaintenanceBanner() {
   const banner = useQuery({ queryKey: ["rp", "jobs", "maintenanceBanner"], queryFn: () => api.maintenanceBanner(), staleTime: 60_000, retry: false });
   if (!banner.data?.active) return null;
   return (
-    <div className="border-b border-warning/40 bg-warning-soft">
+    <aside aria-label="Maintenance notice" className="border-b border-warning/40 bg-warning-soft">
       <div className="mx-auto max-w-7xl px-4 py-1 sm:px-6 lg:px-8">
         <Callout tone="warning" live="polite" className="border-0 bg-transparent px-0 py-2">
           {banner.data.message ?? "Scheduled maintenance is in progress. Some actions may be temporarily unavailable."}
         </Callout>
       </div>
-    </div>
+    </aside>
   );
 }
 
