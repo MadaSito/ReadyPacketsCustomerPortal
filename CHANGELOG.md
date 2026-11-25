@@ -66,7 +66,7 @@ procedure.
 ### Operations
 
 - **Migration `0007_increment_07`**: additive. Details: _PENDING-LEAD — table and column counts._
-- **Upgrade notes:** _PENDING — section in `docs/operations/UPGRADE.md`, written with http_security_engineer (SAML ACS and metadata proxy paths, range pass-through)._
+- **Upgrade notes:** [UPGRADE.md — increment 07 and migration 0007](docs/operations/UPGRADE.md#increment-07-and-migration-0007). It covers the hash check against one journal row, the SAML proxy paths, playback range pass-through and the Stripe webhook's country-only exemption.
 
 ## Increment 06
 
