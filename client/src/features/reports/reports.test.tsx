@@ -606,6 +606,24 @@ describe("Package I — Reports Overview, Built-in Analytics & Custom Report Bui
     });
   });
 
+  it.each([
+    "/admin/reports/custom/new",
+    `/admin/reports/custom/${DEF_OWNED_ID}/edit`,
+  ])("sets a narrow-layout Query mode on %s without changing its keyboard controls", async (route) => {
+    const user = userEvent.setup();
+    renderReportsRoute(route, "admin");
+    const group = await screen.findByRole("radiogroup", { name: "Query mode" });
+    // jsdom cannot calculate viewport overflow; assert the breakpoint wiring on both routes.
+    expect(group.parentElement?.classList.contains("max-[320px]:flex")).toBe(true);
+    expect(group.parentElement?.classList.contains("max-[320px]:[&_[role=radiogroup]]:flex-col")).toBe(true);
+    const current = within(group).getByRole("radio", { checked: true });
+    const next = within(group).getByRole("radio", { checked: false });
+    current.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(next.getAttribute("aria-checked")).toBe("true");
+    expect(document.activeElement).toBe(next);
+  });
+
   it("builds, previews, and saves a grouped custom report with empty detail columns and typed filters", async () => {
     const user = userEvent.setup();
     const { calls } = renderReportsRoute("/admin/reports/custom/new", "admin");
