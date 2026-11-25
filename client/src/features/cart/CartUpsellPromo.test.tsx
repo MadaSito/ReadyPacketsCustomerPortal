@@ -222,6 +222,11 @@ describe("Cart upsells & promo codes (Increment 05 Package B)", () => {
     expect(addBtn).toHaveTextContent("Add to cart");
     expect(upgradeBtn).toHaveTextContent("Upgrade");
 
+    const addOnBadge = screen.getByText("Add-on").closest("span.inline-flex");
+    expect(addOnBadge).toHaveClass("shrink-0", "whitespace-nowrap");
+    expect(addOnBadge?.parentElement?.parentElement).toHaveClass("min-w-0", "flex-1", "sm:basis-60");
+    expect(addOnBadge?.parentElement?.parentElement?.parentElement).toHaveClass("sm:flex-wrap");
+
     await user.click(addBtn);
     await waitFor(() => {
       expect(calls.some((c) => c.path === "cart.upsell.accept")).toBe(true);
