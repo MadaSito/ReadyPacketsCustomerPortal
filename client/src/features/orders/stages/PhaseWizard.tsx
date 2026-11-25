@@ -20,6 +20,8 @@ export interface PhaseWizardProps {
   workspace: WizardWorkspace;
   /** Renders one enabled action of a stage (questions, documents, audio, team files). */
   renderAction: (action: StageActionKey, stage: WizardStage, readOnly: boolean) => ReactNode;
+  /** Optional extras under a phase's actions (for example the phase ZIP download). */
+  renderStageExtras?: (stage: WizardStage) => ReactNode;
   onNext: (stage: WizardStage) => Promise<void>;
   onSubmit: (stage: WizardStage, ack: { accepted: true; textSha256: string } | undefined) => Promise<void>;
   busy: boolean;
@@ -27,7 +29,7 @@ export interface PhaseWizardProps {
   error: string | null;
 }
 
-export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, error }: PhaseWizardProps) {
+export function PhaseWizard({ workspace, renderAction, renderStageExtras, onNext, onSubmit, busy, error }: PhaseWizardProps) {
   const current = currentStage(workspace);
   const [viewKey, setViewKey] = useState<string | null>(null);
   /** Bumped when the shown phase changes without a route change, so focus moves to the new heading. */
@@ -67,6 +69,7 @@ export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, e
           onBackToCurrent={current && viewed.key !== current.key ? () => show(null) : undefined}
           focusToken={focusToken}
           renderAction={renderAction}
+          renderStageExtras={renderStageExtras}
           onNext={(stage) => after(onNext(stage))}
           onSubmit={(stage, ack) => after(onSubmit(stage, ack))}
           busy={busy}
@@ -81,7 +84,7 @@ export function PhaseWizard({ workspace, renderAction, onNext, onSubmit, busy, e
   );
 }
 
-function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focusToken, renderAction, onNext, onSubmit, busy, error }: {
+function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focusToken, renderAction, renderStageExtras, onNext, onSubmit, busy, error }: {
   workspace: WizardWorkspace; stage: WizardStage; total: number; isCurrent: boolean; onBackToCurrent?: () => void; focusToken: number;
 } & Omit<PhaseWizardProps, "workspace">) {
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -141,6 +144,8 @@ function StagePanel({ workspace, stage, total, isCurrent, onBackToCurrent, focus
         ) : isCurrent ? (
           <p className="text-body">There is nothing to upload or answer in this phase.</p>
         ) : null}
+
+        {renderStageExtras ? renderStageExtras(stage) : null}
 
         {error ? <Callout tone="danger" live="assertive">{error}</Callout> : null}
 
