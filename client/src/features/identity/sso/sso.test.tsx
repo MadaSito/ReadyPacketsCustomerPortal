@@ -12,7 +12,7 @@ import { TRPCProvider } from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { SsoSignInButton, ssoStartHref } from "./index";
 import SsoAdminPage from "./SsoAdminPage";
-import SsoCompletePage from "./SsoCompletePage";
+import SsoCompletePage, { lastSsoTestResult } from "./SsoCompletePage";
 import SsoRefusedPage from "./SsoRefusedPage";
 
 const admin = {
@@ -161,6 +161,15 @@ describe("SSO admin page — SAML (increment 07)", () => {
     expect(await screen.findByRole("checkbox", { name: "Administrators" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Staff" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Customers" })).not.toBeChecked();
+  });
+
+  it("moves focus to the test sign-in result after returning from Entra", async () => {
+    lastSsoTestResult.value = { protocol: "saml", signatureVerified: true, tenantMatches: true, audienceMatches: true, roleAllowed: true, claimNames: [] };
+    renderPage(<SsoAdminPage />, { "identity.admin.sso.get": () => samlView }, "/admin/sso?test=done");
+    const region = await screen.findByRole("region", { name: "Test sign-in result" });
+    expect(region).toHaveFocus();
+    expect(within(region).getByText("Test sign-in completed")).toBeInTheDocument();
+    lastSsoTestResult.value = null;
   });
 });
 

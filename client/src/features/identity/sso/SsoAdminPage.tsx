@@ -5,7 +5,7 @@
  * allowed roles, signing certificates and app-role mappings (SamlCards).
  */
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useSearch } from "wouter";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import {
@@ -245,7 +245,7 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
               error={fieldErrors.acceptedAuthnContexts}
             />
           ) : null}
-          <fieldset className="min-w-0">
+          <fieldset className="min-w-0" aria-describedby={fieldErrors.allowedRoles ? "sso-allowed-roles-error" : undefined}>
             <legend className="mb-1.5 text-sm font-medium text-ink">Who can use single sign-on</legend>
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:gap-6">
               {(Object.keys(ROLE_LABELS) as Role[]).map((role) => (
@@ -257,7 +257,7 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
                 />
               ))}
             </div>
-            {fieldErrors.allowedRoles ? <p className="mt-1 text-sm text-danger" role="alert">{fieldErrors.allowedRoles}</p> : null}
+            {fieldErrors.allowedRoles ? <p id="sso-allowed-roles-error" className="mt-1 text-sm text-danger" role="alert">{fieldErrors.allowedRoles}</p> : null}
           </fieldset>
           <RadioGroup legend="Create accounts on first sign-in" options={JIT_OPTIONS} value={jitMode} onValueChange={(v) => setJitMode(v as JitMode)} error={fieldErrors.jitMode} />
           {jitMode !== "off" ? (
@@ -309,7 +309,12 @@ function SsoAdmin({ data, refetch }: { data: AdminView; refetch: () => Promise<v
 
 function TestResult({ result }: { result: Record<string, unknown> }) {
   const yes = (v: unknown) => (v === true ? <Badge tone="success">Yes</Badge> : <Badge tone="warning">No</Badge>);
+  // The result arrives after a full-page return from Entra, so a live region alone is not announced:
+  // move focus to the result once so screen readers read it and keyboard users start there.
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => ref.current?.focus(), []);
   return (
+    <div ref={ref} tabIndex={-1} role="region" aria-label="Test sign-in result" className="rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-action">
     <Callout tone="success" title="Test sign-in completed" live="polite">
       <KeyValueList
         columns={2}
@@ -335,6 +340,7 @@ function TestResult({ result }: { result: Record<string, unknown> }) {
         </div>
       ) : null}
     </Callout>
+    </div>
   );
 }
 
