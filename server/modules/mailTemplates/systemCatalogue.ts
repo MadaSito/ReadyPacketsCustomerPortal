@@ -122,6 +122,15 @@ const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
     htmlTemplate:
       '<p>Thank you. Your ReadyPackets order <strong>{{reference}}</strong> has been received.</p><p><a href="{{link}}" data-rp-button="primary" rel="noopener noreferrer">View order</a></p>',
   },
+  "orders.phase_update": {
+    name: "Order phase update",
+    description: "A neutral notification for the customer to sign in and review their order.",
+    category: "orders",
+    requiredVars: ["reference", "link"],
+    subjectTemplate: "An update to your ReadyPackets order",
+    textTemplate: "There is an update to order {{reference}}.\n\nSign in to review your order:\n{{link}}",
+    htmlTemplate: '<p>There is an update to order <strong>{{reference}}</strong>.</p><p><a href="{{link}}" data-rp-button="primary" rel="noopener noreferrer">Review your order</a></p>',
+  },
   "orders.status_changed": {
     name: "Order status change",
     description: "Notifies an order owner when their order moves to a new customer-visible workflow status.",

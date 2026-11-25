@@ -36,6 +36,15 @@ const VERIFY_AUDIT_KEY = "jobs.mail.verify_audit_copy";
 const TEST_VERSION_PREFIX = "mail_templates.test_v.";
 const TEST_DEFAULT_PREFIX = "mail_templates.test_default.";
 const CUSTOM_KEY_RE = /^custom\.[a-z][a-z0-9_]{1,63}$/;
+const PHASE_SYSTEM_KEYS = new Set(["orders.phase_update", "orders.status_changed"]);
+const PHASE_VARS = new Set(["reference", "phaseLabel", "statusLabel", "link"]);
+const phaseVarsCompatible = (vars: readonly string[], sensitive: readonly string[] = []) =>
+  !sensitive.length && vars.every((name) => PHASE_VARS.has(name));
+export interface PhaseActionTemplateOption {
+  templateKey: string;
+  name: string;
+  vars: readonly string[];
+}
 
 export interface MailTemplateSummaryView {
   publicId: string;
@@ -506,6 +515,31 @@ export function createMailTemplatesService(deps: ModuleDeps) {
   return {
     store,
     ensureSystemTemplatesSynced,
+
+    async resolveForPhaseAction(templateKey: string, tx?: Tx): Promise<PublishedMailTemplate | null> {
+      const system = PHASE_SYSTEM_KEYS.has(templateKey);
+      if (!system && !CUSTOM_KEY_RE.test(templateKey)) return null;
+      const published = await store.resolve(templateKey, tx);
+      if (published) return phaseVarsCompatible(published.vars, published.sensitiveVars) ? published : null;
+      if (!system) return null;
+      const builtin = deps.services.jobAdmin.getBuiltinMailTemplates().find(({ key }) => key === templateKey);
+      return builtin && phaseVarsCompatible(builtin.vars, builtin.sensitiveVars) ? {
+        ...builtin, render: (vars) => ({ subject: builtin.subject(vars), text: builtin.text(vars) }),
+      } : null;
+    },
+
+    async listForPhaseActions(principal: SessionPrincipal): Promise<PhaseActionTemplateOption[]> {
+      return runMailTemplatesTx(deps, principal, { type: "mail_template" }, async (tx) => {
+        await assertLiveMailAdminInTx(deps, principal, tx, "workflows.manage");
+        const all = await loadSummaryList(tx);
+        return all.flatMap(({ templateKey, name, kind, declaredVars, hasPublishedOverride }) => {
+          if (kind === "system" ? !PHASE_SYSTEM_KEYS.has(templateKey) : !hasPublishedOverride || !CUSTOM_KEY_RE.test(templateKey)) return [];
+          const vars = declaredVars.map(({ name }) => name);
+          const sensitive = declaredVars.filter(({ sensitive }) => sensitive).map(({ name }) => name);
+          return phaseVarsCompatible(vars, sensitive) ? [{ templateKey, name, vars }] : [];
+        });
+      });
+    },
 
     async list(
       principal: SessionPrincipal,

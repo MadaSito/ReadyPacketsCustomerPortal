@@ -93,12 +93,20 @@ function htmlAlternative(text: string): string {
   return `<!doctype html><html lang="en"><body><p>${escapeHtml(text).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
 }
 
+export const ORDER_PHASE_UPDATE_TEMPLATE: MailTemplate = {
+  key: "orders.phase_update",
+  vars: ["reference", "link"],
+  subject: () => "An update to your ReadyPackets order",
+  text: ({ reference, link }) => `There is an update to order ${reference}.\n\nSign in to review your order:\n${link}`,
+};
+
 export class MailEngine implements Mailer {
   readonly #templates = new Map<string, MailTemplate>();
   readonly #transports = new Map<MailTransportKey, MailTransport>();
   #templateStore: MailTemplateStore | undefined;
 
   constructor(readonly deps: MailDeps) {
+    this.registerTemplate(ORDER_PHASE_UPDATE_TEMPLATE);
     this.registerTemplate({
       key: PAYMENT_RECEIPT_TEMPLATE,
       vars: ["receiptNumber"],
