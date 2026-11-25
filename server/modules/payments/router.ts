@@ -83,6 +83,8 @@ export const updatePaymentsSettingsInputSchema = z.strictObject({
   clearStripeSecretKey: z.boolean().optional(),
   stripeWebhookSecret: z.string().trim().min(1).max(256).optional(),
   clearStripeWebhookSecret: z.boolean().optional(),
+  stripeWebhookSecretSecondary: z.string().trim().min(1).max(256).optional(),
+  clearStripeWebhookSecretSecondary: z.boolean().optional(),
   squareLocationId: z
     .union([z.string().trim().regex(/^[A-Za-z0-9_-]{4,64}$/u), z.literal(""), z.null()])
     .optional(),
@@ -161,6 +163,50 @@ export const paymentsRouter = router({
       .input(updatePaymentsSettingsInputSchema)
       .mutation(({ ctx, input }) =>
         requirePaymentsModule(ctx.services).admin.updateSettings(ctx.session, input),
+      ),
+
+    readiness: adminProcedure
+      .meta({ rateLimit: "standard_browsing" })
+      .query(({ ctx }) => requirePaymentsModule(ctx.services).admin.readiness(ctx.session)),
+
+    testConnection: paymentsManageProc
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(
+        z
+          .strictObject({
+            provider: z.literal("stripe").optional(),
+          })
+          .optional(),
+      )
+      .mutation(({ ctx }) => requirePaymentsModule(ctx.services).admin.testConnection(ctx.session)),
+
+    sendSelfTestWebhook: paymentsManageProc
+      .meta({ rateLimit: "auth_high_risk" })
+      .input(
+        z
+          .strictObject({
+            provider: z.literal("stripe").optional(),
+          })
+          .optional(),
+      )
+      .mutation(({ ctx }) =>
+        requirePaymentsModule(ctx.services).admin.sendSelfTestWebhook(ctx.session),
+      ),
+
+    listWebhookRejections: adminProcedure
+      .meta({ rateLimit: "standard_browsing" })
+      .input(
+        z
+          .strictObject({
+            provider: z.enum(ACTIVE_PAYMENT_PROVIDERS).optional(),
+            reasonCode: z.string().trim().min(1).max(64).optional(),
+            cursor: cursorSchema.optional(),
+            limit: z.number().int().min(1).max(100).optional(),
+          })
+          .optional(),
+      )
+      .query(({ ctx, input }) =>
+        requirePaymentsModule(ctx.services).admin.listWebhookRejections(ctx.session, input ?? {}),
       ),
 
     listAttempts: adminProcedure

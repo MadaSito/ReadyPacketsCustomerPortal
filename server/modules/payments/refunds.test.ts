@@ -1387,7 +1387,7 @@ describe("payments.refunds — B5 console order refunds, reconciliation, webhook
       });
       expect(res.httpStatus).toBe(200);
       expect(res.booked).toBe(false);
-      expect(res.reasonCode).toBe("IGNORED");
+      expect(res.reasonCode).toBe("UNLINKED_PROVIDER_REFUND");
     }
 
     // Even if a webhook envelope spoofs `metadata.refund_public_id` pointing at `dashboardRefundId`,

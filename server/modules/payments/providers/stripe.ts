@@ -14,6 +14,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ModuleDeps } from "../../../container.js";
 import { DomainError, validation } from "../../../core/errors.js";
+import { ulid } from "../../../core/ids.js";
 import type { EgressPolicy } from "../../integrations/egress.js";
 import type {
   CreateProviderRefundInput,
@@ -24,8 +25,13 @@ import type {
   ProviderCreateCheckoutOutput,
   ProviderFetchedPayment,
   ProviderFetchPaymentInput,
+  ProviderListedRefundItem,
+  ProviderListPaymentRefundsInput,
+  ProviderListPaymentRefundsResult,
   ProviderRefundExecutionOutcome,
   ProviderRefundLookupResult,
+  ProviderTestConnectionInput,
+  ProviderTestConnectionResult,
   ProviderVerifyWebhookInput,
   ProviderVerifyWebhookOutput,
 } from "./types.js";
@@ -35,6 +41,61 @@ const STRIPE_API_ORIGIN = `https://${STRIPE_API_HOST}`;
 const STRIPE_API_VERSION = "2024-06-20";
 const MAX_STRIPE_RESPONSE_BYTES = 256 * 1024;
 const STRIPE_TIMEOUT_MS = 12_000;
+
+export const STRIPE_REQUIRED_WEBHOOK_EVENTS = [
+  "checkout.session.completed",
+  "checkout.session.async_payment_succeeded",
+  "checkout.session.async_payment_failed",
+  "checkout.session.expired",
+  "payment_intent.payment_failed",
+  "charge.refunded",
+  "refund.created",
+  "refund.updated",
+  "charge.refund.updated",
+] as const;
+
+export function buildSignedStripeSelfTestWebhook(input: {
+  webhookSecret: string;
+  mode: "test" | "live";
+  now: Date;
+}): {
+  eventId: string;
+  rawBody: Buffer;
+  headers: Readonly<Record<string, string>>;
+} {
+  const token = ulid(input.now.getTime());
+  const eventId = `evt_test_rp_selftest_${token}`;
+  const createdSec = Math.floor(input.now.getTime() / 1000);
+  const rawBody = Buffer.from(
+    JSON.stringify({
+      id: eventId,
+      object: "event",
+      api_version: STRIPE_API_VERSION,
+      created: createdSec,
+      livemode: input.mode === "live",
+      type: "readypackets.self_test",
+      data: {
+        object: {
+          id: `selftest_${token}`,
+          object: "readypackets.self_test",
+        },
+      },
+    }),
+    "utf8",
+  );
+  const v1 = createHmac("sha256", input.webhookSecret)
+    .update(`${createdSec}.`, "utf8")
+    .update(rawBody)
+    .digest("hex");
+  return {
+    eventId,
+    rawBody,
+    headers: {
+      "content-type": "application/json",
+      "stripe-signature": `t=${createdSec},v1=${v1}`,
+    },
+  };
+}
 
 export function isAllowedStripeHostedUrl(rawUrl: string): boolean {
   if (rawUrl.length > 2048 || /[\s"'<>\\]/u.test(rawUrl)) return false;
@@ -205,44 +266,63 @@ export function createStripeProvider(
         return { ok: false, reasonCode: "MALFORMED_SIGNATURE" };
       }
 
-      const expectedMac = createHmac("sha256", input.webhookSecret)
+      const expectedPrimaryMac = createHmac("sha256", input.webhookSecret)
         .update(`${parsedSig.timestamp}.`, "utf8")
         .update(input.rawBody)
         .digest();
 
-      let matched = false;
+      const expectedSecondaryMac =
+        input.secondaryWebhookSecret && input.secondaryWebhookSecret.trim().length > 0
+          ? createHmac("sha256", input.secondaryWebhookSecret.trim())
+              .update(`${parsedSig.timestamp}.`, "utf8")
+              .update(input.rawBody)
+              .digest()
+          : null;
+
+      let matchedSecretSlot: "primary" | "secondary" | null = null;
       for (const candidate of parsedSig.v1Signatures) {
-        if (candidate.byteLength === expectedMac.byteLength && timingSafeEqual(candidate, expectedMac)) {
-          matched = true;
+        if (
+          candidate.byteLength === expectedPrimaryMac.byteLength &&
+          timingSafeEqual(candidate, expectedPrimaryMac)
+        ) {
+          matchedSecretSlot = "primary";
+        } else if (
+          expectedSecondaryMac &&
+          candidate.byteLength === expectedSecondaryMac.byteLength &&
+          timingSafeEqual(candidate, expectedSecondaryMac)
+        ) {
+          matchedSecretSlot ??= "secondary";
         }
       }
-      if (!matched) {
+      if (!matchedSecretSlot) {
         return { ok: false, reasonCode: "INVALID_SIGNATURE" };
       }
 
       const nowSeconds = Math.floor(input.now.getTime() / 1000);
       const tolerance = Math.min(Math.max(input.toleranceSeconds, 30), 300);
-      if (Math.abs(nowSeconds - parsedSig.timestamp) > tolerance) {
-        return { ok: false, reasonCode: "TIMESTAMP_OUT_OF_RANGE" };
+      const skewSeconds = Math.abs(nowSeconds - parsedSig.timestamp);
+      if (skewSeconds > tolerance) {
+        return { ok: false, reasonCode: "TIMESTAMP_OUT_OF_RANGE", skewSeconds };
       }
 
       let payload: Record<string, unknown> | null;
       try {
         payload = asRecord(JSON.parse(input.rawBody.toString("utf8")));
       } catch {
-        return { ok: false, reasonCode: "INVALID_JSON" };
+        return { ok: false, reasonCode: "INVALID_JSON", skewSeconds };
       }
       if (!payload) {
-        return { ok: false, reasonCode: "INVALID_EVENT_PAYLOAD" };
+        return { ok: false, reasonCode: "INVALID_EVENT_PAYLOAD", skewSeconds };
       }
 
       const externalEventId = typeof payload.id === "string" ? payload.id.trim() : "";
       const eventType = typeof payload.type === "string" ? payload.type.trim() : "";
       const livemode = payload.livemode === true;
+      const environmentHint = typeof payload.livemode === "boolean" ? (livemode ? "live" : "test") : "unknown";
       const createdSec = typeof payload.created === "number" ? payload.created : parsedSig.timestamp;
 
       if (!/^evt_[A-Za-z0-9_]{6,120}$/u.test(externalEventId) || !eventType || eventType.length > 96) {
-        return { ok: false, reasonCode: "INVALID_EVENT_ENVELOPE" };
+        return { ok: false, reasonCode: "INVALID_EVENT_ENVELOPE", skewSeconds, environmentHint };
       }
 
       const dataObj = asRecord(asRecord(payload.data)?.object);
@@ -271,7 +351,7 @@ export function createStripeProvider(
             ? (asRecord(chargeRaw)!.id as string)
             : null;
 
-      let outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "ignored" = "ignored";
+      let outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "self_test" | "ignored" = "ignored";
       let providerRef: string | null = null;
       let providerOrderRef: string | null = paymentIntentId;
       let providerPaymentRef: string | null = paymentIntentId;
@@ -355,6 +435,11 @@ export function createStripeProvider(
               ? latestRefund.currency.toUpperCase()
               : null;
         }
+      } else if (
+        eventType === "readypackets.self_test" &&
+        /^evt_test_rp_selftest_[0-9A-HJKMNP-TV-Z]{26}$/u.test(externalEventId)
+      ) {
+        outcomeHint = "self_test";
       }
 
       return {
@@ -363,6 +448,7 @@ export function createStripeProvider(
         eventType,
         occurredAt: new Date(createdSec * 1000),
         livemode,
+        matchedSecretSlot,
         attemptPublicId: attemptPublicId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(attemptPublicId) ? attemptPublicId : null,
         invoicePublicId: metaInvoiceId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(metaInvoiceId) ? metaInvoiceId : null,
         providerRef,
@@ -486,6 +572,104 @@ export function createStripeProvider(
         paidAt: status === "paid" ? piCreated : null,
         paymentMethodBrand,
         paymentMethodLast4,
+      };
+    },
+
+    async testConnection(input: ProviderTestConnectionInput): Promise<ProviderTestConnectionResult> {
+      const startedMs = Date.now();
+      try {
+        assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      } catch {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          reasonCode: "STRIPE_KEY_MODE_MISMATCH",
+        };
+      }
+
+      let response;
+      try {
+        const egress = getEgress();
+        response = await egress.fetchPinned(
+          new URL("/v1/checkout/sessions?limit=1", STRIPE_API_ORIGIN),
+          "stripe",
+          {
+            method: "GET",
+            headers: {
+              authorization: `Bearer ${input.credentials.secretKey}`,
+              "stripe-version": STRIPE_API_VERSION,
+            },
+            timeoutMs: STRIPE_TIMEOUT_MS,
+            maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+            requireAllowlistRule: true,
+            publicAddressesOnly: true,
+            expectedHostSuffixes: [STRIPE_API_HOST],
+            ...(input.signal ? { signal: input.signal } : {}),
+          },
+        );
+      } catch (err) {
+        const reasonCode =
+          err instanceof DomainError && /^[A-Z0-9_]{2,64}$/u.test(err.reasonCode)
+            ? err.reasonCode
+            : "STRIPE_EGRESS_OR_NETWORK_FAILED";
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs: Math.max(0, Date.now() - startedMs),
+          verifiedAt: null,
+          reasonCode,
+        };
+      }
+
+      const latencyMs = Math.max(0, Date.now() - startedMs);
+      if (response.status === 401 || response.status === 403) {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs,
+          verifiedAt: null,
+          reasonCode: response.status === 401 ? "STRIPE_AUTH_INVALID_KEY" : "STRIPE_KEY_MISSING_PERMISSION",
+        };
+      }
+      if (response.status < 200 || response.status >= 300) {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs,
+          verifiedAt: null,
+          reasonCode: "STRIPE_UPSTREAM_HTTP_ERROR",
+        };
+      }
+
+      try {
+        const parsed = asRecord(JSON.parse(response.body.toString("utf8")));
+        if (parsed?.object !== "list") {
+          return {
+            ok: false,
+            mode: input.credentials.mode,
+            latencyMs,
+            verifiedAt: null,
+            reasonCode: "STRIPE_UNEXPECTED_PAYLOAD",
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          mode: input.credentials.mode,
+          latencyMs,
+          verifiedAt: null,
+          reasonCode: "STRIPE_INVALID_JSON",
+        };
+      }
+
+      return {
+        ok: true,
+        mode: input.credentials.mode,
+        latencyMs,
+        verifiedAt: input.now,
+        reasonCode: null,
       };
     },
   };
@@ -940,6 +1124,97 @@ export function createStripeRefundProvider(
           failureReasonCode: "STRIPE_LOOKUP_TRANSPORT_UNKNOWN",
           settledAt: null,
         };
+      }
+    },
+
+    async listPaymentRefunds(input: ProviderListPaymentRefundsInput): Promise<ProviderListPaymentRefundsResult> {
+      try {
+        assertStripeKeyMatchesMode(input.credentials.secretKey, input.credentials.mode);
+      } catch {
+        return { ok: false, items: [], failureReasonCode: "STRIPE_KEY_MODE_MISMATCH" };
+      }
+
+      if (!/^(pi|ch)_[A-Za-z0-9_]{6,120}$/u.test(input.providerPaymentRef)) {
+        return { ok: false, items: [], failureReasonCode: "STRIPE_INVALID_PAYMENT_REF" };
+      }
+
+      let egress: Pick<EgressPolicy, "fetchPinned">;
+      try {
+        egress = getEgress();
+      } catch {
+        return { ok: false, items: [], failureReasonCode: "EGRESS_UNAVAILABLE" };
+      }
+
+      const queryKey = input.providerPaymentRef.startsWith("pi_") ? "payment_intent" : "charge";
+      try {
+        const listUrl = new URL(
+          `/v1/refunds?${queryKey}=${encodeURIComponent(input.providerPaymentRef)}&limit=25`,
+          STRIPE_API_ORIGIN,
+        );
+        const response = await egress.fetchPinned(listUrl, "stripe", {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${input.credentials.secretKey}`,
+            "stripe-version": STRIPE_API_VERSION,
+          },
+          timeoutMs: STRIPE_TIMEOUT_MS,
+          maxResponseBytes: MAX_STRIPE_RESPONSE_BYTES,
+          requireAllowlistRule: true,
+          publicAddressesOnly: true,
+          expectedHostSuffixes: [STRIPE_API_HOST],
+          ...(input.signal ? { signal: input.signal } : {}),
+          ...(input.beforeSend ? { beforeSend: input.beforeSend } : {}),
+        });
+        if (response.status < 200 || response.status >= 300) {
+          return { ok: false, items: [], failureReasonCode: "STRIPE_LOOKUP_LIST_UNKNOWN" };
+        }
+        const parsed = asRecord(JSON.parse(response.body.toString("utf8")));
+        const list = parsed?.data;
+        if (!Array.isArray(list)) {
+          return { ok: false, items: [], failureReasonCode: "STRIPE_LOOKUP_INVALID_LIST" };
+        }
+
+        const items: ProviderListedRefundItem[] = [];
+        for (const rawItem of list) {
+          const obj = asRecord(rawItem);
+          if (!obj) continue;
+          const refundId = typeof obj.id === "string" ? obj.id.trim() : "";
+          if (!/^re_[A-Za-z0-9_]{6,120}$/u.test(refundId)) continue;
+          const metadata = asRecord(obj.metadata);
+          const rawPubId = typeof metadata?.refund_public_id === "string" ? metadata.refund_public_id.trim() : "";
+          const refundPublicIdHint = /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(rawPubId) ? rawPubId : null;
+          const amount = typeof obj.amount === "number" && Number.isSafeInteger(obj.amount) && obj.amount > 0 ? obj.amount : 0;
+          const currency =
+            typeof obj.currency === "string" && /^[a-zA-Z]{3}$/u.test(obj.currency)
+              ? obj.currency.toUpperCase()
+              : "";
+          const rawStatus = typeof obj.status === "string" ? obj.status : "";
+          const createdSec = typeof obj.created === "number" ? obj.created : null;
+          const settledAt =
+            createdSec && Number.isSafeInteger(createdSec) && createdSec > 0 ? new Date(createdSec * 1000) : null;
+          const failureReasonCode =
+            typeof obj.failure_reason === "string" && /^[a-z0-9_]{2,64}$/iu.test(obj.failure_reason)
+              ? obj.failure_reason.toUpperCase()
+              : null;
+
+          let status: "succeeded" | "pending" | "failed" | "unknown" = "unknown";
+          if (rawStatus === "succeeded") status = "succeeded";
+          else if (rawStatus === "pending" || rawStatus === "requires_action") status = "pending";
+          else if (rawStatus === "failed" || rawStatus === "canceled") status = "failed";
+
+          items.push({
+            providerRefundRef: refundId,
+            refundPublicIdHint,
+            status,
+            amountMinor: amount,
+            currency,
+            settledAt: status === "succeeded" || status === "failed" ? settledAt : null,
+            failureReasonCode: status === "failed" ? (failureReasonCode ?? "STRIPE_REFUND_FAILED") : null,
+          });
+        }
+        return { ok: true, items, failureReasonCode: null };
+      } catch {
+        return { ok: false, items: [], failureReasonCode: "STRIPE_LOOKUP_TRANSPORT_UNKNOWN" };
       }
     },
   };

@@ -47,6 +47,7 @@ export interface ProviderVerifyWebhookInput {
   rawBody: Buffer;
   headers: Readonly<Record<string, string | undefined>>;
   webhookSecret: string;
+  secondaryWebhookSecret?: string | null | undefined;
   /** Exact canonical notification URL (`https://<canonicalOrigin>/api/payments/webhooks/<provider>`). */
   notificationUrl: string;
   now: Date;
@@ -60,6 +61,7 @@ export type ProviderVerifyWebhookOutput =
       eventType: string;
       occurredAt: Date;
       livemode: boolean;
+      matchedSecretSlot?: "primary" | "secondary" | undefined;
       attemptPublicId: string | null;
       invoicePublicId: string | null;
       providerRef: string | null;
@@ -70,11 +72,13 @@ export type ProviderVerifyWebhookOutput =
       refundStatusHint?: "pending" | "succeeded" | "failed" | null | undefined;
       refundAmountMinorHint?: number | null | undefined;
       refundCurrencyHint?: string | null | undefined;
-      outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "ignored";
+      outcomeHint: "paid" | "failed" | "expired" | "refund_updated" | "self_test" | "ignored";
     }
   | {
       ok: false;
       reasonCode: string;
+      skewSeconds?: number | null | undefined;
+      environmentHint?: "test" | "live" | "unknown" | undefined;
     };
 
 export interface ProviderFetchPaymentInput {
@@ -156,11 +160,50 @@ export interface ProviderRefundLookupResult {
   readonly settledAt: Date | null;
 }
 
+export interface ProviderListedRefundItem {
+  readonly providerRefundRef: string;
+  readonly refundPublicIdHint: string | null;
+  readonly status: "succeeded" | "pending" | "failed" | "unknown";
+  readonly amountMinor: number;
+  readonly currency: string;
+  readonly settledAt: Date | null;
+  readonly failureReasonCode: string | null;
+}
+
+export interface ProviderListPaymentRefundsInput {
+  readonly credentials: ProviderCredentials;
+  readonly providerPaymentRef: string;
+  readonly signal?: AbortSignal | undefined;
+  readonly beforeSend?: (() => Promise<void>) | undefined;
+}
+
+export interface ProviderListPaymentRefundsResult {
+  readonly ok: boolean;
+  readonly items: readonly ProviderListedRefundItem[];
+  readonly failureReasonCode: string | null;
+}
+
+export interface ProviderTestConnectionInput {
+  readonly credentials: ProviderCredentials;
+  readonly now: Date;
+  readonly signal?: AbortSignal | undefined;
+}
+
+export interface ProviderTestConnectionResult {
+  readonly ok: boolean;
+  readonly mode: PaymentEnvironmentMode;
+  readonly latencyMs: number;
+  readonly verifiedAt: Date | null;
+  readonly reasonCode: string | null;
+}
+
 export interface PaymentRefundAdapter<P extends ActivePaymentProvider = ActivePaymentProvider> {
   readonly provider: P;
   createRefund(input: CreateProviderRefundInput): Promise<ProviderRefundExecutionOutcome>;
   /** Read-only GET lookup (NEVER sends POST). Used by reconcile job and webhook verification. */
   lookupRefund(input: LookupProviderRefundInput): Promise<ProviderRefundLookupResult>;
+  /** Read-only GET list of upstream refunds on a payment/charge (used when `charge.refunded` omits `refunds.data`). */
+  listPaymentRefunds?(input: ProviderListPaymentRefundsInput): Promise<ProviderListPaymentRefundsResult>;
 }
 
 export interface PaymentProviderAdapter {
@@ -168,4 +211,5 @@ export interface PaymentProviderAdapter {
   createCheckout(input: ProviderCreateCheckoutInput): Promise<ProviderCreateCheckoutOutput>;
   verifyWebhook(input: ProviderVerifyWebhookInput): ProviderVerifyWebhookOutput;
   fetchPayment(input: ProviderFetchPaymentInput): Promise<ProviderFetchedPayment>;
+  testConnection?(input: ProviderTestConnectionInput): Promise<ProviderTestConnectionResult>;
 }
