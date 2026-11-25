@@ -316,6 +316,16 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
         };
       }
 
+      if (opts.method === "GET" && u.pathname === "/v1/checkout/sessions") {
+        const auth = opts.headers?.authorization ?? opts.headers?.Authorization ?? "";
+        const livemode = auth.startsWith("Bearer sk_live_") || auth.startsWith("Bearer rk_live_");
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ object: "list", data: [{ livemode }] }), "utf8"),
+        };
+      }
+
       if (opts.method === "GET" && u.pathname.startsWith("/v1/checkout/sessions/")) {
         const sessionId = decodeURIComponent(u.pathname.slice("/v1/checkout/sessions/".length));
         const found = stripeSessions.get(sessionId);
@@ -391,6 +401,21 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       integrations: {
         egress: {
           fetchPinned,
+          async isPresetEnabled(key: string) {
+            return key === "stripe";
+          },
+          async listAllowlist() {
+            return [
+              {
+                publicId: "rule_stripe_test",
+                purpose: "stripe" as const,
+                host: "api.stripe.com",
+                port: 443,
+                enabled: true,
+                updatedAt: new Date("2026-11-23T12:00:00.000Z"),
+              },
+            ];
+          },
           async listPresets() {
             return [
               {
@@ -400,7 +425,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
                 parameterized: false,
                 hosts: ["api.stripe.com"],
                 enabled: true,
-                matchingRulePublicIds: [],
+                matchingRulePublicIds: ["rule_stripe_test"],
               },
             ];
           },
@@ -459,6 +484,32 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
         transport: { issue() {}, clear() {} },
       });
 
+    async function activateVerifiedStripe(
+      session: SessionPrincipal,
+      input: Parameters<ReturnType<typeof paymentsCaller>["admin"]["updateSettings"]>[0],
+    ) {
+      const caller = paymentsCaller(session);
+      await caller.admin.updateSettings({
+        ...input,
+        provider: "none",
+      });
+      const apiRes = await caller.admin.testConnection({ provider: "stripe" });
+      if (!apiRes.ok) {
+        throw new Error(`Expected testConnection to succeed: ${apiRes.detail}`);
+      }
+      const selfRes = await caller.admin.sendSelfTestWebhook({ provider: "stripe" });
+      if (!selfRes.ok) {
+        throw new Error(`Expected sendSelfTestWebhook to succeed: ${selfRes.reasonCode ?? "unknown"}`);
+      }
+      return caller.admin.updateSettings({
+        ...input,
+        provider: "stripe",
+        stripeSecretKey: undefined,
+        stripeWebhookSecret: undefined,
+        stripeWebhookSecretSecondary: undefined,
+      });
+    }
+
     return {
       t,
       moduleDeps,
@@ -471,6 +522,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
       seedOrder,
       complianceCaller,
       paymentsCaller,
+      activateVerifiedStripe,
       spawnFreshComplianceCaller(session: SessionPrincipal | null) {
         const freshT = createTestDeps({ db: tdb.db, now: new Date(clockMs) });
         freshT.deps.clock.now = () => new Date(clockMs);
@@ -578,7 +630,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
   it("D5: evaluates checkout amounts, blocks sub-minimum when configured, waives sub-minimum without cash refund/referral exposure, and settles $0 totals idempotently", async () => {
     const h = createHarness();
     const webhookSecret = "whsec_test_inc06_small_totals_secret_123456";
-    await h.paymentsCaller(adminPrincipal).admin.updateSettings({
+    await h.activateVerifiedStripe(adminPrincipal, {
       provider: "stripe",
       mode: "test",
       currency: "USD",
@@ -745,7 +797,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
   it("D15: issues immutable receipts for Stripe webhook & manual payments, attaches PDF to mail, enforces ownership, rate-limits resend, and appends refund notes", async () => {
     const h = createHarness();
     const webhookSecret = "whsec_test_inc06_receipt_webhook_secret_789";
-    await h.paymentsCaller(adminPrincipal).admin.updateSettings({
+    await h.activateVerifiedStripe(adminPrincipal, {
       provider: "stripe",
       mode: "test",
       currency: "USD",
@@ -1224,7 +1276,7 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
   it("Wave 2 security regressions: blocks waiver when prior provider attempt has exposure, enforces DB-durable 3/hr resend across instances, and denies generic order collaborators on receipts/PDFs", async () => {
     const h = createHarness();
     const webhookSecret = "whsec_test_inc06_wave2_sec_regressions_999";
-    await h.paymentsCaller(adminPrincipal).admin.updateSettings({
+    await h.activateVerifiedStripe(adminPrincipal, {
       provider: "stripe",
       mode: "test",
       currency: "USD",
