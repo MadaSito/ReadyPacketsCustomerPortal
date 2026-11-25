@@ -26,7 +26,7 @@ export interface WizardStage {
   canNext: boolean;
   canSubmit: boolean;
   /** Current phase only: why the customer has no Next / Submit here (server `waitingOn`). Old servers omit it. */
-  waitingOn?: "payment" | "team" | null;
+  waitingOn?: "payment" | "team" | "status_action" | null;
 }
 
 export interface WizardWorkspace {
@@ -62,9 +62,10 @@ export const FUTURE_REASON_LABEL: Partial<Record<NonNullable<WizardStage["future
 };
 
 /** Panel text when the current phase has nothing for the customer to do (lead QA ruling 3). */
-export const WAITING_MESSAGE: Record<"payment" | "team", string> = {
+export const WAITING_MESSAGE: Record<NonNullable<WizardStage["waitingOn"]>, string> = {
   payment: "This step completes when your payment is confirmed.",
   team: "Our team is working on this step. Nothing is needed from you right now.",
+  status_action: "When you're ready, use one of the actions at the top of the page, such as Approve or Request changes.",
 };
 
 /** Shown under the payment message when no open invoice exists yet. */
@@ -105,10 +106,11 @@ export const WIZARD_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   POLICY_ACCEPTANCE_REQUIRED: "Please accept the required policy shown at the top of the page first.",
   STAGE_NOT_CUSTOMER_ACTIONABLE: "Nothing is needed from you in this phase. It moves on when our team or your payment completes it.",
   STAGE_SUBMIT_REQUIRED: "Please submit and lock this phase first.",
+  STAGE_USE_STATUS_ACTION: "Use one of the actions at the top of the page to continue, such as Approve or Request changes.",
 };
 
 /** Codes after which the workspace should be read again (the server state moved on). */
-export const REFRESH_CODES: ReadonlySet<string> = new Set(["STALE_VERSION", "ACK_TEXT_CHANGED", "STAGE_NOT_FOUND", "STAGE_NOT_OPEN", "STAGE_LOCKED", "STAGE_NOT_CUSTOMER_ACTIONABLE"]);
+export const REFRESH_CODES: ReadonlySet<string> = new Set(["STALE_VERSION", "ACK_TEXT_CHANGED", "STAGE_NOT_FOUND", "STAGE_NOT_OPEN", "STAGE_LOCKED", "STAGE_NOT_CUSTOMER_ACTIONABLE", "STAGE_USE_STATUS_ACTION"]);
 
 export function wizardErrorMessage(reasonCode: string | undefined, safeMessage: string | undefined): string {
   return (reasonCode && WIZARD_ERROR_MESSAGES[reasonCode]) ?? safeMessage ?? "Something went wrong. Please try again.";

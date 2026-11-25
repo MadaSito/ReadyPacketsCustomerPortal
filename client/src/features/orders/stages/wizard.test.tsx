@@ -98,6 +98,13 @@ describe("phase wizard guards (lead QA rulings 5 and 3)", () => {
     expect(screen.getByText("Add page two.")).toBeInTheDocument();
     expect(screen.getAllByText("This phase was reopened. Make your changes, then continue.")).toHaveLength(1);
   });
+  it("a phase left through a status action points to the page actions", () => {
+    const ws = workspace();
+    ws.stages[1] = { ...ws.stages[1]!, canNext: false, waitingOn: "status_action" };
+    setup(ws);
+    expect(screen.getByText(/use one of the actions at the top of the page, such as Approve or Request changes/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+  });
   it("a team phase shows the waiting text and no Next", () => {
     const ws = workspace();
     ws.stages[1] = { ...ws.stages[1]!, canNext: false, waitingOn: "team", actions: { ...noActions } };
