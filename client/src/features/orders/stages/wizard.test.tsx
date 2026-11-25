@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { pageA11y } from "@/test/a11y";
 import { expectNoAxeViolations, renderUi } from "@/ui/testing";
+import { OrderListProgress } from "./OrderListProgress";
 import { PhaseWizard, type PhaseWizardProps } from "./PhaseWizard";
 import { STANDARD_ACK_MESSAGE, isWritable, progressStages, wizardErrorMessage, type WizardStage, type WizardWorkspace } from "./wizardModel";
 
@@ -164,5 +165,20 @@ describe("PhaseWizard", () => {
         <PhaseWizard workspace={workspace()} renderAction={() => <p>Action</p>} onNext={async () => undefined} onSubmit={async () => undefined} busy={false} error={null} />
       </main>,
     );
+  });
+});
+
+describe("OrderListProgress", () => {
+  it("names each bar after its order and describes the current phase", async () => {
+    renderUi(<ul><li><OrderListProgress name="Smith family" progressPercent={40} phaseLabel="Synthesis" phaseIndex={1} phaseTotal={5} /></li></ul>);
+    const bar = screen.getByRole("progressbar", { name: "Progress of Smith family" });
+    expect(bar).toHaveAttribute("aria-valuetext", "40 percent, phase 2 of 5: Synthesis");
+    await expectNoAxeViolations();
+  });
+  it("shows nothing for rows without a phase model; canceled is said in words", () => {
+    const { container } = renderUi(<OrderListProgress name="Old" progressPercent={null} phaseLabel={null} phaseIndex={null} phaseTotal={null} />);
+    expect(container.querySelector("[role=progressbar]")).toBeNull();
+    renderUi(<OrderListProgress name="Gone" progressPercent={60} phaseLabel="Review" phaseIndex={2} phaseTotal={3} canceled />);
+    expect(screen.getByRole("progressbar", { name: "Progress of Gone" }).getAttribute("aria-valuetext")).toMatch(/canceled/);
   });
 });
