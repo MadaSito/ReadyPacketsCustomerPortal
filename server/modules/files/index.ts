@@ -449,11 +449,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   const listStages = (principal: SessionPrincipal, orderPublicId: string, tx: Tx) =>
     deps.services.orders.stages?.listForOrder({ orderPublicId, actor: principal }, tx);
 
-  function statusStage(stages: Awaited<ReturnType<typeof listStages>>, statusKey: string | null) {
+  function statusStage(stages: Awaited<ReturnType<typeof listStages>> | undefined, statusKey: string | null) {
     return stages && statusKey && Object.hasOwn(stages.statusToStage, statusKey) ? stages.statusToStage[statusKey] ?? null : null;
   }
 
-  function stageStatusKeys(stages: Awaited<ReturnType<typeof listStages>>, key: string) {
+  function stageStatusKeys(stages: Awaited<ReturnType<typeof listStages>> | undefined, key: string) {
     if (!stageKeySchema.safeParse(key).success || !stages?.stages.some((entry) => entry.key === key && entry.viewable)) {
       throw notFound("STAGE_NOT_FOUND");
     }
