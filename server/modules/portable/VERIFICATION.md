@@ -27,6 +27,12 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 - **Reviewed, not tested:** the wording changes to `historical-evidence` (receipts) and `internal-order-notes` (task notes and waivers). No collector reads the new tables.
 - **Not verified here:** that a backup restore covers the new tables (owned by the backup module).
 
+## Increment 07
+
+- **Tested (one file, `portable.test.ts`, real MySQL with migration 0007):** the manifest lists the new exclusions `ephemeral-access`, `phase-workspace`, `operational-diagnostics` and `installation-configuration`. Export and import of a complete order still pass with the new `orders` and `order_files` columns present.
+- **Reviewed, not tested:** the per-table assignment of the 16 new tables (API.md "Increment 07 coverage"). No collector reads them.
+- **Not verified here:** that a backup restore covers the new tables (owned by the backup module; it enumerates every base table). Phase assignment (`order_files.stage_key`) is not carried in a package by design.
+
 ## Release limits and proposed decisions
 
 - **Historical modules**: This portal export does not collect engagement, support, billing, or compliance evidence; permissions/grants, internal notes and historical file revisions are excluded. When verified input contains historical evidence, inactive file versions, or optional unknown extensions, retain them inert rather than inserting live module rows or replaying side effects. Decide which historical evidence must be portable and which parts may be shown to authorized target users.

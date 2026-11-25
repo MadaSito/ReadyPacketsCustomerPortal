@@ -162,7 +162,8 @@ describe("portable transfer across isolated MySQL installations", () => {
           discountLabel: OFFERING_PRICE.discountLabel, total: { amountMinor: OFFERING_PRICE.totalMinor, currency: "USD" },
           promoDiscount: { amountMinor: OFFERING_PRICE.promoDiscountMinor, currency: "USD" }, promoLabel: OFFERING_PRICE.promoLabel,
         });
-        expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers", "security-operations", "policy-notices", "report-definitions"]));
+        expect(pkg.manifest.exclusions.map((entry) => entry.category)).toEqual(expect.arrayContaining(["promotions", "cart-upsell-offers", "security-operations", "policy-notices", "report-definitions",
+          "ephemeral-access", "phase-workspace", "operational-diagnostics", "installation-configuration"]));
         expect(records.find((entry) => entry.type === "order-items")?.record).toMatchObject({
           ...OFFERING_SNAPSHOT, tier: "standard", lineTotal: { amountMinor: OFFERING_PRICE.subtotalMinor, currency: "USD" },
         });
