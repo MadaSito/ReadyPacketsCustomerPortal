@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 on `fix/increment-07-1`, PR #19, merge commit filled at merge). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16; fix pack 07.1 merged to `main` as `547a31d` through PR #19). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -383,7 +383,7 @@ Details are in `docs/session-logs/2026-11-22-session-03.md`.
 
 ## Verification for increment 07.1
 
-Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). Mostly client-side. The one server change is the single-page app fallback for dotted mail template keys (`916f52a`). There is no server permission, schema or migration change, and the upgrade commands are unchanged. PR #19; the merge commit will be filled at merge.
+Fix pack for the owner's prompts 28 and 29 of 2026-11-25 ([session log](../session-logs/2026-11-25-session-01.md)). Mostly client-side. The one server change is the single-page app fallback for dotted mail template keys (`916f52a`). There is no server permission, schema or migration change, and the upgrade commands are unchanged. PR #19, merged to `main` as `547a31d`.
 
 ### What changed
 
