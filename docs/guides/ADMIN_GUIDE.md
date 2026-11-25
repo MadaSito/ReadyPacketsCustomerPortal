@@ -43,6 +43,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Policy acceptances](#policy-acceptances)
 - [Reports](#reports)
 - [Security incidents](#security-incidents)
+- [Microsoft 365 file sync](#microsoft-365-file-sync)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
 ## Increment 04 operating guides
@@ -381,6 +382,33 @@ The portal correlates security events every minute and opens an incident when a 
 - **Proxy warning.** If client addresses cannot be determined behind your proxy, a warning appears, and banning pauses until the trusted-proxy settings are fixed.
 - **Break-glass.** A server command lists and clears bans without the web UI ([ADR 0050](../adr/0050-signin-bans-backoff-correlation.md)).
 - **SIEM.** Incidents and bans are audit events (`security.incident.*`, `security.ban.*`), so SIEM and syslog receivers get them.
+
+## Microsoft 365 file sync
+
+<!-- platform_engineer: from portable_ops_engineer's D12 handoff; verification PENDING-LEAD. -->
+
+File sync copies order files from the portal to SharePoint, one way, phase by phase ([ADR 0061](../adr/0061-microsoft-365-file-sync.md)). The portal stays authoritative: nothing done in SharePoint changes the portal. Remote deletes and moves are never made, and files from before you switch sync on are not copied (no historical backfill).
+
+### Setting it up
+
+1. On **Storage connections**, add a dedicated **private SharePoint** connection. Prefer SharePoint with the `Sites.Selected` permission on a private, dedicated site. OneDrive needs tenant-wide application file permissions, so it is not recommended.
+2. On **Integrations → Egress** (`/admin/integrations/egress`), switch on the **Graph** and **Graph upload** presets.
+3. Run the ordinary read test and enable the connection. Then run the session-based **write check**. It proves the portal may write, without creating a file.
+4. Open **File sync** (`/admin/storage/file-sync`, linked from Storage connections) and approve the destination explicitly. Approve it either for phase files, or as the only, restricted **Receipts** target.
+5. In the workflow's phase editor, choose for each phase:
+   - the document folder and audio folder (defaults `{phase_key}/Docs` and `{phase_key}/Audio`);
+   - the originals, conversion staging and intake delivery targets.
+
+   These selectors default to **off** ("Do not transfer").
+
+Files land under `CustomerName-CustomerID/OrderNumber/<phase folder>`. The first two segments are fixed when an order is first exported.
+
+### Running and repairing
+
+- **Uploads never fail because Graph is offline.** Copies wait and retry.
+- **Resync.** **Dry run** first shows the count. Then queue a bounded resync of at most 100 existing failed or blocked items.
+- **Uncertain uploads.** An upload whose outcome is unknown is inspected and reconciled, never replayed blindly.
+- **Health and alerts.** Health shows the last success, the backlog and blocked items, and problems raise alerts on `/admin/alerts`. The order's **File sync** tab shows each file's role, destination and state.
 
 ## Storage copy log
 

@@ -157,7 +157,7 @@ Existing orders keep their pinned workflow version. The upgrade prepares a phase
     - `GET /api/identity/saml/metadata`
     - `GET /api/identity/saml/start`
     - `POST /api/identity/saml/acs`. The match is exact and POST only. The body is a flat URL-encoded form of at most 256 KiB, with no decompression and no caching.
-    - Sensitive fields (the SAML form body and identity headers) are stripped from proxy logs.
+    - Sensitive request data never goes into proxy or application request logs. This covers the assertion and form body, request headers including cookies, and callback query material such as the start ticket or completion attempt. Application logs record only a fixed route label, the method, the status and the correlation id.
   - **Audio playback** (`GET` / `HEAD /api/files/playback/:grantPublicId`):
     - `Range` and `If-Range` are forwarded to the portal unchanged;
     - the proxy must not buffer or build its own 206 answer.
