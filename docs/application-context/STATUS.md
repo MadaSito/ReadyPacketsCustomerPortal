@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 lead QA and final gates recorded; PR #16). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 merged to `main` as `c337492` through PR #16). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -441,6 +441,13 @@ The lead's QA of 2026-11-25 (QA 5044), on a production build against MySQL in a 
 - **Full vitest at `7c6bb71`:** 229 files, with 2,894 tests passed, 1 flaky client test (being fixed) and 4 todo.
 - **Final gates** on `fa9780a` (`54c6f26` plus a gitleaks baseline commit): full vitest 229 files, 2,896 passed, 4 todo, 0 failed; type check clean; `eslint . --max-warnings 0` clean; `pnpm audit --prod` reported no known vulnerabilities; gitleaks found no leaks (five reviewed synthetic fixtures were added to `.gitleaksignore` in `fa9780a`). The branch is on [PR #16](https://github.com/MadaSito/ReadyPacketsCustomerPortal/pull/16), to be merged with a merge commit once the four workflows (ci, security, container, native-install) pass; CI results live on the PR.
 - **Since the QA pass:** `54c6f26` shows production dispatches as "Failed" or "Failed (retrying)" with the next attempt time, uses readable trigger labels and adds a "Switched off" badge on the integrations hub; `fd20503` makes the pending-upload guard use layout effects. ui_foundation's sweep on `7c6bb71` found no axe violations and no overflow at 320, 768 and 1280 px in both themes on all changed pages, with reduced motion honoured and one polite announcement per progress change; the Stripe activation confirm dialog and the run-summary callout were not swept. No screen-reader or physical-phone pass was done.
+- **Merge record (2026-11-25):** on PR #16 the ci, container and native-install workflows passed on `194979a`; the security workflow failed its CodeQL gate with five findings at or above severity 7.0. `ec9837b` resolved them:
+  - the SAML multi-factor claim check now tests exact membership of the claim value instead of `Array.includes` on a URL-shaped constant (no behaviour change);
+  - the Graph write-check test compares the parsed hostname instead of a URL substring;
+  - the QA-only fake identity provider (`scripts/qa/saml-fake-idp.ts`) now requires an explicit private `--state` directory and creates its key files exclusively, instead of defaulting to a shared temporary folder;
+  - the audio playback grant cookie was added to `.github/codeql-baseline.json` with a reviewed justification (an opaque random grant token, hashed server-side, HttpOnly, SameSite=Strict, path-scoped; not stored personal or credential data).
+
+  All four workflows then passed on `ec9837b`, and PR #16 was merged to `main` with merge commit `c337492`. The sandbox preview was rebuilt from `ec9837b` on a database migrated to 0007 and smoke-checked in a browser as a customer and as an administrator (every new administration page loads). The preview administrator account was still on a temporary password from an earlier recovery test; it was moved to a new password through the normal forced-change flow.
 
 ## Verified for increment 06 (integrator's own runs)
 
