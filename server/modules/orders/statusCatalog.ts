@@ -529,7 +529,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           .for("update")
           .limit(1);
         if (!row) {
-          throw notFound("STATUS_NOT_FOUND", "Status was not found in the catalogue.");
+          throw notFound("STATUS_NOT_FOUND");
         }
         if (row.version !== input.expectedVersion) {
           throw conflict("VERSION_CONFLICT", "This status was updated by another administrator. Reload and try again.");
@@ -599,7 +599,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
         const byKey = new Map(rows.map((r) => [r.key, r]));
         for (const key of orderedKeys) {
           if (!byKey.has(key)) {
-            throw notFound("STATUS_NOT_FOUND", `Unknown status key: ${key}.`);
+            throw notFound("STATUS_NOT_FOUND");
           }
         }
 
@@ -668,7 +668,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           .for("update")
           .limit(1);
         if (!row) {
-          throw notFound("STATUS_NOT_FOUND", "Status was not found in the catalogue.");
+          throw notFound("STATUS_NOT_FOUND");
         }
         if (row.version !== input.expectedVersion) {
           throw conflict("VERSION_CONFLICT", "This status was updated by another administrator. Reload and try again.");
@@ -750,7 +750,7 @@ export function createOrderStatusCatalogService(deps: StatusCatalogDeps): OrderS
           .for("update")
           .limit(1);
         if (!row) {
-          throw notFound("STATUS_NOT_FOUND", "Status was not found in the catalogue.");
+          throw notFound("STATUS_NOT_FOUND");
         }
         if (row.version !== input.expectedVersion) {
           throw conflict("VERSION_CONFLICT", "This status was updated by another administrator. Reload and try again.");
