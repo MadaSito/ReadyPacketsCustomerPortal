@@ -1,7 +1,7 @@
 /** /admin/promotions/:promotionId — rules, code (reveal + copy code / link), batch generation, exports, redemptions. Owner: audit engineer. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Eye, Layers, Pencil } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "wouter";
 import { formatMoney } from "@shared/domain";
 import { errorMessage } from "@/lib/trpc";
@@ -91,19 +91,28 @@ function CodeCard({ promotion, canManage }: { promotion: PromotionView; canManag
   const [batchOpen, setBatchOpen] = useState(false);
   const showRef = useRef<HTMLButtonElement>(null);
   const revealedRef = useRef<HTMLDivElement>(null);
+  const pendingFocus = useRef<"revealed" | "show" | null>(null);
   const origin = typeof window === "undefined" ? "" : window.location.origin;
   const show = async () => {
     try {
       const out = await stepUp.run(() => reveal.mutateAsync({ publicId: promotion.publicId }), { reason: "Showing a discount code requires a fresh confirmation. The view is recorded." });
-      setCode(out.code);
       // "Show code and link" is replaced by the revealed controls: focus the first copy action, never the value.
-      requestAnimationFrame(() => revealedRef.current?.querySelector<HTMLElement>("button")?.focus());
+      // Focus moves in an effect after the commit; a frame callback can run before React has rendered the controls.
+      pendingFocus.current = "revealed";
+      setCode(out.code);
     } catch (e) {
       if (e instanceof StepUpCancelledError) return;
       toast.show({ tone: "danger", title: "Code not shown", description: errorMessage(e) });
     }
   };
-  const hide = () => { setCode(null); requestAnimationFrame(() => showRef.current?.focus()); };
+  const hide = () => { pendingFocus.current = "show"; setCode(null); };
+  useEffect(() => {
+    const target = pendingFocus.current;
+    if (!target) return;
+    pendingFocus.current = null;
+    if (target === "revealed" && code) revealedRef.current?.querySelector<HTMLElement>("button")?.focus();
+    if (target === "show" && !code) showRef.current?.focus();
+  }, [code]);
 
   return (
     <Card title={promotion.isBatch ? "Codes" : "Code"} headingLevel={2} className="ph-no-capture" data-clarity-mask="true">
