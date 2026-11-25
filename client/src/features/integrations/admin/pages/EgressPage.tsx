@@ -1,5 +1,6 @@
 /**
- * /admin/integrations/egress — the outbound connection allowlist, the permanently blocked ranges and a dry-run checker.
+ * /admin/integrations/egress — one-click provider presets, the outbound connection allowlist,
+ * the permanently blocked ranges and a dry-run destination checker.
  * The blocked-range read-out mirrors server/modules/integrations/API.md §1.1 (ipPolicy.ts is the enforcement point).
  */
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -7,13 +8,14 @@ import { MoreHorizontal, Plus, ShieldBan } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { safeError, useTRPC, type useTRPCClient } from "@/lib/trpc";
 import {
-  Badge, Button, Callout, Card, Checkbox, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu, EmptyState, Field, IconButton, Input,
-  PageHeader, Select, Textarea,
+  Badge, Button, Callout, Card, Checkbox, ConfirmDialog, DataTable, DateTime, Dialog, DropdownMenu, EmptyState, ErrorState, Field, IconButton, Input,
+  PageHeader, Select, Skeleton, Switch, Textarea,
 } from "@/ui";
 import { IntegrationsCrumbs, usePrivilegedAction } from "../shared";
 
 type Client = ReturnType<typeof useTRPCClient>;
 type Rule = Awaited<ReturnType<Client["integrations"]["admin"]["egress"]["list"]["query"]>>[number];
+type Preset = Awaited<ReturnType<Client["integrations"]["admin"]["egress"]["presets"]["query"]>>[number];
 type CheckResult = Awaited<ReturnType<Client["integrations"]["admin"]["egress"]["check"]["mutate"]>>;
 type Purpose = Rule["purpose"];
 type Protocol = Rule["protocol"];
@@ -29,7 +31,7 @@ export const PURPOSE_LABELS: Record<Purpose, string> = {
   antivirus: "Malware scanner",
   graph: "Microsoft Graph API",
   graph_upload: "Microsoft Graph upload session",
-  entra_oidc: "Microsoft Entra OIDC",
+  entra_oidc: "Microsoft Entra OIDC & SAML metadata",
   storage_s3: "S3-compatible storage",
   storage_azure: "Azure Blob Storage",
   storage_dropbox: "Dropbox storage",
@@ -38,6 +40,17 @@ export const PURPOSE_LABELS: Record<Purpose, string> = {
 const PROTOCOL_LABELS: Record<Protocol, string> = { "https:": "HTTPS", "tls:": "TLS (syslog over TLS)", "smtp:": "SMTP with STARTTLS", "smtps:": "SMTP over implicit TLS" };
 const MATCH_LABELS: Record<MatchType, string> = { host: "Host name", ip: "IP address", cidr: "Address range (CIDR)" };
 const opts = <K extends string>(labels: Record<K, string>) => (Object.keys(labels) as K[]).map((value) => ({ value, label: labels[value] }));
+
+const DIRECT_PRESET_ORDER: readonly Preset["key"][] = [
+  "stripe",
+  "microsoft_graph",
+  "microsoft_graph_upload",
+  "entra_oidc",
+  "square",
+  "square_sandbox",
+  "dropbox",
+  "google_drive",
+];
 
 /** Never allowlistable, whatever rule exists. */
 export const NEVER_ALLOWED: readonly { label: string; ranges: string }[] = [
@@ -62,16 +75,21 @@ export const PRIVATE_UNLESS_ALLOWED: readonly { label: string; ranges: string }[
 export default function EgressPage() {
   const trpc = useTRPC();
   const run = usePrivilegedAction();
+  const presets = useQuery(trpc.integrations.admin.egress.presets.queryOptions());
   const list = useQuery(trpc.integrations.admin.egress.list.queryOptions());
   const update = useMutation(trpc.integrations.admin.egress.update.mutationOptions());
   const remove = useMutation(trpc.integrations.admin.egress.remove.mutationOptions());
   const [creating, setCreating] = useState(false);
   const [removing, setRemoving] = useState<Rule | null>(null);
 
+  const refreshAll = async () => {
+    await Promise.all([presets.refetch(), list.refetch()]);
+  };
+
   const toggle = async (rule: Rule) => {
     await run(() => update.mutateAsync({ publicId: rule.publicId, expectedVersion: rule.version, enabled: !rule.enabled }),
       rule.enabled ? "Rule switched off" : "Rule switched on", "Changing the allowlist needs verification.").catch(() => undefined);
-    await list.refetch();
+    await refreshAll();
   };
 
   return (
@@ -80,6 +98,13 @@ export default function EgressPage() {
         description="Every connection the server opens to another system must pass this policy. Changes need your verification and are audited."
         actions={<Button leadingIcon={<Plus className="size-4" aria-hidden />} onClick={() => setCreating(true)}>Add rule</Button>} />
       <div className="flex min-w-0 flex-col gap-6">
+        <PresetsCard
+          presets={presets.data}
+          loading={presets.isPending}
+          error={presets.error}
+          onRetry={() => void presets.refetch()}
+          onChanged={refreshAll}
+        />
         <DataTable<Rule>
           caption="Allowlist rules"
           rows={list.data}
@@ -105,7 +130,7 @@ export default function EgressPage() {
                 { label: "Remove", destructive: true, onSelect: () => setRemoving(rule) },
               ]} />
           )}
-          empty={<EmptyState icon={ShieldBan} title="No allowlist rules" description="Only public addresses on standard ports are reachable. Add a rule for a private relay or SIEM collector." />}
+          empty={<EmptyState icon={ShieldBan} title="No allowlist rules" description="Only public addresses on standard ports are reachable. Switch on a provider preset above or add a rule for a private relay or SIEM collector." />}
         />
         <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-2">
           <Card as="section" title="Always blocked" description="These destinations can never be allowlisted.">
@@ -118,7 +143,7 @@ export default function EgressPage() {
         </div>
         <CheckCard />
       </div>
-      <CreateRuleDialog open={creating} onOpenChange={setCreating} onCreated={() => void list.refetch()} />
+      <CreateRuleDialog open={creating} onOpenChange={setCreating} onCreated={() => void refreshAll()} />
       <ConfirmDialog open={!!removing} onOpenChange={(o) => { if (!o) setRemoving(null); }} destructive confirmLabel="Remove rule"
         title="Remove this rule?" description={removing ? `Connections to ${removing.pattern}:${removing.port} will be refused unless another rule allows them.` : undefined}
         onConfirm={async () => {
@@ -126,9 +151,198 @@ export default function EgressPage() {
           const done = await run(() => remove.mutateAsync({ publicId: removing.publicId }), "Rule removed", "Changing the allowlist needs verification.");
           if (done === undefined) throw new Error("cancelled");
           setRemoving(null);
-          await list.refetch();
+          await refreshAll();
         }} />
     </>
+  );
+}
+
+function PresetsCard({
+  presets,
+  loading,
+  error,
+  onRetry,
+  onChanged,
+}: {
+  presets: readonly Preset[] | undefined;
+  loading: boolean;
+  error: unknown;
+  onRetry: () => void;
+  onChanged: () => Promise<void>;
+}) {
+  const trpc = useTRPC();
+  const run = usePrivilegedAction();
+  const setPreset = useMutation(trpc.integrations.admin.egress.setPreset.mutationOptions());
+  const [pendingKey, setPendingKey] = useState<Preset["key"] | null>(null);
+  const [paramForms, setParamForms] = useState<Record<string, { region: string; bucket: string; accountName: string; error?: string }>>({});
+
+  const byKey = new Map((presets ?? []).map((p) => [p.key, p] as const));
+  const directPresets = DIRECT_PRESET_ORDER.map((k) => byKey.get(k)).filter((p): p is Preset => Boolean(p));
+  const parameterizedPresets = (presets ?? []).filter((p) => p.parameterized);
+
+  const toggleDirect = async (preset: Preset, next: boolean) => {
+    setPendingKey(preset.key);
+    try {
+      await run(
+        () => setPreset.mutateAsync({ presetKey: preset.key, enabled: next }),
+        next ? `${preset.label} switched on` : `${preset.label} switched off`,
+        "Changing outbound provider presets needs verification.",
+      ).catch(() => undefined);
+      await onChanged();
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
+  const getParamState = (key: string) => paramForms[key] ?? { region: "", bucket: "", accountName: "" };
+  const patchParamState = (key: string, patch: Partial<{ region: string; bucket: string; accountName: string; error?: string }>) =>
+    setParamForms((prev) => ({ ...prev, [key]: { ...getParamState(key), ...patch } }));
+
+  const enableParameterized = async (preset: Preset, event: FormEvent) => {
+    event.preventDefault();
+    const state = getParamState(preset.key);
+    patchParamState(preset.key, { error: undefined });
+    const params =
+      preset.key === "azure_blob"
+        ? { accountName: state.accountName.trim() }
+        : {
+            region: state.region.trim(),
+            ...(state.bucket.trim() ? { bucket: state.bucket.trim() } : {}),
+          };
+    setPendingKey(preset.key);
+    try {
+      await run(
+        () => setPreset.mutateAsync({ presetKey: preset.key, enabled: true, params }),
+        `${preset.label} switched on`,
+        "Enabling a cloud storage preset needs verification.",
+      );
+      await onChanged();
+    } catch (err) {
+      patchParamState(preset.key, { error: safeError(err)?.safeMessage ?? "Check the storage region or account name." });
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
+  const disableParameterized = async (preset: Preset) => {
+    setPendingKey(preset.key);
+    try {
+      await run(
+        () => setPreset.mutateAsync({ presetKey: preset.key, enabled: false }),
+        `${preset.label} switched off`,
+        "Changing outbound provider presets needs verification.",
+      ).catch(() => undefined);
+      await onChanged();
+    } finally {
+      setPendingKey(null);
+    }
+  };
+
+  return (
+    <Card
+      as="section"
+      title="Provider presets"
+      description="One-click HTTPS port 443 allowlist switches for cloud payments, Microsoft Graph & SharePoint, single sign-on, and cloud storage. All presets start off by default."
+    >
+      {error ? (
+        <ErrorState error={error} title="Provider presets unavailable" onRetry={onRetry} />
+      ) : loading ? (
+        <Skeleton lines={4} />
+      ) : (
+        <div className="flex min-w-0 flex-col gap-6">
+          <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+            {directPresets.map((preset) => (
+              <div key={preset.key} className="min-w-0 rounded-lg border border-line bg-surface-subtle/40 p-3">
+                <Switch
+                  label={preset.label}
+                  description={`${PURPOSE_LABELS[preset.purpose]} — ${preset.hosts.map((h) => `${h}:443`).join(", ")} (HTTPS)`}
+                  checked={preset.enabled}
+                  disabled={pendingKey === preset.key}
+                  onCheckedChange={(next) => void toggleDirect(preset, next)}
+                />
+              </div>
+            ))}
+          </div>
+
+          {parameterizedPresets.length > 0 ? (
+            <div className="flex min-w-0 flex-col gap-3 border-t border-line pt-4">
+              <div>
+                <h3 className="text-sm font-semibold text-ink">Regional object-storage presets</h3>
+                <p className="text-xs text-muted">Enter the exact cloud region or Azure Storage account so only your tenant’s HTTPS endpoint is opened.</p>
+              </div>
+              <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
+                {parameterizedPresets.map((preset) => {
+                  const state = getParamState(preset.key);
+                  return (
+                    <form
+                      key={preset.key}
+                      noValidate
+                      onSubmit={(e) => void enableParameterized(preset, e)}
+                      aria-label={preset.label}
+                      className="flex min-w-0 flex-col gap-3 rounded-lg border border-line p-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-sm font-semibold text-ink">{preset.label}</span>
+                        {preset.enabled ? <Badge tone="success">On</Badge> : <Badge>Off</Badge>}
+                      </div>
+                      {preset.hosts.length > 0 ? (
+                        <p className="break-all font-mono text-xs text-muted">{preset.hosts.map((h) => `${h}:443`).join(", ")}</p>
+                      ) : null}
+                      {state.error ? <Callout tone="danger" live="assertive">{state.error}</Callout> : null}
+                      {preset.key === "azure_blob" ? (
+                        <Field label="Azure Storage account" hint="3–24 lowercase letters and digits">
+                          <Input
+                            value={state.accountName}
+                            onChange={(e) => patchParamState(preset.key, { accountName: e.target.value })}
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        </Field>
+                      ) : (
+                        <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2">
+                          <Field label="Region" hint="For example us-east-1">
+                            <Input
+                              value={state.region}
+                              onChange={(e) => patchParamState(preset.key, { region: e.target.value })}
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </Field>
+                          <Field label="Bucket (optional)" hint="Adds virtual-hosted bucket host">
+                            <Input
+                              value={state.bucket}
+                              onChange={(e) => patchParamState(preset.key, { bucket: e.target.value })}
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </Field>
+                        </div>
+                      )}
+                      <div className="flex flex-wrap gap-2">
+                        <Button type="submit" size="sm" variant="secondary" loading={pendingKey === preset.key}>
+                          Enable preset
+                        </Button>
+                        {preset.enabled ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={pendingKey === preset.key}
+                            onClick={() => void disableParameterized(preset)}
+                          >
+                            Switch off
+                          </Button>
+                        ) : null}
+                      </div>
+                    </form>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </Card>
   );
 }
 

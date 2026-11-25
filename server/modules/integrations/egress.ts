@@ -268,7 +268,9 @@ export interface EgressPolicy {
   fetchPinned(url: string | URL, purpose: EgressPurpose, options?: EgressFetchOptions): Promise<EgressFetchResponse>;
   listAllowlist(): Promise<EgressAllowlistRuleView[]>;
   listPresets(): Promise<EgressPresetView[]>;
+  isPresetEnabled(key: EgressPresetKey): Promise<boolean>;
   setPresetEnabled(principal: SessionPrincipal, input: SetEgressPresetInput): Promise<EgressPresetView>;
+  setPreset(principal: SessionPrincipal, input: SetEgressPresetInput): Promise<EgressPresetView>;
   createAllowlistRule(principal: SessionPrincipal, input: CreateEgressRuleInput): Promise<EgressAllowlistRuleView>;
   updateAllowlistRule(principal: SessionPrincipal, input: UpdateEgressRuleInput): Promise<EgressAllowlistRuleView>;
   deleteAllowlistRule(principal: SessionPrincipal, publicId: string): Promise<void>;
@@ -1254,6 +1256,16 @@ export function createEgressPolicy(deps: ModuleDeps, options: EgressPolicyOption
     async listPresets() {
       const rules = await loadAllRulesSafe();
       return PRESET_CATALOG.map((meta) => buildPresetView(meta, rules));
+    },
+
+    async isPresetEnabled(key) {
+      const meta = getPresetMeta(key);
+      const rules = await loadAllRulesSafe();
+      return buildPresetView(meta, rules).enabled;
+    },
+
+    async setPreset(principal, input) {
+      return this.setPresetEnabled(principal, input);
     },
 
     async setPresetEnabled(principal, input) {

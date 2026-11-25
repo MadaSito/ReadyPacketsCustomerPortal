@@ -56,26 +56,13 @@ function renderPage(page: ReactElement, records: Record<string, (input: unknown)
 
 const providers = [
   { key: "smtp", name: "E-mail (SMTP)", state: "configured", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Saved; no test has succeeded yet." },
+  { key: "graph", name: "Microsoft Graph Mail & Cloud", state: "not_configured", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Not configured." },
   { key: "clarity", name: "Microsoft Clarity", state: "not_configured", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "No project ID saved." },
   { key: "posthog", name: "PostHog", state: "configured", verified: true, scaffoldOnly: false, lastCheckedAt: date, summary: "Sending page views." },
-  { key: "stripe", name: "Stripe", state: "disabled", verified: false, scaffoldOnly: true, lastCheckedAt: null, summary: "Scaffold." },
-  { key: "saml", name: "SAML single sign-on", state: "disabled", verified: false, scaffoldOnly: true, lastCheckedAt: null, summary: "Scaffold." },
-  { key: "sharepoint", name: "SharePoint", state: "disabled", verified: false, scaffoldOnly: true, lastCheckedAt: null, summary: "Scaffold." },
+  { key: "stripe", name: "Stripe Payments", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Outbound api.stripe.com:443 preset is switched off." },
+  { key: "saml", name: "Enterprise SAML 2.0 SSO", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Configure SAML 2.0 and Microsoft Entra single sign-on in Single Sign-On settings." },
+  { key: "sharepoint", name: "Microsoft 365 / SharePoint Sync", state: "disabled", verified: false, scaffoldOnly: false, lastCheckedAt: null, summary: "Microsoft 365 SharePoint & OneDrive sync is switched off." },
 ];
-
-const scaffolds = {
-  "integrations.admin.stripe.get": () => ({
-    enabled: false, availableInRelease: false, releaseBanner: "Not available in this release — card payments are not taken.", configured: false, verified: false,
-    state: "disabled", summary: "Scaffold", publishableKey: "", secretKeyConfigured: false, webhookSecretConfigured: false, webhookToleranceSeconds: 300,
-    webhookPath: "/api/integrations/webhooks/stripe", lastCheckedAt: null, verificationNote: "Webhook signatures will be verified.",
-  }),
-  "integrations.admin.saml.get": () => ({
-    state: "disabled", availableInRelease: false, releaseBanner: "Not available in this release — local sign-in with MFA is the only active method",
-    metadata: { idpEntityId: "", idpSsoUrl: "", spEntityId: "", nameIdFormat: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent" },
-    securityRequirements: ["Signed assertions required"],
-  }),
-  "integrations.admin.sharepoint.get": () => ({ state: "disabled", availableInRelease: false, summary: "Not available in this release.", targetRequirements: ["Least-privilege Graph scopes"] }),
-};
 
 const smtpConfig = {
   enabled: true, configured: true, verified: false, state: "configured", summary: "Saved; no test has succeeded yet.", host: "smtp.example.test", port: 587,
@@ -108,23 +95,28 @@ describe("integrations console registration", () => {
 });
 
 describe("Integrations overview", () => {
-  it("shows one card per integration with truthful status and the release banners", async () => {
-    const { container } = renderPage(<IntegrationsOverviewPage />, { "integrations.admin.providers": () => providers, ...scaffolds });
+  it("shows truthful live status cards and configuration links without dead scaffold banners", async () => {
+    const { container } = renderPage(<IntegrationsOverviewPage />, { "integrations.admin.providers": () => providers });
     expect(await screen.findByRole("heading", { level: 1, name: "Integrations" })).toBeInTheDocument();
     const card = async (name: string) => (await screen.findByRole("heading", { level: 2, name })).closest("article") as HTMLElement;
     expect(within(await card("E-mail (SMTP)")).getByText("Configured — not yet verified")).toBeInTheDocument();
     expect(within(await card("Microsoft Clarity")).getByText("Not configured")).toBeInTheDocument();
     expect(within(await card("PostHog")).getByText("Configured")).toBeInTheDocument();
-    for (const name of ["SAML single sign-on", "SharePoint"]) {
-      const c = await card(name);
-      await waitFor(() => expect(within(c).getAllByText("Not available in this release").length).toBeGreaterThan(0));
-      expect(within(c).queryByRole("link")).toBeNull();
-    }
-    const stripeCard = await card("Stripe");
-    await waitFor(() => expect(within(stripeCard).getAllByText("Not available in this release").length).toBeGreaterThan(0));
-    expect(within(stripeCard).getByRole("link", { name: /Open payments/ })).toHaveAttribute("href", "/admin/payments");
-    expect(within(await card("SAML single sign-on")).getByText(/local sign-in with MFA is the only active method/)).toBeInTheDocument();
+
+    const stripeCard = await card("Stripe Payments");
+    expect(within(stripeCard).queryByText("Not available in this release")).toBeNull();
+    expect(within(stripeCard).getByRole("link", { name: /Payment setup/ })).toHaveAttribute("href", "/admin/payments/setup");
+
+    const spCard = await card("Microsoft 365 / SharePoint Sync");
+    expect(within(spCard).queryByText("Not available in this release")).toBeNull();
+    expect(within(spCard).getByRole("link", { name: /Configure storage/ })).toHaveAttribute("href", "/admin/storage");
+    expect(within(spCard).getByRole("link", { name: /SharePoint folders/ })).toHaveAttribute("href", "/admin/storage/sharepoint-orders");
+
+    const samlCard = await card("Enterprise SAML 2.0 SSO");
+    expect(within(samlCard).getByRole("link", { name: /Configure single sign-on/ })).toHaveAttribute("href", "/admin/sso");
+
     expect(screen.getByRole("link", { name: /Configure e-mail/ })).toHaveAttribute("href", "/admin/integrations/smtp");
+    expect(screen.getByRole("link", { name: "Manage production pipeline" })).toHaveAttribute("href", "/admin/integrations/production");
     expect(screen.getByRole("link", { name: "Manage webhooks" })).toHaveAttribute("href", "/admin/integrations/webhooks");
     expect(screen.getByRole("link", { name: "Review allowlist" })).toHaveAttribute("href", "/admin/integrations/egress");
     expect(container.querySelectorAll("h1")).toHaveLength(1);
@@ -255,8 +247,22 @@ describe("Outbound connections", () => {
     allowPrivateAddress: true, enabled: true, justification: "Internal SIEM collector", version: 2, createdAt: date, updatedAt: date,
   };
 
-  it("lists rules, reads out blocked ranges, validates new rules and runs a dry-run check", async () => {
+  const presetCatalog = [
+    { key: "stripe", label: "Stripe Checkout & Payments API", purpose: "stripe", parameterized: false, hosts: ["api.stripe.com"], enabled: false, matchingRulePublicIds: [] },
+    { key: "microsoft_graph", label: "Microsoft Graph & Entra Token", purpose: "graph", parameterized: false, hosts: ["login.microsoftonline.com", "graph.microsoft.com"], enabled: false, matchingRulePublicIds: [] },
+    { key: "microsoft_graph_upload", label: "Microsoft SharePoint & OneDrive Upload Sessions", purpose: "graph_upload", parameterized: false, hosts: ["*.sharepoint.com", "*.files.1drv.com"], enabled: false, matchingRulePublicIds: [] },
+    { key: "entra_oidc", label: "Microsoft Entra ID Single Sign-On (OIDC & SAML Metadata)", purpose: "entra_oidc", parameterized: false, hosts: ["login.microsoftonline.com"], enabled: false, matchingRulePublicIds: [] },
+    { key: "amazon_s3", label: "Amazon S3 Regional Endpoint", purpose: "storage_s3", parameterized: true, hosts: [], enabled: false, matchingRulePublicIds: [] },
+  ];
+
+  it("renders one-click provider preset switches, lists rules, validates new rules and runs a dry-run check", async () => {
     const { container, calls } = renderPage(<EgressPage />, {
+      "integrations.admin.egress.presets": () => presetCatalog,
+      "integrations.admin.egress.setPreset": (input) => {
+        const typed = input as { presetKey: string; enabled: boolean };
+        const found = presetCatalog.find((p) => p.key === typed.presetKey) ?? presetCatalog[0]!;
+        return { ...found, enabled: typed.enabled };
+      },
       "integrations.admin.egress.list": () => [rule],
       "integrations.admin.egress.update": () => ({ ...rule, enabled: false, version: 3 }),
       "integrations.admin.egress.check": () => ({ allowed: false, reasonCode: "EGRESS_METADATA", safeMessage: "Cloud metadata addresses are never reachable." }),
@@ -265,7 +271,18 @@ describe("Outbound connections", () => {
     expect((await screen.findAllByText("siem.corp.example:6514")).length).toBeGreaterThan(0);
     expect(screen.getByText("Cloud metadata")).toBeInTheDocument();
     expect(screen.getByText(/169\.254\.169\.254/)).toBeInTheDocument();
+    expect(await screen.findByRole("switch", { name: "Stripe Checkout & Payments API" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Microsoft Entra ID Single Sign-On (OIDC & SAML Metadata)" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
+
+    // One-click Stripe egress preset switch
+    await userEvent.click(screen.getByRole("switch", { name: "Stripe Checkout & Payments API" }));
+    await waitFor(() =>
+      expect(calls.find((c) => c.path === "integrations.admin.egress.setPreset")?.input).toEqual({
+        presetKey: "stripe",
+        enabled: true,
+      }),
+    );
 
     await userEvent.click(screen.getAllByRole("button", { name: "Actions for siem.corp.example" })[0]!);
     await userEvent.click(await screen.findByRole("menuitem", { name: "Switch off" }));

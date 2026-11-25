@@ -370,13 +370,26 @@ export function createIntegrationsModule(
   const webhooks = createWebhooksService(deps, egress);
 
   async function buildAllStatuses(): Promise<ProviderStatus[]> {
-    const [smtpView, graphView, analyticsView, stripeView, samlView, sharepointView] = await Promise.all([
+    const [
+      smtpView,
+      graphView,
+      analyticsView,
+      stripeView,
+      samlView,
+      stripePresetEnabled,
+      graphPresetEnabled,
+      graphUploadPresetEnabled,
+      sharepointCheck,
+    ] = await Promise.all([
       smtp.getConfig(),
       graphRuntime.admin.getConfig(),
       analytics.getAdminConfig(),
       stripe.getConfig(),
       scaffolds.getSamlScaffold(),
-      scaffolds.getSharePointScaffold(),
+      egress.isPresetEnabled("stripe"),
+      egress.isPresetEnabled("microsoft_graph"),
+      egress.isPresetEnabled("microsoft_graph_upload"),
+      checks.get("sharepoint"),
     ]);
 
     const clarityState: ProviderState = !analyticsView.clarity.configured
@@ -400,6 +413,39 @@ export function createIntegrationsModule(
       : !analyticsView.posthog.enabled
         ? "PostHog project token saved, but event capture is disabled."
         : "Configured for /privacy and /terms after visitor consent (live vendor delivery not verified by server).";
+
+    const stripeLiveState: ProviderState =
+      stripeView.state !== "disabled"
+        ? stripeView.state
+        : stripePresetEnabled
+          ? "configured"
+          : "disabled";
+    const stripeLiveSummary = stripePresetEnabled
+      ? "Outbound api.stripe.com:443 preset is enabled — manage keys, webhooks and readiness in Payment Setup."
+      : "Outbound api.stripe.com:443 preset is switched off — open Payment Setup or Outbound connections to enable Stripe.";
+
+    const sharepointVerified =
+      graphPresetEnabled &&
+      graphUploadPresetEnabled &&
+      sharepointCheck?.lastOutcome === "succeeded";
+    const sharepointState: ProviderState =
+      !graphPresetEnabled && !graphUploadPresetEnabled
+        ? "disabled"
+        : sharepointCheck?.lastOutcome === "failed"
+          ? "failing"
+          : graphPresetEnabled && graphUploadPresetEnabled
+            ? "configured"
+            : "degraded";
+    const sharepointSummary =
+      !graphPresetEnabled && !graphUploadPresetEnabled
+        ? "Microsoft 365 SharePoint & OneDrive sync is switched off until both Graph egress presets and an Entra Sites.Selected connection are configured."
+        : !graphPresetEnabled || !graphUploadPresetEnabled
+          ? `Enable both Microsoft Graph (${graphPresetEnabled ? "on" : "off"}) and SharePoint Upload Session (${graphUploadPresetEnabled ? "on" : "off"}) egress presets before syncing files.`
+          : sharepointVerified
+            ? "Graph + upload egress presets enabled and Entra Sites.Selected write check passed."
+            : sharepointCheck?.lastOutcome === "failed"
+              ? "The most recent Entra Sites.Selected check failed — verify site grant and re-test in Storage."
+              : "Graph + upload egress presets enabled — run the Entra Sites.Selected write check in Storage.";
 
     return [
       {
@@ -440,30 +486,30 @@ export function createIntegrationsModule(
       },
       {
         key: "stripe",
-        name: "Stripe Payment Webhooks",
-        state: stripeView.state,
+        name: "Stripe Payments",
+        state: stripeLiveState,
         verified: stripeView.verified,
-        scaffoldOnly: true,
+        scaffoldOnly: false,
         lastCheckedAt: stripeView.lastCheckedAt,
-        summary: stripeView.summary,
+        summary: stripeLiveSummary,
       },
       {
         key: "saml",
         name: "Enterprise SAML 2.0 SSO",
         state: samlView.state,
         verified: false,
-        scaffoldOnly: true,
+        scaffoldOnly: false,
         lastCheckedAt: null,
-        summary: samlView.releaseBanner,
+        summary: "Configure SAML 2.0 and Microsoft Entra single sign-on in Single Sign-On settings.",
       },
       {
         key: "sharepoint",
         name: "Microsoft 365 / SharePoint Sync",
-        state: sharepointView.state,
-        verified: false,
-        scaffoldOnly: true,
-        lastCheckedAt: null,
-        summary: sharepointView.summary,
+        state: sharepointState,
+        verified: sharepointVerified,
+        scaffoldOnly: false,
+        lastCheckedAt: sharepointCheck?.lastCheckedAt ?? null,
+        summary: sharepointSummary,
       },
     ];
   }

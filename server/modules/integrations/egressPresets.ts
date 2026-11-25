@@ -105,11 +105,11 @@ export const PRESET_CATALOG: readonly StaticPresetMeta[] = [
   },
   {
     key: "entra_oidc",
-    label: "Microsoft Entra ID Single Sign-On (OIDC)",
+    label: "Microsoft Entra ID Single Sign-On (OIDC & SAML Metadata)",
     purpose: "entra_oidc",
     parameterized: false,
     fixedHosts: ["login.microsoftonline.com"],
-    justification: "Preset: Microsoft Entra ID OIDC token and JWKS discovery endpoints",
+    justification: "Preset: Microsoft Entra ID OIDC token/JWKS and SAML 2.0 federation metadata endpoints",
     capabilities: ["integrations.manage", "identity.sso.manage"],
   },
   {
