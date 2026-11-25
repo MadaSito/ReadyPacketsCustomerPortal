@@ -16,6 +16,7 @@ const orderId = "01J00000000000000000000002";
 const questionId = "01J00000000000000000000003";
 const userId = "01J00000000000000000000005";
 const stageKey = "intake";
+const intakeProgress = { percent: 0, currentIndex: 0, canceled: false, total: 1, currentLabel: "Intake" };
 const date = new Date("2026-11-24T13:00:00Z");
 const title = "Where should our team look?";
 type Fixtures = Record<string, (input: unknown) => unknown>;
@@ -59,6 +60,7 @@ it("answers, edits a new version, restores focus, and never renders message text
   });
   const user = userEvent.setup();
   const question = await screen.findByRole("heading", { name: title });
+  expect(question).toHaveAttribute("data-question-id", questionId);
   await user.click(screen.getByRole("button", { name: "Answer question" }));
   const input = screen.getByRole("textbox", { name: /Your answer/ });
   expect(input).toHaveFocus();
@@ -134,7 +136,7 @@ it("records changes requested and requires a reason and confirmation before reop
     submittedAt: date.toISOString(), review: null, canReview: true, canReopen: true,
   };
   const { calls } = renderPhase(<OrderPhaseConsolePanel orderId={orderId} renderActions={() => <p>Phase actions slot</p>} />, {
-    "orders.stages.workspace": () => ({ orderId, version: 5, currentStageKey: stageKey, derived: false, stages: [intake] }),
+    "orders.stages.workspace": () => ({ orderId, version: 5, currentStageKey: stageKey, derived: false, progress: intakeProgress, stages: [intake] }),
     "orders.stages.review": () => ({ version: 6 }),
     "orders.stages.reopen": () => ({ version: 7, progressPercent: 0 }),
   });
@@ -170,7 +172,7 @@ it("records changes requested and requires a reason and confirmation before reop
 it("keeps a derived phase readable without creating new question, checklist, or run controls", async () => {
   renderPhase(<OrderPhaseConsolePanel orderId={orderId} renderActions={() => <p>Phase actions slot</p>} />, {
     "orders.stages.workspace": () => ({
-      orderId, version: 5, currentStageKey: stageKey, derived: true, stages: [{
+      orderId, version: 5, currentStageKey: stageKey, derived: true, progress: intakeProgress, stages: [{
         key: stageKey, staffLabel: "Legacy intake", customerLabel: "Intake", index: 0, state: "open",
         completed: false, locked: false, viewable: true, actions: { answerQuestions: false },
         submittedAt: null, review: null, canReview: false, canReopen: false,
@@ -184,6 +186,35 @@ it("keeps a derived phase readable without creating new question, checklist, or 
   expect(screen.queryByRole("heading", { name: "Administrator checklist" })).not.toBeInTheDocument();
 });
 
+it("shows staff phase steps without a second progress bar and keeps Select as the phase picker", async () => {
+  const base = {
+    completed: false, locked: false, viewable: true, actions: { answerQuestions: false },
+    submittedAt: null, review: null, canReview: false, canReopen: false,
+  };
+  renderPhase(<OrderPhaseConsolePanel orderId={orderId} renderActions={() => null} />, {
+    "orders.stages.workspace": () => ({
+      orderId, version: 5, currentStageKey: stageKey, derived: false,
+      progress: { percent: 33, currentIndex: 1, canceled: false, total: 3, currentLabel: "Intake review" },
+      stages: [
+        { ...base, key: "prep", staffLabel: "Staff preparation", customerLabel: "Preparation", index: 0, state: "accepted", completed: true },
+        { ...base, key: stageKey, staffLabel: "Intake review", customerLabel: "Intake", index: 1, state: "submitted", locked: true },
+        { ...base, key: "delivery", staffLabel: "Staff delivery", customerLabel: "Delivery", index: 2, state: "future" },
+      ],
+    }),
+  });
+  const stepper = await screen.findByRole("list", { name: "Order phases" });
+  const [done, current, future] = within(stepper).getAllByRole("listitem");
+  expect(done).toHaveTextContent(/Staff preparation.*completed/i);
+  expect(current).toHaveAttribute("aria-current", "step");
+  expect(current).toHaveTextContent(/Intake review.*Locked/i);
+  expect(future).toHaveTextContent(/Staff delivery.*not started/i);
+  expect(within(stepper).queryByRole("button")).not.toBeInTheDocument();
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  await userEvent.setup().selectOptions(screen.getByRole("combobox", { name: "Select a phase" }), "delivery");
+  expect(screen.getByRole("heading", { name: "Staff delivery" })).toBeInTheDocument();
+  expect(current).toHaveAttribute("aria-current", "step");
+});
+
 it("keeps the reviewed phase selected and focused when accepting advances the order", async () => {
   let accepted = false;
   const intake = {
@@ -193,7 +224,8 @@ it("keeps the reviewed phase selected and focused when accepting advances the or
   };
   renderPhase(<OrderPhaseConsolePanel orderId={orderId} renderActions={() => null} />, {
     "orders.stages.workspace": () => ({
-      orderId, version: accepted ? 6 : 5, currentStageKey: accepted ? "delivery" : stageKey, derived: false, stages: [
+      orderId, version: accepted ? 6 : 5, currentStageKey: accepted ? "delivery" : stageKey, derived: false,
+      progress: { ...intakeProgress, total: 2, currentIndex: accepted ? 1 : 0 }, stages: [
         { ...intake, state: accepted ? "accepted" : "submitted", completed: accepted, canReview: !accepted },
         { ...intake, key: "delivery", staffLabel: "Delivery", index: 1, state: accepted ? "open" : "future", canReview: false },
       ],

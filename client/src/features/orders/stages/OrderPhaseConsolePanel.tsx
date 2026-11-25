@@ -3,7 +3,7 @@ import { lazy, Suspense, useId, useRef, useState, type ComponentType, type FormE
 import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
-import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, Field, Select, Skeleton, Textarea, useStepUp, useToast } from "@/ui";
+import { Badge, Button, Callout, Card, Checkbox, DateTime, Dialog, Field, OrderProgress, Select, Skeleton, Textarea, useStepUp, useToast, type OrderProgressStage } from "@/ui";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
 import { AdminPhaseChecklist, StaffPhaseQuestions } from "./PhaseConsoleWork";
 
@@ -29,6 +29,16 @@ function stateLabel(phase: Phase) {
   if (phase.state === "in_review") return "In review";
   if (phase.state === "accepted" || phase.completed) return "Complete";
   return "Open";
+}
+
+function consoleSteps({ stages, currentStageKey }: Workspace): OrderProgressStage[] {
+  return stages.map((phase) => {
+    const current = phase.key === currentStageKey;
+    const state = current ? "current" : phase.completed ? "done" : phase.locked ? "locked" : "upcoming";
+    const detail = phase.state === "submitted" || phase.state === "in_review" || phase.state === "reopened" ? stateLabel(phase) : null;
+    const note = [detail, phase.locked && state !== "locked" ? "Locked" : null].filter(Boolean).join(" · ");
+    return { key: phase.key, label: phase.staffLabel ?? phase.customerLabel, state, ...(note ? { note } : {}) };
+  });
 }
 
 function PhaseDecisionDialog({ command, orderId, stageKey, expectedVersion, onClose, refresh, returnFocusRef }: {
@@ -198,6 +208,9 @@ export function OrderPhaseConsolePanel({ orderId, renderActions }: { orderId: st
       <Card title="Order phases" headingLevel={2}>
         {phase ? (
           <div className="min-w-0 space-y-5">
+            <OrderProgress variant="steps" percent={workspace.data.progress.percent}
+              currentIndex={workspace.data.progress.currentIndex} canceled={workspace.data.progress.canceled}
+              stages={consoleSteps(workspace.data)} />
             <Field label="Select a phase">
               <Select value={phase.key} onChange={(event) => setSelection(event.target.value)}
                 options={stages.map((stage) => ({
