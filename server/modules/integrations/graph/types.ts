@@ -83,6 +83,8 @@ export interface GraphApiErrorInit {
   retryable: boolean;
   /** `true` if the HTTPS request entered the wire stage (ambiguous for non-idempotent mutations like `sendMail`). */
   requestSent: boolean;
+  /** Bounded `Retry-After` delay in seconds parsed from `429` / `503` Graph or upload-session responses (`1..300`, else `null`). */
+  retryAfterSeconds?: number | null;
   aborted?: boolean;
 }
 
@@ -91,6 +93,7 @@ export class GraphApiError extends DomainError {
   readonly graphCode: string | null;
   readonly retryable: boolean;
   readonly requestSent: boolean;
+  readonly retryAfterSeconds: number | null;
   /** Alias matching `graphDriveGraph.ts` error-classifier inspection (`e.reason`). */
   readonly reason: string;
 
@@ -101,6 +104,7 @@ export class GraphApiError extends DomainError {
     this.graphCode = init.graphCode ?? null;
     this.retryable = init.retryable;
     this.requestSent = init.requestSent;
+    this.retryAfterSeconds = init.retryAfterSeconds ?? null;
     this.reason = init.reasonCode;
   }
 }
@@ -131,6 +135,7 @@ export interface GraphConfigView {
   clientSecretLast4: string | null;
   senderMailbox: string;
   egressPresetEnabled: boolean;
+  uploadEgressPresetEnabled?: boolean;
   egressReady: boolean;
   lastCheckedAt: Date | null;
   lastOutcome: "succeeded" | "failed" | "unknown" | null;
@@ -174,10 +179,48 @@ export interface GraphReadiness {
   summary: string;
 }
 
+export interface GraphSitesSelectedWriteCheckInput {
+  /** SharePoint site Graph ID (e.g. `contoso.sharepoint.com,guid,guid`) or HTTPS site URL. */
+  siteUrlOrId?: string;
+  /** Optional drive Graph ID; when omitted, resolves the site's default document library (`GET /sites/{id}/drive`). */
+  driveId?: string;
+  /** Optional relative probe folder inside the library (defaults to `.readypackets-probe`). */
+  probeFolderPath?: string;
+  /** Optional explicit credentials when verifying a scoped storage connection's Entra app rather than platform Graph config. */
+  credentials?: GraphCredentialsInput;
+}
+
+export interface GraphSitesSelectedWriteCheckResult {
+  outcome: "succeeded" | "failed";
+  reasonCode: string;
+  safeMessage: string;
+  graphEgressEnabled: boolean;
+  uploadEgressEnabled: boolean;
+  tokenAcquired: boolean;
+  readVerified: boolean;
+  writeVerified: boolean;
+  durationMs: number;
+  checkedAt: Date;
+}
+
+export interface GraphEntraRunbookView {
+  requiredApplicationPermission: "Sites.Selected";
+  discouragedBroadPermissions: readonly string[];
+  steps: readonly string[];
+  siteGrantEndpointTemplate: string;
+  siteGrantPayloadExample: string;
+  oneDriveNote: string;
+}
+
 export interface GraphAdminService {
   getReadiness(): Promise<GraphReadiness>;
   getConfig(): Promise<GraphConfigView>;
   updateConfig(principal: SessionPrincipal, input: UpdateGraphConfigInput): Promise<GraphConfigView>;
   testConnection(principal: SessionPrincipal): Promise<GraphConnectionTestResult>;
   sendTestMessage(principal: SessionPrincipal, input?: { toAddress?: string }): Promise<GraphMailTestResult>;
+  verifySitesSelectedWrite?(
+    principal: SessionPrincipal,
+    input?: GraphSitesSelectedWriteCheckInput,
+  ): Promise<GraphSitesSelectedWriteCheckResult>;
+  getEntraRunbook?(): GraphEntraRunbookView;
 }

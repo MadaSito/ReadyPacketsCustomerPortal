@@ -442,3 +442,50 @@ All `admin.*` queries require `adminProcedure`. Step-up mutations re-validate se
   - `integration_webhook_deliveries`
   - `integration_webhook_delivery_attempts`
   - `integration_production_dispatches.retry_of_public_id` (`varchar(26)` nullable) and `integration_production_dispatches.redelivery_of_public_id` (`varchar(26)` nullable, indexed via `idx_prod_dispatch_redelivery_of`)
+
+---
+
+## Increment 07 — Package K (Decision D7: Outbound Webhooks, Phase Triggers, Egress Presets & Microsoft Graph)
+
+### 1. `services.integrations.workflowWebhooks` (`WorkflowWebhooksService`, `server/modules/integrations/workflowWebhooks/types.ts`)
+
+- **`listOptions(input?: { kind?: "all" | "production" | "subscription" }, tx?: DbOrTx): Promise<WorkflowWebhookOptionView[]>`**
+  - Returns safe selector options (`targetKey` matching `STAGE_WEBHOOK_TARGET = /^(production:P[1-4]01|subscription:[0-9A-HJKMNP-TV-Z]{26})$/`, `kind`, `phase`, `subscriptionPublicId`, `label`, `configured`, `enabled`, `signingEnabled`, `portableRef`). Never returns URLs, hosts, or secrets.
+- **`listOptionsForActor(principal, input?)`** — capability-checked (`workflows.manage`, `automations.read`, `orders.stage.run`, `integrations.manage`, or `webhooks.manage`).
+- **`validateTargetKey(targetKey: string | null | undefined, tx?: DbOrTx): Promise<WorkflowWebhookValidationResult>`**
+  - Called by `orders` at workflow draft save/publish and by `automations` on rule save (`webhook.enqueue_subscription`).
+  - Blank/`null` returns `{ valid: true, normalizedKey: null, kind: null, exists: true, configured: true, enabled: true, reasonCode: null, message: null, portableRef: null }`.
+  - Validates format (`STAGE_WEBHOOK_TARGET`), subscription existence, and endpoint configuration status.
+- **`resolvePortableTargetRef(portableRef, tx?)`** — maps portable logical keys (`"production:P101"`..`"production:P401"` or subscription name) back to local `targetKey` on workflow import.
+- **`enqueueStageWebhook(input: EnqueueStageWebhookInput, tx?: Tx): Promise<EnqueueStageWebhookResult>`**
+  - Supports both `production:P101..P401` and `subscription:<publicId>` for stage bundles (`triggerSource: "stage_bundle"`), lifecycle auto-queue (`"lifecycle_payment_confirmed"` | `"lifecycle_phase1_locked"`), and automation rule actions (`"automation_rule"`).
+  - Enforces delivered `P101` + Phase 1 lock on `P201` across **all** trigger paths.
+  - Returns `{ outcome: "queued" | "already_queued_or_delivered" | "refused_precondition" | "disabled", kind, deliveryPublicId, dispatchPublicId, reasonCode, message }`. Unmet preconditions never throw to roll back customer payment or stage submission.
+- **Lifecycle auto-queue (opt-in per workflow, off by default)**:
+  - `listLifecycleAutoQueuePolicies`, `getLifecycleAutoQueuePolicy(workflowKey)`, `setLifecycleAutoQueuePolicy(principal, { workflowKey, p101OnPaymentConfirmed, p201OnPhase1Locked })` (audited via `integration.production.workflow_auto_queue_updated`).
+  - When enabled for an order's workflow, `AuditTap` enqueues `P101` in-tx when `order.payment_state.changed` transitions to `"paid"` and `P201` in-tx when `order.stage.submitted` locks Phase 1 intake.
+
+### 2. tRPC Additions & Updates (`trpc.integrations.*`)
+
+- **`workflowWebhooks.listOptions`** (`query`, protected: `workflows.manage` | `automations.read` | `orders.stage.run` | `integrations.manage` | `webhooks.manage`) -> `WorkflowWebhookOptionView[]` (consumed by `PhaseWebhookSlot` and automation rule editor).
+- **`production.workflowAutoQueue.list` / `production.workflowAutoQueue.set`** (`integrations.manage` or `workflows.manage`) -> per-workflow opt-in switches for `P101` on payment confirmed and `P201` on Phase 1 lock.
+- **`production.rotateSigningSecret` / `production.setSigningEnabled`** (`integrations.manage` step-up) -> optional `whsec_...` HMAC-SHA256 signing (`X-ReadyPackets-Signature: t=<unix>,v1=<hex>`) with overlap rotation; folded into `destinationFingerprint`.
+- **`production.stopDispatch`** (`orders.production.trigger` or `integrations.manage`) -> halts `queued` / `retrying` dispatch (`state = "stopped"`, cancels `job_runs` under job fence). Stopped dispatches are retryable via `production.retryDispatch`.
+- **`admin.webhooks.subscriptions.create` / `update`** -> adds optional `signingEnabled?: boolean` (default `true`; when `false`, omits `X-ReadyPackets-Signature`).
+- **`admin.webhooks.deliveries.list`** -> adds `orderPublicId?: string` filter.
+- **`admin.webhooks.deliveries.stop`** (`webhooks.manage` or `api.replay`) -> halts `queued` / `retrying` outbound delivery (`status = "stopped"`, cancels `job_runs`).
+- **`admin.webhooks.deliveries.retry`** (`webhooks.manage` or `api.replay`, `expensive` rate limit) -> retries an eligible `failed` / `dead` / `stopped` outbound delivery along the **same** delivery record (`manualRetryCount + 1`, no `X-ReadyPackets-Replay`), distinct from `redeliver` (`api.replay` step-up, new replay record with `X-ReadyPackets-Replay: 1`).
+- **`admin.egress.presets` / `admin.egress.setPreset`** -> existing preset query & mutation (`presetKey: "stripe" | "microsoft_graph" | "microsoft_graph_upload" | ...`, `stepUpRequiredIf(enabled === true)`), surfaced as visible one-click switches on `/admin/integrations/egress` and reusable by `/admin/payments/setup` (`payments.manage`) and `/admin/storage` (`storage.manage`).
+- **`admin.graph.verifySitesSelectedWrite` / `admin.graph.entraRunbook`** (`integrations.manage` or `storage.manage`, step-up on write check) -> verifies both Graph egress presets (`microsoft_graph` + `microsoft_graph_upload`), token acquisition, site/drive `GET`, and non-destructive `createUploadSession` + immediate `DELETE` cancel (`Sites.Selected` `write` verification without marker files).
+
+### 3. Client Slot Export (`client/src/features/integrations/phaseSlots.tsx`)
+
+- `export function PhaseWebhookSlot(props: PhaseSlotProps<string | null>): JSX.Element` — renders labelled `"Webhook trigger"` selector backed by `trpc.integrations.workflowWebhooks.listOptions` without URLs or secrets.
+
+### 4. Additive Increment 07 Schema & Audit Events
+
+- **`integration_production_dispatches`**: `trigger_source` (`varchar(32) not null default 'manual'`), `stage_key` (`varchar(64)`), `stopped_at` (`datetime(3)`), `stopped_by_user_id` (`bigint unsigned`), `stopped_by_public_id` (`varchar(26)`), `stop_reason` (`varchar(280)`).
+- **`integration_webhook_subscriptions`**: `signing_enabled` (`boolean not null default true`).
+- **`integration_webhook_deliveries`**: `order_public_id` (`varchar(26)`), `stage_key` (`varchar(64)`), `manual_retry_count` (`int unsigned not null default 0`), `stopped_at` (`datetime(3)`), `stopped_by_user_id` (`bigint unsigned`), `stopped_by_public_id` (`varchar(26)`), `stop_reason` (`varchar(280)`), index `idx_webhook_delivery_order_created (order_public_id, created_at, id)`.
+- **New audit events**: `integration.production.signing_updated`, `integration.production.signing_secret_rotated`, `integration.production.workflow_auto_queue_updated`, `integration.production.dispatch.stopped`, `integration.production.dispatch.refused`, `integration.webhook.delivery_stopped`, `integration.webhook.delivery_retried`, `integration.graph.sites_selected_checked`.
+

@@ -153,6 +153,20 @@ import {
   type WebhooksService,
   type WebhooksSettingsView,
 } from "./webhooks/index.js";
+import {
+  STAGE_WEBHOOK_TRIGGER_SOURCES,
+  WORKFLOW_WEBHOOK_KINDS,
+  type EnqueueStageWebhookInput,
+  type EnqueueStageWebhookOutcome,
+  type EnqueueStageWebhookResult,
+  type ListWorkflowWebhookOptionsInput,
+  type StageWebhookTriggerSource,
+  type WorkflowLifecycleAutoQueuePolicy,
+  type WorkflowWebhookOptionView,
+  type WorkflowWebhooksService,
+  type WorkflowWebhookTargetKind,
+  type WorkflowWebhookValidationResult,
+} from "./workflowWebhooks/types.js";
 
 // Ensure all `integrations.*` settings/secrets/flags register on module import.
 import "./settings.js";
@@ -181,7 +195,19 @@ export {
   WEBHOOK_MAX_ATTEMPTS,
   WEBHOOK_PURGE_JOB,
   WEBHOOK_SUBSCRIPTION_STATUSES,
+  WORKFLOW_WEBHOOK_KINDS,
+  STAGE_WEBHOOK_TRIGGER_SOURCES,
   type AdminAnalyticsConfig,
+  type EnqueueStageWebhookInput,
+  type EnqueueStageWebhookOutcome,
+  type EnqueueStageWebhookResult,
+  type ListWorkflowWebhookOptionsInput,
+  type StageWebhookTriggerSource,
+  type WorkflowLifecycleAutoQueuePolicy,
+  type WorkflowWebhookOptionView,
+  type WorkflowWebhooksService,
+  type WorkflowWebhookTargetKind,
+  type WorkflowWebhookValidationResult,
   type AnalyticsCspPolicy,
   type AnalyticsService,
   type ControlledResendReason,
@@ -323,6 +349,7 @@ export interface IntegrationsModule extends Omit<ModuleLifecycle, "health"> {
   scaffolds: ScaffoldsService;
   production: ProductionWebhookService;
   webhooks: WebhooksService;
+  workflowWebhooks?: WorkflowWebhooksService;
   /** Convenience hook consumed by `server/http` CSP middleware (`services.integrations.analyticsCsp(pathname)`). */
   analyticsCsp(pathname: string): Promise<AnalyticsCspPolicy | null>;
 }
