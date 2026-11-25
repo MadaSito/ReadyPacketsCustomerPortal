@@ -4,6 +4,8 @@ import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import type { ReactElement } from "react";
 import superjson from "superjson";
 import { describe, expect, it } from "vitest";
+import { fireEvent, within } from "@testing-library/react";
+import { pageA11y } from "@/test/a11y";
 import type { AppRouter } from "@server/trpc/root";
 import type { MeResult } from "@/lib/authApi";
 import { TRPCProvider } from "@/lib/trpc";
@@ -45,6 +47,31 @@ const adminView = {
   trustEntraMfa: false, jitMode: "off", jitStaffAppRole: null, jitDailyLimit: 25,
   redirectUri: "https://portal.example.test/api/identity/sso/callback", version: 2, complete: true,
   availableInThisDeployment: true, linkedAccounts: 0, breakGlass: { localMfaAdministrators: 1, soleLocalMfaAdministratorHasPasskey: false },
+  protocol: "oidc", entraMfaMode: "portal", acceptedAuthnContexts: [], allowedRoles: ["admin", "staff"],
+  saml: {
+    entityId: "https://portal.example.test/api/identity/saml/metadata", entityIdIsDefault: true,
+    acsUrl: "https://portal.example.test/api/identity/saml/acs", signOnUrl: "https://portal.example.test/api/identity/saml/start",
+    metadataUrl: "https://portal.example.test/api/identity/saml/metadata", idpIssuer: "https://sts.windows.net/11111111-2222-3333-4444-555555555555/",
+    requiredClaims: [
+      "http://schemas.microsoft.com/identity/claims/objectidentifier", "http://schemas.microsoft.com/identity/claims/tenantid",
+      "http://schemas.microsoft.com/claims/authnmethodsreferences",
+    ],
+    metadataSourceUrl: null, metadataRefreshedAt: null, metadataStatus: null, certificates: [] as unknown[],
+  },
+  roleMappings: [] as unknown[],
+};
+
+const samlView = {
+  ...adminView,
+  protocol: "saml", entraMfaMode: "claim", jitMode: "staff", jitStaffAppRole: "Portal.Staff",
+  saml: {
+    ...adminView.saml,
+    certificates: [{
+      id: "01JD0000000000000000000009", fingerprintSha256: "AB".repeat(32), subject: "CN=Microsoft Azure Federated SSO Certificate",
+      notBefore: new Date("2026-01-01T00:00:00Z"), notAfter: new Date("2029-01-01T00:00:00Z"), source: "metadata", state: "trusted", daysLeft: 800,
+    }],
+  },
+  roleMappings: [{ appRoleValue: "Portal.Customer", role: "customer" }],
 };
 
 describe("SSO sign-in button", () => {
@@ -100,4 +127,51 @@ describe("SSO admin page", () => {
     expect(screen.getAllByText(/break-glass|local administrator/i).length).toBeGreaterThan(0);
     await expectNoAxeViolations();
   });
+});
+
+describe("SSO admin page — SAML (increment 07)", () => {
+  it("shows the Entra values to copy, required claims, certificates and mappings", async () => {
+    renderPage(<SsoAdminPage />, { "identity.admin.sso.get": () => samlView }, "/admin/sso");
+    expect(await screen.findByRole("heading", { level: 1, name: "Single sign-on" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Reply URL (Assertion Consumer Service URL)")).toHaveValue(samlView.saml.acsUrl);
+    expect(screen.getByLabelText("Identifier (Entity ID)", { selector: "[readonly]" })).toHaveValue(samlView.saml.entityId);
+    expect(screen.getByLabelText("Sign on URL")).toHaveValue(samlView.saml.signOnUrl);
+    expect(screen.getByText(/Object ID \(objectidentifier\)/)).toBeInTheDocument();
+    const certs = screen.getByRole("list", { name: "Certificates" });
+    expect(within(certs).getByText("Trusted")).toBeInTheDocument();
+    expect(within(certs).getByRole("button", { name: "Retire" })).toBeInTheDocument();
+    expect(screen.getByLabelText("App role value 1")).toHaveValue("Portal.Customer");
+    // OIDC-only fields are hidden for SAML.
+    expect(screen.queryByLabelText(/Application \(client\) ID/)).not.toBeInTheDocument();
+    expect(screen.queryByText(samlView.redirectUri)).not.toBeInTheDocument();
+  });
+
+  it("asks for the typed confirmation before letting Entra manage MFA", async () => {
+    renderPage(<SsoAdminPage />, { "identity.admin.sso.get": () => samlView }, "/admin/sso");
+    fireEvent.click(await screen.findByRole("radio", { name: /Microsoft Entra ID manages MFA/ }));
+    expect(screen.getByText("Recommended: require MFA in Entra ID")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText(/Let Microsoft Entra ID manage MFA/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Confirm" })).toBeDisabled();
+  });
+
+  it("offers allowed roles as checkboxes", async () => {
+    renderPage(<SsoAdminPage />, { "identity.admin.sso.get": () => samlView }, "/admin/sso");
+    expect(await screen.findByRole("checkbox", { name: "Administrators" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Staff" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Customers" })).not.toBeChecked();
+  });
+});
+
+pageA11y("SSO admin page (OpenID Connect)", async () => {
+  renderPage(<main><SsoAdminPage /></main>, { "identity.admin.sso.get": () => adminView }, "/admin/sso");
+  expect(await screen.findByLabelText(/Directory \(tenant\) ID/)).toBeInTheDocument();
+  document.title = "Single sign-on · ReadyPackets";
+});
+
+pageA11y("SSO admin page (SAML)", async () => {
+  renderPage(<main><SsoAdminPage /></main>, { "identity.admin.sso.get": () => samlView }, "/admin/sso");
+  expect(await screen.findByRole("list", { name: "Certificates" })).toBeInTheDocument();
+  document.title = "Single sign-on · ReadyPackets";
 });

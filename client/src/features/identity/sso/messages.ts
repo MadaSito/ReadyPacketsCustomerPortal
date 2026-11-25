@@ -16,6 +16,7 @@ export const SSO_REFUSAL_MESSAGES: Record<string, { title: string; body: string 
   SSO_WRONG_ACCOUNT: { title: "A different Microsoft account was used", body: "Sign in to Microsoft with the account linked to this portal account." },
   SSO_MAINTENANCE: { title: "Customer sign-in is paused for maintenance", body: "We are carrying out planned maintenance. Please try again later." },
   SSO_RESTRICTED: { title: "Sign-in is not allowed from here", body: "Your organization limits where you can sign in from. Contact your administrator if you need access." },
+  SSO_ROLE_NOT_ALLOWED: { title: "Single sign-on is not offered for your account", body: "Sign in with your e-mail address and password instead." },
   SSO_IDENTITY_IN_USE: { title: "This Microsoft account is linked elsewhere", body: "It is already linked to a different portal account." },
 };
 

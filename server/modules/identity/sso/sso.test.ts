@@ -16,7 +16,7 @@ import { createTestDeps, type TestHarness } from "../../../../tests/helpers/fake
 import { createTestDb, type TestDb } from "../../../../tests/helpers/testDb.js";
 import { createEntraAssurance } from "../../assurance/entra.js";
 import { createIdentityModule, type IdentityModule } from "../index.js";
-import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, users, userSessions } from "../schema.js";
+import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, ssoAuthRequests, ssoConfiguration, ssoIdentities, ssoRoleMappings, ssoSamlCertificates, users, userSessions } from "../schema.js";
 import { authorizationUrl, entraEndpoints, OidcValidationError, peekKeyId, verifyIdToken } from "./oidc.js";
 import { createFakeEntra, type FakeEntra, type FakeEntraIdentity } from "./testing.js";
 import type { SsoConfigInput } from "./service.js";
@@ -89,7 +89,8 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
 
   const baseConfig = (patch: Partial<SsoConfigInput> = {}): SsoConfigInput => ({
     expectedVersion: 1, tenantId: TENANT, clientId: CLIENT, clientSecret: SECRET, buttonLabel: null, allowedDomains: [],
-    trustEntraMfa: true, jitMode: "off", jitStaffAppRole: null, jitDailyLimit: 25, ...patch,
+    jitMode: "off", jitStaffAppRole: null, jitDailyLimit: 25,
+    protocol: "oidc", samlEntityId: null, entraMfaMode: "claim", acceptedAuthnContexts: [], allowedRoles: ["admin", "staff", "customer"], ...patch,
   });
 
   async function configure(patch: Partial<SsoConfigInput> = {}, enable = true) {
@@ -130,7 +131,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     db.db.select().from(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.authMethod, "entra"), isNull(userSessions.revokedAt)));
 
   beforeAll(async () => {
-    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests } });
+    db = await createTestDb({ schema: { users, userSessions, identityTokens, customerRefReservations, customerRefHistory, signInEvents, sessionRestrictions, ssoConfiguration, ssoIdentities, ssoAuthRequests, ssoSamlCertificates, ssoRoleMappings } });
   });
   afterAll(async () => db?.cleanup());
   beforeEach(async () => build());
@@ -192,7 +193,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
     });
 
     it("without Entra MFA trust, an Entra session still needs local MFA", async () => {
-      await configure({ trustEntraMfa: false });
+      await configure({ entraMfaMode: "portal" });
       const user = await makeUser({ mfa: false });
       const id = oid();
       await bind(user.publicId, id);
@@ -481,7 +482,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       const view = await configure();
       const { user, run } = await prepared();
       const gate = gateAudit("identity.sso.config_updated");
-      const change = sso().updateConfig(admin, { ...baseConfig({ trustEntraMfa: false }), clientSecret: undefined, expectedVersion: view.version });
+      const change = sso().updateConfig(admin, { ...baseConfig({ entraMfaMode: "portal" }), clientSecret: undefined, expectedVersion: view.version });
       await gate.arrived; // updateConfig holds the configuration lock
       const completion = run.finish();
       await new Promise((resolve) => setTimeout(resolve, 150));
@@ -500,7 +501,7 @@ describe("Entra ID single sign-on (MySQL, fake IdP)", () => {
       const gate = gateAudit("auth.login.succeeded");
       const completion = run.finish();
       await gate.arrived; // completion holds the configuration lock
-      const change = sso().updateConfig(admin, { ...baseConfig({ trustEntraMfa: false }), clientSecret: undefined, expectedVersion: view.version });
+      const change = sso().updateConfig(admin, { ...baseConfig({ entraMfaMode: "portal" }), clientSecret: undefined, expectedVersion: view.version });
       await new Promise((resolve) => setTimeout(resolve, 150));
       gate.release();
       await completion;
