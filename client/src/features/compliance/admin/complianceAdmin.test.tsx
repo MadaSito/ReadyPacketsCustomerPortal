@@ -12,6 +12,7 @@ import InvoiceDetailPage from "./InvoiceDetailPage";
 import InvoicesAdminPage from "./InvoicesAdminPage";
 import PoliciesAdminPage from "./PoliciesAdminPage";
 import PolicyDetailPage from "./PolicyDetailPage";
+import { AdminReceiptDetailPage } from "../receipts/ReceiptViews";
 import { OrderInvoicesTab } from "../customer/InvoicePages";
 import { acceptanceCounts, blankField, draftsToFields, type FieldDraft, type PolicyAcceptance } from "./model";
 
@@ -720,5 +721,143 @@ describe("invoices", () => {
         },
       }),
     );
+  });
+
+  it("displays Order and Project across admin invoice list, admin invoice detail, admin receipt detail, and default logo option", async () => {
+    const user = userEvent.setup();
+    const RECEIPT = "01JTEST0000000000000000099";
+    const projectTitle = "Boreal Cloud — Series B Due Diligence Packet";
+    handlers.set("compliance.invoices.admin.list", () => ({
+      items: [{ ...summary, orderReference: "RP-2026-004400", projectName: projectTitle }],
+      nextCursor: null,
+    }));
+    handlers.set("compliance.invoices.admin.companyProfile.get", () => ({
+      issuerName: "Ready Packets Consulting LLC",
+      issuerAddress: "100 Harbor Way",
+      issuerContact: "billing@example.test",
+      issuerTaxId: "EIN 98-7654321",
+      issuerLogo: {
+        mode: "brand" as const,
+        brandPath: "/brand/readypackets-approved-header-icon-light.png" as const,
+      },
+      paymentInstructions: "Pay by wire within 30 days.",
+    }));
+    handlers.set("compliance.invoices.get", () => ({
+      ...detail,
+      orderReference: "RP-2026-004400",
+      projectName: projectTitle,
+    }));
+    handlers.set("compliance.receipts.get", () => ({
+      receiptPublicId: RECEIPT,
+      receiptNumber: "RPR-2026-000099",
+      settlementKind: "provider_online",
+      invoicePublicId: INV,
+      paymentPublicId: PAY,
+      orderPublicId: ORDER,
+      orderReference: "RP-2026-004400",
+      projectName: projectTitle,
+      customerRef: "CUST-44",
+      currency: "USD",
+      subtotalMinor: 5000,
+      discountMinor: 0,
+      bundleDiscountMinor: 0,
+      promoDiscountMinor: 0,
+      promoLabel: null,
+      taxMinor: 0,
+      amountWaivedMinor: 0,
+      amountPaidMinor: 5000,
+      refundedMinor: 0,
+      refundState: "none",
+      paymentMethod: "provider_online",
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+      paymentMethodSummary: "Visa ending in 4242",
+      provider: "stripe",
+      issuedAt: now,
+      emailedAt: now,
+      lastResentAt: null,
+      resendCount: 0,
+      canResend: true,
+      origin: "portal",
+      refundNotes: [],
+      snapshot: {
+        schemaVersion: 1,
+        receiptPublicId: RECEIPT,
+        receiptNumber: "RPR-2026-000099",
+        settlementKind: "provider_online",
+        issuedAt: now.toISOString(),
+        orderPublicId: ORDER,
+        orderReference: "RP-2026-004400",
+        projectName: projectTitle,
+        invoicePublicId: INV,
+        invoiceNumber: "INV-2026-0001",
+        paymentPublicId: PAY,
+        company: {
+          legalName: "Ready Packets Consulting LLC",
+          address: "100 Harbor Way",
+          contact: "billing@example.test",
+          taxId: "EIN 98-7654321",
+          logoMode: "brand",
+          logoBrandPath: "/brand/readypackets-approved-header-icon-light.png",
+        },
+        customer: {
+          name: "Synthetic Buyer",
+          email: "buyer@example.test",
+          customerRef: "CUST-44",
+        },
+        currency: "USD",
+        lines: [
+          { position: 1, description: "Packet review", quantity: 1, unitAmountMinor: 5000, lineTotalMinor: 5000 },
+        ],
+        subtotalMinor: 5000,
+        discountMinor: 0,
+        bundleDiscountMinor: 0,
+        discountLabel: null,
+        promoDiscountMinor: 0,
+        promoLabel: null,
+        taxMinor: 0,
+        invoiceTotalMinor: 5000,
+        amountWaivedMinor: 0,
+        amountPaidMinor: 5000,
+        paymentMethod: "provider_online",
+        paymentMethodBrand: "visa",
+        paymentMethodLast4: "4242",
+        provider: "stripe",
+        paymentReference: "pi_4400",
+        footerText: "",
+      },
+    }));
+
+    const adminListView = renderUi(<InvoicesAdminPage />, { path: "/admin/invoices" });
+    expect((await screen.findAllByText("RP-2026-004400")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
+    await user.click(screen.getByRole("button", { name: "Company profile" }));
+    const profileDialog = await screen.findByRole("dialog", { name: "Company billing profile" });
+    const logoSelect = await within(profileDialog).findByLabelText(/^PDF header logo/);
+    expect(logoSelect).toHaveValue("brand");
+    const assetSelect = await within(profileDialog).findByLabelText(/^Brand logo asset/);
+    expect(assetSelect).toHaveValue("/brand/readypackets-approved-header-icon-light.png");
+    await expectNoAxeViolations(profileDialog);
+    adminListView.unmount();
+
+    const adminInvDetail = pageByPath(`/admin/invoices/${INV}`, <InvoiceDetailPage />, "/admin/invoices/:invoiceId");
+    expect(await screen.findByRole("heading", { name: "Order & project" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "RP-2026-004400" })).toHaveAttribute(
+      "href",
+      `/admin/orders/${ORDER}`,
+    );
+    expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
+    await expectNoAxeViolations(adminInvDetail.container);
+    adminInvDetail.unmount();
+
+    const adminRcptDetail = pageByPath(`/admin/receipts/${RECEIPT}`, <AdminReceiptDetailPage />, "/admin/receipts/:receiptId");
+    expect(await screen.findByRole("heading", { name: "Order & project" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "RP-2026-004400" })).toHaveAttribute(
+      "href",
+      `/admin/orders/${ORDER}`,
+    );
+    expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
+    await expectNoAxeViolations(adminRcptDetail.container);
+    adminRcptDetail.unmount();
   });
 });

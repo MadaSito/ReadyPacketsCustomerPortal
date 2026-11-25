@@ -887,7 +887,10 @@ describe("Increment 06 — D5 small totals, D15 payment receipts & refund notes,
 
     const lastMail = h.t.mailer.last("payment_receipt");
     expect(lastMail).toBeDefined();
-    expect(lastMail?.vars).toEqual({ receiptNumber: onlineReceipt.receiptNumber });
+    expect(lastMail?.vars).toMatchObject({
+      receiptNumber: onlineReceipt.receiptNumber,
+      orderReference: ordOnline.reference,
+    });
     expect(lastMail?.attachments?.[0]?.filename).toBe(`${onlineReceipt.receiptNumber}.pdf`);
 
     // Download original PDF and capture SHA-256 to prove immutability across refunds

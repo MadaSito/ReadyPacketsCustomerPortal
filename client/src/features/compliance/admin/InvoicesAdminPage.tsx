@@ -95,7 +95,17 @@ export default function InvoicesAdminPage() {
                 </Link>
               ),
             },
-            { key: "order", header: "Order", cell: (row) => <span className="break-all">{row.orderReference}</span> },
+            { key: "order", header: "Order", cell: (row) => <span className="font-mono break-all">{row.orderReference}</span> },
+            {
+              key: "project",
+              header: "Project",
+              cell: (row) =>
+                row.projectName?.trim() ? (
+                  <span className="break-words">{row.projectName.trim()}</span>
+                ) : (
+                  <span className="text-muted">—</span>
+                ),
+            },
             { key: "status", header: "Status", cell: (row) => <InvoiceStatusBadge status={row.status} /> },
             { key: "total", header: "Total", align: "end", cell: (row) => <Money value={money(row.totalMinor, row.currency)} /> },
             { key: "balance", header: "Balance due", align: "end", cell: (row) => <Money value={money(row.balanceDueMinor, row.currency)} /> },

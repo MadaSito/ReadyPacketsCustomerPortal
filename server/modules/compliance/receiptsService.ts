@@ -90,6 +90,7 @@ export interface ReceiptSummaryView {
   paymentPublicId: string | null;
   orderPublicId: string;
   orderReference: string;
+  projectName?: string | null;
   customerRef: string | null;
   currency: string;
   subtotalMinor: number;
@@ -305,6 +306,49 @@ export function createReceiptsService(deps: ModuleDeps) {
     return { name, email, customerRef: row.customerRef ?? null };
   }
 
+  async function resolveProjectNamesByOrderIds(
+    dbOrTx: DbOrTx,
+    orderIds: readonly number[],
+  ): Promise<Map<number, string>> {
+    const out = new Map<number, string>();
+    const uniqueIds = [...new Set(orderIds.filter((id) => Number.isInteger(id) && id > 0))];
+    if (uniqueIds.length === 0) return out;
+
+    try {
+      const ordRows = await dbOrTx
+        .select({
+          id: orders.id,
+          projectName: orders.projectName,
+        })
+        .from(orders)
+        .where(inArray(orders.id, uniqueIds));
+      for (const row of ordRows) {
+        const trimmed = row.projectName?.trim();
+        if (trimmed) out.set(row.id, trimmed);
+      }
+    } catch {
+      // Standalone compliance unit tests may mock orders service without populating `orders` rows.
+    }
+
+    const ordersSvc = (deps.services as Partial<typeof deps.services>).orders;
+    if (ordersSvc && typeof ordersSvc.getOrderRefById === "function") {
+      for (const orderId of uniqueIds) {
+        if (out.has(orderId)) continue;
+        const ref = await ordersSvc.getOrderRefById(
+          orderId,
+          dbOrTx !== deps.db ? (dbOrTx as Tx) : undefined,
+        );
+        const candidateName =
+          ref && typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+        if (candidateName) {
+          out.set(orderId, candidateName);
+        }
+      }
+    }
+
+    return out;
+  }
+
   async function readOrderDiscountContextInTx(
     tx: Tx,
     orderId: number,
@@ -313,6 +357,7 @@ export function createReceiptsService(deps: ModuleDeps) {
   ): Promise<{
     ownerUserId: number;
     orderReference: string;
+    projectName: string | null;
     bundleDiscountMinor: number;
     discountLabel: string | null;
     promoDiscountMinor: number;
@@ -320,6 +365,7 @@ export function createReceiptsService(deps: ModuleDeps) {
   }> {
     let ownerUserId = 0;
     let orderReference = fallbackOrderPublicId;
+    let projectName: string | null = null;
     let orderDiscountMinor = 0;
     let orderPromoMinor = 0;
     let orderDiscountLabel: string | null = null;
@@ -331,6 +377,9 @@ export function createReceiptsService(deps: ModuleDeps) {
       if (ref) {
         ownerUserId = ref.ownerUserId;
         orderReference = ref.reference;
+        const refName =
+          typeof (ref as { name?: unknown }).name === "string" ? ref.name.trim() : "";
+        if (refName) projectName = refName;
       }
     }
 
@@ -339,6 +388,7 @@ export function createReceiptsService(deps: ModuleDeps) {
         .select({
           ownerUserId: orders.ownerUserId,
           reference: orders.reference,
+          projectName: orders.projectName,
           discountMinor: orders.discountMinor,
           discountLabel: orders.discountLabel,
           promoDiscountMinor: orders.promoDiscountMinor,
@@ -350,6 +400,9 @@ export function createReceiptsService(deps: ModuleDeps) {
       if (ord) {
         if (!ownerUserId) ownerUserId = ord.ownerUserId;
         orderReference = ord.reference || orderReference;
+        if (ord.projectName?.trim()) {
+          projectName = ord.projectName.trim();
+        }
         orderDiscountMinor = Math.max(0, ord.discountMinor ?? 0);
         orderPromoMinor = Math.max(0, ord.promoDiscountMinor ?? 0);
         orderDiscountLabel = ord.discountLabel ?? null;
@@ -383,6 +436,7 @@ export function createReceiptsService(deps: ModuleDeps) {
     return {
       ownerUserId,
       orderReference,
+      projectName,
       bundleDiscountMinor,
       discountLabel,
       promoDiscountMinor,
@@ -477,6 +531,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       paymentPublicId: pmt.publicId,
       orderPublicId: inv.orderPublicId,
       orderReference: orderCtx.orderReference,
+      projectName: orderCtx.projectName,
       company: {
         legalName: inv.issuerNameSnapshot || company.legalName,
         address: inv.issuerAddressSnapshot ?? company.address,
@@ -591,6 +646,8 @@ export function createReceiptsService(deps: ModuleDeps) {
           receiptPublicId,
           recipientUserId: orderCtx.ownerUserId,
           receiptNumber,
+          orderReference: orderCtx.orderReference,
+          ...(orderCtx.projectName ? { projectName: orderCtx.projectName } : {}),
           pdf: pdfBuffer,
         },
         tx,
@@ -676,6 +733,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       paymentPublicId: null,
       orderPublicId: inv.orderPublicId,
       orderReference: orderCtx.orderReference,
+      projectName: orderCtx.projectName,
       company: {
         legalName: inv.issuerNameSnapshot || company.legalName,
         address: inv.issuerAddressSnapshot ?? company.address,
@@ -788,6 +846,8 @@ export function createReceiptsService(deps: ModuleDeps) {
           receiptPublicId,
           recipientUserId: orderCtx.ownerUserId,
           receiptNumber,
+          orderReference: orderCtx.orderReference,
+          ...(orderCtx.projectName ? { projectName: orderCtx.projectName } : {}),
           pdf: pdfBuffer,
         },
         tx,
@@ -867,10 +927,26 @@ export function createReceiptsService(deps: ModuleDeps) {
       .where(eq(complianceInvoices.id, receipt.invoiceId))
       .limit(1);
 
-    const [company, customer] = await Promise.all([
+    const [company, customer, projectByOrder] = await Promise.all([
       readCompanyProfileInTx(tx),
       readCustomerSnapshotInTx(tx, receipt.customerUserId),
+      resolveProjectNamesByOrderIds(tx, [receipt.orderId]),
     ]);
+
+    let receiptProjectName: string | null = null;
+    try {
+      const parsedOrig = JSON.parse(
+        deps.crypto.decrypt(receipt.snapshotEnc, receiptSnapshotAad(receipt.publicId)),
+      ) as Partial<ReceiptSnapshot>;
+      if (typeof parsedOrig.projectName === "string" && parsedOrig.projectName.trim()) {
+        receiptProjectName = parsedOrig.projectName.trim();
+      }
+    } catch {
+      // Preserve refund note issuance even if legacy snapshot omits projectName.
+    }
+    if (!receiptProjectName) {
+      receiptProjectName = projectByOrder.get(receipt.orderId) ?? null;
+    }
 
     const issuedAt = refundRow.refundedAt ?? now;
     const sequenceNumber = await allocateYearlySequenceInTx(tx, "refund_note", issuedAt);
@@ -889,6 +965,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       refundPublicId: refundRow.publicId,
       orderPublicId: receipt.orderPublicId,
       orderReference: receipt.orderReference,
+      projectName: receiptProjectName,
       company,
       customer,
       currency: receipt.currency,
@@ -980,6 +1057,7 @@ export function createReceiptsService(deps: ModuleDeps) {
   function toSummaryView(
     row: typeof compliancePaymentReceipts.$inferSelect,
     notes: RefundNoteSummaryView[],
+    projectName: string | null = null,
   ): ReceiptSummaryView {
     return {
       receiptPublicId: row.publicId,
@@ -989,6 +1067,7 @@ export function createReceiptsService(deps: ModuleDeps) {
       paymentPublicId: row.paymentPublicId ?? null,
       orderPublicId: row.orderPublicId,
       orderReference: row.orderReference,
+      projectName,
       customerRef: row.customerRefSnapshot ?? null,
       currency: row.currency,
       subtotalMinor: row.subtotalMinor,
@@ -1021,9 +1100,10 @@ export function createReceiptsService(deps: ModuleDeps) {
   function toAdminSummaryView(
     row: typeof compliancePaymentReceipts.$inferSelect,
     notes: RefundNoteSummaryView[],
+    projectName: string | null = null,
   ): AdminReceiptSummaryView {
     return {
-      ...toSummaryView(row, notes),
+      ...toSummaryView(row, notes, projectName),
       providerReference: row.providerReference ?? null,
       emailedAt: row.emailedAt ?? null,
       lastResentAt: row.lastResentAt ?? null,
@@ -1124,13 +1204,19 @@ export function createReceiptsService(deps: ModuleDeps) {
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const notesMap = await loadNotesMap(
-      deps.db,
-      pageRows.map((r) => r.id),
-    );
+    const [notesMap, projectMap] = await Promise.all([
+      loadNotesMap(
+        deps.db,
+        pageRows.map((r) => r.id),
+      ),
+      resolveProjectNamesByOrderIds(
+        deps.db,
+        pageRows.map((r) => r.orderId),
+      ),
+    ]);
 
     return {
-      items: pageRows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? [])),
+      items: pageRows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null)),
       nextCursor: hasMore && pageRows.length > 0 ? encodeIdCursor(pageRows[pageRows.length - 1]!.id) : null,
     };
   }
@@ -1161,11 +1247,15 @@ export function createReceiptsService(deps: ModuleDeps) {
       .where(eq(compliancePaymentReceipts.orderPublicId, orderPublicId))
       .orderBy(desc(compliancePaymentReceipts.issuedAt), desc(compliancePaymentReceipts.id));
 
-    const notesMap = await loadNotesMap(
-      deps.db,
-      rows.map((r) => r.id),
-    );
-    return rows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? []));
+    const [notesMap, projectMap] = await Promise.all([
+      loadNotesMap(
+        deps.db,
+        rows.map((r) => r.id),
+      ),
+      resolveProjectNamesByOrderIds(deps.db, [orderView.id]),
+    ]);
+    const orderProjectName = projectMap.get(orderView.id) ?? null;
+    return rows.map((r) => toSummaryView(r, notesMap.get(r.id) ?? [], orderProjectName));
   }
 
   async function get(principal: SessionPrincipal, receiptPublicId: string): Promise<ReceiptDetailView> {
@@ -1177,9 +1267,18 @@ export function createReceiptsService(deps: ModuleDeps) {
     if (!row) throw notFound("RECEIPT_NOT_FOUND");
 
     const { liveRole } = await assertCanReadReceiptRow(principal, row);
-    const notesMap = await loadNotesMap(deps.db, [row.id]);
+    const [notesMap, projectMap] = await Promise.all([
+      loadNotesMap(deps.db, [row.id]),
+      resolveProjectNamesByOrderIds(deps.db, [row.orderId]),
+    ]);
     const rawSnapshot = deps.crypto.decrypt(row.snapshotEnc, receiptSnapshotAad(row.publicId));
     const snapshot = JSON.parse(rawSnapshot) as ReceiptSnapshot;
+    const resolvedProjectName =
+      (typeof snapshot.projectName === "string" && snapshot.projectName.trim()
+        ? snapshot.projectName.trim()
+        : null) ??
+      projectMap.get(row.orderId) ??
+      null;
 
     const canResend =
       (liveRole === "staff" || liveRole === "admin") &&
@@ -1187,8 +1286,11 @@ export function createReceiptsService(deps: ModuleDeps) {
       row.origin === "portal";
 
     return {
-      ...toSummaryView(row, notesMap.get(row.id) ?? []),
-      snapshot,
+      ...toSummaryView(row, notesMap.get(row.id) ?? [], resolvedProjectName),
+      snapshot:
+        snapshot.projectName === undefined && resolvedProjectName !== null
+          ? { ...snapshot, projectName: resolvedProjectName }
+          : snapshot,
       emailedAt: row.emailedAt ?? null,
       lastResentAt: row.lastResentAt ?? null,
       resendCount: row.resendCount,
@@ -1367,11 +1469,17 @@ export function createReceiptsService(deps: ModuleDeps) {
       .where(eq(compliancePaymentReceipts.orderPublicId, orderPublicId))
       .orderBy(desc(compliancePaymentReceipts.issuedAt), desc(compliancePaymentReceipts.id));
 
-    const notesMap = await loadNotesMap(
-      deps.db,
-      rows.map((r) => r.id),
-    );
-    return rows.map((r) => toAdminSummaryView(r, notesMap.get(r.id) ?? []));
+    const [notesMap, projectMap] = await Promise.all([
+      loadNotesMap(
+        deps.db,
+        rows.map((r) => r.id),
+      ),
+      resolveProjectNamesByOrderIds(
+        deps.db,
+        rows.map((r) => r.orderId),
+      ),
+    ]);
+    return rows.map((r) => toAdminSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null));
   }
 
   async function adminListForCustomer(
@@ -1405,13 +1513,21 @@ export function createReceiptsService(deps: ModuleDeps) {
 
     const hasMore = rows.length > limit;
     const pageRows = hasMore ? rows.slice(0, limit) : rows;
-    const notesMap = await loadNotesMap(
-      deps.db,
-      pageRows.map((r) => r.id),
-    );
+    const [notesMap, projectMap] = await Promise.all([
+      loadNotesMap(
+        deps.db,
+        pageRows.map((r) => r.id),
+      ),
+      resolveProjectNamesByOrderIds(
+        deps.db,
+        pageRows.map((r) => r.orderId),
+      ),
+    ]);
 
     return {
-      items: pageRows.map((r) => toAdminSummaryView(r, notesMap.get(r.id) ?? [])),
+      items: pageRows.map((r) =>
+        toAdminSummaryView(r, notesMap.get(r.id) ?? [], projectMap.get(r.orderId) ?? null),
+      ),
       nextCursor: hasMore && pageRows.length > 0 ? encodeIdCursor(pageRows[pageRows.length - 1]!.id) : null,
     };
   }
@@ -1489,12 +1605,30 @@ export function createReceiptsService(deps: ModuleDeps) {
         const pdfBuffer = Buffer.from(b64, "base64");
         const resendRequestPublicId = ulid(now.getTime());
 
+        let resendProjectName: string | null = null;
+        try {
+          const parsedSnap = JSON.parse(
+            deps.crypto.decrypt(row.snapshotEnc, receiptSnapshotAad(row.publicId)),
+          ) as Partial<ReceiptSnapshot>;
+          if (typeof parsedSnap.projectName === "string" && parsedSnap.projectName.trim()) {
+            resendProjectName = parsedSnap.projectName.trim();
+          }
+        } catch {
+          // Fall back to live order lookup when resending pre-07.2 receipts.
+        }
+        if (!resendProjectName) {
+          const projectMap = await resolveProjectNamesByOrderIds(tx, [row.orderId]);
+          resendProjectName = projectMap.get(row.orderId) ?? null;
+        }
+
         const mailRes = await enqueuePaymentReceipt(
           deps.mailer,
           {
             receiptPublicId: row.publicId,
             recipientUserId: row.customerUserId,
             receiptNumber: row.receiptNumber,
+            orderReference: row.orderReference,
+            ...(resendProjectName ? { projectName: resendProjectName } : {}),
             pdf: pdfBuffer,
             resendRequestPublicId,
           },

@@ -147,12 +147,21 @@ export type {
   SettleCheckoutInvoiceResult,
 };
 export {
+  decodePdfLiteralText,
+  escapePdfText,
   parsePngForPdf,
+  PDF_BRAND_LEGAL_NAME,
+  PDF_BRAND_PORTAL_HOST,
+  PDF_BRAND_SHORT_NAME,
+  PDF_BRAND_TAGLINE,
+  PDF_LOGO_ALT_TEXT,
+  type PdfPageSize,
   type ReceiptSnapshot,
   type RefundNoteSnapshot,
   renderInvoicePdf,
   renderPaymentReceiptPdf,
   renderRefundNotePdf,
+  sanitizePdfTextToWinAnsi,
 } from "./invoicePdf.js";
 export * from "./settings.js";
 

@@ -232,13 +232,26 @@ function ReceiptCard({
                     area === "console" ? (
                       <Link
                         href={`/admin/orders/${encodeURIComponent(receipt.orderPublicId)}`}
-                        className="font-mono text-action underline underline-offset-2"
+                        className="font-mono break-all text-action underline underline-offset-2"
                       >
                         {receipt.orderReference}
                       </Link>
                     ) : (
-                      receipt.orderReference
+                      <Link
+                        href={`/orders/${encodeURIComponent(receipt.orderPublicId)}`}
+                        className="font-mono break-all text-action underline underline-offset-2"
+                      >
+                        {receipt.orderReference}
+                      </Link>
                     ),
+                },
+              ]
+            : []),
+          ...(showOrder && receipt.projectName?.trim()
+            ? [
+                {
+                  label: "Project",
+                  value: <span className="break-words">{receipt.projectName.trim()}</span>,
                 },
               ]
             : []),
@@ -476,16 +489,18 @@ function ReceiptDetailBody({
   }
 
   const snap = receipt.snapshot;
+  const projectLabel = receipt.projectName?.trim() || snap.projectName?.trim() || null;
   const amount = (minor: number) => <MinorAmount minor={minor} currency={receipt.currency} />;
   const backHref = area === "console" ? `/admin/orders/${encodeURIComponent(receipt.orderPublicId)}` : "/invoices";
   const backLabel = area === "console" ? `Order ${receipt.orderReference}` : "Invoices & receipts";
+  const orderHref = area === "console" ? `/admin/orders/${encodeURIComponent(receipt.orderPublicId)}` : `/orders/${encodeURIComponent(receipt.orderPublicId)}`;
 
   return (
     <div className="space-y-6">
       <PageHeader
         breadcrumbs={<Breadcrumbs items={[{ href: backHref, label: backLabel }, { label: receipt.receiptNumber }]} />}
         title={`Receipt ${receipt.receiptNumber}`}
-        description={`Order ${receipt.orderReference}`}
+        description={projectLabel ? `Order ${receipt.orderReference} · ${projectLabel}` : `Order ${receipt.orderReference}`}
         meta={<ReceiptRefundBadge state={receipt.refundState} />}
         actions={
           <div className="flex flex-wrap gap-2">
@@ -520,6 +535,32 @@ function ReceiptDetailBody({
           The original receipt PDF remains unchanged as a permanent payment record. Separate numbered refund notes are attached below.
         </Callout>
       ) : null}
+      <Card title="Order & project">
+        <KeyValueList
+          columns={2}
+          items={[
+            {
+              label: "Order",
+              value: (
+                <Link
+                  href={orderHref}
+                  className="font-mono font-semibold break-all text-action underline underline-offset-2"
+                >
+                  {receipt.orderReference}
+                </Link>
+              ),
+            },
+            {
+              label: "Project",
+              value: projectLabel ? (
+                <span className="font-semibold break-words">{projectLabel}</span>
+              ) : (
+                <span className="text-muted">Not specified</span>
+              ),
+            },
+          ]}
+        />
+      </Card>
       <div className="grid gap-4 md:grid-cols-2">
         <Card title="Issued by">
           <KeyValueList
@@ -700,6 +741,10 @@ export function CompanyProfileDialog({ onClose }: { onClose: () => void }) {
 }
 
 const BRAND_LOGO_OPTIONS = [
+  {
+    value: "/brand/readypackets-approved-header-icon-light.png",
+    label: "Approved header brand mark (light, default)",
+  },
   {
     value: "/brand/readypackets-approved-header-wordmark-light.png",
     label: "Approved header wordmark (light)",

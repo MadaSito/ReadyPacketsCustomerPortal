@@ -10,6 +10,7 @@ import type * as trpcModule from "@/lib/trpc";
 import { createTestQueryClient, expectNoAxeViolations, renderUi } from "@/ui/testing";
 import { Route, useLocation, useSearch } from "wouter";
 import { InvoiceDetailPage, InvoicesPage, OrderInvoicesTab, invoiceCheckoutNavigation } from "./InvoicePages";
+import { ReceiptDetailPage } from "../receipts/ReceiptViews";
 import OrderIntakeTab from "./OrderIntakeTab";
 import PolicyAcceptanceWidget, { RequiredPolicyGate } from "./PolicyAcceptance";
 import { LegalPage, MyPoliciesPage } from "./PolicyPages";
@@ -17,7 +18,7 @@ import { LegalPage, MyPoliciesPage } from "./PolicyPages";
 const mocks = vi.hoisted(() => ({
   policyStatus: vi.fn(), published: vi.fn(), accept: vi.fn(), intakeList: vi.fn(), history: vi.fn(),
   save: vi.fn(), submit: vi.fn(), invoiceList: vi.fn(), orderInvoices: vi.fn(), invoice: vi.fn(),
-  receiptList: vi.fn(), orderReceipts: vi.fn(), receipt: vi.fn(), fetch: vi.fn(),
+  receiptList: vi.fn(), orderReceipts: vi.fn(), receipt: vi.fn(), receiptResend: vi.fn(), fetch: vi.fn(),
   startInvoiceCheckout: vi.fn(), checkoutStatus: vi.fn(),
 }));
 vi.mock("@/lib/sessionTransport", async (load) => ({ ...await load<typeof sessionModule>(), sessionFetch: mocks.fetch }));
@@ -51,6 +52,9 @@ vi.mock("@/lib/trpc", async (load) => {
           myList: query("receipts", mocks.receiptList),
           forOrder: query("order-receipts", mocks.orderReceipts),
           get: query("receipt", mocks.receipt),
+          admin: {
+            resend: mutation(mocks.receiptResend),
+          },
         },
       },
       payments: {
@@ -619,5 +623,143 @@ describe("customer invoices", () => {
     );
     await expectNoAxeViolations(returnView.container);
     returnView.unmount();
+  });
+
+  it("displays Order and Project prominently across customer invoice & receipt lists and detail pages", async () => {
+    const user = userEvent.setup();
+    const receiptId = publicId("R");
+    const projectTitle = "Horizon FinTech — SOC2 & Vendor Packet (María)";
+    mocks.invoiceList.mockResolvedValue({
+      items: [{ ...invoice, orderReference: "RP-2026-009101", projectName: projectTitle }],
+      nextCursor: null,
+    });
+    mocks.invoice.mockResolvedValue({
+      ...invoice,
+      orderReference: "RP-2026-009101",
+      projectName: projectTitle,
+      issuerName: "Ready Packets Consulting LLC",
+    });
+    const receiptViewObj = {
+      receiptPublicId: receiptId,
+      receiptNumber: "RPR-2026-000042",
+      settlementKind: "provider_online" as const,
+      invoicePublicId: invoice.invoicePublicId,
+      paymentPublicId: publicId("8"),
+      orderPublicId: orderId,
+      orderReference: "RP-2026-009101",
+      projectName: projectTitle,
+      customerRef: "CUST-91",
+      currency: "USD",
+      subtotalMinor: 10000,
+      discountMinor: 0,
+      bundleDiscountMinor: 0,
+      promoDiscountMinor: 0,
+      promoLabel: null,
+      taxMinor: 0,
+      amountWaivedMinor: 0,
+      amountPaidMinor: 10000,
+      refundedMinor: 0,
+      refundState: "none" as const,
+      paymentMethod: "provider_online" as const,
+      paymentMethodBrand: "visa",
+      paymentMethodLast4: "4242",
+      paymentMethodSummary: "Visa ending in 4242",
+      provider: "stripe",
+      issuedAt: date,
+      origin: "portal" as const,
+      refundNotes: [],
+      emailedAt: date,
+      lastResentAt: null,
+      resendCount: 0,
+      canResend: false,
+      snapshot: {
+        schemaVersion: 1 as const,
+        receiptPublicId: receiptId,
+        receiptNumber: "RPR-2026-000042",
+        settlementKind: "provider_online" as const,
+        issuedAt: date.toISOString(),
+        orderPublicId: orderId,
+        orderReference: "RP-2026-009101",
+        projectName: projectTitle,
+        invoicePublicId: invoice.invoicePublicId,
+        invoiceNumber: invoice.invoiceNumber,
+        paymentPublicId: publicId("8"),
+        company: {
+          legalName: "Ready Packets Consulting LLC",
+          address: "100 Harbor Way",
+          contact: "billing@example.test",
+          taxId: "EIN 98-7654321",
+          logoMode: "brand" as const,
+          logoBrandPath: "/brand/readypackets-approved-header-icon-light.png",
+        },
+        customer: {
+          name: "María Elena García-López",
+          email: "maria.buyer@example.test",
+          customerRef: "CUST-91",
+        },
+        currency: "USD",
+        lines: [
+          { position: 1, description: "Mixing", quantity: 2, unitAmountMinor: 5000, lineTotalMinor: 10000 },
+        ],
+        subtotalMinor: 10000,
+        discountMinor: 0,
+        bundleDiscountMinor: 0,
+        discountLabel: null,
+        promoDiscountMinor: 0,
+        promoLabel: null,
+        taxMinor: 0,
+        invoiceTotalMinor: 10000,
+        amountWaivedMinor: 0,
+        amountPaidMinor: 10000,
+        paymentMethod: "provider_online" as const,
+        paymentMethodBrand: "visa",
+        paymentMethodLast4: "4242",
+        provider: "stripe",
+        paymentReference: "pi_test_91",
+        footerText: "",
+      },
+    };
+    mocks.receiptList.mockResolvedValue({ items: [receiptViewObj], nextCursor: null });
+    mocks.receipt.mockResolvedValue(receiptViewObj);
+
+    const listView = renderUi(<InvoicesPage />, { path: "/invoices" });
+    expect((await screen.findAllByText("RP-2026-009101")).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(new RegExp("Horizon FinTech")).length).toBeGreaterThanOrEqual(1);
+    await user.click(screen.getByRole("tab", { name: "Receipts" }));
+    expect((await screen.findAllByRole("link", { name: "RPR-2026-000042" })).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/RP-2026-009101/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(new RegExp("Horizon FinTech")).length).toBeGreaterThanOrEqual(1);
+    await expectNoAxeViolations(listView.container);
+    listView.unmount();
+
+    const invDetailView = renderUi(
+      <Route path="/invoices/:invoiceId">
+        <InvoiceDetailPage />
+      </Route>,
+      { path: `/invoices/${invoice.invoicePublicId}` },
+    );
+    expect(await screen.findByRole("heading", { name: "Order & project" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "RP-2026-009101" })).toHaveAttribute(
+      "href",
+      `/orders/${orderId}`,
+    );
+    expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
+    await expectNoAxeViolations(invDetailView.container);
+    invDetailView.unmount();
+
+    const rcptDetailView = renderUi(
+      <Route path="/receipts/:receiptId">
+        <ReceiptDetailPage />
+      </Route>,
+      { path: `/receipts/${receiptId}` },
+    );
+    expect(await screen.findByRole("heading", { name: "Order & project" })).toBeVisible();
+    expect(screen.getByRole("link", { name: "RP-2026-009101" })).toHaveAttribute(
+      "href",
+      `/orders/${orderId}`,
+    );
+    expect(screen.getAllByText(projectTitle).length).toBeGreaterThanOrEqual(1);
+    await expectNoAxeViolations(rcptDetailView.container);
+    rcptDetailView.unmount();
   });
 });

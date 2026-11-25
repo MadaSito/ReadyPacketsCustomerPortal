@@ -19,7 +19,7 @@ export const INVOICE_ISSUER_NAME = defineSetting({
   label: "Company legal name",
   description: "Legal business name shown on customer invoices and payment receipts.",
   schema: z.string().trim().min(1).max(160),
-  default: "ReadyPackets",
+  default: "Ready Packets Consulting LLC",
   sensitivity: "public",
 });
 
@@ -57,11 +57,12 @@ export const INVOICE_ISSUER_TAX_ID = defineSetting({
 });
 
 export const DOCUMENT_LOGO_ALLOWLIST = [
+  "/brand/readypackets-approved-header-icon-light.png",
+  "/brand/readypackets-approved-header-wordmark-light.png",
   "/brand/readypackets-approved-icon-light-192.png",
   "/brand/readypackets-approved-icon-light-512.png",
   "/brand/readypackets-approved-icon-maskable-192.png",
   "/brand/readypackets-approved-icon-maskable-512.png",
-  "/brand/readypackets-approved-header-wordmark-light.png",
 ] as const;
 export type DocumentLogoBrandPath = (typeof DOCUMENT_LOGO_ALLOWLIST)[number];
 
@@ -70,13 +71,13 @@ export type IssuerLogoMode = (typeof ISSUER_LOGO_MODES)[number];
 
 export const issuerLogoSettingSchema = z.strictObject({
   mode: z.enum(ISSUER_LOGO_MODES).default("brand"),
-  brandPath: z.enum(DOCUMENT_LOGO_ALLOWLIST).default("/brand/readypackets-approved-icon-light-192.png"),
+  brandPath: z.enum(DOCUMENT_LOGO_ALLOWLIST).default("/brand/readypackets-approved-header-icon-light.png"),
 });
 export type IssuerLogoSetting = z.infer<typeof issuerLogoSettingSchema>;
 
 export const DEFAULT_ISSUER_LOGO_SETTING: IssuerLogoSetting = {
   mode: "brand",
-  brandPath: "/brand/readypackets-approved-icon-light-192.png",
+  brandPath: "/brand/readypackets-approved-header-icon-light.png",
 };
 
 /** Backwards-compatible parser: never throws on legacy/partial stored values. */
