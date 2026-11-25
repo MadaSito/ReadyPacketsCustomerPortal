@@ -14,8 +14,11 @@ import {
   Callout,
   Card,
   Checkbox,
+  CodeBlock,
+  ConfirmDialog,
   DataTable,
   DateTime,
+  Dialog,
   EmptyState,
   ErrorState,
   Field,
@@ -36,6 +39,7 @@ import {
   auditCorrelationHref,
   DISPATCH_STATE_META,
   formatMaskedUrl,
+  formatTriggerSource,
   HEADER_NAME_RE,
   PHASE_LABELS,
   RUN_MODE_RE,
@@ -45,6 +49,7 @@ import {
   type ProductionDispatchState,
   type ProductionPhase,
   type ProductionSettingsView,
+  type WorkflowAutoQueueItemView,
 } from "./model";
 
 export interface SettingsFormState {
@@ -186,10 +191,19 @@ export default function ProductionPipelinePage() {
   const toast = useToast();
 
   const settings = useQuery(prodTrpc.settings.get.queryOptions());
+  const autoQueue = useQuery(prodTrpc.workflowAutoQueue.list.queryOptions());
 
   const [draft, setDraft] = useState<SettingsFormState>();
   const [errors, setErrors] = useState<FormErrors>({});
   const [saving, setSaving] = useState(false);
+
+  const [signingBusy, setSigningBusy] = useState<"toggle" | "rotate" | null>(null);
+  const [signingError, setSigningError] = useState<string>();
+  const [confirmRotateOpen, setConfirmRotateOpen] = useState(false);
+  const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
+
+  const [autoQueueBusyId, setAutoQueueBusyId] = useState<string | null>(null);
+  const [autoQueueError, setAutoQueueError] = useState<string>();
 
   const [testingPhase, setTestingPhase] = useState<ProductionPhase | null>(null);
   const [testError, setTestError] = useState<string>();
@@ -336,6 +350,88 @@ export default function ProductionPipelinePage() {
       setTestError(errorMessage(err, "Destination check could not be completed."));
     } finally {
       setTestingPhase(null);
+    }
+  };
+
+  const onToggleSigning = async (nextEnabled: boolean) => {
+    if (signingBusy || !data) return;
+    setSigningError(undefined);
+    setSigningBusy("toggle");
+    try {
+      const updated = await stepUp.run(
+        () => prodClient.settings.setSigningEnabled.mutate({ signingEnabled: nextEnabled }),
+        { reason: "Changing production payload signing requires verification." },
+      );
+      queryClient.setQueryData(prodTrpc.settings.get.queryKey(), updated);
+      toast.show({
+        tone: "success",
+        title: nextEnabled
+          ? "Production HMAC-SHA256 signing enabled"
+          : "Production HMAC-SHA256 signing turned off",
+      });
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      setSigningError(errorMessage(err, "Could not update production payload signing."));
+    } finally {
+      setSigningBusy(null);
+    }
+  };
+
+  const executeRotateSigningSecret = async () => {
+    if (signingBusy) return;
+    setSigningError(undefined);
+    setSigningBusy("rotate");
+    try {
+      const result = await stepUp.run(
+        () => prodClient.settings.rotateSigningSecret.mutate({ overlapMinutes: 1440 }),
+        { reason: "Generating or rotating the production signing secret requires verification." },
+      );
+      queryClient.setQueryData(prodTrpc.settings.get.queryKey(), result.settings);
+      setConfirmRotateOpen(false);
+      setRevealedSecret(result.signingSecretOnce);
+      toast.show({
+        tone: "success",
+        title: "Production signing secret updated",
+        description: "Copy the new secret now; it will not be shown again.",
+      });
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      setSigningError(errorMessage(err, "Could not rotate the production signing secret."));
+      throw err;
+    } finally {
+      setSigningBusy(null);
+    }
+  };
+
+  const onUpdateWorkflowAutoQueue = async (
+    item: WorkflowAutoQueueItemView,
+    patch: { p101OnPaymentConfirmed: boolean; p201OnPhase1Locked: boolean },
+  ) => {
+    if (autoQueueBusyId) return;
+    setAutoQueueError(undefined);
+    setAutoQueueBusyId(item.workflowPublicId);
+    try {
+      const updated = await stepUp.run(
+        () =>
+          prodClient.workflowAutoQueue.set.mutate({
+            workflowPublicId: item.workflowPublicId,
+            workflowKey: item.workflowKey,
+            ...patch,
+          }),
+        { reason: "Changing workflow lifecycle auto-queue rules requires verification." },
+      );
+      queryClient.setQueryData(prodTrpc.workflowAutoQueue.list.queryKey(), updated);
+      toast.show({
+        tone: "success",
+        title: `Updated auto-queue switches for ${item.workflowName}`,
+      });
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      setAutoQueueError(
+        errorMessage(err, "Could not update workflow lifecycle auto-queue settings."),
+      );
+    } finally {
+      setAutoQueueBusyId(null);
     }
   };
 
@@ -709,9 +805,172 @@ export default function ProductionPipelinePage() {
           </div>
         )}
 
+        {data ? (
+          <Section
+            title="Payload signing (HMAC-SHA256)"
+            description="Sign outbound production pipeline payloads with HMAC-SHA256 (X-ReadyPackets-Signature) and rotate secrets with overlap."
+          >
+            <Card
+              title="HMAC-SHA256 signing"
+              actions={
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={data.signingEnabled ? "info" : "neutral"}>
+                    {data.signingEnabled ? "Signed" : "Unsigned"}
+                  </Badge>
+                  {data.previousSigningSecretActive ? (
+                    <Badge tone="warning">Overlap secret active</Badge>
+                  ) : null}
+                </div>
+              }
+            >
+              <div className="flex flex-col gap-4">
+                {signingError ? (
+                  <Callout tone="danger" live="assertive" title="Signing update failed">
+                    {signingError}
+                  </Callout>
+                ) : null}
+
+                <Switch
+                  label="Sign production payloads with HMAC-SHA256 (X-ReadyPackets-Signature)"
+                  description={
+                    data.signingSecretConfigured
+                      ? "When on, every P101–P401 delivery carries an HMAC-SHA256 signature header."
+                      : "Generate a signing secret first before turning on HMAC-SHA256 payload signing."
+                  }
+                  checked={data.signingEnabled}
+                  disabled={!data.signingSecretConfigured || signingBusy !== null}
+                  onCheckedChange={(checked) => void onToggleSigning(checked)}
+                />
+
+                <KeyValueList
+                  columns={2}
+                  items={[
+                    {
+                      label: "Current secret",
+                      value: data.signingSecretConfigured
+                        ? `Configured (ending …${data.signingSecretLast4 ?? "****"})`
+                        : "Not generated",
+                    },
+                    {
+                      label: "Rotation overlap",
+                      value: data.previousSigningSecretActive
+                        ? "Previous secret still active during transition window"
+                        : "No previous secret active",
+                    },
+                  ]}
+                />
+
+                <div>
+                  <Button
+                    variant="secondary"
+                    loading={signingBusy === "rotate"}
+                    disabled={signingBusy !== null}
+                    onClick={() => {
+                      if (data.signingSecretConfigured) {
+                        setConfirmRotateOpen(true);
+                      } else {
+                        void executeRotateSigningSecret().catch(() => undefined);
+                      }
+                    }}
+                  >
+                    {data.signingSecretConfigured
+                      ? "Rotate signing secret"
+                      : "Generate signing secret"}
+                  </Button>
+                </div>
+              </div>
+            </Card>
+          </Section>
+        ) : null}
+
+        <Section
+          title="Workflow lifecycle auto-queue"
+          description="Opt-in automatic queueing of Phase I (P101) and Phase II (P201) dispatches per workflow. Disabled by default."
+        >
+          <div className="flex flex-col gap-4">
+            <Callout tone="info" title="Lifecycle rules and non-retroactive guarantee">
+              Turning on these switches affects future order events only and never fires retroactively
+              for existing orders. Automatic Phase II (P201) queueing requires both a delivered P101
+              dispatch and a locked Phase 1 customer intake.
+            </Callout>
+
+            {autoQueueError ? (
+              <Callout tone="danger" live="assertive" title="Auto-queue update failed">
+                {autoQueueError}
+              </Callout>
+            ) : null}
+
+            <DataTable<WorkflowAutoQueueItemView>
+              caption="Workflow lifecycle auto-queue switches"
+              rows={autoQueue.data?.items}
+              loading={autoQueue.isPending}
+              error={autoQueue.error}
+              onRetry={() => void autoQueue.refetch()}
+              rowKey={(row) => row.workflowPublicId}
+              empty={
+                <EmptyState
+                  title="No workflows configured"
+                  description="Published order workflows appear here so administrators can opt into lifecycle auto-queueing."
+                  headingLevel={3}
+                />
+              }
+              columns={[
+                {
+                  key: "workflow",
+                  header: "Workflow",
+                  primary: true,
+                  cell: (row) => (
+                    <div className="flex flex-col gap-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-ink">{row.workflowName}</span>
+                        {row.isDefault ? <Badge tone="info">Default</Badge> : null}
+                      </div>
+                      <code className="break-all text-xs text-muted">{row.workflowKey}</code>
+                    </div>
+                  ),
+                },
+                {
+                  key: "p101",
+                  header: "P101 on payment confirmed",
+                  cell: (row) => (
+                    <Switch
+                      label={`Auto-queue P101 on payment confirmed for ${row.workflowName}`}
+                      checked={row.p101OnPaymentConfirmed}
+                      disabled={autoQueueBusyId === row.workflowPublicId}
+                      onCheckedChange={(checked) =>
+                        void onUpdateWorkflowAutoQueue(row, {
+                          p101OnPaymentConfirmed: checked,
+                          p201OnPhase1Locked: row.p201OnPhase1Locked,
+                        })
+                      }
+                    />
+                  ),
+                },
+                {
+                  key: "p201",
+                  header: "P201 on Phase 1 lock",
+                  cell: (row) => (
+                    <Switch
+                      label={`Auto-queue P201 on Phase 1 lock for ${row.workflowName}`}
+                      checked={row.p201OnPhase1Locked}
+                      disabled={autoQueueBusyId === row.workflowPublicId}
+                      onCheckedChange={(checked) =>
+                        void onUpdateWorkflowAutoQueue(row, {
+                          p101OnPaymentConfirmed: row.p101OnPaymentConfirmed,
+                          p201OnPhase1Locked: checked,
+                        })
+                      }
+                    />
+                  ),
+                },
+              ]}
+            />
+          </div>
+        </Section>
+
         <Section
           title="Production dispatches"
-          description="Every manual Phase I (P101), Phase II (P201), Phase III (P301), and Phase IV (P401) webhook dispatch across orders."
+          description="Every manual or workflow-queued Phase I (P101), Phase II (P201), Phase III (P301), and Phase IV (P401) webhook dispatch across orders."
         >
           <div className="space-y-4">
             <FilterBar
@@ -748,6 +1007,7 @@ export default function ProductionPipelinePage() {
                     { value: "delivered", label: DISPATCH_STATE_META.delivered.label },
                     { value: "failed", label: DISPATCH_STATE_META.failed.label },
                     { value: "dead", label: DISPATCH_STATE_META.dead.label },
+                    { value: "stopped", label: DISPATCH_STATE_META.stopped.label },
                     { value: "unknown", label: DISPATCH_STATE_META.unknown.label },
                   ]}
                 />
@@ -823,6 +1083,12 @@ export default function ProductionPipelinePage() {
                           <Badge tone="neutral">Retry of {shortPublicId(row.retryOf)}</Badge>
                         </div>
                       ) : null}
+                      {row.triggerSource ? (
+                        <div className="text-xs text-muted">
+                          {formatTriggerSource(row.triggerSource)}
+                          {row.stageKey ? ` · Phase ${row.stageKey}` : ""}
+                        </div>
+                      ) : null}
                     </div>
                   ),
                 },
@@ -855,6 +1121,11 @@ export default function ProductionPipelinePage() {
                       {row.responseSummary ? (
                         <div className="mt-0.5 break-words text-xs text-muted">
                           {row.responseSummary}
+                        </div>
+                      ) : null}
+                      {row.stopReason ? (
+                        <div className="mt-0.5 break-words text-xs text-muted">
+                          Stopped: {row.stopReason}
                         </div>
                       ) : null}
                     </div>
@@ -893,6 +1164,32 @@ export default function ProductionPipelinePage() {
           </div>
         </Section>
       </div>
+
+      <ConfirmDialog
+        open={confirmRotateOpen}
+        onOpenChange={setConfirmRotateOpen}
+        title="Rotate production signing secret?"
+        description="Generates a new HMAC-SHA256 signing secret and retains the previous secret for 24 hours so receivers can transition without downtime."
+        confirmLabel="Rotate signing secret"
+        destructive
+        onConfirm={() => executeRotateSigningSecret()}
+      />
+
+      <Dialog
+        open={revealedSecret !== null}
+        onOpenChange={(open) => {
+          if (!open) setRevealedSecret(null);
+        }}
+        title="Production signing secret"
+        description="Store this secret securely in your production pipeline receiver now. It will not be shown again."
+        footer={<Button onClick={() => setRevealedSecret(null)}>Done</Button>}
+      >
+        <div className="ph-no-capture" data-clarity-mask="true">
+          <CodeBlock label="HMAC-SHA256 signing secret" copyable wrap>
+            {revealedSecret ?? ""}
+          </CodeBlock>
+        </div>
+      </Dialog>
     </>
   );
 }

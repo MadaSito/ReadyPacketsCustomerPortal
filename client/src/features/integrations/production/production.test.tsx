@@ -42,10 +42,14 @@ const {
   mockState,
   updateSettings,
   testDestination,
+  rotateSigningSecret,
+  setSigningEnabled,
+  setWorkflowAutoQueue,
   requestP101,
   requestP201,
   requestP301,
   requestP401,
+  stopDispatch,
   retryDispatch,
   redeliverDispatch,
   resendDispatch,
@@ -69,6 +73,9 @@ const {
     p401Configured: false,
     p401Delivered: false,
     hasRedeliveryRow: false,
+    hasQueuedSendingStoppedRows: false,
+    signingSecretConfigured: true,
+    signingEnabled: true,
     ineligibleOrder: false,
     staffViewer: true,
     unconfigured: false,
@@ -76,10 +83,14 @@ const {
   },
   updateSettings: vi.fn(),
   testDestination: vi.fn(),
+  rotateSigningSecret: vi.fn(),
+  setSigningEnabled: vi.fn(),
+  setWorkflowAutoQueue: vi.fn(),
   requestP101: vi.fn(),
   requestP201: vi.fn(),
   requestP301: vi.fn(),
   requestP401: vi.fn(),
+  stopDispatch: vi.fn(),
   retryDispatch: vi.fn(),
   redeliverDispatch: vi.fn(),
   resendDispatch: vi.fn(),
@@ -107,6 +118,10 @@ vi.mock("@/lib/trpc", () => {
           p401UrlMask: null,
           authHeaderName: "",
           authHeaderValueConfigured: false,
+          signingEnabled: false,
+          signingSecretConfigured: false,
+          signingSecretLast4: null,
+          previousSigningSecretActive: false,
           canonVersion: "",
           runMode: "production",
           timeoutMs: 10_000,
@@ -130,6 +145,10 @@ vi.mock("@/lib/trpc", () => {
             : null,
           authHeaderName: "X-Webhook-Token",
           authHeaderValueConfigured: true,
+          signingEnabled: mockState.signingSecretConfigured && mockState.signingEnabled,
+          signingSecretConfigured: mockState.signingSecretConfigured,
+          signingSecretLast4: mockState.signingSecretConfigured ? "7c19" : null,
+          previousSigningSecretActive: false,
           canonVersion: "ReadyPackets_Production_v2.0",
           runMode: "production",
           timeoutMs: 12_000,
@@ -398,15 +417,92 @@ vi.mock("@/lib/trpc", () => {
     };
   };
 
+  const queuedP201Dispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMQ",
+    phase: "P201",
+    state: "queued",
+    attemptCount: 0,
+    packet: null,
+    tier: null,
+    bundleScopeManifest: null,
+    httpStatus: null,
+    responseSummary: null,
+    triggerSource: "phase1_locked",
+    stageKey: "intake",
+    deliveredAt: null,
+    finalizedAt: null,
+    createdAt: laterAt,
+    updatedAt: laterAt,
+  };
+
+  const sendingP301Dispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMS",
+    phase: "P301",
+    state: "sending",
+    attemptCount: 1,
+    packet: null,
+    tier: null,
+    bundleScopeManifest: null,
+    httpStatus: null,
+    responseSummary: null,
+    triggerSource: "stage_bundle",
+    stageKey: "review",
+    deliveredAt: null,
+    finalizedAt: null,
+    createdAt: laterAt,
+    updatedAt: laterAt,
+  };
+
+  const stoppedP401Dispatch: ProductionDispatchItem = {
+    ...sampleDispatch,
+    publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMT",
+    phase: "P401",
+    state: "stopped",
+    attemptCount: 0,
+    packet: null,
+    tier: null,
+    bundleScopeManifest: null,
+    httpStatus: null,
+    responseSummary: "Stopped by operator before worker claim.",
+    lastReasonCode: "OPERATOR_STOPPED",
+    triggerSource: "manual",
+    stoppedAt: laterAt,
+    stoppedByPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMJ",
+    stopReason: "Hold while verifying packet scope",
+    deliveredAt: null,
+    finalizedAt: laterAt,
+    createdAt: laterAt,
+    updatedAt: laterAt,
+  };
+
   const makeHistoryItems = (): ProductionDispatchItem[] => {
     if (mockState.emptyDispatches) return [];
     if (mockState.p101Unknown) return [unknownDispatch];
+    if (mockState.hasQueuedSendingStoppedRows) {
+      return [queuedP201Dispatch, sendingP301Dispatch, stoppedP401Dispatch, sampleDispatch];
+    }
     const rows: ProductionDispatchItem[] = [];
     if (mockState.hasRedeliveryRow) rows.push(redeliveredDispatch);
     if (mockState.p201Failed) rows.push(failedP201Dispatch);
     if (mockState.p101Delivered) rows.push(sampleDispatch);
     return rows;
   };
+
+  const defaultWorkflowAutoQueue = () => ({
+    items: [
+      {
+        workflowPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMW",
+        workflowKey: "standard_packet",
+        workflowName: "Standard Packet Workflow",
+        isDefault: true,
+        p101OnPaymentConfirmed: false,
+        p201OnPhase1Locked: false,
+        updatedAt: null,
+      },
+    ],
+  });
 
   const endpoint = <TInput, TOut>(name: string, fn: (input: TInput) => TOut) => ({
     queryOptions: (input?: TInput) => ({
@@ -425,6 +521,18 @@ vi.mock("@/lib/trpc", () => {
       get: endpoint("settings.get", () => makeSettings()),
       update: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: updateSettings }) },
       test: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: testDestination }) },
+      rotateSigningSecret: {
+        mutationOptions: (opts?: object) => ({ ...opts, mutationFn: rotateSigningSecret }),
+      },
+      setSigningEnabled: {
+        mutationOptions: (opts?: object) => ({ ...opts, mutationFn: setSigningEnabled }),
+      },
+    },
+    workflowAutoQueue: {
+      list: endpoint("workflowAutoQueue.list", () => defaultWorkflowAutoQueue()),
+      set: {
+        mutationOptions: (opts?: object) => ({ ...opts, mutationFn: setWorkflowAutoQueue }),
+      },
     },
     order: {
       pathKey: () => ["integrations", "production", "order"],
@@ -434,6 +542,7 @@ vi.mock("@/lib/trpc", () => {
       requestP201: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: requestP201 }) },
       requestP301: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: requestP301 }) },
       requestP401: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: requestP401 }) },
+      stop: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: stopDispatch }) },
       retry: { mutationOptions: (opts?: object) => ({ ...opts, mutationFn: retryDispatch }) },
       redeliver: {
         mutationOptions: (opts?: object) => ({ ...opts, mutationFn: redeliverDispatch }),
@@ -448,9 +557,11 @@ vi.mock("@/lib/trpc", () => {
             ? []
             : mockState.p101Unknown
               ? [unknownDispatch]
-              : mockState.hasRedeliveryRow
-                ? [redeliveredDispatch, sampleDispatch]
-                : [sampleDispatch],
+              : mockState.hasQueuedSendingStoppedRows
+                ? [stoppedP401Dispatch, sampleDispatch]
+                : mockState.hasRedeliveryRow
+                  ? [redeliveredDispatch, sampleDispatch]
+                  : [sampleDispatch],
         };
       }),
     },
@@ -462,12 +573,18 @@ vi.mock("@/lib/trpc", () => {
         settings: {
           update: { mutate: updateSettings },
           test: { mutate: testDestination },
+          rotateSigningSecret: { mutate: rotateSigningSecret },
+          setSigningEnabled: { mutate: setSigningEnabled },
+        },
+        workflowAutoQueue: {
+          set: { mutate: setWorkflowAutoQueue },
         },
         order: {
           requestP101: { mutate: requestP101 },
           requestP201: { mutate: requestP201 },
           requestP301: { mutate: requestP301 },
           requestP401: { mutate: requestP401 },
+          stop: { mutate: stopDispatch },
           retry: { mutate: retryDispatch },
           redeliver: { mutate: redeliverDispatch },
           resend: { mutate: resendDispatch },
@@ -545,6 +662,9 @@ beforeEach(() => {
   mockState.p401Configured = false;
   mockState.p401Delivered = false;
   mockState.hasRedeliveryRow = false;
+  mockState.hasQueuedSendingStoppedRows = false;
+  mockState.signingSecretConfigured = true;
+  mockState.signingEnabled = true;
   mockState.ineligibleOrder = false;
   mockState.staffViewer = true;
   mockState.unconfigured = false;
@@ -1133,5 +1253,165 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
         /Verify downstream workflow executions and output folders before re-sending/i,
       ),
     ).toBeTruthy();
+  });
+
+  it("manages HMAC-SHA256 payload signing, rotates the signing secret once-only, and updates workflow lifecycle auto-queue switches", async () => {
+    const user = userEvent.setup();
+    const rotatedSecret = "prod_whsec_synthetic_once_9999";
+    rotateSigningSecret.mockResolvedValue({
+      settings: {
+        enabled: true,
+        configured: true,
+        state: "configured" as const,
+        summary: "Configured",
+        p101UrlConfigured: true,
+        p101UrlMask: { host: "hooks.example.test", last4: "9f2a" },
+        p201UrlConfigured: true,
+        p201UrlMask: { host: "hooks.example.test", last4: "4b8c" },
+        p301UrlConfigured: false,
+        p301UrlMask: null,
+        p401UrlConfigured: false,
+        p401UrlMask: null,
+        authHeaderName: "X-Webhook-Token",
+        authHeaderValueConfigured: true,
+        signingEnabled: true,
+        signingSecretConfigured: true,
+        signingSecretLast4: "9999",
+        previousSigningSecretActive: true,
+        canonVersion: "ReadyPackets_Production_v2.0",
+        runMode: "production",
+        timeoutMs: 12_000,
+      },
+      signingSecretOnce: rotatedSecret,
+    });
+    setSigningEnabled.mockImplementation(async ({ signingEnabled }: { signingEnabled: boolean }) => ({
+      enabled: true,
+      configured: true,
+      state: "configured" as const,
+      summary: "Configured",
+      p101UrlConfigured: true,
+      p101UrlMask: { host: "hooks.example.test", last4: "9f2a" },
+      p201UrlConfigured: true,
+      p201UrlMask: { host: "hooks.example.test", last4: "4b8c" },
+      p301UrlConfigured: false,
+      p301UrlMask: null,
+      p401UrlConfigured: false,
+      p401UrlMask: null,
+      authHeaderName: "X-Webhook-Token",
+      authHeaderValueConfigured: true,
+      signingEnabled,
+      signingSecretConfigured: true,
+      signingSecretLast4: "9999",
+      previousSigningSecretActive: true,
+      canonVersion: "ReadyPackets_Production_v2.0",
+      runMode: "production",
+      timeoutMs: 12_000,
+    }));
+    setWorkflowAutoQueue.mockResolvedValue({
+      items: [
+        {
+          workflowPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMW",
+          workflowKey: "standard_packet",
+          workflowName: "Standard Packet Workflow",
+          isDefault: true,
+          p101OnPaymentConfirmed: true,
+          p201OnPhase1Locked: false,
+          updatedAt: new Date("2026-11-24T12:00:00Z"),
+        },
+      ],
+    });
+
+    const view = renderUi(<ProductionPipelinePage />, {
+      path: "/admin/integrations/production",
+      api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+    });
+
+    const rotateBtn = await screen.findByRole("button", { name: "Rotate signing secret" });
+    await user.click(rotateBtn);
+    const confirmDialog = await screen.findByRole("alertdialog", {
+      name: "Rotate production signing secret?",
+    });
+    await user.click(within(confirmDialog).getByRole("button", { name: "Rotate signing secret" }));
+
+    const secretDialog = await screen.findByRole("dialog", { name: "Production signing secret" });
+    expect(within(secretDialog).getByText(rotatedSecret)).toBeVisible();
+    expect(JSON.stringify(view.queryClient.getQueriesData({}))).not.toContain(rotatedSecret);
+    await expectNoAxeViolations(secretDialog);
+    await user.click(within(secretDialog).getByRole("button", { name: "Done" }));
+    expect(screen.queryByText(rotatedSecret)).toBeNull();
+    expect(screen.getByText("Overlap secret active")).toBeVisible();
+
+    const signingSwitch = screen.getByRole("switch", {
+      name: /Sign production payloads with HMAC-SHA256/i,
+    });
+    await user.click(signingSwitch);
+    expect(setSigningEnabled).toHaveBeenCalledWith({ signingEnabled: false });
+
+    const workflowTable = await screen.findByRole("table", {
+      name: "Workflow lifecycle auto-queue switches",
+    });
+    const p101AutoSwitch = within(workflowTable).getByRole("switch", {
+      name: /Auto-queue P101 on payment confirmed for Standard Packet Workflow/i,
+    });
+    await user.click(p101AutoSwitch);
+    expect(setWorkflowAutoQueue).toHaveBeenCalledWith({
+      workflowPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMW",
+      workflowKey: "standard_packet",
+      p101OnPaymentConfirmed: true,
+      p201OnPhase1Locked: false,
+    });
+  });
+
+  it("stops queued dispatches, marks sending rows as non-stoppable in flight, and retries stopped dispatches", async () => {
+    const user = userEvent.setup();
+    mockState.p101Delivered = true;
+    mockState.hasQueuedSendingStoppedRows = true;
+    mockState.staffViewer = false;
+    stopDispatch.mockResolvedValue({
+      publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMQ",
+      state: "stopped",
+    });
+    retryDispatch.mockResolvedValue({
+      publicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMN",
+      state: "queued",
+    });
+
+    renderUi(
+      <OrderProductionTab orderId={orderPublicId} area="console" stageActionsSlot={null} />,
+      {
+        path: `/admin/orders/${orderPublicId}/automation`,
+        api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+      },
+    );
+
+    const historyTable = await screen.findByRole("table", {
+      name: "This order's pipeline history",
+    });
+    expect(within(historyTable).getByText("In flight (cannot stop)")).toBeVisible();
+    expect(
+      within(historyTable).queryByRole("button", { name: "Stop Phase III start (P301)" }),
+    ).toBeNull();
+    expect(within(historyTable).getByText(/Auto-queued on Phase 1 lock/)).toBeVisible();
+    expect(within(historyTable).getByText(/Stopped: Hold while verifying packet scope/)).toBeVisible();
+
+    await user.click(within(historyTable).getByRole("button", { name: "Stop Phase II start (P201)" }));
+    const stopDialog = await screen.findByRole("dialog", { name: "Stop Phase II start (P201)?" });
+    await user.type(
+      within(stopDialog).getByLabelText("Reason for stopping (optional)"),
+      "Customer requested intake hold",
+    );
+    await expectNoAxeViolations(stopDialog);
+    await user.click(within(stopDialog).getByRole("button", { name: "Stop dispatch" }));
+    expect(stopDispatch).toHaveBeenCalledWith({
+      orderPublicId,
+      dispatchPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMQ",
+      reason: "Customer requested intake hold",
+    });
+
+    await user.click(within(historyTable).getByRole("button", { name: "Retry Phase IV start (P401)" }));
+    expect(retryDispatch).toHaveBeenCalledWith({
+      orderPublicId,
+      dispatchPublicId: "01JAFJ8VEGZ9GPVRR2S9KTYZMT",
+    });
   });
 });

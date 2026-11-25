@@ -11,6 +11,7 @@ export type ProductionDispatchState =
   | "delivered"
   | "failed"
   | "dead"
+  | "stopped"
   | "unknown";
 export type ProductionSettingsState =
   | "disabled"
@@ -56,9 +57,30 @@ export interface ProductionSettingsView {
   p401UrlMask: ProductionUrlMask | null;
   authHeaderName: string;
   authHeaderValueConfigured: boolean;
+  signingEnabled: boolean;
+  signingSecretConfigured: boolean;
+  signingSecretLast4: string | null;
+  previousSigningSecretActive: boolean;
   canonVersion: string;
   runMode: string;
   timeoutMs: number;
+}
+
+export interface WorkflowAutoQueueItemView {
+  workflowPublicId: string;
+  workflowKey: string;
+  workflowName: string;
+  isDefault: boolean;
+  p101OnPaymentConfirmed: boolean;
+  p201OnPhase1Locked: boolean;
+  updatedAt: Date | string | null;
+}
+
+export interface SetWorkflowAutoQueueInput {
+  workflowPublicId?: string;
+  workflowKey?: string;
+  p101OnPaymentConfirmed: boolean;
+  p201OnPhase1Locked: boolean;
 }
 
 export interface ProductionSettingsUpdateInput {
@@ -125,6 +147,11 @@ export interface ProductionDispatchItem {
   resendReason: string | null;
   retryOf: string | null;
   redeliveryOf: string | null;
+  triggerSource?: string;
+  stageKey?: string | null;
+  stoppedAt?: Date | string | null;
+  stoppedByPublicId?: string | null;
+  stopReason?: string | null;
   requestedByPublicId: string | null;
   correlationId: string;
   createdAt: Date | string;
@@ -214,8 +241,24 @@ export const DISPATCH_STATE_META: Record<ProductionDispatchState, { label: strin
   delivered: { label: "Delivered", tone: "success" },
   failed: { label: "Failed (retrying)", tone: "warning" },
   dead: { label: "Dead-lettered", tone: "danger" },
+  stopped: { label: "Stopped", tone: "neutral" },
   unknown: { label: "Outcome unknown", tone: "warning" },
 };
+
+const TRIGGER_SOURCE_LABELS: Record<string, string> = {
+  manual: "Manual operator trigger",
+  payment_confirmed: "Auto-queued on payment confirmed",
+  phase1_locked: "Auto-queued on Phase 1 lock",
+  stage_bundle: "Workflow phase action",
+  retry: "Manual retry",
+  redeliver: "Administrator redelivery",
+  resend: "Administrator re-send",
+};
+
+export function formatTriggerSource(source: string | null | undefined): string | null {
+  if (!source) return null;
+  return TRIGGER_SOURCE_LABELS[source] ?? source.replace(/_/gu, " ");
+}
 
 export const SETTINGS_STATE_META: Record<ProductionSettingsState, { label: string; tone: Tone }> = {
   configured: { label: "Configured", tone: "success" },

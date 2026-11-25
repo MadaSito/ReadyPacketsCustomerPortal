@@ -51,6 +51,7 @@ import { useProductionClient, useProductionTRPC } from "./api";
 import {
   auditCorrelationHref,
   DISPATCH_STATE_META,
+  formatTriggerSource,
   PHASE_LABELS,
   PHASE_START_LABELS,
   PRODUCTION_PIPELINE_PATH,
@@ -175,20 +176,19 @@ function shortPublicId(publicId: string): string {
 }
 
 function computeRetryableIds(items: readonly ProductionDispatchItem[]): Set<string> {
-  const blockedPhases = new Set<ProductionPhase>();
+  const activeBlockedPhases = new Set<ProductionPhase>();
+  const deliveredPhases = new Set<ProductionPhase>();
   const latestByPhase = new Map<
     ProductionPhase,
     { row: ProductionDispatchItem; ts: number; index: number }
   >();
 
   items.forEach((row, index) => {
-    if (
-      row.state === "queued" ||
-      row.state === "sending" ||
-      row.state === "unknown" ||
-      row.state === "delivered"
-    ) {
-      blockedPhases.add(row.phase);
+    if (row.state === "queued" || row.state === "sending" || row.state === "unknown") {
+      activeBlockedPhases.add(row.phase);
+    }
+    if (row.state === "delivered") {
+      deliveredPhases.add(row.phase);
     }
     const parsedTs = new Date(row.createdAt).getTime();
     const ts = Number.isNaN(parsedTs) ? 0 : parsedTs;
@@ -200,8 +200,13 @@ function computeRetryableIds(items: readonly ProductionDispatchItem[]): Set<stri
 
   const retryable = new Set<string>();
   for (const [phase, entry] of latestByPhase.entries()) {
-    if (blockedPhases.has(phase)) continue;
-    if (entry.row.state === "failed" || entry.row.state === "dead") {
+    if (activeBlockedPhases.has(phase)) continue;
+    if (deliveredPhases.has(phase) && !entry.row.redeliveryOf) continue;
+    if (
+      entry.row.state === "failed" ||
+      entry.row.state === "dead" ||
+      entry.row.state === "stopped"
+    ) {
       retryable.add(entry.row.publicId);
     }
   }
@@ -237,6 +242,12 @@ function ConsoleOrderAutomationPanel({
   const [confirmStartPhase, setConfirmStartPhase] = useState<ProductionPhase | null>(null);
   const [actionError, setActionError] = useState<string>();
   const [retryingDispatchId, setRetryingDispatchId] = useState<string | null>(null);
+
+  // Stop dialog state (queued dispatches -> orders.production.stop)
+  const [stopTarget, setStopTarget] = useState<ProductionDispatchItem | null>(null);
+  const [stopReason, setStopReason] = useState("");
+  const [stopError, setStopError] = useState<string>();
+  const [stopping, setStopping] = useState(false);
 
   // Admin Redeliver dialog state (delivered dispatches -> orders.production.redeliver)
   const [redeliverTarget, setRedeliverTarget] = useState<ProductionDispatchItem | null>(null);
@@ -359,11 +370,18 @@ function ConsoleOrderAutomationPanel({
           message: "A Phase I (P101) dispatch is already queued or sending.",
           settingsActionable: false,
         });
-      } else if (p101.activeState === "failed" || p101.activeState === "dead") {
+      } else if (
+        p101.activeState === "failed" ||
+        p101.activeState === "dead" ||
+        p101.activeState === "stopped"
+      ) {
         list.push({
           code: "P101_RETRY_REQUIRED",
           category: "retry_or_resend_required",
-          message: "The previous Phase I dispatch failed. Retry it from this order's pipeline history.",
+          message:
+            p101.activeState === "stopped"
+              ? "The previous Phase I dispatch was stopped. Retry it from this order's pipeline history."
+              : "The previous Phase I dispatch failed. Retry it from this order's pipeline history.",
           settingsActionable: false,
         });
       } else if (p101.activeState === "unknown") {
@@ -437,11 +455,18 @@ function ConsoleOrderAutomationPanel({
           message: "A Phase II (P201) dispatch is already queued or sending.",
           settingsActionable: false,
         });
-      } else if (p201.activeState === "failed" || p201.activeState === "dead") {
+      } else if (
+        p201.activeState === "failed" ||
+        p201.activeState === "dead" ||
+        p201.activeState === "stopped"
+      ) {
         list.push({
           code: "P201_RETRY_REQUIRED",
           category: "retry_or_resend_required",
-          message: "The previous Phase II dispatch failed. Retry it from this order's pipeline history.",
+          message:
+            p201.activeState === "stopped"
+              ? "The previous Phase II dispatch was stopped. Retry it from this order's pipeline history."
+              : "The previous Phase II dispatch failed. Retry it from this order's pipeline history.",
           settingsActionable: false,
         });
       } else if (p201.activeState === "unknown") {
@@ -586,6 +611,37 @@ function ConsoleOrderAutomationPanel({
       setActionError(errorMessage(err, `Could not retry ${PHASE_LABELS[row.phase]}.`));
     } finally {
       setRetryingDispatchId(null);
+    }
+  };
+
+  const openStopDialog = (row: ProductionDispatchItem) => {
+    setStopTarget(row);
+    setStopReason("");
+    setStopError(undefined);
+  };
+
+  const onSubmitStop = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!stopTarget || stopping) return;
+    setStopping(true);
+    setStopError(undefined);
+    try {
+      await prodClient.order.stop.mutate({
+        orderPublicId: orderId,
+        dispatchPublicId: stopTarget.publicId,
+        reason: stopReason.trim() || null,
+      });
+      toast.show({
+        tone: "success",
+        title: `${PHASE_LABELS[stopTarget.phase]} dispatch stopped`,
+        description: "The queued dispatch was canceled before worker delivery.",
+      });
+      setStopTarget(null);
+      await refreshOrderProduction();
+    } catch (err) {
+      setStopError(errorMessage(err, `Could not stop ${PHASE_LABELS[stopTarget.phase]}.`));
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -1083,6 +1139,12 @@ function ConsoleOrderAutomationPanel({
                           <Badge tone="neutral">Retry of {shortPublicId(row.retryOf)}</Badge>
                         </div>
                       ) : null}
+                      {row.triggerSource ? (
+                        <div className="text-xs text-muted">
+                          {formatTriggerSource(row.triggerSource)}
+                          {row.stageKey ? ` · Phase ${row.stageKey}` : ""}
+                        </div>
+                      ) : null}
                     </div>
                   ),
                 },
@@ -1122,6 +1184,11 @@ function ConsoleOrderAutomationPanel({
                           Reason: {row.resendReason}
                         </div>
                       ) : null}
+                      {row.stopReason ? (
+                        <div className="mt-0.5 break-words text-xs text-muted">
+                          Stopped: {row.stopReason}
+                        </div>
+                      ) : null}
                     </div>
                   ),
                 },
@@ -1143,6 +1210,7 @@ function ConsoleOrderAutomationPanel({
                   key: "actions",
                   header: "Audit & actions",
                   cell: (row) => {
+                    const canStop = row.state === "queued";
                     const canRetry = featureEnabled && retryableIds.has(row.publicId);
                     const canRedeliver = isAdmin && featureEnabled && row.state === "delivered";
                     return (
@@ -1154,6 +1222,19 @@ function ConsoleOrderAutomationPanel({
                         >
                           {shortPublicId(row.correlationId)}
                         </Link>
+                        {canStop ? (
+                          <Button
+                            size="sm"
+                            variant="danger"
+                            onClick={() => openStopDialog(row)}
+                            aria-label={`Stop ${PHASE_LABELS[row.phase]}`}
+                          >
+                            Stop
+                          </Button>
+                        ) : null}
+                        {row.state === "sending" ? (
+                          <span className="text-xs text-muted">In flight (cannot stop)</span>
+                        ) : null}
                         {canRetry ? (
                           <Button
                             size="sm"
@@ -1203,6 +1284,51 @@ function ConsoleOrderAutomationPanel({
           confirmStartPhase ? executeStartPhase(confirmStartPhase) : Promise.resolve()
         }
       />
+
+      {/* Stop dialog for queued production dispatches */}
+      <Dialog
+        open={stopTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !stopping) setStopTarget(null);
+        }}
+        dismissible={!stopping}
+        title={stopTarget ? `Stop ${PHASE_LABELS[stopTarget.phase]}?` : "Stop queued dispatch?"}
+        description="Stopping cancels this queued dispatch before worker delivery. Dispatches already sending on the wire cannot be stopped."
+      >
+        <form onSubmit={(e) => void onSubmitStop(e)} noValidate className="flex flex-col gap-4">
+          {stopError ? (
+            <Callout tone="danger" live="assertive">
+              {stopError}
+            </Callout>
+          ) : null}
+
+          <Field
+            label="Reason for stopping (optional)"
+            hint="Recorded in the audit trail (up to 240 characters)."
+          >
+            <Textarea
+              value={stopReason}
+              onChange={(e) => setStopReason(e.target.value)}
+              maxLength={240}
+              rows={2}
+              disabled={stopping}
+            />
+          </Field>
+
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button
+              variant="secondary"
+              onClick={() => setStopTarget(null)}
+              disabled={stopping}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" variant="danger" loading={stopping}>
+              Stop dispatch
+            </Button>
+          </div>
+        </form>
+      </Dialog>
 
       {/* Administrator step-up Redeliver dialog for already-delivered dispatches */}
       <Dialog
