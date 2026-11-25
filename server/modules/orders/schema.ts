@@ -42,6 +42,15 @@ export const NOTE_VISIBILITIES = ["customer", "internal"] as const;
 export const ORDER_ORIGINS = ["portal", "import"] as const;
 /** Packet tiers (Master Offerings Matrix v3.0). A product with a tier is a packet product. */
 export const PACKET_TIERS = ["Basic", "Standard", "Premium"] as const;
+/** Increment 07 (D2/D9): order attention and payment state (written by orders in the status / stage / payment tx). */
+export const ORDER_ATTENTION = ["none", "staff_review", "customer_response"] as const;
+export type OrderAttention = (typeof ORDER_ATTENTION)[number];
+export const ORDER_PAYMENT_STATES = ["not_required", "unpaid", "pending_async", "paid", "partially_refunded", "refunded"] as const;
+export type OrderPaymentState = (typeof ORDER_PAYMENT_STATES)[number];
+/** Increment 07 (D1): stored stage states (`future` is derived, never stored). */
+export const STAGE_PROGRESS_STATES = ["open", "submitted", "in_review", "accepted", "reopened"] as const;
+export const STAGE_REVIEW_OUTCOMES = ["accepted", "changes_requested"] as const;
+export const STAGE_COMPLETION_KINDS = ["next", "submit", "review", "payment", "status"] as const;
 export type PacketTier = (typeof PACKET_TIERS)[number];
 export interface Deliverable {
   title: string;
@@ -251,12 +260,24 @@ export const orders = mysqlTable(
     /** Idempotency for create (owner-scoped). */
     createKey: varchar("create_key", { length: 80 }),
     submittedAt: utcDateTime("submitted_at"),
+    /** Increment 07 (D3): cached shown percent (null = fill on first read); explicit completion and its fence. */
+    progressPercent: tinyint("progress_percent", { unsigned: true }),
+    completionPercent: tinyint("completion_percent", { unsigned: true }),
+    completionRevision: int("completion_revision", { unsigned: true }).notNull().default(0),
+    /** Increment 07 (D2): attention filter; `attentionSince` changes only when the value changes. */
+    attention: mysqlEnum("attention", ORDER_ATTENTION).notNull().default("none"),
+    attentionSince: utcDateTime("attention_since"),
+    /** Increment 07 (D9): payment state; existing orders are backfilled at start-up (paid / not_required). */
+    paymentState: mysqlEnum("payment_state", ORDER_PAYMENT_STATES).notNull().default("not_required"),
+    paidAt: utcDateTime("paid_at"),
     version: versionColumn(),
     createdAt: createdAtColumn(),
     updatedAt: updatedAtColumn(),
   },
   (t) => [
     uniqueIndex("orders_reference_uq").on(t.reference),
+    index("orders_attention_idx").on(t.attention, t.attentionSince, t.id),
+    index("orders_payment_state_idx").on(t.paymentState, t.id),
     uniqueIndex("orders_create_key_uq").on(t.ownerUserId, t.createKey),
     index("orders_owner_idx").on(t.ownerUserId, t.id),
     index("orders_status_idx").on(t.statusKey, t.id),
@@ -583,4 +604,45 @@ export const orderTaskWaivers = mysqlTable(
   (t) => [uniqueIndex("order_task_waivers_task_uq").on(t.orderId, t.workflowVersionId, t.statusKey, t.taskKey), index("order_task_waivers_order_idx").on(t.orderId)],
 );
 
+/**
+ * Increment 07 (D1): runtime state of one stage (phase) on one order, for the pinned workflow version. Created when the
+ * stage is first reached. Acknowledgement evidence = policy + text hash + time + actor. Review / reopen text lives in
+ * `order_notes` (review note: customer-visible; reopen reason: internal), referenced by public id.
+ */
+export const orderStageProgress = mysqlTable(
+  "order_stage_progress",
+  {
+    id: idColumn(),
+    orderId: refColumn("order_id").notNull(),
+    workflowVersionId: refColumn("workflow_version_id").notNull(),
+    stageKey: varchar("stage_key", { length: 48 }).notNull(),
+    state: mysqlEnum("state", STAGE_PROGRESS_STATES).notNull().default("open"),
+    openedAt: utcDateTime("opened_at").notNull(),
+    completedAt: utcDateTime("completed_at"),
+    completedHow: mysqlEnum("completed_how", STAGE_COMPLETION_KINDS),
+    submittedAt: utcDateTime("submitted_at"),
+    submittedByUserId: refColumn("submitted_by_user_id").references(() => users.id),
+    ackPolicy: mysqlEnum("ack_policy", ["required", "optional", "none"] as const),
+    ackTextSha256: char("ack_text_sha256", { length: 64 }),
+    ackAt: utcDateTime("ack_at"),
+    ackByUserId: refColumn("ack_by_user_id").references(() => users.id),
+    reviewOutcome: mysqlEnum("review_outcome", STAGE_REVIEW_OUTCOMES),
+    reviewedAt: utcDateTime("reviewed_at"),
+    reviewedByUserId: refColumn("reviewed_by_user_id").references(() => users.id),
+    reviewNotePublicId: varchar("review_note_public_id", { length: 26 }),
+    reopenedAt: utcDateTime("reopened_at"),
+    reopenedByUserId: refColumn("reopened_by_user_id").references(() => users.id),
+    reopenNotePublicId: varchar("reopen_note_public_id", { length: 26 }),
+    reopenCount: int("reopen_count", { unsigned: true }).notNull().default(0),
+    version: versionColumn(),
+    createdAt: createdAtColumn(),
+    updatedAt: updatedAtColumn(),
+  },
+  (t) => [
+    uniqueIndex("order_stage_progress_uq").on(t.orderId, t.workflowVersionId, t.stageKey),
+    index("order_stage_progress_state_idx").on(t.state, t.orderId),
+  ],
+);
+
 export { orderAdminTasks, orderQuestionAnswers, orderQuestions } from "./questionsSchema.js";
+export { orderStatusCatalog } from "./statusCatalogSchema.js";
