@@ -63,7 +63,9 @@ export default function OrdersListPage() {
                 </span>
               ),
             },
-            { key: "progress", header: "Progress", cell: (order) => <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="min-w-40" /> },
+            // The 10rem floor only applies to the md+ table; in the phone card the bar shrinks to its cell (an unconditional
+            // min-w-40 forced +57 px of horizontal scroll at a 240 px viewport).
+            { key: "progress", header: "Progress", cell: (order) => <OrderListProgress name={order.projectName} progressPercent={order.progressPercent} phaseLabel={order.phaseLabel} phaseIndex={order.phaseIndex} phaseTotal={order.phaseTotal} canceled={order.progressCanceled} className="w-full md:min-w-40" /> },
             { key: "access", header: "Access", hideOnMobile: true, cell: (order) => ACCESS_ROLE_LABELS[order.accessRole] ?? order.accessRole },
             { key: "updatedAt", header: "Updated", cell: (order) => <DateTime value={order.updatedAt} format="relative" /> },
             { key: "total", header: "Total", align: "end", cell: (order) => <Money value={money(order.totalMinor, order.currency)} /> },

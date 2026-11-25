@@ -254,6 +254,21 @@ describe("customer order list", () => {
     }
   });
 
+  it("240 px reflow: the phone card's progress bar has no fixed minimum width (the 10rem floor is md+ table only)", async () => {
+    handlers.set("orders.list", () => ({ items: [{ ...listItem, progressPercent: 40, phaseLabel: "Payment", phaseIndex: 0, phaseTotal: 7, progressCanceled: false }], nextCursor: null }));
+    const { container } = renderUi(<OrdersListPage />, { path: "/orders" });
+    await screen.findAllByRole("link", { name: "Synthetic project" });
+    const cards = screen.getByRole("list", { name: "Your orders" });
+    const bars = [...container.querySelectorAll<HTMLElement>('[data-variant="compact"]')];
+    expect(bars.length).toBeGreaterThan(0);
+    expect(bars.some((bar) => cards.contains(bar))).toBe(true);
+    for (const bar of bars) {
+      const classes = bar.className.split(/\s+/);
+      expect(classes).not.toContain("min-w-40");
+      expect(classes).toContain("md:min-w-40");
+    }
+  });
+
   it("shows an error state when the list fails", async () => {
     handlers.set("orders.list", () => {
       throw new Error("boom");
