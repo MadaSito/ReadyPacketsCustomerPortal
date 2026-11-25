@@ -1,0 +1,29 @@
+# Increment 07 accessibility review
+
+This is a source and component review of changed surfaces, not a WCAG or ADA conformance finding. The integrator should record the final route, role, state, browser, viewport, theme, input method and result for each rendered check. Features that have not landed in the integrated build are listed as pending verification, not as passes.
+
+## Source findings and disposition
+
+| Surface | Finding and disposition |
+| --- | --- |
+| D3: order progress | The 100% display could say “All phases complete” while a phase was still open. Foundation changed the status line and added a regression for this state in `92231ef`. A dense, long-label 20-phase stepper at its horizontal breakpoint still needs rendered reflow, focus-ring and target-size checks. |
+| D4: customer phase wizard | Changing phase could remove the focused control, and the acknowledgement dialog needed consistent reset, pending and error behavior. Audit added focus on the incoming phase or completion message, shared cancel/reset, pending dismissal protection and missing-acknowledgement focus/announcement in `8b69722`. Integrated keyboard verification remains open. |
+| D4: questions and phase console | The wizard can render the question section below the phase heading without skipping a level. Customer answer saves return to the question heading; accepting a submission keeps the reviewed phase and focus after the current phase advances. MySQL and component evidence is recorded in the [phase work verification notes](../../server/modules/orders/questions/VERIFICATION.md). Check actual step-up focus, filters and role changes in the integrated UI. |
+| D5: phase actions | The legacy action list referenced the pending dialog's phase instead of the row's phase. Reported to the UI owner; verify labels for both the legacy list and phase-scoped actions. Check run confirmation, busy state, result announcement and return to the invoking phase or control. |
+| D6: operational alerts | Acknowledging or resolving can disable the focused control and then remove it or its entire row under a filter. Reported to Jobs. Check that keyboard users keep a usable tab position and hear the new state under both an open filter and an unfiltered view. |
+| D8: files and ZIP archives | Per-file and archive downloads natively disable the focused trigger while busy. Reported to Files and Portable Contract; preserve focus with guarded activation where possible. Check microphone refusal, recording controls, upload/processing, ZIP queued-to-ready and download failure, and confirm that status changes are announced without reading every poll. |
+| D12: Microsoft 365 file sync | Identity verification, saving approval and applying a resync can remove the focused controls. Repeated file and destination controls need context in their accessible names or descriptions. Reported to Portable Ops. Check focus after step-up, successful save and result refresh, and after a retry changes or removes a filtered row. |
+
+## Integrated browser checks
+
+| Surface | Checks still needed |
+| --- | --- |
+| D1–D2: phase editor and status catalogue | Check keyboard alternatives for reordering, focus after adding/removing entries, current position announcements, duplicate or archived status errors, and validation associated with the appropriate field. Check narrow forms for nested phase options. |
+| D3–D6: order progress, workspace, actions and alerts | Cover a mixed-state pinned order, legacy order, grant-only viewer, staff reviewer and admin. Verify current/read-only/locked state without colour, stable focus after actions, status updates, and readable errors. |
+| D7: outbound integration settings | Check named destinations, any repeatable mapping controls, test or save results, safe error/detail reading, and focus after a changed or removed destination. |
+| D8: uploads, recording, deliverables and archives | Cover keyboard-operable upload, alternate file picker, mic permission decline, native audio controls, failed or revoked download, phase and order ZIPs, and nested step-up. Check buttons with long file names at narrow widths. |
+| D9: payment completion and diagnostics | Test pending and failed checkout return, paid/receipt and manual-payment outcomes, and reconciliation confirmation. Verify that status isn't conveyed by colour alone, updating is announced, and payment attempt and webhook data remain readable with magnification. |
+| D10: Microsoft Entra sign-in and SAML settings | Verify local MFA sign-in still works. Check SSO protocol-dependent fields, copy actions, test/validation and failure notices, and browser back/focus after returning from the IdP. Do not treat the external IdP as covered by this portal review. |
+| D11–D13: ingress, file sync and documentation | Check branded access or unavailable pages if present, rendered File Sync workflows, and that admin help headings, links and instructions remain usable without screenshots. |
+
+Run the checks at a 320 CSS-pixel viewport, desktop, and zoomed/reflowed layouts, in both themes. Verify visible focus without clipping, keyboard navigation, reduced motion, forced colours, rendered text/UI contrast and target sizes. Test a screen reader on representative forms, live status changes and nested dialogs. Fixture-backed axe checks do not verify those rendered or assistive-technology behaviors, and this peer did not run a browser.
