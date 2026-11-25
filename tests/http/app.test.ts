@@ -612,6 +612,12 @@ describe("HTTP edge: bounds, errors, static assets and rendering", () => {
     policy.countries = { mode: "deny", codes: ["US"] };
     await post().expect(403);
     policy.countries = { mode: "allow", codes: ["CA"] };
+    policy.custom = [{
+      id: "33333333-3333-4333-8333-333333333333", label: "Synthetic policy fixture",
+      field: "country", operator: "exact", value: "US", action: "block",
+    }];
+    await post().expect(403);
+    policy.custom = [];
     h.services.rateLimiter = { consume: async () => ({ allowed: false, retryAfterSeconds: 30 }) };
     await post().expect(429).expect("Retry-After", "30");
     expect(seen).toHaveBeenCalledOnce();
