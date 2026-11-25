@@ -380,6 +380,12 @@ describe("RFC 5424 & RFC 5425 golden vectors", () => {
 
     expect(findSiemCatalogueEntry("policy.notice.scheduled")?.forwardable).toBe(true);
     expect(findSiemCatalogueEntry("report.definition.created")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("file.archive.denied")?.defaultSeverity).toBe("WARN");
+    expect(findSiemCatalogueEntry("file.archive.ticket_issued")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("file.archive.revoked")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.graph.sites_selected_checked")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.egress.preset_updated")?.forwardable).toBe(true);
+    expect(findSiemCatalogueEntry("integration.production.dispatch.stopped")?.forwardable).toBe(true);
     expect(findSiemCatalogueEntry("siem.delivery.failed")?.forwardable).toBe(false);
     expect(isSiemOperationalSelfEvent("siem.delivery.failed")).toBe(true);
   });

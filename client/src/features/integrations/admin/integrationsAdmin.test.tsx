@@ -5,12 +5,15 @@ import type { ReactElement } from "react";
 import superjson from "superjson";
 import { describe, expect, it } from "vitest";
 import type { AppRouter } from "@server/trpc/root";
+import { RouteFocus } from "@/app/RouteFocus";
 import type { MeResult } from "@/lib/authApi";
 import { TRPCProvider } from "@/lib/trpc";
+import { pageA11y } from "@/test/a11y";
 import { createTestQueryClient, expectNoAxeViolations, fakeAuthApi, renderUi } from "@/ui/testing";
 import { integrationsAdminNav, integrationsAdminRoutes } from "./index";
 import AnalyticsPage, { ENABLE_CONFIRM_TEXT } from "./pages/AnalyticsPage";
 import EgressPage from "./pages/EgressPage";
+import GraphMailPage from "./pages/GraphMailPage";
 import IntegrationsOverviewPage from "./pages/IntegrationsOverviewPage";
 import SmtpPage from "./pages/SmtpPage";
 import { providerStatus } from "./shared";
@@ -19,12 +22,24 @@ const date = new Date("2026-11-20T12:00:00.000Z");
 
 function me(): MeResult {
   return {
-    user: { publicId: "01JD0000000000000000000001", role: "admin", name: "Avery Example", email: "avery@example.test", customerRef: null, status: "active" },
+    user: {
+      publicId: "01JD0000000000000000000001",
+      role: "admin",
+      capabilities: ["integrations.manage"],
+      name: "Avery Example",
+      email: "avery@example.test",
+      customerRef: null,
+      status: "active",
+    },
     state: "full", pendingSteps: [], nextStep: null,
   } as MeResult;
 }
 
-function renderPage(page: ReactElement, records: Record<string, (input: unknown) => unknown>) {
+function renderPage(
+  page: ReactElement,
+  records: Record<string, (input: unknown) => unknown>,
+  path?: string,
+) {
   const queryClient = createTestQueryClient();
   const calls: { path: string; input: unknown }[] = [];
   const client = createTRPCClient<AppRouter>({
@@ -36,11 +51,11 @@ function renderPage(page: ReactElement, records: Record<string, (input: unknown)
         const data = JSON.parse((typeof init?.body === "string" ? init.body : url.searchParams.get("input")) || "{}") as
           Record<string, Parameters<typeof superjson.deserialize>[0]>;
         const paths = url.pathname.slice("/rpc/".length).split(",");
-        const result = paths.map((path, index) => {
-          const respond = records[path];
-          if (!respond) throw new Error(`Unexpected test request: ${path}`);
+        const result = paths.map((p, index) => {
+          const respond = records[p];
+          if (!respond) throw new Error(`Unexpected test request: ${p}`);
           const input = data[index] === undefined ? undefined : superjson.deserialize(data[index]!);
-          calls.push({ path, input });
+          calls.push({ path: p, input });
           return { result: { data: superjson.serialize(respond(input)) } };
         });
         return Response.json(result);
@@ -48,6 +63,7 @@ function renderPage(page: ReactElement, records: Record<string, (input: unknown)
     })],
   });
   const rendered = renderUi(page, {
+    ...(path ? { path } : {}),
     api: fakeAuthApi({ me: async () => me() }), queryClient,
     wrapper: (ui) => <TRPCProvider trpcClient={client} queryClient={queryClient}>{ui}</TRPCProvider>,
   });
@@ -78,8 +94,14 @@ const analyticsConfig = {
 };
 
 describe("integrations console registration", () => {
-  it("exports four admin routes guarded by integrations.manage and one Platform nav entry", () => {
-    expect(integrationsAdminRoutes.map((r) => r.path)).toEqual(["/admin/integrations", "/admin/integrations/smtp", "/admin/integrations/analytics", "/admin/integrations/egress"]);
+  it("exports five admin routes guarded by integrations.manage and one Platform nav entry", () => {
+    expect(integrationsAdminRoutes.map((r) => r.path)).toEqual([
+      "/admin/integrations",
+      "/admin/integrations/smtp",
+      "/admin/integrations/graph",
+      "/admin/integrations/analytics",
+      "/admin/integrations/egress",
+    ]);
     for (const r of integrationsAdminRoutes) expect(r).toMatchObject({ access: "admin", capability: "integrations.manage" });
     expect(integrationsAdminNav).toHaveLength(1);
     expect(integrationsAdminNav[0]).toMatchObject({ href: "/admin/integrations", area: "console", group: "Platform", access: "admin", capability: "integrations.manage" });
@@ -95,6 +117,19 @@ describe("integrations console registration", () => {
 });
 
 describe("Integrations overview", () => {
+  pageA11y("/admin/integrations ready", async () => {
+    renderPage(
+      <main id="main">
+        <IntegrationsOverviewPage />
+        <RouteFocus title="Integrations" path="/admin/integrations" />
+      </main>,
+      { "integrations.admin.providers": () => providers },
+      "/admin/integrations",
+    );
+    await screen.findByRole("heading", { level: 1, name: "Integrations" });
+    await screen.findByRole("heading", { name: "Microsoft Graph Mail & Cloud" });
+  });
+
   it("shows truthful live status cards and configuration links without dead scaffold banners", async () => {
     const { container } = renderPage(<IntegrationsOverviewPage />, { "integrations.admin.providers": () => providers });
     expect(await screen.findByRole("heading", { level: 1, name: "Integrations" })).toBeInTheDocument();
@@ -299,5 +334,157 @@ describe("Outbound connections", () => {
     await userEvent.click(screen.getByRole("button", { name: "Check" }));
     expect(await screen.findByText("Connection would be refused")).toBeInTheDocument();
     expect(screen.getByText("Cloud metadata addresses are never reachable.")).toBeInTheDocument();
+  });
+});
+
+describe("Microsoft Graph & SharePoint readiness, write check, and runbook", () => {
+  const graphConfig = {
+    enabled: true,
+    configured: true,
+    verified: false,
+    state: "configured" as const,
+    summary: "Credentials saved; connection not yet verified.",
+    tenantId: "00000000-0000-0000-0000-000000000011",
+    clientId: "00000000-0000-0000-0000-000000000022",
+    clientSecretConfigured: true,
+    clientSecretLast4: "8f3d",
+    senderMailbox: "noreply@contoso.example",
+    egressPresetEnabled: false,
+    uploadEgressPresetEnabled: true,
+    egressReady: false,
+    lastCheckedAt: null,
+    lastOutcome: null,
+    sitesSelectedLastCheckedAt: date,
+    sitesSelectedLastOutcome: "succeeded" as const,
+    mailboxRestrictionNote: "Scope application Mail.Send to this mailbox using an Exchange application access policy.",
+  };
+
+  const entraRunbook = {
+    requiredApplicationPermission: "Sites.Selected" as const,
+    discouragedBroadPermissions: ["Sites.ReadWrite.All", "Files.ReadWrite.All"],
+    steps: [
+      "Grant Microsoft Graph application permission Sites.Selected in Microsoft Entra ID.",
+      "Assign site-scoped write role to the target SharePoint site via Graph /sites/{siteId}/permissions.",
+      "Enable both Microsoft Graph & Entra Token and SharePoint Upload Session outbound presets.",
+    ],
+    siteGrantEndpointTemplate: "POST https://graph.microsoft.com/v1.0/sites/{site-id}/permissions",
+    siteGrantPayloadExample: '{\n  "roles": ["write"],\n  "grantedToIdentities": [{ "application": { "id": "<client-id>", "displayName": "ReadyPackets" } }]\n}',
+    powershellExample: "Grant-PnPAzureADAppSitePermission -AppId <client-id> -DisplayName ReadyPackets -Permissions Write",
+    oneDriveNote: "Personal OneDrive drives do not support Sites.Selected; provision a dedicated SharePoint site library.",
+  };
+
+  pageA11y("/admin/integrations/graph ready", async () => {
+    renderPage(
+      <main id="main">
+        <GraphMailPage />
+        <RouteFocus title="Microsoft Graph & SharePoint" path="/admin/integrations/graph" />
+      </main>,
+      {
+        "integrations.admin.graph.get": () => graphConfig,
+        "integrations.admin.graph.entraRunbook": () => entraRunbook,
+      },
+      "/admin/integrations/graph",
+    );
+    await screen.findByRole("heading", { level: 1, name: "Microsoft Graph & SharePoint" });
+    await screen.findByRole("heading", { name: "Entra Sites.Selected runbook" });
+    await screen.findByText("Sites.Selected");
+  });
+
+  it("keeps clientSecret write-only, shows egress preset readiness, runs Sites.Selected write check, and renders Entra runbook", async () => {
+    const user = userEvent.setup();
+    const { container, calls } = renderPage(<GraphMailPage />, {
+      "integrations.admin.graph.get": () => graphConfig,
+      "integrations.admin.graph.entraRunbook": () => entraRunbook,
+      "integrations.admin.graph.update": () => ({ ...graphConfig, egressPresetEnabled: true, egressReady: true }),
+      "integrations.admin.graph.testConnection": () => ({
+        outcome: "succeeded" as const,
+        reasonCode: "GRAPH_OK",
+        safeMessage: "OAuth token acquired and Graph endpoint responded.",
+        durationMs: 142,
+        checkedAt: date,
+      }),
+      "integrations.admin.graph.sendTest": () => ({
+        outcome: "accepted" as const,
+        reasonCode: "GRAPH_MAIL_ACCEPTED",
+        safeMessage: "Accepted by Exchange Online.",
+        recipientAddress: "ops@contoso.example",
+        durationMs: 210,
+        checkedAt: date,
+      }),
+      "integrations.admin.graph.verifySitesSelectedWrite": () => ({
+        outcome: "succeeded" as const,
+        reasonCode: "SITES_SELECTED_WRITE_OK",
+        safeMessage: "Upload session created and immediately cancelled with DELETE.",
+        graphEgressEnabled: true,
+        uploadEgressEnabled: true,
+        tokenAcquired: true,
+        readVerified: true,
+        writeVerified: true,
+        durationMs: 318,
+        checkedAt: date,
+      }),
+    });
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Microsoft Graph & SharePoint" })).toBeInTheDocument();
+    expect(await screen.findByText("Switched off")).toBeInTheDocument();
+    expect(screen.getByText("Enabled")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Review outbound presets/ })).toHaveAttribute("href", "/admin/integrations/egress");
+
+    // Client secret is write-only: never prefilled, omitted when unchanged, null when cleared
+    const secretInput = screen.getByLabelText(/^Client secret/);
+    expect(secretInput).toHaveValue("");
+    expect(secretInput).toHaveAttribute("type", "password");
+    expect(screen.getByText(/ending ••••8f3d/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: /Also enable the Microsoft Graph & Entra Token outbound preset/ }));
+    await user.click(screen.getByRole("button", { name: "Save Graph settings" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "integrations.admin.graph.update")).toBe(true));
+    const firstUpdate = calls.find((c) => c.path === "integrations.admin.graph.update")!.input as Record<string, unknown>;
+    expect(firstUpdate).not.toHaveProperty("clientSecret");
+    expect(firstUpdate).toMatchObject({
+      enabled: true,
+      tenantId: graphConfig.tenantId,
+      clientId: graphConfig.clientId,
+      senderMailbox: graphConfig.senderMailbox,
+      enableEgressPreset: true,
+    });
+
+    await user.click(screen.getByRole("checkbox", { name: "Remove the stored client secret" }));
+    await user.click(screen.getByRole("button", { name: "Save Graph settings" }));
+    await waitFor(() => expect(calls.filter((c) => c.path === "integrations.admin.graph.update")).toHaveLength(2));
+    expect((calls.filter((c) => c.path === "integrations.admin.graph.update")[1]!.input as Record<string, unknown>).clientSecret).toBeNull();
+
+    // Connection check + test mail
+    await user.click(screen.getByRole("button", { name: "Test Graph connection" }));
+    expect(await screen.findByText("Graph connection verified")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText(/^Send test mail to/), "ops@contoso.example");
+    await user.click(screen.getByRole("button", { name: "Send test message" }));
+    expect(await screen.findByText("Microsoft Graph accepted the test message")).toBeInTheDocument();
+
+    // Sites.Selected write check: blank optional inputs omitted so min(3) schema passes
+    await user.click(screen.getByRole("button", { name: "Run Sites.Selected write check" }));
+    expect(await screen.findByText("Sites.Selected read and upload-session write verified")).toBeInTheDocument();
+    expect(calls.find((c) => c.path === "integrations.admin.graph.verifySitesSelectedWrite")?.input).toEqual({});
+    expect(screen.getByText("Upload session + DELETE: passed")).toBeInTheDocument();
+
+    // Explicit site/drive/folder inputs forwarded when provided
+    await user.type(screen.getByLabelText(/SharePoint site URL or Graph site ID/), "https://contoso.sharepoint.com/sites/orders");
+    await user.type(screen.getByLabelText(/Probe folder path/), ".rp-check");
+    await user.click(screen.getByRole("button", { name: "Run Sites.Selected write check" }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.path === "integrations.admin.graph.verifySitesSelectedWrite")).toHaveLength(2),
+    );
+    expect(calls.filter((c) => c.path === "integrations.admin.graph.verifySitesSelectedWrite")[1]!.input).toEqual({
+      siteUrlOrId: "https://contoso.sharepoint.com/sites/orders",
+      probeFolderPath: ".rp-check",
+    });
+
+    // Entra Sites.Selected runbook rendered with discouraged broad permissions and copyable code blocks
+    expect(screen.getByText("Sites.Selected")).toBeInTheDocument();
+    expect(screen.getByText("Sites.ReadWrite.All")).toBeInTheDocument();
+    expect(screen.getByText(/Personal OneDrive drives do not support Sites\.Selected/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Graph site permission endpoint" })).toBeInTheDocument();
+    await expectNoAxeViolations(container);
   });
 });

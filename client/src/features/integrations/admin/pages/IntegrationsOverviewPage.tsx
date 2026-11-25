@@ -33,6 +33,8 @@ const META: Record<
     icon: Mail,
     href: "/admin/email-delivery",
     manage: "Configure Graph mail",
+    secondaryHref: INTEGRATION_PATHS.graph,
+    secondaryLabel: "Readiness & runbook",
     blurb: "Single-tenant Microsoft 365 application mail delivery and Graph cloud connectivity.",
   },
   clarity: {

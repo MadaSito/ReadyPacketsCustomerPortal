@@ -668,6 +668,7 @@ describe("AnalyticsConsentSlot — shared @/lib/consent cutover (J-01, J-04) & I
     expect(integrationsFeature.routes.map((r) => r.path)).toEqual([
       "/admin/integrations",
       "/admin/integrations/smtp",
+      "/admin/integrations/graph",
       "/admin/integrations/analytics",
       "/admin/integrations/egress",
       "/admin/integrations/production",

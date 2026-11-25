@@ -56,6 +56,7 @@ export function ProviderStatusBadge(props: ProviderStatusInput) {
 export const INTEGRATION_PATHS = {
   overview: "/admin/integrations",
   smtp: "/admin/integrations/smtp",
+  graph: "/admin/integrations/graph",
   analytics: "/admin/integrations/analytics",
   egress: "/admin/integrations/egress",
 } as const;
