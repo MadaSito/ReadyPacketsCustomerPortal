@@ -10,6 +10,7 @@ import type { ActorCheck } from "./actor.js";
 import type { AuditEmitter, Clock, Db, DbOrTx, SessionPrincipal, Tx } from "../../core/types.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersionLayouts, orderWorkflowVersions, type WorkflowDraftSource } from "./schema.js";
 import { compileRuntimeDefinition } from "./stageModel.js";
+import { workflowStageSchema, type WorkflowStage } from "../../../shared/workflowStages.js";
 import { DEFAULT_WORKFLOW, usesWorkflowRules, workflowDefinitionSchema, type WorkflowDefinition } from "./workflowTypes.js";
 import {
   BLANK_DRAFT,
@@ -33,6 +34,16 @@ export interface WorkflowDeps {
   actorCheck: ActorCheck;
   /** Increment 04: reads `orders.workflow_rules.enabled`. Absent = disabled (fail closed). */
   rulesEnabled?: (tx?: Tx) => Promise<boolean>;
+  /** Increment 07 (D6/D7): integrations / storage checks of phase webhook and file-sync targets (throws on refusal). */
+  checkStageTargets?: (stages: readonly WorkflowStage[], tx: Tx) => Promise<void>;
+}
+
+/** Only phases that already parse are checked on draft save (an unfinished phase is reported by the designer). */
+function parsedStages(stages: readonly unknown[] | undefined): WorkflowStage[] {
+  return (stages ?? []).flatMap((stage) => {
+    const parsed = workflowStageSchema.safeParse(stage);
+    return parsed.success ? [parsed.data] : [];
+  });
 }
 
 export interface BoundWorkflow {
@@ -338,6 +349,7 @@ export function createWorkflowService(deps: WorkflowDeps) {
         await assertDesigner(principal, tx, false);
         const row = await loadDraftRow(tx, input.draftId, true);
         if (row.version !== input.expectedVersion) throw staleDraft();
+        if (definition.stages?.length) await deps.checkStageTargets?.(parsedStages(definition.stages), tx);
         await tx
           .update(orderWorkflowDrafts)
           .set({
@@ -401,6 +413,11 @@ export function createWorkflowService(deps: WorkflowDeps) {
         const issues = assertPublishable(draft);
         const definition = toPublishable(draft);
         await assertRulesAllowed(definition, tx);
+        if (definition.stages?.length) {
+          // Fail closed: a format-3 publish needs the target checks wired.
+          if (!deps.checkStageTargets) throw validation("STAGE_TARGETS_UNCHECKED", "Phase targets could not be checked. Try again later.");
+          await deps.checkStageTargets(definition.stages, tx);
+        }
         const layout = pruneLayout(row.layout ? layoutSchema.parse(row.layout) : null, draft);
         const [hasDefault] = await tx.select({ id: orderWorkflows.id }).from(orderWorkflows).where(eq(orderWorkflows.isDefault, true)).limit(1);
         let workflowRow: typeof orderWorkflows.$inferSelect;

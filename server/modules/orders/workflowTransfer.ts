@@ -10,6 +10,8 @@
  * The digest detects damage and accidental edits; it is not a signature and never proves origin.
  */
 import { createHash } from "node:crypto";
+import { DEFAULT_STAGE_FILE_SYNC } from "../../../shared/orderStageFileSync.js";
+import { MAX_STAGES } from "../../../shared/workflowStages.js";
 import { z } from "zod";
 import { validation } from "../../core/errors.js";
 import {
@@ -32,8 +34,14 @@ import { FOLDER_TEMPLATE_MAX, GATE_SIGNATURE_MODES, MAX_ACCEPTANCE_GATES, MAX_PH
 export const TRANSFER_FORMAT = "readypackets.workflows";
 /** Increment 06 (D8): version 2 adds customer tasks (record options, order-note acknowledgements, documents). */
 export const TRANSFER_FORMAT_VERSION = 2;
-/** Versions this installation can import. Version 1 files are a subset of version 2. */
-export const TRANSFER_READABLE_VERSIONS: readonly number[] = [1, 2];
+/** Increment 07 (D1): version 3 adds phases (`definition.stages`); written only when an exported workflow has them. */
+export const TRANSFER_FORMAT_VERSION_STAGES = 3;
+/** Versions this installation can import. Each version's files are a subset of the next. */
+export const TRANSFER_READABLE_VERSIONS: readonly number[] = [1, 2, 3];
+/** The version to write for a set of exported definitions. */
+export function transferFormatVersionFor(definitions: readonly { stages?: readonly unknown[] }[]): number {
+  return definitions.some((definition) => (definition.stages?.length ?? 0) > 0) ? TRANSFER_FORMAT_VERSION_STAGES : TRANSFER_FORMAT_VERSION;
+}
 export const TRANSFER_MAX_BYTES = 2 * 1024 * 1024;
 export const TRANSFER_MAX_WORKFLOWS = 50;
 export const TRANSFER_MAX_DEPTH = 24;
@@ -77,6 +85,8 @@ const packageDefinitionSchema = z.strictObject({
   phases: z.array(z.strictObject({ key: draftText(48), label: draftText(60) })).max(MAX_PHASES).optional(),
   acceptanceGates: z.array(packageGateSchema).max(MAX_ACCEPTANCE_GATES).optional(),
   storageFolder: draftText(FOLDER_TEMPLATE_MAX).optional(),
+  /** Version 3: phases, validated by the designer validator after import (unknown shapes are findings, not crashes). */
+  stages: z.array(z.unknown()).max(MAX_STAGES).optional(),
 });
 export type PackageDefinition = z.output<typeof packageDefinitionSchema>;
 
@@ -102,7 +112,7 @@ export type PackagePolicy = z.output<typeof packagePolicySchema>;
 
 const packageSchema = z.strictObject({
   format: z.literal(TRANSFER_FORMAT),
-  formatVersion: z.union([z.literal(1), z.literal(TRANSFER_FORMAT_VERSION)]),
+  formatVersion: z.union([z.literal(1), z.literal(TRANSFER_FORMAT_VERSION), z.literal(TRANSFER_FORMAT_VERSION_STAGES)]),
   exportedAt: z.string().max(40).refine((value) => !Number.isNaN(Date.parse(value)), "Use an ISO date."),
   source: z.strictObject({ release: z.string().max(80), label: z.string().max(120) }),
   // Bounded far above the product limit so "51 workflows" is reported as a plain blocking error, not a schema dump.
@@ -251,7 +261,37 @@ export function toDraftDefinition(definition: PackageDefinition, resolution: Gat
     if (resolved && "removeGates" in resolved) return [];
     return [{ ...gateRest, policyPublicId: resolved ? resolved.localPolicyPublicId : PLACEHOLDER_POLICY_ID }];
   });
-  return { ...rest, ...(gates.length ? { acceptanceGates: gates } : {}) };
+  const stages = rest.stages?.map(portableStage);
+  return { ...rest, ...(stages ? { stages } : {}), ...(gates.length ? { acceptanceGates: gates } : {}) };
+}
+
+/**
+ * Installation-local phase targets do not travel: file-sync connection ids and managed webhook subscriptions are
+ * cleared on import (the administrator picks local ones); canonical production targets (`production:P101`) are kept.
+ */
+function portableStage(stage: unknown): unknown {
+  if (!stage || typeof stage !== "object" || Array.isArray(stage)) return stage;
+  const copy = { ...(stage as Record<string, unknown>) };
+  if (copy.fileSync && typeof copy.fileSync === "object") copy.fileSync = { ...DEFAULT_STAGE_FILE_SYNC };
+  const actions = copy.stageActions;
+  if (actions && typeof actions === "object" && !Array.isArray(actions)) {
+    const { webhookTargetKey, ...other } = actions as Record<string, unknown>;
+    copy.stageActions = typeof webhookTargetKey === "string" && webhookTargetKey.startsWith("production:") ? { ...other, webhookTargetKey } : other;
+  }
+  return copy;
+}
+
+/** Warnings for phase targets that `portableStage` clears. */
+function stageTargetFindings(definition: PackageDefinition, out: TransferFinding[]): void {
+  (definition.stages ?? []).forEach((stage, index) => {
+    if (!stage || typeof stage !== "object") return;
+    const record = stage as { fileSync?: Record<string, unknown>; stageActions?: { webhookTargetKey?: unknown } };
+    if (record.fileSync && Object.values(record.fileSync).some(Boolean))
+      out.push({ severity: "warning", code: "STAGE_FILE_SYNC_CLEARED", path: `definition.stages.${index}.fileSync`, message: `Phase ${index + 1}: file sync targets belong to the source installation and are cleared. Choose local ones before publishing.` });
+    const target = record.stageActions?.webhookTargetKey;
+    if (typeof target === "string" && !target.startsWith("production:"))
+      out.push({ severity: "warning", code: "STAGE_WEBHOOK_CLEARED", path: `definition.stages.${index}.stageActions.webhookTargetKey`, message: `Phase ${index + 1}: the webhook subscription belongs to the source installation and is cleared.` });
+  });
 }
 
 /** Findings for one workflow: markup, unknown references, the designer validator and the publishing schema. */
@@ -266,6 +306,7 @@ export function workflowFindings(workflow: PackageWorkflow, knownRefs: ReadonlyS
     if (!knownRefs.has(gate.policyRef))
       findings.push({ severity: "error", code: "GATE_REFERENCE_UNKNOWN", path: `definition.acceptanceGates.${index}.policyRef`, message: `Acceptance gate ${index + 1} points to a policy that is not listed in the file.` });
   });
+  stageTargetFindings(workflow.definition, findings);
   const draft = toDraftDefinition(workflow.definition, resolution);
   const issues: WorkflowIssue[] = validateDraft(draft);
   for (const issue of issues) findings.push({ severity: issue.severity, code: issue.code, path: issue.path ? `definition.${issue.path}` : "definition", message: issue.message });

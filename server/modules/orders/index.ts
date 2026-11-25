@@ -52,6 +52,7 @@ import { createOrderPaymentsPort, createStagesService } from "./stages.js";
 export type { StageWorkspace, StageViewState } from "./stages.js";
 import { createPhaseWorkServices } from "./questionsRouter.js";
 import { createStageStartup, STAGE_STARTUP_JOB } from "./stageStartup.js";
+import { checkStageTargets } from "./stageTargets.js";
 
 export type * from "./types.js";
 
@@ -144,6 +145,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     audit: deps.audit,
     actorCheck,
     rulesEnabled: (tx) => readSetting(deps.settings, ORDER_WORKFLOW_RULES_ENABLED, tx),
+    checkStageTargets: (stages, tx) => checkStageTargets(deps.services, stages, tx),
   });
   const gates = createGatesService({
     db: deps.db,

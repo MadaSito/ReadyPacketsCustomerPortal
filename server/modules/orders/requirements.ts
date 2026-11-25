@@ -800,6 +800,9 @@ export function createRequirementsService(deps: RequirementsDeps) {
         if (!roleHasCapability(principal.role, "orders.phase.unlock")) throw forbidden("CAPABILITY_NOT_GRANTED");
         await deps.actorCheck(principal, tx, "orders.phase.unlock");
         if (view.lockState === "legal_hold" || view.lockState === "imported_read_only") throw orderLocked(view.lockState);
+        // Increment 07 (D1): format-3 phases are reopened through orders.stages.reopen (admin, step-up, audited).
+        const pinned = await workflows.byVersionId(tx, view.workflowVersionId);
+        if (pinned.definition.stages?.length) throw conflict("USE_STAGE_REOPEN", "Phases in this workflow are reopened from the phase panel.");
         const [row] = await tx
           .select()
           .from(orderPhaseLocks)

@@ -442,6 +442,8 @@ export function createStagesService(deps: StagesDeps) {
     /** `orders.stages.review` — staff record the outcome of a submitted phase. `changes_requested` does not unlock. */
     async review(principal: SessionPrincipal, input: { orderId: string; stageKey: string; outcome: "accepted" | "changes_requested"; note?: string; expectedVersion: number }) {
       if (!roleHasCapability(principal.role, "orders.stage.review")) throw forbidden("CAPABILITY_NOT_GRANTED");
+      if (input.outcome === "changes_requested" && !input.note?.trim())
+        throw validation("NOTE_REQUIRED", "Tell the customer what needs to change.");
       const outcome = await deps.db.transaction(async (tx) => {
         const view = await deps.policy.assertCanReadOrder(principal, input.orderId, { tx, forUpdate: true });
         if (!isStaffSide(view)) throw ORDER_NOT_FOUND();

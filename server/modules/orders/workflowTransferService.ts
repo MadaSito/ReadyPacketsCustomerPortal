@@ -33,7 +33,7 @@ import {
   sha256Hex,
   toDraftDefinition,
   TRANSFER_FORMAT,
-  TRANSFER_FORMAT_VERSION,
+  transferFormatVersionFor,
   TRANSFER_MAX_BYTES,
   TRANSFER_MAX_WORKFLOWS,
   uniqueKey,
@@ -370,7 +370,7 @@ export function createWorkflowTransferService(deps: WorkflowTransferDeps) {
         const now = deps.clock.now();
         const pkg = {
           format: TRANSFER_FORMAT,
-          formatVersion: TRANSFER_FORMAT_VERSION,
+          formatVersion: transferFormatVersionFor(workflows.map((workflow) => workflow.definition)),
           exportedAt: now.toISOString(),
           source: { release: deps.release.slice(0, 80), label: deps.installationLabel.slice(0, 120) },
           workflows: plain.workflows,
