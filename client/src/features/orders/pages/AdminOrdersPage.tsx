@@ -5,15 +5,24 @@ import { useState } from "react";
 import { Link, useSearch } from "wouter";
 import { useSession } from "@/lib/session";
 import { useTRPC } from "@/lib/trpc";
-import { DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
+import { Button, DataTable, DateTime, EmptyState, Field, FilterBar, Input, LoadMore, Money, PageHeader, Select } from "@/ui";
 import { NewOrderForCustomerButton } from "../ConsoleOrderTools";
 import { LOCK_LABELS, LockBadge, OrderStatusBadge, money, type LockState } from "../shared";
 
 const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const STATUS_KEY = /^[a-z][a-z0-9_]{1,47}$/;
 
-type Filters = { referencePrefix: string; status: string; lockState: string; customerPublicId: string; from: string; to: string };
-const EMPTY: Filters = { referencePrefix: "", status: "", lockState: "", customerPublicId: "", from: "", to: "" };
+type AttentionFilter = "" | "staff_review" | "customer_response";
+type Filters = {
+  referencePrefix: string;
+  status: string;
+  lockState: string;
+  customerPublicId: string;
+  from: string;
+  to: string;
+  attention: AttentionFilter;
+};
+const EMPTY: Filters = { referencePrefix: "", status: "", lockState: "", customerPublicId: "", from: "", to: "", attention: "" };
 
 function toInput(filters: Filters) {
   const ref = filters.referencePrefix.trim();
@@ -25,6 +34,7 @@ function toInput(filters: Filters) {
     customerPublicId: ULID.test(filters.customerPublicId.trim()) ? filters.customerPublicId.trim() : undefined,
     from: filters.from ? new Date(`${filters.from}T00:00:00`) : undefined,
     to: filters.to ? new Date(`${filters.to}T23:59:59.999`) : undefined,
+    attention: filters.attention === "staff_review" || filters.attention === "customer_response" ? filters.attention : undefined,
   };
 }
 
@@ -32,28 +42,68 @@ export default function AdminOrdersPage() {
   const trpc = useTRPC();
   const { me } = useSession();
   const search = useSearch();
-  // Deep links such as /admin/orders?status=in_review (from the console overview) pre-select the status filter.
+  // Deep links such as /admin/orders?status=in_review or /admin/orders?attention=staff_review pre-select filters.
   const [draft, setDraft] = useState<Filters>(() => {
-    const status = new URLSearchParams(search).get("status") ?? "";
-    return { ...EMPTY, status: STATUS_KEY.test(status) ? status : "" };
+    const params = new URLSearchParams(search);
+    const status = params.get("status") ?? "";
+    const attention = params.get("attention") ?? "";
+    return {
+      ...EMPTY,
+      status: STATUS_KEY.test(status) ? status : "",
+      attention: attention === "staff_review" || attention === "customer_response" ? attention : "",
+    };
   });
   // Filter controls apply immediately; the reference search applies on submit.
   const [appliedRef, setAppliedRef] = useState("");
   const applied: Filters = { ...draft, referencePrefix: appliedRef };
+  const statusCatalog = useQuery(trpc.orders.statusCatalog.list.queryOptions({ includeRetired: true }, { retry: false }));
+  const attentionCounts = useQuery(trpc.orders.statusCatalog.attentionCounts.queryOptions(undefined, { retry: false }));
   const workflows = useQuery(trpc.orders.admin.workflows.list.queryOptions(undefined, { enabled: me?.user.role === "admin", retry: false }));
   const list = useInfiniteQuery(trpc.orders.admin.list.infiniteQueryOptions(toInput(applied), { getNextPageParam: (page) => page.nextCursor ?? undefined }));
   const rows = list.data?.pages.flatMap((page) => page.items);
-  const statusOptions = (workflows.data ?? [])
+  const catalogEntries = (statusCatalog.data ?? []).map((item) => ({
+    key: item.key,
+    label: item.retired ? `${item.staffLabel} (retired)` : item.staffLabel,
+  }));
+  const workflowEntries = (workflows.data ?? [])
     .flatMap((wf) => wf.definition?.states ?? [])
-    .filter((state, index, all) => all.findIndex((s) => s.key === state.key) === index)
-    .map((state) => ({ value: state.key, label: state.label }));
+    .map((state) => ({ key: state.key, label: state.label }));
+  const statusOptions = [...catalogEntries, ...workflowEntries]
+    .filter((entry, index, all) => all.findIndex((candidate) => candidate.key === entry.key) === index)
+    .map((entry) => ({ value: entry.key, label: entry.label }));
   const activeCount = Object.values(applied).filter((value) => value !== "").length - (applied.referencePrefix ? 1 : 0);
   const set = (key: keyof Filters) => (event: { target: { value: string } }) => setDraft((current) => ({ ...current, [key]: event.target.value }));
 
   return (
     <>
-      <PageHeader title="Orders" description="Every customer order. Filter by reference, status, lock, customer or date." actions={<NewOrderForCustomerButton />} />
+      <PageHeader title="Orders" description="Every customer order. Filter by attention, reference, status, lock, customer or date." actions={<NewOrderForCustomerButton />} />
       <div className="flex flex-col gap-6">
+        <div role="group" aria-label="Filter orders by attention" className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant={draft.attention === "" ? "primary" : "secondary"}
+            aria-pressed={draft.attention === ""}
+            onClick={() => setDraft((current) => ({ ...current, attention: "" }))}
+          >
+            All orders
+          </Button>
+          <Button
+            size="sm"
+            variant={draft.attention === "staff_review" ? "primary" : "secondary"}
+            aria-pressed={draft.attention === "staff_review"}
+            onClick={() => setDraft((current) => ({ ...current, attention: "staff_review" }))}
+          >
+            {attentionCounts.data ? `Awaiting staff review (${attentionCounts.data.staffReview})` : "Awaiting staff review"}
+          </Button>
+          <Button
+            size="sm"
+            variant={draft.attention === "customer_response" ? "primary" : "secondary"}
+            aria-pressed={draft.attention === "customer_response"}
+            onClick={() => setDraft((current) => ({ ...current, attention: "customer_response" }))}
+          >
+            {attentionCounts.data ? `Awaiting customer response (${attentionCounts.data.customerResponse})` : "Awaiting customer response"}
+          </Button>
+        </div>
         <FilterBar
           search={draft.referencePrefix}
           onSearchChange={(value) => setDraft((current) => ({ ...current, referencePrefix: value }))}

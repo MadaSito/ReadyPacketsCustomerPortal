@@ -20,12 +20,13 @@ const COUNT_PAGE = 100;
 
 export default function OrdersPipelineWidget() {
   const trpc = useTRPC();
+  const attentionCounts = useQuery(trpc.orders.statusCatalog.attentionCounts.queryOptions(undefined, { retry: false }));
   const counts = useQueries({
     queries: PIPELINE_STATUSES.map((status) => trpc.orders.admin.list.queryOptions({ status: status.key, limit: COUNT_PAGE })),
   });
   const recent = useQuery(trpc.orders.admin.list.queryOptions({ limit: 5 }));
   const failed = [recent, ...counts].find((query) => query.isError);
-  const ready = recent.isSuccess && counts.every((query) => query.isSuccess);
+  const ready = recent.isSuccess && !attentionCounts.isPending && counts.every((query) => query.isSuccess);
 
   return (
     <Card
@@ -42,6 +43,7 @@ export default function OrdersPipelineWidget() {
           title="We couldn't load the orders pipeline"
           onRetry={() => {
             void recent.refetch();
+            void attentionCounts.refetch();
             for (const query of counts) void query.refetch();
           }}
         />
@@ -49,6 +51,34 @@ export default function OrdersPipelineWidget() {
         <Skeleton lines={4} />
       ) : (
         <div className="flex flex-col gap-4">
+          {attentionCounts.data ? (
+            <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
+                <dt className="text-xs text-muted">Awaiting staff review</dt>
+                <dd className="mt-1 text-xl font-semibold text-ink">
+                  <Link
+                    href="/admin/orders?attention=staff_review"
+                    className="inline-flex min-h-6 min-w-6 items-center justify-center rounded-sm underline-offset-2 hover:underline"
+                  >
+                    {attentionCounts.data.staffReview}{" "}
+                    <span className="sr-only">orders awaiting staff review</span>
+                  </Link>
+                </dd>
+              </div>
+              <div className="rounded-[var(--radius-card)] border border-line bg-surface-soft p-3">
+                <dt className="text-xs text-muted">Awaiting customer response</dt>
+                <dd className="mt-1 text-xl font-semibold text-ink">
+                  <Link
+                    href="/admin/orders?attention=customer_response"
+                    className="inline-flex min-h-6 min-w-6 items-center justify-center rounded-sm underline-offset-2 hover:underline"
+                  >
+                    {attentionCounts.data.customerResponse}{" "}
+                    <span className="sr-only">orders awaiting customer response</span>
+                  </Link>
+                </dd>
+              </div>
+            </dl>
+          ) : null}
           <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             {PIPELINE_STATUSES.map((status, index) => {
               const data = counts[index]!.data!;

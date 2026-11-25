@@ -64,7 +64,17 @@ export default function AdminWorkflowsPage() {
     <PageHeader
       title="Workflows"
       description="Order statuses and who may move an order between them. Publishing creates a new version; existing orders keep theirs."
-      actions={workflows.data ? <><Button onClick={() => setCreating(true)}>New workflow</Button>{transfer.importAction}</> : null}
+      actions={
+        workflows.data ? (
+          <>
+            <Button asChild variant="secondary">
+              <Link href="/admin/workflows/statuses">Statuses</Link>
+            </Button>
+            <Button onClick={() => setCreating(true)}>New workflow</Button>
+            {transfer.importAction}
+          </>
+        ) : null
+      }
     />
   );
   if (workflows.isPending)
