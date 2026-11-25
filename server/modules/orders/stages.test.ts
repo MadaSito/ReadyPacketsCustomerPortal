@@ -11,6 +11,7 @@ import { createOrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersions } from "./schema.js";
 import { STANDARD_V3_DEFINITION, stageModelOf, workflowFormatOf } from "./stageModel.js";
+import { completedStageKeys } from "./stageRuntime.js";
 import { createStageStartup } from "./stageStartup.js";
 import { fakeIdentity, insertUser, ordersTestSchema } from "./testSupport.js";
 import { transferFormatVersionFor } from "./workflowTransfer.js";
@@ -28,6 +29,18 @@ describe("stored shapes", () => {
     const old = workflowStageSchema.parse({ key: "intake", customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["start"], actions: {} });
     expect(old).toMatchObject({ progression: "next", completesOn: "manual", weight: 1, acknowledgement: { policy: "none" }, adminTasks: [] });
     expect(old.fileSync).toEqual({ originals: null, conversionStaging: null, intakeDelivery: null });
+  });
+
+  it("after a reopen, phases after the current one that were accepted before no longer count as completed", () => {
+    const model = stageModelOf(workflowDefinitionSchema.parse(STANDARD_V3_DEFINITION));
+    const keys = model.stages.map((stage) => stage.key);
+    const accepted = keys.slice(0, 4).map((stageKey) => ({ stageKey, state: "accepted" as const }));
+    const firstStatusOf = (index: number) => model.stages[index]!.statusKeys[0]!;
+    // Back at phase 2 (index 1) after a reopen: only phase 1 and (if accepted) phase 2 count.
+    expect([...completedStageKeys(model, accepted, firstStatusOf(1))].sort()).toEqual([keys[0], keys[1]].sort());
+    // At phase 5 the earlier phases count; a final status outside the phases keeps every accepted row.
+    expect(completedStageKeys(model, accepted, firstStatusOf(4)).size).toBe(4);
+    expect(completedStageKeys(model, accepted, "canceled").size).toBe(4);
   });
 
   it("transfer writes version 3 only when a workflow has phases", () => {

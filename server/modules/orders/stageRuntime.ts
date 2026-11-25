@@ -43,6 +43,22 @@ export function isCanceledStatus(statusKey: string, lookup: Pick<StatusCatalogLo
   return statusKey.includes("cancel") || lookup?.category === "canceled";
 }
 
+/**
+ * Completed stages for D3: every stage before the current one (the order moved past it), plus accepted rows up to
+ * and including the current stage. After an administrator reopens an earlier phase, phases after it that were
+ * accepted before no longer count, matching the stepper (stateAt). With no current stage (final or unmapped
+ * status), every accepted row counts.
+ */
+export function completedStageKeys(model: StageModel, rows: readonly Pick<StageProgressRow, "stageKey" | "state">[], statusKey: string): Set<string> {
+  const current = stageIndexOfStatus(model, statusKey);
+  const indexOf = new Map(model.stages.map((stage, index) => [stage.key, index]));
+  const done = new Set(
+    rows.filter((row) => row.state === "accepted" && (current < 0 || (indexOf.get(row.stageKey) ?? Infinity) <= current)).map((row) => row.stageKey),
+  );
+  if (current > 0) for (const stage of model.stages.slice(0, current)) done.add(stage.key);
+  return done;
+}
+
 export function createStageRuntime(deps: StageRuntimeDeps) {
   /** D2 catalogue (recovery_ops' port on services.orders.statusCatalog), else the deterministic fallback. */
   async function statusLookup(db: DbOrTx, bound: BoundWorkflow, statusKey: string): Promise<StatusCatalogLookup> {
@@ -78,13 +94,7 @@ export function createStageRuntime(deps: StageRuntimeDeps) {
       .where(eq(orderStageProgress.id, row.id));
   }
 
-  /** Completed stages for D3: accepted rows, plus every stage before the current one (the order moved past it). */
-  function completedKeys(model: StageModel, rows: StageProgressRow[], statusKey: string): Set<string> {
-    const done = new Set(rows.filter((row) => row.state === "accepted").map((row) => row.stageKey));
-    const current = stageIndexOfStatus(model, statusKey);
-    if (current > 0) for (const stage of model.stages.slice(0, current)) done.add(stage.key);
-    return done;
-  }
+  const completedKeys = completedStageKeys;
 
   async function attentionOf(db: DbOrTx, input: { orderId: number; workflowVersionId: number; statusKey: string; model: StageModel; rows: StageProgressRow[]; lookup: StatusCatalogLookup }): Promise<OrderAttention> {
     if (isCanceledStatus(input.statusKey, input.lookup)) return "none";
