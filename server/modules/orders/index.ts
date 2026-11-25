@@ -184,7 +184,7 @@ export function createOrdersModule(deps: ModuleDeps): OrdersModule {
     resolveStage: stages.resolveQuestionStage,
     refreshAttentionInTx: stages.refreshAttentionInTx,
   });
-  const stageStartup = createStageStartup({ db: deps.db, clock: deps.clock, audit: deps.audit, logger: deps.logger, paymentSummary: () => paymentProvider });
+  const stageStartup = createStageStartup({ db: deps.db, clock: deps.clock, audit: deps.audit, logger: deps.logger, paymentSummary: () => paymentProvider, recalcStoredProgress: stageRuntime.recalcStored });
   deps.jobs.register(STAGE_STARTUP_JOB, async (job) => {
     await job.assertStillOwned();
     return stageStartup.job();

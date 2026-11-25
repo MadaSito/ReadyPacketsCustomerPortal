@@ -222,22 +222,21 @@ export function deriveStages(definition: DerivableDefinition): WorkflowStage[] {
 
 /**
  * D3 progress for one order (pure; the server stores the result in `orders.progress_percent`).
+ * Increment 07 lead ruling (QA on e8fe1ec): every phase counts by its weight — no "actionable" filter.
  * - `completedStageKeys`: stages whose runtime state is `accepted`, or that the order has moved past.
- * - A stage is actionable when it has any customer action or uses submit_lock; when no stage is actionable, every
- *   stage counts (so derived workflows still progress by status).
- * - `statusCategory` `done` gives 100. Shown = max(derived, explicit).
+ * - derived = floor(doneWeight * 100 / totalWeight), capped at 99 until the status category is `done` (then 100),
+ *   so the bar never shows 100 while work is still ahead.
+ * - Shown = max(derived, explicit). Canceled handling stays with the caller.
  */
 export function computeProgress(input: {
-  stages: readonly Pick<WorkflowStage, "key" | "actions" | "progression" | "weight">[];
+  stages: readonly Pick<WorkflowStage, "key" | "weight">[];
   completedStageKeys: ReadonlySet<string>;
   statusCategory: "start" | "working" | "waiting" | "done" | "canceled" | null;
   explicitPercent: number | null;
 }): { derived: number; shown: number } {
-  const actionable = input.stages.filter((stage) => stage.progression === "submit_lock" || STAGE_ACTION_KEYS.some((key) => stage.actions[key]));
-  const counted = actionable.length ? actionable : input.stages;
-  const total = counted.reduce((sum, stage) => sum + stage.weight, 0);
-  const done = counted.filter((stage) => input.completedStageKeys.has(stage.key)).reduce((sum, stage) => sum + stage.weight, 0);
-  const derived = input.statusCategory === "done" ? 100 : total === 0 ? 0 : Math.floor((done * 100) / total);
+  const total = input.stages.reduce((sum, stage) => sum + stage.weight, 0);
+  const done = input.stages.filter((stage) => input.completedStageKeys.has(stage.key)).reduce((sum, stage) => sum + stage.weight, 0);
+  const derived = input.statusCategory === "done" ? 100 : total === 0 ? 0 : Math.min(99, Math.floor((done * 100) / total));
   const explicit = input.explicitPercent === null ? 0 : Math.max(0, Math.min(100, Math.trunc(input.explicitPercent)));
   return { derived, shown: Math.max(derived, explicit) };
 }

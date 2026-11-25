@@ -68,6 +68,23 @@ export function stageHasCustomerWork(stage: WorkflowStage): boolean {
   return stage.progression === "submit_lock" || Object.values(stage.actions).some(Boolean);
 }
 
+/**
+ * Lead ruling (QA e8fe1ec): the customer gets Next only on a "next" phase with at least one enabled customer action
+ * that does not complete on payment. Payment phases complete from the payment state or a staff status change;
+ * phases with nothing for the customer are completed by staff or by status.
+ */
+export function customerMayNext(stage: Pick<WorkflowStage, "progression" | "actions" | "completesOn">): boolean {
+  return stage.progression === "next" && stage.completesOn !== "payment" && Object.values(stage.actions).some(Boolean);
+}
+
+/** The submit-and-lock phase that owns `statusKey` on a format-3 model (null otherwise). */
+export function submitLockStageOf(model: StageModel, statusKey: string): WorkflowStage | null {
+  if (model.derived) return null;
+  const index = stageIndexOfStatus(model, statusKey);
+  const stage = index >= 0 ? model.stages[index]! : null;
+  return stage?.progression === "submit_lock" ? stage : null;
+}
+
 /** The text a customer acknowledges when a submit-and-lock phase has no custom message. */
 export const STANDARD_LOCK_WARNING =
   "When you submit this phase it is locked. You will not be able to add, change or remove anything in it unless our team reopens it.";

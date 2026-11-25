@@ -25,7 +25,7 @@ import type { RequirementsService } from "./requirements.js";
 import { sha256Hex } from "./requirements.js";
 import { orderNotes, orderPhaseLocks, orders, orderStageProgress, type OrderPaymentState } from "./schema.js";
 import { isCanceledStatus, type StageProgressRow, type StageRuntime } from "./stageRuntime.js";
-import { stageAckText, stageIndexOfStatus, stageModelOf, type StageModel } from "./stageModel.js";
+import { customerMayNext, stageAckText, stageIndexOfStatus, stageModelOf, type StageModel } from "./stageModel.js";
 import type { OrderAccessView } from "./types.js";
 import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import { findState, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
@@ -66,6 +66,8 @@ export interface StageWorkspaceStage {
   submittedAt: string | null;
   review: { outcome: "accepted" | "changes_requested"; note: string | null; at: string } | null;
   canNext: boolean;
+  /** Current phase, customer view: "payment" = waiting for payment confirmation, "team" = staff complete it. */
+  waitingOn: "payment" | "team" | null;
   canSubmit: boolean;
   canReview: boolean;
   canReopen: boolean;
@@ -258,7 +260,9 @@ export function createStagesService(deps: StagesDeps) {
         ...(staff ? { adminTasks: [...stage.adminTasks] } : {}),
         submittedAt: row?.submittedAt ? row.submittedAt.toISOString() : null,
         review: row?.reviewOutcome && row.reviewedAt ? { outcome: row.reviewOutcome, note: await noteBody(db, row.reviewNotePublicId), at: row.reviewedAt.toISOString() } : null,
-        canNext: customerCanWork && stage.progression === "next",
+        canNext: customerCanWork && customerMayNext(stage),
+        /** Lead ruling (QA e8fe1ec): why the customer has no Next/Submit on the current phase (null = they do, or not theirs). */
+        waitingOn: customerCanWork && !customerMayNext(stage) && stage.progression !== "submit_lock" ? (stage.completesOn === "payment" ? ("payment" as const) : ("team" as const)) : null,
         canSubmit: customerCanWork && stage.progression === "submit_lock",
         canReview: v3 && staff && roleHasCapability(principal.role, "orders.stage.review") && (state === "submitted" || state === "in_review") && !projection.canceled,
         canReopen:
@@ -299,6 +303,8 @@ export function createStagesService(deps: StagesDeps) {
       if (projection.canceled || index !== projection.currentIndex) throw stageNotOpen();
       if (!workingStates.has(stateAt(projection, index))) throw stageNotOpen();
       if (projection.lockedKeys.has(stage.key)) throw stageLocked();
+      if (kind === "next" && stage.progression === "next" && !customerMayNext(stage))
+        throw conflict("STAGE_NOT_CUSTOMER_ACTIONABLE", stage.completesOn === "payment" ? "This phase completes when payment is confirmed." : "Our team completes this phase. Nothing is needed from you right now.");
       if ((kind === "next") !== (stage.progression === "next"))
         throw conflict("STAGE_PROGRESSION", kind === "next" ? "This phase is finished with Submit and lock." : "This phase is finished with Next.");
       await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });

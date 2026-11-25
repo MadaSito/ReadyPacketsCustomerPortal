@@ -468,11 +468,17 @@ type StageWorkspace = {
     governance: StageGovernance | null; adminTasks?: StageAdminTask[] /* staff only */;
     submittedAt: string | null; review: { outcome: "accepted" | "changes_requested"; note: string | null; at: string } | null;
     canNext: boolean; canSubmit: boolean; canReview: boolean; canReopen: boolean;
+    waitingOn: "payment" | "team" | null; // current phase, customer: why there is no Next/Submit (null otherwise)
   }>;
 };
 ```
 
 Rules: only the current stage is writable for the customer; earlier stages are viewable read-only; later stages are `future`. "Next" completes the stage without a lock; "Submit and lock" records the submission (acknowledgement evidence: policy, text hash, time, actor) and creates the `order_phase_locks` row keyed by the stage key (administrator unlock only, via `reopen`). When the next stage's first status is reachable by an allowed transition for the actor in the pinned version, the order moves there in the same transaction; otherwise the status waits for staff. `changes_requested` records the outcome and note and sets the stage state to `in_review` (the lock stays); an administrator reopens to let the customer edit. Derived (format 1/2) workflows refuse `next` / `submit` / `review` / `reopen` with `STAGE_ACTION_OFF`. The legacy `orders.phases.unlock` refuses format-3 orders with `USE_STAGE_REOPEN`. Ack text hash = SHA-256 of the message shown (the standard warning when empty).
+
+Lead rulings (QA on e8fe1ec):
+- Customer Next only on a `next` phase with at least one enabled customer action that does not complete on payment (`customerMayNext`); otherwise `canNext: false`, `waitingOn` is `payment` (completesOn payment) or `team`, and `orders.stages.next` refuses with `STAGE_NOT_CUSTOMER_ACTIONABLE` (409).
+- Submit-and-lock cannot be bypassed: on format 3, a customer `orders.transition` out of a status owned by a `submit_lock` phase is refused with `STAGE_SUBMIT_REQUIRED` (409) until that phase is `submitted`, `in_review` or `accepted`; cancel targets stay allowed; staff, admin and API actors are unaffected. `orders.get` omits those transitions for the customer.
+- Progress (D3 as changed): every phase counts by weight; a phase is complete when accepted or passed; derived = floor(doneWeight × 100 ÷ totalWeight), capped at 99 until the status category is `done` (100); shown = max(derived, explicit); canceled frozen. The start-up job (`orders.increment07.startup`) recalculates stored `progress_percent` for orders on format-3 versions (may lower a stale value; up to 25 batches of 200 per run, once per process).
 
 List rows (`orders.list`, `orders.admin.list`, dashboard recent orders) gain `progressPercent`, `progressCanceled`, `phaseLabel` (customer label for customers, staff label for staff), `phaseIndex` (0-based, null when the status is in no phase), `phaseTotal`, `paymentState`, `attention`. Rows with a null progress cache are filled on read. `orders.admin.list` accepts `attention?: "staff_review" | "customer_response"`.
 

@@ -12,7 +12,7 @@ import type { AuditEmitter, Clock, Db, DbOrTx, FieldCrypto, Logger, Mailer, Sess
 import type { Services } from "../../container.js";
 import { readSetting } from "../platform/index.js";
 import type { CatalogService } from "./catalog.js";
-import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStatusHistory } from "./schema.js";
+import { orderGrants, orderLineItems, orderLockHistory, orderNotes, orderReassignments, orderNameHistory, orderReferences, orders, orderStageProgress, orderStatusHistory } from "./schema.js";
 import { ORDER_NOT_FOUND, orderLocked, type OrderPolicy } from "./policy.js";
 import { compliancePort, engagementPort, filesPort, identityPort, paymentExposurePort, promoNotApplicable, promotionsPort, releaseIsSafe, requirePromotions, withPromoAttemptGuard, type PromotionContext, type PromotionOutcome } from "./ports.js";
 import { getRequestContext } from "../../core/requestContext.js";
@@ -25,7 +25,7 @@ import type { BoundWorkflow, WorkflowService } from "./workflows.js";
 import type { RequirementsService } from "./requirements.js";
 import type { OrderGatesService } from "./gates.js";
 import type { StageRuntime } from "./stageRuntime.js";
-import { stageIndexOfStatus, stageModelOf } from "./stageModel.js";
+import { stageIndexOfStatus, stageModelOf, submitLockStageOf } from "./stageModel.js";
 import type { OrderAttention, OrderPaymentState as OrderPaymentStateV7 } from "./schema.js";
 import { findState, initialState, isCancelState, transitionActionLabel, transitionsFrom, type WorkflowActor } from "./workflowTypes.js";
 
@@ -712,7 +712,11 @@ export function createOrderService(deps: OrderServiceDeps) {
       const history = await tx.select().from(orderStatusHistory).where(eq(orderStatusHistory.orderId, view.id)).orderBy(desc(orderStatusHistory.id)).limit(200);
       const actor = workflowActor(view);
       const canTransition = actor !== null && policy.writeVerdict(principal, view.accessRole, view.lockState, "status") === null;
-      const transitions = canTransition && actor ? transitionsFrom(bound.definition, order.statusKey, actor) : [];
+      const allTransitions = canTransition && actor ? transitionsFrom(bound.definition, order.statusKey, actor) : [];
+      // Lead ruling (QA e8fe1ec): while a submit-and-lock phase is open the customer finishes it with Submit and lock
+      // in the phase panel, so the header offers only cancel (the server refuses the rest: STAGE_SUBMIT_REQUIRED).
+      const lockPending = actor === "customer" && allTransitions.length > 0 && (await submitLockPending(tx, view.id, view.workflowVersionId, bound, order.statusKey));
+      const transitions = lockPending ? allTransitions.filter((t) => isCancelTarget(bound, t.to)) : allTransitions;
       const label = (key: string | null) => {
         if (!key) return null;
         const state = findState(bound.definition, key);
@@ -1154,6 +1158,10 @@ export function createOrderService(deps: OrderServiceDeps) {
           const transition = actor ? transitionsFrom(bound.definition, view.statusKey, actor).find((t) => t.to === input.toStatus) : undefined;
           if (!transition) throw new DomainError("FORBIDDEN", "TRANSITION_NOT_ALLOWED", "That status change is not available for this order.");
           if (transition.requiresNote && !input.note) throw validation("NOTE_REQUIRED", "Please add a note explaining this change.");
+          // Lead ruling (QA e8fe1ec): a customer may not move out of an open submit-and-lock phase by a plain status
+          // change (that skipped the questions, acknowledgement and lock). Staff, admin and API actors are unaffected.
+          if (actor === "customer" && !isCancelTarget(bound, transition.to) && (await submitLockPending(tx, view.id, view.workflowVersionId, bound, view.statusKey)))
+            throw conflict("STAGE_SUBMIT_REQUIRED", "Finish this phase with Submit and lock first.");
           // B6: a customer-side phase submit (any move out of a gated status) needs the gate met; cancel is always allowed.
           if (actor === "customer" && !isCancelTarget(bound, transition.to))
             await deps.gates.assertCustomerMayWork({ tx, orderId: view.id, actor: principal, action: "phase_submit", statusKey: view.statusKey });
@@ -1813,3 +1821,15 @@ export interface OrderSyncView {
 
 export type OrderService = ReturnType<typeof createOrderService>;
 export { notFound };
+
+/** True while the format-3 submit-and-lock phase owning `statusKey` has not been submitted or accepted. */
+async function submitLockPending(db: DbOrTx, orderId: number, workflowVersionId: number, bound: BoundWorkflow, statusKey: string): Promise<boolean> {
+  const stage = submitLockStageOf(stageModelOf(bound.definition), statusKey);
+  if (!stage) return false;
+  const [row] = await db
+    .select({ state: orderStageProgress.state })
+    .from(orderStageProgress)
+    .where(and(eq(orderStageProgress.orderId, orderId), eq(orderStageProgress.workflowVersionId, workflowVersionId), eq(orderStageProgress.stageKey, stage.key)))
+    .limit(1);
+  return !(row && (row.state === "submitted" || row.state === "in_review" || row.state === "accepted"));
+}

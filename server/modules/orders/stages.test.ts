@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { workflowStageSchema } from "../../../shared/workflowStages.js";
+import { computeProgress, workflowStageSchema } from "../../../shared/workflowStages.js";
 import { createTestDeps } from "../../../tests/helpers/fakes.js";
 import { createTestDb } from "../../../tests/helpers/testDb.js";
 import { ulid } from "../../core/ids.js";
@@ -11,7 +11,7 @@ import { createOrdersModule } from "./index.js";
 import { ordersRouter } from "./router.js";
 import { orders, orderWorkflowDrafts, orderWorkflows, orderWorkflowVersions } from "./schema.js";
 import { STANDARD_V3_DEFINITION, stageModelOf, workflowFormatOf } from "./stageModel.js";
-import { completedStageKeys } from "./stageRuntime.js";
+import { completedStageKeys, createStageRuntime } from "./stageRuntime.js";
 import { createStageStartup } from "./stageStartup.js";
 import { fakeIdentity, insertUser, ordersTestSchema } from "./testSupport.js";
 import { transferFormatVersionFor } from "./workflowTransfer.js";
@@ -41,6 +41,18 @@ describe("stored shapes", () => {
     // At phase 5 the earlier phases count; a final status outside the phases keeps every accepted row.
     expect(completedStageKeys(model, accepted, firstStatusOf(4)).size).toBe(4);
     expect(completedStageKeys(model, accepted, "canceled").size).toBe(4);
+  });
+
+  it("progress counts every phase by weight and never shows 100 before the done category", () => {
+    const stages = [{ key: "a", weight: 1 }, { key: "b", weight: 2 }, { key: "c", weight: 1 }];
+    const run = (done: string[], statusCategory: "working" | "done" = "working", explicitPercent: number | null = null) =>
+      computeProgress({ stages, completedStageKeys: new Set(done), statusCategory, explicitPercent });
+    expect(run([])).toEqual({ derived: 0, shown: 0 });
+    expect(run(["a"])).toEqual({ derived: 25, shown: 25 });
+    expect(run(["a", "b"])).toEqual({ derived: 75, shown: 75 });
+    expect(run(["a", "b", "c"])).toEqual({ derived: 99, shown: 99 });
+    expect(run(["a", "b", "c"], "done")).toEqual({ derived: 100, shown: 100 });
+    expect(run(["a"], "working", 60)).toEqual({ derived: 25, shown: 60 });
   });
 
   it("transfer writes version 3 only when a workflow has phases", () => {
@@ -82,6 +94,11 @@ it("runs the standard phases end to end with owner-only actions, acknowledgement
     await expect(as(outsider.principal).stages.workspace({ orderId })).rejects.toMatchObject({ code: "NOT_FOUND" });
     const first = await workspace();
     expect(first).toMatchObject({ workflowFormat: 3, derived: false, currentStageKey: "payment_confirmed" });
+    // Lead ruling: nothing for the customer to do on the payment phase — no Next, a clear wait reason, server refuses.
+    expect(first.stages.find((stage) => stage.key === "payment_confirmed")).toMatchObject({ canNext: false, waitingOn: "payment" });
+    await expect(buyer.stages.next({ orderId, stageKey: "payment_confirmed", expectedVersion: first.version }))
+      .rejects.toMatchObject({ cause: { reasonCode: "STAGE_NOT_CUSTOMER_ACTIONABLE" } });
+    expect(first.progress.percent).toBe(0);
 
     // Payment port: paid completes the payment phase and advances; a repeat is a no-op.
     const paid = await db.db.transaction((tx) =>
@@ -95,6 +112,17 @@ it("runs the standard phases end to end with owner-only actions, acknowledgement
     const intake = await workspace();
     expect(intake.currentStageKey).toBe("phase_1_intake");
     const progressAfterPayment = intake.progress.percent;
+    // Every phase counts by weight (7 phases of weight 1): payment done = floor(100 / 7).
+    expect(progressAfterPayment).toBe(14);
+    expect(intake.stages.find((stage) => stage.key === "phase_1_intake")).toMatchObject({ canSubmit: true, waitingOn: null });
+    // Submit-and-lock cannot be bypassed with a plain status change; the header offers no such transition.
+    const header = await buyer.get({ orderId });
+    expect(header.transitions.map((t) => t.to)).not.toContain("in_review");
+    await expect(buyer.transition({ orderId, expectedVersion: intake.version, toStatus: "in_review" }))
+      .rejects.toMatchObject({ cause: { reasonCode: "STAGE_SUBMIT_REQUIRED" } });
+    expect((await row()).statusKey).toBe("intake_open");
+    // Staff are unaffected (checked on the header only, so the phase stays open for the customer path below).
+    expect((await reviewer.get({ orderId })).transitions.map((t) => t.to)).toContain("in_review");
     const scope = { orderId, stageKey: "phase_1_intake" };
     await expect(reviewer.stages.submit({ ...scope, expectedVersion: intake.version })).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(buyer.stages.review({ ...scope, expectedVersion: intake.version, outcome: "accepted" })).rejects.toMatchObject({ code: "FORBIDDEN" });
@@ -142,6 +170,16 @@ it("runs the standard phases end to end with owner-only actions, acknowledgement
     expect(reopened.currentStageKey).toBe("phase_1_intake");
     expect(reopened.stages.find((stage) => stage.key === "phase_1_intake")).toMatchObject({ state: "reopened", locked: false });
     expect(reopened.progress.percent).toBeLessThanOrEqual(accepted.progress.percent);
+    expect((await buyer.get({ orderId })).transitions.map((t) => t.to)).not.toContain("in_review");
+
+    // Stored values from the old rule are recalculated by the start-up job (allowed to lower a stale value).
+    expect(accepted.progress.percent).toBe(28);
+    await db.db.update(orders).set({ progressPercent: 100 }).where(eq(orders.publicId, orderId));
+    const runtime = createStageRuntime({ db: db.db, clock: h.clock, services: h.services, workflows: mod.workflows });
+    const startup = createStageStartup({ db: db.db, clock: h.clock, audit: h.deps.audit, logger: h.deps.logger, recalcStoredProgress: runtime.recalcStored });
+    expect(await startup.refreshProgress()).toBe(1);
+    expect((await row()).progressPercent).toBeLessThan(100);
+    expect(await startup.refreshProgress()).toBe(0);
   } finally {
     await db.cleanup();
   }

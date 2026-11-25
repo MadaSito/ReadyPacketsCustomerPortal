@@ -210,6 +210,28 @@ export function createStageRuntime(deps: StageRuntimeDeps) {
       return filled;
     },
 
+    /**
+     * Lead ruling (QA on e8fe1ec): the progress rule changed (every phase counts), so stored values computed under the
+     * old rule are recalculated once per start for orders on format-3 versions. `allowLower` drops a stale 50 or
+     * 100; a canceled order stays frozen (recalcInTx). Each order runs in its own short transaction with its row lock.
+     */
+    async recalcStored(orderIds: number[]): Promise<number> {
+      let changed = 0;
+      for (const orderId of orderIds) {
+        try {
+          await deps.db.transaction(async (tx) => {
+            const [row] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, orderId)).limit(1).for("update");
+            if (!row) return;
+            const result = await recalcInTx(tx, orderId, { allowLower: true });
+            if (result.progressPercent !== result.previousPercent) changed += 1;
+          });
+        } catch {
+          // start-up maintenance: one order failing must not stop the rest (the next start tries again)
+        }
+      }
+      return changed;
+    },
+
     /** Batch read of current-stage rows for list projections (no locks). */
     async rowsForOrders(db: DbOrTx, orderIds: number[]): Promise<StageProgressRow[]> {
       if (!orderIds.length) return [];
