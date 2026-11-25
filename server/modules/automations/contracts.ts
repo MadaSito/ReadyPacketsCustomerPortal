@@ -33,9 +33,12 @@ import type {
   TriggerFieldType,
   TriggerRecipient,
 } from "../audit/triggerCatalogue.js";
+import type { StageActions, StageCompletion } from "../../../shared/workflowStages.js";
 
 export type {
   AuditTapEvent,
+  StageActions,
+  StageCompletion,
   TriggerCatalogueEntry,
   TriggerField,
   TriggerFieldType,
@@ -87,6 +90,51 @@ export const AUTOMATION_STEP_STATES = [
   "unknown",
 ] as const;
 export type AutomationStepState = (typeof AUTOMATION_STEP_STATES)[number];
+
+export const ORDER_STAGE_RUN_STATES = [
+  "completed",
+  "partial_failed",
+  "failed",
+] as const;
+export type OrderStageRunState = (typeof ORDER_STAGE_RUN_STATES)[number];
+
+export const STAGE_BUNDLE_SLOTS = [
+  "status",
+  "completion",
+  "email",
+  "webhook",
+  "dashboard_alert",
+] as const;
+export type StageBundleSlotKey = (typeof STAGE_BUNDLE_SLOTS)[number];
+
+export const STAGE_BUNDLE_SLOT_OUTCOMES = [
+  "completed",
+  "scheduled",
+  "skipped",
+  "failed",
+] as const;
+export type StageBundleSlotOutcome = (typeof STAGE_BUNDLE_SLOT_OUTCOMES)[number];
+
+export const COMPLETION_JOB_SOURCES = [
+  "stage_run",
+  "automation_run",
+] as const;
+export type CompletionJobSource = (typeof COMPLETION_JOB_SOURCES)[number];
+
+export const COMPLETION_POLICY_KINDS = [
+  "fixed",
+  "range",
+] as const;
+export type CompletionPolicyKind = (typeof COMPLETION_POLICY_KINDS)[number];
+
+export const COMPLETION_JOB_STATES = [
+  "scheduled",
+  "applied",
+  "superseded",
+  "canceled",
+  "failed",
+] as const;
+export type CompletionJobState = (typeof COMPLETION_JOB_STATES)[number];
 
 export const AUTOMATION_MAX_CONDITION_GROUPS = 10 as const;
 export const AUTOMATION_MAX_CONDITIONS_PER_GROUP = 20 as const;
