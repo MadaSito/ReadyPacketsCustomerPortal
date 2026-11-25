@@ -71,6 +71,20 @@ Workflows today are status graphs. Definition formats 1 and 2 group statuses int
 - The upgrade prepares a draft only. The owner reviews and publishes it; running orders keep their version.
 - The progress percentage shown is the higher of the derived and explicit values.
 
+## As implemented: questions and checklist (D4)
+
+Package D, from the owner's [API](../../server/modules/orders/questions/API.md) and [admin guide](../../server/modules/orders/questions/ADMIN_GUIDE.md). Verification: **PENDING-LEAD**.
+
+- **Procedures.** `orders.questions.{customerList, answer, list, ask, withdraw, history}` and `orders.adminTasks.{list, set}`. Staff procedures need `orders.questions.manage`; review and reopen stay in `orders.stages`.
+- **Limits.** A prompt is 1–2,000 characters and an answer 1–8,000. A phase holds at most 40 questions, withdrawn ones included, and a question at most 1,000 answer versions. History is returned newest first, 10 at a time.
+- **Concurrency.** Answers and checklist ticks are compare-and-set on `expectedVersion`. A stale answer is refused with `QUESTION_ANSWER_VERSION_CHANGED`, and an unavailable phase with `STAGE_NOT_OPEN`.
+- **Who may write.** A viewer may read the current or a completed phase but not answer. Customer writes recheck the open, unlocked phase, a working order, live account authority and every customer-work gate. Staff cannot add questions to a submitted or completed phase without a reopen.
+- **Withdrawing.** A withdrawn question keeps its answers, is hidden from the customer and takes no new answers.
+- **Gate.** Before a phase advances, `assertStageQuestionsAnswered` runs inside the order-locked transaction. If any active required question has no answer, it refuses with `QUESTIONS_UNANSWERED`.
+- **Review.** **Request changes** records the review but does not reopen editing.
+- **Checklist.** The task keys are `upload_team_document`, `assign_questions`, `review_submission` and `run_automation`. A tick tracks work. It does not replace a review, a file check or an automation run.
+- **Storage and audit.** Prompts and answers are field-encrypted with per-row AAD, and answer versions are never overwritten or deleted. The audit events are `order.question.{asked, withdrawn, answered}` and `order.admin_task.{checked, unchecked}`. They carry identifiers, phase, versions, booleans and task keys only. Question and answer text never appears in logs or the audit trail, and it is rendered as plain text, never as HTML.
+
 ## Consequences
 - Administrators design phases in an editor close to the one they know, while the status graph and existing orders keep working.
 - Two models coexist (format 1/2 phases and format 3 stages), and the derived-stage view hides the difference from customers.
