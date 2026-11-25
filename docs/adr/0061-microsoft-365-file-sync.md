@@ -31,6 +31,18 @@ The owner asked for Microsoft 365 / SharePoint sync "so order files can be prope
 - File sync targets and receipts to Microsoft 365 are off until configured.
 - "Conversion staging" receives the original audio and the WebM derivative; no document conversion runs.
 
+## As implemented
+
+Package L, as reported by the owner:
+
+- **Connection.** File sync uses a dedicated private SharePoint connection with the Graph and Graph upload egress presets.
+- **Write check.** After the ordinary read test, the write check is session-based and creates no file.
+- **Approval.** A destination is approved explicitly, either for phase files or as the only, restricted Receipts target. The phase selectors default to off.
+- **Resync.** It is bounded to 100 existing failed or blocked intents, with a dry run first.
+- **Uncertain uploads.** They are inspected, not replayed.
+- **No backfill.** Files from before sync was switched on are not copied.
+- **OneDrive.** It needs tenant-wide application file permissions, so SharePoint with `Sites.Selected` is preferred.
+
 ## Consequences
 - SharePoint mirrors the portal's phase structure. Changes made in SharePoint are not reflected back.
 - The `Sites.Selected` permission must be granted to the specific site before the destination test passes.

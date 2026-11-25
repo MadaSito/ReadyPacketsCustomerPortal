@@ -43,6 +43,7 @@ TLS, upgrades, and go-live checks are in the [deployment profiles](../../deploy/
 - [Policy acceptances](#policy-acceptances)
 - [Reports](#reports)
 - [Security incidents](#security-incidents)
+- [Alerts](#alerts)
 - [Microsoft 365 file sync](#microsoft-365-file-sync)
 - [Customer tasks and the order agreement](./WORKFLOW_CUSTOMER_TASKS.md)
 
@@ -382,6 +383,25 @@ The portal correlates security events every minute and opens an incident when a 
 - **Proxy warning.** If client addresses cannot be determined behind your proxy, a warning appears, and banning pauses until the trusted-proxy settings are fixed.
 - **Break-glass.** A server command lists and clears bans without the web UI ([ADR 0050](../adr/0050-signin-bans-backoff-correlation.md)).
 - **SIEM.** Incidents and bans are audit events (`security.incident.*`, `security.ban.*`), so SIEM and syslog receivers get them.
+
+## Alerts
+
+<!-- platform_engineer: from jobs_engineer's D6 handoff; verification PENDING-LEAD. -->
+
+Operational alerts collect failures that need a person ([ADR 0058](../adr/0058-outbound-webhooks-and-operational-alerts.md)). They come from:
+
+- phase action bundles and completion jobs;
+- webhooks;
+- Microsoft Graph and file sync;
+- payments;
+- certificate expiry.
+
+Each failure raises one alert, not one per retry.
+
+- **Dashboard.** The `/admin` dashboard counts open alerts by severity (warning, error, critical) and links to them.
+- **Alerts page.** Open **Alerts** (`/admin/alerts`). Staff and administrators can read alerts with `ops.alerts.read` and filter them by severity, source and state. With `ops.alerts.manage` they can **Acknowledge** or **Resolve** an alert.
+- **Audit and SIEM.** Alerts go to the audit trail and SIEM with safe codes only.
+- **Attention reminders.** Reminders for orders waiting on staff or the customer are **off** by default. When switched on, a reminder fires after 48 hours by default (`orders.attention_alert_hours`).
 
 ## Microsoft 365 file sync
 
