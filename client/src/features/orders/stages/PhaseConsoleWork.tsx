@@ -4,7 +4,7 @@ import type { inferRouterOutputs } from "@trpc/server";
 import type { AppRouter } from "@server/trpc/root";
 import type { StageAdminTask } from "@shared/workflowStages";
 import { errorMessage, useTRPC } from "@/lib/trpc";
-import { Badge, Button, Callout, Checkbox, ConfirmDialog, DateTime, Field, Skeleton, Textarea, useToast } from "@/ui";
+import { Badge, Button, Callout, Checkbox, DateTime, Dialog, Field, Skeleton, Textarea, useToast } from "@/ui";
 
 type Scope = { orderId: string; stageKey: string };
 type Question = inferRouterOutputs<AppRouter>["orders"]["questions"]["list"]["questions"][number];
@@ -56,15 +56,33 @@ function StaffQuestion({ question, scope, canManage, refresh }: {
   const trpc = useTRPC();
   const toast = useToast();
   const heading = useRef<HTMLHeadingElement>(null);
+  const cancelWithdraw = useRef<HTMLButtonElement>(null);
+  const withdrawing = useRef(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [withdrawOpen, setWithdrawOpen] = useState(false);
   const [error, setError] = useState("");
   const historyId = useId();
+  const questionLabelId = useId();
   const withdraw = useMutation(trpc.orders.questions.withdraw.mutationOptions());
+  async function withdrawQuestion() {
+    if (withdrawing.current) return;
+    withdrawing.current = true;
+    setError("");
+    try {
+      await withdraw.mutateAsync({ ...scope, questionId: question.questionId });
+      setWithdrawOpen(false);
+      await refresh();
+      toast.show({ tone: "success", title: "Question withdrawn" });
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      withdrawing.current = false;
+    }
+  }
   return (
     <li className="min-w-0 space-y-2 rounded-[var(--radius-control)] border border-line px-4 py-3">
       <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
-        <h4 ref={heading} tabIndex={-1} className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</h4>
+        <h4 ref={heading} id={questionLabelId} tabIndex={-1} className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</h4>
         <Badge tone="neutral">{question.withdrawnAt ? "Withdrawn" : question.required ? "Required" : "Optional"}</Badge>
       </div>
       <p className="text-sm text-muted">Asked <DateTime value={question.askedAt} />{question.withdrawnAt ? <> · Withdrawn <DateTime value={question.withdrawnAt} /></> : null}</p>
@@ -75,29 +93,23 @@ function StaffQuestion({ question, scope, canManage, refresh }: {
         </div>
       ) : <p className="text-sm text-muted">No answer yet.</p>}
       <div className="flex flex-wrap gap-2">
-        {question.latestAnswer ? <Button variant="secondary" aria-expanded={historyOpen} aria-controls={historyId}
+        {question.latestAnswer ? <Button variant="secondary" aria-expanded={historyOpen} aria-controls={historyId} aria-describedby={questionLabelId}
           onClick={() => setHistoryOpen(!historyOpen)}>{historyOpen ? "Hide answer history" : "Show answer history"}</Button> : null}
-        {canManage && !question.withdrawnAt ? <Button variant="ghost" onClick={() => { setError(""); setWithdrawOpen(true); }}>Withdraw question</Button> : null}
+        {canManage && !question.withdrawnAt ? <Button variant="ghost" aria-describedby={questionLabelId}
+          onClick={() => { setError(""); setWithdrawOpen(true); }}>Withdraw question</Button> : null}
       </div>
       <div id={historyId} hidden={!historyOpen}>
         {historyOpen ? <History questionId={question.questionId} scope={scope} /> : null}
       </div>
-      <ConfirmDialog open={withdrawOpen} onOpenChange={setWithdrawOpen} title="Withdraw this question?"
+      <Dialog open={withdrawOpen} onOpenChange={setWithdrawOpen} title="Withdraw this question?"
+        initialFocusRef={cancelWithdraw} returnFocusRef={heading} dismissible={!withdraw.isPending}
         description="The customer will no longer see the question or be able to answer. Existing answer versions will stay in the console."
-        destructive confirmLabel="Withdraw question" onConfirm={async () => {
-          setError("");
-          try {
-            await withdraw.mutateAsync({ ...scope, questionId: question.questionId });
-            await refresh();
-            toast.show({ tone: "success", title: "Question withdrawn" });
-            requestAnimationFrame(() => heading.current?.focus());
-          } catch (cause) {
-            setError(errorMessage(cause));
-            throw cause;
-          }
-        }}>
+        footer={<div className="flex flex-wrap gap-2">
+          <Button variant="secondary" ref={cancelWithdraw} disabled={withdraw.isPending} onClick={() => setWithdrawOpen(false)}>Cancel</Button>
+          <Button variant="danger" loading={withdraw.isPending} onClick={() => void withdrawQuestion()}>Withdraw question</Button>
+        </div>}>
         {error ? <Callout live="assertive" tone="danger">{error}</Callout> : null}
-      </ConfirmDialog>
+      </Dialog>
     </li>
   );
 }

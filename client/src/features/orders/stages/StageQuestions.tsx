@@ -10,7 +10,9 @@ type Scope = { orderId: string; stageKey: string };
 type Question = inferRouterOutputs<AppRouter>["orders"]["questions"]["customerList"]["questions"][number];
 const MAX_ANSWER_LENGTH = 8_000;
 
-function CustomerQuestion({ scope, question, canAnswer }: { scope: Scope; question: Question; canAnswer: boolean }) {
+function CustomerQuestion({ scope, question, canAnswer, Heading }: {
+  scope: Scope; question: Question; canAnswer: boolean; Heading: "h4" | "h5";
+}) {
   const id = useId();
   const trpc = useTRPC();
   const cache = useQueryClient();
@@ -91,7 +93,7 @@ function CustomerQuestion({ scope, question, canAnswer }: { scope: Scope; questi
   return (
     <li className="min-w-0 space-y-3 rounded-[var(--radius-control)] border border-line bg-surface px-4 py-3">
       <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
-        <h4 ref={heading} id={id} tabIndex={-1} className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</h4>
+        <Heading ref={heading} id={id} tabIndex={-1} className="min-w-0 flex-1 whitespace-pre-wrap break-words font-medium text-ink">{question.prompt}</Heading>
         <Badge tone={question.required && !question.latestAnswer ? "warning" : "neutral"}>{question.required ? "Required" : "Optional"}</Badge>
       </div>
       {question.latestAnswer ? (
@@ -118,7 +120,7 @@ function CustomerQuestion({ scope, question, canAnswer }: { scope: Scope; questi
           </div>
         </form>
       ) : canAnswer ? (
-        <Button ref={trigger} variant="secondary" onClick={startEditing}>{question.latestAnswer ? "Edit answer" : "Answer question"}</Button>
+        <Button ref={trigger} variant="secondary" aria-describedby={id} onClick={startEditing}>{question.latestAnswer ? "Edit answer" : "Answer question"}</Button>
       ) : null}
       <p className={status ? "text-sm text-body" : "sr-only"} role="status">{status}</p>
       {agreement && edit ? (
@@ -131,15 +133,17 @@ function CustomerQuestion({ scope, question, canAnswer }: { scope: Scope; questi
 }
 
 /** Customer wizard slot. The server (not readOnly) enforces phase and order access. */
-export function StageQuestions({ orderId, stageKey, readOnly = false }: Scope & { readOnly?: boolean }) {
+export function StageQuestions({ orderId, stageKey, readOnly = false, headingLevel = 3 }: Scope & { readOnly?: boolean; headingLevel?: 3 | 4 }) {
   const trpc = useTRPC();
   const scope = { orderId, stageKey };
   const id = useId();
   const query = useQuery(trpc.orders.questions.customerList.queryOptions(scope));
+  const SectionHeading = headingLevel === 4 ? "h4" : "h3";
+  const QuestionHeading = headingLevel === 4 ? "h5" : "h4";
   return (
     <section aria-labelledby={id} className="ph-no-capture min-w-0 space-y-3" data-clarity-mask="true">
-      <h3 id={id} className="font-semibold text-ink">Questions from our team</h3>
-      {query.isPending ? <Skeleton className="h-20 w-full" /> : query.isError ? (
+      <SectionHeading id={id} className="font-semibold text-ink">Questions from our team</SectionHeading>
+      {query.isPending ? <><p role="status" className="sr-only">Loading questions</p><Skeleton className="h-20 w-full" /></> : query.isError ? (
         <Callout tone="danger" live="assertive" title="Could not load questions">
           <p>{errorMessage(query.error)}</p>
           <Button variant="secondary" onClick={() => void query.refetch()}>Retry</Button>
@@ -151,7 +155,8 @@ export function StageQuestions({ orderId, stageKey, readOnly = false }: Scope & 
           {!readOnly && query.data.canAnswer ? <p className="text-sm text-muted">Save an answer for each required question before continuing.</p>
             : <p className="text-sm text-muted">You can read saved answers, but cannot edit them.</p>}
           <ul className="space-y-3">
-            {query.data.questions.map((question) => <CustomerQuestion key={question.questionId} scope={scope} question={question} canAnswer={!readOnly && query.data.canAnswer} />)}
+            {query.data.questions.map((question) => <CustomerQuestion key={question.questionId} scope={scope} question={question}
+              Heading={QuestionHeading} canAnswer={!readOnly && query.data.canAnswer} />)}
           </ul>
         </>
       )}

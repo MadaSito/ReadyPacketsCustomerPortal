@@ -83,8 +83,10 @@ function PhaseDecisionDialog({ command, orderId, stageKey, expectedVersion, onCl
       onClose();
       await refresh();
     } catch (cause) {
-      setRequestError(errorMessage(cause));
-      if (safeError(cause)?.reasonCode === "STALE_VERSION") await refresh();
+      if (safeError(cause)?.reasonCode === "STALE_VERSION") {
+        setRequestError("This order changed while the dialog was open. Close the dialog and review the updated phase before trying again.");
+        await refresh();
+      } else setRequestError(errorMessage(cause));
     } finally {
       busy.current = false;
       setWorking(false);
@@ -95,8 +97,8 @@ function PhaseDecisionDialog({ command, orderId, stageKey, expectedVersion, onCl
     <Dialog open onOpenChange={(open) => { if (!open && !working) onClose(); }} title={COMMAND_LABELS[command]}
       initialFocusRef={noteRef} returnFocusRef={returnFocusRef} dismissible={!working}
       description={reasonNeeded ? "The customer can edit this phase again. The reason is recorded for staff." : changes
-        ? "Record what needs to change. An administrator must reopen the phase before the customer can edit it."
-        : "Record your review of the submitted phase."}
+        ? "Your note is shown to the customer. An administrator must reopen the phase before the customer can edit it."
+        : "Record your review of the submitted phase. Any note you enter is shown to the customer."}
       footer={<div className="flex flex-wrap gap-2">
         <Button variant="secondary" disabled={working} onClick={onClose}>Cancel</Button>
         <Button form={formId} type="submit" loading={working}>{COMMAND_LABELS[command]}</Button>
@@ -118,7 +120,9 @@ function PhaseDecisionDialog({ command, orderId, stageKey, expectedVersion, onCl
   );
 }
 
-function PhaseContent({ phase, workspace, renderActions }: { phase: Phase; workspace: Workspace; renderActions?: (stageKey: string) => ReactNode }) {
+function PhaseContent({ phase, workspace, renderActions, retainPhase }: {
+  phase: Phase; workspace: Workspace; renderActions?: (stageKey: string) => ReactNode; retainPhase: (key: string) => void;
+}) {
   const trpc = useTRPC();
   const cache = useQueryClient();
   const phaseHeading = useRef<HTMLHeadingElement>(null);
@@ -131,9 +135,11 @@ function PhaseContent({ phase, workspace, renderActions }: { phase: Phase; works
     cache.invalidateQueries({ queryKey: trpc.orders.admin.get.queryKey({ orderId }) }),
   ]);
   function open(command: Command) {
+    // Refresh can advance the current phase; retain this selection as the dialog's return target.
+    retainPhase(stageKey);
     setDecision({ command, expectedVersion: workspace.version });
   }
-  const actions = renderActions ? renderActions(stageKey) : PhaseActions
+  const actions = workspace.derived ? null : renderActions ? renderActions(stageKey) : PhaseActions
     ? <Suspense fallback={<><p role="status" className="sr-only">Loading phase actions</p><Skeleton lines={2} /></>}>
         <PhaseActions orderId={orderId} stageKey={stageKey} />
       </Suspense>
@@ -198,7 +204,7 @@ export function OrderPhaseConsolePanel({ orderId, renderActions }: { orderId: st
                   value: stage.key, label: `${stage.index + 1}. ${stage.staffLabel ?? stage.customerLabel}${stage.key === currentStageKey ? " (current)" : ""}`,
                 }))} />
             </Field>
-            <PhaseContent key={phase.key} phase={phase} workspace={workspace.data} renderActions={renderActions} />
+            <PhaseContent key={phase.key} phase={phase} workspace={workspace.data} renderActions={renderActions} retainPhase={setSelection} />
           </div>
         ) : <p className="text-sm text-muted">No phases are associated with this order.</p>}
       </Card>
