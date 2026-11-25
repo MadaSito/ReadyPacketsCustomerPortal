@@ -26,12 +26,25 @@ export function registerFileArchiveHttpRoutes(router: Router, services: Services
       if (error instanceof DomainError) await archives().recordDenied(getHttpState(req).session ?? null, error.reasonCode);
       throw error;
     }
+    const form = typeof req.is("application/x-www-form-urlencoded") === "string";
     const parsed = body.safeParse(req.body);
     if (!parsed.success) {
       await archives().recordDenied(principal, "DOWNLOAD_TICKET_INVALID");
+      if (form) { res.status(204).end(); return; }
       throw validation("DOWNLOAD_TICKET_INVALID", "The download request is invalid.");
     }
-    const download = await archives().redeemDownloadTicket(principal, parsed.data.ticket);
+    // Native form POST (the browser streams to disk): a refusal must not replace the app page, so answer 204
+    // (the browser stays put) and let the client read the archive state. The refusal is still audited.
+    let download;
+    try {
+      download = await archives().redeemDownloadTicket(principal, parsed.data.ticket);
+    } catch (error) {
+      if (form && error instanceof DomainError && !res.headersSent) {
+        res.status(204).end();
+        return;
+      }
+      throw error;
+    }
     let outcome: "completed" | "failed" | "unknown" = "unknown";
     try {
       await sendPrivateDownload(res, { stream: download.stream, filename: download.filename, contentType: "application/zip", size: download.size });

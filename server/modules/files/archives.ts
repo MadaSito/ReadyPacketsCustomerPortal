@@ -62,6 +62,8 @@ export interface ArchiveView {
   createdAt: string;
   builtAt: string | null;
   expiresAt: string;
+  /** Admitted downloads so far; the form-download client watches this to confirm the browser received the ZIP. */
+  downloadCount: number;
 }
 
 export interface ArchiveDownload { stream: Readable; filename: string; size: number; archiveId: string }
@@ -92,6 +94,7 @@ export function toArchiveView(row: ArchiveRow): ArchiveView {
     archiveId: row.publicId, orderId: row.orderPublicId, scope: row.scope, stageKey: row.stageKey, state: row.state,
     reasonCode: row.reasonCode, fileCount: row.fileCount, totalBytes: row.totalBytes, zipBytes: row.zipBytes,
     createdAt: row.createdAt.toISOString(), builtAt: row.builtAt?.toISOString() ?? null, expiresAt: row.expiresAt.toISOString(),
+    downloadCount: row.downloadCount,
   };
 }
 
