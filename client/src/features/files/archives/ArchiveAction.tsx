@@ -44,7 +44,7 @@ export function submitDownloadForm(ticket: string, csrf: string): void {
   try { form.submit(); } finally { form.remove(); }
 }
 
-function useArchive(orderId: string, stageKey: string | null, filename: string) {
+function useArchive(orderId: string, stageKey: string | null) {
   const api = useTRPCClient();
   const stepUp = useStepUp();
   const [phase, setPhase] = useState<Phase>("idle");
@@ -79,9 +79,12 @@ function useArchive(orderId: string, stageKey: string | null, filename: string) 
         const response = await sessionFetch(apiUrl(DOWNLOAD_PATH), {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ticket }), cache: "no-store",
         });
-        if (!response.ok || !/^attachment[;\s]/iu.test(response.headers.get("content-disposition") ?? "")) {
+        const disposition = response.headers.get("content-disposition") ?? "";
+        if (!response.ok || !/^attachment[;\s]/iu.test(disposition)) {
           throw new ArchiveError("The download could not be authorized or completed. Prepare the archive again.");
         }
+        // The archive route emits a bounded ASCII name in both disposition fields.
+        const filename = /;\s*filename\*=UTF-8''([A-Za-z0-9._-]{1,116}\.zip)(?:;|$)/iu.exec(disposition)?.[1] ?? "order-files.zip";
         saveFileBlob(await response.blob(), filename);
         setPhase("done");
         setMessage("The ZIP archive was downloaded.");
@@ -113,8 +116,8 @@ function useArchive(orderId: string, stageKey: string | null, filename: string) 
   return { phase, message, run };
 }
 
-function ArchiveButton({ label, orderId, stageKey, filename }: { label: string; orderId: string; stageKey: string | null; filename: string }) {
-  const { phase, message, run } = useArchive(orderId, stageKey, filename);
+function ArchiveButton({ label, orderId, stageKey }: { label: string; orderId: string; stageKey: string | null }) {
+  const { phase, message, run } = useArchive(orderId, stageKey);
   const busy = phase === "preparing" || phase === "downloading";
   return (
     <div className="flex min-w-0 flex-col items-start gap-1">
@@ -128,10 +131,10 @@ function ArchiveButton({ label, orderId, stageKey, filename }: { label: string; 
 
 /** Phase ZIP: every current deliverable of one phase that the viewer may see. */
 export function PhaseArchiveAction({ orderId, stageKey, phaseName }: { orderId: string; stageKey: string; phaseName?: string }) {
-  return <ArchiveButton label={phaseName ? `Download ${phaseName} files (ZIP)` : "Download phase files (ZIP)"} orderId={orderId} stageKey={stageKey} filename={`order-${orderId}-phase-${stageKey}.zip`} />;
+  return <ArchiveButton label={phaseName ? `Download ${phaseName} files (ZIP)` : "Download phase files (ZIP)"} orderId={orderId} stageKey={stageKey} />;
 }
 
 /** Whole-order ZIP (administrators; the server requires a fresh identity check). Render only for administrators. */
 export function OrderArchiveAction({ orderId }: { orderId: string }) {
-  return <ArchiveButton label="Download all files (ZIP)" orderId={orderId} stageKey={null} filename={`order-${orderId}-all-files.zip`} />;
+  return <ArchiveButton label="Download all files (ZIP)" orderId={orderId} stageKey={null} />;
 }

@@ -75,4 +75,21 @@ describe("PhaseArchiveAction", () => {
     await waitFor(() => expect(screen.getByText(/The files changed since this archive was prepared/)).toBeInTheDocument(), { timeout: 5000 });
     expect(submitted).toHaveLength(1);
   }, 10_000);
+
+  it("retries an interrupted submission with a new ticket for the same already-ready archive", async () => {
+    api.request.mockResolvedValue(view({ downloadCount: 2 }));
+    api.issue.mockResolvedValueOnce({ ticket: "abandoned-ticket" }).mockResolvedValueOnce({ ticket: "retry-ticket" });
+    api.status.mockResolvedValue(view({ downloadCount: 3 }));
+    vi.mocked(HTMLFormElement.prototype.submit).mockImplementationOnce(() => { throw new Error("Synthetic interruption"); });
+    const user = userEvent.setup();
+    renderUi(<PhaseArchiveAction orderId={ORDER} stageKey="design" />);
+    const button = screen.getByRole("button", { name: /Download phase files/ });
+    await user.click(button);
+    await waitFor(() => expect(button).toBeEnabled());
+    await user.click(button);
+    await screen.findByText(/Your browser is saving the ZIP archive/, {}, { timeout: 5000 });
+    expect(api.request).toHaveBeenCalledTimes(2);
+    expect(api.issue.mock.calls).toEqual([[{ archiveId: view().archiveId }], [{ archiveId: view().archiveId }]]);
+    expect(submitted[0]!.fields.ticket).toBe("retry-ticket");
+  }, 10_000);
 });

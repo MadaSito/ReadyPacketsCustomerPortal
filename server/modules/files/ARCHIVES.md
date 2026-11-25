@@ -12,9 +12,11 @@ Owner: portable_contract_engineer. These files live in `server/modules/files` by
   - At build, by `openDeliverableFile` for every entry, as the requester's live session (the real principal from `identity.sessions.principalForJob`, which must be the same user and session, in state full with no pending steps; any refusal fails the build with `ARCHIVE_SESSION_ENDED`). If any entry is no longer eligible, the build fails with `ARCHIVE_STALE` and nothing old is exported silently.
   - At download, by the live session, the same session as the request, the capability and step-up again, and the selector for every member (count and versions must still match).
 - **Caps:** 250 files and 500 MiB uncompressed. Larger sets are refused with `ARCHIVE_TOO_LARGE`, and nothing is cut silently. Each account can have one active archive (queued, building or ready) across processes.
+- **Retries:** within the same session and scope, clicking Download again resumes queued/building work or reuses a ready archive whose manifest still matches. The click issues a fresh single-use ticket once ready. A stale ready archive is revoked and rebuilt. A valid request in another scope or after signing in through a new session supersedes the previous archive and is audited; old tickets never transfer.
 - **Expiry:** archives expire 30 minutes after they are requested. The object is deleted on expiry, revocation or failure.
 - **Entry names:** NFC, with control characters, `/`, `\`, `:` and leading dots replaced. Names are never absolute and never contain `..`, are at most 120 characters (extension kept), and get ` (2)`-style suffixes when names collide case-insensitively. Phase ZIPs are flat. Order ZIPs use one folder per phase plus `Order files/` for files that have no phase.
 - **Download:** a single-use, account- and session-bound ticket that lasts 60 seconds (hashed at rest), then `POST /api/files/archives/download` with `{ ticket }` in the body. The response is streamed with `Content-Type: application/zip`, never through a bearer URL.
+  - The `Content-Disposition` filename uses the order reference and customer phase label slug (for example, `RP-2026-000013-phase-1-intake.zip`), or the order reference and `-all-files.zip`, in both `filename` and `filename*`.
   - Ticket semantics: only a ticket bound to the caller's account and current session is consumed (atomically, committed before admission), so a refused admission still burns it; a ticket presented by anyone else is refused and left untouched. Admission (live session, archive row, order fence via the Files selector, fixed-manifest comparison, audit row, object open) runs in one transaction; only the byte stream continues after commit. A manifest mismatch revokes the archive (`ARCHIVE_STALE`).
   - `status` / `latest` re-check current order access under the order fence; a requester who lost access gets `NOT_FOUND` / `null` (no metadata or counts).
   - Foreign requester (another user's archive id): `NOT_FOUND`, reason `ARCHIVE_NOT_FOUND`, plus a `file.archive.denied` audit row.
@@ -49,7 +51,7 @@ tRPC, mounted by /root as `fileArchives` (`server/modules/files/archivesRouter.t
 
 | Procedure | Who | Input → output |
 |---|---|---|
-| `request` (mutation, expensive) | stage: any full session allowed by the selector; order: admin + `files.archive.order` (step-up) | `{ orderId, stageKey? }` → `ArchiveView`. An identical active archive is returned again; a different active one gives `CONFLICT/ARCHIVE_BUSY`. |
+| `request` (mutation, expensive) | stage: any full session allowed by the selector; order: admin + `files.archive.order` (step-up) | `{ orderId, stageKey? }` → `ArchiveView`. Resumes or reuses a matching active archive; otherwise an authorised request with eligible files replaces the previous active archive. |
 | `status` (query) | the requester only | `{ archiveId }` → `ArchiveView` |
 | `latest` (query) | the requester | `{ orderId, stageKey? }` → `ArchiveView \| null` (button state) |
 | `cancel` (mutation) | the requester | `{ archiveId }` → `ArchiveView` (revoked) |
@@ -77,14 +79,14 @@ Both are short-lived operational rows. They are not in portable packages (manife
 
 ## Verification (increment 07)
 
-- **Tested (`archives.test.ts`, 15 cases, real MySQL and in-memory storage):**
+- **Tested (`archives.test.ts`, real MySQL and in-memory storage):**
   - Entry names: traversal, reserved names and separators; case-insensitive dedupe; 30 duplicates at maximum length terminate, stay unique, ≤120 characters with the extension kept.
   - Caps: 251 files, more than 500 MiB and empty sets are refused.
-  - Requests: same-request reuse and a busy slot; whole-order ZIP needs admin and step-up; another user's archive and an archive after access is lost are hidden.
+  - Requests: queued/building resume, ready reuse and fresh tickets, stale replacement, scope/session supersession with one active slot; whole-order ZIP needs admin and step-up on request and ticket issue; another user's archive and an archive after access is lost are hidden.
   - Build: a ZIP read back with yauzl; a hash mismatch fails the build; an ended session fails the build.
   - Real Identity sessions (real `createIdentityModule`, and the fake Files port calls the real `sessions.assertCurrent`): a customer phase ZIP builds and downloads; an admin whole-order ZIP after a fresh step-up is ready with 2 files; a revoked session fails the build with `ARCHIVE_SESSION_ENDED` and stores no object. These cover the earlier `SESSION_NOT_CURRENT` failure from live QA.
   - Tickets and lifetime: single use; another session's ticket is refused without burning it; expiry; a manifest change before download revokes the archive; the expire job purges the object.
-- **Client (`ArchiveAction.test.tsx`, jsdom, 2 cases):** queued → ready under StrictMode submits one native form POST with only `ticket` + `csrf`, makes no fetch, removes the form, keeps focus on the button and passes axe; a refused download (archive revoked as stale) is reported in the polite status line.
+- **Client (`ArchiveAction.test.tsx`, jsdom):** queued → ready under StrictMode submits one native form POST with only `ticket` + `csrf`, makes no fetch, removes the form, keeps focus on the button and passes axe; a refused download (archive revoked as stale) is reported in the polite status line; a retry after an interrupted submission uses a fresh ticket.
 - **Type-checked and linted, not run:** `archivesRouter.ts` and `archivesHttp.ts` (including the 204 answer to a refused form POST). No real browser, mobile or screen-reader run.
 - **Download flow (browser):** a native top-level form POST (`application/x-www-form-urlencoded`, fields `ticket` and `csrf`) to `/api/files/archives/download`. The browser streams the attachment to disk; the page never holds the ZIP. The app layer (http_security_engineer) accepts the form only on this exact path, checks Origin, full session and the cookie + session-bound CSRF token, and hands the route a strict `{ ticket }`. A refusal inside the route answers `204 No Content` so the page stays put. The client then reads `downloadCount` from `status` to tell the user whether the download started. The sandboxed preview build refuses the form path and keeps a fetch fallback.
 - **Known limits:** refusals raised before the route (origin, CSRF, session) are JSON responses and would navigate away from the page. A real Files selector and the real job runner have not been exercised together with this module.

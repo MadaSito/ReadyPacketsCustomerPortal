@@ -10,6 +10,15 @@ const MAX_NAME = 120;
 const RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
 export const UNPHASED_FOLDER = "Order files";
 
+/** ASCII download filename, distinct from the member names inside the ZIP. */
+export function archiveDownloadName(reference: string, stageKey: string | null, customerLabel?: string): string {
+  const ascii = (value: string) => value.normalize("NFKD").replace(/\p{M}/gu, "");
+  const stem = ascii(reference).replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^[._-]+|[._-]+$/gu, "").slice(0, 64) || "order";
+  const slug = (value: string) => ascii(value).toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "");
+  const suffix = stageKey ? (slug(customerLabel ?? "") || slug(stageKey) || "phase") : "all-files";
+  return `${stem}-${suffix.slice(0, MAX_NAME - stem.length - "-.zip".length).replace(/-+$/u, "")}.zip`;
+}
+
 export function sanitiseSegment(raw: string, fallback = "file"): string {
   let name = raw.normalize("NFC").replace(/[\p{Cc}\p{Cf}/\\:*?"<>|]/gu, "_").replace(/\s+/gu, " ");
   name = name.replace(/^[.\s]+/u, "").replace(/[.\s]+$/u, "");

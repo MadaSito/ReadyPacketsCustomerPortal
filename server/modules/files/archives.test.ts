@@ -2,7 +2,7 @@
  * D8 archives against LOCAL FAKES and the local dev MySQL test database: entry names, caps, slot reuse, order-scope
  * re-authorisation, build verification, ticket semantics and stale-download revocation. Synthetic data only.
  */
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import yauzl from "yauzl";
 import { eq } from "drizzle-orm";
@@ -12,10 +12,11 @@ import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { DomainError } from "../../core/errors.js";
 import { ulid } from "../../core/ids.js";
 import type { SessionPrincipal, Tx } from "../../core/types.js";
+import { sendPrivateDownload } from "../../http/downloads.js";
 import { createIdentityModule, type IdentityModule } from "../identity/index.js";
 import { customerRefHistory, customerRefReservations, identityTokens, sessionRestrictions, signInEvents, users, userSessions } from "../identity/schema.js";
 import { orders } from "../orders/schema.js";
-import { archiveEntryNames, isSafeEntryName, sanitiseSegment } from "./archiveNames.js";
+import { archiveDownloadName, archiveEntryNames, isSafeEntryName, sanitiseSegment } from "./archiveNames.js";
 import { ARCHIVE_BUILD_JOB, ARCHIVE_LIMITS, createFileArchivesModule, type DeliverableFile, type FileArchivesModule } from "./archives.js";
 import { fileArchiveTickets, fileArchives } from "./archivesSchema.js";
 
@@ -72,7 +73,7 @@ beforeEach(async () => {
   } as never);
   orderId = ulid();
   await db.db.insert(orders).values({
-    publicId: orderId, reference: orderId, projectName: "Synthetic order", ownerUserId: Number((user as { insertId: number }).insertId),
+    publicId: orderId, reference: "RP-2026-000013", projectName: "Synthetic order", ownerUserId: Number((user as { insertId: number }).insertId),
     workflowVersionId: 1, statusKey: "intake", subtotalMinor: 0, totalMinor: 0, currency: "USD",
   } as never);
   customer = fakePrincipal({ role: "customer" });
@@ -116,6 +117,9 @@ beforeEach(async () => {
     },
     transitions: { derive: async () => [] },
   } as never;
+  h.services.orders = { stages: { listForOrder: async () => ({
+    stages: [{ key: "design", customerLabel: "Phase 1 Intake", staffLabel: "Internal design", viewable: true }],
+  }) } } as never;
   mod = createFileArchivesModule(h.deps);
 });
 
@@ -126,6 +130,15 @@ async function buildReady(p: SessionPrincipal, stageKey: string | null = "design
 }
 
 describe("entry names", () => {
+  it("sanitises and bounds download names while keeping the reference, label slug and ZIP extension", () => {
+    expect(archiveDownloadName("RP-2026-000013", "internal_key", "Fáse / Intake")).toBe("RP-2026-000013-fase-intake.zip");
+    expect(archiveDownloadName("..\r\n/RP-2026-000013", null)).toBe("RP-2026-000013-all-files.zip");
+    expect(archiveDownloadName("RP-2026-000013", "phase_1", "☃")).toBe("RP-2026-000013-phase-1.zip");
+    const long = archiveDownloadName("RP-2026-000013", "phase_1", "a".repeat(200));
+    expect(long).toHaveLength(120);
+    expect(long).toMatch(/^RP-2026-000013-[a-z]+\.zip$/u);
+  });
+
   it("sanitises traversal, reserved names, separators and dedupes case-insensitively", () => {
     expect(sanitiseSegment("../../etc/passwd")).not.toContain("/");
     expect(sanitiseSegment("CON.txt")).toBe("_CON.txt");
@@ -156,17 +169,116 @@ describe("request", () => {
     expect(await reason(mod.request(customer, { orderId, stageKey: "design" }))).toBe("ARCHIVE_EMPTY");
   });
 
-  it("reuses the same request and refuses a second different one", async () => {
+  it.each(["queued", "building"] as const)("resumes a %s job without re-snapshotting changed files", async (state) => {
     const a = await mod.request(customer, { orderId, stageKey: "design" });
+    await db.db.update(fileArchives).set({ state }).where(eq(fileArchives.publicId, a.archiveId));
+    files.push(file("late.pdf", "delta"));
     const b = await mod.request(customer, { orderId, stageKey: "design" });
-    expect(b.archiveId).toBe(a.archiveId);
-    expect(await reason(mod.request(customer, { orderId, stageKey: null }))).not.toBe("NO_ERROR");
+    expect(b).toMatchObject({ archiveId: a.archiveId, state, fileCount: 2, expiresAt: a.expiresAt });
+    expect(h.jobs.enqueued).toHaveLength(1);
+  });
+
+  it("reuses a matching ready archive and issues fresh single-use tickets without incrementing on issue", async () => {
+    const id = await buildReady(customer);
+    const abandoned = await mod.issueDownloadTicket(customer, id);
+    expect(await mod.request(customer, { orderId, stageKey: "design" })).toMatchObject({ archiveId: id, state: "ready", downloadCount: 0 });
+    const retry = await mod.issueDownloadTicket(customer, id);
+    expect(retry.ticket).not.toBe(abandoned.ticket);
+    expect((await mod.status(customer, id)).downloadCount).toBe(0);
+    await drain((await mod.redeemDownloadTicket(customer, retry.ticket)).stream);
+    expect(await reason(mod.redeemDownloadTicket(customer, retry.ticket))).toBe("DOWNLOAD_TICKET_INVALID");
+    expect(await mod.request(customer, { orderId, stageKey: "design" })).toMatchObject({ archiveId: id, state: "ready", downloadCount: 1 });
+    expect(h.audit.named("file.archive.requested")).toHaveLength(1);
+    expect(h.audit.named("file.archive.ticket_issued")).toHaveLength(2);
+    expect(h.audit.named("file.archive.downloaded")).toHaveLength(1);
+    expect(h.jobs.enqueued).toHaveLength(0);
+  });
+
+  it("revokes and rebuilds a stale ready archive under the same scope", async () => {
+    const id = await buildReady(customer);
+    const old = await mod.issueDownloadTicket(customer, id);
+    files.push(file("late.pdf", "delta"));
+    const replacement = await mod.request(customer, { orderId, stageKey: "design" });
+    expect(replacement.archiveId).not.toBe(id);
+    expect(replacement).toMatchObject({ state: "queued", fileCount: 3, downloadCount: 0 });
+    expect(await mod.status(customer, id)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_STALE" });
+    expect(h.storage.objects.size).toBe(0);
+    expect(await reason(mod.redeemDownloadTicket(customer, old.ticket))).toBe("ARCHIVE_NOT_READY");
+    expect(h.audit.named("file.archive.revoked")).toMatchObject([{ reasonCode: "ARCHIVE_STALE", resource: { publicId: id } }]);
+    await h.jobs.runAll(ARCHIVE_BUILD_JOB);
+    expect(await mod.status(customer, replacement.archiveId)).toMatchObject({ state: "ready" });
+  });
+
+  it("releases a stale ready ZIP when all files have been removed", async () => {
+    const id = await buildReady(customer);
+    files = [];
+    expect(await reason(mod.request(customer, { orderId, stageKey: "design" }))).toBe("ARCHIVE_EMPTY");
+    expect(await mod.status(customer, id)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_STALE" });
+    expect(h.storage.objects.size).toBe(0);
+  });
+
+  it("supersedes a different scope only after validating the new request and leaves one active ZIP", async () => {
+    const first = await mod.request(customer, { orderId, stageKey: "design" });
+    expect(await reason(mod.request(customer, { orderId, stageKey: null }))).toBe("CAPABILITY_NOT_GRANTED");
+    expect(await reason(mod.request(customer, { orderId, stageKey: "empty" }))).toBe("ARCHIVE_EMPTY");
+    expect(await mod.status(customer, first.archiveId)).toMatchObject({ state: "queued" });
+    files.push(file("review.pdf", "delta", "review"));
+    const replacement = await mod.request(customer, { orderId, stageKey: "review" });
+    expect(await mod.status(customer, first.archiveId)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_SUPERSEDED" });
+    expect(h.audit.named("file.archive.revoked")).toMatchObject([{ reasonCode: "ARCHIVE_SUPERSEDED" }]);
+    await h.jobs.runAll(ARCHIVE_BUILD_JOB);
+    expect(await mod.status(customer, first.archiveId)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_SUPERSEDED" });
+    expect(await mod.status(customer, replacement.archiveId)).toMatchObject({ state: "ready" });
+    expect(await db.db.select().from(fileArchives).where(eq(fileArchives.activeUserId, customer.userId))).toHaveLength(1);
+  });
+
+  it("does not let an in-flight superseded worker publish a ZIP or overwrite its revocation", async () => {
+    const first = await mod.request(customer, { orderId, stageKey: "design" });
+    const filesPort = h.services.files!;
+    const open = filesPort.openDeliverableFile;
+    let notifyStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const unblocked = new Promise<void>((resolve) => { release = resolve; });
+    filesPort.openDeliverableFile = async (...args) => {
+      notifyStarted();
+      await unblocked;
+      return open(...args);
+    };
+    const building = mod.build(first.archiveId);
+    await started;
+    try {
+      files.push(file("review.pdf", "delta", "review"));
+      await mod.request(customer, { orderId, stageKey: "review" });
+    } finally {
+      release();
+    }
+    expect(await building).toBe("revoked");
+    expect(await mod.status(customer, first.archiveId)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_SUPERSEDED" });
+    expect(h.storage.objects.size).toBe(0);
+    expect(h.audit.named("file.archive.built")).toHaveLength(0);
+  });
+
+  it("starts a new build for the same account in a new session without transferring old tickets", async () => {
+    const id = await buildReady(customer);
+    const old = await mod.issueDownloadTicket(customer, id);
+    const other = { ...customer, sessionId: "sess_reopened_example" };
+    liveSessions.add(other.sessionId);
+    const replacement = await mod.request(other, { orderId, stageKey: "design" });
+    expect(replacement).toMatchObject({ state: "queued" });
+    expect(replacement.archiveId).not.toBe(id);
+    expect(await mod.status(other, id)).toMatchObject({ state: "revoked", reasonCode: "ARCHIVE_SESSION_CHANGED" });
+    expect(await reason(mod.redeemDownloadTicket(other, old.ticket))).toBe("DOWNLOAD_TICKET_INVALID");
+    expect(await reason(mod.redeemDownloadTicket(customer, old.ticket))).toBe("ARCHIVE_NOT_READY");
   });
 
   it("whole-order ZIP needs admin and fresh step-up", async () => {
     expect(await reason(mod.request(customer, { orderId, stageKey: null }))).toBe("CAPABILITY_NOT_GRANTED");
+    const id = await buildReady(admin, null);
     const stale = { ...admin, stepUpAt: new Date(h.clock.now().getTime() - 60 * 60_000) };
-    expect(await reason(mod.request(stale, { orderId, stageKey: null }))).not.toBe("NO_ERROR");
+    expect(await reason(mod.request(stale, { orderId, stageKey: null }))).toBe("STEP_UP_REQUIRED");
+    expect(await reason(mod.issueDownloadTicket(stale, id))).toBe("STEP_UP_REQUIRED");
+    expect(await mod.request(admin, { orderId, stageKey: null })).toMatchObject({ archiveId: id, state: "ready" });
     expect(h.audit.named("file.archive.denied").length).toBeGreaterThan(0);
   });
 
@@ -185,10 +297,23 @@ describe("build and download", () => {
     expect((await mod.status(admin, id)).state).toBe("ready");
     const { ticket } = await mod.issueDownloadTicket(admin, id);
     const dl = await mod.redeemDownloadTicket(admin, ticket);
+    expect(dl.filename).toBe("RP-2026-000013-all-files.zip");
     const entries = await readZip(await drain(dl.stream));
     expect([...entries.keys()].sort()).toEqual(["Order files/notes.txt", "design/Plan (2).PDF", "design/plan.pdf"].sort());
     expect(entries.get("design/plan.pdf")?.toString()).toBe("alpha");
     expect(await reason(mod.redeemDownloadTicket(admin, ticket))).toBe("DOWNLOAD_TICKET_INVALID");
+  });
+
+  it("sets both Content-Disposition names from the authorised phase's customer label", async () => {
+    const id = await buildReady(customer);
+    const { ticket } = await mod.issueDownloadTicket(customer, id);
+    const download = await mod.redeemDownloadTicket(customer, ticket);
+    expect(download.filename).toBe("RP-2026-000013-phase-1-intake.zip");
+    const headers = new Map<string, string | number>();
+    const output = Object.assign(new PassThrough(), { setHeader: (name: string, value: string | number) => headers.set(name, value) });
+    output.resume();
+    await sendPrivateDownload(output as unknown as Parameters<typeof sendPrivateDownload>[0], { ...download, contentType: "application/zip" });
+    expect(headers.get("Content-Disposition")).toBe("attachment; filename=\"RP-2026-000013-phase-1-intake.zip\"; filename*=UTF-8''RP-2026-000013-phase-1-intake.zip");
   });
 
   it("fails the build when bytes do not match the manifest hash", async () => {

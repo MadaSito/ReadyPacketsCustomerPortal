@@ -5,7 +5,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { PassThrough, Transform, type Readable } from "node:stream";
-import { and, eq, isNull, lt, inArray } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, lt, inArray } from "drizzle-orm";
 import yazl from "yazl";
 import { roleHasCapability } from "../../../shared/capabilities.js";
 import type { ModuleDeps } from "../../container.js";
@@ -14,7 +14,7 @@ import { ulid } from "../../core/ids.js";
 import type { ModuleHealth, ModuleLifecycle, SessionPrincipal, Tx } from "../../core/types.js";
 import { hasFreshStepUp } from "../../trpc/trpc.js";
 import { orders } from "../orders/schema.js";
-import { archiveEntryNames, isSafeEntryName } from "./archiveNames.js";
+import { archiveDownloadName, archiveEntryNames, isSafeEntryName } from "./archiveNames.js";
 import { fileArchiveTickets, fileArchives, type FileArchiveManifestEntry, type FileArchiveScope, type FileArchiveState } from "./archivesSchema.js";
 
 export const ARCHIVE_BUILD_JOB = "files.archive.build";
@@ -214,23 +214,39 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
     }
   }
 
-  /** Releases the user's slot when its archive has expired (lazy; the expire job does the rest). */
-  async function releaseExpired(tx: Tx, userId: number) {
-    await tx.update(fileArchives).set({ state: "expired", activeUserId: null, reasonCode: "ARCHIVE_EXPIRED" })
-      .where(and(eq(fileArchives.activeUserId, userId), lt(fileArchives.expiresAt, clock.now())));
-  }
-
-  async function finish(row: ArchiveRow, state: "failed" | "expired" | "revoked", reasonCode: string, tx?: Tx) {
-    const runner = tx ?? db;
-    await runner.update(fileArchives).set({ state, reasonCode, activeUserId: null, version: row.version + 1 }).where(eq(fileArchives.id, row.id));
+  async function purgeObject(row: ArchiveRow, tx?: Tx) {
     if (row.objectKeyEnc && !row.purgedAt) {
       try {
         await storage.delete(crypto.decrypt(row.objectKeyEnc, keyAad(row.publicId)));
-        await runner.update(fileArchives).set({ purgedAt: clock.now() }).where(eq(fileArchives.id, row.id));
+        await (tx ?? db).update(fileArchives).set({ purgedAt: clock.now() }).where(eq(fileArchives.id, row.id));
       } catch {
         // The expire job retries the purge; never surface storage detail.
       }
     }
+  }
+
+  async function markTerminal(row: ArchiveRow, state: "failed" | "expired" | "revoked", reasonCode: string, tx?: Tx) {
+    await (tx ?? db).update(fileArchives).set({ state, reasonCode, activeUserId: null, version: row.version + 1 }).where(eq(fileArchives.id, row.id));
+  }
+
+  async function finish(row: ArchiveRow, state: "failed" | "expired" | "revoked", reasonCode: string, tx?: Tx) {
+    // Outside a row lock, do not overwrite a concurrent supersession or cancellation.
+    const [updated] = await (tx ?? db).update(fileArchives).set({
+      state, reasonCode, activeUserId: null, version: row.version + 1,
+    }).where(and(eq(fileArchives.id, row.id), eq(fileArchives.version, row.version), eq(fileArchives.state, row.state)));
+    if (!updated.affectedRows) return false;
+    await purgeObject(row, tx);
+    return true;
+  }
+
+  async function retireForRequest(tx: Tx, p: SessionPrincipal, row: ArchiveRow, reasonCode: string) {
+    const expired = reasonCode === "ARCHIVE_EXPIRED";
+    await markTerminal(row, expired ? "expired" : "revoked", reasonCode, tx);
+    await audit.record({
+      category: "file", eventName: expired ? "file.archive.expired" : "file.archive.revoked", action: "delete", outcome: "completed",
+      reasonCode, actor: actor(p), resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId,
+      attributes: { scope: row.scope, ...(row.stageKey ? { stage_key: row.stageKey } : {}) },
+    }, tx);
   }
 
   function normaliseStage(stageKey: string | null | undefined): string | null {
@@ -244,25 +260,45 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       const stageKey = normaliseStage(input.stageKey);
       const scope: FileArchiveScope = stageKey ? "stage" : "order";
       return guarded(principal, async () => {
-        const p = await db.transaction((tx) => live(principal, tx));
-        assertScope(p, scope);
-        const limited = await deps.rateLimiter.consume("expensive", `files.archive:${p.userId}`);
+        // The durable limiter uses its own database transaction; do not call it while holding a pool slot or the user lock.
+        const preflight = await db.transaction((tx) => live(principal, tx));
+        assertScope(preflight, scope);
+        const limited = await deps.rateLimiter.consume("expensive", `files.archive:${preflight.userId}`);
         if (!limited.allowed) throw new DomainError("RATE_LIMITED", "ARCHIVE_RATE_LIMITED", "Please wait a moment before preparing another archive.", { retryAfterSeconds: limited.retryAfterSeconds });
-        const { entries, totalBytes } = await collect(p, input.orderId, stageKey, scope);
-        if (!entries.length) throw validation("ARCHIVE_EMPTY", "There are no files to download here yet.");
-        const digest = manifestDigest(entries);
-        const now = clock.now();
-        const publicId = ulid(now.getTime());
-        const view = await db.transaction(async (tx) => {
-          const orderId = await orderIdFor(tx, input.orderId);
-          await releaseExpired(tx, p.userId);
+        const result = await db.transaction(async (tx): Promise<{ view: ArchiveView; retired?: ArchiveRow } | { error: DomainError; retired: ArchiveRow }> => {
+          const p = await live(principal, tx);
+          assertScope(p, scope);
+          // Identity locks the user before the active slot; match redemption's user → archive → order order.
           const [active] = await tx.select().from(fileArchives).where(eq(fileArchives.activeUserId, p.userId)).for("update");
-          if (active) {
-            const same = active.orderId === orderId && active.stageKey === stageKey && active.scope === scope && active.sessionId === p.sessionId
-              && manifestDigest(active.manifest) === digest;
-            if (same) return toArchiveView(active);
-            throw conflict("ARCHIVE_BUSY", "Another archive of yours is still being prepared or waiting to download. Cancel it or wait for it to expire.");
+          const current = active && active.expiresAt > clock.now() ? active : undefined;
+          const sameScope = current?.orderPublicId === input.orderId && current.stageKey === stageKey && current.scope === scope;
+          const sameSession = sameScope && current.sessionId === p.sessionId;
+          if (sameSession && (current.state === "queued" || current.state === "building")) {
+            // Keep polling the existing job; it still re-authorises and verifies each fixed manifest entry.
+            await port().listDeliverableFiles(p, { orderPublicId: input.orderId, ...(stageKey ? { stageKey } : {}), limit: 1 }, tx);
+            return { view: toArchiveView(current) };
           }
+          let manifest;
+          try {
+            manifest = await collect(p, input.orderId, stageKey, scope, tx);
+            if (!manifest.entries.length) throw validation("ARCHIVE_EMPTY", "There are no files to download here yet.");
+          } catch (error) {
+            if (sameScope && current.state === "ready" && error instanceof DomainError && ["ARCHIVE_EMPTY", "ARCHIVE_TOO_LARGE"].includes(error.reasonCode)) {
+              await retireForRequest(tx, p, current, "ARCHIVE_STALE");
+              return { error, retired: current };
+            }
+            // An invalid or unauthorised request must not displace another scope's archive.
+            throw error;
+          }
+          const { entries, totalBytes } = manifest;
+          if (sameSession && current.state === "ready" && current.objectKeyEnc && manifestDigest(current.manifest) === manifestDigest(entries)) {
+            return { view: toArchiveView(current) };
+          }
+          const orderId = await orderIdFor(tx, input.orderId);
+          if (active) await retireForRequest(tx, p, active, !current ? "ARCHIVE_EXPIRED"
+            : !sameScope ? "ARCHIVE_SUPERSEDED" : !sameSession ? "ARCHIVE_SESSION_CHANGED" : "ARCHIVE_STALE");
+          const now = clock.now();
+          const publicId = ulid(now.getTime());
           try {
             await tx.insert(fileArchives).values({
               publicId, orderId, orderPublicId: input.orderId, scope, stageKey, requestedByUserId: p.userId, sessionId: p.sessionId,
@@ -271,7 +307,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
             });
           } catch (error) {
             const code = (error as { cause?: { code?: string }; code?: string });
-            if (code.code === "ER_DUP_ENTRY" || code.cause?.code === "ER_DUP_ENTRY") throw conflict("ARCHIVE_BUSY", "Another archive of yours is still being prepared. Wait for it to finish.");
+            if (code.code === "ER_DUP_ENTRY" || code.cause?.code === "ER_DUP_ENTRY") throw conflict("ARCHIVE_BUSY", "Another archive request just started. Select Download ZIP again to resume or replace it.");
             throw error;
           }
           const { jobId } = await deps.jobs.enqueue(ARCHIVE_BUILD_JOB, { archiveId: publicId }, undefined, tx);
@@ -282,9 +318,12 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
             safeCounts: { files: entries.length, bytes: totalBytes }, attributes: { scope, ...(stageKey ? { stage_key: stageKey } : {}) },
           }, tx);
           const [row] = await tx.select().from(fileArchives).where(eq(fileArchives.publicId, publicId));
-          return toArchiveView(row!);
+          return { view: toArchiveView(row!), retired: active };
         });
-        return view;
+        // Never delete a ready object until its terminal state and replacement have committed.
+        if (result.retired) await purgeObject(result.retired);
+        if ("error" in result) throw result.error;
+        return result.view;
       }, { orderPublicId: input.orderId });
     },
 
@@ -369,6 +408,12 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
               stale.row = row;
               throw conflict("ARCHIVE_STALE", "The files changed since this archive was prepared. Prepare it again.");
             }
+            const [order] = await tx.select({ reference: orders.reference }).from(orders).where(eq(orders.id, row.orderId));
+            if (!order) throw notFound("ORDER_NOT_FOUND");
+            const stage = row.stageKey ? (await deps.services.orders?.stages?.listForOrder({
+              orderPublicId: row.orderPublicId, actor: p, stageKey: row.stageKey,
+            }, tx))?.stages.find((entry) => entry.key === row.stageKey && entry.viewable) : undefined;
+            const filename = archiveDownloadName(order.reference, row.stageKey, stage?.customerLabel);
             await audit.record({
               category: "file", eventName: "file.archive.downloaded", action: "download", outcome: "attempted", actor: actor(p),
               resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId, safeCounts: { files: row.fileCount, bytes: row.zipBytes ?? 0 },
@@ -376,8 +421,7 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
             await tx.update(fileArchives).set({ downloadCount: row.downloadCount + 1, lastDownloadedAt: clock.now() }).where(eq(fileArchives.id, row.id));
             const stream = await storage.get(crypto.decrypt(row.objectKeyEnc, keyAad(row.publicId)));
             opened.stream = stream;
-            const suffix = row.scope === "stage" ? `phase-${row.stageKey}` : "all-files";
-            return { stream, filename: `order-${row.orderPublicId}-${suffix}.zip`, size: row.zipBytes ?? 0, archiveId: row.publicId };
+            return { stream, filename, size: row.zipBytes ?? 0, archiveId: row.publicId };
           });
         } catch (error) {
           opened.stream?.destroy();
@@ -403,7 +447,11 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       const [row] = await db.select().from(fileArchives).where(eq(fileArchives.publicId, archivePublicId));
       if (!row || row.state !== "queued") return row?.state ?? "failed";
       if (row.expiresAt <= clock.now()) { await finish(row, "expired", "ARCHIVE_EXPIRED"); return "expired"; }
-      await db.update(fileArchives).set({ state: "building" }).where(and(eq(fileArchives.id, row.id), eq(fileArchives.state, "queued")));
+      const [claim] = await db.update(fileArchives).set({ state: "building" }).where(and(eq(fileArchives.id, row.id), eq(fileArchives.state, "queued")));
+      if (!claim.affectedRows) {
+        const [latest] = await db.select({ state: fileArchives.state }).from(fileArchives).where(eq(fileArchives.id, row.id));
+        return latest?.state ?? "failed";
+      }
       let objectKey: string | null = null;
       try {
         const p = await principalFor(row);
@@ -454,13 +502,16 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       } catch (error) {
         if (objectKey) await storage.delete(objectKey).catch(() => undefined);
         const reasonCode = error instanceof DomainError ? error.reasonCode : "ARCHIVE_BUILD_FAILED";
-        const [latestRow] = await db.select().from(fileArchives).where(eq(fileArchives.id, row.id));
-        if (latestRow && ACTIVE_STATES.includes(latestRow.state)) await finish(latestRow, "failed", reasonCode);
-        await audit.record({
-          category: "file", eventName: "file.archive.failed", action: "create", outcome: "failed", reasonCode, actor: { userId: row.requestedByUserId, role: "system" },
-          resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId,
-        }).catch(() => undefined);
-        return "failed";
+        return db.transaction(async (tx) => {
+          const [latest] = await tx.select().from(fileArchives).where(eq(fileArchives.id, row.id)).for("update");
+          if (latest?.state !== "building") return latest?.state ?? "failed";
+          await markTerminal(latest, "failed", reasonCode, tx);
+          await audit.record({
+            category: "file", eventName: "file.archive.failed", action: "create", outcome: "failed", reasonCode, actor: { userId: row.requestedByUserId, role: "system" },
+            resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId,
+          }, tx).catch(() => undefined);
+          return "failed";
+        });
       }
     },
 
@@ -468,12 +519,18 @@ export function createFileArchivesModule(deps: ModuleDeps): FileArchivesModule {
       const now = clock.now();
       const rows = await db.select().from(fileArchives)
         .where(and(inArray(fileArchives.state, ["queued", "building", "ready"]), lt(fileArchives.expiresAt, now))).limit(200);
+      let expired = 0;
       for (const row of rows) {
-        await finish(row, "expired", "ARCHIVE_EXPIRED");
+        if (!(await finish(row, "expired", "ARCHIVE_EXPIRED"))) continue;
+        expired += 1;
         await audit.record({ category: "file", eventName: "file.archive.expired", action: "delete", outcome: "completed", actor: { role: "system" }, resource: { type: "file_archive", publicId: row.publicId }, orderPublicId: row.orderPublicId }).catch(() => undefined);
       }
+      const pendingPurges = await db.select().from(fileArchives).where(and(
+        inArray(fileArchives.state, ["failed", "expired", "revoked"]), isNotNull(fileArchives.objectKeyEnc), isNull(fileArchives.purgedAt),
+      )).limit(200);
+      for (const row of pendingPurges) await purgeObject(row);
       await db.delete(fileArchiveTickets).where(lt(fileArchiveTickets.expiresAt, now));
-      return rows.length;
+      return expired;
     },
 
     async health(): Promise<ModuleHealth[]> {
