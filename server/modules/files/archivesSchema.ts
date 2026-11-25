@@ -32,8 +32,11 @@ export const fileArchives = mysqlTable(
     /** Set for `stage` scope; null for a whole-order archive. */
     stageKey: varchar("stage_key", { length: 64 }),
     requestedByUserId: refColumn("requested_by_user_id").notNull(),
-    /** SHA-256 of the requesting session id: the archive can be downloaded only from the same session. */
-    sessionRef: char("session_ref", { length: 64 }).notNull(),
+    /**
+     * Public, non-secret session id of the request (as in `file_download_tickets`). The build job re-authorises
+     * as this live session and the archive is downloadable only from it.
+     */
+    sessionId: varchar("session_id", { length: 80 }).notNull(),
     /** Set while queued/building/ready; its unique index gives one active archive per account across processes. */
     activeUserId: refColumn("active_user_id"),
     state: mysqlEnum("state", FILE_ARCHIVE_STATES).notNull().default("queued"),
@@ -72,7 +75,7 @@ export const fileArchiveTickets = mysqlTable(
     tokenHash: char("token_hash", { length: 64 }).notNull(),
     archiveId: refColumn("archive_id").notNull(),
     userId: refColumn("user_id").notNull(),
-    sessionRef: char("session_ref", { length: 64 }).notNull(),
+    sessionId: varchar("session_id", { length: 80 }).notNull(),
     issuedAt: utcDateTime("issued_at").notNull(),
     expiresAt: utcDateTime("expires_at").notNull(),
     usedAt: utcDateTime("used_at"),

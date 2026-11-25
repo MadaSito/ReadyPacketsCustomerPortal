@@ -9,7 +9,7 @@ Owner: portable_contract_engineer. These files live in `server/modules/files` by
 - **Built by a job** (`files.archive.build`) from a fixed manifest captured when the archive is requested: file public id, version, size, sha256 and the entry name the server derives. Members come from Files' deliverable selector only, so placeholders, removed rows and superseded versions are never included.
 - **Re-authorised three times:**
   - At request, by the live session, the capability and the selector.
-  - At build, by `openDeliverableFile` for every entry, as the requester. If any entry is no longer eligible, the build fails with `ARCHIVE_STALE` and nothing old is exported silently.
+  - At build, by `openDeliverableFile` for every entry, as the requester's live session (rebuilt from `identity.sessions.getState`; an ended session fails the build with `ARCHIVE_SESSION_ENDED`). If any entry is no longer eligible, the build fails with `ARCHIVE_STALE` and nothing old is exported silently.
   - At download, by the live session, the same session as the request, the capability and step-up again, and the selector for every member (count and versions must still match).
 - **Caps:** 250 files and 500 MiB uncompressed. Larger sets are refused with `ARCHIVE_TOO_LARGE`, and nothing is cut silently. Each account can have one active archive (queued, building or ready) across processes.
 - **Expiry:** archives expire 30 minutes after they are requested. The object is deleted on expiry, revocation or failure.
@@ -67,7 +67,7 @@ Both show a "Download phase files (ZIP)" or "Download all order files (ZIP)" but
 
 ## Tables (migration 0007, additive)
 
-- `file_archives`: id, public_id, order_id, order_public_id, scope enum(stage, order), stage_key varchar(64) null, requested_by_user_id, session_ref char(64), active_user_id null (unique), state enum, reason_code, manifest json, file_count, total_bytes, zip_bytes, zip_sha256, object_key_enc text, job_id, expires_at, built_at, download_count, last_downloaded_at, purged_at, version, created_at.
-- `file_archive_tickets`: id, token_hash char(64) unique, archive_id, user_id, session_ref, issued_at, expires_at, used_at.
+- `file_archives`: id, public_id, order_id, order_public_id, scope enum(stage, order), stage_key varchar(64) null, requested_by_user_id, session_id varchar(80), active_user_id null (unique), state enum, reason_code, manifest json, file_count, total_bytes, zip_bytes, zip_sha256, object_key_enc text, job_id, expires_at, built_at, download_count, last_downloaded_at, purged_at, version, created_at.
+- `file_archive_tickets`: id, token_hash char(64) unique, archive_id, user_id, session_id varchar(80), issued_at, expires_at, used_at.
 
 Both are short-lived operational rows. They are not in portable packages (manifest exclusion `file-archives`) and are dumped by backups.
