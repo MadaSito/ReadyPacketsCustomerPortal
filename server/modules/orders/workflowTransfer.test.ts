@@ -273,7 +273,7 @@ describe("workflow transfer: import abuse cases (§4)", () => {
     await structural(`[${"0,".repeat(600_000)}0]`, "VALIDATION:PACKAGE_TOO_LARGE");
     await structural(`{${Array.from({ length: 210_000 }, (_, i) => `"${i.toString(36)}":0`).join(",")}}`, "VALIDATION:PACKAGE_TOO_LARGE");
     const pkg = await exportAll();
-    await structural(JSON.stringify({ ...pkg, formatVersion: 3 }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
+    await structural(JSON.stringify({ ...pkg, formatVersion: 4 }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
     await structural(JSON.stringify({ ...pkg, format: "something.else" }), "VALIDATION:PACKAGE_FORMAT_UNSUPPORTED");
   });
 
