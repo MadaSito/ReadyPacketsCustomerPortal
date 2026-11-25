@@ -17,6 +17,7 @@ import {
 import { ConsoleActions, ReferenceHistory } from "../ConsoleActions";
 import { SharingPanel } from "../SharingPanel";
 import { WorkflowRulesPanel } from "../WorkflowRulesPanel";
+import { CustomerPhaseWizard } from "../stages/CustomerPhaseWizard";
 // ── increment 07 panel imports (other owners: one import line each, below this anchor) ──
 import { OrderPhaseConsolePanel } from "../stages/OrderPhaseConsolePanel";
 // ── end increment 07 panel imports ──
@@ -107,7 +108,7 @@ export function OrderDetailView({ area }: { area: Area }) {
       })}
       {/* Banners (e.g. a blocking acceptance gate) come before the checklist they pause. */}
       {/* ── increment 07 customer phase mount (audit_engineer replaces the next line only) ── */}
-      {consoleArea ? null : <WorkflowRulesPanel orderId={order.publicId} area={area} />}
+      {consoleArea ? null : <CustomerPhaseWizard orderId={order.publicId} fallback={<WorkflowRulesPanel orderId={order.publicId} area={area} />} />}
       {/* ── end increment 07 customer phase mount ── */}
       <RouteTabs
         idBase="order-tabs"
