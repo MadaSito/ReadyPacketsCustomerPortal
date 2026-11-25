@@ -162,6 +162,19 @@ describe("CustomerPhaseWizard", () => {
     expect(await screen.findByText("Our team is working on this step. Nothing is needed from you right now.")).toBeInTheDocument();
   });
 
+  it("when a later read finds a new order version, the order header is read again and the change is announced", async () => {
+    let version = 12;
+    handlers["orders.stages.workspace"] = () => ws({ version, currentStageKey: version > 12 ? "review" : "intake" });
+    const view = renderUi(<CustomerPhaseWizard orderId={ORDER} />);
+    await screen.findByRole("button", { name: "Next" });
+    const invalidate = vi.spyOn(view.queryClient, "invalidateQueries");
+    version = 13;
+    await act(async () => { await view.queryClient.refetchQueries({ queryKey: ["orders.stages.workspace"] }); });
+    expect(await screen.findByText("This order was updated. The current phase is now Review.")).toBeInTheDocument();
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["orders.get"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["orders.list"] });
+  });
+
   it("offers the phase ZIP only where the phase lists files", () => {
     expect(hasFileActions(stage({ actions: { ...actions, uploadDocuments: false } }))).toBe(false);
     expect(hasFileActions(stage({ actions: { ...actions, uploadDocuments: false, teamFileReview: true } }))).toBe(true);

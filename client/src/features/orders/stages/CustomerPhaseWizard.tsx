@@ -62,10 +62,14 @@ export function CustomerPhaseWizard({ orderId, fallback }: { orderId: string; fa
     if (!data) return;
     const before = previous.current;
     previous.current = data;
-    if (!before || ownVersion.current === data.version) return;
+    if (!before || before.version === data.version) return;
+    // The order row moved on (staff accept, payment, …): the page header and lists read the same row, so read them again.
+    void client.invalidateQueries({ queryKey: trpc.orders.get.queryKey({ orderId }) });
+    void client.invalidateQueries({ queryKey: trpc.orders.list.queryKey() });
+    if (ownVersion.current === data.version) return;
     const change = describeWorkspaceChange(before, data);
     if (change) setAnnouncement(change);
-  }, [data]);
+  }, [data, client, trpc, orderId]);
 
   // Required questions of the current writable phase (same cache as the questions panel).
   const current = data ? currentStage(data) : null;
