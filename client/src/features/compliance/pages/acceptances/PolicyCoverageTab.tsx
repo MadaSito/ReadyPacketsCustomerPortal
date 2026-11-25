@@ -48,22 +48,25 @@ function outstandingColumnsFor(policyTitle: string): readonly Column<PolicyCover
       header: "Last accepted version",
       cell: (row) =>
         row.lastAcceptedVersionPublicId && row.lastAcceptedVersionLabel ? (
-          <div className="flex flex-col gap-0.5">
+          <div className="flex min-w-0 max-w-full flex-col gap-0.5">
             <Link
               href={`/admin/policy-acceptances/versions/${row.lastAcceptedVersionPublicId}`}
               aria-label={`Version ${row.lastAcceptedVersionLabel} of ${policyTitle}`}
-              className="font-medium text-action underline underline-offset-2"
+              className="font-medium break-words text-action underline underline-offset-2"
             >
               Version {row.lastAcceptedVersionLabel}
             </Link>
             {row.lastAcceptedAt ? <TimestampWithUtc value={row.lastAcceptedAt} /> : null}
           </div>
         ) : (
-          <span className="inline-flex flex-wrap items-center gap-1.5">
+          <span
+            className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
+            title="No version accepted"
+          >
             <Badge tone="warning" icon={<AlertCircle className="size-3.5" aria-hidden="true" />}>
               None
             </Badge>
-            <span className="text-xs text-muted">Never accepted</span>
+            <span className="text-xs break-words text-muted">Never accepted</span>
           </span>
         ),
     },
@@ -75,18 +78,26 @@ function CoveragePolicyCard({ policy }: { policy: PolicyCoverageDocumentView }) 
   return (
     <Card
       as="section"
+      className="min-w-0"
       aria-label={`${policy.title} coverage`}
-      title={policy.title}
+      title={<span className="break-words">{policy.title}</span>}
       description={`Audience: ${formatPolicyAudience(policy.audience)}`}
       actions={
         allAccepted ? (
-          <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
-            Complete
-          </Badge>
+          <span className="inline-flex min-w-0 max-w-full" title="Complete">
+            <Badge tone="success" icon={<CheckCircle2 className="size-3.5" aria-hidden="true" />}>
+              Complete
+            </Badge>
+          </span>
         ) : (
-          <Badge tone="warning" icon={<AlertCircle className="size-3.5" aria-hidden="true" />}>
-            {policy.outstandingCount} outstanding
-          </Badge>
+          <span
+            className="inline-flex min-w-0 max-w-full"
+            title={`${policy.outstandingCount} outstanding`}
+          >
+            <Badge tone="warning" icon={<AlertCircle className="size-3.5" aria-hidden="true" />}>
+              {policy.outstandingCount} outstanding
+            </Badge>
+          </span>
         )
       }
     >
@@ -104,7 +115,7 @@ function CoveragePolicyCard({ policy }: { policy: PolicyCoverageDocumentView }) 
                 <Link
                   href={`/admin/policy-acceptances/versions/${policy.currentVersionPublicId}`}
                   aria-label={`Version ${policy.currentVersionLabel} (#${policy.currentVersionNumber}) of ${policy.title}`}
-                  className="font-medium text-action underline underline-offset-2"
+                  className="font-medium break-words text-action underline underline-offset-2"
                 >
                   Version {policy.currentVersionLabel} (#{policy.currentVersionNumber})
                 </Link>
@@ -131,11 +142,13 @@ function CoveragePolicyCard({ policy }: { policy: PolicyCoverageDocumentView }) 
           </p>
         ) : (
           <div className="flex min-w-0 flex-col gap-3">
-            <h3 className="text-sm font-semibold text-ink">
+            <h3 className="text-sm font-semibold break-words text-ink">
               Outstanding customers ({policy.outstandingCount})
             </h3>
+            {/* Nested Card + DataTable card leaves 148 px below 320 px; stack <dt>/<dd> below 320 px while keeping 320+ unchanged. */}
             <DataTable<PolicyCoverageOutstandingCustomer>
               caption={`Outstanding customers for ${policy.title}`}
+              className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
               columns={outstandingColumnsFor(policy.title)}
               rows={policy.outstandingCustomers}
               rowKey={(row) => row.customer.userPublicId}

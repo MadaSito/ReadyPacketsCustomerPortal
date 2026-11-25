@@ -63,8 +63,10 @@ export function PolicyUpdatesTab() {
               )}
               <span className="text-xs text-muted">{formatPolicyAudience(row.audience)}</span>
             </div>
-            <span className="inline-flex items-center gap-1">
-              <code className="font-mono text-xs text-muted">{row.shortContentHash}</code>
+            <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1">
+              <code className="min-w-0 font-mono text-xs break-all text-muted">
+                {row.shortContentHash}
+              </code>
               <CopyButton
                 value={row.contentHash}
                 label={`Copy SHA-256 content hash for ${row.policyTitle} version ${row.versionLabel}`}
@@ -125,6 +127,7 @@ export function PolicyUpdatesTab() {
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <FilterBar
+        className="min-w-0"
         activeCount={hasFilter ? 1 : 0}
         onReset={() => setDocumentPublicId("")}
       >
@@ -140,6 +143,7 @@ export function PolicyUpdatesTab() {
 
       <DataTable<PolicyUpdateHistoryItem>
         caption="Published policy versions and customer acceptance counts"
+        className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
         columns={columns}
         rows={rows}
         rowKey={(row) => row.versionPublicId}

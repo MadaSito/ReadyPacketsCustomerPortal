@@ -126,6 +126,7 @@ export default function PolicyAcceptancesPage() {
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <PageHeader
+        className="min-w-0"
         title="Policy acceptances"
         description="Read-only evidence of customer account, checkout, and order-gate policy acceptances, coverage, and published updates."
         actions={
@@ -149,7 +150,7 @@ export default function PolicyAcceptancesPage() {
         value={activeTab}
       />
 
-      <RouteTabPanel idBase={TAB_ID_BASE} value={activeTab}>
+      <RouteTabPanel idBase={TAB_ID_BASE} value={activeTab} className="min-w-0">
         {activeTab === "coverage" ? (
           <PolicyCoverageTab />
         ) : activeTab === "updates" ? (

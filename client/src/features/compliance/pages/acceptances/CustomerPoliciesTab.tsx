@@ -104,8 +104,10 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
               freshness={row.freshness}
               supersededByVersionLabel={row.supersededByVersionLabel}
             />
-            <span className="inline-flex items-center gap-1">
-              <code className="font-mono text-xs text-muted">{row.shortContentHash}</code>
+            <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1">
+              <code className="min-w-0 font-mono text-xs break-all text-muted">
+                {row.shortContentHash}
+              </code>
               <CopyButton
                 value={row.contentHash}
                 label={`Copy SHA-256 hash for ${row.policyTitle} v${row.versionLabel}`}
@@ -186,6 +188,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
         <div className="p-4 sm:p-5">
           <DataTable<CustomerPolicyStatusRow>
             caption="Customer policy status"
+            className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
             columns={POLICY_STATUS_COLUMNS}
             rows={policyRows}
             rowKey={(row) => row.documentPublicId}
@@ -211,6 +214,7 @@ export default function CustomerPoliciesTab({ customerId }: { customerId: string
         <div className="flex min-w-0 flex-col gap-3 p-4 sm:p-5">
           <DataTable<AcceptanceLogItem>
             caption="Customer policy acceptance history"
+            className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
             columns={historyColumns}
             rows={historyRows}
             rowKey={(row) => `${row.evidenceKind}:${row.publicId}`}
