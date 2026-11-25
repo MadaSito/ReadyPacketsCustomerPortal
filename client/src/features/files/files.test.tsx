@@ -283,6 +283,37 @@ describe("file upload", () => {
 });
 
 describe("order file tab", () => {
+  it.each([true, false])("sends the right general upload binding with stageUploadsRequired=%s", async (stageUploadsRequired) => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired,
+      currentStageKey: "intake_phase", phases: [{ key: "intake_phase", label: "Intake" }], uploadSlots: null });
+    phasePolicy.mockResolvedValue({ enabled: true, maxSeconds: 60, policy, remainingDocuments: 3, remainingAudio: 3,
+      remainingAudioSeconds: 7200 });
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ results: [{ index: 0, outcome: "completed" }] })));
+    const user = userEvent.setup();
+    const { container } = renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await screen.findByRole("button", { name: "Choose files" });
+    if (stageUploadsRequired) expect(screen.getByLabelText("Upload phase")).toHaveValue("intake_phase");
+    else expect(screen.queryByLabelText("Upload phase")).not.toBeInTheDocument();
+    await user.upload(container.querySelector("input[type=file]")!, new File(["synthetic"], "evidence.pdf", { type: "application/pdf" }));
+    await user.click(screen.getByRole("button", { name: "Upload file" }));
+    expect(await screen.findByText("1 of 1 uploads confirmed.")).toBeInTheDocument();
+    const { searchParams } = new URL(String(fetchMock.mock.calls[0]?.[0]), "https://example.test");
+    expect(searchParams.get("stageKey")).toBe(stageUploadsRequired ? "intake_phase" : null);
+    expect(searchParams.get("intent")).toBe(stageUploadsRequired ? "document" : null);
+  });
+
+  it("does not offer an unbound upload for a phased task without a current phase", async () => {
+    view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired: true,
+      currentStageKey: null, phases: [], uploadSlots: { statusKey: "intake", slots: [
+        { key: "voice_evidence", label: "Voice evidence", kind: "audio", maxCount: 1, allowedTypes: ["wav"] },
+      ] } });
+    const user = userEvent.setup();
+    const { container } = renderUi(<OrderFilesTab orderId={orderId} area="customer" />);
+    await user.selectOptions(await screen.findByLabelText("Upload to"), "voice_evidence");
+    expect(screen.getByText("No current phase is available for this requirement.")).toBeInTheDocument();
+    expect(container.querySelector("input[type=file]")).toBeNull();
+  });
+
   it("includes the visible edit text and filename in the console document link name", async () => {
     const file = { ...sample, displayName: "qa-synthetic.docx", extension: "docx" };
     view.mockResolvedValue({ items: [file], nextCursor: null, canUpload: false, uploadPolicy: null });

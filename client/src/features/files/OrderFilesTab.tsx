@@ -181,6 +181,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
               ]}
               rowActions={(file) => {
                 const canReplace = canChange && !!policy?.extensions.length && !file.deletedAt && !file.supersededAt && !file.derivedFromPublicId &&
+                  (!first?.stageUploadsRequired || !!file.stageKey) &&
                   (consoleArea || file.category !== "deliverable") && (!file.slotKey || (!!slots?.slots.some((slot) => slot.key === file.slotKey) && file.statusKey === slots?.statusKey));
                 const staffActions = consoleArea && canChange && !file.derivedFromPublicId;
                 return <div className="flex flex-wrap items-center gap-1">
@@ -220,7 +221,9 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                 options={[{ value: "", label: first.stageUploadsRequired ? "Phase files" : "General order files" },
                   ...uploadSlots.map((slot) => ({ value: slot.key, label: slot.label }))]} />
             </Field> : null}
-            {first.stageUploadsRequired && !chosenSlot ? uploadPhase ? <>
+            {first.stageUploadsRequired && chosenSlot && !first.currentStageKey
+              ? <p className="text-sm text-body">No current phase is available for this requirement.</p>
+              : first.stageUploadsRequired && !chosenSlot ? uploadPhase ? <>
               <Field label="Upload phase">
                 <Select value={uploadPhase.key} onChange={(event) => setUploadPhaseKey(event.target.value)}
                   options={phases.map((phase) => ({ value: phase.key, label: phase.label }))} />
@@ -265,7 +268,8 @@ export default function OrderFilesTab({ orderId, area }: Props) {
       </div>
       <Dialog title="Upload a new version" description={replacement ? `Choose a replacement for ${replacement.displayName}. Earlier versions remain in file history.` : undefined}
         open={!!replacement} onOpenChange={(open) => { if (!open) setReplacement(null); }}>
-        {replacement && policy ? <FileUploadPanel key={replacement.publicId} orderId={orderId} staff={consoleArea} policy={policy} onChanged={reload}
+        {replacement && policy && (!first?.stageUploadsRequired || replacement.stageKey)
+          ? <FileUploadPanel key={replacement.publicId} orderId={orderId} staff={consoleArea} policy={policy} onChanged={reload}
           audio={first?.audio} slot={replacementSlot && slots ? { ...replacementSlot, statusKey: slots.statusKey } : undefined}
           phase={replacement.stageKey ? { key: replacement.stageKey,
             intent: replacementSlot ? undefined : replacement.contentType.startsWith("audio/") ? "prerecorded_audio" : "document" } : undefined}

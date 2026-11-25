@@ -3,21 +3,27 @@
  * through the assembled system exactly as a browser would. See tests/integration/README.md.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { ulid } from "../../server/core/ids.js";
 import { exampleWav } from "../../server/modules/files/fixtures.test-support.js";
+import { orders, orderWorkflows, orderWorkflowVersions } from "../../server/modules/orders/schema.js";
+import type { StageWorkspace } from "../../server/modules/orders/stages.js";
+import { DEFAULT_WORKFLOW, workflowDefinitionSchema } from "../../server/modules/orders/workflowTypes.js";
 import {
   Browser, bootstrapAdmin, createSystem, linkToken, seedProduct, STRONG_PASSWORD, totpCode, type System,
-  freshProbeAddress,
+  freshProbeAddress, stepUp, type ReadyAdmin,
 } from "./harness.js";
 
 const EMAIL = "casey.customer@example.test";
 let sys: System;
 let productId: string;
+let admin: ReadyAdmin;
 const browser = () => customer;
 let customer: Browser;
 
 beforeAll(async () => {
   sys = await createSystem();
-  const admin = await bootstrapAdmin(sys);
+  admin = await bootstrapAdmin(sys);
   productId = await seedProduct(admin);
   customer = sys.browser();
 });
@@ -127,17 +133,43 @@ describe("customer journey (assembled system)", () => {
     expect(JSON.stringify(detail)).toContain("Please call before delivery.");
   });
 
+  it("opens intake once the administrator records an offline payment", async () => {
+    const before = Browser.ok(await browser().query<StageWorkspace>("orders.stages.workspace", { orderId }));
+    expect(before.stages.find((item) => item.key === before.currentStageKey)).toMatchObject({ waitingOn: "payment" });
+    Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
+    const { invoicePublicId } = Browser.ok(await admin.browser.mutate<{ invoicePublicId: string }>("compliance.invoices.admin.createDraft", {
+      orderPublicId: orderId, currency: "USD", lines: [{ description: "Integration Item", quantity: 2, unitAmountMinor: 1500 }],
+    }));
+    Browser.ok(await admin.browser.mutate("compliance.invoices.admin.issue", { invoicePublicId }));
+    Browser.ok(await admin.browser.mutate("compliance.invoices.admin.recordManualPayment", {
+      invoicePublicId, method: "check", amountMinor: 3000, currency: "USD",
+      reference: "Synthetic journey payment", idempotencyKey: "journey-customer-manual-payment",
+    }));
+    const after = Browser.ok(await browser().query<StageWorkspace>("orders.stages.workspace", { orderId }));
+    expect(after.stages.find((item) => item.key === after.currentStageKey)).toMatchObject({ state: "open", actions: { uploadAudio: true } });
+  });
+
   it("uploads a file to the order and downloads it with a single-use ticket sent in the POST body", async () => {
+    const workspace = Browser.ok(await browser().query<StageWorkspace>("orders.stages.workspace", { orderId }));
+    expect(workspace.workflowFormat).toBe(3);
+    const stage = workspace.stages.find((item) => item.key === workspace.currentStageKey);
+    expect(stage).toMatchObject({ state: "open", locked: false, actions: { uploadAudio: true } });
     const bytes = exampleWav();
-    const noCsrf = await browser().raw("post", `/api/files/upload/${orderId}`, { csrf: null }).attach("files", bytes, "voice-note.wav");
+    const path = `/api/files/upload/${orderId}`;
+    const boundPath = `${path}?${new URLSearchParams({ stageKey: stage!.key, intent: "prerecorded_audio" })}`;
+    const noCsrf = await browser().raw("post", boundPath, { csrf: null }).attach("files", bytes, "voice-note.wav");
     expect(noCsrf.status).toBe(403);
-    const upload = await browser().raw("post", `/api/files/upload/${orderId}`).attach("files", bytes, "voice-note.wav");
+    const unbound = await browser().raw("post", path).attach("files", bytes, "voice-note.wav");
+    expect(unbound.status).toBe(400);
+    expect(unbound.body.safe).toMatchObject({ domainCode: "VALIDATION", reasonCode: "STAGE_REQUIRED" });
+    const upload = await browser().raw("post", boundPath).attach("files", bytes, "voice-note.wav");
     expect(upload.status).toBe(200);
-    expect(upload.body.results).toEqual([expect.objectContaining({ outcome: "completed", file: expect.objectContaining({ extension: "wav" }) })]);
+    expect(upload.body.results).toEqual([expect.objectContaining({ outcome: "completed",
+      file: expect.objectContaining({ extension: "wav", stageKey: stage!.key }) })]);
     const fileId = upload.body.results[0].file.publicId as string;
     await expectAudited(String(upload.headers["x-request-id"]), "file.uploaded");
 
-    const listed = Browser.ok(await browser().query<{ items: { publicId: string }[] }>("files.list", { orderId }));
+    const listed = Browser.ok(await browser().query<{ items: { publicId: string }[] }>("files.list", { orderId, stageKey: stage!.key }));
     expect(listed.items.map((file) => file.publicId)).toContain(fileId);
 
     await expectCsrfRequired("files.issueDownloadTicket", { fileId });
@@ -158,6 +190,36 @@ describe("customer journey (assembled system)", () => {
 
     const replay = await browser().raw("post", "/api/files/download").send({ ticket });
     expect(replay.status).toBe(404);
+  });
+
+  it.each([1, 2])("still accepts the unbound Files-tab upload for existing orders pinned to format %i", async (format) => {
+    const legacy = workflowDefinitionSchema.parse(format === 1 ? DEFAULT_WORKFLOW : {
+      ...DEFAULT_WORKFLOW, phases: [{ key: "intake", label: "Intake" }],
+      states: DEFAULT_WORKFLOW.states.map((state) => state.kind === "initial" ? { ...state, phase: "intake" } : state),
+    });
+    const legacyOrderId = ulid();
+    await sys.t.db.transaction(async (tx) => {
+      const [owner] = await tx.select({ userId: orders.ownerUserId }).from(orders).where(eq(orders.publicId, orderId));
+      const [workflow] = await tx.insert(orderWorkflows).values({
+        publicId: ulid(), workflowKey: `journey_legacy_${format}`, name: `Classic integration fixture ${format}`, isDefault: false,
+      }).$returningId();
+      const [version] = await tx.insert(orderWorkflowVersions).values({
+        publicId: ulid(), workflowId: workflow!.id, versionNumber: 1, definition: legacy,
+      }).$returningId();
+      await tx.update(orderWorkflows).set({ currentVersionId: version!.id }).where(eq(orderWorkflows.id, workflow!.id));
+      await tx.insert(orders).values({
+        publicId: legacyOrderId, reference: legacyOrderId, projectName: "Existing customer order",
+        ownerUserId: owner!.userId, workflowVersionId: version!.id, statusKey: "submitted",
+        subtotalMinor: 100, totalMinor: 100, currency: "USD",
+      });
+    });
+    const workspace = Browser.ok(await browser().query<StageWorkspace>("orders.stages.workspace", { orderId: legacyOrderId }));
+    expect(workspace).toMatchObject({ workflowFormat: format, derived: true });
+    const listed = Browser.ok(await browser().query<{ canUpload: boolean; stageUploadsRequired: boolean }>("files.list", { orderId: legacyOrderId }));
+    expect(listed).toMatchObject({ canUpload: true, stageUploadsRequired: false });
+    const upload = await browser().raw("post", `/api/files/upload/${legacyOrderId}`).attach("files", exampleWav(), "legacy-voice-note.wav");
+    expect(upload.status).toBe(200);
+    expect(upload.body.results).toMatchObject([{ outcome: "completed", file: { extension: "wav", stageKey: null } }]);
   });
 
   it("sends a message on the order thread and reads it back", async () => {
