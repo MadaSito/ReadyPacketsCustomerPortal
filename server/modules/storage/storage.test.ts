@@ -10,7 +10,7 @@ import { jobAttempts, jobRuns } from "../jobs/schema.js";
 import { orderFilesCopyAction } from "./automation.js";
 import { StorageAdapterError, type StorageConnectionView } from "./contracts.js";
 import { createStorageModule, type StorageModule } from "./index.js";
-import { storageAssignments, storageConnections, storageCopyAttempts, storageFileCopies } from "./schema.js";
+import { storageAssignments, storageConnections, storageCopyAttempts, storageFileCopies, storageManagedFileCopies } from "./schema.js";
 
 const jobType = "storage.copy_order_file";
 const sourceBytes = Buffer.from("synthetic local order file");
@@ -36,7 +36,7 @@ let adapterPuts: ReturnType<typeof vi.fn<(path: readonly string[], name: string,
 let adapterRemovals: ReturnType<typeof vi.fn<() => void>>;
 
 beforeAll(async () => {
-  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies, storageCopyAttempts, jobRuns, jobAttempts } });
+  db = await createTestDb({ schema: { storageConnections, storageAssignments, storageFileCopies, storageManagedFileCopies, storageCopyAttempts, jobRuns, jobAttempts } });
 });
 afterAll(() => db?.cleanup());
 beforeEach(async () => {

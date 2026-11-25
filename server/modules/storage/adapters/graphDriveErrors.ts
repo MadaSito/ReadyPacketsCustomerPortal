@@ -22,9 +22,10 @@ export function codeForStatus(status: number): { code: GraphDriveErrorCode; retr
   return { code: "PROVIDER_UNAVAILABLE", retryable: status >= 500 };
 }
 
-export function fromStatus(status: number): StorageAdapterError {
+export function fromStatus(status: number, retryAfter?: string): StorageAdapterError {
   const { code, retryable } = codeForStatus(status);
-  return new StorageAdapterError(code, retryable);
+  const seconds = retryAfter && /^\d{1,6}$/u.test(retryAfter) ? Number(retryAfter) : undefined;
+  return new StorageAdapterError(code, retryable, seconds);
 }
 
 /** Normalises anything thrown by the transport into a StorageAdapterError (unknown errors → provider unavailable). */

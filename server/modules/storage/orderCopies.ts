@@ -10,7 +10,7 @@ import { jobAttempts, jobRuns } from "../jobs/schema.js";
 import type { CopyState } from "./copyLogTypes.js";
 import { copyAttemptPrivateAad, recordCopyAttempt } from "./copyLogWriter.js";
 import { ORDER_FILE_COPY_JOB, ORDER_FILE_COPY_MAX_ATTEMPTS, safeManualCopyRetry } from "./fileCopies.js";
-import { storageAssignments, storageConnections, storageCopyAttempts as attempt, storageFileCopies } from "./schema.js";
+import { storageAssignments, storageConnections, storageCopyAttempts as attempt, storageFileCopies, storageManagedFileCopies } from "./schema.js";
 import { storagePublicId } from "./validation.js";
 
 export const orderCopyList = z.strictObject({
@@ -91,6 +91,9 @@ export function createOrderCopies(deps: ModuleDeps, assertDestination: (publicId
           .leftJoin(jobRuns, eq(jobRuns.publicId, attempt.jobPublicId))
           .leftJoin(jobAttempts, and(eq(jobAttempts.jobId, jobRuns.id), eq(jobAttempts.attempt, attempt.attempt)))
           .where(scope).groupBy(sql`transfer_state_key`);
+        const [managed] = await tx.select({ total: count() }).from(storageManagedFileCopies)
+          .where(and(eq(storageManagedFileCopies.orderPublicId, input.orderPublicId),
+            principal.role === "admin" ? undefined : sql`${storageManagedFileCopies.role} <> 'receipt'`));
         const [assignment] = await tx.select({ ids: storageAssignments.connectionPublicIds }).from(storageAssignments)
           .where(eq(storageAssignments.purpose, "order_files")).limit(1);
         const ids = assignment?.ids ?? [];
@@ -110,6 +113,7 @@ export function createOrderCopies(deps: ModuleDeps, assertDestination: (publicId
         return {
           totals, hasAssignedConnection: assigned.length > 0,
           hasSharePoint: assigned.some(({ kind }) => kind === "sharepoint" || kind === "onedrive"),
+          ...(managed?.total ? { managedCount: managed.total } : {}),
           nextCursor: found.length > limit ? (page.at(-1)?.publicId ?? null) : null,
           items: page.map((row) => {
             const file = files.get(row.filePublicId);
