@@ -521,6 +521,41 @@ describe("HTTP edge: isolated preview controls", () => {
 });
 
 describe("HTTP edge: bounds, errors, static assets and rendering", () => {
+  it("accepts a bounded native ZIP form only with canonical Origin and full-session CSRF", async () => {
+    const payload = vi.fn();
+    const moduleRouter = Router({ caseSensitive: true, strict: true });
+    const path = "/api/files/archives/download";
+    moduleRouter.post("/files/archives/download", (req, res) => { payload(req.body); res.status(204).end(); });
+    const h = harness({ moduleRouter }, { aliasHosts: ["portal.readypackets.test"] });
+    const ticket = "synthetic-download-ticket".padEnd(43, "A");
+    const form = { ticket, csrf: csrfA };
+    const post = (url = path, session = TOKEN_A, proof = csrfA) => h.http.post(url).set("Host", HOST)
+      .set("Origin", ORIGIN).set("Sec-Fetch-Site", "same-origin").set("Cookie", requestCookies(h.config, session, proof));
+
+    await post().type("form").send(form).expect(204);
+    await post().type("json").set(HEADER_CSRF, csrfA).send({ ticket }).expect(204);
+    expect(payload.mock.calls).toEqual([[{ ticket }], [{ ticket }]]);
+    await post().type("form").set("Origin", "https://external.example.test").send(form).expect(403);
+    await post().type("form").set("Host", "portal.readypackets.test").send(form).expect(404);
+    await post(path, "", csrfA).type("form").send(form).expect(401);
+    await post(path, TOKEN_B).type("form").send(form).expect(403);
+    await post(path, TOKEN_A, csrfB).type("form").send(form).expect(403);
+    await post().type("form").set(HEADER_CSRF, csrfA).send({ ticket }).expect(403);
+    await post().type("json").send(form).expect(403);
+    await post().type("form").send(`ticket=${ticket}&csrf=${csrfA}&csrf=${csrfA}`).expect(413);
+    await post().type("form").send({ csrf: csrfA, ticket: "A".repeat(1024) }).expect(413);
+    await post().type("form").set("Content-Encoding", "gzip").send(gzipSync(`ticket=${ticket}&csrf=${csrfA}`)).expect(415);
+    for (const url of [`${path}/`, `${path}?alternate=1`, "/api/files/Archives/download", "/api/files/download"]) {
+      await post(url).type("form").send(form).expect(403);
+    }
+    const preview = harness({ moduleRouter }, { deploymentProfile: "preview" });
+    await preview.http.post(path).set("Host", HOST).type("form").send(form).expect(404);
+    expect(payload).toHaveBeenCalledTimes(2);
+    const access = JSON.stringify(h.access.mock.calls);
+    expect(access).not.toContain(ticket);
+    expect(access).not.toContain(csrfA);
+  });
+
   it("admits only the literal ACS POST without browser credentials and applies the form cap before dispatch", async () => {
     const payload = vi.fn();
     const h = harness({ samlAcs: (req, res) => {

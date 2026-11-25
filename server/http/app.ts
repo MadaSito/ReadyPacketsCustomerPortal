@@ -8,7 +8,7 @@
  *   4. cheap address admission, origin checks, durable edge budgets and bounded body parsers
  *      (signed webhooks use a separate raw body route with no browser credentials)
  *   5. session resolution (services.sessionResolver) → request actor
- *   6. session-bound CSRF validation for unsafe methods, then the two workflow import body exceptions
+ *   6. bounded native archive form and session-bound CSRF validation for unsafe methods, then the two workflow import body exceptions
  *   7. CSRF bootstrap  8. /api/trpc (independent procedure budgets)  9. module raw routes
  *  10. health endpoints  11. static assets + SPA fallback (prebuilt dist/public; no dev server in production)
  *  12. safe JSON error handler (never stacks/SQL/paths)
@@ -43,7 +43,7 @@ import { createIsolatedHttpRouter, isolatedRoutePrefix, type IsolatedRouterFacto
 import { createModuleHttpRouter } from "./moduleRoutes.js";
 import { previewProfile } from "./previewProfile.js";
 import { isSamlRouteFamily, SAML_ACS_PATH, SAML_METADATA_PATH, SAML_START_PATH } from "./providerPaths.js";
-import { getHttpState, setHttpState } from "./requestState.js";
+import { getHttpState, requireFullSession, setHttpState } from "./requestState.js";
 import { cookieCredentials, cookieTransport, readCookie, setCsrfCookie } from "./sessionTransport.js";
 import { assertSeparateStorage, registerStatic } from "./static.js";
 
@@ -77,7 +77,13 @@ const CATEGORY_PRIORITY: Record<RateLimitCategory, number> = {
 };
 const METHOD_LABELS = new Set(["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE"]);
 const WEBHOOK_LIMIT = 256 * 1024;
+const ARCHIVE_DOWNLOAD_PATH = "/api/files/archives/download";
+const ARCHIVE_FORM_LIMIT_BYTES = 1024;
 const ANALYTICS_CSP_PATHS = new Set(["/privacy", "/terms"]);
+
+function isArchiveDownloadForm(req: Request): boolean {
+  return req.method === "POST" && req.originalUrl === ARCHIVE_DOWNLOAD_PATH && !!req.is("application/x-www-form-urlencoded");
+}
 
 function hasCanonicalOrigin(req: Request, origin: string, allowMissingOrigin = false): boolean {
   const site = req.get("Sec-Fetch-Site");
@@ -227,6 +233,7 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     const isolated = isolatedRoutePrefix(req.path);
     const saml = isSamlRouteFamily(req.path);
     if ((!canonicalHost && (providerCallbackRoute(req.path) || isolated)) || ((isolated || saml) && preview)) throw notFound();
+    if (isArchiveDownloadForm(req) && (!canonicalHost || preview)) throw notFound();
     if (saml && !((req.method === "GET" && (req.path === SAML_METADATA_PATH || req.path === SAML_START_PATH)) ||
       (req.method === "POST" && req.originalUrl === SAML_ACS_PATH))) throw notFound();
     if (saml && req.method === "GET") {
@@ -376,11 +383,28 @@ export function createApp(services: Services, options: AppOptions = {}): Express
     next();
   });
 
-  // 6. Session-bound double submit on unsafe methods. Origin was already checked.
+  // 6. Only native ZIP downloads may carry CSRF in a small form, after exact host, Origin and full-session admission.
+  const archiveDownloadForm = express.urlencoded({ extended: false, limit: ARCHIVE_FORM_LIMIT_BYTES, inflate: false, parameterLimit: 2 });
+  app.use((req, res, next) => {
+    if (!isArchiveDownloadForm(req)) return next();
+    requireFullSession(req);
+    archiveDownloadForm(req, res, next);
+  });
+
+  // All unsafe methods still require constant-time cookie comparison and the session-bound proof.
   app.use((req, _res, next) => {
     if (SAFE_METHODS.has(req.method)) return next();
     const { session } = getHttpState(req);
-    const token = req.get(HEADER_CSRF);
+    let token = req.get(HEADER_CSRF);
+    if (isArchiveDownloadForm(req)) {
+      const form: Record<string, unknown> | undefined = req.body;
+      if (!form || typeof form.csrf !== "string") return denyBrowserRequest("CSRF_INVALID");
+      if (typeof form.ticket !== "string" || Object.keys(form).length !== 2) {
+        throw validation("DOWNLOAD_TICKET_INVALID", "The download request is invalid.");
+      }
+      token = form.csrf;
+      req.body = { ticket: form.ticket }; // CSRF never reaches the module or its audit events.
+    }
     const cookie = preview?.usesExplicitCredentials ? token : readCookie(req, config.csrfCookieName);
     const matches = token && cookie && secureEqual(token, cookie) && (session
       ? matchesSessionCsrfToken(token, session.sessionId, session.csrfSecret)
