@@ -506,4 +506,45 @@ describe("Microsoft Graph & SharePoint readiness, write check, and runbook", () 
     expect(screen.getByRole("region", { name: "Graph site permission endpoint" })).toBeInTheDocument();
     await expectNoAxeViolations(container);
   });
+
+  it("240/320 px reflow: wraps unbroken SharePoint URL templates, hostnames, and runbook steps with min-w-0 containers", async () => {
+    const prodLikeRunbook = {
+      ...entraRunbook,
+      steps: [
+        ...entraRunbook.steps,
+        "Enable both 'Microsoft Graph' and 'SharePoint Upload Session' outbound presets on /admin/integrations/egress.",
+      ],
+      oneDriveNote:
+        "OneDrive for Business drives live inside personal SharePoint site collections (https://<tenant>-my.sharepoint.com/personal/<user>); grant Sites.Selected 'write' on that personal site collection rather than Files.ReadWrite.All.",
+    };
+    const { container } = renderPage(<GraphMailPage />, {
+      "integrations.admin.graph.get": () => graphConfig,
+      "integrations.admin.graph.entraRunbook": () => prodLikeRunbook,
+    });
+
+    await screen.findByRole("heading", { name: "Entra Sites.Selected runbook" });
+
+    const noteParagraph = screen.getByText(/https:\/\/<tenant>-my\.sharepoint\.com\/personal\/<user>/);
+    expect(noteParagraph.className.split(/\s+/)).toContain("wrap-anywhere");
+
+    const stepItem = screen.getByText(/\/admin\/integrations\/egress/);
+    expect(stepItem.className.split(/\s+/)).toContain("wrap-anywhere");
+
+    for (const host of [
+      "login.microsoftonline.com",
+      "graph.microsoft.com",
+      "*.sharepoint.com",
+      "*.files.1drv.com",
+    ]) {
+      const codeEl = screen.getByText(host);
+      expect(codeEl.tagName).toBe("CODE");
+      expect(codeEl.className.split(/\s+/)).toContain("break-all");
+    }
+
+    for (const pre of container.querySelectorAll<HTMLElement>("pre")) {
+      const classes = pre.className.split(/\s+/);
+      expect(classes).toContain("break-all");
+      expect(classes).toContain("whitespace-pre-wrap");
+    }
+  });
 });

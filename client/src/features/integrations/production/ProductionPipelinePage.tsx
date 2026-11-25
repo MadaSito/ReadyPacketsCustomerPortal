@@ -460,7 +460,15 @@ export default function ProductionPipelinePage() {
         }
         title="Production pipeline"
         description="Manual Phase I (P101), Phase II (P201), and optional Phase III (P301) / Phase IV (P401) webhook triggers. Webhook URLs and authorization headers are encrypted at rest, checked against the outbound allowlist, and never echoed."
-        meta={stateMeta ? <Badge tone={stateMeta.tone}>{stateMeta.label}</Badge> : undefined}
+        meta={
+          stateMeta ? (
+            <span className="inline-flex min-w-0 max-w-full" title={stateMeta.label}>
+              <Badge className="min-w-0" tone={stateMeta.tone}>
+                {stateMeta.label}
+              </Badge>
+            </span>
+          ) : undefined
+        }
       />
 
       <div className="flex min-w-0 flex-col gap-6">
@@ -491,23 +499,24 @@ export default function ProductionPipelinePage() {
               <form
                 noValidate
                 onSubmit={(e) => void onSave(e)}
-                className="flex flex-col gap-4"
+                className="flex min-w-0 flex-col gap-4"
                 aria-label="Pipeline settings"
               >
                 {errors.form ? (
                   <Callout tone="danger" live="assertive" title="Settings were not saved">
-                    {errors.form}
+                    <p className="wrap-anywhere">{errors.form}</p>
                   </Callout>
                 ) : null}
 
                 <Switch
-                  label="Enable production pipeline webhooks"
+                  className="min-w-0"
+                  label={<span className="wrap-anywhere">Enable production pipeline webhooks</span>}
                   description="Off by default until Phase I (P101), Phase II (P201), and a canon version are configured. Phase III and Phase IV are optional."
                   checked={form.enabled}
                   onCheckedChange={(checked) => updateForm("enabled", checked)}
                 />
 
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-3">
                   <Field
                     label="Canon version"
                     hint="Sent as canon_version in P101 (required when enabled)."
@@ -558,7 +567,12 @@ export default function ProductionPipelinePage() {
 
                 <Field
                   label="Phase I (P101) webhook URL"
-                  hint={`Saved endpoint: ${formatMaskedUrl(data.p101UrlMask)}. Leave blank to keep the saved URL.`}
+                  hint={
+                    <span className="wrap-anywhere">
+                      Saved endpoint: {formatMaskedUrl(data.p101UrlMask)}. Leave blank to keep the
+                      saved URL.
+                    </span>
+                  }
                   error={errors.p101Url}
                 >
                   <Input
@@ -582,7 +596,12 @@ export default function ProductionPipelinePage() {
 
                 <Field
                   label="Phase II (P201) webhook URL"
-                  hint={`Saved endpoint: ${formatMaskedUrl(data.p201UrlMask)}. Leave blank to keep the saved URL.`}
+                  hint={
+                    <span className="wrap-anywhere">
+                      Saved endpoint: {formatMaskedUrl(data.p201UrlMask)}. Leave blank to keep the
+                      saved URL.
+                    </span>
+                  }
                   error={errors.p201Url}
                 >
                   <Input
@@ -606,7 +625,12 @@ export default function ProductionPipelinePage() {
 
                 <Field
                   label="Phase III (P301) webhook URL (optional)"
-                  hint={`Saved endpoint: ${formatMaskedUrl(data.p301UrlMask)}. When configured, shows "Start Phase III" on the order Automation tab.`}
+                  hint={
+                    <span className="wrap-anywhere">
+                      Saved endpoint: {formatMaskedUrl(data.p301UrlMask)}. When configured, shows
+                      &quot;Start Phase III&quot; on the order Automation tab.
+                    </span>
+                  }
                   error={errors.p301Url}
                 >
                   <Input
@@ -630,7 +654,12 @@ export default function ProductionPipelinePage() {
 
                 <Field
                   label="Phase IV (P401) webhook URL (optional)"
-                  hint={`Saved endpoint: ${formatMaskedUrl(data.p401UrlMask)}. When configured, shows "Start Phase IV" on the order Automation tab.`}
+                  hint={
+                    <span className="wrap-anywhere">
+                      Saved endpoint: {formatMaskedUrl(data.p401UrlMask)}. When configured, shows
+                      &quot;Start Phase IV&quot; on the order Automation tab.
+                    </span>
+                  }
                   error={errors.p401Url}
                 >
                   <Input
@@ -652,7 +681,7 @@ export default function ProductionPipelinePage() {
                   />
                 ) : null}
 
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2">
                   <Field
                     label="Authorization header name"
                     hint="Optional custom header name (leave blank if unused)."
@@ -718,10 +747,10 @@ export default function ProductionPipelinePage() {
               title="Destination allowlist check"
               description="Dry run only: resolves DNS and verifies the saved destination against the outbound webhook allowlist without sending an HTTP request."
             >
-              <div className="flex flex-col gap-3">
+              <div className="flex min-w-0 flex-col gap-3">
                 {testError ? (
                   <Callout tone="danger" live="assertive">
-                    {testError}
+                    <p className="wrap-anywhere">{testError}</p>
                   </Callout>
                 ) : null}
 
@@ -779,22 +808,35 @@ export default function ProductionPipelinePage() {
                         : `${PHASE_LABELS[lastTest.phase]} blocked`
                     }
                   >
-                    <p className="mb-3">{lastTest.safeMessage}</p>
+                    <p className="mb-3 wrap-anywhere">{lastTest.safeMessage}</p>
                     <KeyValueList
                       columns={1}
                       items={[
-                        { label: "Reason code", value: lastTest.reasonCode },
-                        { label: "Host", value: lastTest.host ?? "Unavailable" },
+                        {
+                          label: "Reason code",
+                          value: <span className="break-all">{lastTest.reasonCode}</span>,
+                        },
+                        {
+                          label: "Host",
+                          value: <span className="break-all">{lastTest.host ?? "Unavailable"}</span>,
+                        },
                         {
                           label: "Resolved addresses",
-                          value:
-                            lastTest.resolvedAddresses.length > 0
-                              ? lastTest.resolvedAddresses.join(", ")
-                              : "None",
+                          value: (
+                            <span className="break-all">
+                              {lastTest.resolvedAddresses.length > 0
+                                ? lastTest.resolvedAddresses.join(", ")
+                                : "None"}
+                            </span>
+                          ),
                         },
                         {
                           label: "Matched allowlist rule",
-                          value: lastTest.matchedAllowlistRulePublicId ?? "None",
+                          value: (
+                            <span className="break-all">
+                              {lastTest.matchedAllowlistRulePublicId ?? "None"}
+                            </span>
+                          ),
                         },
                         { label: "Checked", value: <DateTime value={lastTest.checkedAt} /> },
                       ]}
@@ -809,30 +851,50 @@ export default function ProductionPipelinePage() {
         {data ? (
           <Section
             title="Payload signing (HMAC-SHA256)"
-            description="Sign outbound production pipeline payloads with HMAC-SHA256 (X-ReadyPackets-Signature) and rotate secrets with overlap."
+            description={
+              <span className="wrap-anywhere">
+                Sign outbound production pipeline payloads with HMAC-SHA256
+                (X-ReadyPackets-Signature) and rotate secrets with overlap.
+              </span>
+            }
           >
             <Card
+              className="min-w-0"
               title="HMAC-SHA256 signing"
               actions={
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge tone={data.signingEnabled ? "info" : "neutral"}>
-                    {data.signingEnabled ? "Signed" : "Unsigned"}
-                  </Badge>
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <span
+                    className="inline-flex min-w-0 max-w-full"
+                    title={data.signingEnabled ? "Signed" : "Unsigned"}
+                  >
+                    <Badge className="min-w-0" tone={data.signingEnabled ? "info" : "neutral"}>
+                      {data.signingEnabled ? "Signed" : "Unsigned"}
+                    </Badge>
+                  </span>
                   {data.previousSigningSecretActive ? (
-                    <Badge tone="warning">Overlap secret active</Badge>
+                    <span className="inline-flex min-w-0 max-w-full" title="Overlap secret active">
+                      <Badge className="min-w-0" tone="warning">
+                        Overlap secret active
+                      </Badge>
+                    </span>
                   ) : null}
                 </div>
               }
             >
-              <div className="flex flex-col gap-4">
+              <div className="flex min-w-0 flex-col gap-4">
                 {signingError ? (
                   <Callout tone="danger" live="assertive" title="Signing update failed">
-                    {signingError}
+                    <p className="wrap-anywhere">{signingError}</p>
                   </Callout>
                 ) : null}
 
                 <Switch
-                  label="Sign production payloads with HMAC-SHA256 (X-ReadyPackets-Signature)"
+                  className="min-w-0"
+                  label={
+                    <span className="wrap-anywhere">
+                      Sign production payloads with HMAC-SHA256 (X-ReadyPackets-Signature)
+                    </span>
+                  }
                   description={
                     data.signingSecretConfigured
                       ? "When on, every P101–P401 delivery carries an HMAC-SHA256 signature header."
@@ -888,7 +950,7 @@ export default function ProductionPipelinePage() {
           title="Workflow lifecycle auto-queue"
           description="Opt-in automatic queueing of Phase I (P101) and Phase II (P201) dispatches per workflow. Disabled by default."
         >
-          <div className="flex flex-col gap-4">
+          <div className="flex min-w-0 flex-col gap-4">
             <Callout tone="info" title="Lifecycle rules and non-retroactive guarantee">
               Turning on these switches affects future order events only and never fires retroactively
               for existing orders. Automatic Phase II (P201) queueing requires both a delivered P101
@@ -897,12 +959,14 @@ export default function ProductionPipelinePage() {
 
             {autoQueueError ? (
               <Callout tone="danger" live="assertive" title="Auto-queue update failed">
-                {autoQueueError}
+                <p className="wrap-anywhere">{autoQueueError}</p>
               </Callout>
             ) : null}
 
+            {/* Below 320 px, stack DataTable <dt>/<dd> so long header labels do not squeeze Switch controls. */}
             <DataTable<WorkflowAutoQueueItemView>
               caption="Workflow lifecycle auto-queue switches"
+              className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
               rows={autoQueue.data?.items}
               loading={autoQueue.isPending}
               error={autoQueue.error}
@@ -921,10 +985,18 @@ export default function ProductionPipelinePage() {
                   header: "Workflow",
                   primary: true,
                   cell: (row) => (
-                    <div className="flex flex-col gap-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium text-ink">{row.workflowName}</span>
-                        {row.isDefault ? <Badge tone="info">Default</Badge> : null}
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="font-medium wrap-anywhere text-ink">
+                          {row.workflowName}
+                        </span>
+                        {row.isDefault ? (
+                          <span className="inline-flex min-w-0 max-w-full" title="Default">
+                            <Badge className="min-w-0" tone="info">
+                              Default
+                            </Badge>
+                          </span>
+                        ) : null}
                       </div>
                       <code className="break-all text-xs text-muted">{row.workflowKey}</code>
                     </div>
@@ -935,7 +1007,12 @@ export default function ProductionPipelinePage() {
                   header: "P101 on payment confirmed",
                   cell: (row) => (
                     <Switch
-                      label={`Auto-queue P101 on payment confirmed for ${row.workflowName}`}
+                      className="min-w-0"
+                      label={
+                        <span className="wrap-anywhere">
+                          {`Auto-queue P101 on payment confirmed for ${row.workflowName}`}
+                        </span>
+                      }
                       checked={row.p101OnPaymentConfirmed}
                       disabled={autoQueueBusyId === row.workflowPublicId}
                       onCheckedChange={(checked) =>
@@ -952,7 +1029,12 @@ export default function ProductionPipelinePage() {
                   header: "P201 on Phase 1 lock",
                   cell: (row) => (
                     <Switch
-                      label={`Auto-queue P201 on Phase 1 lock for ${row.workflowName}`}
+                      className="min-w-0"
+                      label={
+                        <span className="wrap-anywhere">
+                          {`Auto-queue P201 on Phase 1 lock for ${row.workflowName}`}
+                        </span>
+                      }
                       checked={row.p201OnPhase1Locked}
                       disabled={autoQueueBusyId === row.workflowPublicId}
                       onCheckedChange={(checked) =>
@@ -973,7 +1055,7 @@ export default function ProductionPipelinePage() {
           title="Production dispatches"
           description="Every manual or workflow-queued Phase I (P101), Phase II (P201), Phase III (P301), and Phase IV (P401) webhook dispatch across orders."
         >
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             <FilterBar
               search={searchInput}
               onSearchChange={setSearchInput}
@@ -1020,8 +1102,10 @@ export default function ProductionPipelinePage() {
               </Field>
             </FilterBar>
 
+            {/* Below 320 px, stack DataTable <dt>/<dd> so Receiver response / Phase labels do not squeeze cells. */}
             <DataTable<ProductionDispatchItem>
               caption="Production webhook dispatches"
+              className="max-[320px]:[&_li]:min-w-0 max-[320px]:[&_dl]:grid-cols-1 max-[320px]:[&_dt]:break-words"
               rows={dispatches.data?.items}
               loading={dispatches.isPending}
               error={dispatches.error}
@@ -1040,8 +1124,8 @@ export default function ProductionPipelinePage() {
                   header: "Order",
                   primary: true,
                   cell: (row) => (
-                    <div>
-                      <Button asChild variant="link">
+                    <div className="min-w-0">
+                      <Button asChild variant="link" className="min-w-0 wrap-anywhere text-left">
                         <Link href={`/admin/orders/${row.orderPublicId}/automation`}>
                           {row.orderReference}
                         </Link>
@@ -1056,27 +1140,41 @@ export default function ProductionPipelinePage() {
                   key: "phase",
                   header: "Phase",
                   cell: (row) => (
-                    <div className="flex flex-col gap-1">
-                      <span className="font-medium text-ink">{PHASE_LABELS[row.phase]}</span>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <span className="font-medium wrap-anywhere text-ink">
+                        {PHASE_LABELS[row.phase]}
+                      </span>
                       {row.packet && row.tier ? (
-                        <div className="text-xs text-muted">
+                        <div className="text-xs wrap-anywhere text-muted">
                           Packet {row.packet} · {row.tier}
                         </div>
                       ) : null}
                       {row.redeliveryOf ? (
-                        <div>
-                          <Badge tone="info">
-                            Redelivery of {shortPublicId(row.redeliveryOf)}
-                          </Badge>
+                        <div className="min-w-0">
+                          <span
+                            className="inline-flex min-w-0 max-w-full"
+                            title={`Redelivery of ${shortPublicId(row.redeliveryOf)}`}
+                          >
+                            <Badge className="min-w-0" tone="info">
+                              Redelivery of {shortPublicId(row.redeliveryOf)}
+                            </Badge>
+                          </span>
                         </div>
                       ) : null}
                       {row.retryOf ? (
-                        <div>
-                          <Badge tone="neutral">Retry of {shortPublicId(row.retryOf)}</Badge>
+                        <div className="min-w-0">
+                          <span
+                            className="inline-flex min-w-0 max-w-full"
+                            title={`Retry of ${shortPublicId(row.retryOf)}`}
+                          >
+                            <Badge className="min-w-0" tone="neutral">
+                              Retry of {shortPublicId(row.retryOf)}
+                            </Badge>
+                          </span>
                         </div>
                       ) : null}
                       {row.triggerSource ? (
-                        <div className="text-xs text-muted">
+                        <div className="text-xs wrap-anywhere text-muted">
                           {formatTriggerSource(row.triggerSource)}
                           {row.stageKey ? ` · Phase ${row.stageKey}` : ""}
                         </div>
@@ -1090,13 +1188,17 @@ export default function ProductionPipelinePage() {
                   cell: (row) => {
                     const meta = getDispatchStateMeta(row);
                     return (
-                      <div>
-                        <Badge tone={meta.tone}>{meta.label}</Badge>
-                        <div className="mt-1 tabular-nums text-xs text-muted">
+                      <div className="min-w-0">
+                        <span className="inline-flex min-w-0 max-w-full" title={meta.label}>
+                          <Badge className="min-w-0" tone={meta.tone}>
+                            {meta.label}
+                          </Badge>
+                        </span>
+                        <div className="mt-1 tabular-nums text-xs wrap-anywhere text-muted">
                           Attempts: {row.attemptCount} of {row.maxAttempts}
                         </div>
                         {row.state === "queued" && row.attemptCount > 0 && row.nextAttemptAt ? (
-                          <div className="mt-0.5 tabular-nums text-xs text-muted">
+                          <div className="mt-0.5 tabular-nums text-xs wrap-anywhere text-muted">
                             Next attempt <DateTime value={row.nextAttemptAt} />
                           </div>
                         ) : null}
@@ -1109,19 +1211,19 @@ export default function ProductionPipelinePage() {
                   header: "Receiver response",
                   cell: (row) => (
                     <div className="min-w-0">
-                      <span className="tabular-nums text-sm text-body">
+                      <span className="tabular-nums text-sm wrap-anywhere text-body">
                         {row.httpStatus !== null ? `HTTP ${row.httpStatus}` : "No HTTP response"}
                       </span>
                       {row.lastReasonCode ? (
                         <div className="break-all text-xs text-muted">{row.lastReasonCode}</div>
                       ) : null}
                       {row.responseSummary ? (
-                        <div className="mt-0.5 break-words text-xs text-muted">
+                        <div className="mt-0.5 wrap-anywhere text-xs text-muted">
                           {row.responseSummary}
                         </div>
                       ) : null}
                       {row.stopReason ? (
-                        <div className="mt-0.5 break-words text-xs text-muted">
+                        <div className="mt-0.5 wrap-anywhere text-xs text-muted">
                           Stopped: {row.stopReason}
                         </div>
                       ) : null}
@@ -1132,7 +1234,7 @@ export default function ProductionPipelinePage() {
                   key: "timestamps",
                   header: "Requested",
                   cell: (row) => (
-                    <div>
+                    <div className="min-w-0 wrap-anywhere">
                       <DateTime value={row.createdAt} />
                       {row.deliveredAt ? (
                         <div className="mt-0.5 text-xs text-muted">
@@ -1146,7 +1248,7 @@ export default function ProductionPipelinePage() {
                   key: "correlation",
                   header: "Audit trail",
                   cell: (row) => (
-                    <Button asChild variant="link">
+                    <Button asChild variant="link" className="min-w-0 wrap-anywhere text-left">
                       <Link
                         href={auditCorrelationHref(row.correlationId)}
                         aria-label={`Open audit correlation ${row.correlationId}`}

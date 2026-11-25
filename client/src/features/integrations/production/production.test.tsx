@@ -1518,4 +1518,37 @@ describe("Production pipeline & Order Automation tab (Part B T1 / B4)", () => {
       expect(listDispatchesSpy).toHaveBeenCalledWith(expect.objectContaining({ state: "failed" })),
     );
   });
+
+  it("240 px reflow: stacks mobile DataTable <dl> below 320 px and wraps unbroken signing headers and masked URLs", async () => {
+    mockState.p301Configured = true;
+    mockState.hasRedeliveryRow = true;
+
+    renderUi(<ProductionPipelinePage />, {
+      path: "/admin/integrations/production",
+      api: fakeAuthApi({ me: async () => sessionFor("admin") }),
+    });
+
+    await screen.findByRole("heading", { level: 1, name: "Production pipeline" });
+
+    for (const listName of [
+      "Workflow lifecycle auto-queue switches",
+      "Production webhook dispatches",
+    ]) {
+      const mobileList = await screen.findByRole("list", { name: listName });
+      const dataTableRoot = mobileList.parentElement;
+      expect(dataTableRoot).not.toBeNull();
+      const rootClasses = dataTableRoot!.className.split(/\s+/);
+      expect(rootClasses).toContain("max-[320px]:[&_li]:min-w-0");
+      expect(rootClasses).toContain("max-[320px]:[&_dl]:grid-cols-1");
+      expect(rootClasses).toContain("max-[320px]:[&_dt]:break-words");
+    }
+
+    const signingLabelSpan = screen.getByText(
+      "Sign production payloads with HMAC-SHA256 (X-ReadyPackets-Signature)",
+    );
+    expect(signingLabelSpan.className.split(/\s+/)).toContain("wrap-anywhere");
+
+    const maskedEndpointHint = screen.getByText(/https:\/\/hooks\.example\.test\/…9f2a/);
+    expect(maskedEndpointHint.className.split(/\s+/)).toContain("wrap-anywhere");
+  });
 });
