@@ -216,13 +216,14 @@ const ENTRIES: TriggerCatalogueEntry[] = [
     key: "payment.failed", label: "Payment failed", group: "Billing", owner: "payments", staffOnly: true,
     description: "An online payment attempt failed. Only the invoice and the provider are known, never card details.",
     eventName: "payments.attempt.failed", outcomes: ["failed"], resourceType: "payment_attempt",
-    fields: [f("invoice_public_id", "Invoice id", "public_id"), f("provider", "Payment provider", "string"), f("reason_code", "Reason", "string")],
+    fields: [f("invoice_public_id", "Invoice id", "public_id"), f("order_public_id", "Order id", "public_id"), f("provider", "Payment provider", "string"), f("reason_code", "Reason", "string")],
     recipients: [ADMINS, STAFF],
   },
   {
     key: "payment.refunded", label: "Payment refunded", group: "Billing", owner: "payments",
-    description: "A refund was confirmed by the payment provider.",
-    eventName: "payment.refund.succeeded", outcomes: ["completed"], resourceType: "payment_refund",
+    description: "A refund was confirmed by the payment provider or recorded manually.",
+    // Provider and manual invoice refunds both emit this event (compliance), so the resource type is not fixed.
+    eventName: "payment.refund.succeeded", outcomes: ["completed"], resourceType: null,
     fields: [f("invoice_public_id", "Invoice id", "public_id"), f("provider", "Payment provider", "string"), ...orderContext, recipientName],
     recipients: [ORDER_OWNER, ADMINS],
   },

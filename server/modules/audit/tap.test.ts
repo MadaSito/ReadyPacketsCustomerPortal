@@ -249,6 +249,7 @@ describe("trigger catalogue", () => {
     expect(keysFor("invoice.payment.recorded", "completed", "invoice_payment")).toEqual(["invoice.paid", "payment.succeeded"]);
     expect(keysFor("payments.attempt.failed", "failed", "payment_attempt")).toEqual(["payment.failed"]);
     expect(keysFor("payment.refund.succeeded", "completed", "payment_refund")).toEqual(["payment.refunded"]);
+    expect(keysFor("payment.refund.succeeded", "completed", "invoice_refund")).toEqual(["payment.refunded"]);
     expect(keysFor("intake.submission.submitted", "completed", "intake_submission")).toEqual(["intake.submitted"]);
     expect(keysFor("intake.submission.draft_saved", "completed", "intake_submission")).toEqual([]);
     expect(keysFor("intake.submission.reviewed", "completed", "intake_submission")).toEqual(["intake.reviewed"]);

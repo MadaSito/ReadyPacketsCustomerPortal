@@ -110,6 +110,9 @@ export const ORDER_ACTIVITY_CATALOGUE: readonly CatalogueEntry[] = Object.freeze
   { pattern: "order.completion.*", category: "automation", label: "Completion update", customer: false },
   { pattern: "order.payment_state.changed", category: "payments", label: "Payment status updated", customer: true },
   { pattern: "file.archive.*", category: "files", label: "File archive (ZIP)", customer: false },
+  { pattern: "payments.attempt.pending_async", category: "payments", label: "Bank payment pending", customer: false },
+  { pattern: "payments.attempt.failed", category: "payments", label: "Online payment failed", customer: false },
+  { pattern: "payment.refund.flagged", category: "payments", label: "Refund made outside the portal flagged", customer: false },
   { pattern: "storage.file_sync.*", category: "storage", label: "Microsoft 365 file sync", customer: false },
   /* Wildcards label with the humanised event name (see `humanizeEventName`). */
   { pattern: "payment.*", category: "payments", label: "", customer: false },
