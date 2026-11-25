@@ -461,7 +461,7 @@ export default function PaymentSetupPage() {
       label: "Verify outbound Stripe API connectivity",
       description: connectionCheckResult
         ? connectionCheckResult.message
-        : "Calls GET /v1/balance over the pinned outbound allowlist and confirms key environment alignment.",
+        : "Calls GET /v1/checkout/sessions?limit=1 over the pinned outbound allowlist and confirms key environment alignment.",
       state: connectionCheckResult?.ok ? "done" : "optional",
       action: (
         <Button
@@ -535,7 +535,7 @@ export default function PaymentSetupPage() {
   ].join("\n");
 
   return (
-    <div className="grid min-w-0 gap-6">
+    <div className="grid min-w-0 grid-cols-1 gap-6">
       <PageHeader
         breadcrumbs={
           <Breadcrumbs
@@ -580,8 +580,8 @@ export default function PaymentSetupPage() {
         }
         description="Save or rotate Stripe keys for the selected environment. Saving here keeps your current active provider unchanged until you activate Stripe Checkout."
       >
-        <form className="grid min-w-0 gap-4" onSubmit={(event) => void submitStagedCredentials(event)}>
-          <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+        <form className="grid min-w-0 grid-cols-1 gap-4" onSubmit={(event) => void submitStagedCredentials(event)}>
+          <div className="grid min-w-0 grid-cols-1 gap-4 sm:grid-cols-2">
             <Field label="Target Stripe environment" required>
               <Select
                 value={activeMode}
@@ -674,25 +674,27 @@ export default function PaymentSetupPage() {
         }
         description="Register this exact HTTPS endpoint in the Stripe Dashboard and subscribe to all 9 event types below."
       >
-        <div className="grid min-w-0 gap-4">
+        <div className="grid min-w-0 grid-cols-1 gap-4">
           <CopyField
+            className="min-w-0"
             label="Stripe webhook endpoint URL"
             value={settings.stripe.webhookUrl}
             copyLabel="Copy webhook endpoint URL"
             monospace
           />
           <CopyField
+            className="min-w-0"
             label="Required Stripe webhook events (comma-separated)"
             value={requiredEvents.join(",")}
             copyLabel="Copy event list"
             monospace
           />
-          <ul className="flex flex-wrap gap-2" aria-label="Required Stripe webhook event names">
+          <ul className="flex min-w-0 max-w-full flex-wrap gap-2" aria-label="Required Stripe webhook event names">
             {requiredEvents.map((eventName) => (
-              <li key={eventName}>
-                <Badge tone="neutral">
-                  <span className="font-mono text-xs">{eventName}</span>
-                </Badge>
+              <li key={eventName} className="min-w-0 max-w-full">
+                <code className="inline-block max-w-full rounded-full border border-line bg-surface-sunken px-2.5 py-0.5 font-mono text-xs font-semibold break-all text-ink">
+                  {eventName}
+                </code>
               </li>
             ))}
           </ul>
@@ -710,7 +712,7 @@ export default function PaymentSetupPage() {
               {
                 label: "Last verified event type",
                 value: settings.stripe.lastVerifiedWebhookEventType ? (
-                  <span className="font-mono text-xs">{settings.stripe.lastVerifiedWebhookEventType}</span>
+                  <span className="break-all font-mono text-xs">{settings.stripe.lastVerifiedWebhookEventType}</span>
                 ) : (
                   "Not applicable"
                 ),
