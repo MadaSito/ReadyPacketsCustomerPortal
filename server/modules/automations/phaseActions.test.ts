@@ -1005,6 +1005,36 @@ describe("automations module — Increment 07 D5 (Package F)", () => {
         confirmationToken: freshPreview.confirmationToken,
       }),
     ).rejects.toThrow();
+
+    // Concurrent same-idempotencyKey race across two authorized sessions replays cleanly under READ COMMITTED + FOR UPDATE
+    const raceOrder = await placeCustomerOrder(admin.principal, customer.principal, "Concurrent Idem Order");
+    const [staffPrevRace, adminPrevRace] = await Promise.all([
+      staffCaller.automations.orderStageActions.previewBundle({
+        orderPublicId: raceOrder.publicId,
+        stageKey: "intake_phase",
+      }),
+      adminCaller.automations.orderStageActions.previewBundle({
+        orderPublicId: raceOrder.publicId,
+        stageKey: "intake_phase",
+      }),
+    ]);
+    const sharedRaceKey = nextKey("concurrent_idem");
+    const [raceA, raceB] = await Promise.all([
+      staffCaller.automations.orderStageActions.runBundle({
+        orderPublicId: raceOrder.publicId,
+        stageKey: "intake_phase",
+        idempotencyKey: sharedRaceKey,
+        confirmationToken: staffPrevRace.confirmationToken,
+      }),
+      adminCaller.automations.orderStageActions.runBundle({
+        orderPublicId: raceOrder.publicId,
+        stageKey: "intake_phase",
+        idempotencyKey: sharedRaceKey,
+        confirmationToken: adminPrevRace.confirmationToken,
+      }),
+    ]);
+    expect([raceA.deduplicated, raceB.deduplicated].sort()).toEqual([false, true]);
+    expect(raceA.stageRun.publicId).toBe(raceB.stageRun.publicId);
   });
 
   it("resolves range completion once via CSPRNG, fences delayed jobs, supersedes on stage leave / cancel / newer write, supports admin cancel, and alerts after 3 worker failures", async () => {

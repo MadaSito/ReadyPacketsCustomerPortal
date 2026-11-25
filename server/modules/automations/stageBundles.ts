@@ -551,84 +551,87 @@ export async function executeOrderStageBundle(
   const ordersSvc = deps.services.orders;
   await ordersSvc.assertCanReadOrder(principal, input.orderPublicId);
 
-  return deps.db.transaction(async (tx) => {
-    const lockedActors = await assertAutomationsActorInTx(
-      deps,
-      principal,
-      tx,
-      "orders.stage.run",
-    );
-    const liveActor = lockedActors.get(principal.userId)!;
-
-    const cfg = await readSetting(deps.settings, AUTOMATIONS_CONFIG, tx);
-    if (!cfg.stageBundlesEnabled) {
-      throw new DomainError(
-        "NOT_CONFIGURED",
-        "STAGE_BUNDLES_DISABLED",
-        STAGE_BUNDLES_DISABLED_MESSAGE,
+  return deps.db.transaction(
+    async (tx) => {
+      const lockedActors = await assertAutomationsActorInTx(
+        deps,
+        principal,
+        tx,
+        "orders.stage.run",
       );
-    }
+      const liveActor = lockedActors.get(principal.userId)!;
 
-    const [lockedOrder] = await tx
-      .select({
-        id: orders.id,
-        publicId: orders.publicId,
-        reference: orders.reference,
-        ownerUserId: orders.ownerUserId,
-        workflowVersionId: orders.workflowVersionId,
-        statusKey: orders.statusKey,
-        lockState: orders.lockState,
-        completionRevision: orders.completionRevision,
-        version: orders.version,
-      })
-      .from(orders)
-      .where(eq(orders.publicId, input.orderPublicId))
-      .for("update");
-
-    if (!lockedOrder) {
-      throw notFound("Order not found.");
-    }
-
-    await ordersSvc.assertCanReadOrder(principal, lockedOrder.publicId, { tx });
-
-    const [existingRun] = await tx
-      .select()
-      .from(orderStageRuns)
-      .where(
-        and(
-          eq(orderStageRuns.orderId, lockedOrder.id),
-          eq(orderStageRuns.idempotencyKey, idempotencyKey),
-        ),
-      )
-      .limit(1);
-
-    if (existingRun) {
-      if (existingRun.stageKey !== stageKey) {
-        throw conflict(
-          "IDEMPOTENCY_KEY_CONFLICT",
-          "Idempotency key was already used for another stage on this order.",
+      const cfg = await readSetting(deps.settings, AUTOMATIONS_CONFIG, tx);
+      if (!cfg.stageBundlesEnabled) {
+        throw new DomainError(
+          "NOT_CONFIGURED",
+          "STAGE_BUNDLES_DISABLED",
+          STAGE_BUNDLES_DISABLED_MESSAGE,
         );
       }
-      const [runView] = await hydrateStageRunViews(tx, deps.crypto, [existingRun]);
-      const [linkedJobRow] = await tx
+
+      const [lockedOrder] = await tx
+        .select({
+          id: orders.id,
+          publicId: orders.publicId,
+          reference: orders.reference,
+          ownerUserId: orders.ownerUserId,
+          workflowVersionId: orders.workflowVersionId,
+          statusKey: orders.statusKey,
+          lockState: orders.lockState,
+          completionRevision: orders.completionRevision,
+          version: orders.version,
+        })
+        .from(orders)
+        .where(eq(orders.publicId, input.orderPublicId))
+        .for("update");
+
+      if (!lockedOrder) {
+        throw notFound("Order not found.");
+      }
+
+      await ordersSvc.assertCanReadOrder(principal, lockedOrder.publicId, { tx });
+
+      const [existingRun] = await tx
         .select()
-        .from(orderCompletionJobs)
+        .from(orderStageRuns)
         .where(
           and(
-            eq(orderCompletionJobs.sourceKind, "stage_run"),
-            eq(orderCompletionJobs.sourcePublicId, existingRun.publicId),
+            eq(orderStageRuns.orderId, lockedOrder.id),
+            eq(orderStageRuns.idempotencyKey, idempotencyKey),
           ),
         )
-        .limit(1);
-      const [jobView] = linkedJobRow
-        ? await hydrateCompletionJobViews(tx, deps.crypto, [linkedJobRow])
-        : [null];
-      return {
-        deduplicated: true,
-        stageRun: runView!,
-        completionJob: jobView ?? null,
-      };
-    }
+        .limit(1)
+        .for("update");
+
+      if (existingRun) {
+        if (existingRun.stageKey !== stageKey) {
+          throw conflict(
+            "IDEMPOTENCY_KEY_CONFLICT",
+            "Idempotency key was already used for another stage on this order.",
+          );
+        }
+        const [runView] = await hydrateStageRunViews(tx, deps.crypto, [existingRun]);
+        const [linkedJobRow] = await tx
+          .select()
+          .from(orderCompletionJobs)
+          .where(
+            and(
+              eq(orderCompletionJobs.sourceKind, "stage_run"),
+              eq(orderCompletionJobs.sourcePublicId, existingRun.publicId),
+            ),
+          )
+          .limit(1)
+          .for("share");
+        const [jobView] = linkedJobRow
+          ? await hydrateCompletionJobViews(tx, deps.crypto, [linkedJobRow])
+          : [null];
+        return {
+          deduplicated: true,
+          stageRun: runView!,
+          completionJob: jobView ?? null,
+        };
+      }
 
     let stageCtx = await ordersSvc.stages.contextForRun(lockedOrder.publicId, tx);
     // Use current-read columns from SELECT ... FOR UPDATE rather than REPEATABLE READ snapshot values.
@@ -1159,7 +1162,9 @@ export async function executeOrderStageBundle(
       stageRun: stageRunView!,
       completionJob: completionJobView ?? null,
     };
-  });
+    },
+    { isolationLevel: "read committed" },
+  );
 }
 
 export async function listOrderStageBundleRuns(

@@ -17,13 +17,13 @@
 ## Increment 07 — Package F (Phase Actions, Completion Policies, Rule Reordering & Picker Options, D5 Server)
 - **Additive Schema (`schema.ts` + `migrations/0007_increment_07.sql`)**:
   - Added `sort_order INT UNSIGNED NOT NULL DEFAULT 0` + `(sort_order, id)` index on `automations`, with idempotent start-up backfill (`backfillAutomationSortOrder`).
-  - Added `order_stage_runs` (`UNIQUE (order_id, idempotency_key_hash)`, per-slot outcomes JSON, pinned `workflow_version_id`, actor/correlation metadata).
+  - Added `order_stage_runs` (`UNIQUE (order_id, idempotency_key)`, per-slot outcomes JSON, pinned `workflow_version_id`, actor/correlation metadata).
   - Added `order_completion_jobs` (`scheduled` / `applied` / `superseded` / `canceled` / `failed`, `resolved_percent` drawn once on the server via `crypto.randomInt(min, max + 1)`, `expected_revision` fencing).
 - **Phase Action Bundle Runner (`stageBundles.ts`, `router.ts`, `settings.ts`)**:
   - Resolves `stageActions` strictly from the order's pinned `workflowVersionId` (existing orders are never re-pinned; later workflow publishes do not mutate pinned orders).
-  - `previewBundle` computes a keyed HMAC confirmation token (`stgc1_<64hex>`) bound to `actorUserId`, `sessionId`, pinned `workflowVersionId`, live `orderVersion`, `statusKey`, `lockState`, `ownerUserId`, `completionRevision`, and slot availability.
-  - `runBundle` requires `orders.stage.run`, active MFA step-up, `stageBundlesEnabled: true` (parsed with `.default(true)` for backward compatibility with older stored settings), and current-read `SELECT ... FROM orders ... FOR UPDATE` inside the transaction.
-  - Declines stale confirmations with `STALE_STAGE_CONFIRMATION` and locked orders (`legal_hold`, `imported_read_only`, `finalized`) with `ORDER_LOCKED` with zero side effects, while replaying completed `(orderId, idempotencyKeyHash)` calls idempotently (`deduplicated: true`).
+  - `previewBundle` / `listBundleRuns` / `listCompletionJobs` require `staffProcedure` + `orders.automations.run` (so operators can inspect and preview before MFA step-up); `previewBundle` computes a keyed HMAC confirmation token (`stgc1_<64hex>`) bound to `actorUserId`, `sessionId`, pinned `workflowVersionId`, live `orderVersion`, `statusKey`, `lockState`, `ownerUserId`, `completionRevision`, and slot availability.
+  - `runBundle` requires `orders.stage.run`, active MFA step-up, `stageBundlesEnabled: true` (parsed with `.default(true)` for backward compatibility with older stored settings), `{ isolationLevel: "read committed" }`, and locking current reads (`orders` `FOR UPDATE`, `order_stage_runs` `FOR UPDATE`, `order_completion_jobs` `FOR SHARE`).
+  - Declines stale confirmations with `STALE_STAGE_CONFIRMATION` and locked orders (`legal_hold`, `imported_read_only`, `finalized`) with `ORDER_LOCKED` with zero side effects, while replaying completed `(orderId, idempotencyKey)` calls idempotently (`deduplicated: true`) even under concurrent multi-session races.
   - Executes all 5 slots in deterministic order (`status` -> `completion` -> `email` -> `webhook` -> `alert`), requiring `admin` + `statusOverrideReason` for non-direct status overrides, and emits `opsAlerts` (`STAGE_BUNDLE_FAILED` / `STAGE_BUNDLE_PARTIAL`) on slot failures.
 - **One-Shot Fenced Completion Jobs (`completionJobs.ts`)**:
   - Draws range completion once via `crypto.randomInt(min, max + 1)` and persists `resolved_percent`.

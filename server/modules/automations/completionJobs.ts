@@ -708,7 +708,7 @@ export async function handleApplyCompletionJob(
         tx,
       );
       outcomeKind = "applied";
-    });
+    }, { isolationLevel: "read committed" });
 
     return {
       outcome: "completed",
@@ -968,5 +968,5 @@ export async function cancelOrderCompletionJobByAdmin(
       .limit(1);
     const [view] = await hydrateCompletionJobViews(tx, deps.crypto, [updated!]);
     return view!;
-  });
+  }, { isolationLevel: "read committed" });
 }
