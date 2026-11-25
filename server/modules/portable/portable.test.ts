@@ -58,9 +58,10 @@ function distinctKeyConfig() {
 async function environment(t: TestDb, installationId: string) {
   const h = createTestDeps({ db: t.db, config: { ...distinctKeyConfig(), installationId, canonicalOrigin: `https://${installationId}.example.test` } });
   const admins: SessionPrincipal[] = [];
-  h.services.assurance = {
+  const assuranceFixture: Pick<TestHarness["services"]["assurance"], "getAssuranceState"> = {
     getAssuranceState: async () => ({ mfaEnrolled: true, recoveryCodesAcknowledged: true, passkeyCount: 0, totpEnrolled: true }),
-  } as TestHarness["services"]["assurance"];
+  };
+  h.services.assurance = assuranceFixture as TestHarness["services"]["assurance"];
   const identity = createIdentityModule(h.deps);
   h.services.identity = identity;
   const signInAdmin = async (email: string): Promise<SessionPrincipal> => {
