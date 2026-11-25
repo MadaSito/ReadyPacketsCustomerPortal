@@ -377,6 +377,9 @@ describe("private file admission and authorization", () => {
       const found = await files.list(owner, orderPublicId, {});
       const derived = found.items.find((item) => item.derivedFromPublicId === id)!;
       expect(derived).toMatchObject({ contentType: "audio/webm", extension: "webm", slotKey: "voice_evidence" });
+      await expect(files.listDeliverableFiles(owner, { orderPublicId })).resolves.toMatchObject({
+        items: [expect.objectContaining({ publicId: derived.publicId })],
+      });
       expect(stageOrderFile.mock.calls.map(([publicId]) => publicId).filter((publicId) => publicId === derived.publicId)).toHaveLength(1);
       expect(stageOrderFile.mock.calls.map(([publicId]) => publicId)).not.toContain(id);
       expect(found.items.find((item) => item.publicId === id)).toMatchObject({ extension: "wav", conversionState: "converted" });
@@ -795,6 +798,12 @@ describe("phase files", () => {
     expect(selected.items.map(({ version }) => version)).toEqual([2]);
     await expect(files.openDeliverableFile(owner, { orderPublicId, stageKey, filePublicId: only!.publicId }))
       .rejects.toMatchObject({ code: "NOT_FOUND" });
+    const current = selected.items[0]!;
+    await files.remove(staff, current.publicId);
+    const standIn = await (await prepare())();
+    await expect(files.restore(staff, current.publicId)).rejects.toMatchObject({ reasonCode: "PHASE_FILE_COUNT_LIMIT" });
+    await files.remove(staff, standIn.publicId);
+    await expect(files.restore(staff, current.publicId)).resolves.toMatchObject({ stageKey, deletedAt: null });
   });
 
   it("verifies audio from staged bytes and enforces individual and combined phase limits", async () => {
@@ -818,6 +827,23 @@ describe("phase files", () => {
     } finally { await rm(root, { force: true, recursive: true }); }
   });
 
+  it("accepts explicit phase document intent over multipart and refuses incomplete bindings", async () => {
+    setPhase({});
+    const url = `/api/files/upload/${orderPublicId}`;
+    await request(appFor(owner)).post(`${url}?stageKey=${stageKey}`)
+      .attach("files", examplePdf(), "phase.pdf").expect(400);
+    await request(appFor(owner)).post(`${url}?stageKey=${stageKey}&intent=document&source=recording`)
+      .attach("files", examplePdf(), "phase.pdf").expect(400);
+    const response = await request(appFor(owner)).post(`${url}?stageKey=${stageKey}&intent=document`)
+      .attach("files", examplePdf(), "phase.pdf").expect(200);
+    expect(response.body.results).toMatchObject([{ outcome: "completed", file: { stageKey } }]);
+    const pending = await prepare();
+    phaseLocked = true;
+    await expect(pending()).rejects.toMatchObject({ reasonCode: "STAGE_LOCKED" });
+    expect(h.audit.named("file.uploaded")).toHaveLength(1);
+    expect(h.audit.named("file.uploaded")[0]?.attributes).toMatchObject({ stage_key: stageKey, file_source: "document" });
+  });
+
   it("selects only active, authorized bytes and gates team review separately", async () => {
     setPhase({});
     const publicFile = await (await prepare(staff, { ...documentUpload, category: "deliverable" }))();
@@ -825,7 +851,7 @@ describe("phase files", () => {
     const supportFile = await (await prepare())();
     const ids = (list: { items: Array<{ publicId: string }> }) => list.items.map(({ publicId }) => publicId);
     expect(ids(await files.teamFiles(owner, orderPublicId, stageKey))).toEqual([publicFile.publicId]);
-    expect(ids(await files.listDeliverableFiles(owner, { orderPublicId, stageKey }))).toEqual([publicFile.publicId, supportFile.publicId]);
+    expect(ids(await files.listDeliverableFiles(owner, { orderPublicId, stageKey }))).toEqual([publicFile.publicId, supportFile.publicId].sort());
     await expect(files.openDeliverableFile(owner, { orderPublicId, filePublicId: privateFile.publicId }))
       .rejects.toMatchObject({ code: "NOT_FOUND" });
     const opened = await files.openDeliverableFile(owner, { orderPublicId, stageKey, filePublicId: publicFile.publicId });
@@ -861,9 +887,12 @@ describe("playback grant custody and HTTP", () => {
     await request(app).get(path).set("Range", "bytes=0-3").expect(404);
     await request(appFor(grantee)).get(path).set("Cookie", cookie).expect(404);
     const partial = await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-3")
-      .buffer(true).parse((res, done) => { void buffer(res).then((body) => done(null, body), done); })
+      .buffer(true).parse((res, done) => { void buffer(res).then<void>((body) => done(null, body), (error: Error) => done(error)); })
       .expect(206).expect("Content-Range", `bytes 0-3/${file.size}`).expect("Cache-Control", "private, no-store");
     expect(partial.body).toEqual(exampleWav().subarray(0, 4));
+    await vi.waitFor(() => expect(h.audit.named("file.playback.result")).toContainEqual(expect.objectContaining({
+      orderPublicId, outcome: "completed", attributes: { bytes_sent: 4 },
+    })));
     await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-2,4-").expect(416).expect("Content-Range", `bytes */${file.size}`);
     await request(app).head(path).set("Cookie", cookie).set("Range", "bytes=0-3").expect(200).expect("Content-Length", String(file.size));
     await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-3").set("If-Range", "\"stale\"")

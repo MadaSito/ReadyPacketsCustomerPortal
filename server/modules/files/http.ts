@@ -156,6 +156,13 @@ async function readMultipart(req: Request, services: Services, plan: UploadAutho
 }
 
 export function registerFilesHttpRoutes(router: Router, services: Services): void {
+  async function requirePlaybackSession(req: Request) {
+    try { return requireFullSession(req); }
+    catch (error) {
+      if (error instanceof DomainError) await services.files.recordPlaybackAccess(getHttpState(req).session, "denied", undefined, error.reasonCode);
+      throw error;
+    }
+  }
   router.post("/upload/:orderId", async (req, res) => {
     const principal = requireFullSession(req);
     const orderId = req.params.orderId;
@@ -246,7 +253,7 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
   });
 
   router.post("/playback", async (req, res) => {
-    const principal = requireFullSession(req);
+    const principal = await requirePlaybackSession(req);
     const body = downloadBody.safeParse(req.body);
     if (!body.success) {
       await services.files.recordPlaybackAccess(principal, "denied", undefined, "PLAYBACK_NOT_AVAILABLE");
@@ -261,7 +268,7 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
   });
 
   router.get("/playback/:publicId", async (req, res) => {
-    const principal = requireFullSession(req);
+    const principal = await requirePlaybackSession(req);
     const id = publicId.safeParse(req.params.publicId);
     if (!id.success || req.get("sec-fetch-site") === "cross-site") {
       await services.files.recordPlaybackAccess(principal, "denied", undefined, "PLAYBACK_NOT_AVAILABLE");
@@ -304,7 +311,7 @@ export function registerFilesHttpRoutes(router: Router, services: Services): voi
       res.destroy();
     } finally {
       stream?.destroy();
-      await services.files.recordPlaybackAccess(principal, outcome, file)
+      await services.files.recordPlaybackAccess(principal, outcome, file, undefined, outcome === "completed" ? (stream ? size : 0) : undefined)
         .catch(() => services.logger.error("Audio playback outcome could not be recorded"));
     }
   });

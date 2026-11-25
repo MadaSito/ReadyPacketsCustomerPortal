@@ -20,17 +20,27 @@ export function limitsForPhase(governance: StageGovernance, platformFileBytes: n
 
 export type PhaseUsage = { documents: number; audio: number; audioDurationMs: number; unverifiedAudio: number };
 
+export function assertPhaseRoom(limits: ReturnType<typeof limitsForPhase>, usage: PhaseUsage, isAudio: boolean) {
+  if (isAudio ? usage.audio >= limits.audioCount : usage.documents >= limits.documentCount) {
+    throw conflict("PHASE_FILE_COUNT_LIMIT", "This phase has reached its file count limit for this format.");
+  }
+  if (isAudio && usage.unverifiedAudio > 0) {
+    throw validation("AUDIO_DURATION_UNVERIFIED", "The total audio duration in this phase could not be verified.");
+  }
+  if (isAudio && usage.audioDurationMs >= limits.totalAudioMaxSeconds * 1000) {
+    throw conflict("PHASE_AUDIO_DURATION_LIMIT", "This phase has reached its total audio time limit.");
+  }
+}
+
 export function verifyPhaseCapacity(limits: ReturnType<typeof limitsForPhase>, usage: PhaseUsage, isAudio: boolean,
   size: number, durationMs?: number) {
   if (size > (isAudio ? limits.audioMaxBytes : limits.documentMaxBytes)) {
     throw validation("PHASE_FILE_SIZE_LIMIT", "This file exceeds the phase file size limit.");
   }
-  if (isAudio ? usage.audio >= limits.audioCount : usage.documents >= limits.documentCount) {
-    throw conflict("PHASE_FILE_COUNT_LIMIT", "This phase has reached its file count limit for this format.");
-  }
+  assertPhaseRoom(limits, usage, isAudio);
   if (isAudio) {
-    if (durationMs === undefined || usage.unverifiedAudio > 0) {
-      throw validation("AUDIO_DURATION_UNVERIFIED", "The total audio duration in this phase could not be verified.");
+    if (durationMs === undefined || !Number.isSafeInteger(durationMs) || durationMs <= 0) {
+      throw validation("AUDIO_DURATION_UNVERIFIED", "The audio duration could not be verified.");
     }
     if (durationMs + usage.audioDurationMs > limits.totalAudioMaxSeconds * 1000) {
       throw conflict("PHASE_AUDIO_DURATION_LIMIT", "This file would exceed the total audio time allowed in this phase.");

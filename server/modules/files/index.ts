@@ -17,7 +17,7 @@ import { acceptsDeclaredType, allowedExtensions, audioExtensions, classifyFile, 
 import { audioJob, AudioConversionError, convertAudio, maxAudioOutputBytes, measureTaskAudio, probeAudioBinary } from "./audio.js";
 import { fileAccessLog, fileDownloadTickets, filePlaybackGrants, orderFiles, type FileCategory, type FileVisibility } from "./schema.js";
 import { parseAudioRange, type AudioRange } from "./playback.js";
-import { limitsForPhase, verifyPhaseCapacity, type PhaseUsage, type UploadIntent } from "./governance.js";
+import { assertPhaseRoom, limitsForPhase, verifyPhaseCapacity, type PhaseUsage, type UploadIntent } from "./governance.js";
 export type { UploadIntent } from "./governance.js";
 import { audioRulesSchema, audioRulesSetting, documentEditingRulesSchema, documentEditingSetting, fileRulesSetting, hardMaxFileBytes, hardMaxFiles, hardMaxRequestBytes, slotKeySchema, transcriptSchema, type AudioRules, type DocumentEditingRules, type FileRules } from "./settings.js";
 import type { LocalObjectStorage } from "./storage.js";
@@ -121,6 +121,7 @@ export type UploadAuthorization = UploadOptions & {
   phaseLimits?: PhaseLimits;
   maxAudioSeconds?: number;
   targetStatusKey?: string;
+  requestedStageKey?: string;
 };
 export type StagedUpload = { info: StoredObjectInfo; classification: FileClassification; displayName: string };
 export type Download = { file: FileRecord; stream: Readable };
@@ -152,6 +153,7 @@ export interface FilesModule extends ModuleLifecycle {
     audio: { enabled: boolean; maxMinutes: number } | null;
     phases: FilePhase[];
     stageUploadsRequired: boolean;
+    canArchiveOrder: boolean;
   }>;
   countFilesInSlot(orderId: number, slotKey: string, tx?: Tx, options?: { statusKey?: string }): Promise<number>;
   readTranscript(principal: SessionPrincipal, filePublicId: string): Promise<{ transcript: string | null }>;
@@ -166,7 +168,7 @@ export interface FilesModule extends ModuleLifecycle {
   redeemPlaybackTicket(principal: SessionPrincipal, ticket: string): Promise<{ grantPublicId: string; secret: string }>;
   openPlayback(principal: SessionPrincipal, grantPublicId: string, secret: string, header: string | undefined, head: boolean):
     Promise<{ file: FileRecord; range: AudioRange; stream?: Readable }>;
-  recordPlaybackAccess(principal: SessionPrincipal | null, outcome: AccessOutcome, file?: FileRecord, reason?: string): Promise<void>;
+  recordPlaybackAccess(principal: SessionPrincipal | null, outcome: AccessOutcome, file?: FileRecord, reason?: string, bytesSent?: number): Promise<void>;
   recordDownloadDenied(principal: SessionPrincipal | null, reason: string): Promise<void>;
   recordDownloadResult(principal: SessionPrincipal, filePublicId: string, outcome: "completed" | "failed" | "unknown"): Promise<void>;
   setVisibility(principal: SessionPrincipal, filePublicId: string, visibility: FileVisibility): Promise<FileRecord>;
@@ -294,7 +296,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   }
 
   async function access(principal: SessionPrincipal | null, outcome: AccessOutcome, tx: Tx, filePublicId?: string, reason?: string,
-    action = "download", orderPublicId?: string) {
+    action = "download", orderPublicId?: string, attributes?: AuditEventInput["attributes"]) {
     const request = getRequestContext();
     await tx.insert(fileAccessLog).values({
       filePublicId, orderPublicId, action, userId: principal?.userId, requestId: request?.requestId, traceId: request?.traceId, correlationId: request?.correlationId,
@@ -303,7 +305,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const attempted = outcome === "attempted" || outcome === "denied";
     await audit.record({ ...event(principal, action === "playback" ? attempted ? "file.playback.access" : "file.playback.result" :
       action === "deliverable" ? "file.deliverable.open" : attempted ? "file.download" : "file.download.result",
-    action, outcome, filePublicId, reason), orderPublicId }, tx);
+    action, outcome, filePublicId, reason), orderPublicId, attributes }, tx);
   }
 
   function fullCapability(principal: SessionPrincipal, capability: Capability, stepUp = false) {
@@ -417,10 +419,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const limits = stage?.governance ? limitsForPhase(stage.governance, policy.maxFileBytes, audio.maxMinutes * 60) : undefined;
     const isAudioIntent = intent === "recording" || intent === "prerecorded_audio";
     const category: readonly string[] = isAudioIntent ? audioExtensions : intent === "document" ? documentExtensions : allowedExtensions;
-    const kindBytes = isAudioIntent ? limits?.audioMaxBytes : ["document", "document_edit"].includes(intent) ? limits?.documentMaxBytes : undefined;
+    const kindBytes = isAudioIntent || slot?.kind === "audio" ? limits?.audioMaxBytes
+      : ["document", "document_edit"].includes(intent) || slot?.kind === "document" ? limits?.documentMaxBytes : undefined;
     const limitsRules = { ...policy, extensions: eligibleExtensions(policy, slot, sourceFor(options)).filter((value) => category.includes(value)),
       maxFileBytes: kindBytes ?? policy.maxFileBytes, maxFiles: sourceFor(options) || options.versionOf ? 1 : policy.maxFiles };
-    const maxAudioSeconds = limits ? Math.min(limits.totalAudioMaxSeconds,
+    const maxAudioSeconds = limits ? Math.min(limits.totalAudioMaxSeconds, audio.maxMinutes * 60,
       intent === "recording" ? limits.recordingMaxSeconds : Infinity, slot?.maxMinutes ? slot.maxMinutes * 60 : Infinity) :
       slot?.maxMinutes ? slot.maxMinutes * 60 : undefined;
     return { rules: limitsRules, phaseLimits: limits, maxAudioSeconds };
@@ -431,7 +434,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       documents: sql<string>`COALESCE(SUM(${orderFiles.contentType} NOT LIKE 'audio/%'), 0)`,
       audio: sql<string>`COALESCE(SUM(${orderFiles.contentType} LIKE 'audio/%'), 0)`,
       audioDurationMs: sql<string>`COALESCE(SUM(CASE WHEN ${orderFiles.contentType} LIKE 'audio/%' THEN ${orderFiles.durationMs} END), 0)`,
-      unverifiedAudio: sql<string>`COALESCE(SUM(${orderFiles.contentType} LIKE 'audio/%' AND ${orderFiles.durationMs} IS NULL), 0)`,
+      unverifiedAudio: sql<string>`COALESCE(SUM(${orderFiles.contentType} LIKE 'audio/%' AND (${orderFiles.durationMs} IS NULL OR ${orderFiles.durationMs} <= 0)), 0)`,
     }).from(orderFiles).where(and(eq(orderFiles.orderId, orderId), eq(orderFiles.stageKey, stageKey),
       isNull(orderFiles.deletedAt), isNull(orderFiles.purgedAt), isNull(orderFiles.supersededAt), isNull(orderFiles.derivedFromPublicId),
       exceptId ? ne(orderFiles.id, exceptId) : undefined));
@@ -455,7 +458,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   }
 
   async function requireStageRead(principal: SessionPrincipal, row: FileRow, tx: Tx) {
-    if (!row.stageKey) return;
+    if (row.stageKey === null) return;
     stageStatusKeys(await listStages(principal, row.orderPublicId, tx), row.stageKey);
   }
 
@@ -522,11 +525,12 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     const limit = boundedLimit(options.limit);
     const after = cursorValue(options.cursor);
     const order = await deps.services.orders.assertCanReadOrder(principal, orderPublicId, { tx, forUpdate: true });
+    await requireCurrent(principal, tx);
     const staff = roleHasCapability(principal.role, "files.read_all");
     const stages = await listStages(principal, orderPublicId, tx);
     const stageKeys = stages?.stages.filter((entry) => entry.viewable).map((entry) => entry.key) ?? [];
     const selectedPhase = options.stageKey ? phaseFilter(options.stageKey, stageStatusKeys(stages, options.stageKey)) :
-      stages ? or(isNull(orderFiles.stageKey), stageKeys.length ? inArray(orderFiles.stageKey, stageKeys) : undefined) : undefined;
+      or(isNull(orderFiles.stageKey), stageKeys.length ? inArray(orderFiles.stageKey, stageKeys) : undefined);
     if (options.includeDeleted && !staff) throw forbidden("CAPABILITY_NOT_GRANTED");
     let canUpload = ["owner", "contributor", "staff", "admin"].includes(order.accessRole) &&
       (order.lockState === "none" || (staff && order.lockState === "review"));
@@ -541,7 +545,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       }
     }
     const rows = await tx.select().from(orderFiles).where(and(
-      eq(orderFiles.orderId, order.id), eq(orderFiles.ownerUserId, order.ownerUserId),
+      eq(orderFiles.orderId, order.id), eq(orderFiles.orderPublicId, order.publicId), eq(orderFiles.ownerUserId, order.ownerUserId),
       selectedPhase,
       isNull(orderFiles.purgedAt),
       options.includeDeleted ? undefined : isNull(orderFiles.deletedAt),
@@ -558,6 +562,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       canUpload,
       phases: stages?.stages.filter((entry) => entry.viewable).map((entry) => ({ key: entry.key, label: staff ? entry.staffLabel : entry.customerLabel })) ?? [],
       stageUploadsRequired: stages?.format === 3,
+      canArchiveOrder: principal.role === "admin" && roleHasCapability(principal.role, "files.archive.order"),
     };
   }
 
@@ -682,7 +687,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     publicId?: string; orderPublicId: string; orderId: number; ownerUserId: number; phasePublicId?: string | null;
     statusKey: string; stageKey?: string | null; category: FileCategory; visibility: FileVisibility; staged: StagedUpload; storageKey: string;
     previous?: FileRow; imported?: boolean; createdAt?: Date; slotKey?: string; transcript?: string; convertAudio?: boolean;
-    source?: UploadOptions["source"]; durationMs?: number; replyBranch?: boolean; conversionDisabled?: boolean;
+    source?: UploadOptions["source"]; intent?: UploadIntent; durationMs?: number; replyBranch?: boolean; conversionDisabled?: boolean;
   }) {
     const now = clock.now();
     const publicId = input.publicId ?? ulid(now.getTime());
@@ -713,7 +718,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     await audit.record({ ...event(principal, input.imported ? "file.imported" : "file.uploaded",
       input.imported ? "import" : "upload", "completed", publicId),
       ...(!input.imported ? { orderPublicId: input.orderPublicId, attributes: {
-        order_public_id: input.orderPublicId, file_visibility: input.visibility, file_source: input.source ?? "upload",
+        order_public_id: input.orderPublicId, file_visibility: input.visibility, file_source: input.intent ?? input.source ?? "upload",
+        ...(input.stageKey ? { stage_key: input.stageKey } : {}),
       } } : {}) }, tx);
     if (input.source === "document_edit") {
       await audit.record({ ...event(principal, "file.edited_version_created", "edit_document", "completed", publicId),
@@ -733,10 +739,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
   async function resolveDocumentEdit(principal: SessionPrincipal, locator: DocumentLocator, tx: Tx) {
     const order = await deps.services.orders.assertCanWriteOrder(principal, locator.orderPublicId, { kind: "file", tx, forUpdate: true });
     await requireCurrent(principal, tx);
-    await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
     const row = await findFile(locator.filePublicId, tx, true);
     if (row.orderId !== order.id || row.orderPublicId !== order.publicId) throw notFound("FILE_NOT_FOUND");
     enforceVisibility(row, principal, order.ownerUserId);
+    await requireStageRead(principal, row, tx);
+    if (!row.stageKey) await deps.services.orders.assertFileStatusWritable(principal, order.publicId, order.statusKey, tx);
     if (!isDocx(row)) throw validation("DOCUMENT_NOT_EDITABLE", "Only supported Word documents can be edited in the portal.");
     if (row.supersededAt) throw conflict("FILE_VERSION_CHANGED", "This file already has a newer version.");
     if (row.slotKey && row.statusKey !== order.statusKey) {
@@ -780,13 +787,19 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       }
     } else {
       fullCapability(principal, "files.manage");
-      if (row.statusKey && row.statusKey !== order.statusKey) {
+      if (!row.stageKey && row.statusKey && row.statusKey !== order.statusKey) {
         await deps.services.orders.assertFileStatusWritable(principal, order.publicId, row.statusKey, tx);
       }
     }
     if (slot && !slotAllows(slot, { extension: "docx", mime: docxMime })) throw forbidden("DOCUMENT_TASK_EDIT_UNAVAILABLE");
-    return { row, order, slot, replyBranch, policy: { ...policy, maxFileBytes: maxBytes,
-      maxRequestBytes: Math.min(policy.maxRequestBytes, maxBytes + 16 * 1024), maxFiles: 1, extensions: ["docx"] as FileExtension[] } };
+    const options: UploadOptions = { stageKey: row.stageKey ?? undefined, slotKey: slot?.key ?? row.slotKey ?? undefined,
+      versionOf: row.publicId, category: replyBranch ? "supporting" : row.category, visibility: row.visibility, source: "document_edit" };
+    const stage = await resolveUploadStage(principal, order.publicId, options, tx);
+    const documentPolicy = { ...policy, maxFileBytes: maxBytes,
+      maxRequestBytes: Math.min(policy.maxRequestBytes, maxBytes + 16 * 1024), maxFiles: 1, extensions: ["docx"] as FileExtension[] };
+    const effective = limitsForRequest(documentPolicy, stage, await audioRules(tx), options, slot);
+    if (row.byteSize > effective.rules.maxFileBytes) throw validation("DOCUMENT_TOO_LARGE", "This Word document exceeds the phase file size limit.");
+    return { row, order, slot, replyBranch, options, stage, effective, policy: effective.rules };
   }
 
   async function documentOutput(row: FileRow, principal: SessionPrincipal, tx: Tx) {
@@ -1122,9 +1135,18 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           assertSlotCapture(slot, source);
           const [fullPolicy, audio] = await Promise.all([rules(tx), audioRules(tx)]);
           if (source === "recording" && !audio.enabled) throw forbidden("RECORDING_DISABLED");
-          return { ...options, ...limitsForRequest(fullPolicy, stage, audio, options, slot),
+          const effective = limitsForRequest(fullPolicy, stage, audio, options, slot);
+          if (stage && effective.phaseLimits && !options.versionOf) {
+            const intent = uploadIntent(options);
+            if (intent !== "legacy" || slot) {
+              const isAudio = intent === "recording" || intent === "prerecorded_audio" || (intent === "legacy" && slot?.kind === "audio");
+              const usage = await phaseUsage(order.id, stage.stageKey, tx);
+              assertPhaseRoom(effective.phaseLimits, usage, isAudio);
+            }
+          }
+          return { ...options, ...effective,
             orderPublicId: order.publicId, orderId: order.id, ownerUserId: order.ownerUserId, statusKey: order.statusKey,
-            stageKey: stage?.stageKey, targetStatusKey: stage?.statusKey, slot };
+            stageKey: stage?.stageKey, requestedStageKey: options.stageKey, targetStatusKey: stage?.statusKey, slot };
         });
       } catch (error) {
         if (error instanceof DomainError && error.code !== "AUDIT_UNAVAILABLE") await orderEvent(principal, orderPublicId, error.reasonCode);
@@ -1225,11 +1247,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         await requireCurrent(principal, tx);
         const [edit, policy, file] = await Promise.all([documentRules(tx), rules(tx), documentOutput(row, principal, tx)]);
         const enabled = edit.enabled && policy.extensions.includes("docx");
-        const maxBytes = Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024);
+        let maxBytes = Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024);
         let disabledReason: string | null = null;
         let agreementPolicyPublicId: string | null = null;
         let agreementSignatureMode: "typed_name" | "checkbox" | null = null;
-        try { await resolveDocumentEdit(principal, locator, tx); }
+        try { maxBytes = (await resolveDocumentEdit(principal, locator, tx)).policy.maxFileBytes; }
         catch (error) {
           if (!(error instanceof DomainError) || !["CONFLICT", "FORBIDDEN", "VALIDATION", "LOCKED", "NOT_FOUND"].includes(error.code)) throw error;
           if (error.reasonCode === "AGREEMENT_REQUIRED") {
@@ -1278,7 +1300,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           if (!edit.enabled || !policy.extensions.includes("docx")) throw forbidden("DOCUMENT_EDITING_DISABLED");
           if (!isDocx(row)) throw notFound("FILE_NOT_FOUND");
           if (row.byteSize > Math.min(edit.maxBytes, policy.maxFileBytes, policy.maxRequestBytes - 1024)) throw validation("DOCUMENT_TOO_LARGE", "This Word document exceeds the editor size limit.");
-          await access(principal, "attempted", tx, row.publicId);
+          await access(principal, "attempted", tx, row.publicId, undefined, "download", row.orderPublicId);
           stream = await readObject(row);
           return { file: await documentOutput(row, principal, tx), stream };
         });
@@ -1291,14 +1313,11 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
     async beginEditedVersion(principal, locator) {
       try {
         return await currentTx(async (tx) => {
-          const { order, row, slot, policy, replyBranch } = await resolveDocumentEdit(principal, locator, tx);
-          const options: UploadOptions = { stageKey: row.stageKey ?? undefined, slotKey: slot?.key ?? row.slotKey ?? undefined,
-            versionOf: row.publicId, category: replyBranch ? "supporting" : row.category, visibility: row.visibility, source: "document_edit" };
-          const stage = await resolveUploadStage(principal, order.publicId, options, tx);
+          const { order, options, stage, slot, effective } = await resolveDocumentEdit(principal, locator, tx);
           // A response is a new customer-visible supporting file, not a replacement for the staff source.
           return { orderId: order.id, orderPublicId: order.publicId, ownerUserId: order.ownerUserId, statusKey: order.statusKey,
-            ...options, ...limitsForRequest(policy, stage, await audioRules(tx), options, slot), slot, taskKey: locator.taskKey,
-            stageKey: stage?.stageKey, targetStatusKey: stage?.statusKey };
+            ...options, ...effective, slot, taskKey: locator.taskKey,
+            stageKey: stage?.stageKey, requestedStageKey: options.stageKey, targetStatusKey: stage?.statusKey };
         });
       } catch (error) {
         if (error instanceof DomainError && error.code !== "AUDIT_UNAVAILABLE") await orderEvent(principal, locator.orderPublicId, error.reasonCode);
@@ -1320,7 +1339,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const isAudio = staged.classification.mime.startsWith("audio/");
       const source = sourceFor(request);
       if (source === "recording" && !isAudio) throw validation("UPLOAD_RECORDING_TYPE", "A recording must be a supported audio file.");
-      if ((request.intent === "prerecorded_audio" && !isAudio) || (request.intent === "document" && !documentExtensions.includes(staged.classification.extension))) {
+      if ((request.intent === "prerecorded_audio" && !isAudio) || (request.intent === "document" &&
+        !documentExtensions.some((extension) => extension === staged.classification.extension))) {
         throw validation("UPLOAD_PHASE_FILE_TYPE", "The detected file type does not match this phase action.");
       }
       const editing = request.source === "document_edit";
@@ -1360,7 +1380,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           if (order.id !== request.orderId || order.ownerUserId !== request.ownerUserId || order.statusKey !== request.statusKey) {
             throw conflict("ORDER_ACCESS_CHANGED", "The order changed during upload. Please reload and try again.");
           }
-          const stage = await resolveUploadStage(principal, order.publicId, request, tx);
+          const stage = await resolveUploadStage(principal, order.publicId, { ...request, stageKey: request.requestedStageKey }, tx);
           if ((stage?.stageKey ?? undefined) !== request.stageKey || stage?.statusKey !== request.targetStatusKey) {
             throw conflict("STAGE_CHANGED", "The phase changed during upload. Please reload and try again.");
           }
@@ -1424,7 +1444,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           const needsConversion = isAudio && (staged.classification.mime !== "audio/webm" || staged.classification.requiresReencode === true);
           const convert = needsConversion && audio.enabled;
           const file = await insertVersion(tx, principal, { ...request, source, statusKey: previous?.statusKey ?? stage?.statusKey ?? request.statusKey,
-            staged, storageKey, previous,
+            staged, storageKey, previous, phasePublicId: previous?.phasePublicId,
             transcript: parsedTranscript?.data, convertAudio: convert, conversionDisabled: needsConversion && !convert,
             durationMs, replyBranch: edit?.replyBranch });
           placementAttempted = true;
@@ -1480,7 +1500,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       const run = async (executor: Tx) => {
         const { rows: [row], stages } = await selectDeliverables(principal, { ...scope, limit: 1 }, executor);
         if (!row) throw notFound("FILE_NOT_FOUND");
-        await access(principal, "attempted", executor, row.publicId, undefined, "deliverable", row.orderPublicId);
+        await access(principal, "attempted", executor, row.publicId, undefined, "deliverable", row.orderPublicId,
+          row.stageKey ? { stage_key: row.stageKey } : undefined);
         stream = await readObject(row);
         return { file: deliverableOutput(row, stages), stream };
       };
@@ -1564,7 +1585,7 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
           enforceVisibility(row, principal, order.ownerUserId);
           await requireStageRead(principal, row, tx);
           const file = output(row);
-          await access(principal, "attempted", tx, row.publicId);
+          await access(principal, "attempted", tx, row.publicId, undefined, "download", row.orderPublicId);
           await tx.delete(fileDownloadTickets).where(eq(fileDownloadTickets.id, current.id));
           stream = await readObject(row);
           return { file, stream };
@@ -1593,7 +1614,8 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
             publicId: ulid(now.getTime()), tokenHash: crypto.hashToken(ticket), orderId: row.orderId, fileId: row.id,
             userId: principal.userId, sessionId: principal.sessionId, issuedAt: now, expiresAt: new Date(now.getTime() + ticketLifetimeMs),
           });
-          await audit.record({ ...event(principal, "file.playback.ticket_issued", "create", "completed", row.publicId), orderPublicId }, tx);
+          await audit.record({ ...event(principal, "file.playback.ticket_issued", "create", "completed", row.publicId), orderPublicId,
+            ...(row.stageKey ? { attributes: { stage_key: row.stageKey } } : {}) }, tx);
           return { ticket };
         });
       } catch (error) {
@@ -1610,18 +1632,22 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
         const now = clock.now();
         await tx.update(filePlaybackGrants).set({ tokenHash: crypto.hashToken(secret), redeemedAt: now,
           expiresAt: new Date(now.getTime() + playbackLifetimeMs) }).where(eq(filePlaybackGrants.id, grant.id));
-        await audit.record({ ...event(principal, "file.playback.grant_started", "create", "completed", row.publicId), orderPublicId: row.orderPublicId }, tx);
+        await audit.record({ ...event(principal, "file.playback.grant_started", "create", "completed", row.publicId), orderPublicId: row.orderPublicId,
+          ...(row.stageKey ? { attributes: { stage_key: row.stageKey } } : {}) }, tx);
         return { grantPublicId: grant.publicId, secret };
       });
     },
     async openPlayback(principal, grantPublicId, secret, header, head) {
       let stream: Readable | undefined;
+      let authorizedFile: FileRecord | undefined;
       try {
         return await withPlayback(principal, secret, grantPublicId, async (row, _grant, tx) => {
           const range = parseAudioRange(head ? undefined : header, row.byteSize);
           const file = output(row);
+          authorizedFile = file;
           await access(principal, range === "unsatisfiable" ? "denied" : "attempted", tx, row.publicId,
-            range === "unsatisfiable" ? "PLAYBACK_RANGE_INVALID" : undefined, "playback", row.orderPublicId);
+            range === "unsatisfiable" ? "PLAYBACK_RANGE_INVALID" : undefined, "playback", row.orderPublicId,
+            row.stageKey ? { stage_key: row.stageKey } : undefined);
           if (range !== "unsatisfiable" && !head) {
             stream = await storage.get(row.storageKey, range ?? undefined).catch(() => {
               throw new DomainError("UNAVAILABLE", "FILE_BYTES_UNAVAILABLE", "The private file is unavailable.");
@@ -1632,15 +1658,21 @@ export function createFilesModule(deps: ModuleDeps, { scanner }: { scanner?: Fil
       } catch (error) {
         stream?.destroy();
         if (error instanceof DomainError && error.reasonCode === "FILE_BYTES_UNAVAILABLE") {
-          await service.recordPlaybackAccess(principal, "failed", undefined, error.reasonCode);
+          await service.recordPlaybackAccess(principal, "failed", authorizedFile, error.reasonCode);
         }
         throw error;
       }
     },
-    recordPlaybackAccess: (principal, outcome, file, reason) =>
-      currentTx((tx) => access(principal, outcome, tx, file?.publicId, reason, "playback", file?.orderPublicId)),
+    recordPlaybackAccess: (principal, outcome, file, reason, bytesSent) =>
+      currentTx((tx) => access(principal, outcome, tx, file?.publicId, reason, "playback", file?.orderPublicId, {
+        ...(file?.stageKey ? { stage_key: file.stageKey } : {}),
+        ...(bytesSent !== undefined ? { bytes_sent: bytesSent } : {}),
+      })),
     recordDownloadDenied: (principal, reason) => db.transaction((tx) => access(principal, "denied", tx, undefined, reason)),
-    recordDownloadResult: (principal, publicId, outcome) => db.transaction((tx) => access(principal, outcome, tx, publicId)),
+    recordDownloadResult: (principal, publicId, outcome) => db.transaction(async (tx) => {
+      const [file] = await tx.select({ orderPublicId: orderFiles.orderPublicId }).from(orderFiles).where(eq(orderFiles.publicId, publicId)).limit(1);
+      await access(principal, outcome, tx, publicId, undefined, "download", file?.orderPublicId);
+    }),
     setVisibility: (principal, publicId, visibility) => writeFile(principal, publicId, { visibility }),
     remove: (principal, publicId) => writeFile(principal, publicId, "delete"),
     restore: (principal, publicId) => writeFile(principal, publicId, "restore"),

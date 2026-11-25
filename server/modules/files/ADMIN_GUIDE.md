@@ -2,6 +2,14 @@
 
 Use the workflow designer to define document and audio slots on a status. Set the authorized upload actors, minimum and maximum file counts, and allowed extensions. The type rules under Console → Files also apply. Workflow slots accept only customer-visible files; a general upload never fills a requirement. A replacement preserves its slot and scope; earlier versions, deleted files, and converted copies do not count.
 
+## Phase files and governance
+
+For phase-based workflows, configure separate document upload, recording, prerecorded audio, and team-file review actions. Set document and audio counts, maximum bytes per file, maximum recording seconds, and total audio seconds in the phase. A blank limit inherits the platform ceiling. The service applies the narrowest of phase, task, and platform limits; it counts current originals, never derivative copies, and verifies every newly admitted audio duration from staged bytes. Restoring an item must fit the current phase's capacity.
+
+In Console → Orders → Files, select a reached phase and upload action before adding a file. To publish a team file for review, select Deliverable and Customer-visible. Existing files stay bound to their original phase even when the status changes. For phase-managed audio, configured Originals and Conversion Staging destinations may receive an admitted original; Intake Delivery receives a current native WebM/Opus file or an admitted derivative, never an unconverted fallback. Earlier remote copies are kept.
+
+Search the audit center by the order, file or correlation ID to review access attempts and outcomes. Playback events use `file.playback.*`, and opening an eligible file for an archive records `file.deliverable.open`. Do not include playback cookies, tickets, file names, or transcripts in operational logs.
+
 ## Audio conversion
 
 In Console → Files, open Audio recording and conversion. It is enabled by default; an existing explicit setting is preserved, and changes require recent step-up verification. Configure the maximum duration (1–120 minutes, default 30) and Opus bitrate (24–256 kbps, default 128). A recording task can specify its own duration. Keeping the original is mandatory. This setting does not enable access to another customer's order or backfill previously uploaded audio.
