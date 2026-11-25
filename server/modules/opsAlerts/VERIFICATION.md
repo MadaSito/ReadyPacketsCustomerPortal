@@ -5,6 +5,7 @@
 - `scripts/dev/test.sh server/modules/opsAlerts/opsAlerts.test.ts`: concurrent deduplication, severity escalation, terminal resolution, caller rollback, safe audit payload, cursor pagination, live actor validation, content guard, default-off and enabled/fenced reminders, daily SAML slot.
 - `scripts/dev/test.sh server/modules/mailTemplates/mailTemplates.test.ts`: built-in and published phase template eligibility, exclusion of unrelated, sensitive and unpublished templates, and non-admin rejection.
 - `scripts/dev/test.sh server/modules/jobs/jobs.test.ts`: durable Jobs and mail regression suite.
+- `scripts/dev/test.sh client/src/features/opsAlerts/OpsAlertsPage.test.tsx`: keyboard focus while resolving, repeat activation guard, and focus recovery when the open alert is removed.
 - `scripts/dev/tc.sh`: full repository typecheck, plus scoped ESLint with `--max-warnings 0`.
 
 ## Integrated console checks

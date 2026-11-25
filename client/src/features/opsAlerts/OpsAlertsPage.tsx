@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { BellRing } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearch } from "wouter";
 import { roleHasCapability } from "@shared/capabilities";
 import { useSession } from "@/lib/session";
@@ -30,9 +30,16 @@ export default function OpsAlertsPage() {
   const [state, setState] = useState(() => states.find((value) => value === query.get("state")));
   const [source, setSource] = useState(() => sources.find((value) => value === query.get("source")));
   const [notice, setNotice] = useState("");
+  const noticeRef = useRef<HTMLParagraphElement>(null);
+  const [previousAction, setPreviousAction] = useState<HTMLButtonElement | null>(null);
   const result = useInfiniteQuery(trpc.opsAlerts.list.infiniteQueryOptions({ severity, state, source }, {
     getNextPageParam: (last) => last.nextCursor ?? undefined,
   }));
+  useEffect(() => {
+    if (notice && previousAction && !previousAction.isConnected && document.activeElement === document.body) {
+      noticeRef.current?.focus();
+    }
+  }, [notice, previousAction, result.data]);
   async function changed(message: string) {
     setNotice(message);
     await Promise.all([
@@ -42,6 +49,7 @@ export default function OpsAlertsPage() {
   }
   const acknowledge = useMutation(trpc.opsAlerts.acknowledge.mutationOptions({ onSuccess: (r) => changed(r.changed ? "Alert acknowledged." : "Alert already updated.") }));
   const resolve = useMutation(trpc.opsAlerts.resolve.mutationOptions({ onSuccess: (r) => changed(r.changed ? "Alert resolved." : "Alert already resolved.") }));
+  const changing = acknowledge.isPending || resolve.isPending;
   const rows = result.data?.pages.flatMap(({ items }) => items) ?? [];
   return <>
     <PageHeader title="Operational alerts" description="Review and track issues from order workflows and connected services." />
@@ -55,8 +63,8 @@ export default function OpsAlertsPage() {
         onChange={(e) => setSource(sources.find((value) => value === e.target.value))} /></Field>
     </FilterBar>
     {acknowledge.isError || resolve.isError ? <Callout tone="danger" live="assertive" title="The alert could not be updated">Refresh the list and try again.</Callout> : null}
-    <p role="status" className="text-sm text-muted">{notice}</p>
-    <DataTable caption="Operational alerts" rows={rows} rowKey={(row) => row.publicId} loading={result.isPending}
+    <p ref={noticeRef} tabIndex={-1} role="status" className="text-sm text-muted">{notice}</p>
+    <DataTable caption="Operational alerts" rows={result.isPending ? undefined : rows} rowKey={(row) => row.publicId} loading={result.isPending}
       error={result.error} onRetry={() => void result.refetch()} empty={<EmptyState icon={BellRing} title="No matching alerts"
         description="Choose different filters or check back when work needs your attention." />}
       columns={[
@@ -70,10 +78,18 @@ export default function OpsAlertsPage() {
         { key: "time", header: "Opened", cell: (row) => <DateTime value={row.createdAt} format="relative" /> },
       ]}
       rowActions={canManage ? (row) => <div className="flex flex-wrap gap-2">
-        {row.state === "open" ? <Button variant="secondary" aria-label={`Acknowledge: ${row.title}`} disabled={acknowledge.isPending || resolve.isPending}
-          onClick={() => { setNotice(""); resolve.reset(); acknowledge.mutate({ publicId: row.publicId }); }}>Acknowledge</Button> : null}
-        {row.state !== "resolved" ? <Button variant="secondary" aria-label={`Resolve: ${row.title}`} disabled={acknowledge.isPending || resolve.isPending}
-          onClick={() => { setNotice(""); acknowledge.reset(); resolve.mutate({ publicId: row.publicId }); }}>Resolve</Button> : null}
+        {row.state === "open" ? <Button variant="secondary" aria-label={`Acknowledge: ${row.title}`} aria-disabled={changing}
+          onClick={(event) => {
+            if (changing) return;
+            setPreviousAction(event.currentTarget);
+            setNotice(""); resolve.reset(); acknowledge.mutate({ publicId: row.publicId });
+          }}>Acknowledge</Button> : null}
+        {row.state !== "resolved" ? <Button variant="secondary" aria-label={`Resolve: ${row.title}`} aria-disabled={changing}
+          onClick={(event) => {
+            if (changing) return;
+            setPreviousAction(event.currentTarget);
+            setNotice(""); acknowledge.reset(); resolve.mutate({ publicId: row.publicId });
+          }}>Resolve</Button> : null}
       </div> : undefined} />
     <LoadMore hasMore={result.hasNextPage} loading={result.isFetchingNextPage} onLoadMore={() => void result.fetchNextPage()}
       summary={result.isSuccess ? `Showing ${rows.length} alerts` : undefined} />
