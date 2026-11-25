@@ -218,6 +218,8 @@ The owner requested this on 2026-11-24 (prompt 26). The contract is [INCREMENT_0
 
 _Verification status: PENDING-LEAD — /root supplies the verified / not verified facts._
 
+**Migration `0007_increment_07`.** 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`. The schema is frozen; a further change needs `0008`.
+
 | Area | What it does | Switch and guard |
 | --- | --- | --- |
 | Phases (`orders`) | Definition format 3 `stages[]` on the existing slots, locks and gates; `order_stage_progress`; customer wizard; questions and admin tasks ([ADR 0055](../adr/0055-phases-first-order-workflow.md)). | On. Uses `orders.stage.review`, `orders.stage.reopen` (step-up) and `orders.questions.manage`. |

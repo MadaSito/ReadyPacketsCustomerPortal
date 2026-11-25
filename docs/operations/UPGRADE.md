@@ -140,9 +140,12 @@ Migration `0005_increment_05` is additive. It adds eight tables: one workflow im
 
 ## Increment 07 and migration `0007`
 
-<!-- platform_engineer with http_security_engineer. D11 proxy and upgrade testing: PENDING-LEAD (not yet run as of this draft). Table and column counts: PENDING-LEAD. -->
+<!-- platform_engineer with http_security_engineer. D11 proxy and upgrade testing: PENDING-LEAD (not yet run as of this draft). Counts from /root at f4fa798. -->
 
-`0007_increment_07` is additive: new tables, nullable columns or columns with defaults, new indexes and enum widening. It drops and renames nothing. Seeding and backfill run in code at start-up and are idempotent; the migration contains no data SQL. Table and column counts: _PENDING-LEAD_.
+`0007_increment_07` is additive: new tables, nullable columns or columns with defaults, new indexes and enum widening. It drops and renames nothing. Seeding and backfill run in code at start-up and are idempotent; the migration contains no data SQL. It has 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`. The schema is frozen for increment 07; any further change would need `0008`.
+
+- **New tables:** `order_stage_progress`, `order_status_catalog`, `order_questions`, `order_question_answers`, `order_admin_tasks`, `order_stage_runs`, `order_completion_jobs`, `operational_alerts`, `file_playback_grants`, `file_archives`, `file_archive_tickets`, `storage_managed_order_roots`, `storage_managed_file_copies`, `payment_webhook_rejections`, `sso_saml_certificates` and `sso_role_mappings`.
+- **New columns:** `orders` (7: progress, completion, attention and payment state), `sso_configuration` (8, SAML), `integration_webhook_deliveries` (7), `integration_production_dispatches` (6), `sso_auth_requests` (3), `file_access_log` (2), `storage_connections` (2), `payment_webhook_events` (2), and one each on `order_files` (`stage_key`), `integration_webhook_subscriptions` (`signing_enabled`) and `automations` (`sort_order`).
 
 Existing orders keep their pinned workflow version. The upgrade prepares a phases (format 3) **draft** of the standard workflow for review and publishes nothing.
 

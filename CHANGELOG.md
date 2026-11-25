@@ -65,7 +65,7 @@ procedure.
 
 ### Operations
 
-- **Migration `0007_increment_07`**: additive. Details: _PENDING-LEAD — table and column counts._
+- **Migration `0007_increment_07`**: additive. 16 new tables, 40 new columns on 11 existing tables and one widened enum (`payment_webhook_events.status`) in 96 statements, with no `DROP`. Reported by /root at `f4fa798`: it applied cleanly on a copy of an increment 06 database (189 → 205 tables, 8 migrations), and existing orders got `payment_state = not_required` and `attention = none`.
 - **Upgrade notes:** [UPGRADE.md — increment 07 and migration 0007](docs/operations/UPGRADE.md#increment-07-and-migration-0007). It covers the hash check against one journal row, the SAML proxy paths, playback range pass-through and the Stripe webhook's country-only exemption.
 
 ## Increment 06
