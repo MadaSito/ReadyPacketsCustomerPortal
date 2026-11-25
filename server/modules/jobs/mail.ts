@@ -93,14 +93,35 @@ function htmlAlternative(text: string): string {
   return `<!doctype html><html lang="en"><body><p>${escapeHtml(text).replace(/\r\n?|\n/g, "<br>")}</p></body></html>`;
 }
 
-const RECEIPT_CONTEXT_FIELDS = [["orderReference", "Order"], ["projectName", "Project"]] as const;
+const ORDER_CONTEXT_FIELDS = [["orderReference", "Order"], ["projectName", "Project"]] as const;
+const INVOICE_NOTICE_TEMPLATES = new Set(["compliance.invoice_issued", "compliance.invoice_paid"]);
 
-function receiptContextLines(vars: OutboundMail["vars"]): string[] {
-  return RECEIPT_CONTEXT_FIELDS.flatMap(([key, label]) => {
+function orderContextLines(vars: OutboundMail["vars"]): string[] {
+  return ORDER_CONTEXT_FIELDS.flatMap(([key, label]) => {
     const raw = vars[key];
     const value = typeof raw === "string" ? raw.replace(/\s+/gu, " ").trim() : "";
     return value ? [`${label}: ${value}`] : [];
   });
+}
+
+function prependOrderContext(
+  rendered: ReturnType<PublishedMailTemplate["render"]>,
+  lines: string[],
+  deduplicate: boolean,
+) {
+  if (!lines.length) return rendered;
+  const textBody = deduplicate ? rendered.text.replace(/\s+/gu, " ") : "";
+  const missingText = deduplicate ? lines.filter((line) => !textBody.includes(line)) : lines;
+  const text = missingText.length ? `${missingText.join("\n")}\n\n${rendered.text}` : rendered.text;
+  if (rendered.html === undefined) return { ...rendered, text };
+  const htmlBody = deduplicate ? rendered.html.replace(/<[^<>]*>/gu, "").replace(/(?:&nbsp;|\s)+/gu, " ") : "";
+  const missingHtml = deduplicate ? lines.filter((line) => !htmlBody.includes(escapeHtml(line))) : lines;
+  if (!missingHtml.length) return { ...rendered, text };
+  const block = `<p>${missingHtml.map(escapeHtml).join("<br>")}</p>`;
+  const html = /<body\b[^>]*>/iu.test(rendered.html)
+    ? rendered.html.replace(/<body\b[^>]*>/iu, (body) => `${body}${block}`)
+    : `${block}${rendered.html}`;
+  return { ...rendered, text, html };
 }
 
 export const ORDER_PHASE_UPDATE_TEMPLATE: MailTemplate = {
@@ -119,11 +140,11 @@ export class MailEngine implements Mailer {
     this.registerTemplate(ORDER_PHASE_UPDATE_TEMPLATE);
     this.registerTemplate({
       key: PAYMENT_RECEIPT_TEMPLATE,
-      vars: ["receiptNumber", ...RECEIPT_CONTEXT_FIELDS.map(([key]) => key)],
+      vars: ["receiptNumber", ...ORDER_CONTEXT_FIELDS.map(([key]) => key)],
       sensitiveVars: ["receiptNumber"],
       subject: () => "Your ReadyPackets payment receipt",
       text: (vars) => {
-        const lines = receiptContextLines(vars);
+        const lines = orderContextLines(vars);
         const message = `Thank you for your payment. Your ReadyPackets payment receipt number is ${vars.receiptNumber}.`;
         return lines.length ? `${lines.join("\n")}\n\n${message}` : message;
       },
@@ -220,26 +241,18 @@ export class MailEngine implements Mailer {
       if (published.key !== key || builtin?.sensitiveVars?.some((name) => !published.vars.includes(name))) {
         throw validation("INVALID_MAIL_RENDER", "The message template could not be rendered safely.");
       }
-      const receipt = key === PAYMENT_RECEIPT_TEMPLATE;
+      const invoice = INVOICE_NOTICE_TEMPLATES.has(key);
+      const addOrderContext = invoice || key === PAYMENT_RECEIPT_TEMPLATE;
       return {
         ...published,
-        ...(receipt ? { vars: [...new Set([...(builtin?.vars ?? []), ...published.vars])] } : {}),
+        ...(addOrderContext ? { vars: [...new Set([...(builtin?.vars ?? []), ...published.vars])] } : {}),
         sensitiveVars: [...new Set([...(builtin?.sensitiveVars ?? []), ...(published.sensitiveVars ?? [])])],
         render: (vars) => {
-          if (!receipt) return published.render(vars);
-          // Legacy published contracts accept only their declared inputs. Receipt context is supplied
-          // by the system even when the customized body predates these variables.
+          if (!addOrderContext) return published.render(vars);
+          // Published contracts accept only their declared inputs. The system supplies any missing
+          // order context even when a customized body predates these variables.
           const declared = Object.fromEntries(Object.entries(vars).filter(([name]) => published.vars.includes(name)));
-          const rendered = published.render(declared);
-          const lines = receiptContextLines(vars);
-          if (!lines.length) return rendered;
-          const text = `${lines.join("\n")}\n\n${rendered.text}`;
-          if (rendered.html === undefined) return { ...rendered, text };
-          const block = `<p>${lines.map(escapeHtml).join("<br>")}</p>`;
-          const html = /<body\b[^>]*>/iu.test(rendered.html)
-            ? rendered.html.replace(/<body\b[^>]*>/iu, (body) => `${body}${block}`)
-            : `${block}${rendered.html}`;
-          return { ...rendered, text, html };
+          return prependOrderContext(published.render(declared), orderContextLines(vars), invoice);
         },
       };
     }
@@ -491,9 +504,11 @@ export class MailEngine implements Mailer {
             const masked = { ...payload.vars };
             for (const key of new Set([...(template.sensitiveVars ?? []), ...(payload.sensitiveVars ?? [])])) masked[key] = REDACTED;
             if (isReceipt) {
-              for (const [key] of RECEIPT_CONTEXT_FIELDS) {
+              for (const [key] of ORDER_CONTEXT_FIELDS) {
                 if (Object.hasOwn(masked, key)) masked[key] = REDACTED;
               }
+            } else if (INVOICE_NOTICE_TEMPLATES.has(row.template) && Object.hasOwn(masked, "projectName")) {
+              masked.projectName = REDACTED;
             }
             redacted = { ...this.#content(template, masked), to: data.to };
           } catch { redactionFailed = true; }

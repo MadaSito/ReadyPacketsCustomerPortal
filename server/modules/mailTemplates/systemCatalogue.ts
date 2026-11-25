@@ -33,6 +33,7 @@ const DEFAULT_VAR_LABELS: Readonly<Record<string, { label: string; sample: strin
   resetLink: { label: "Password reset URL", sample: "https://portal.readypackets.example/forgot-password" },
   reference: { label: "Order reference", sample: "RP-2026-0142" },
   orderReference: { label: "Order reference", sample: "RP-2026-0142" },
+  projectName: { label: "Project", sample: "Acme Formation Packet" },
   statusLabel: { label: "Order status", sample: "In review" },
   questionnaireTitle: { label: "Questionnaire title", sample: "Entity Onboarding Questionnaire" },
   portalPath: { label: "Portal path", sample: "/orders/01J9EXAMPLE00000000000000" },
@@ -178,9 +179,9 @@ const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
     requiredVars: ["invoiceNumber", "orderReference", "portalPath"],
     subjectTemplate: "Invoice {{invoiceNumber}} issued for order {{orderReference}}",
     textTemplate:
-      "Invoice {{invoiceNumber}} has been issued for your ReadyPackets order {{orderReference}}.\n\nSign in to view or download your invoice PDF: {{portalPath}}\n\nYou are receiving this message because you own this order.",
+      "Order: {{orderReference}}\nProject: {{projectName}}\n\nInvoice {{invoiceNumber}} has been issued for your ReadyPackets order.\n\nSign in to view or download your invoice PDF: {{portalPath}}\n\nYou are receiving this message because you own this order.",
     htmlTemplate:
-      '<p>Invoice <strong>{{invoiceNumber}}</strong> has been issued for your ReadyPackets order <strong>{{orderReference}}</strong>.</p><p><a href="{{portalPath}}" data-rp-button="primary" rel="noopener noreferrer">View invoice</a></p>',
+      '<p>Order: <strong>{{orderReference}}</strong><br>Project: <strong>{{projectName}}</strong></p><p>Invoice <strong>{{invoiceNumber}}</strong> has been issued for your ReadyPackets order.</p><p><a href="{{portalPath}}" data-rp-button="primary" rel="noopener noreferrer">View invoice</a></p>',
   },
   "compliance.invoice_paid": {
     name: "Invoice receipt (payment recorded)",
@@ -189,9 +190,9 @@ const KNOWN_SYSTEM_SEEDS: Readonly<Record<string, CatalogueSeed>> = {
     requiredVars: ["invoiceNumber", "orderReference", "portalPath"],
     subjectTemplate: "Payment recorded for invoice {{invoiceNumber}}",
     textTemplate:
-      "Payment has been recorded in full for invoice {{invoiceNumber}} (order {{orderReference}}).\n\nSign in to download your updated receipt/invoice PDF: {{portalPath}}",
+      "Order: {{orderReference}}\nProject: {{projectName}}\n\nPayment has been recorded in full for invoice {{invoiceNumber}}.\n\nSign in to download your updated receipt/invoice PDF: {{portalPath}}",
     htmlTemplate:
-      '<p>Payment has been recorded in full for invoice <strong>{{invoiceNumber}}</strong> (order <strong>{{orderReference}}</strong>).</p><p><a href="{{portalPath}}" data-rp-button="primary" rel="noopener noreferrer">Download receipt</a></p>',
+      '<p>Order: <strong>{{orderReference}}</strong><br>Project: <strong>{{projectName}}</strong></p><p>Payment has been recorded in full for invoice <strong>{{invoiceNumber}}</strong>.</p><p><a href="{{portalPath}}" data-rp-button="primary" rel="noopener noreferrer">Download receipt</a></p>',
   },
   "engagement.order_message_received": {
     name: "Order message notification",

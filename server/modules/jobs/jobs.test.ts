@@ -879,6 +879,45 @@ describe("MySQL transactional mail outbox", () => {
   });
 
   it.each([
+    { key: "compliance.invoice_issued", hasVar: false, inBody: false },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: false },
+    { key: "compliance.invoice_paid", hasVar: true, inBody: true },
+  ])("keeps published $key compatible (project declared=$hasVar, rendered=$inBody)", async ({ key, hasVar, inBody }) => {
+    const f = fixture();
+    const { send } = setDelivery(f, "accepted");
+    await f.h.settings.set(MAIL_RETAIN_CONTENT.key, true);
+    const vars = { invoiceNumber: "INV-2026-000016", orderReference: "RP-2026-000116", projectName: "Advisory & design", portalPath: "/invoices" };
+    const legacyVars = ["invoiceNumber", "orderReference", "portalPath"];
+    f.mailer.registerTemplate({
+      key, vars: [...legacyVars, "projectName"], subject: () => "Invoice", text: () => "Invoice notice.",
+    });
+    const render = vi.fn((input: Readonly<Record<string, string | number | boolean>>) => ({
+      subject: "Customized invoice",
+      text: `Order: ${vars.orderReference}\n${inBody ? `Project: ${input.projectName}\n` : ""}Invoice notice.`,
+      html: `<p>Order: <strong>${vars.orderReference}</strong></p>${inBody ? `<p>Project: <strong>${String(input.projectName).replaceAll("&", "&amp;")}</strong></p>` : ""}<p>Invoice notice.</p>`,
+    }));
+    f.mail.registerMailTemplateStore({
+      resolve: async (requested) => requested === key
+        ? { key, vars: hasVar ? [...legacyVars, "projectName"] : legacyVars, render } : null,
+    });
+    await f.mailer.enqueue({ template: key, vars, to: { userId: 22 }, idempotencyKey: "invoice-project-test" });
+    await f.engine.execute((await f.engine.claim())!);
+    expect(send).toHaveBeenCalledOnce();
+    const message = send.mock.calls[0]![0];
+    expect(message.subject).toBe("Customized invoice");
+    expect(message.text.match(/Order: RP-2026-000116/g)).toHaveLength(1);
+    expect(message.text.match(/Project: Advisory & design/g)).toHaveLength(1);
+    expect(message.html.match(/Order: (?:<strong>)?RP-2026-000116/g)).toHaveLength(1);
+    expect(message.html.match(/Project: (?:<strong>)?Advisory &amp; design/g)).toHaveLength(1);
+    if (hasVar) expect(render.mock.calls[0]).toEqual([vars]);
+    else expect(render.mock.calls[0]).toEqual([expect.not.objectContaining({ projectName: vars.projectName })]);
+    const [row] = await t.db.select().from(mailOutbox);
+    const retained = f.h.deps.crypto.decrypt(row!.contentEnc!, `mail_outbox.content_enc:${row!.publicId}`);
+    expect(retained).toContain("Project: ");
+    expect(retained).not.toMatch(/Advisory (&|&amp;) design/);
+  });
+
+  it.each([
     { status: "active", emailVerified: false, portalOnly: false },
     { status: "pending_activation", emailVerified: true, portalOnly: false },
     { status: "active", emailVerified: false, portalOnly: true },
