@@ -891,7 +891,7 @@ describe("playback grant custody and HTTP", () => {
     await request(app).get(path).set("Range", "bytes=0-3").expect(404);
     await request(appFor(grantee)).get(path).set("Cookie", cookie).expect(404);
     const partial = await request(app).get(path).set("Cookie", cookie).set("Range", "bytes=0-3")
-      .buffer(true).parse((res, done) => { void buffer(res).then<void>((body) => done(null, body), (error: Error) => done(error)); })
+      .buffer(true)
       .expect(206).expect("Content-Range", `bytes 0-3/${file.size}`).expect("Cache-Control", "private, no-store");
     expect(partial.body).toEqual(exampleWav().subarray(0, 4));
     await vi.waitFor(() => expect(h.audit.named("file.playback.result")).toContainEqual(expect.objectContaining({
