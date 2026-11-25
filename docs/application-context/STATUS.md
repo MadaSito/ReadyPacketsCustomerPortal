@@ -1,6 +1,6 @@
 # ReadyPackets Portal — Status
 
-Last updated: 2026-11-25 (increment 07 lead QA recorded; final gates pending). Keep this file current; it is the honest state of the build,
+Last updated: 2026-11-25 (increment 07 lead QA and final gates recorded; PR #16). Keep this file current; it is the honest state of the build,
 not a certification. "Verified" below means the integrator ran the check and saw the result. Anything not
 listed under "Verified" has not been proven and must not be described as working in production.
 
@@ -439,7 +439,8 @@ The lead's QA of 2026-11-25 (QA 5044), on a production build against MySQL in a 
 ### Gates
 
 - **Full vitest at `7c6bb71`:** 229 files, with 2,894 tests passed, 1 flaky client test (being fixed) and 4 todo.
-- **Final gates, PR and merge commit:** **PENDING-LEAD (final gates)**. /root sends them after the last two peer commits.
+- **Final gates** on `fa9780a` (`54c6f26` plus a gitleaks baseline commit): full vitest 229 files, 2,896 passed, 4 todo, 0 failed; type check clean; `eslint . --max-warnings 0` clean; `pnpm audit --prod` reported no known vulnerabilities; gitleaks found no leaks (five reviewed synthetic fixtures were added to `.gitleaksignore` in `fa9780a`). The branch is on [PR #16](https://github.com/MadaSito/ReadyPacketsCustomerPortal/pull/16), to be merged with a merge commit once the four workflows (ci, security, container, native-install) pass; CI results live on the PR.
+- **Since the QA pass:** `54c6f26` shows production dispatches as "Failed" or "Failed (retrying)" with the next attempt time, uses readable trigger labels and adds a "Switched off" badge on the integrations hub; `fd20503` makes the pending-upload guard use layout effects. ui_foundation's sweep on `7c6bb71` found no axe violations and no overflow at 320, 768 and 1280 px in both themes on all changed pages, with reduced motion honoured and one polite announcement per progress change; the Stripe activation confirm dialog and the run-summary callout were not swept. No screen-reader or physical-phone pass was done.
 
 ## Verified for increment 06 (integrator's own runs)
 
