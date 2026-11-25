@@ -171,6 +171,10 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@xmldom/xmldom': 0.8.15
+  xml-crypto: 6.4.0
+
 importers:
 
   .:
