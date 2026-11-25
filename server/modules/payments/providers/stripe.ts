@@ -329,11 +329,22 @@ export function createStripeProvider(
       const metadata = asRecord(dataObj?.metadata);
       const objectId = typeof dataObj?.id === "string" ? dataObj.id.trim() : null;
       const clientReferenceId =
-        typeof dataObj?.client_reference_id === "string" ? dataObj.client_reference_id.trim() : null;
+        typeof dataObj?.client_reference_id === "string" && dataObj.client_reference_id.trim() !== ""
+          ? dataObj.client_reference_id.trim()
+          : null;
       const metaAttemptId =
-        typeof metadata?.attempt_public_id === "string" ? metadata.attempt_public_id.trim() : null;
+        typeof metadata?.attempt_public_id === "string" && metadata.attempt_public_id.trim() !== ""
+          ? metadata.attempt_public_id.trim()
+          : null;
       const metaInvoiceId =
-        typeof metadata?.invoice_public_id === "string" ? metadata.invoice_public_id.trim() : null;
+        typeof metadata?.invoice_public_id === "string" && metadata.invoice_public_id.trim() !== ""
+          ? metadata.invoice_public_id.trim()
+          : null;
+      const metaOrderId =
+        typeof metadata?.order_public_id === "string" && metadata.order_public_id.trim() !== ""
+          ? metadata.order_public_id.trim()
+          : null;
+      const hasPortalMetadata = Boolean(metaAttemptId || metaInvoiceId || metaOrderId);
 
       const attemptPublicId = metaAttemptId ?? clientReferenceId;
       const paymentIntentRaw = dataObj?.payment_intent;
@@ -451,6 +462,8 @@ export function createStripeProvider(
         matchedSecretSlot,
         attemptPublicId: attemptPublicId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(attemptPublicId) ? attemptPublicId : null,
         invoicePublicId: metaInvoiceId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(metaInvoiceId) ? metaInvoiceId : null,
+        orderPublicId: metaOrderId && /^[0-9A-HJKMNP-TV-Z]{26}$/u.test(metaOrderId) ? metaOrderId : null,
+        hasPortalMetadata,
         providerRef,
         providerOrderRef,
         providerPaymentRef,

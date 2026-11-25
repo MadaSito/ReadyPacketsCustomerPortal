@@ -43,6 +43,8 @@ function StripeReadinessBanner({ settings }: { settings: PaymentSettingsView }) 
   if (!settings.stripe.egressAllowlisted) missing.push("outbound HTTPS allowlist for api.stripe.com:443");
   if (!settings.stripe.secretKeyConfigured) missing.push("Stripe API secret key");
   if (!settings.stripe.webhookSecretConfigured) missing.push("Stripe webhook signing secret");
+  if (settings.stripe.lastApiVerifiedAt === null) missing.push("verified Stripe API connection");
+  if (settings.stripe.lastSelfTestWebhookAt === null) missing.push("passing signed webhook self-test");
   return (
     <div className="mb-5">
       <Callout tone="warning" title="Stripe checkout is selected, but readiness checks are incomplete">

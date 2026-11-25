@@ -103,6 +103,7 @@ let stripeSeq = 500;
 
 function createProtocolFakeStripe(opts: { nowSec: () => number }) {
   let stripeEgressEnabled = false;
+  let stripeRuleVersion = 1;
   const sessions = new Map<string, FakeStripeSession>();
   const sessionByIdem = new Map<string, FakeStripeSession>();
   const refunds = new Map<string, FakeStripeRefund>();
@@ -111,6 +112,9 @@ function createProtocolFakeStripe(opts: { nowSec: () => number }) {
 
   const egress = {
     setStripePreset(enabled: boolean) {
+      if (stripeEgressEnabled !== enabled) {
+        stripeRuleVersion += 1;
+      }
       stripeEgressEnabled = enabled;
     },
     async isPresetEnabled(key: string): Promise<boolean> {
@@ -123,6 +127,17 @@ function createProtocolFakeStripe(opts: { nowSec: () => number }) {
           label: "Stripe API",
           enabled: stripeEgressEnabled,
           parameterized: false,
+        },
+      ];
+    },
+    async listAllowlist() {
+      return [
+        {
+          publicId: "01JSTRIPEEGRESSRULE0000001",
+          purpose: "stripe" as const,
+          pattern: "api.stripe.com",
+          enabled: stripeEgressEnabled,
+          version: stripeRuleVersion,
         },
       ];
     },
@@ -162,7 +177,7 @@ function createProtocolFakeStripe(opts: { nowSec: () => number }) {
 
       // GET /v1/checkout/sessions?limit=1 (testConnection)
       if (method === "GET" && parsed.pathname === "/v1/checkout/sessions") {
-        if (!token.startsWith("sk_") && !token.startsWith("rk_")) {
+        if ((!token.startsWith("sk_") && !token.startsWith("rk_")) || token.includes("_fake_401_")) {
           return {
             status: 401,
             headers: { "content-type": "application/json" },
@@ -765,7 +780,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     fakeStripe.egress.setStripePreset(true);
 
     await paymentsMod.admin.updateSettings(admin.principal, {
-      provider: "stripe",
+      provider: "none",
       mode: "test",
       currency: "USD",
       successPath: "/checkout/return",
@@ -774,6 +789,17 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       squareLocationId: null,
       stripeSecretKey: stripeSk,
       stripeWebhookSecret: stripeWh,
+    });
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
     });
 
     const buyerCaller = callerFor(buyer.principal);
@@ -989,7 +1015,7 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     fakeStripe.egress.setStripePreset(true);
 
     await paymentsMod.admin.updateSettings(admin.principal, {
-      provider: "stripe",
+      provider: "none",
       mode: "test",
       currency: "USD",
       successPath: "/checkout/return",
@@ -998,6 +1024,17 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       squareLocationId: null,
       stripeSecretKey: stripeSk,
       stripeWebhookSecret: stripeWh,
+    });
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
     });
 
     const buyerCaller = callerFor(buyer.principal);
@@ -1164,8 +1201,8 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     const secondaryWh = "whsec_test_inc07_secondary_rotate_2222";
     fakeStripe.egress.setStripePreset(true);
 
-    const savedWithSecondary = await paymentsMod.admin.updateSettings(admin.principal, {
-      provider: "stripe",
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "none",
       mode: "test",
       currency: "USD",
       successPath: "/checkout/return",
@@ -1175,6 +1212,17 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
       stripeSecretKey: "sk_test_inc07_rotate_5555",
       stripeWebhookSecret: primaryWh,
       stripeWebhookSecretSecondary: secondaryWh,
+    });
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
+    const savedWithSecondary = await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
     });
     expect(savedWithSecondary.stripe.webhookSecretSecondaryConfigured).toBe(true);
     expect(savedWithSecondary.stripe.webhookSecretSecondaryLast4).toBe("2222");
@@ -1386,5 +1434,284 @@ describe("Increment 07 — Stripe completion (D9), receipt PDF sync port (D12), 
     });
     expect(revCtx.orderPublicId).toBe(submittedOrder.orderPublicId);
     expect(JSON.stringify(intakeSubAudit.attributes)).not.toContain("Ship Stripe Checkout cleanly");
+  });
+
+  it("enforces verified API + self-test gates on activation, invalidates verification on key/mode/egress changes, labels rejection reasons, and alerts on unmatched portal-metadata webhooks while ignoring shared-account sessions", async () => {
+    const stack = await buildStack();
+    const { h, fakeStripe, opsAlertsMod, paymentsMod, admin, callerFor } = stack;
+    const adminCaller = callerFor(admin.principal);
+    const stripeWh = "whsec_test_qa_live_defects_9999";
+
+    fakeStripe.egress.setStripePreset(true);
+
+    // 1. Defect 1: stage a syntactically valid fake sk_test_ key that returns HTTP 401 on testConnection.
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      successPath: "/checkout/return",
+      cancelPath: "/checkout/cancel",
+      webhookToleranceSeconds: 300,
+      squareLocationId: null,
+      stripeSecretKey: "sk_test_fake_401_rejected_by_stripe_0001",
+      stripeWebhookSecret: stripeWh,
+    });
+
+    const rejectedConn = await paymentsMod.admin.testConnection(admin.principal);
+    expect(rejectedConn.ok).toBe(false);
+    expect(rejectedConn.failureReasonCode).toBe("STRIPE_AUTH_INVALID_KEY");
+    expect(rejectedConn.message).toBe("Stripe rejected the staged secret key (HTTP 401).");
+    expect((await paymentsMod.admin.sendSelfTestWebhook(admin.principal)).ok).toBe(true);
+
+    // Activation MUST be refused with STRIPE_API_NOT_VERIFIED!
+    await expect(
+      paymentsMod.admin.updateSettings(admin.principal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+        successPath: "/checkout/return",
+        cancelPath: "/checkout/cancel",
+        webhookToleranceSeconds: 300,
+        squareLocationId: null,
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_API_NOT_VERIFIED",
+    });
+
+    const readinessFake = await paymentsMod.admin.readiness(admin.principal);
+    expect(readinessFake.onlineEnabled).toBe(false);
+    expect(
+      readinessFake.checklist.find((item) => item.key === "api_connection_verified")?.ready,
+    ).toBe(false);
+
+    // Stage a working test key and verify API -> toggling egress preset invalidates lastApiVerifiedAt!
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_working_key_0002",
+    });
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    expect((await paymentsMod.admin.getSettings(admin.principal)).stripe.lastApiVerifiedAt).not.toBeNull();
+
+    // Toggling egress off and back on bumps rule version -> invalidates lastApiVerifiedAt until re-tested!
+    fakeStripe.egress.setStripePreset(false);
+    await expect(
+      paymentsMod.admin.updateSettings(admin.principal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_EGRESS_NOT_ALLOWLISTED",
+    });
+
+    fakeStripe.egress.setStripePreset(true);
+    expect((await paymentsMod.admin.getSettings(admin.principal)).stripe.lastApiVerifiedAt).toBeNull();
+    await expect(
+      paymentsMod.admin.updateSettings(admin.principal, {
+        provider: "stripe",
+        mode: "test",
+        currency: "USD",
+      }),
+    ).rejects.toMatchObject({
+      code: "VALIDATION",
+      reasonCode: "STRIPE_API_NOT_VERIFIED",
+    });
+
+    // Re-verify API -> activate succeeds -> switching back to Pay by invoice ("none") works cleanly.
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    const activated = await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+    expect(activated.provider).toBe("stripe");
+    expect(activated.onlineEnabled).toBe(true);
+
+    // Rotating the staged secret key invalidates lastApiVerifiedAt immediately even while provider is stripe.
+    const rotated = await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "none",
+      mode: "test",
+      currency: "USD",
+      stripeSecretKey: "sk_test_working_key_0003",
+    });
+    expect(rotated.provider).toBe("none");
+    expect(rotated.stripe.lastApiVerifiedAt).toBeNull();
+    expect((await paymentsMod.admin.testConnection(admin.principal)).ok).toBe(true);
+    await paymentsMod.admin.updateSettings(admin.principal, {
+      provider: "stripe",
+      mode: "test",
+      currency: "USD",
+    });
+
+    // 2. Defect 2 & 3: exercise missing signature, invalid signature, stale timestamp, malformed JSON, and livemode mismatch.
+    const notificationUrl = "https://portal.example.test/api/payments/webhooks/stripe";
+    const nowSec = Math.floor(h.clock.now().getTime() / 1000);
+    const sampleEventBuf = Buffer.from(
+      JSON.stringify({
+        id: "evt_rej_check_1",
+        type: "checkout.session.completed",
+        livemode: false,
+        created: nowSec,
+        data: { object: { id: "cs_test_rej_1", payment_status: "paid" } },
+      }),
+      "utf8",
+    );
+
+    await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: sampleEventBuf,
+      headers: {},
+      notificationUrl,
+    });
+    await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: sampleEventBuf,
+      headers: { "stripe-signature": signStripeWebhook(sampleEventBuf, "whsec_wrong_secret", nowSec) },
+      notificationUrl,
+    });
+    await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: sampleEventBuf,
+      headers: { "stripe-signature": signStripeWebhook(sampleEventBuf, stripeWh, nowSec - 900) },
+      notificationUrl,
+    });
+    const malformedJsonBuf = Buffer.from("{not-valid-json", "utf8");
+    await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: malformedJsonBuf,
+      headers: { "stripe-signature": signStripeWebhook(malformedJsonBuf, stripeWh, nowSec) },
+      notificationUrl,
+    });
+    const liveMismatchBuf = Buffer.from(
+      JSON.stringify({
+        id: "evt_live_mismatch_1",
+        type: "checkout.session.completed",
+        livemode: true,
+        created: nowSec,
+        data: { object: { id: "cs_live_rej_1", payment_status: "paid" } },
+      }),
+      "utf8",
+    );
+    await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: liveMismatchBuf,
+      headers: { "stripe-signature": signStripeWebhook(liveMismatchBuf, stripeWh, nowSec) },
+      notificationUrl,
+    });
+
+    const allRej = await adminCaller.payments.admin.listWebhookRejections({
+      provider: "stripe",
+      limit: 20,
+    });
+    const byCode = new Map(allRej.items.map((r) => [r.reasonCode, r]));
+    expect(byCode.get("MISSING_SIGNATURE")?.reasonLabel).toBe("Missing signature");
+    expect(byCode.get("MISSING_SIGNATURE")?.detail).toContain("Stripe-Signature");
+    expect(byCode.get("INVALID_SIGNATURE")?.reasonLabel).toBe("Invalid signature");
+    expect(byCode.get("INVALID_SIGNATURE")?.detail).toContain("signing secret");
+    expect(byCode.get("TIMESTAMP_OUT_OF_RANGE")?.reasonLabel).toBe("Stale timestamp");
+    expect(byCode.get("TIMESTAMP_OUT_OF_RANGE")?.detail).toContain("freshness window");
+    expect(byCode.get("INVALID_JSON")?.reasonLabel).toBe("Malformed JSON");
+    expect(byCode.get("INVALID_JSON")?.detail).toContain("JSON");
+    expect(byCode.get("WEBHOOK_MODE_MISMATCH")?.reasonLabel).toBe("Environment mismatch");
+
+    // Reason filter matches canonical code cleanly.
+    const invalidJsonFiltered = await adminCaller.payments.admin.listWebhookRejections({
+      provider: "stripe",
+      reasonCode: "INVALID_JSON",
+      limit: 10,
+    });
+    expect(invalidJsonFiltered.items.length).toBeGreaterThanOrEqual(1);
+    expect(invalidJsonFiltered.items.every((r) => r.reasonLabel === "Malformed JSON")).toBe(true);
+
+    // 3. Defect 4: shared Stripe account session WITHOUT portal metadata is ignored quietly (attention stays 0).
+    const sharedAccountBuf = Buffer.from(
+      JSON.stringify({
+        id: `evt_shared_acct_${ulid().slice(-8)}`,
+        type: "checkout.session.completed",
+        livemode: false,
+        created: nowSec,
+        data: {
+          object: {
+            id: "cs_test_other_system_01",
+            payment_status: "paid",
+            payment_intent: "pi_test_other_system_01",
+            metadata: { external_service: "other-billing-app" },
+          },
+        },
+      }),
+      "utf8",
+    );
+    const baselineAttention = (await paymentsMod.admin.readiness(admin.principal)).verification
+      .attentionRequiredWebhookCount;
+    const sharedRes = await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: sharedAccountBuf,
+      headers: { "stripe-signature": signStripeWebhook(sharedAccountBuf, stripeWh, nowSec) },
+      notificationUrl,
+    });
+    expect(sharedRes).toMatchObject({
+      httpStatus: 200,
+      accepted: true,
+      booked: false,
+      reasonCode: "IGNORED",
+    });
+    expect(
+      (await paymentsMod.admin.readiness(admin.principal)).verification.attentionRequiredWebhookCount,
+    ).toBe(baselineAttention);
+    expect(
+      (await opsAlertsMod.list({ source: "payment" })).items.some(
+        (a) => a.code === "UNMATCHED_PORTAL_PAYMENT",
+      ),
+    ).toBe(false);
+
+    // Signed checkout.session.completed WITH portal metadata that does NOT match any portal attempt/invoice
+    // raises an operational warning alert and increments attentionRequiredWebhookCount!
+    const unmatchedOrderId = ulid();
+    const unmatchedPortalBuf = Buffer.from(
+      JSON.stringify({
+        id: `evt_unmatched_portal_${ulid().slice(-8)}`,
+        type: "checkout.session.completed",
+        livemode: false,
+        created: nowSec,
+        data: {
+          object: {
+            id: "cs_test_unknown_portal_session_99",
+            payment_status: "paid",
+            payment_intent: "pi_test_unknown_portal_99",
+            metadata: {
+              attempt_public_id: ulid(),
+              invoice_public_id: ulid(),
+              order_public_id: unmatchedOrderId,
+            },
+          },
+        },
+      }),
+      "utf8",
+    );
+    const unmatchedRes = await paymentsMod.handleSignedWebhook({
+      provider: "stripe",
+      rawBody: unmatchedPortalBuf,
+      headers: { "stripe-signature": signStripeWebhook(unmatchedPortalBuf, stripeWh, nowSec) },
+      notificationUrl,
+    });
+    expect(unmatchedRes).toMatchObject({
+      httpStatus: 200,
+      accepted: true,
+      booked: false,
+      reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+    });
+    expect(
+      (await paymentsMod.admin.readiness(admin.principal)).verification.attentionRequiredWebhookCount,
+    ).toBe(baselineAttention + 1);
+    const alertsAfterUnmatched = await opsAlertsMod.list({ source: "payment" });
+    const unmatchedAlert = alertsAfterUnmatched.items.find(
+      (a) => a.code === "UNMATCHED_PORTAL_PAYMENT",
+    );
+    expect(unmatchedAlert).toBeDefined();
+    expect(unmatchedAlert?.severity).toBe("warning");
   });
 });

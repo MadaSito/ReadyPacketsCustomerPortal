@@ -64,6 +64,13 @@ export type ProviderVerifyWebhookOutput =
       matchedSecretSlot?: "primary" | "secondary" | undefined;
       attemptPublicId: string | null;
       invoicePublicId: string | null;
+      orderPublicId?: string | null | undefined;
+      /**
+       * True when the signed provider object explicitly carries ReadyPackets portal metadata
+       * (`attempt_public_id`, `invoice_public_id`, or `order_public_id`). Events without portal
+       * metadata (e.g. from another product sharing the same Stripe account) leave this false/undefined.
+       */
+      hasPortalMetadata?: boolean | undefined;
       providerRef: string | null;
       providerOrderRef: string | null;
       providerPaymentRef: string | null;

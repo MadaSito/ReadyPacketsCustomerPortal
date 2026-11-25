@@ -42,6 +42,7 @@ const defaultConfig: PaymentSettingsView = {
       "refund.updated",
     ],
     ready: false,
+    lastApiVerifiedAt: null,
     lastVerifiedWebhookAt: null,
     lastVerifiedWebhookEventType: null,
     lastVerifiedWebhookStatus: null,
@@ -83,7 +84,8 @@ const receipt = {
 const rejection = {
   rejectionPublicId: id,
   provider: "stripe" as const,
-  reasonCode: "invalid_signature" as const,
+  reasonCode: "INVALID_SIGNATURE",
+  reasonLabel: "Invalid signature",
   httpStatus: 400,
   detail: "Stripe-Signature header did not match primary or secondary signing secret.",
   receivedAt: date,
@@ -270,6 +272,8 @@ it("requires fresh credentials for switching environments and confirms live acti
   await user.click(screen.getByRole("button", { name: "Save payment settings" }));
   expect(screen.getByRole("alertdialog", { name: "Enable live payments?" })).toBeInTheDocument();
   expect(save).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Enable live payments" })).toBeDisabled();
+  await user.type(screen.getByLabelText(/Type ACTIVATE LIVE PAYMENTS/i), "ACTIVATE LIVE PAYMENTS");
   await user.click(screen.getByRole("button", { name: "Enable live payments" }));
   expect(save).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -388,8 +392,119 @@ it("toggles Stripe egress, stages keys while keeping Pay by invoice active, and 
   await user.click(screen.getByRole("button", { name: "Send self-test webhook" }));
   expect(mocks.sendSelfTest).toHaveBeenCalledWith({ provider: "stripe" });
 
-  // Rejections table renders safe reason codes
+  // Rejections table renders human reason labels + secondary raw codes, and omits HTTP-layer filter options
+  expect((await screen.findAllByText("Invalid signature")).length).toBeGreaterThan(0);
+  expect((await screen.findAllByText(/INVALID_SIGNATURE · HTTP 400/u)).length).toBeGreaterThan(0);
   expect(
     (await screen.findAllByText("Stripe-Signature header did not match primary or secondary signing secret.")).length,
   ).toBeGreaterThan(0);
+  const reasonSelect = screen.getByLabelText("Rejection reason");
+  expect(reasonSelect.textContent).not.toContain("Unsupported media type");
+  expect(reasonSelect.textContent).not.toContain("Payload over 256 KB");
+  expect(screen.getByText(/payloads over 256 KB \(HTTP 413\) are refused by the HTTP transport layer/i)).toBeInTheDocument();
+});
+
+it("keeps Activate Stripe Checkout disabled when API check fails (HTTP 401), requires confirmation dialogs (ACTIVATE LIVE PAYMENTS in live mode), and deactivates in one confirm", async () => {
+  const user = userEvent.setup();
+  mocks.egressPresets.mockResolvedValue([
+    { key: "stripe", label: "Stripe API", enabled: true, parameterized: false },
+  ]);
+
+  // 1. Staged fake key: API check fails with HTTP 401 -> Activate button remains disabled & checklist item is NOT Optional.
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "test",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "0001",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: null,
+      lastSelfTestWebhookAt: "2026-11-21T12:00:00.000Z",
+    },
+  });
+  mocks.testConnection.mockResolvedValueOnce({
+    provider: "stripe",
+    mode: "test",
+    ok: false,
+    message: "Stripe rejected the staged secret key (HTTP 401).",
+  });
+
+  const firstRender = renderSetupPage();
+  await screen.findByRole("heading", { name: "Stripe readiness checklist" });
+  expect(screen.queryByText("Optional")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Activate Stripe Checkout" })).toBeDisabled();
+
+  await user.click(screen.getByRole("button", { name: "Test Stripe API" }));
+  expect((await screen.findAllByText("Stripe rejected the staged secret key (HTTP 401).")).length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: "Activate Stripe Checkout" })).toBeDisabled();
+  firstRender.unmount();
+
+  // 2. Live mode with verified API + self-test requires typing ACTIVATE LIVE PAYMENTS in confirmation dialog.
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "none",
+    mode: "live",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "4242",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: "2026-11-21T12:05:00.000Z",
+      lastSelfTestWebhookAt: "2026-11-21T12:06:00.000Z",
+    },
+  });
+
+  const liveRender = renderSetupPage();
+  const activateBtn = await screen.findByRole("button", { name: "Activate Stripe Checkout" });
+  expect(activateBtn).toBeEnabled();
+  await user.click(activateBtn);
+
+  expect(screen.getByRole("alertdialog", { name: "Activate live Stripe Checkout?" })).toBeInTheDocument();
+  const confirmLiveBtn = screen.getByRole("button", { name: "Activate live Stripe Checkout" });
+  expect(confirmLiveBtn).toBeDisabled();
+  expect(mocks.updateSettings).not.toHaveBeenCalled();
+
+  await user.type(screen.getByLabelText(/Type ACTIVATE LIVE PAYMENTS/i), "ACTIVATE LIVE PAYMENTS");
+  expect(confirmLiveBtn).toBeEnabled();
+  await user.click(confirmLiveBtn);
+  expect(mocks.updateSettings).toHaveBeenCalledWith(
+    expect.objectContaining({ provider: "stripe", mode: "live" }),
+  );
+  liveRender.unmount();
+
+  // 3. Deactivation back to Pay by invoice stays a single confirmation click (even if Stripe was selected with incomplete checks).
+  mocks.updateSettings.mockReset().mockResolvedValue(defaultConfig);
+  mocks.getSettings.mockResolvedValue({
+    ...defaultConfig,
+    provider: "stripe",
+    mode: "test",
+    onlineEnabled: false,
+    stripe: {
+      ...defaultConfig.stripe,
+      egressAllowlisted: true,
+      secretKeyConfigured: true,
+      secretKeyLast4: "0001",
+      webhookSecretConfigured: true,
+      webhookSecretLast4: "9876",
+      lastApiVerifiedAt: null,
+      lastSelfTestWebhookAt: null,
+    },
+  });
+
+  renderSetupPage();
+  const switchBackBtn = await screen.findByRole("button", { name: "Switch to Pay by invoice" });
+  await user.click(switchBackBtn);
+  expect(screen.getByRole("alertdialog", { name: "Switch back to Pay by invoice?" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Switch to Pay by invoice" }));
+  expect(mocks.updateSettings).toHaveBeenCalledWith(
+    expect.objectContaining({ provider: "none", mode: "test" }),
+  );
 });

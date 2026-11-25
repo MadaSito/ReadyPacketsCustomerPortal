@@ -59,6 +59,7 @@ export type PaymentSettingsView = Pick<
         | "inboundCountryAllowlistExempt"
         | "requiredEvents"
         | "ready"
+        | "lastApiVerifiedAt"
         | "lastVerifiedWebhookAt"
         | "lastVerifiedWebhookEventType"
         | "lastVerifiedWebhookStatus"
@@ -110,6 +111,9 @@ export function PaymentSettings({ settings, saving, onSave }: {
     (mode === "live" ? "connect.squareup.com" : "connect.squareupsandbox.com") : activeSettings?.egressHost;
   const egressConfirmed = provider !== "square" || mode === settings.mode;
   const changingLive = mode === "live" && provider !== "none" && (settings.mode !== "live" || settings.provider !== provider);
+  const activatingTest = mode === "test" && provider !== "none" && settings.provider !== provider;
+  const deactivatingToInvoice = provider === "none" && settings.provider !== "none";
+  const needsConfirmation = changingLive || activatingTest || deactivatingToInvoice;
   const sameMode = settings.mode === mode;
   const newCredentialsRequired =
     provider === "stripe"
@@ -179,7 +183,7 @@ export function PaymentSettings({ settings, saving, onSave }: {
       setNotice("Enter both credentials for the selected provider and environment before activating it.");
       return;
     }
-    if (changingLive) setConfirm(input);
+    if (needsConfirmation) setConfirm(input);
     else void save(input).catch(() => {});
   }
 
@@ -316,8 +320,40 @@ export function PaymentSettings({ settings, saving, onSave }: {
         </Callout>
       </div>
     </Card> : null}
-    <ConfirmDialog title="Enable live payments?" open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }}
-      description="Customers will use the live provider to make real payments. Verify the provider account and live webhook before enabling it."
-      confirmLabel="Enable live payments" onConfirm={async () => { if (confirm) await save(confirm); }} />
+    <ConfirmDialog
+      title={
+        confirm?.provider === "none"
+          ? "Switch back to Pay by invoice?"
+          : confirm?.mode === "live"
+            ? "Enable live payments?"
+            : `Activate ${confirm ? providerLabels[confirm.provider] : "hosted checkout"} (test mode)?`
+      }
+      open={confirm !== null}
+      onOpenChange={(open) => {
+        if (!open) setConfirm(null);
+      }}
+      description={
+        confirm?.provider === "none"
+          ? "Hosted online checkout buttons will be turned off for new customer cart checkouts and unpaid invoices. Customers will place invoice-only orders while saved provider credentials remain stored."
+          : confirm?.mode === "live"
+            ? "Customer cart checkouts and unpaid issued invoices will redirect buyers to the live payment provider and charge real funds. Verify outbound API connectivity and live webhooks before enabling it."
+            : "Customer cart checkouts and unpaid issued invoices will offer hosted sandbox checkout instead of invoice-only settlement. Test payment methods will be accepted and no real funds will move."
+      }
+      confirmText={
+        confirm && confirm.provider !== "none" && confirm.mode === "live"
+          ? "ACTIVATE LIVE PAYMENTS"
+          : undefined
+      }
+      confirmLabel={
+        confirm?.provider === "none"
+          ? "Switch to Pay by invoice"
+          : confirm?.mode === "live"
+            ? "Enable live payments"
+            : "Activate hosted checkout"
+      }
+      onConfirm={async () => {
+        if (confirm) await save(confirm);
+      }}
+    />
   </div>;
 }

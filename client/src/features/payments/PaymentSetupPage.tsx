@@ -52,35 +52,43 @@ const modeOptions = [
 ];
 
 const rejectionReasons: Record<string, string> = {
+  INVALID_SIGNATURE: "Invalid signature",
+  SQUARE_SIGNATURE_INVALID: "Invalid signature",
   WEBHOOK_SIGNATURE_INVALID: "Invalid signature",
+  invalid_signature: "Invalid signature",
+  MISSING_SIGNATURE: "Missing signature",
+  MALFORMED_SIGNATURE: "Missing signature",
   WEBHOOK_SIGNATURE_MISSING: "Missing signature",
+  TIMESTAMP_OUT_OF_RANGE: "Stale timestamp",
+  SQUARE_EVENT_STALE: "Stale timestamp",
   WEBHOOK_TIMESTAMP_EXPIRED: "Stale timestamp",
+  stale_timestamp: "Stale timestamp",
+  INVALID_JSON: "Malformed JSON",
+  INVALID_EVENT_PAYLOAD: "Malformed JSON",
+  INVALID_EVENT_ENVELOPE: "Malformed JSON",
+  SQUARE_EVENT_INVALID: "Malformed JSON",
   WEBHOOK_PAYLOAD_INVALID: "Malformed JSON",
-  UNSUPPORTED_MEDIA_TYPE: "Unsupported media type",
-  PAYLOAD_TOO_LARGE: "Payload over 256 KB",
+  malformed_json: "Malformed JSON",
   WEBHOOK_MODE_MISMATCH: "Environment mismatch",
+  environment_mismatch: "Environment mismatch",
+  WEBHOOK_NOT_CONFIGURED: "Signing secret missing",
   WEBHOOK_SECRET_MISSING: "Signing secret missing",
   WEBHOOK_PROVIDER_OFF: "Provider not configured",
-  invalid_signature: "Invalid signature",
-  stale_timestamp: "Stale timestamp",
-  malformed_json: "Malformed JSON",
-  unsupported_media_type: "Unsupported media type",
-  body_too_large: "Payload over 256 KB",
-  environment_mismatch: "Environment mismatch",
   provider_not_configured: "Provider not configured",
+  PAYLOAD_TAMPER_CONFLICT: "Payload conflict",
+  WEBHOOK_EMPTY_BODY: "Empty payload",
 };
 
 const rejectionReasonOptions = [
   { value: "", label: "All rejection reasons" },
-  { value: "WEBHOOK_SIGNATURE_INVALID", label: "Invalid signature" },
-  { value: "WEBHOOK_SIGNATURE_MISSING", label: "Missing signature" },
-  { value: "WEBHOOK_TIMESTAMP_EXPIRED", label: "Stale timestamp" },
-  { value: "WEBHOOK_PAYLOAD_INVALID", label: "Malformed JSON" },
-  { value: "UNSUPPORTED_MEDIA_TYPE", label: "Unsupported media type" },
-  { value: "PAYLOAD_TOO_LARGE", label: "Payload over 256 KB" },
+  { value: "INVALID_SIGNATURE", label: "Invalid signature" },
+  { value: "MISSING_SIGNATURE", label: "Missing signature" },
+  { value: "TIMESTAMP_OUT_OF_RANGE", label: "Stale timestamp" },
+  { value: "INVALID_JSON", label: "Malformed JSON" },
   { value: "WEBHOOK_MODE_MISMATCH", label: "Environment mismatch" },
-  { value: "WEBHOOK_SECRET_MISSING", label: "Signing secret missing" },
-  { value: "WEBHOOK_PROVIDER_OFF", label: "Provider not configured" },
+  { value: "WEBHOOK_NOT_CONFIGURED", label: "Signing secret missing" },
+  { value: "PAYLOAD_TAMPER_CONFLICT", label: "Payload conflict" },
+  { value: "WEBHOOK_EMPTY_BODY", label: "Empty payload" },
 ];
 
 const providerFilterOptions = [
@@ -119,7 +127,7 @@ function WebhookRejectionsCard() {
           Webhook rejections
         </span>
       }
-      description="Recent pre-verification rejections retained for 14 days. Raw bodies, headers, secrets, and client IP addresses are never stored."
+      description="Recent pre-verification rejections retained for 14 days. Raw bodies, headers, secrets, and client IP addresses are never stored. Requests with non-JSON media types (HTTP 400) or payloads over 256 KB (HTTP 413) are refused by the HTTP transport layer before webhook verification and do not appear in this log."
     >
       <FilterBar
         activeCount={Number(Boolean(provider)) + Number(Boolean(reasonCode))}
@@ -164,12 +172,20 @@ function WebhookRejectionsCard() {
             key: "reason",
             header: "Reason",
             primary: true,
-            cell: (row) => (
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone="danger">{rejectionReasons[row.reasonCode] ?? row.reasonCode}</Badge>
-                <span className="font-mono text-xs text-muted">HTTP {row.httpStatus}</span>
-              </div>
-            ),
+            cell: (row) => {
+              const humanLabel =
+                ("reasonLabel" in row && typeof row.reasonLabel === "string" && row.reasonLabel) ||
+                rejectionReasons[row.reasonCode] ||
+                row.reasonCode;
+              return (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone="danger">{humanLabel}</Badge>
+                  <span className="font-mono text-xs text-muted">
+                    {row.reasonCode} · HTTP {row.httpStatus}
+                  </span>
+                </div>
+              );
+            },
           },
           {
             key: "provider",
@@ -220,7 +236,9 @@ export default function PaymentSetupPage() {
   const [clearSecondary, setClearSecondary] = useState(false);
   const [savingKeys, setSavingKeys] = useState(false);
   const [activating, setActivating] = useState(false);
-  const [confirmLiveOpen, setConfirmLiveOpen] = useState(false);
+  const [deactivating, setDeactivating] = useState(false);
+  const [confirmActivateOpen, setConfirmActivateOpen] = useState(false);
+  const [confirmDeactivateOpen, setConfirmDeactivateOpen] = useState(false);
   const [formNotice, setFormNotice] = useState<string | null>(null);
   const [connectionCheckResult, setConnectionCheckResult] = useState<{
     ok: boolean;
@@ -260,8 +278,14 @@ export default function PaymentSetupPage() {
   const stripePreset = egressPresetsQuery.data?.find((preset) => preset.key === "stripe");
   const egressAllowlisted = stripePreset ? stripePreset.enabled : settings.stripe.egressAllowlisted;
   const requiredEvents = settings.stripe.requiredEvents ?? DEFAULT_STRIPE_EVENTS;
+  const apiVerified = Boolean(settings.stripe.lastApiVerifiedAt);
+  const selfTestVerified = Boolean(settings.stripe.lastSelfTestWebhookAt);
   const stripePrereqsReady =
-    egressAllowlisted && settings.stripe.secretKeyConfigured && settings.stripe.webhookSecretConfigured;
+    egressAllowlisted &&
+    settings.stripe.secretKeyConfigured &&
+    settings.stripe.webhookSecretConfigured &&
+    apiVerified &&
+    selfTestVerified;
   const stripeActiveAndReady = settings.provider === "stripe" && settings.onlineEnabled;
 
   async function toggleStripeEgress(nextEnabled: boolean) {
@@ -270,6 +294,7 @@ export default function PaymentSetupPage() {
         () => setEgressPreset.mutateAsync({ presetKey: "stripe", enabled: nextEnabled }),
         { reason: "Updating outbound network presets requires a recent identity check." },
       );
+      setConnectionCheckResult(null);
       await refreshAll();
       toast.show({
         title: nextEnabled ? "Stripe outbound HTTPS enabled" : "Stripe outbound HTTPS disabled",
@@ -367,6 +392,9 @@ export default function PaymentSetupPage() {
       setWebhookSecretSecondary("");
       setClearSecondary(false);
       setModeDraft(null);
+      if (trimmedSk || !sameMode) {
+        setConnectionCheckResult(null);
+      }
       await refreshAll();
       toast.show({
         title:
@@ -415,6 +443,37 @@ export default function PaymentSetupPage() {
     }
   }
 
+  async function deactivateStripeCheckout() {
+    setDeactivating(true);
+    try {
+      await stepUp.run(
+        () =>
+          client.payments.admin.updateSettings.mutate({
+            provider: "none",
+            mode: settings.mode,
+            currency: settings.currency,
+            successPath: settings.successPath,
+            cancelPath: settings.cancelPath,
+            webhookToleranceSeconds: settings.webhookToleranceSeconds,
+            squareLocationId: settings.square.locationId,
+          }),
+        { reason: "Switching back to Pay by invoice requires a recent identity check." },
+      );
+      await refreshAll();
+      toast.show({ title: "Switched back to Pay by invoice", tone: "success" });
+    } catch (error) {
+      if (!(error instanceof StepUpCancelledError)) {
+        toast.show({
+          title: "Provider could not be updated",
+          tone: "danger",
+          description: errorMessage(error),
+        });
+      }
+    } finally {
+      setDeactivating(false);
+    }
+  }
+
   const checklistItems: ChecklistItem[] = [
     {
       key: "egress",
@@ -459,10 +518,18 @@ export default function PaymentSetupPage() {
     {
       key: "apiTest",
       label: "Verify outbound Stripe API connectivity",
-      description: connectionCheckResult
-        ? connectionCheckResult.message
-        : "Calls GET /v1/checkout/sessions?limit=1 over the pinned outbound allowlist and confirms key environment alignment.",
-      state: connectionCheckResult?.ok ? "done" : "optional",
+      description:
+        connectionCheckResult && !connectionCheckResult.ok ? (
+          connectionCheckResult.message
+        ) : settings.stripe.lastApiVerifiedAt ? (
+          <span>
+            Verified <DateTime value={settings.stripe.lastApiVerifiedAt} />
+            {connectionCheckResult?.ok ? ` — ${connectionCheckResult.message}` : "."}
+          </span>
+        ) : (
+          "Calls GET /v1/checkout/sessions?limit=1 over the pinned outbound allowlist and confirms key environment alignment. Required for the current staged key, mode, and allowlist."
+        ),
+      state: apiVerified ? "done" : "todo",
       action: (
         <Button
           variant="secondary"
@@ -488,7 +555,7 @@ export default function PaymentSetupPage() {
       ) : (
         "Signs a synthetic event with the saved signing secret and runs it through signature verification without booking any invoice."
       ),
-      state: settings.stripe.lastSelfTestWebhookAt ? "done" : "todo",
+      state: selfTestVerified ? "done" : "todo",
       action: (
         <Button
           variant="secondary"
@@ -510,22 +577,42 @@ export default function PaymentSetupPage() {
       description: stripeActiveAndReady
         ? `Active in ${settings.mode} mode.`
         : settings.provider === "stripe"
-          ? "Stripe is selected as provider, waiting on the prerequisites above."
+          ? "Stripe is selected as provider, but online checkout stays on invoice fallback until every prerequisite above is verified."
           : `Current active provider: ${settings.provider === "none" ? "Pay by invoice" : "Square"}.`,
       state: stripeActiveAndReady ? "done" : stripePrereqsReady ? "todo" : "blocked",
-      action: !stripeActiveAndReady ? (
-        <Button
-          size="sm"
-          loading={activating}
-          disabled={!stripePrereqsReady || activating}
-          onClick={() => {
-            if (settings.mode === "live") setConfirmLiveOpen(true);
-            else void activateStripeCheckout();
-          }}
-        >
-          Activate Stripe Checkout
-        </Button>
-      ) : undefined,
+      action:
+        settings.provider === "stripe" ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {!stripeActiveAndReady && stripePrereqsReady ? (
+              <Button
+                size="sm"
+                loading={activating}
+                disabled={activating || deactivating}
+                onClick={() => setConfirmActivateOpen(true)}
+              >
+                Activate Stripe Checkout
+              </Button>
+            ) : null}
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={deactivating}
+              disabled={deactivating || activating}
+              onClick={() => setConfirmDeactivateOpen(true)}
+            >
+              Switch to Pay by invoice
+            </Button>
+          </div>
+        ) : (
+          <Button
+            size="sm"
+            loading={activating}
+            disabled={!stripePrereqsReady || activating}
+            onClick={() => setConfirmActivateOpen(true)}
+          >
+            Activate Stripe Checkout
+          </Button>
+        ),
     },
   ];
 
@@ -747,12 +834,32 @@ export default function PaymentSetupPage() {
       <WebhookRejectionsCard />
 
       <ConfirmDialog
-        title="Activate live Stripe Checkout?"
-        open={confirmLiveOpen}
-        onOpenChange={setConfirmLiveOpen}
-        description="Customers will be redirected to live Stripe Checkout and charged real funds once you confirm."
-        confirmLabel="Activate live Stripe Checkout"
+        title={
+          settings.mode === "live"
+            ? "Activate live Stripe Checkout?"
+            : "Activate Stripe Checkout (test mode)?"
+        }
+        open={confirmActivateOpen}
+        onOpenChange={setConfirmActivateOpen}
+        description={
+          settings.mode === "live"
+            ? "Customer cart checkouts and unpaid issued invoices will redirect buyers to live Stripe Checkout and charge real payment methods. Verified live webhooks will settle matching invoices and issue receipts automatically."
+            : "Customer cart checkouts and unpaid issued invoices will offer hosted Stripe Checkout in test mode instead of invoice-only checkout. Sandbox test cards will be accepted and no real funds will move."
+        }
+        confirmText={settings.mode === "live" ? "ACTIVATE LIVE PAYMENTS" : undefined}
+        confirmLabel={
+          settings.mode === "live" ? "Activate live Stripe Checkout" : "Activate Stripe Checkout"
+        }
         onConfirm={activateStripeCheckout}
+      />
+
+      <ConfirmDialog
+        title="Switch back to Pay by invoice?"
+        open={confirmDeactivateOpen}
+        onOpenChange={setConfirmDeactivateOpen}
+        description="Hosted Stripe Checkout buttons will be turned off for new customer cart checkouts and unpaid invoices. Customers will place invoice-only orders while your staged Stripe credentials remain saved."
+        confirmLabel="Switch to Pay by invoice"
+        onConfirm={deactivateStripeCheckout}
       />
     </div>
   );

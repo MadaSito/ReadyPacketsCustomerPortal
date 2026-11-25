@@ -327,6 +327,7 @@ export interface PaymentWebhookRejectionSummary {
   provider: ActivePaymentProvider;
   environmentHint: PaymentWebhookEnvHint;
   reasonCode: string;
+  reasonLabel: string;
   httpStatus: number;
   skewSeconds: number | null;
   detail: string;
@@ -576,32 +577,112 @@ function toAdminWebhookSummary(row: PaymentWebhookEventRow): AdminPaymentWebhook
   };
 }
 
+function labelWebhookRejectionReason(reasonCode: string): string {
+  switch (reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "SQUARE_SIGNATURE_INVALID":
+    case "WEBHOOK_SIGNATURE_INVALID":
+      return "Invalid signature";
+    case "MISSING_SIGNATURE":
+    case "MALFORMED_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_MISSING":
+      return "Missing signature";
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "SQUARE_EVENT_STALE":
+    case "WEBHOOK_TIMESTAMP_EXPIRED":
+      return "Stale timestamp";
+    case "INVALID_JSON":
+    case "INVALID_EVENT_PAYLOAD":
+    case "INVALID_EVENT_ENVELOPE":
+    case "SQUARE_EVENT_INVALID":
+    case "WEBHOOK_PAYLOAD_INVALID":
+      return "Malformed JSON";
+    case "WEBHOOK_MODE_MISMATCH":
+      return "Environment mismatch";
+    case "WEBHOOK_NOT_CONFIGURED":
+    case "WEBHOOK_SECRET_MISSING":
+    case "WEBHOOK_PROVIDER_OFF":
+      return "Provider not configured";
+    case "PAYLOAD_TAMPER_CONFLICT":
+      return "Conflicting duplicate payload";
+    case "WEBHOOK_EMPTY_BODY":
+      return "Empty request body";
+    default:
+      return "Rejected delivery";
+  }
+}
+
+function expandWebhookRejectionReasonFilter(reasonCode: string): string[] {
+  switch (reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_INVALID":
+      return ["INVALID_SIGNATURE", "SQUARE_SIGNATURE_INVALID", "WEBHOOK_SIGNATURE_INVALID"];
+    case "MISSING_SIGNATURE":
+    case "WEBHOOK_SIGNATURE_MISSING":
+      return ["MISSING_SIGNATURE", "MALFORMED_SIGNATURE", "WEBHOOK_SIGNATURE_MISSING"];
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "WEBHOOK_TIMESTAMP_EXPIRED":
+      return ["TIMESTAMP_OUT_OF_RANGE", "SQUARE_EVENT_STALE", "WEBHOOK_TIMESTAMP_EXPIRED"];
+    case "INVALID_JSON":
+    case "WEBHOOK_PAYLOAD_INVALID":
+      return [
+        "INVALID_JSON",
+        "INVALID_EVENT_PAYLOAD",
+        "INVALID_EVENT_ENVELOPE",
+        "SQUARE_EVENT_INVALID",
+        "WEBHOOK_PAYLOAD_INVALID",
+      ];
+    case "WEBHOOK_NOT_CONFIGURED":
+    case "WEBHOOK_SECRET_MISSING":
+    case "WEBHOOK_PROVIDER_OFF":
+      return ["WEBHOOK_NOT_CONFIGURED", "WEBHOOK_SECRET_MISSING", "WEBHOOK_PROVIDER_OFF"];
+    default:
+      return [reasonCode];
+  }
+}
+
 function describeWebhookRejection(row: PaymentWebhookRejectionRow): string {
   switch (row.reasonCode) {
+    case "INVALID_SIGNATURE":
+    case "SQUARE_SIGNATURE_INVALID":
     case "WEBHOOK_SIGNATURE_INVALID":
       return "HMAC signature did not match the configured signing secret(s).";
+    case "MISSING_SIGNATURE":
     case "WEBHOOK_SIGNATURE_MISSING":
-      return "Webhook signature header was missing or malformed.";
+      return row.provider === "stripe"
+        ? "Stripe-Signature header was missing."
+        : "Webhook signature header was missing.";
+    case "MALFORMED_SIGNATURE":
+      return row.provider === "stripe"
+        ? "Stripe-Signature header was malformed."
+        : "Webhook signature header was malformed.";
+    case "TIMESTAMP_OUT_OF_RANGE":
+    case "SQUARE_EVENT_STALE":
     case "WEBHOOK_TIMESTAMP_EXPIRED":
       return row.skewSeconds !== null
-        ? `Timestamp outside allowed tolerance (skew ${row.skewSeconds}s).`
-        : "Timestamp outside allowed tolerance.";
+        ? `Timestamp outside the allowed freshness window (skew ${row.skewSeconds}s).`
+        : "Timestamp outside the allowed freshness window.";
     case "WEBHOOK_MODE_MISMATCH":
       return `Event livemode (${row.environmentHint}) did not match configured portal mode.`;
+    case "WEBHOOK_NOT_CONFIGURED":
     case "WEBHOOK_SECRET_MISSING":
-      return "Webhook signing secret is not configured yet.";
     case "WEBHOOK_PROVIDER_OFF":
-      return "Provider is not active and no staged signing secret was configured.";
+      return "Provider signing credentials were not configured when this delivery arrived.";
+    case "INVALID_JSON":
     case "WEBHOOK_PAYLOAD_INVALID":
-      return "Payload was not valid JSON or missed required event fields.";
-    case "UNSUPPORTED_MEDIA_TYPE":
-      return "Content-Type header must be application/json.";
-    case "PAYLOAD_TOO_LARGE":
-      return "Webhook body exceeded the 256 KiB cap.";
+      return "Request body was not valid JSON.";
+    case "INVALID_EVENT_PAYLOAD":
+    case "INVALID_EVENT_ENVELOPE":
+    case "SQUARE_EVENT_INVALID":
+      return "JSON payload missed required webhook event envelope fields.";
+    case "PAYLOAD_TAMPER_CONFLICT":
+      return "Duplicate event ID arrived with a different payload digest.";
+    case "WEBHOOK_EMPTY_BODY":
+      return "Webhook request body was empty.";
     default:
       return row.skewSeconds !== null
-        ? `${row.reasonCode} (skew ${row.skewSeconds}s)`
-        : row.reasonCode;
+        ? `Rejected before verification (skew ${row.skewSeconds}s).`
+        : "Rejected before webhook signature and envelope verification.";
   }
 }
 
@@ -612,6 +693,7 @@ function toWebhookRejectionSummary(row: PaymentWebhookRejectionRow): PaymentWebh
     provider: row.provider,
     environmentHint: row.environmentHint,
     reasonCode: row.reasonCode,
+    reasonLabel: labelWebhookRejectionReason(row.reasonCode),
     httpStatus: row.httpStatus,
     skewSeconds: row.skewSeconds,
     detail: describeWebhookRejection(row),
@@ -774,40 +856,85 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     };
   }
 
+  function computeStripeApiFingerprint(
+    mode: PaymentEnvironmentMode,
+    stripeSecretKey: string,
+    stripeEgressStamp: string,
+  ): string {
+    return createHash("sha256")
+      .update(`stripe-api-v1|${mode}|${stripeSecretKey}|${stripeEgressStamp}`)
+      .digest("hex");
+  }
+
+  function computeStripeSelfTestFingerprint(
+    mode: PaymentEnvironmentMode,
+    stripeWebhookSecret: string,
+  ): string {
+    return createHash("sha256")
+      .update(`stripe-wh-v1|${mode}|${stripeWebhookSecret}`)
+      .digest("hex");
+  }
+
   async function checkEgressPresets(mode: PaymentEnvironmentMode): Promise<{
     wired: boolean;
     stripeAllowlisted: boolean;
     squareAllowlisted: boolean;
+    stripeEgressStamp: string;
   }> {
     const egressSvc = (deps.services as Partial<typeof deps.services>).integrations?.egress as
       | {
           isPresetEnabled?: (key: string) => Promise<boolean>;
           listPresets?: () => Promise<Array<{ key: string; enabled: boolean }>>;
+          listAllowlist?: () => Promise<
+            Array<{
+              publicId: string;
+              purpose: string;
+              pattern: string;
+              enabled: boolean;
+              version: number;
+            }>
+          >;
         }
       | undefined;
     if (
       !egressSvc ||
       (typeof egressSvc.isPresetEnabled !== "function" && typeof egressSvc.listPresets !== "function")
     ) {
-      return { wired: false, stripeAllowlisted: false, squareAllowlisted: false };
+      return { wired: false, stripeAllowlisted: false, squareAllowlisted: false, stripeEgressStamp: "unwired" };
     }
     try {
       const sqPresetKey = mode === "live" ? "square" : "square_sandbox";
+      const allowlistPromise =
+        typeof egressSvc.listAllowlist === "function" ? egressSvc.listAllowlist() : Promise.resolve(null);
+      let stripeAllowlisted = false;
+      let squareAllowlisted = false;
       if (typeof egressSvc.isPresetEnabled === "function") {
-        const [stripeAllowlisted, squareAllowlisted] = await Promise.all([
+        [stripeAllowlisted, squareAllowlisted] = await Promise.all([
           egressSvc.isPresetEnabled("stripe"),
           egressSvc.isPresetEnabled(sqPresetKey),
         ]);
-        return { wired: true, stripeAllowlisted, squareAllowlisted };
+      } else {
+        const presets = await egressSvc.listPresets!();
+        stripeAllowlisted = presets.some((p) => p.key === "stripe" && p.enabled);
+        squareAllowlisted = presets.some((p) => p.key === sqPresetKey && p.enabled);
       }
-      const presets = await egressSvc.listPresets!();
-      return {
-        wired: true,
-        stripeAllowlisted: presets.some((p) => p.key === "stripe" && p.enabled),
-        squareAllowlisted: presets.some((p) => p.key === sqPresetKey && p.enabled),
-      };
+      const rules = await allowlistPromise;
+      const stripeRules = rules
+        ? rules
+            .filter((r) => r.purpose === "stripe")
+            .map((r) => `${r.publicId}:${r.version}:${r.enabled ? 1 : 0}`)
+            .sort()
+        : null;
+      const stripeEgressStamp = stripeRules
+        ? stripeRules.length > 0
+          ? stripeRules.join(",")
+          : "none"
+        : stripeAllowlisted
+          ? "preset:1"
+          : "preset:0";
+      return { wired: true, stripeAllowlisted, squareAllowlisted, stripeEgressStamp };
     } catch {
-      return { wired: true, stripeAllowlisted: false, squareAllowlisted: false };
+      return { wired: true, stripeAllowlisted: false, squareAllowlisted: false, stripeEgressStamp: "error" };
     }
   }
 
@@ -922,19 +1049,69 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     }
   }
 
+  function resolveStripeVerificationState(
+    config: PaymentsConfigValue,
+    stripeKey: string | null,
+    stripeWh: string | null,
+    egress: { wired: boolean; stripeAllowlisted: boolean; stripeEgressStamp: string },
+  ): {
+    egressOk: boolean;
+    secretKeyModeMatches: boolean;
+    apiVerified: boolean;
+    selfTestVerified: boolean;
+    effectiveLastApiVerifiedAt: string | null;
+    effectiveLastSelfTestAt: string | null;
+    ready: boolean;
+  } {
+    const egressOk = !egress.wired || egress.stripeAllowlisted;
+    const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+    const secretKeyModeMatches = Boolean(stripeKey && expectedPrefix.test(stripeKey));
+    const apiVerified = Boolean(
+      stripeKey &&
+        secretKeyModeMatches &&
+        egressOk &&
+        config.stripeLastApiVerifiedAt &&
+        config.stripeApiVerifiedFingerprint ===
+          computeStripeApiFingerprint(config.mode, stripeKey, egress.stripeEgressStamp),
+    );
+    const selfTestVerified = Boolean(
+      stripeWh &&
+        config.stripeLastSelfTestAt &&
+        config.stripeSelfTestedFingerprint === computeStripeSelfTestFingerprint(config.mode, stripeWh),
+    );
+    const ready = Boolean(
+      stripeKey && secretKeyModeMatches && stripeWh && egressOk && apiVerified && selfTestVerified,
+    );
+    return {
+      egressOk,
+      secretKeyModeMatches,
+      apiVerified,
+      selfTestVerified,
+      effectiveLastApiVerifiedAt: apiVerified ? config.stripeLastApiVerifiedAt : null,
+      effectiveLastSelfTestAt: selfTestVerified ? config.stripeLastSelfTestAt : null,
+      ready,
+    };
+  }
+
   async function isProviderCredentialsReady(
     config: PaymentsConfigValue,
     tx?: Tx,
   ): Promise<boolean> {
     if (config.provider === "none") return false;
-    const egress = tx ? { wired: false, stripeAllowlisted: true, squareAllowlisted: true } : await checkEgressPresets(config.mode);
+    const egress = tx
+      ? { wired: false, stripeAllowlisted: true, squareAllowlisted: true, stripeEgressStamp: "unwired" }
+      : await checkEgressPresets(config.mode);
     if (config.provider === "stripe") {
-      const [hasKey, hasWh] = await Promise.all([
-        isSecretConfigured(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
-        isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+      const [stripeKey, stripeWh] = await Promise.all([
+        readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
+        readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
       ]);
-      const egressOk = !egress.wired || egress.stripeAllowlisted;
-      return hasKey && hasWh && egressOk;
+      const state = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+      if (!egress.wired && config.stripeApiVerifiedFingerprint === null && config.stripeSelfTestedFingerprint === null) {
+        // Legacy pre-Increment-07 raw settings seeded in isolated unit harnesses without wired egress.
+        return Boolean(stripeKey && state.secretKeyModeMatches && stripeWh);
+      }
+      return state.ready;
     }
     const [hasToken, hasSig] = await Promise.all([
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_ACCESS_TOKEN, tx),
@@ -2487,6 +2664,89 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       });
 
       if (!attempt || verified.outcomeHint === "ignored") {
+        if (!attempt && verified.outcomeHint !== "ignored" && verified.hasPortalMetadata) {
+          if (existing) {
+            await tx
+              .update(paymentWebhookEvents)
+              .set({
+                status: "attention_required",
+                reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+                lastErrorCode: "UNMATCHED_PORTAL_PAYMENT",
+                attemptPublicId: verified.attemptPublicId ?? existing.attemptPublicId,
+                providerRef: verified.providerRef ?? existing.providerRef,
+                providerOrderRef: verified.providerOrderRef ?? existing.providerOrderRef,
+                providerPaymentRef: verified.providerPaymentRef ?? existing.providerPaymentRef,
+                processedAt: now,
+              })
+              .where(eq(paymentWebhookEvents.id, existing.id));
+          } else {
+            await tx.insert(paymentWebhookEvents).values({
+              publicId: webhookPublicId,
+              provider: input.provider,
+              environment: eventEnv,
+              externalEventId: verified.externalEventId,
+              eventType: verified.eventType,
+              payloadSha256,
+              attemptId: null,
+              attemptPublicId: verified.attemptPublicId,
+              providerRef: verified.providerRef,
+              providerOrderRef: verified.providerOrderRef,
+              providerPaymentRef: verified.providerPaymentRef,
+              status: "attention_required",
+              reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+              lastErrorCode: "UNMATCHED_PORTAL_PAYMENT",
+              occurredAt: verified.occurredAt,
+              receivedAt: now,
+              processedAt: now,
+            });
+          }
+
+          await deps.audit.record(
+            {
+              category: "security",
+              eventName: "payments.webhook.unmatched_portal_session",
+              action: "verify",
+              outcome: "denied",
+              severity: "WARN",
+              reasonCode: "UNMATCHED_PORTAL_PAYMENT",
+              actor: { role: "system" },
+              resource: {
+                type: "payment_webhook",
+                publicId: webhookPublicId,
+              },
+              ...(verified.orderPublicId ? { orderPublicId: verified.orderPublicId } : {}),
+              attributes: {
+                provider: input.provider,
+                external_event_id: verified.externalEventId,
+                event_type: verified.eventType,
+                attempt_public_id: verified.attemptPublicId,
+                invoice_public_id: verified.invoicePublicId,
+                order_public_id: verified.orderPublicId ?? null,
+                reason_code: "UNMATCHED_PORTAL_PAYMENT",
+              },
+            },
+            tx,
+          );
+
+          const sessionRef = verified.providerRef ?? verified.externalEventId;
+          const sessionHash = createHash("sha256")
+            .update(`${input.provider}:${sessionRef}`)
+            .digest("hex")
+            .slice(0, 24);
+          await emitPaymentOpsAlert(
+            {
+              dedupKey: `unmatched-portal-payment:${input.provider}:${sessionHash}`,
+              severity: "warning",
+              code: "UNMATCHED_PORTAL_PAYMENT",
+              title: "Signed payment event with portal metadata could not be matched",
+              text: "A verified payment webhook carried ReadyPackets metadata (attempt, invoice, or order ID) that did not match any portal payment attempt or invoice. Review before settling manually.",
+              ...(verified.orderPublicId ? { orderPublicId: verified.orderPublicId } : {}),
+            },
+            tx,
+          );
+          return { kind: "unmatched_portal_payment" as const, duplicate: Boolean(existing) };
+        }
+
         if (existing) {
           await tx
             .update(paymentWebhookEvents)
@@ -2693,6 +2953,16 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         duplicate: staged.duplicate,
         booked: false,
         reasonCode: "UNLINKED_PROVIDER_REFUND",
+      };
+    }
+
+    if (staged.kind === "unmatched_portal_payment") {
+      return {
+        httpStatus: 200,
+        accepted: true,
+        duplicate: staged.duplicate,
+        booked: false,
+        reasonCode: "UNMATCHED_PORTAL_PAYMENT",
       };
     }
 
@@ -3285,22 +3555,23 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       loadSmallTotals(tx),
       loadReceiptsSetting(tx),
     ]);
-    const [stripeKeySet, stripeWhSet, stripeWhSecSet, squareTokenSet, squareSigSet] = await Promise.all([
-      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
-      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
+    const [stripeKey, stripeWh, stripeWhSecSet, squareTokenSet, squareSigSet] = await Promise.all([
+      readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
+      readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
       isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY, tx),
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_ACCESS_TOKEN, tx),
       isSecretConfigured(deps.settings, PAYMENTS_SQUARE_WEBHOOK_SIGNATURE_KEY, tx),
     ]);
+    const stripeKeySet = Boolean(stripeKey);
+    const stripeWhSet = Boolean(stripeWh);
 
     const squareHost =
       config.mode === "live" ? ("connect.squareup.com" as const) : ("connect.squareupsandbox.com" as const);
 
-    const egress = tx
-      ? { wired: false, stripeAllowlisted: false, squareAllowlisted: false }
-      : await checkEgressPresets(config.mode);
+    const egress = await checkEgressPresets(config.mode);
+    const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
 
-    const stripeReady = stripeKeySet && stripeWhSet && (!egress.wired || egress.stripeAllowlisted);
+    const stripeReady = stripeState.ready;
     const onlineEnabled =
       config.provider === "stripe"
         ? stripeReady
@@ -3350,9 +3621,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         webhookSecretLast4: stripeWhSet ? config.stripeWebhookSecretLast4 : null,
         webhookSecretSecondaryConfigured: stripeWhSecSet,
         webhookSecretSecondaryLast4: stripeWhSecSet ? config.stripeWebhookSecretSecondaryLast4 : null,
-        lastApiVerifiedAt: config.stripeLastApiVerifiedAt,
-        lastSelfTestAt: config.stripeLastSelfTestAt,
-        lastSelfTestWebhookAt: config.stripeLastSelfTestAt,
+        lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
+        lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
+        lastSelfTestWebhookAt: stripeState.effectiveLastSelfTestAt,
         lastVerifiedWebhookAt: latestStripeWebhook ? latestStripeWebhook.receivedAt.toISOString() : null,
         lastVerifiedWebhookEventType: latestStripeWebhook?.eventType ?? null,
         lastVerifiedWebhookStatus: latestStripeWebhook?.status ?? null,
@@ -3395,6 +3666,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       throw validation("INVALID_CURRENCY", "Currency must be a 3-letter uppercase ISO 4217 code.");
     }
 
+    const egress = await checkEgressPresets(input.mode);
+
     await runComplianceTx(deps, principal, { type: "payments_settings" }, async (tx) => {
       const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
       const prev = await loadConfig(tx);
@@ -3411,7 +3684,9 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         stripeWebhookSecretLast4: prev.stripeWebhookSecretLast4,
         stripeWebhookSecretSecondaryLast4: prev.stripeWebhookSecretSecondaryLast4,
         stripeLastApiVerifiedAt: modeChanged ? null : prev.stripeLastApiVerifiedAt,
+        stripeApiVerifiedFingerprint: modeChanged ? null : prev.stripeApiVerifiedFingerprint,
         stripeLastSelfTestAt: modeChanged ? null : prev.stripeLastSelfTestAt,
+        stripeSelfTestedFingerprint: modeChanged ? null : prev.stripeSelfTestedFingerprint,
         squareLocationId:
           input.squareLocationId !== undefined
             ? input.squareLocationId && input.squareLocationId.trim() !== ""
@@ -3440,6 +3715,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, null, tx);
         nextConfig.stripeSecretKeyLast4 = null;
         nextConfig.stripeLastApiVerifiedAt = null;
+        nextConfig.stripeApiVerifiedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "cleared" });
       } else if (input.stripeSecretKey !== undefined && input.stripeSecretKey.trim() !== "") {
         const parsed = parseCredential(PAYMENTS_STRIPE_SECRET_KEY.schema, input.stripeSecretKey.trim(), "Stripe secret key");
@@ -3453,6 +3729,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_STRIPE_SECRET_KEY.key, parsed, tx);
         nextConfig.stripeSecretKeyLast4 = maskLast4(parsed);
         nextConfig.stripeLastApiVerifiedAt = null;
+        nextConfig.stripeApiVerifiedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "api_key", operation: "rotated" });
       }
 
@@ -3460,12 +3737,14 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, null, tx);
         nextConfig.stripeWebhookSecretLast4 = null;
         nextConfig.stripeLastSelfTestAt = null;
+        nextConfig.stripeSelfTestedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "cleared" });
       } else if (input.stripeWebhookSecret !== undefined && input.stripeWebhookSecret.trim() !== "") {
         const parsed = parseCredential(PAYMENTS_STRIPE_WEBHOOK_SECRET.schema, input.stripeWebhookSecret.trim(), "Stripe webhook signing secret");
         await deps.settings.setSecret(PAYMENTS_STRIPE_WEBHOOK_SECRET.key, parsed, tx);
         nextConfig.stripeWebhookSecretLast4 = maskLast4(parsed);
         nextConfig.stripeLastSelfTestAt = null;
+        nextConfig.stripeSelfTestedFingerprint = null;
         rotatedSecrets.push({ provider: "stripe", slot: "webhook_primary", operation: "rotated" });
       }
 
@@ -3554,6 +3833,36 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             `Stripe secret key must match ${nextConfig.mode} mode.`,
           );
         }
+        if (egress.wired && !egress.stripeAllowlisted) {
+          throw validation(
+            "STRIPE_EGRESS_NOT_ALLOWLISTED",
+            "Enable the Stripe outbound HTTPS allowlist preset (api.stripe.com:443) before activating Stripe Checkout.",
+          );
+        }
+        const expectedApiFp = computeStripeApiFingerprint(
+          nextConfig.mode,
+          stripeKey,
+          egress.stripeEgressStamp,
+        );
+        if (
+          !nextConfig.stripeLastApiVerifiedAt ||
+          nextConfig.stripeApiVerifiedFingerprint !== expectedApiFp
+        ) {
+          throw validation(
+            "STRIPE_API_NOT_VERIFIED",
+            "Verify outbound Stripe API connectivity for the current staged secret key, mode, and outbound allowlist before activating Stripe Checkout.",
+          );
+        }
+        const expectedWhFp = computeStripeSelfTestFingerprint(nextConfig.mode, stripeWh);
+        if (
+          !nextConfig.stripeLastSelfTestAt ||
+          nextConfig.stripeSelfTestedFingerprint !== expectedWhFp
+        ) {
+          throw validation(
+            "STRIPE_WEBHOOK_NOT_VERIFIED",
+            "Run a passing signed webhook self-test for the current staged signing secret and mode before activating Stripe Checkout.",
+          );
+        }
       } else if (nextConfig.provider === "square") {
         const requiresSquareFresh =
           prev.provider !== nextConfig.provider || prev.mode !== nextConfig.mode;
@@ -3639,16 +3948,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     await pruneExpiredWebhookRejections(now);
 
     const config = await loadConfig();
-    const [stripeKey, stripeWhSet, stripeWhSecSet, egress] = await Promise.all([
+    const [stripeKey, stripeWh, stripeWhSecSet, egress] = await Promise.all([
       readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY),
-      isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET),
+      readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET),
       isSecretConfigured(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET_SECONDARY),
       checkEgressPresets(config.mode),
     ]);
 
     const stripeKeySet = Boolean(stripeKey);
-    const expectedPrefix = config.mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
-    const secretKeyModeMatches = stripeKey ? expectedPrefix.test(stripeKey) : false;
+    const stripeWhSet = Boolean(stripeWh);
+    const stripeState = resolveStripeVerificationState(config, stripeKey, stripeWh, egress);
+    const secretKeyModeMatches = stripeState.secretKeyModeMatches;
 
     const cutoff24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     const [[lastRealWebhook], [attentionRow], [rejRow]] = await Promise.all([
@@ -3686,13 +3996,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         ),
     ]);
 
-    const egressReady = !egress.wired || egress.stripeAllowlisted;
-    const onlineEnabled =
-      config.provider === "stripe" &&
-      stripeKeySet &&
-      secretKeyModeMatches &&
-      stripeWhSet &&
-      egressReady;
+    const egressReady = stripeState.egressOk;
+    const onlineEnabled = config.provider === "stripe" && stripeState.ready;
 
     const webhookUrl = new URL("/api/payments/webhooks/stripe", deps.config.canonicalOrigin).href;
 
@@ -3735,17 +4040,17 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       {
         key: "api_connection_verified",
         label: "Pinned Stripe API connection verified",
-        ready: Boolean(config.stripeLastApiVerifiedAt),
-        detail: config.stripeLastApiVerifiedAt
-          ? `Verified at ${config.stripeLastApiVerifiedAt}.`
-          : "Run Test Stripe API to verify egress and key livemode.",
+        ready: stripeState.apiVerified,
+        detail: stripeState.effectiveLastApiVerifiedAt
+          ? `Verified at ${stripeState.effectiveLastApiVerifiedAt} for the current staged key, mode, and outbound allowlist.`
+          : "Run Test Stripe API to verify egress and key livemode for the current staged key.",
       },
       {
         key: "self_test_webhook_verified",
         label: "Signed webhook receiver self-test passed",
-        ready: Boolean(config.stripeLastSelfTestAt),
-        detail: config.stripeLastSelfTestAt
-          ? `Verified at ${config.stripeLastSelfTestAt}.`
+        ready: stripeState.selfTestVerified,
+        detail: stripeState.effectiveLastSelfTestAt
+          ? `Verified at ${stripeState.effectiveLastSelfTestAt} for the current staged signing secret and mode.`
           : "Run Send self-test webhook to verify HMAC signature and timestamp handling.",
       },
       {
@@ -3755,7 +4060,7 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         detail: onlineEnabled
           ? `Online Stripe checkout is active in ${config.mode} mode.`
           : config.provider === "stripe"
-            ? "Stripe is selected, but one or more prerequisites above are incomplete."
+            ? "Stripe is selected, but one or more prerequisites above are incomplete or unverified; checkout remains on invoice fallback until resolved."
             : "Provider is currently set to off (invoice-only). Activate Stripe when ready.",
       },
     ];
@@ -3789,8 +4094,8 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
         webhookSecretSecondaryLast4: stripeWhSecSet ? config.stripeWebhookSecretSecondaryLast4 : null,
       },
       verification: {
-        lastApiVerifiedAt: config.stripeLastApiVerifiedAt,
-        lastSelfTestAt: config.stripeLastSelfTestAt,
+        lastApiVerifiedAt: stripeState.effectiveLastApiVerifiedAt,
+        lastSelfTestAt: stripeState.effectiveLastSelfTestAt,
         lastVerifiedWebhookAt: lastRealWebhook?.receivedAt
           ? lastRealWebhook.receivedAt.toISOString()
           : null,
@@ -3855,17 +4160,34 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
             : `Outbound connection to api.stripe.com failed (${failureReasonCode}). Enable the Stripe outbound allowlist preset and try again.`;
 
     const verifiedAt = res.ok ? (res.verifiedAt ?? now).toISOString() : null;
-    if (res.ok && verifiedAt) {
-      await deps.db.transaction(async (tx) => {
-        const latest = await loadConfig(tx);
-        await writeSetting(
-          deps.settings,
-          PAYMENTS_CONFIG_SETTING,
-          { ...latest, stripeLastApiVerifiedAt: verifiedAt },
-          tx,
-        );
-      });
-    }
+    const egress = await checkEgressPresets(stagedCheck.config.mode);
+    await deps.db.transaction(async (tx) => {
+      const latest = await loadConfig(tx);
+      const currentKey = await readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx);
+      const sameKeyAndMode =
+        latest.mode === stagedCheck.config.mode && currentKey === stagedCheck.stripeKey;
+      if (!sameKeyAndMode) return;
+      await writeSetting(
+        deps.settings,
+        PAYMENTS_CONFIG_SETTING,
+        res.ok && verifiedAt
+          ? {
+              ...latest,
+              stripeLastApiVerifiedAt: verifiedAt,
+              stripeApiVerifiedFingerprint: computeStripeApiFingerprint(
+                latest.mode,
+                stagedCheck.stripeKey,
+                egress.stripeEgressStamp,
+              ),
+            }
+          : {
+              ...latest,
+              stripeLastApiVerifiedAt: null,
+              stripeApiVerifiedFingerprint: null,
+            },
+        tx,
+      );
+    });
 
     await deps.audit.record({
       category: "integration",
@@ -3911,14 +4233,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
       async (tx) => {
         const liveActor = await assertLiveActorInTx(deps, principal, tx, "payments.manage");
         const config = await loadConfig(tx);
-        const [stripeKey, stripeWh] = await Promise.all([
-          readSecret(deps.settings, PAYMENTS_STRIPE_SECRET_KEY, tx),
-          readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx),
-        ]);
-        if (!stripeKey || !stripeWh) {
+        const stripeWh = await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx);
+        if (!stripeWh) {
           throw validation(
             "STRIPE_CREDENTIALS_REQUIRED",
-            "Stage both the Stripe secret key and primary webhook signing secret before running a self-test webhook.",
+            "Stage the primary Stripe webhook signing secret before running a self-test webhook.",
           );
         }
         return { liveActor, config, stripeWh };
@@ -3942,17 +4261,32 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const ok = dispatched.accepted && dispatched.reasonCode === "SELF_TEST_OK";
     const verifiedAt = ok ? deps.clock.now().toISOString() : null;
 
-    if (ok && verifiedAt) {
-      await deps.db.transaction(async (tx) => {
-        const latest = await loadConfig(tx);
-        await writeSetting(
-          deps.settings,
-          PAYMENTS_CONFIG_SETTING,
-          { ...latest, stripeLastSelfTestAt: verifiedAt },
-          tx,
-        );
-      });
-    }
+    await deps.db.transaction(async (tx) => {
+      const latest = await loadConfig(tx);
+      const currentWh = await readSecret(deps.settings, PAYMENTS_STRIPE_WEBHOOK_SECRET, tx);
+      const sameWhAndMode =
+        latest.mode === stagedCheck.config.mode && currentWh === stagedCheck.stripeWh;
+      if (!sameWhAndMode) return;
+      await writeSetting(
+        deps.settings,
+        PAYMENTS_CONFIG_SETTING,
+        ok && verifiedAt
+          ? {
+              ...latest,
+              stripeLastSelfTestAt: verifiedAt,
+              stripeSelfTestedFingerprint: computeStripeSelfTestFingerprint(
+                latest.mode,
+                stagedCheck.stripeWh,
+              ),
+            }
+          : {
+              ...latest,
+              stripeLastSelfTestAt: null,
+              stripeSelfTestedFingerprint: null,
+            },
+        tx,
+      );
+    });
 
     await deps.audit.record({
       category: "integration",
@@ -3995,7 +4329,11 @@ export function createPaymentsService(deps: ModuleDeps, options?: PaymentsServic
     const conds = [gte(paymentWebhookRejections.receivedAt, cutoff)];
     if (afterId !== null) conds.push(lt(paymentWebhookRejections.id, afterId));
     if (input.provider) conds.push(eq(paymentWebhookRejections.provider, input.provider));
-    if (input.reasonCode) conds.push(eq(paymentWebhookRejections.reasonCode, input.reasonCode));
+    if (input.reasonCode) {
+      conds.push(
+        inArray(paymentWebhookRejections.reasonCode, expandWebhookRejectionReasonFilter(input.reasonCode)),
+      );
+    }
 
     const rows = await deps.db
       .select()
