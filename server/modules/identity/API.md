@@ -194,6 +194,17 @@ still enrols at first sign-in), and re-checks profile + origin every call. Audit
 (actor system, attributes { reason, user_public_id, ttl_seconds }) in the same tx. Revoke with
 `sessions.revoke(sessionId, "demo_seed_complete")`.
 
+## Job principals (background jobs only)
+`sessions.principalForJob(sessionId, expectedUserId, { tx? }) → Promise<SessionPrincipal>` re-hydrates the FULL
+principal of the session that requested a job (e.g. files' ZIP archive build), so the job can call services that run
+`assertCurrent`. Server-side only: never exposed on tRPC/HTTP, never returned to a browser, and the CSRF secret is
+never logged or audited. Same liveness rules as `assertCurrent`: user active, idle/absolute policy live, not revoked,
+session belongs to `expectedUserId`, role/authMethod/authenticatedAt/mfaVerifiedAt/stepUpAt from the persisted rows,
+real decrypted CSRF secret (ops rows: same origin check and waived steps). Throws UNAUTHENTICATED
+`SESSION_NOT_CURRENT` otherwise, or REMEDIATION_REQUIRED `ACCOUNT_STEP_PENDING` when account steps are pending. Does
+not update `lastSeenAt`. With `tx` it locks `users` then `user_sessions` (lock order below); the job still calls
+`assertCurrent` in its own transaction before acting.
+
 ## Lock ordering (all modules)
 `users` row(s) → `user_sessions` row(s) → `identity_tokens` → other modules' rows (e.g. assurance account).
 Exception (orders/files, agreed with http_security): order-scoped mutations lock the `orders` row FIRST, then

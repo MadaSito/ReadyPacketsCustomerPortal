@@ -474,6 +474,49 @@ export function createSessionService(deps: ModuleDeps, transitions: TransitionSe
       return { pendingSteps, role: user.role, stepUpAt: row.stepUpAt, mfaVerifiedAt: row.mfaVerifiedAt };
     },
 
+    /**
+     * Server-side only (background jobs acting for the session that requested them; never tRPC/HTTP).
+     * Re-hydrates the FULL principal of a session that is live right now, with the same liveness rules as
+     * assertCurrent (user active, idle/absolute policy, not revoked, role and auth method from the persisted
+     * rows, real CSRF secret) so the result passes assertCurrent inside the job's own transaction. Refuses
+     * (SESSION_NOT_CURRENT) a session that is not live or does not belong to `expectedUserId`, and
+     * (ACCOUNT_STEP_PENDING) one with pending account steps. Does not touch lastSeenAt (a job is not
+     * user activity). With `tx`, locks users then the session row (assertCurrent's order). Never logs the secret.
+     */
+    async principalForJob(sessionId: string, expectedUserId: number, opts: { tx?: Tx } = {}): Promise<SessionPrincipal> {
+      const lock = opts.tx !== undefined;
+      const conn = db(opts.tx);
+      if (typeof sessionId !== "string" || sessionId.length === 0 || !Number.isSafeInteger(expectedUserId)) throw sessionNotCurrent();
+      const userQuery = conn.select().from(users).where(eq(users.id, expectedUserId)).limit(1);
+      const [user] = lock ? await (userQuery as unknown as { for(mode: "update"): Promise<UserRow[]> }).for("update") : await userQuery;
+      const row = await sessionRow(conn, sessionId, lock);
+      if (!user || !row || row.userId !== user.id) throw sessionNotCurrent();
+      if (!isLive(row, user, deps.clock.now(), await policy(opts.tx, user.role))) throw sessionNotCurrent();
+      if (row.deviceSummary === OPS_SESSION_MARKER && !opsSessionAllowed(user)) throw sessionNotCurrent();
+      let csrfSecret: string;
+      try {
+        csrfSecret = deps.crypto.decrypt(row.csrfSecretEnc, csrfAad(row.publicId));
+      } catch {
+        throw sessionNotCurrent();
+      }
+      let pendingSteps = await transitions.derive(user, row, opts.tx);
+      if (row.deviceSummary === OPS_SESSION_MARKER) pendingSteps = pendingSteps.filter((step) => !OPS_WAIVABLE_STEPS.has(step));
+      if (pendingSteps.length > 0) throw new DomainError("REMEDIATION_REQUIRED", "ACCOUNT_STEP_PENDING", "Please finish securing your account to continue.");
+      return {
+        sessionId: row.publicId,
+        userId: user.id,
+        userPublicId: user.publicId,
+        role: user.role,
+        state: "full",
+        pendingSteps: [],
+        authMethod: row.authMethod,
+        authenticatedAt: row.authenticatedAt,
+        mfaVerifiedAt: row.mfaVerifiedAt,
+        stepUpAt: row.stepUpAt,
+        csrfSecret,
+      };
+    },
+
     async listForUser(userId: number, currentSessionId: string, role?: UserRole): Promise<SessionListItem[]> {
       const now = deps.clock.now();
       const p = await policy(undefined, role);

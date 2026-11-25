@@ -746,6 +746,48 @@ describe("identity module (MySQL)", () => {
     });
   });
 
+  describe("sessions.principalForJob (background jobs)", () => {
+    it("re-hydrates the full live principal, which passes assertCurrent, without touching lastSeenAt", async () => {
+      const user = await makeUser({ role: "staff" });
+      const { principal } = await session(user.email, { stepUp: true });
+      const before = (await db.db.select().from(userSessions).where(eq(userSessions.publicId, principal.sessionId)))[0]!;
+      h.clock.advance(2 * 60_000);
+      const job = await identity.sessions.principalForJob(principal.sessionId, user.id);
+      expect(job).toEqual({ ...principal, state: "full", pendingSteps: [] });
+      const inTx = await db.db.transaction(async (tx) => {
+        const p = await identity.sessions.principalForJob(principal.sessionId, user.id, { tx: tx as Tx });
+        return identity.sessions.assertCurrent(p, tx as Tx);
+      });
+      expect(inTx).toMatchObject({ pendingSteps: [], role: "staff" });
+      const after = (await db.db.select().from(userSessions).where(eq(userSessions.publicId, principal.sessionId)))[0]!;
+      expect(after.lastSeenAt).toEqual(before.lastSeenAt);
+      expect(JSON.stringify(h.audit.events)).not.toContain(job.csrfSecret);
+    });
+
+    it("refuses another user, unknown, revoked, idle-expired and inactive sessions", async () => {
+      const user = await makeUser();
+      const other = await makeUser();
+      const { principal } = await session(user.email);
+      await rejects(identity.sessions.principalForJob(principal.sessionId, other.id), "SESSION_NOT_CURRENT");
+      await rejects(identity.sessions.principalForJob("no-such-session", user.id), "SESSION_NOT_CURRENT");
+      await db.db.update(users).set({ status: "suspended" }).where(eq(users.id, user.id));
+      await rejects(identity.sessions.principalForJob(principal.sessionId, user.id), "SESSION_NOT_CURRENT");
+      await db.db.update(users).set({ status: "active" }).where(eq(users.id, user.id));
+      h.clock.advance(31 * 60_000);
+      await rejects(identity.sessions.principalForJob(principal.sessionId, user.id), "SESSION_NOT_CURRENT");
+      const fresh = (await session(user.email)).principal;
+      await identity.sessions.revoke(fresh.sessionId, "test");
+      await rejects(identity.sessions.principalForJob(fresh.sessionId, user.id), "SESSION_NOT_CURRENT");
+    });
+
+    it("refuses a session with pending account steps", async () => {
+      const user = await makeUser();
+      const { principal } = await session(user.email);
+      await db.db.update(users).set({ mustChangePassword: true }).where(eq(users.id, user.id));
+      await rejects(identity.sessions.principalForJob(principal.sessionId, user.id), "ACCOUNT_STEP_PENDING");
+    });
+  });
+
   describe("ops sessions (demo seeder)", () => {
     const seed = (email = `seedops${++seq}.${Date.now()}@example.test`) =>
       db.db.transaction((tx) => identity.provisionLocalAccount({ email, name: "Seed Person", role: "customer", password: PW, mustChangePassword: false }, { tx: tx as Tx, reason: "demo_seed" }));
