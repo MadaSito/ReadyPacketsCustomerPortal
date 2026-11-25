@@ -29,7 +29,7 @@ scripts/dev/lint.sh server/modules/portable client/src/features/portable
 
 ## Increment 07
 
-- **Tested (one file, `portable.test.ts`, real MySQL with migration 0007):** the manifest lists the new exclusions `ephemeral-access`, `phase-workspace`, `operational-diagnostics` and `installation-configuration`. Export and import of a complete order still pass with the new `orders` and `order_files` columns present.
+- **Tested (one file, `portable.test.ts`, real MySQL with migration 0007):** the manifest lists the new exclusions `ephemeral-access`, `phase-workspace`, `operational-diagnostics` and `installation-configuration`. Export and import of a complete order still pass with the new `orders` and `order_files` columns present. An order imported onto a format-3 default workflow (status in the second of three phases) has no `order_stage_progress` rows and `progress_percent` NULL; `orders.stages.workspace` opens it as the customer, reports format 3, current phase `review`, progress above 0 and only the last phase as future (orders' runtime derives state from the status and creates rows lazily).
 - **Reviewed, not tested:** the per-table assignment of the 16 new tables (API.md "Increment 07 coverage"). No collector reads them.
 - **Not verified here:** that a backup restore covers the new tables (owned by the backup module; it enumerates every base table). Phase assignment (`order_files.stage_key`) is not carried in a package by design.
 

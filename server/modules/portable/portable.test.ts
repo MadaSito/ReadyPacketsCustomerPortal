@@ -7,13 +7,18 @@ import { createTestDeps, fakePrincipal, type TestHarness } from "../../../tests/
 import { createTestDb, type TestDb } from "../../../tests/helpers/testDb.js";
 import { ulid } from "../../core/ids.js";
 import { DomainError } from "../../core/errors.js";
+import { newRequestContext } from "../../core/requestContext.js";
 import type { JobResult, SessionPrincipal } from "../../core/types.js";
+import { createCallerFactory } from "../../trpc/trpc.js";
 import { examplePdf } from "../files/fixtures.test-support.js";
 import { createFilesModule } from "../files/index.js";
 import * as filesSchema from "../files/schema.js";
 import { createIdentityModule } from "../identity/index.js";
 import * as identitySchema from "../identity/schema.js";
 import { createOrdersModule } from "../orders/index.js";
+import { ordersRouter } from "../orders/router.js";
+import { fakeIdentity, insertUser, ordersTestSchema } from "../orders/testSupport.js";
+import { workflowDefinitionSchema } from "../orders/workflowTypes.js";
 import * as ordersSchema from "../orders/schema.js";
 import { copyExact, inPrivateWorkspace } from "./custody.js";
 import { buildPlan, type PortableInputRecord } from "./importPlanning.js";
@@ -386,4 +391,60 @@ describe("portable transfer across isolated MySQL installations", () => {
     expect(() => projectedOrder(order, [{ ...line, packetNumber: 2, tier: "unrecognized" }], []))
       .toThrow("VALIDATION:PORTABLE_TARGET_POLICY");
   });
+});
+
+describe("imported order on a format-3 workflow (increment 07, no phase-workspace rows travel)", () => {
+  it("opens the phase workspace with no order_stage_progress rows and derives the current phase and progress", async () => {
+    const db = await createTestDb({ schema: ordersTestSchema });
+    try {
+      const h = createTestDeps({ db: db.db });
+      const mod = createOrdersModule(h.deps);
+      Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
+      const admin = await insertUser(h, db.db, { role: "admin", stepUp: true });
+      const customer = await insertUser(h, db.db);
+      const [{ id: workflowId }] = (await db.db.insert(ordersSchema.orderWorkflows).values({
+        publicId: ulid(), workflowKey: "synthetic_phased", name: "Synthetic phased", isDefault: true,
+      }).$returningId()) as [{ id: number }];
+      const [{ id: workflowVersionId }] = (await db.db.insert(ordersSchema.orderWorkflowVersions).values({
+        publicId: ulid(), workflowId, versionNumber: 1, createdByUserId: admin.id,
+        definition: workflowDefinitionSchema.parse({
+          states: [
+            { key: "start", label: "Intake", customerLabel: "Intake", kind: "initial", tone: "neutral" },
+            { key: "middle", label: "Review", customerLabel: "Review", kind: "active", tone: "neutral" },
+            { key: "finish", label: "Finished", customerLabel: "Finished", kind: "terminal", tone: "success" },
+          ],
+          transitions: [
+            { from: "start", to: "middle", allowedBy: ["staff", "admin"], notifyCustomer: false },
+            { from: "middle", to: "finish", allowedBy: ["staff", "admin"], notifyCustomer: false },
+          ],
+          stages: [
+            { key: "intake", customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["start"], actions: {} },
+            { key: "review", customerLabel: "Review", staffLabel: "Review", statusKeys: ["middle"], actions: {} },
+            { key: "delivery", customerLabel: "Delivery", staffLabel: "Delivery", statusKeys: ["finish"], actions: {} },
+          ],
+        }),
+      }).$returningId()) as [{ id: number }];
+      await db.db.update(ordersSchema.orderWorkflows).set({ currentVersionId: workflowVersionId }).where(eq(ordersSchema.orderWorkflows.id, workflowId));
+      const imported = await db.db.transaction((tx) => mod.importOrder({
+        importId: ulid(), sourceInstallationId: "synthetic-source-fixture", sourceOrderPublicId: ulid(),
+        targetOwnerUserId: customer.id, projectName: "Synthetic imported order", statusKey: "middle",
+        ...OFFERING_PRICE, currency: "USD", createdAt: CREATED, submittedAt: CREATED, editable: false,
+        lineItems: [{ sourcePublicId: ulid(), productPublicId: null, productVersion: null, name: "Fixture line",
+          description: "", features: [], ...OFFERING_SNAPSHOT, unitPriceMinor: 2500, currency: "USD", quantity: 1, lineTotalMinor: 2500 }],
+        statusHistory: [{ sourcePublicId: ulid(), fromStatus: null, toStatus: "middle", actorRole: "system", reasonCode: "SOURCE_FIXTURE", occurredAt: CREATED }],
+      }, tx));
+      const [row] = await db.db.select().from(ordersSchema.orders).where(eq(ordersSchema.orders.id, imported.id));
+      expect(row).toMatchObject({ workflowVersionId, statusKey: "middle", progressPercent: null, attention: "none", paymentState: "not_required" });
+      const progressRows = () => db.db.select().from(ordersSchema.orderStageProgress).where(eq(ordersSchema.orderStageProgress.orderId, imported.id));
+      expect(await progressRows()).toHaveLength(0);
+      const caller = createCallerFactory(ordersRouter)({ services: h.services, session: customer.principal, request: newRequestContext("test"), transport: { issue() {}, clear() {} } });
+      const workspace = await caller.stages.workspace({ orderId: imported.publicId });
+      expect(workspace.workflowFormat).toBe(3);
+      expect(workspace.currentStageKey).toBe("review");
+      expect(workspace.progress.percent).toBeGreaterThan(0);
+      expect(workspace.stages.map((stage) => stage.state)).toEqual([expect.not.stringMatching(/future/), expect.not.stringMatching(/future/), "future"]);
+    } finally {
+      await db.cleanup();
+    }
+  }, 20_000);
 });
