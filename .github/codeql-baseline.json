@@ -8,5 +8,10 @@
     "ruleId": "js/missing-rate-limiting",
     "path": "server/http/static.ts",
     "justification": "Rate limited upstream by a limiter CodeQL does not model. The admission middleware in server/http/app.ts charges every navigation request to the standard_browsing budget before registerStatic is mounted, and the application shell handler returns early for anything that is not a navigation, so the index.html read is only reachable after that charge. Reviewed 2026-11-20."
+  },
+  {
+    "ruleId": "js/clear-text-storage-of-sensitive-data",
+    "path": "server/modules/files/http.ts",
+    "justification": "Not stored personal or credential data. The value written to the rp_audio_grant cookie is a single-purpose random bearer token minted by redeemPlaybackTicket for one audio playback grant, because an <audio> element cannot send request headers for range requests. It works like a session identifier: the server keeps only its hash (filePlaybackGrants.tokenHash), the grant is bound to the signed-in account and one file, expires after playbackLifetimeMs, and the cookie is HttpOnly, SameSite=Strict, scoped to /api/files/playback/<grant> and Secure on HTTPS origins. Encrypting an opaque random token would add nothing; CodeQL flags it because the variable is named secret. Reviewed 2026-11-25."
   }
 ]

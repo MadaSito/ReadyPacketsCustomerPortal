@@ -443,7 +443,8 @@ export function serviceProviderMetadata(sp: SpUrls): string {
 /** MFA facts from a verified assertion (values never leave the server). */
 export function samlMfaFacts(assertion: Pick<VerifiedSamlAssertion, "methods" | "authnContextClassRef">, acceptedContexts: readonly string[]) {
   return {
-    multipleAuthn: assertion.methods.includes(ENTRA_MULTIPLE_AUTHN),
+    // Exact membership of the claim value in the verified list; never a substring test on a URL.
+    multipleAuthn: assertion.methods.some((method) => method === ENTRA_MULTIPLE_AUTHN),
     acceptedContext: assertion.authnContextClassRef !== null && acceptedContexts.includes(assertion.authnContextClassRef),
   };
 }

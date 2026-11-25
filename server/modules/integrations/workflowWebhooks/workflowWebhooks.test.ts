@@ -1156,7 +1156,7 @@ describe("Increment 07 Package K (D7) — workflowWebhooks, signing, stop/retry,
       readVerified: true,
       writeVerified: true,
     });
-    expect(httpCalls.some((c) => c.method === "DELETE" && c.url.includes("contoso.sharepoint.com"))).toBe(true);
+    expect(httpCalls.some((c) => c.method === "DELETE" && new URL(c.url).hostname === "contoso.sharepoint.com")).toBe(true);
     // DELETE to SharePoint uploadUrl MUST NOT leak Authorization header
     const deleteCall = httpCalls.find((c) => c.method === "DELETE")!;
     expect(deleteCall.headers?.Authorization).toBeUndefined();

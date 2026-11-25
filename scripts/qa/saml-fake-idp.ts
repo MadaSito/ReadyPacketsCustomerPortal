@@ -1,9 +1,10 @@
 /**
  * QA-ONLY fake Entra SAML identity provider (increment 07, D10). Never deploy; never point it at production.
  *
- *   node_modules/.bin/tsx scripts/qa/saml-fake-idp.ts --sp http://localhost:5044 --tenant <tenant-guid> [--port 5045]
+ *   node_modules/.bin/tsx scripts/qa/saml-fake-idp.ts --sp http://localhost:5044 --tenant <tenant-guid> --state <private-dir> [--port 5045]
  *
- * 1. Start it. It prints a self-signed certificate (key kept in --state, default /tmp/rp-fake-idp, outside the repo).
+ * 1. Start it. It prints a self-signed certificate. The signing key is kept in --state: a directory only you can
+ *    read, outside the repository and outside shared temporary folders (for example ~/.rp-fake-idp).
  * 2. In the portal (/admin/sso): protocol SAML 2.0, tenant = --tenant, add that certificate, enable.
  * 3. Bind your test user to an object id (or use the one shown on the sign-in form).
  * 4. Click "Sign in with Microsoft". The portal redirects to https://login.microsoftonline.com/<tenant>/saml2?SAMLRequest=…
@@ -13,7 +14,7 @@
  * The signed response is built with the same fixture as the server tests (server/modules/identity/sso/samlTesting.ts).
  */
 import { createPrivateKey, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { inflateRawSync } from "node:zlib";
@@ -29,21 +30,25 @@ const arg = (name: string, fallback?: string) => {
 const spOrigin = arg("sp").replace(/\/$/, "");
 const tenant = arg("tenant").toLowerCase();
 const port = Number(arg("port", "5045"));
-const stateDir = arg("state", "/tmp/rp-fake-idp");
+const stateDir = arg("state");
 const entityOverride = process.argv.includes("--entity-id") ? arg("entity-id") : null;
 const sp = spUrls(spOrigin, entityOverride);
 
 function loadKey(): TestIdpKey {
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const keyFile = join(stateDir, "key.pem");
   const certFile = join(stateDir, "cert.pem");
-  if (existsSync(keyFile) && existsSync(certFile)) {
+  try {
     const certificatePem = readFileSync(certFile, "utf8");
     return { privateKey: createPrivateKey(readFileSync(keyFile, "utf8")), certificatePem, certificateBody: certificatePem.replace(/-----[^-]+-----|\s/g, "") };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  // First run for this state directory. "wx" creates each file exclusively, so an existing file is never followed
+  // or overwritten; a half-written state directory fails loudly instead of being silently replaced.
   const key = createTestIdpKey({ cn: "ReadyPackets QA fake IdP" });
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  writeFileSync(keyFile, key.privateKey.export({ type: "pkcs8", format: "pem" }) as string, { mode: 0o600 });
-  writeFileSync(certFile, key.certificatePem, { mode: 0o644 });
+  writeFileSync(keyFile, key.privateKey.export({ type: "pkcs8", format: "pem" }) as string, { mode: 0o600, flag: "wx" });
+  writeFileSync(certFile, key.certificatePem, { mode: 0o644, flag: "wx" });
   return key;
 }
 const key = loadKey();
