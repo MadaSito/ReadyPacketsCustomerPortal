@@ -89,6 +89,8 @@ it("integrates phase questions with submit, attention, review and administrator 
     expect(await attention()).not.toBe("customer_response");
     await buyer.stages.submit({ ...scope, expectedVersion: (await workspace()).version });
     expect(await attention()).toBe("staff_review");
+    await expect(reviewer.stages.review({ ...scope, expectedVersion: (await workspace()).version, outcome: "changes_requested" }))
+      .rejects.toMatchObject({ code: "BAD_REQUEST", cause: { reasonCode: "NOTE_REQUIRED" } });
     await reviewer.stages.review({
       ...scope, expectedVersion: (await workspace()).version, outcome: "changes_requested", note: "Attach the updated document.",
     });
