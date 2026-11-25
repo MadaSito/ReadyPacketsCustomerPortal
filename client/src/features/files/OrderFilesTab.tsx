@@ -238,7 +238,7 @@ export default function OrderFilesTab({ orderId, area }: Props) {
                   {!file.deletedAt && !file.supersededAt && file.contentType.startsWith("audio/") ?
                     <Button size="sm" variant="secondary" onClick={() => setPlaying(file)} aria-label={`Listen to ${file.displayName}`}>Listen</Button> : null}
                   {!file.deletedAt && !file.supersededAt && file.extension === "docx" ? <Button asChild size="sm" variant="secondary">
-                    <Link href={orderDocumentEditHref(orderId, file.publicId, { area })} aria-label={`Edit ${file.displayName}`}>Edit document</Link>
+                    <Link href={orderDocumentEditHref(orderId, file.publicId, { area })}>Edit document<span className="sr-only">: {file.displayName}</span></Link>
                   </Button> : null}
                   {canReplace || staffActions ? <DropdownMenu
                     trigger={<IconButton variant="ghost" label={`Actions for ${file.displayName}`} icon={<MoreHorizontal aria-hidden />} />}

@@ -235,6 +235,15 @@ describe("file upload", () => {
 });
 
 describe("order file tab", () => {
+  it("includes the visible edit text and filename in the console document link name", async () => {
+    const file = { ...sample, displayName: "qa-synthetic.docx", extension: "docx" };
+    view.mockResolvedValue({ items: [file], nextCursor: null, canUpload: false, uploadPolicy: null });
+    const { container } = renderUi(<><h1>Order</h1><OrderFilesTab orderId={orderId} area="console" /></>);
+    const links = await screen.findAllByRole("link", { name: "Edit document: qa-synthetic.docx" });
+    for (const link of links) expect(link).toHaveTextContent("Edit document");
+    await expectNoAxeViolations(container);
+  });
+
   it("binds a format-3 task upload to the current phase and keeps its status and slot", async () => {
     view.mockResolvedValue({ items: [], nextCursor: null, canUpload: true, uploadPolicy: policy, stageUploadsRequired: true,
       currentStageKey: "intake_phase", phases: [{ key: "intake_phase", label: "Intake evidence" }],
