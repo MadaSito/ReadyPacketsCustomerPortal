@@ -74,3 +74,14 @@ Both show a "Download phase files (ZIP)" or "Download all order files (ZIP)" but
 - `file_archive_tickets`: id, token_hash char(64) unique, archive_id, user_id, session_id varchar(80), issued_at, expires_at, used_at.
 
 Both are short-lived operational rows. They are not in portable packages (manifest exclusion `file-archives`) and are dumped by backups.
+
+## Verification (increment 07)
+
+- **Tested (`archives.test.ts`, 12 cases, real MySQL with a fake Files selector, fake identity and in-memory storage):**
+  - Entry names: traversal, reserved names and separators; case-insensitive dedupe; 30 duplicates at maximum length terminate, stay unique, ≤120 characters with the extension kept.
+  - Caps: 251 files, more than 500 MiB and empty sets are refused.
+  - Requests: same-request reuse and a busy slot; whole-order ZIP needs admin and step-up; another user's archive and an archive after access is lost are hidden.
+  - Build: a ZIP read back with yauzl; a hash mismatch fails the build; an ended session fails the build.
+  - Tickets and lifetime: single use; another session's ticket is refused without burning it; expiry; a manifest change before download revokes the archive; the expire job purges the object.
+- **Type-checked and linted, not run:** `archivesRouter.ts`, `archivesHttp.ts` (POST /api/files/archives/download) and the client `ArchiveAction.tsx`. They have no browser, axe or screen-reader run, and no StrictMode render test yet.
+- **Known limits:** the client buffers the ZIP as a Blob (up to the 500 MiB cap) the same way single-file downloads do. A real Files selector and the real job runner have not been exercised together with this module.
