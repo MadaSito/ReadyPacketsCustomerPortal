@@ -284,7 +284,7 @@ describe("order activity port (real MySQL)", () => {
     for (const name of ["order.stage.advanced", "order.stage.submitted", "order.stage.reviewed", "order.stage.reopened", "order.question.asked", "order.question.answered"])
       expect(classifyOrderEvent(name)).toMatchObject({ category: "phases", customer: true });
     expect(classifyOrderEvent("order.payment_state.changed")).toMatchObject({ category: "payments", customer: true });
-    for (const name of ["order.question.withdrawn", "order.admin_task.unchecked", "order.stage_run.failed", "order.completion.scheduled", "order.stage.status_overridden", "order.progress.lowered", "file.archive.built", "file.sync.failed"])
+    for (const name of ["order.question.withdrawn", "order.admin_task.unchecked", "order.stage_run.failed", "order.completion.scheduled", "order.stage.status_overridden", "order.progress.lowered", "file.archive.built", "storage.file_sync.failed"])
       expect(classifyOrderEvent(name)).toMatchObject({ customer: false });
   });
 });

@@ -244,7 +244,7 @@ Audit owns the names; each owner emits its events (`deps.audit.record`, snake_ca
 | portable_contract (D8 ZIP) | `file.archive.requested`, `.built`, `.downloaded`, `.failed`, `.expired` | `archive_public_id`, `scope` (phase, order), `stage_key`, `file_count`, `total_bytes`, `reason_code` |
 | compliance (D9) | `payments.webhook.rejected` (existing), `payments.attempt.pending_async`, `payments.attempt.paid` (existing), `payments.attempt.failed` (existing), `payment.refund.flagged`, `payments.setup.self_test`, `payments.secret.rotated` | `reason_code`, `event_type`, `payment_state` |
 | identity (D10) | `identity.saml.config_changed`, `identity.saml.certificate_changed`, `identity.saml.mfa_mode_changed` (outcome warning for `entra`), `identity.saml.test_signin`, `auth.login.succeeded` / `auth.login.failed` with `method: "saml"` | `protocol`, `mfa_mode`, `reason_code`, `mfa_source` (entra_claim, portal, entra_managed) |
-| portable_ops (D12) | `file.sync.exported`, `.failed`, `.reconciled`, `.resync_requested`, `file.sync.target_tested`, `file.sync.plan_changed` | `target_role` (originals, staging, intake), `destination_key`, `reason_code`, `dry_run_count` |
+| portable_ops (D12) — confirmed (category integration) | `storage.file_sync.write_test`, `.target_changed`, `.resync_requested`, `.attempted`, `.completed`, `.failed`, `.unknown`, `.blocked` | ids, counts and controlled reason codes only |
 
 **Customer order timeline (`orderActivity.ts`)**: customer-visible are `order.stage.advanced` ("Phase completed"), `.submitted` ("Phase submitted"), `.reviewed` ("Phase reviewed"), `.reopened` ("Phase reopened"), `order.question.asked` / `.answered`, `order.payment_state.changed` ("Payment updated"). Staff-only: everything else above.
 
