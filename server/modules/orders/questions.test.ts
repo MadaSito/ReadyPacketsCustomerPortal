@@ -44,8 +44,6 @@ it("integrates phase questions with submit, attention, review and administrator 
     const h = createTestDeps({ db: db.db });
     const mod = createOrdersModule(h.deps);
     Object.assign(h.services, { orders: mod, identity: fakeIdentity(h, db.db) });
-    // Isolate D4 from global D2 seed data; the runtime falls back to the pinned definition for unseen statuses.
-    vi.spyOn(mod.statusCatalog, "getManyInTx").mockResolvedValue(new Map());
     const admin = await insertUser(h, db.db, { role: "admin", stepUp: true });
     const staff = await insertUser(h, db.db, { role: "staff" });
     const customer = await insertUser(h, db.db);
