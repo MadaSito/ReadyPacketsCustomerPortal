@@ -22,7 +22,7 @@ import { paymentAttempts } from "../../server/modules/payments/schema.js";
 import { isPlatformSettingsStore } from "../../server/modules/platform/settingsStore.js";
 import { storageCopyAttempts } from "../../server/modules/storage/schema.js";
 import { appRouter } from "../../server/trpc/root.js";
-import { adminProcedure, protectedProcedure, staffProcedure } from "../../server/trpc/trpc.js";
+import { adminProcedure, protectedProcedure, staffProcedure, STEP_UP_MAX_AGE_MS } from "../../server/trpc/trpc.js";
 import {
   Browser, bootstrapAdmin, createSystem, registerCustomer, seedProduct, stepUp, STRONG_PASSWORD,
   type ReadyAdmin, type ReadyCustomer, type System, type TrpcResult,
@@ -34,6 +34,9 @@ let a: ReadyCustomer;
 let b: ReadyCustomer;
 let bOrderId = "";
 let aOrderVersion = 0;
+let phaseOrderVersion = 0;
+const intake = "isolation_intake";
+const reopenReason = "Synthetic reason for reopening the phase";
 const gateKey = "isolation_policy";
 
 /** Everything customer A owns, by public id. */
@@ -45,6 +48,7 @@ const owned = {
   policyVersionId: "", policyHash: "", receiptId: "", copyAttemptId: "", refundPaymentId: "", dispatchId: "",
   customerPublicId: "", productId: "", documentFileId: "", paymentReceiptId: "",
   enforcementDocumentId: "", enforcementVersionId: "", staffPolicyVersionId: "", staffPolicyHash: "", policyNoticeId: "",
+  phaseOrderId: "", questionId: "", archiveId: "",
 };
 let cartVersion = 0;
 let policyNoticeRevision = 0;
@@ -87,9 +91,12 @@ const RESOURCE_KEY = /(Id|PublicId|Ids)$/;
 const NOT_A_FOREIGN_RESOURCE = new Set(["recoverySetId", "challengeId", "upToMessageId", "productPublicId", "offerPublicId"]);
 
 /** Every probe customer B runs, keyed by procedure path. Inputs are otherwise valid so only ownership decides. */
-type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "FILTERED" }; alternateInputs?: () => unknown[] };
+type Probe = { kind: "query" | "mutation"; input: () => unknown; denial?: { code: "FORBIDDEN"; reason: string } | { code: "FILTERED" | "EMPTY" }; alternateInputs?: () => unknown[] };
 
 const documentLocator = (orderPublicId = owned.orderId) => ({ orderPublicId, filePublicId: owned.documentFileId });
+const phaseRef = () => ({ orderId: owned.phaseOrderId, stageKey: intake });
+const phaseWrite = () => ({ ...phaseRef(), expectedVersion: phaseOrderVersion });
+const questionRef = () => ({ ...phaseRef(), questionId: owned.questionId });
 
 function probes(): Record<string, Probe> {
   const o = owned;
@@ -155,8 +162,28 @@ function probes(): Record<string, Probe> {
     "orders.sharing.respond": { kind: "mutation", input: () => ({ grantId: o.grantId, accept: true }) },
     "orders.requirements.forOrder": { kind: "query", input: () => ({ orderId: o.orderId }) },
     "orders.requirements.acknowledge": { kind: "mutation", input: () => ({ orderId: o.orderId, statusKey: "submitted", ackKey: "terms", textSha256: o.ackHash, typedName: "Bob Isolation" }) },
+    "orders.stages.workspace": { kind: "query", input: () => ({ orderId: o.phaseOrderId }) },
+    "orders.stages.next": { kind: "mutation", input: phaseWrite },
+    "orders.stages.submit": { kind: "mutation", input: phaseWrite },
+    "orders.stages.review": { kind: "mutation", input: () => ({ ...phaseWrite(), outcome: "accepted" }), denial: consoleOnly },
+    "orders.stages.reopen": { kind: "mutation", input: () => ({ ...phaseWrite(), reason: reopenReason, confirm: true }), denial: consoleOnly },
+    "orders.questions.customerList": { kind: "query", input: phaseRef },
+    "orders.questions.answer": {
+      kind: "mutation", input: () => ({ ...questionRef(), body: "Synthetic customer response", expectedVersion: 0 }),
+    },
     "files.list": { kind: "query", input: () => ({ orderId: o.orderId }) },
     "files.issueDownloadTicket": { kind: "mutation", input: () => ({ fileId: o.fileId }) },
+    "files.issuePlaybackTicket": {
+      kind: "mutation", input: () => ({ orderId: o.orderId, fileId: o.fileId }),
+      alternateInputs: () => [{ orderId: bOrderId, fileId: o.fileId }],
+    },
+    "files.phasePolicy": { kind: "query", input: () => ({ orderPublicId: o.phaseOrderId, stageKey: intake, intent: "document" }) },
+    "files.teamFiles": { kind: "query", input: () => ({ orderPublicId: o.phaseOrderId, stageKey: intake }) },
+    "fileArchives.request": { kind: "mutation", input: phaseRef },
+    "fileArchives.latest": { kind: "query", input: phaseRef, denial: { code: "EMPTY" } },
+    "fileArchives.status": { kind: "query", input: () => ({ archiveId: o.archiveId }) },
+    "fileArchives.cancel": { kind: "mutation", input: () => ({ archiveId: o.archiveId }) },
+    "fileArchives.issueDownloadTicket": { kind: "mutation", input: () => ({ archiveId: o.archiveId }) },
     "files.readTranscript": { kind: "mutation", input: () => ({ fileId: o.fileId }) },
     "files.recording.preflight": { kind: "query", input: () => ({ orderPublicId: o.orderId, slotKey: "voice_evidence" }) },
     "files.document.status": { kind: "query", input: () => documentLocator(), alternateInputs: () => [documentLocator(bOrderId)] },
@@ -308,6 +335,48 @@ async function installRequirementsWorkflow(policyPublicId: string) {
     },
   }));
   Browser.ok(await admin.browser.mutate(`${workflow}.publish`, { draftId: publicId, expectedVersion: 2, makeDefault: true }));
+}
+
+/** Separate format-3 order: keep the existing legacy workflow fixtures pinned and unchanged. */
+async function seedPhaseOrder(productPublicId: string) {
+  const workflow = "orders.admin.workflows.drafts";
+  const name = "Isolation phases";
+  Browser.ok(await stepUp(sys, admin.browser, admin.password, admin.secret));
+  const { publicId } = Browser.ok(await admin.browser.mutate<{ publicId: string }>(`${workflow}.create`, {
+    from: "blank", workflowKey: "isolation_phases", name,
+  }));
+  Browser.ok(await admin.browser.mutate(`${workflow}.save`, {
+    draftId: publicId, expectedVersion: 1, name,
+    definition: {
+      states: [
+        { key: "submitted", label: "Submitted", customerLabel: "Submitted", kind: "initial", tone: "info" },
+        { key: "completed", label: "Completed", customerLabel: "Completed", kind: "terminal", tone: "success" },
+        { key: "canceled", label: "Canceled", customerLabel: "Canceled", kind: "terminal", tone: "neutral" },
+      ],
+      transitions: [
+        { from: "submitted", to: "completed", allowedBy: ["staff", "admin"], notifyCustomer: true, requiresNote: false },
+        { from: "submitted", to: "canceled", allowedBy: ["customer", "staff", "admin"], notifyCustomer: true, requiresNote: false },
+      ],
+      stages: [{
+        key: intake, customerLabel: "Intake", staffLabel: "Intake", statusKeys: ["submitted"],
+        actions: { answerQuestions: true, uploadDocuments: true, teamFileReview: true },
+        adminTasks: ["assign_questions"],
+      }],
+    },
+  }));
+  Browser.ok(await admin.browser.mutate(`${workflow}.publish`, { draftId: publicId, expectedVersion: 2, makeDefault: true }));
+  owned.phaseOrderId = Browser.ok(await a.browser.mutate<{ publicId: string }>("orders.create", {
+    projectName: "Isolated format-3 order", items: [{ productPublicId, quantity: 1 }], idempotencyKey: "isolation-phase-order-0001",
+  })).publicId;
+  owned.questionId = Browser.ok(await admin.browser.mutate<{ questionId: string }>("orders.questions.ask", {
+    ...phaseRef(), prompt: "What else should we know about your order?", required: false,
+  })).questionId;
+  const upload = await a.browser.raw("post", `/api/files/upload/${owned.phaseOrderId}?stageKey=${intake}&intent=document`)
+    .attach("files", exampleDocx(), "phase-document.docx");
+  expect(upload.status).toBe(200);
+  expect(upload.body.results[0]).toMatchObject({ outcome: "completed", file: { stageKey: intake } });
+  owned.archiveId = Browser.ok(await a.browser.mutate<{ archiveId: string }>("fileArchives.request", phaseRef())).archiveId;
+  ({ version: phaseOrderVersion } = Browser.ok(await a.browser.query<{ version: number }>("orders.stages.workspace", { orderId: owned.phaseOrderId })));
 }
 
 async function publishPolicy(slug: string, title: string, audience: "customer" | "staff", requiresAcceptance: boolean) {
@@ -534,6 +603,7 @@ beforeAll(async () => {
   await seedKnowledge(adminUser!.userId);
   await seedOrderCopyAndPayment();
   await seedProductionDispatch(aUser!.userId);
+  await seedPhaseOrder(productId);
   await seedPolicyEnforcement();
   ({ version: aOrderVersion } = Browser.ok(await a.browser.query<{ version: number }>("orders.get", { orderId: owned.orderId })));
 
@@ -545,6 +615,14 @@ afterAll(async () => sys?.close());
 describe("cross-customer isolation (assembled system)", () => {
   it("customer A can read every one of its own resources (the probes below are meaningful)", async () => {
     Browser.ok(await a.browser.query("orders.get", { orderId: owned.orderId }));
+    expect(Browser.ok(await a.browser.query("orders.stages.workspace", { orderId: owned.phaseOrderId })))
+      .toMatchObject({ orderId: owned.phaseOrderId, workflowFormat: 3, currentStageKey: intake, derived: false, version: phaseOrderVersion });
+    expect(Browser.ok(await a.browser.query("orders.questions.customerList", phaseRef())))
+      .toMatchObject({ canAnswer: true, questions: [{ questionId: owned.questionId, latestAnswer: null }] });
+    Browser.ok(await a.browser.query("files.phasePolicy", { orderPublicId: owned.phaseOrderId, stageKey: intake, intent: "document" }));
+    Browser.ok(await a.browser.query("files.teamFiles", { orderPublicId: owned.phaseOrderId, stageKey: intake }));
+    expect(Browser.ok(await a.browser.query("fileArchives.latest", phaseRef())))
+      .toMatchObject({ archiveId: owned.archiveId, fileCount: 1, scope: "stage" });
     Browser.ok(await a.browser.query("engagement.tickets.get", { ticketId: owned.ticketId }));
     Browser.ok(await a.browser.query("audit.orderActivity", { orderPublicId: owned.orderId, category: "details" }));
     expect(Browser.ok(await a.browser.query("audit.orderStatusHistory", { orderPublicId: owned.orderId }))).toMatchObject({ view: "customer" });
@@ -574,6 +652,8 @@ describe("cross-customer isolation (assembled system)", () => {
       userPublicId: owned.customerPublicId, versionPublicId: owned.enforcementVersionId,
     }))).toEqual({ canEndSessions: true });
     Browser.ok(await a.browser.mutate("files.issueDownloadTicket", { fileId: owned.fileId }));
+    expect(Browser.ok(await a.browser.mutate("files.issuePlaybackTicket", { orderId: owned.orderId, fileId: owned.fileId })))
+      .toMatchObject({ ticket: expect.any(String) });
     expect(Browser.ok(await a.browser.mutate("files.readTranscript", { fileId: owned.fileId }))).toEqual({ transcript });
     expect(Browser.ok(await a.browser.query("community.topics.get", { topicPublicId: owned.topicId }))).toEqual(expect.objectContaining({
       topic: expect.objectContaining({ publicId: owned.topicId, title: pendingTitle }),
@@ -603,6 +683,8 @@ describe("cross-customer isolation (assembled system)", () => {
             if (visible.includes(privateValue)) failures.push(`${label}: returned private community content`);
           }
           if (!visible.includes(owned.sharedTopicId)) failures.push(`${label}: did not return the shared topic`);
+        } else if (probe.denial?.code === "EMPTY") {
+          if (result.status !== 200 || result.data !== null) failures.push(`${label}: expected empty result`);
         } else if (probe.denial?.code === "FORBIDDEN") {
           if (result.status !== 403 || code !== "FORBIDDEN" || reason !== probe.denial.reason) failures.push(`${label}: ${result.status} ${code ?? ""} ${reason ?? ""}`);
         } else if (result.status !== 404 || code !== "NOT_FOUND") {
@@ -665,6 +747,12 @@ describe("cross-customer isolation (assembled system)", () => {
   });
 
   it("A's resources are unchanged after B's attempts", async () => {
+    expect(Browser.ok(await a.browser.query("orders.stages.workspace", { orderId: owned.phaseOrderId })))
+      .toMatchObject({ version: phaseOrderVersion, currentStageKey: intake, stages: [expect.objectContaining({ key: intake, state: "open" })] });
+    expect(Browser.ok(await a.browser.query("orders.questions.customerList", phaseRef())))
+      .toMatchObject({ questions: [{ questionId: owned.questionId, latestAnswer: null }] });
+    expect(Browser.ok(await a.browser.query("fileArchives.status", { archiveId: owned.archiveId })))
+      .toMatchObject({ archiveId: owned.archiveId, state: "queued", fileCount: 1 });
     const detail = JSON.stringify(Browser.ok(await a.browser.query("orders.get", { orderId: owned.orderId })));
     expect(detail).toContain(owned.projectName);
     expect(detail).not.toContain("Hijacked");
@@ -860,6 +948,15 @@ describe("cross-customer isolation (assembled system)", () => {
   });
 
   it.todo("B cannot remove or rename A's passkey (needs a virtual WebAuthn authenticator fixture for A)");
+
+  it("an administrator needs fresh step-up before reopening a phase", async () => {
+    sys.clock.advance(STEP_UP_MAX_AGE_MS + 1);
+    const result = await admin.browser.mutate("orders.stages.reopen", { ...phaseWrite(), reason: reopenReason, confirm: true });
+    expect(result.status).toBe(403);
+    expect(result.error?.safe).toMatchObject({ domainCode: "STEP_UP_REQUIRED", reasonCode: "STEP_UP_REQUIRED" });
+    expect(Browser.ok(await a.browser.query("orders.stages.workspace", { orderId: owned.phaseOrderId })))
+      .toMatchObject({ version: phaseOrderVersion, currentStageKey: intake });
+  });
 
   it("every customer-reachable procedure that takes a resource id is probed here", () => {
     const covered = probes();
