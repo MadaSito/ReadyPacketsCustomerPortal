@@ -4,10 +4,12 @@
  * Increment 07 QA: while the DEFAULT workflow's current version has no phases, a dismissible notice offers "add" and
  * "convert" drafts (an open phase-less draft of the default is converted in place only after a confirm naming it). Publishing happens
  * in the designer and always creates a new version; orders stay bound to the version they started on.
+ * Increment 07.2: a summary of the default workflow for new orders, and "Set as default" on each published
+ * workflow (confirm dialog, step-up; the server switches the single default in one audited transaction).
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Workflow } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState, type Ref, type RefObject } from "react";
 import { Link, useLocation } from "wouter";
 import { errorMessage, safeError, useTRPC } from "@/lib/trpc";
 import { Badge, Button, Callout, Card, ConfirmDialog, DataTable, DateTime, Dialog, EmptyState, ErrorState, Field, Input, PageHeader, RadioGroup, Select, Skeleton, StepUpCancelledError, useStepUp, useToast } from "@/ui";
@@ -32,6 +34,11 @@ export default function AdminWorkflowsPage() {
   const addPhases = useMutation(trpc.orders.admin.workflows.phases.addStandard.mutationOptions());
   const convertDefault = useMutation(trpc.orders.admin.workflows.phases.convertDefault.mutationOptions());
   const [convertAsk, setConvertAsk] = useState<{ draftId: string; draftName: string } | null>(null);
+  const [makingDefault, setMakingDefault] = useState<WorkflowListRow | null>(null);
+  // Where focus goes when the "Set as default" dialog closes: the clicked button on cancel, the summary on success
+  // (the new default's button disappears).
+  const defaultFocus = useRef<HTMLElement | null>(null);
+  const summaryRef = useRef<HTMLParagraphElement>(null);
 
   const refresh = () =>
     Promise.all([
@@ -146,6 +153,7 @@ export default function AdminWorkflowsPage() {
             {problem}
           </Callout>
         ) : null}
+        <DefaultWorkflowSummary ref={summaryRef} workflow={defaultWorkflow} />
         {showPhasesNotice ? (
           <section aria-labelledby="phases-notice-title" className="flex flex-col gap-3 rounded-[var(--radius-card)] border border-line bg-surface p-4 sm:p-5">
             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -194,6 +202,18 @@ export default function AdminWorkflowsPage() {
                 actions={wf.isDefault ? <Badge tone="brand">Default</Badge> : null}
                 footer={
                   <div className="flex flex-wrap items-center gap-2">
+                    {wf.isDefault ? null : wf.currentVersionPublicId ? (
+                      <Button
+                        size="sm"
+                        aria-label={`Set as default: ${wf.name}`}
+                        onClick={(event) => {
+                          defaultFocus.current = event.currentTarget;
+                          setMakingDefault(wf);
+                        }}
+                      >
+                        Set as default
+                      </Button>
+                    ) : null}
                     <Button size="sm" variant="secondary" aria-label={`${wf.draftPublicId ? "Continue draft" : "Edit"} ${wf.name}`} loading={createDraft.isPending && createDraft.variables?.workflowId === wf.publicId} onClick={() => void edit(wf)}>
                       {wf.draftPublicId ? "Continue draft" : "Edit"}
                     </Button>
@@ -206,6 +226,11 @@ export default function AdminWorkflowsPage() {
               >
                 <div className="grid min-w-0 gap-3">
                   {transfer.selectionControl(wf.workflowKey, wf.name)}
+                  {wf.isDefault ? (
+                    <p className="text-sm text-body">New orders use this workflow (version {wf.versionNumber}).</p>
+                  ) : !wf.currentVersionPublicId ? (
+                    <p className="text-sm text-body">Publish a version before this workflow can be the default.</p>
+                  ) : null}
                   {wf.definition ? (
                     <ul aria-label={`Statuses in ${wf.name}`} className="flex flex-wrap gap-2">
                       {wf.definition.states.map((state) => (
@@ -222,12 +247,16 @@ export default function AdminWorkflowsPage() {
             ))}
           </div>
         )}
+        <p id="drafts-default-hint" className="-mb-3 max-w-3xl text-sm text-body">
+          A draft must be published before it can be the default workflow. A draft for a new workflow can be made the default when you publish it, and you can change the default any time
+          with “Set as default” on a published workflow above.
+        </p>
         <DataTable
           caption="Drafts"
           showCaption
           rows={draftRows}
           rowKey={(draft) => draft.publicId}
-          empty={drafts.isPending ? "Loading drafts…" : "No drafts. Edit a workflow or start a new one."}
+          empty={drafts.isPending ? "Loading drafts…" : "No drafts. Edit a workflow or start a new one. Publish a draft before making it the default."}
           columns={[
             {
               key: "name",
@@ -280,9 +309,122 @@ export default function AdminWorkflowsPage() {
           }}
         />
       ) : null}
+      {makingDefault ? (
+        <SetDefaultDialog
+          workflow={makingDefault}
+          current={defaultWorkflow}
+          returnFocus={defaultFocus}
+          onSuccess={() => {
+            defaultFocus.current = summaryRef.current;
+          }}
+          onClose={() => setMakingDefault(null)}
+          onDone={() => refresh()}
+        />
+      ) : null}
       {discarding ? <DiscardDialog draft={discarding} onClose={() => setDiscarding(null)} onDone={() => void refresh()} /> : null}
       {transfer.dialog}
     </>
+  );
+}
+
+/** Increment 07.2: "Default workflow for new orders: <name> (version N)". Focus target after a default change. */
+function DefaultWorkflowSummary({ workflow, ref }: { workflow: WorkflowListRow | null; ref: Ref<HTMLParagraphElement> }) {
+  return (
+    <p ref={ref} tabIndex={-1} className="rounded-[var(--radius-card)] border border-line bg-surface p-4 text-body outline-none rp-forced-border">
+      {workflow ? (
+        <>
+          <span className="font-semibold text-ink">Default workflow for new orders:</span> <span className="break-words">{`${workflow.name} (version ${workflow.versionNumber})`}</span>
+          <span className="mt-1 block text-sm">Change it with “Set as default” on another published workflow. Existing orders keep the version they started with.</span>
+        </>
+      ) : (
+        <>
+          <span className="font-semibold text-ink">Default workflow for new orders:</span> none published yet. The standard workflow is installed with the first order.
+        </>
+      )}
+    </p>
+  );
+}
+
+/**
+ * Confirms making `workflow` the default. Copy matches the server: every new order (customer wizard, cart checkout,
+ * staff-created, API) binds to the default's current published version when it is created; there is no per-product or
+ * per-package workflow; existing orders keep their version.
+ */
+function SetDefaultDialog({
+  workflow,
+  current,
+  returnFocus,
+  onSuccess,
+  onClose,
+  onDone,
+}: {
+  workflow: WorkflowListRow;
+  current: WorkflowListRow | null;
+  returnFocus: RefObject<HTMLElement | null>;
+  onSuccess: () => void;
+  onClose: () => void;
+  onDone: () => Promise<unknown>;
+}) {
+  const trpc = useTRPC();
+  const toast = useToast();
+  const stepUp = useStepUp();
+  const setDefault = useMutation(trpc.orders.admin.workflows.setDefault.mutationOptions());
+  const [problem, setProblem] = useState<string | null>(null);
+  const busy = setDefault.isPending;
+  const confirm = async () => {
+    setProblem(null);
+    try {
+      const result = await stepUp.run(() => setDefault.mutateAsync({ workflowId: workflow.publicId }), { reason: "Changing the default workflow changes how new orders move." });
+      toast.show(
+        result.changed
+          ? { tone: "success", title: `${result.name} is now the default workflow`, description: `New orders use version ${result.versionNumber}. Existing orders are unchanged.` }
+          : { tone: "info", title: `${result.name} was already the default workflow` },
+      );
+      await onDone();
+      onSuccess();
+      onClose();
+    } catch (err) {
+      if (err instanceof StepUpCancelledError) return;
+      setProblem(errorMessage(err, "The default workflow could not be changed. Please try again."));
+    }
+  };
+  return (
+    <Dialog
+      open
+      size="md"
+      dismissible={!busy}
+      returnFocusRef={returnFocus}
+      onOpenChange={(open) => (open || busy ? undefined : onClose())}
+      title={`Make “${workflow.name}” the default workflow?`}
+      description="This changes which workflow new orders use."
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button loading={busy} onClick={() => void confirm()}>
+            Set as default
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3 text-body">
+        {problem ? (
+          <Callout tone="danger" live="assertive">
+            {problem}
+          </Callout>
+        ) : null}
+        <ul className="flex list-disc flex-col gap-2 pl-5">
+          <li>
+            {`Orders created after this use “${workflow.name}”, version ${workflow.versionNumber} (its latest published version). If you publish a newer version later, new orders use that one.`}
+          </li>
+          <li>This applies to every new order: orders customers place, cart checkout, orders staff create for a customer, and orders created through the API.</li>
+          <li>Existing orders keep the workflow version they started with.</li>
+          <li>Workflows are not chosen per product or package, so nothing else needs changing.</li>
+        </ul>
+        {current ? <p className="text-sm">{`Current default: ${current.name} (version ${current.versionNumber}). You can switch back any time.`}</p> : null}
+      </div>
+    </Dialog>
   );
 }
 

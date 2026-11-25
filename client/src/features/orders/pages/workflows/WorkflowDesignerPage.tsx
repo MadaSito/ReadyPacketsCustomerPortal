@@ -307,6 +307,7 @@ function DraftEditor({ initial, breadcrumbs }: { initial: DraftView; breadcrumbs
                     setDefinition={setDefinition}
                     makeDefault={makeDefault}
                     setMakeDefault={setMakeDefault}
+                    newWorkflow={initial.workflowPublicId === null}
                     changeNote={changeNote}
                     setChangeNote={setChangeNote}
                     publishable={publishable && !dirty}
@@ -437,6 +438,8 @@ interface StepBodyProps {
   setDefinition: (definition: DraftDefinition) => void;
   makeDefault: boolean;
   setMakeDefault: (value: boolean) => void;
+  /** Increment 07.2: the draft proposes a new workflow (not a new version of a published one). */
+  newWorkflow: boolean;
   changeNote: string;
   setChangeNote: (value: string) => void;
   publishable: boolean;
@@ -582,7 +585,7 @@ function StepBody(props: StepBodyProps) {
   );
 }
 
-function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, setChangeNote, publishable, dirty, onJump }: StepBodyProps) {
+function ReviewStep({ work, issues, makeDefault, setMakeDefault, newWorkflow, changeNote, setChangeNote, publishable, dirty, onJump }: StepBodyProps) {
   const { definition } = work;
   return (
     <>
@@ -592,6 +595,13 @@ function ReviewStep({ work, issues, makeDefault, setMakeDefault, changeNote, set
       <DefinitionTables definition={definition} />
       <RulesReviewSummary definition={definition} />
       <Checkbox label="Use for new orders (default workflow)" description="If you leave this off, new orders keep using the current default." checked={makeDefault} onCheckedChange={setMakeDefault} />
+      {/* Increment 07.2: say where the default lives, so it can be found later. */}
+      <p className="text-sm text-body">
+        {newWorkflow
+          ? "A draft must be published before it can be the default. Tick the box above to make this new workflow the default when you publish it, or publish now and choose it later."
+          : "A draft must be published before it can be the default."}{" "}
+        You can change the default workflow any time with “Set as default” on the Workflows list.
+      </p>
       <Field label="Change note (optional)" hint="Shown in the version list, for example why the change was made.">
         <Textarea value={changeNote} maxLength={500} rows={3} onChange={(event) => setChangeNote(event.target.value)} />
       </Field>

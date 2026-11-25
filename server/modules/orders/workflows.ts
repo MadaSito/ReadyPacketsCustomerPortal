@@ -2,7 +2,7 @@
  * Versioned workflow definitions. Orders are bound to the version they started on; publishing a new version
  * affects new orders only (an explicit migration of existing orders is a recorded target, not implemented).
  */
-import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray, or } from "drizzle-orm";
 import { conflict, DomainError, notFound, validation } from "../../core/errors.js";
 import { STEP_UP_MAX_AGE_MS } from "../../trpc/trpc.js";
 import { ulid } from "../../core/ids.js";
@@ -615,6 +615,62 @@ export function createWorkflowService(deps: WorkflowDeps) {
           tx,
         );
         return { workflowPublicId: workflowRow.publicId, versionNumber, isDefault: makeDefault || workflowRow.isDefault };
+      });
+    },
+
+    /**
+     * Increment 07.2: makes a PUBLISHED workflow the default for new orders. Every order-creating path (customer
+     * wizard, cart checkout, staff "New order for a customer", API v1) binds to the default's current version at the
+     * moment the order is created (ensureDefault); existing orders keep their bound version. Same gates as publishing
+     * (admin + workflows.manage, fresh persisted step-up). Single-default switch in one transaction: the target and
+     * every current default are locked FOR UPDATE in id order (so two concurrent switches serialize instead of
+     * deadlocking or leaving two defaults). Idempotent: already default → `changed: false`, nothing written.
+     */
+    async setDefault(principal: SessionPrincipal, input: { workflowId: string }) {
+      return deps.db.transaction(async (tx) => {
+        await assertDesigner(principal, tx, true);
+        const locked = await tx
+          .select()
+          .from(orderWorkflows)
+          .where(or(eq(orderWorkflows.publicId, input.workflowId), eq(orderWorkflows.isDefault, true)))
+          .orderBy(asc(orderWorkflows.id))
+          .for("update");
+        const target = locked.find((row) => row.publicId === input.workflowId);
+        if (!target) throw notFound("WORKFLOW_NOT_FOUND");
+        if (target.currentVersionId === null)
+          throw validation("WORKFLOW_NOT_PUBLISHED", "This workflow has no published version yet. Publish it first, then make it the default.");
+        const [current] = await tx
+          .select({ versionNumber: orderWorkflowVersions.versionNumber })
+          .from(orderWorkflowVersions)
+          .where(eq(orderWorkflowVersions.id, target.currentVersionId))
+          .limit(1);
+        if (!current) throw validation("WORKFLOW_NOT_PUBLISHED", "This workflow has no published version yet. Publish it first, then make it the default.");
+        const previous = locked.filter((row) => row.isDefault && row.id !== target.id);
+        const result = { workflowPublicId: target.publicId, name: target.name, versionNumber: current.versionNumber };
+        if (target.isDefault && previous.length === 0) return { ...result, changed: false as const, previousWorkflowPublicId: null };
+        if (previous.length) await tx.update(orderWorkflows).set({ isDefault: false }).where(inArray(orderWorkflows.id, previous.map((row) => row.id)));
+        if (!target.isDefault) await tx.update(orderWorkflows).set({ isDefault: true }).where(eq(orderWorkflows.id, target.id));
+        const before = previous[0] ?? null;
+        await deps.audit.record(
+          {
+            category: "admin",
+            eventName: "workflow.default.changed",
+            action: "update",
+            outcome: "completed",
+            actor: { userId: principal.userId, role: principal.role },
+            resource: { type: "order_workflow", publicId: target.publicId },
+            reasonCode: "DEFAULT_WORKFLOW_SET",
+            attributes: {
+              workflow_key: target.workflowKey,
+              version_number: current.versionNumber,
+              previous_workflow_id: before?.publicId ?? "none",
+              previous_workflow_key: before?.workflowKey ?? "none",
+            },
+            safeCounts: { previous_defaults: previous.length },
+          },
+          tx,
+        );
+        return { ...result, changed: true as const, previousWorkflowPublicId: before?.publicId ?? null };
       });
     },
 
