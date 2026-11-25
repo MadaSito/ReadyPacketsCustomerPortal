@@ -10,7 +10,7 @@ import { CustomerShell } from "./shell/CustomerShell";
 import { currentNavHref, customerNavLayout, customerNavSections, initials, LEGAL_NAME, navPlacement, PUBLIC_SITE_URL } from "./shell/common";
 import { ALL_NAV } from "./registry";
 import { clearCustomerPortalChoice, readCustomerPortalChoice, setCustomerPortalChoice } from "@/lib/portal";
-import { visibleNav } from "./shell/common";
+import { phoneTabLabel, visibleNav } from "./shell/common";
 import type { NavItem } from "@/lib/routes";
 
 vi.mock("./slots", () => ({ NotificationSlot: () => null, GlobalSearchSlot: () => null, AnalyticsConsentSlot: () => null, CookieConsentSlot: () => null, CustomerMaintenanceSlot: () => null, CartBadgeSlot: () => null, SsoSignInSlot: () => null }));
@@ -241,7 +241,10 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
       const notice = screen.getByTestId("staff-portal-notice");
       expect(notice).toHaveTextContent(`You are viewing the customer portal as ${role === "admin" ? "an administrator" : "a staff member"}.`);
       expect(within(notice).getByRole("link", { name: "New order for a customer" })).toHaveAttribute("href", "/admin/orders?new=1");
-      expect(within(notice).getByRole("link", { name: label })).toHaveAttribute("href", "/admin");
+      // The notice repeats the switch only below md, where the top-bar switch is hidden (no duplicate at md+).
+      const noticeSwitch = within(notice).getByRole("link", { name: label });
+      expect(noticeSwitch).toHaveAttribute("href", "/admin");
+      expect(noticeSwitch.className).toContain("md:hidden");
       const header = screen.getByRole("banner");
       const topSwitch = within(header).getByRole("link", { name: label });
       expect(topSwitch).toHaveAttribute("href", "/admin");
@@ -252,7 +255,11 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
       expect(labels).not.toContain("Cart");
       fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
       const drawer = await screen.findByRole("dialog", { name: "Menu" });
-      expect(within(drawer).getByRole("link", { name: label })).toHaveAttribute("href", "/admin");
+      const drawerSwitch = within(drawer).getByRole("link", { name: label });
+      expect(drawerSwitch).toHaveAttribute("href", "/admin");
+      // First thing in the drawer panel, before the section navigation.
+      const firstNav = within(drawer).getAllByRole("navigation")[0];
+      expect(drawerSwitch.compareDocumentPosition(firstNav!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       fireEvent.keyDown(drawer, { key: "Escape" });
       const menu = await openAccountMenu();
       expect(within(menu).getByRole("menuitem", { name: label })).toHaveAttribute("href", "/admin");
@@ -287,7 +294,9 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
     expect(topSwitch).toHaveAttribute("href", "/");
     fireEvent.click(screen.getByRole("button", { name: "Open console navigation" }));
     const drawer = await screen.findByRole("dialog", { name: "Console navigation" });
-    expect(within(drawer).getByRole("link", { name: "Customer portal" })).toHaveAttribute("href", "/");
+    const drawerSwitch = within(drawer).getByRole("link", { name: "Customer portal" });
+    expect(drawerSwitch).toHaveAttribute("href", "/");
+    expect(drawerSwitch.compareDocumentPosition(within(drawer).getAllByRole("navigation")[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.keyDown(drawer, { key: "Escape" });
     const menu = await openAccountMenu();
     expect(within(menu).getByRole("menuitem", { name: "Customer portal" })).toHaveAttribute("href", "/");
@@ -297,6 +306,24 @@ describe("07.1 staff/admin in the customer portal (D1–D4)", () => {
     expect(readCustomerPortalChoice()).toBe(true);
     await expectNoAxeViolations(container);
     clearCustomerPortalChoice();
+  });
+
+  it("phone bottom bar uses short labels that fit at 320 px, never an ellipsis", () => {
+    const tabs = customerNavSections(visibleNav(ALL_NAV, "customer", "customer")).phone.map(phoneTabLabel);
+    expect(tabs.slice(0, 3)).toEqual(["Home", "Orders", "New order"]);
+    for (const t of tabs) expect(t.length).toBeLessThanOrEqual(9);
+    renderUi(
+      <CustomerShell user={user("customer")}>
+        <h1>Page</h1>
+      </CustomerShell>,
+      { path: "/", api: fakeAuthApi({ bootstrap: () => Promise.resolve({ features: {} }) }) },
+    );
+    const quick = screen.getByRole("navigation", { name: "Quick navigation" });
+    const home = within(quick).getByRole("link", { name: "Home" });
+    expect(home).toHaveAttribute("href", "/");
+    expect(home).toHaveAttribute("aria-current", "page");
+    expect(quick.querySelector(".truncate")).toBeNull();
+    for (const link of within(quick).getAllByRole("link")) expect(link.className).toContain("min-h-14");
   });
 
   it("navigation rails use the thin themed scrollbar", () => {

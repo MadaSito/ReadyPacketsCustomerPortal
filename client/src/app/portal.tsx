@@ -157,7 +157,8 @@ export function StaffPortalNotice({ role: roleProp }: { role?: UserRole } = {}) 
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <NewOrderForCustomerLink variant="secondary" size="sm" />
-          <PortalSwitch area="customer" role={role} />
+          {/* 07.1: from md up the top bar carries the switch; only repeat it here where the top-bar one is hidden. */}
+          <PortalSwitch area="customer" role={role} className="md:hidden" />
         </div>
       </div>
     </div>

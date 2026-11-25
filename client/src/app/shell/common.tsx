@@ -118,6 +118,16 @@ export interface CustomerNavSections {
 /** Preferred phone bottom-bar entries, in order; free slots are filled from the main section. */
 export const PHONE_BAR_HREFS = ["/", "/orders", "/orders/new", "/messages"] as const;
 
+/**
+ * 07.1: short labels for the phone bottom bar so five tabs fit at 320 px without an ellipsis. The visible text is
+ * the accessible name (WCAG 2.5.3); the full label stays in the sidebar, drawer and page heading.
+ */
+const PHONE_TAB_LABELS: Readonly<Record<string, string>> = { "/": "Home", "/orders": "Orders", "/orders/new": "New order" };
+
+export function phoneTabLabel(item: Pick<NavItem, "href" | "label">): string {
+  return PHONE_TAB_LABELS[item.href] ?? item.label;
+}
+
 export function customerNavSections(items: readonly NavItem[]): CustomerNavSections {
   const visible = [...items].filter((item) => navPlacement(item) !== "hidden").sort((a, b) => a.order - b.order);
   const out: CustomerNavSections = { main: [], Support: [], Account: [], phone: [] };

@@ -23,6 +23,7 @@ import {
   customerNavSections,
   Footer,
   MaintenanceBanner,
+  phoneTabLabel,
   PreviewBanner,
   SkipLink,
   ThemeToggle,
@@ -164,10 +165,10 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
                 <Link
                   href={item.href}
                   aria-current={isCurrent(item.href) ? "page" : undefined}
-                  className="rp-nav-tab flex min-h-14 flex-col items-center justify-center gap-0.5 px-1 text-[0.6875rem]"
+                  className="rp-nav-tab flex min-h-14 flex-col items-center justify-center gap-0.5 px-0.5 py-1 text-[0.6875rem] leading-tight tracking-tight"
                 >
-                  <item.icon aria-hidden={true} className="size-5" />
-                  <span className="max-w-full truncate">{item.label}</span>
+                  <item.icon aria-hidden={true} className="size-5 shrink-0" />
+                  <span className="max-w-full text-center [overflow-wrap:anywhere]">{phoneTabLabel(item)}</span>
                 </Link>
               </li>
             ))}
@@ -189,12 +190,12 @@ export function CustomerShell({ user, children }: { user: MeUser; children: Reac
 
       <Drawer open={menuOpen} onOpenChange={setMenuOpen} title="Menu" side="left" width="sm">
         <div className="rp-nav-panel -mx-4 -mt-4 p-4 rp-on-navy">
-          <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
           {staff ? (
-            <div className="mt-5 border-t border-navy-border pt-4">
+            <div className="mb-4 border-b border-navy-border pb-4" data-testid="drawer-portal-switch">
               <PortalSwitch area="customer" role={user.role} appearance="nav" onNavigate={() => setMenuOpen(false)} />
             </div>
           ) : null}
+          <SectionNav sections={sections} label="All sections" onNavigate={() => setMenuOpen(false)} isCurrent={isCurrent} />
         </div>
         <div className="mt-6 border-t border-line pt-4 sm:hidden">
           <ThemeControl showLabel />

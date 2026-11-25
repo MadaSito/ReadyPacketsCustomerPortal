@@ -133,10 +133,10 @@ export function ConsoleShell({ user, children }: { user: MeUser; children: React
 
       <Drawer open={drawerOpen} onOpenChange={setDrawerOpen} title="Console navigation" side="left" width="sm">
         <div className="rp-nav-panel -m-4 min-h-full p-4 rp-on-navy">
-          <SideNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
-          <div className="mt-5 border-t border-navy-border pt-4">
+          <div className="mb-4 border-b border-navy-border pb-4" data-testid="drawer-portal-switch">
             <PortalSwitch area="console" role={user.role} appearance="nav" onNavigate={() => setDrawerOpen(false)} />
           </div>
+          <SideNav groups={groups} onNavigate={() => setDrawerOpen(false)} />
         </div>
       </Drawer>
     </div>
